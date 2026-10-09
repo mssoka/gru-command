@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { lstatSync, readFileSync } from 'node:fs';
 import { repositoryGitEnv } from './artifacts.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './types.js';
@@ -311,6 +311,28 @@ export function parseDeltaHunks(diff: string): readonly DeltaHunk[] {
   return parseDeltaStructure(diff).hunks;
 }
 
+/** Read one bounded `git diff` and parse it into delta structure. Shared by
+ * the commit-to-commit delta and the integration unit (whose `from` is an
+ * auto-merge TREE). Throws when git cannot produce the diff. */
+function boundedDelta(repoPath: string, fromSha: string, toSha: string, label: string): DeltaSince {
+  let diff: string;
+  try {
+    diff = execFileSync('git', ['-C', repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3', fromSha, toSha, '--'], {
+      encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 128 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch (error) {
+    throw new Error(`${label} could not be read: ${String(error)}`);
+  }
+  if (Buffer.byteLength(diff, 'utf8') > DELTA_DIFF_MAX_BYTES) {
+    throw new Error(`${label} exceeds ${DELTA_DIFF_MAX_BYTES} UTF-8 bytes`);
+  }
+  const { hunks, paths } = parseDeltaStructure(diff);
+  return {
+    fromSha, toSha, diff, hunks,
+    touchedPaths: new Set([...paths, ...hunks.map((hunk) => hunk.path)]),
+  };
+}
+
 /** Read the bounded prior-target..target delta from the frozen repository.
  * Throws when git cannot produce the delta: callers decide the fail-closed
  * direction (carry-forward narrows; the convergence rule disables). */
@@ -318,22 +340,102 @@ export function deltaSince(repoPath: string, fromSha: string, toSha: string): De
   if (!/^[0-9a-f]{40}$/u.test(fromSha) || !/^[0-9a-f]{40}$/u.test(toSha)) {
     throw new Error('delta endpoints must be full commit SHAs');
   }
-  let diff: string;
-  try {
-    diff = execFileSync('git', ['-C', repoPath, 'diff', '--no-ext-diff', '--no-color', '--unified=3', fromSha, toSha, '--'], {
-      encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 128 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
-    });
-  } catch (error) {
-    throw new Error(`delta since ${fromSha.slice(0, 12)} could not be read: ${String(error)}`);
+  return boundedDelta(repoPath, fromSha, toSha, `delta since ${fromSha.slice(0, 12)}`);
+}
+
+/** The integration review unit: the feature head H0 a prior round covered,
+ * the advanced incoming base B1, and the clean auto-merge tree `merge(H0,B1)`
+ * git would have produced using their common base (B0). `diff(autoTree, H1)`
+ * is therefore exactly the manual conflict resolutions plus any genuinely
+ * new feature edits since H0 — incoming-base-only files and unchanged
+ * feature files are identical in both trees and drop out. */
+export interface IntegrationDelta extends DeltaSince {
+  readonly priorTargetSha: string;
+  readonly incomingBaseSha: string;
+  readonly autoMergeTreeSha: string;
+}
+
+/** `git merge-tree --write-tree` writes the auto-merge TREE and exits 0 when
+ * clean, 1 when the merge CONFLICTS (the tree still carries conflict
+ * markers). Both statuses are expected; only an unusable tree refuses.
+ * merge-tree writes Git objects, never the index or checkout. */
+function autoMergeTree(repoPath: string, priorTargetSha: string, incomingBaseSha: string): string {
+  const result = spawnSync('git', ['-C', repoPath, 'merge-tree', '--write-tree', priorTargetSha, incomingBaseSha], {
+    encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 16 * 1024 * 1024, timeout: GIT_TIMEOUT_MS,
+  });
+  if (result.error !== undefined && result.error !== null) {
+    throw new Error(`integration auto-merge tree could not be read: ${String(result.error)}`);
   }
-  if (Buffer.byteLength(diff, 'utf8') > DELTA_DIFF_MAX_BYTES) {
-    throw new Error(`delta since ${fromSha.slice(0, 12)} exceeds ${DELTA_DIFF_MAX_BYTES} UTF-8 bytes`);
+  if (result.status !== 0 && result.status !== 1) {
+    throw new Error(`integration auto-merge tree failed (status ${String(result.status)}): ${(result.stderr ?? '').trim().replace(/[\r\n]+/gu, ' ').slice(0, 300)}`);
   }
-  const { hunks, paths } = parseDeltaStructure(diff);
+  const tree = (result.stdout ?? '').split('\n')[0]?.trim() ?? '';
+  if (!/^[0-9a-f]{40}$/u.test(tree)) throw new Error('integration auto-merge produced no merged tree');
+  return tree;
+}
+
+/** Read the integration review unit for a forward-integrated candidate. The
+ * caller must already have proven the lineage (see probeIntegrationLineage);
+ * this only reads bytes and fails closed when git cannot produce the unit. */
+export function integrationSince(
+  repoPath: string, priorTargetSha: string, incomingBaseSha: string, currentTargetSha: string,
+): IntegrationDelta {
+  if (!/^[0-9a-f]{40}$/u.test(priorTargetSha) || !/^[0-9a-f]{40}$/u.test(incomingBaseSha) || !/^[0-9a-f]{40}$/u.test(currentTargetSha)) {
+    throw new Error('integration endpoints must be full commit SHAs');
+  }
+  const autoMergeTreeSha = autoMergeTree(repoPath, priorTargetSha, incomingBaseSha);
+  const delta = boundedDelta(repoPath, autoMergeTreeSha, currentTargetSha, `integration unit for ${currentTargetSha.slice(0, 12)}`);
   return {
-    fromSha, toSha, diff, hunks,
-    touchedPaths: new Set([...paths, ...hunks.map((hunk) => hunk.path)]),
+    ...delta, priorTargetSha, incomingBaseSha, autoMergeTreeSha,
   };
+}
+
+/** Git-probed ancestry of a candidate against the last covered round.
+ * Every field is a necessary condition for retaining coverage: the base only
+ * ADVANCED (B0 is an ancestor of B1), the feature head INTEGRATED FORWARD
+ * (H0 is an ancestor of H1), and the two work streams share exactly the
+ * pinned prior base (merge-base(H0,B1) === B0) rather than one already
+ * containing the other. */
+export interface IntegrationLineage {
+  readonly baseAdvanced: boolean;
+  readonly featureIntegrated: boolean;
+  readonly commonBasePinned: boolean;
+}
+
+function gitIsAncestor(repoPath: string, ancestor: string, descendant: string): boolean {
+  try {
+    execFileSync('git', ['-C', repoPath, 'merge-base', '--is-ancestor', ancestor, descendant], {
+      env: repositoryGitEnv(false), stdio: ['ignore', 'ignore', 'ignore'], timeout: GIT_TIMEOUT_MS,
+    });
+    return true;
+  } catch (error) {
+    if ((error as { status?: unknown } | null)?.status === 1) return false;
+    throw error;
+  }
+}
+
+/** Probe the integration lineage in the frozen object store. Returns null
+ * when the probe cannot be established (malformed SHAs or a git failure):
+ * callers then review whole rather than inherit coverage. */
+export function probeIntegrationLineage(
+  repoPath: string,
+  input: { readonly priorDiffBaseSha: string; readonly priorTargetSha: string; readonly currentDiffBaseSha: string; readonly currentTargetSha: string },
+): IntegrationLineage | null {
+  const shas = [input.priorDiffBaseSha, input.priorTargetSha, input.currentDiffBaseSha, input.currentTargetSha];
+  if (shas.some((sha) => !/^[0-9a-f]{40}$/u.test(sha))) return null;
+  try {
+    const baseAdvanced = gitIsAncestor(repoPath, input.priorDiffBaseSha, input.currentDiffBaseSha);
+    const featureIntegrated = gitIsAncestor(repoPath, input.priorTargetSha, input.currentTargetSha);
+    if (!baseAdvanced || !featureIntegrated) {
+      return { baseAdvanced, featureIntegrated, commonBasePinned: false };
+    }
+    const mergeBase = execFileSync('git', ['-C', repoPath, 'merge-base', input.priorTargetSha, input.currentDiffBaseSha], {
+      encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return { baseAdvanced, featureIntegrated, commonBasePinned: mergeBase === input.priorDiffBaseSha };
+  } catch {
+    return null;
+  }
 }
 
 /** Whether one finding's location intersects the delta hunks. Fail-closed
@@ -447,31 +549,76 @@ export function convergedVerdict(blockerCount: number): Exclude<CanonicalReviewV
  * - same candidate (target AND diff base unchanged) -> whole: there is no
  *   delta to review, and a re-review at an unchanged head is a request for
  *   the whole-change authority, not a delta scan;
- * - moved diff base -> whole: the review CONTEXT changed (a new merge base
- *   puts base-merged changes under review), so a target-only delta would
- *   silently defer findings the new base introduced;
+ * - moved diff base WITH proven integration lineage and retained coverage
+ *   -> integration: the reviewed feature head integrated with a descendant
+ *   base, so the prior coverage stands and only the new integration work is
+ *   reviewed;
+ * - moved diff base without that proof -> whole: the review CONTEXT changed
+ *   (a new merge base puts base-merged changes under review), so a
+ *   target-only delta would silently defer findings the new base introduced;
  * - the prior round was a DELTA round that posted READY -> whole: the
  *   READY candidate gets one whole-change authority pass before approval
  *   means approval;
- * - otherwise -> delta (the normal fix-then-review increment). */
-export function nextReviewScope(input: {
+ * - otherwise -> delta (the normal fix-then-review increment).
+ */
+export interface ReviewScopePlan {
+  readonly scope: 'whole' | 'delta' | 'integration';
+  /** Deterministic, durable explanation of the decision (disclosed on the
+   * convergence record and in the ledger review event). */
+  readonly reason: string;
+}
+
+export function planReviewScope(input: {
   readonly prior: PriorConvergenceMeta | null;
   readonly currentTargetSha: string;
   readonly currentDiffBaseSha: string;
   readonly deltaRoundsFrom: number;
   readonly finalWholePassAtReady: boolean;
-}): 'whole' | 'delta' {
-  if (input.prior === null) return 'whole';
-  const sameCandidate = input.prior.targetSha === input.currentTargetSha &&
-    input.prior.diffBaseSha === input.currentDiffBaseSha;
-  if (sameCandidate) return 'whole';
-  if (input.prior.diffBaseSha !== input.currentDiffBaseSha) return 'whole';
+  /** Policy gate: when not exactly true, a moved base always reviews whole. */
+  readonly integrationCoverage?: boolean;
+  /** Git-probed lineage; null when the probe could not be established. */
+  readonly integrationLineage?: IntegrationLineage | null;
+  /** False when the prior and current rounds bind different effective
+   * acceptance: retained coverage then no longer applies. */
+  readonly acceptanceCompatible?: boolean;
+}): ReviewScopePlan {
+  if (input.prior === null) {
+    return { scope: 'whole', reason: 'first review of this change (no conclusive prior record)' };
+  }
+  const prior = input.prior;
+  const sameCandidate = prior.targetSha === input.currentTargetSha &&
+    prior.diffBaseSha === input.currentDiffBaseSha;
+  if (sameCandidate) {
+    return { scope: 'whole', reason: 're-review at an unchanged candidate (target and merge base unchanged)' };
+  }
+  if (prior.diffBaseSha !== input.currentDiffBaseSha) {
+    const lineage = input.integrationLineage ?? null;
+    if (input.integrationCoverage === true && input.acceptanceCompatible !== false &&
+      lineage !== null && lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned) {
+      return {
+        scope: 'integration',
+        reason: `prior coverage retained: merge base ${prior.diffBaseSha.slice(0, 12)} advanced to ${input.currentDiffBaseSha.slice(0, 12)} and reviewed feature head ${prior.targetSha.slice(0, 12)} integrated forward into the current candidate`,
+      };
+    }
+    const fallback = input.integrationCoverage !== true
+      ? 'merge base moved and integration coverage is disabled by policy — whole-change re-verification'
+      : input.acceptanceCompatible === false
+        ? 'merge base moved and the effective acceptance changed since the retained round — whole-change re-verification'
+        : lineage === null
+          ? 'merge base moved and the integration lineage could not be established — whole-change re-verification'
+          : 'merge base moved without a forward integration of the reviewed feature head — whole-change re-verification';
+    return { scope: 'whole', reason: fallback };
+  }
   if (
     input.finalWholePassAtReady &&
-    input.prior.reviewScope === 'delta' &&
-    input.prior.canonicalVerdict === 'READY TO MERGE'
-  ) return 'whole';
-  return input.prior.seq + 1 >= input.deltaRoundsFrom ? 'delta' : 'whole';
+    prior.reviewScope === 'delta' &&
+    prior.canonicalVerdict === 'READY TO MERGE'
+  ) {
+    return { scope: 'whole', reason: 'a delta round posted READY: the final whole-change authority pass is required' };
+  }
+  return prior.seq + 1 >= input.deltaRoundsFrom
+    ? { scope: 'delta', reason: `incremental fix round ${prior.seq + 1} since the last reviewed SHA` }
+    : { scope: 'whole', reason: 'before the delta-round threshold (standing whole-change authority)' };
 }
 
 /** What a caller must know about a completed round's convergence record to
@@ -480,10 +627,13 @@ export function nextReviewScope(input: {
  * threshold. */
 export interface PriorConvergenceMeta {
   readonly seq: number;
-  readonly reviewScope: 'whole' | 'delta' | 'unknown';
+  readonly reviewScope: 'whole' | 'delta' | 'integration' | 'unknown';
   readonly canonicalVerdict: string;
   readonly targetSha: string;
   readonly diffBaseSha: string;
+  /** The prior round's bound acceptance (null when none was recorded):
+   * retained coverage only applies while the effective acceptance matches. */
+  readonly acceptance: { readonly version: number; readonly contractSha256: string } | null;
 }
 
 const MAX_CONSOLIDATED_META_BYTES = 8 * 1024 * 1024;
@@ -491,7 +641,9 @@ const MAX_CONSOLIDATED_META_BYTES = 8 * 1024 * 1024;
 /** Tolerant read of one prior round's consolidated record for scope
  * planning. Returns null when the file is missing, unreadable or not a
  * complete whole-PR record — the caller then plans as if no prior existed
- * (whole authority); it never guesses a scope from a damaged history. */
+ * (whole authority); it never guesses a scope from a damaged history. An
+ * `integration` scope whose immutable linkage is missing is damaged and
+ * reads as no coverage, never as inherited approval. */
 export function readPriorConvergenceMeta(file: string, seq: number): PriorConvergenceMeta | null {
   try {
     const info = lstatSync(file);
@@ -502,8 +654,8 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       canonicalVerdict?: unknown;
       complete?: unknown;
       headMoved?: unknown;
-      frozen?: { targetSha?: unknown; diffBaseSha?: unknown };
-      convergence?: { reviewScope?: unknown };
+      frozen?: { targetSha?: unknown; diffBaseSha?: unknown; acceptance?: unknown };
+      convergence?: { reviewScope?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationAutoMergeTree?: unknown };
     };
     if (parsed.schemaVersion !== 3 || parsed.architecture !== 'perkins-whole-pr' ||
       parsed.complete !== true || parsed.headMoved !== false ||
@@ -513,12 +665,23 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       return null;
     }
     const scope = parsed.convergence?.reviewScope;
+    if (scope === 'integration') {
+      const linkage = parsed.convergence!;
+      if (typeof linkage.integrationFromSha !== 'string' || typeof linkage.integrationBaseSha !== 'string') return null;
+    }
+    const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; contractSha256?: unknown } | undefined;
+    const acceptance = rawAcceptance !== null && typeof rawAcceptance === 'object' &&
+      typeof rawAcceptance.version === 'number' && Number.isSafeInteger(rawAcceptance.version) &&
+      typeof rawAcceptance.contractSha256 === 'string' && /^[a-f0-9]{64}$/u.test(rawAcceptance.contractSha256)
+      ? { version: rawAcceptance.version, contractSha256: rawAcceptance.contractSha256 }
+      : null;
     return {
       seq,
-      reviewScope: scope === 'whole' || scope === 'delta' ? scope : 'unknown',
+      reviewScope: scope === 'whole' || scope === 'delta' || scope === 'integration' ? scope : 'unknown',
       canonicalVerdict: typeof parsed.canonicalVerdict === 'string' ? parsed.canonicalVerdict : '',
       targetSha: parsed.frozen.targetSha,
       diffBaseSha: parsed.frozen.diffBaseSha,
+      acceptance,
     };
   } catch {
     return null;

@@ -31,7 +31,7 @@ import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/t
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
-import { nextReviewScope, readPriorConvergenceMeta } from './perkins-review/convergence.js';
+import { planReviewScope, probeIntegrationLineage, readPriorConvergenceMeta } from './perkins-review/convergence.js';
 import {
   freezeReviewInputs,
   compatibleReviewIdentity,
@@ -261,9 +261,16 @@ export function hostDisclosureAppendix(
     readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly recoveredForLead?: true; readonly cleanupRecordingError?: string; readonly evidenceRecordingError?: string; readonly progressError?: string }>;
     readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
     readonly budgetRefusals?: ReadonlyArray<RoundBudgetRefusal>;
+    readonly targetSha?: string;
     readonly convergence?: {
-      readonly reviewScope: 'whole' | 'delta';
+      readonly reviewScope: 'whole' | 'delta' | 'integration';
+      readonly scopeReason?: string;
       readonly deltaUnavailable?: string;
+      readonly deltaFromSha?: string;
+      readonly integrationFromSha?: string;
+      readonly integrationBaseSha?: string;
+      readonly integrationAutoMergeTree?: string;
+      readonly integrationDeltaSha256?: string;
       readonly carriedPriors?: readonly number[];
       readonly deferredFollowups?: readonly { readonly title: string; readonly location: string; readonly severity: string }[];
       readonly verdictRecomputed?: { readonly from: string; readonly to: string };
@@ -358,7 +365,15 @@ export function hostDisclosureAppendix(
     ...(notUsed.length > 0 ? [`- Lenses not used this round: ${notUsed.join(', ')}`]: []),
     ...(prior.length > 0 ? [`- Prior findings revisited: ${prior.length} (${priorFixed} fixed, ${priorStill} still present)`] : []),
     ...(review.convergence === undefined ? [] : [
-      `- Review scope: ${review.convergence.reviewScope === 'delta' ? `delta since the last reviewed SHA${review.convergence.deltaUnavailable !== undefined ? ` (delta UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}` : 'whole change (standing authority)'}`,
+      `- Review scope: ${review.convergence.reviewScope === 'integration'
+        ? `integration review — prior coverage retained for the unchanged feature work; the review unit is the new integration/conflict-resolution work${review.convergence.integrationFromSha !== undefined ? ` since ${review.convergence.integrationFromSha}` : ''} integrated with base ${review.convergence.integrationBaseSha ?? review.convergence.deltaFromSha ?? 'n/a'}${review.convergence.deltaUnavailable !== undefined ? ` (integration unit UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}`
+        : review.convergence.reviewScope === 'delta'
+          ? `delta since the last reviewed SHA${review.convergence.deltaUnavailable !== undefined ? ` (delta UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}`
+          : 'whole change (standing authority)'}`,
+      ...(review.convergence.scopeReason !== undefined ? [`- Review scope reason: ${review.convergence.scopeReason}`] : []),
+      ...(review.convergence.integrationFromSha !== undefined
+        ? [`- Integration provenance: prior covered head ${review.convergence.integrationFromSha} -> incoming base ${review.convergence.integrationBaseSha ?? 'n/a'} -> verdict head ${review.targetSha}${review.convergence.integrationDeltaSha256 !== undefined ? ` (integration unit sha256 ${review.convergence.integrationDeltaSha256})` : ''}`]
+        : []),
       ...(review.convergence.carriedPriors !== undefined && review.convergence.carriedPriors.length > 0
         ? [`- Prior findings carried forward without re-verification: ${review.convergence.carriedPriors.length} (quoted evidence unchanged, cited file untouched)`]
         : []),
@@ -4913,6 +4928,41 @@ export class WaveRunner {
             ...(sha256 !== undefined ? { sha256 } : {}) };
         });
       }
+      // Stage-5 convergence (issue #225) + integration coverage: the scope is
+      // planned from the prior round's durable convergence record and the
+      // repo's own ancestry, never from wall-clock heuristics. Integration
+      // coverage is retained only when the prior record is conclusive, the
+      // base only ADVANCED, the reviewed feature head INTEGRATED FORWARD,
+      // the two share exactly the pinned prior base, and the effective
+      // acceptance is unchanged — otherwise the round reviews whole (with a
+      // durable reason).
+      const priorMeta = priorConsolidatedFile !== undefined && newestPredecessor !== undefined
+        ? readPriorConvergenceMeta(priorConsolidatedFile, newestPredecessor.seq)
+        : null;
+      const currentAcceptance = frozenReview.manifest.acceptance;
+      const priorAcceptance = priorMeta?.acceptance ?? null;
+      const acceptanceCompatible = currentAcceptance === undefined
+        ? priorAcceptance === null
+        : priorAcceptance !== null && priorAcceptance.version === currentAcceptance.version &&
+          priorAcceptance.contractSha256 === currentAcceptance.contractSha256;
+      const integrationLineage = priorMeta !== null && priorMeta.diffBaseSha !== frozenReview.manifest.diffBaseSha
+        ? probeIntegrationLineage(frozenReview.manifest.repoPath, {
+            priorDiffBaseSha: priorMeta.diffBaseSha,
+            priorTargetSha: priorMeta.targetSha,
+            currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
+            currentTargetSha: frozenReview.manifest.targetSha,
+          })
+        : null;
+      const scopePlan = planReviewScope({
+        prior: priorMeta,
+        currentTargetSha: frozenReview.manifest.targetSha,
+        currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
+        deltaRoundsFrom: policy.portableContract.rules.convergence.deltaRoundsFrom,
+        finalWholePassAtReady: policy.portableContract.rules.convergence.finalWholePassAtReady,
+        integrationCoverage: policy.portableContract.rules.convergence.integrationCoverage,
+        integrationLineage,
+        acceptanceCompatible,
+      });
       review = await workflow.run({
         roundId: round.id,
         ...(recoveryDirectory !== undefined ? { recoveryDirectory, recoveryStarts, recoverySources } : {}),
@@ -4923,19 +4973,8 @@ export class WaveRunner {
         signal,
         ...(recoveredBaseTips.length > 0 && candidates.length > 0 ? { recoveredBaseTips } : {}),
         ...(priorConsolidatedFile !== undefined ? { priorConsolidatedFile } : {}),
-        // Stage-5 convergence (issue #225): every round after a prior is a
-        // delta round, except the final whole-change pass at a READY
-        // candidate. The scope is planned from the prior round's durable
-        // convergence record, never from wall-clock heuristics.
-        reviewScope: nextReviewScope({
-          prior: priorConsolidatedFile !== undefined && newestPredecessor !== undefined
-            ? readPriorConvergenceMeta(priorConsolidatedFile, newestPredecessor.seq)
-            : null,
-          currentTargetSha: frozenReview.manifest.targetSha,
-          currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
-          deltaRoundsFrom: policy.portableContract.rules.convergence.deltaRoundsFrom,
-          finalWholePassAtReady: policy.portableContract.rules.convergence.finalWholePassAtReady,
-        }),
+        reviewScope: scopePlan.scope,
+        reviewScopeReason: scopePlan.reason,
         ...(claimedFixedPriors !== undefined ? { claimedFixedPriors } : {}),
       });
     } catch (error) {
@@ -5368,6 +5407,11 @@ export class WaveRunner {
           complete: canonical !== 'INCOMPLETE' && !headMoved,
           ...(review.convergence !== undefined ? {
             reviewScope: review.convergence.reviewScope,
+            ...(review.convergence.scopeReason !== undefined ? { scopeReason: review.convergence.scopeReason } : {}),
+            ...(review.convergence.integrationFromSha !== undefined ? { integrationFromSha: review.convergence.integrationFromSha } : {}),
+            ...(review.convergence.integrationBaseSha !== undefined ? { integrationBaseSha: review.convergence.integrationBaseSha } : {}),
+            ...(review.convergence.integrationAutoMergeTree !== undefined ? { integrationAutoMergeTree: review.convergence.integrationAutoMergeTree } : {}),
+            ...(review.convergence.integrationDeltaSha256 !== undefined ? { integrationDeltaSha256: review.convergence.integrationDeltaSha256 } : {}),
             ...(review.convergence.carriedPriors !== undefined ? { carriedPriors: review.convergence.carriedPriors.length } : {}),
             ...(review.convergence.carriedLenses !== undefined ? { carriedLenses: review.convergence.carriedLenses } : {}),
             ...(review.convergence.deferredFollowups !== undefined ? { deferredFollowups: review.convergence.deferredFollowups.length } : {}),

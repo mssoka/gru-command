@@ -8,7 +8,9 @@ import {
   convergedVerdict,
   deltaSince,
   findingIntersectsDelta,
-  nextReviewScope,
+  integrationSince,
+  planReviewScope,
+  probeIntegrationLineage,
   parseDeltaHunks,
   parseFindingLocation,
   parseDeltaStructure,
@@ -273,6 +275,91 @@ describe('deltaSince (bounded git delta)', () => {
   });
 });
 
+describe('integration unit (retained coverage across an advanced base)', () => {
+  it('reads only the new integration/conflict-resolution work, never incoming base or unchanged feature files', () => {
+    const repo = makeFixtureRepo('perkins-integration-unit');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    repo.git(['checkout', '-b', 'feature/integration']);
+    repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    const h0 = repo.commitFile('src/shared.ts', 'export const shared = "feature";\n');
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/mainonly.ts', 'export const mainonly = 1;\n');
+    const b1 = repo.commitFile('src/shared.ts', 'export const shared = "main";\n');
+    repo.git(['checkout', 'feature/integration']);
+    expect(() => repo.git(['merge', 'main'])).toThrow(); // conflict on src/shared.ts
+    writeFileSync(join(repo.path, 'src', 'shared.ts'), 'export const shared = "resolved";\n');
+    repo.git(['add', 'src/shared.ts']);
+    repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'resolve shared']);
+    const h1 = repo.head();
+
+    const unit = integrationSince(repo.path, h0, b1, h1);
+    expect(unit.priorTargetSha).toBe(h0);
+    expect(unit.incomingBaseSha).toBe(b1);
+    expect(unit.autoMergeTreeSha).toMatch(/^[0-9a-f]{40}$/u);
+    // Only the manual resolution: the feature-only file is unchanged and the
+    // main-only file is baseline context, never new PR work.
+    expect(unit.touchedPaths).toEqual(new Set(['src/shared.ts']));
+    expect(unit.diff).toContain('src/shared.ts');
+    expect(unit.diff).not.toContain('mainonly');
+    expect(unit.diff).not.toContain('feature.ts');
+  });
+
+  it('is empty for a clean integration of unchanged feature work', () => {
+    const repo = makeFixtureRepo('perkins-integration-clean');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/clean']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/mainonly.ts', 'export const mainonly = 1;\n');
+    const b1 = repo.head();
+    repo.git(['checkout', 'feature/clean']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    const h1 = repo.head();
+
+    const unit = integrationSince(repo.path, h0, b1, h1);
+    expect(unit.touchedPaths).toEqual(new Set());
+    expect(unit.diff).toBe('');
+    // A base-only advance with unchanged feature work is a clean integration.
+    expect(probeIntegrationLineage(repo.path, {
+      priorDiffBaseSha: b0, priorTargetSha: h0, currentDiffBaseSha: b1, currentTargetSha: h1,
+    })).toEqual({ baseAdvanced: true, featureIntegrated: true, commonBasePinned: true });
+  });
+
+  it('proves the forward-integration lineage and fails closed on a rewrite or rebase', () => {
+    const repo = makeFixtureRepo('perkins-integration-lineage');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/lineage']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    repo.git(['checkout', 'main']);
+    const b1 = repo.commitFile('src/mainonly.ts', 'export const mainonly = 1;\n');
+    repo.git(['checkout', '-b', 'sibling', b0]);
+    const sibling = repo.commitFile('src/sibling.ts', 'export const sibling = 1;\n');
+    repo.git(['checkout', 'feature/lineage']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    const h1 = repo.head();
+
+    expect(probeIntegrationLineage(repo.path, {
+      priorDiffBaseSha: b0, priorTargetSha: h0, currentDiffBaseSha: b1, currentTargetSha: h1,
+    })).toEqual({ baseAdvanced: true, featureIntegrated: true, commonBasePinned: true });
+    // A prior head that was NOT integrated forward cannot retain coverage.
+    expect(probeIntegrationLineage(repo.path, {
+      priorDiffBaseSha: b0, priorTargetSha: sibling, currentDiffBaseSha: b1, currentTargetSha: h1,
+    })).toEqual({ baseAdvanced: true, featureIntegrated: false, commonBasePinned: false });
+    // A malformed SHA can never establish lineage.
+    expect(probeIntegrationLineage(repo.path, {
+      priorDiffBaseSha: 'main', priorTargetSha: h0, currentDiffBaseSha: b1, currentTargetSha: h1,
+    })).toBeNull();
+  });
+});
+
 describe('prior carry-forward classification', () => {
   const priorFinding: VerifiedFinding = {
     source: 'lead',
@@ -378,15 +465,16 @@ describe('convergence partition and verdict mapping', () => {
 describe('review scope planning (final whole pass at a READY candidate)', () => {
   const TARGET = 'a'.repeat(40);
   const BASE = 'd'.repeat(40);
-  const meta = (overrides: Partial<{ seq: number; reviewScope: 'whole' | 'delta' | 'unknown'; canonicalVerdict: string; targetSha: string; diffBaseSha: string }> = {}) => ({
+  const meta = (overrides: Partial<{ seq: number; reviewScope: 'whole' | 'delta' | 'integration' | 'unknown'; canonicalVerdict: string; targetSha: string; diffBaseSha: string }> = {}) => ({
     seq: 1,
     reviewScope: 'delta' as const,
     canonicalVerdict: 'NEEDS CHANGES',
     targetSha: TARGET,
     diffBaseSha: BASE,
+    acceptance: null,
     ...overrides,
   });
-  const scope = (prior: ReturnType<typeof meta> | null, overrides: Partial<{ currentTargetSha: string; currentDiffBaseSha: string; finalWholePassAtReady: boolean }> = {}) => nextReviewScope({
+  const scope = (prior: ReturnType<typeof meta> | null, overrides: Partial<{ currentTargetSha: string; currentDiffBaseSha: string; finalWholePassAtReady: boolean; integrationLineage: { baseAdvanced: boolean; featureIntegrated: boolean; commonBasePinned: boolean } | null; integrationCoverage: boolean; acceptanceCompatible: boolean }> = {}) => planReviewScope({
     prior,
     currentTargetSha: TARGET,
     currentDiffBaseSha: BASE,
@@ -396,37 +484,69 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
   });
 
   it('plans whole for a job with no prior and delta for a moved-target round after a prior', () => {
-    expect(scope(null)).toBe('whole');
+    expect(scope(null).scope).toBe('whole');
     // The normal fix-then-review case: target advanced, base unchanged.
-    expect(scope(meta(), { currentTargetSha: 'c'.repeat(40) })).toBe('delta');
-    expect(scope(meta({ reviewScope: 'whole', canonicalVerdict: 'READY TO MERGE' }), { currentTargetSha: 'c'.repeat(40) })).toBe('delta');
+    expect(scope(meta(), { currentTargetSha: 'c'.repeat(40) }).scope).toBe('delta');
+    expect(scope(meta({ reviewScope: 'whole', canonicalVerdict: 'READY TO MERGE' }), { currentTargetSha: 'c'.repeat(40) }).scope).toBe('delta');
   });
 
-  it('plans whole when nothing changed (same candidate) or the base moved', () => {
+  it('plans whole when nothing changed (same candidate) or the base moved without proven integration lineage', () => {
     // Same head + same base: there is no delta to review; a re-request is
     // a whole-change re-review.
-    expect(scope(meta())).toBe('whole');
-    // A moved merge base changes the review CONTEXT even at one target.
-    expect(scope(meta(), { currentDiffBaseSha: 'e'.repeat(40) })).toBe('whole');
+    expect(scope(meta()).scope).toBe('whole');
+    // A moved merge base with no integration lineage stays whole and says why.
+    const fallback = scope(meta(), { currentDiffBaseSha: 'e'.repeat(40), integrationCoverage: true });
+    expect(fallback.scope).toBe('whole');
+    expect(fallback.reason).toContain('integration lineage could not be established');
+  });
+
+  it('retains coverage for a forward-integrated candidate and reviews the integration unit', () => {
+    const integrated = scope(meta({ reviewScope: 'whole', canonicalVerdict: 'READY TO MERGE' }), {
+      currentDiffBaseSha: 'e'.repeat(40),
+      integrationCoverage: true,
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true },
+    });
+    expect(integrated.scope).toBe('integration');
+    expect(integrated.reason).toContain('prior coverage retained');
+  });
+
+  it('falls back to whole when integration coverage is unsafe', () => {
+    const baseMoved = { currentDiffBaseSha: 'e'.repeat(40) } as const;
+    // Rebased/rewritten feature head: the prior target is not an ancestor.
+    expect(scope(meta(), { ...baseMoved, integrationCoverage: true,
+      integrationLineage: { baseAdvanced: true, featureIntegrated: false, commonBasePinned: true } }).scope).toBe('whole');
+    // Rewritten base: B0 no longer descends into B1.
+    expect(scope(meta(), { ...baseMoved, integrationCoverage: true,
+      integrationLineage: { baseAdvanced: false, featureIntegrated: true, commonBasePinned: true } }).scope).toBe('whole');
+    // One side already contains the other: the pinned prior base is not shared.
+    expect(scope(meta(), { ...baseMoved, integrationCoverage: true,
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: false } }).scope).toBe('whole');
+    // Policy off.
+    expect(scope(meta(), { ...baseMoved, integrationCoverage: false }).scope).toBe('whole');
+    // The effective acceptance changed since the retained round.
+    const acceptance = scope(meta(), { ...baseMoved, integrationCoverage: true, acceptanceCompatible: false,
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true } });
+    expect(acceptance.scope).toBe('whole');
+    expect(acceptance.reason).toContain('effective acceptance changed');
   });
 
   it('plans the final whole pass exactly when a delta round posted READY', () => {
-    expect(scope(meta({ canonicalVerdict: 'READY TO MERGE' }), { currentTargetSha: 'c'.repeat(40) })).toBe('whole');
-    expect(nextReviewScope({
+    expect(scope(meta({ canonicalVerdict: 'READY TO MERGE' }), { currentTargetSha: 'c'.repeat(40) }).scope).toBe('whole');
+    expect(planReviewScope({
       prior: meta({ canonicalVerdict: 'READY TO MERGE' }),
       currentTargetSha: TARGET,
       currentDiffBaseSha: BASE,
       deltaRoundsFrom: 2,
       finalWholePassAtReady: false,
-    })).toBe('whole'); // same candidate still re-reviews whole; the flag only governs the moved-target case
+    }).scope).toBe('whole'); // same candidate still re-reviews whole; the flag only governs the moved-target case
     // A legacy (pre-Stage-5) prior record never triggers the final pass.
-    expect(nextReviewScope({
+    expect(planReviewScope({
       prior: meta({ reviewScope: 'unknown', canonicalVerdict: 'READY TO MERGE' }),
       currentTargetSha: 'c'.repeat(40),
       currentDiffBaseSha: BASE,
       deltaRoundsFrom: 2,
       finalWholePassAtReady: true,
-    })).toBe('delta');
+    }).scope).toBe('delta');
   });
 });
 
@@ -445,10 +565,32 @@ describe('prior convergence meta read (tolerant)', () => {
     };
     writeFileSync(file, JSON.stringify(modern));
     expect(readPriorConvergenceMeta(file, 4)).toEqual({
-      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40),
+      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null,
     });
     writeFileSync(file, JSON.stringify({ ...modern, convergence: undefined }));
     expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('unknown');
+  });
+
+  it('reads an integration record only when its immutable linkage is intact', () => {
+    const root = temp('perkins-meta-integration-');
+    const file = join(root, 'consolidated.json');
+    const integrated = {
+      schemaVersion: 3,
+      architecture: 'perkins-whole-pr',
+      canonicalVerdict: 'READY TO MERGE',
+      complete: true,
+      headMoved: false,
+      frozen: { targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40) },
+      convergence: {
+        reviewScope: 'integration', integrationFromSha: 'a'.repeat(40),
+        integrationBaseSha: 'd'.repeat(40), integrationAutoMergeTree: 'e'.repeat(40),
+      },
+    };
+    writeFileSync(file, JSON.stringify(integrated));
+    expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('integration');
+    // A damaged linkage is not inherited coverage: it reads as no record.
+    writeFileSync(file, JSON.stringify({ ...integrated, convergence: { reviewScope: 'integration', integrationFromSha: 'a'.repeat(40) } }));
+    expect(readPriorConvergenceMeta(file, 4)).toBeNull();
   });
 
   it('returns null for INCOMPLETE, incomplete, or damaged records', () => {
@@ -478,6 +620,7 @@ describe('bundled policy carries the Stage-5 convergence rules with unchanged bu
       convergenceRuleFromRound: 3,
       finalWholePassAtReady: true,
       carryForwardUntouchedPriors: true,
+      integrationCoverage: true,
     });
     // Budgets unchanged: the convergence policy adds no attempts, lenses,
     // terminal submissions or specialist runs.
@@ -488,6 +631,7 @@ describe('bundled policy carries the Stage-5 convergence rules with unchanged bu
     expect(policy.portableContract.leadWorkflow).toContain('CARRIED FORWARD');
     expect(policy.portableContract.leadWorkflow).toContain('CONVERGENCE RULE');
     expect(policy.portableContract.leadWorkflow).toContain('FINAL WHOLE PASS');
+    expect(policy.portableContract.leadWorkflow).toContain('INTEGRATION ROUND');
   });
 });
 
