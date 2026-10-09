@@ -365,6 +365,31 @@ describe('integration unit (retained coverage across an advanced base)', () => {
     expect(h0b).toMatch(/^[0-9a-f]{40}$/u);
   });
 
+  it('flags a resolution that discarded prior feature work', () => {
+    const repo = makeFixtureRepo('perkins-integration-dropped');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/dropped']);
+    const h0 = repo.commitFile('src/shared.ts', 'export const shared = "feature";\n');
+    repo.git(['checkout', 'main']);
+    const b1 = repo.commitFile('src/shared.ts', 'export const shared = "main";\n');
+    repo.git(['checkout', 'feature/dropped']);
+    expect(() => repo.git(['merge', 'main'])).toThrow();
+    // Resolution takes the incoming base verbatim: the feature change is dropped.
+    writeFileSync(join(repo.path, 'src', 'shared.ts'), 'export const shared = "main";\n');
+    repo.git(['add', 'src/shared.ts']);
+    repo.git(['commit', '-m', 'resolve shared (take main)']);
+    const h1 = repo.head();
+
+    const unit = integrationSince(repo.path, h0, b0, b1, h1);
+    expect(unit.integrationPaths).toEqual([]);
+    expect(unit.diff).toBe('');
+    expect(unit.droppedFeaturePaths).toEqual(['src/shared.ts']);
+    expect(unit.carryPaths.has('src/shared.ts')).toBe(true);
+  });
+
   it('refuses non-SHA endpoints and an unreadable revision', () => {
     const repo = makeFixtureRepo('perkins-integration-bad');
     repos.push(repo);
@@ -458,10 +483,26 @@ describe('production scope planning wiring (planPerkinsReviewScope)', () => {
     const mismatched = planPerkinsReviewScope({
       priorConsolidatedFile: priorFile, priorSeq: 1, repoPath: repo.path,
       currentTargetSha: h1, currentDiffBaseSha: b1,
-      currentAcceptance: { version: 1, contractSha256: 'a'.repeat(64) }, rules,
+      currentAcceptance: { version: 1, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] }, rules,
     });
     expect(mismatched.scope).toBe('whole');
     expect(mismatched.reason).toContain('acceptance');
+
+    // A changed briefing hash (baseSha256) or amendment set also revokes
+    // retained coverage even when the contract-prefix hash is identical.
+    const priorWithAcceptance = join(root, 'prior-acceptance.json');
+    writeFileSync(priorWithAcceptance, JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: h0, diffBaseSha: b0, acceptance: { version: 1, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] } },
+      convergence: { reviewScope: 'whole', coverageComplete: true },
+    }));
+    const amendmentMismatch = planPerkinsReviewScope({
+      priorConsolidatedFile: priorWithAcceptance, priorSeq: 1, repoPath: repo.path,
+      currentTargetSha: h1, currentDiffBaseSha: b1,
+      currentAcceptance: { version: 1, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: ['am1'] }, rules,
+    });
+    expect(amendmentMismatch.scope).toBe('whole');
+    expect(amendmentMismatch.reason).toContain('acceptance');
 
     // A prior file that is present but not a conclusive whole-PR record is
     // disclosed as such, never mislabelled as the job's first review.
@@ -752,12 +793,22 @@ describe('prior convergence meta read (tolerant)', () => {
       ...base, frozen: { ...base.frozen, acceptance: { version: 2, contractSha256: 'a'.repeat(64) } },
     }));
     expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    // Each distinct malformed clause fails closed: non-hex baseSha256, a
+    // non-string amendmentIds member, and a non-integer version.
+    for (const acceptance of [
+      { version: 2, baseSha256: 'xyz', contractSha256: 'a'.repeat(64), amendmentIds: [] },
+      { version: 2, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [1] },
+      { version: 1.5, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] },
+    ]) {
+      writeFileSync(file, JSON.stringify({ ...base, frozen: { ...base.frozen, acceptance } }));
+      expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    }
     // A present, FULLY VALID binding parses and preserves the coverage bit.
     writeFileSync(file, JSON.stringify({
       ...base, frozen: { ...base.frozen, acceptance: { version: 2, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] } },
     }));
     const meta = readPriorConvergenceMeta(file, 4);
-    expect(meta?.acceptance).toEqual({ version: 2, contractSha256: 'a'.repeat(64) });
+    expect(meta?.acceptance).toEqual({ version: 2, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] });
     expect(meta?.coverageComplete).toBe(true);
   });
 

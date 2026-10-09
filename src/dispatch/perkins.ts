@@ -274,6 +274,7 @@ export function hostDisclosureAppendix(
       readonly carriedPriors?: readonly number[];
       readonly deferredFollowups?: readonly { readonly title: string; readonly location: string; readonly severity: string }[];
       readonly verdictRecomputed?: { readonly from: string; readonly to: string };
+      readonly finalPassRequired?: true;
     };
   },
   provider: PublicationProviderKind,
@@ -371,6 +372,9 @@ export function hostDisclosureAppendix(
           ? `delta since the last reviewed SHA${review.convergence.deltaUnavailable !== undefined ? ` (delta UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}`
           : 'whole change (standing authority)'}`,
       ...(review.convergence.scopeReason !== undefined ? [`- Review scope reason: ${review.convergence.scopeReason}`] : []),
+      ...(review.convergence.finalPassRequired === true
+        ? ['- Final whole-change pass: STILL OWED — this round did not cover the whole candidate, so a later whole-scope pass must close at this target before the change is merge-ready']
+        : []),
       ...(review.convergence.integrationFromSha !== undefined
         ? [`- Integration provenance: prior covered head ${review.convergence.integrationFromSha} -> incoming base ${review.convergence.integrationBaseSha ?? 'n/a'} -> verdict head ${review.targetSha}${review.convergence.integrationDeltaSha256 !== undefined ? ` (integration unit sha256 ${review.convergence.integrationDeltaSha256})` : ''}`]
         : []),

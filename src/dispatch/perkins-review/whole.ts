@@ -245,6 +245,10 @@ export interface ReviewConvergence {
   readonly integrationPriorDiffBase?: string;
   /** sha256 of the persisted `integration-delta.patch` review unit. */
   readonly integrationDeltaSha256?: string;
+  /** Integration scope only: prior feature changes the integration discarded
+   * (the candidate now matches its base), so the whole-candidate authority is
+   * still owed and the review cannot certify the integration. */
+  readonly integrationDroppedPaths?: readonly string[];
   /** Prior indexes carried forward without lead re-verification. */
   readonly carriedPriors?: readonly number[];
   /** Prior indexes the lead had to disposition. */
@@ -1151,11 +1155,13 @@ export class PerkinsWholeReview {
     let deltaUnavailable: string | null = null;
     let integrationLinkage: { readonly priorTargetSha: string; readonly priorDiffBaseSha: string; readonly incomingBaseSha: string; readonly sha256: string } | null = null;
     let integrationCarryPaths: ReadonlySet<string> | null = null;
+    let integrationDroppedPaths: readonly string[] = [];
     if (reviewScope === 'delta') {
       try {
         delta = deltaSince(review.manifest.repoPath, priorReview.targetSha!, review.manifest.targetSha);
       } catch (error) {
         deltaUnavailable = sanitizeError(error);
+        scopeReason = `delta scope planned but the delta since the prior reviewed head could not be prepared (${deltaUnavailable}) — whole-change re-verification`;
       }
     } else if (reviewScope === 'integration') {
       try {
@@ -1177,6 +1183,7 @@ export class PerkinsWholeReview {
         );
         delta = integration;
         integrationCarryPaths = integration.carryPaths;
+        integrationDroppedPaths = integration.droppedFeaturePaths;
         const deltaSha256 = createHash('sha256').update(integration.diff, 'utf8').digest('hex');
         // Persist the exact reviewed unit so a stranger can distinguish the
         // newly reviewed integration work from retained coverage.
@@ -1198,6 +1205,7 @@ export class PerkinsWholeReview {
         reviewScope = 'whole';
         delta = null;
         integrationCarryPaths = null;
+        integrationDroppedPaths = [];
         integrationLinkage = null;
       }
     }
@@ -2432,7 +2440,7 @@ export class PerkinsWholeReview {
           // round never does. A round that ended INCOMPLETE or on a moved
           // head certifies nothing.
           const coversWhole = reviewScope === 'whole' ||
-            (reviewScope === 'integration' && priorCoveredWhole);
+            (reviewScope === 'integration' && priorCoveredWhole && integrationDroppedPaths.length === 0);
           const convergence: ReviewConvergence = {
             reviewScope,
             ...(scopeReason !== null ? { scopeReason } : {}),
@@ -2443,6 +2451,7 @@ export class PerkinsWholeReview {
               integrationBaseSha: integrationLinkage.incomingBaseSha,
               integrationPriorDiffBase: integrationLinkage.priorDiffBaseSha,
               integrationDeltaSha256: integrationLinkage.sha256,
+              ...(integrationDroppedPaths.length > 0 ? { integrationDroppedPaths } : {}),
             } : {}),
             ...(carriedPriors.length > 0 ? { carriedPriors: carriedPriors.map((classification) => classification.priorIndex).sort((left, right) => left - right) } : {}),
             ...(carriesForward ? { reverifyPriors: reverifyPriors.map((classification) => classification.priorIndex).sort((left, right) => left - right) } : {}),
@@ -2582,7 +2591,9 @@ export class PerkinsWholeReview {
         `Incoming base: ${review.manifest.diffBaseSha}`,
         `Touched paths (${delta.touchedPaths.size}): ${[...delta.touchedPaths].sort().join(', ')}`,
         'Everything below is part of the complete frozen diff; this is the subset this integration round reviews first. Unchanged incoming base code is baseline context, not new PR work; the delta convergence rule does not apply.',
-        delta.diff === '' ? '(clean integration: no conflict-resolution or new feature change)' : delta.diff,
+        delta.diff === '' ? (integrationDroppedPaths.length > 0
+          ? '(the integration unit is empty, but a resolution discarded prior reviewed feature work; the whole-change pass is still owed)'
+          : '(the integration unit is empty: no candidate change differs from the prior frozen diff)') : delta.diff,
       ].join('\n')
       : [
         '--- DELTA SINCE LAST REVIEWED SHA (this round\'s review unit) ---',
@@ -2599,6 +2610,7 @@ export class PerkinsWholeReview {
       integrationBaseSha: review.manifest.diffBaseSha,
       integrationPriorBaseSha: integrationLinkage?.priorDiffBaseSha ?? null,
       priorCoverageComplete: priorCoveredWhole,
+      integrationDroppedPaths,
       carriedPriors,
       reverifyPriors,
       carriedLenses: carriedLensCandidates,
@@ -2989,6 +3001,7 @@ export class PerkinsWholeReview {
       readonly integrationBaseSha?: string | null;
       readonly integrationPriorBaseSha?: string | null;
       readonly priorCoverageComplete?: boolean;
+      readonly integrationDroppedPaths?: readonly string[];
       readonly carriedPriors: readonly PriorCarryClassification[];
       readonly reverifyPriors: readonly PriorCarryClassification[];
       readonly carriedLenses: readonly PerkinsLens[];
@@ -3040,7 +3053,9 @@ export class PerkinsWholeReview {
         `Incoming base (this round's frozen diff base): ${plan.integrationBaseSha ?? review.manifest.diffBaseSha}`,
         `Unit paths (${plan.delta.touchedPaths.size}): ${[...plan.delta.touchedPaths].sort().join(', ') || 'none'}`,
         'This unit is exactly the part of the new whole diff (`base..target`) whose per-path content differs from the prior covered round: unchanged feature work (identical per-path diff) and incoming-base-only files (absent from the new whole diff) are NOT in it, while manual conflict resolutions, new feature edits and files BOTH sides changed ARE. The complete frozen diff above is still your review context; use it to judge the integration boundary. The delta convergence rule does NOT apply — any finding you ground can hold the PR wherever its evidence lies.',
-        plan.delta.diff === '' ? '(no conflict-resolution or new feature change: the integration was clean and the retained coverage stands)' : plan.delta.diff,
+        plan.delta.diff === '' ? ((plan.integrationDroppedPaths?.length ?? 0) > 0
+          ? `(the integration unit is empty, but ${plan.integrationDroppedPaths!.length} prior feature change(s) no longer differ from the incoming base — a resolution discarded reviewed work, so the whole-change pass is still owed)`
+          : '(the integration unit is empty: no candidate change differs from the prior frozen diff, so the retained coverage stands)') : plan.delta.diff,
       ].join('\n')
       : '';
     const deltaSection = plan.delta === null

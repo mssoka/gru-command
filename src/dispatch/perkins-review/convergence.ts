@@ -311,10 +311,10 @@ export function parseDeltaHunks(diff: string): readonly DeltaHunk[] {
   return parseDeltaStructure(diff).hunks;
 }
 
-/** Read one bounded `git diff` and parse it into delta structure. Shared by
- * the commit-to-commit delta and the integration unit (which is assembled
- * from explicit paths via `diffForPaths`). Throws when git cannot produce
- * the diff. */
+/** Read one bounded `git diff` and parse it into delta structure. Used by
+ * the commit-to-commit delta; the integration unit reads its bytes through
+ * `diffForPaths`, which mirrors the same spawn, byte bound and timeout.
+ * Throws when git cannot produce the diff. */
 function boundedDelta(repoPath: string, fromSha: string, toSha: string, label: string): DeltaSince {
   let diff: string;
   try {
@@ -365,6 +365,11 @@ export interface IntegrationDelta extends DeltaSince {
   readonly integrationPaths: readonly string[];
   /** Paths whose content or mode changed between H0 and H1 (carry scope). */
   readonly carryPaths: ReadonlySet<string>;
+  /** Paths the PRIOR round changed that the current candidate no longer
+   * differs from its base on: a resolution discarded the reviewed feature
+   * change. Nothing textual remains to diff, but the review must still owe
+   * the whole-candidate authority rather than certify it. */
+  readonly droppedFeaturePaths: readonly string[];
 }
 
 interface RawChange {
@@ -379,13 +384,22 @@ interface RawChange {
  * decoding; a path that does not decode as UTF-8 refuses (the caller falls
  * back to a whole review). Modes are kept so a mode-only change is not lost. */
 function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<string, RawChange> {
-  let output: string;
+  let bytes: Buffer;
   try {
-    output = execFileSync('git', ['-C', repoPath, 'diff', '--raw', '-z', '--no-ext-diff', '--no-renames', '--abbrev=40', fromSha, toSha, '--'], {
-      encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 16 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
-    });
+    bytes = execFileSync('git', ['-C', repoPath, 'diff', '--raw', '-z', '--no-ext-diff', '--no-renames', '--abbrev=40', fromSha, toSha, '--'], {
+      env: repositoryGitEnv(false), maxBuffer: 16 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+    }) as Buffer;
   } catch (error) {
     throw new Error(`change set ${fromSha.slice(0, 12)}..${toSha.slice(0, 12)} could not be read: ${String(error)}`);
+  }
+  // Paths are raw bytes: decode strictly so an invalid UTF-8 path fails
+  // closed instead of being silently mangled into a path that matches
+  // nothing. A legitimate U+FFFD is valid UTF-8 and is preserved.
+  let output: string;
+  try {
+    output = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error('a changed path is not valid UTF-8');
   }
   const changes = new Map<string, RawChange>();
   const fields = output.split('\0');
@@ -398,9 +412,9 @@ function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<strin
     // shrink the reviewed unit and the carry scope.
     if (match === null) throw new Error('git diff --raw produced an unparseable record');
     const path = fields[index + 1];
-    if (path === undefined || path === '') continue;
+    // A missing/empty path field is the same fail-open class: refuse it.
+    if (path === undefined || path === '') throw new Error('git diff --raw produced a record with no path');
     index += 1;
-    if (path.includes('\uFFFD')) throw new Error('a changed path is not valid UTF-8');
     changes.set(path, { oldMode: match[1]!, newMode: match[2]!, oldSha: match[3]!, newSha: match[4]! });
   }
   return changes;
@@ -453,10 +467,13 @@ export function integrationSince(
   }
   const diff = diffForPaths(repoPath, incomingBaseSha, currentTargetSha, integrationPaths);
   const { hunks, paths } = parseDeltaStructure(diff);
+  // Paths the prior round changed that the candidate now matches its base on:
+  // a resolution discarded the reviewed feature change.
+  const droppedFeaturePaths = [...prior.keys()].filter((path) => !now.has(path)).sort();
   return {
     fromSha: incomingBaseSha, toSha: currentTargetSha, diff, hunks,
     touchedPaths: new Set([...paths, ...hunks.map((hunk) => hunk.path)]),
-    priorTargetSha, priorDiffBaseSha, incomingBaseSha, integrationPaths,
+    priorTargetSha, priorDiffBaseSha, incomingBaseSha, integrationPaths, droppedFeaturePaths,
     carryPaths: new Set(rawChanges(repoPath, priorTargetSha, currentTargetSha).keys()),
   };
 }
@@ -715,8 +732,13 @@ export interface PriorConvergenceMeta {
   readonly targetSha: string;
   readonly diffBaseSha: string;
   /** The prior round's bound acceptance (null when none was recorded):
-   * retained coverage only applies while the effective acceptance matches. */
-  readonly acceptance: { readonly version: number; readonly contractSha256: string } | null;
+   * retained coverage only applies while the WHOLE binding matches. */
+  readonly acceptance: {
+    readonly version: number;
+    readonly baseSha256: string;
+    readonly contractSha256: string;
+    readonly amendmentIds: readonly string[];
+  } | null;
   /** The prior round's durable whole-candidate coverage bit (false for a
    * partial delta/integration round or a legacy record without the field). */
   readonly coverageComplete: boolean;
@@ -778,7 +800,12 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
     }
     const acceptance = rawAcceptance === null || rawAcceptance === undefined
       ? null
-      : { version: rawAcceptance.version as number, contractSha256: rawAcceptance.contractSha256 as string };
+      : {
+          version: rawAcceptance.version as number,
+          baseSha256: rawAcceptance.baseSha256 as string,
+          contractSha256: rawAcceptance.contractSha256 as string,
+          amendmentIds: [...(rawAcceptance.amendmentIds as string[])],
+        };
     // A record with NO convergence block predates Stage 5: it was a
     // whole-change review, so its coverage is whole-complete by construction.
     const legacyWhole = parsed.convergence === undefined;
@@ -808,7 +835,7 @@ export function planPerkinsReviewScope(input: {
   readonly repoPath: string;
   readonly currentTargetSha: string;
   readonly currentDiffBaseSha: string;
-  readonly currentAcceptance: { readonly version: number; readonly contractSha256: string } | undefined;
+  readonly currentAcceptance: { readonly version: number; readonly baseSha256: string; readonly contractSha256: string; readonly amendmentIds: readonly string[] } | undefined;
   readonly rules: {
     readonly deltaRoundsFrom: number;
     readonly finalWholePassAtReady: boolean;
@@ -829,7 +856,9 @@ export function planPerkinsReviewScope(input: {
   const acceptanceCompatible = input.currentAcceptance === undefined
     ? priorAcceptance === null
     : priorAcceptance !== null && priorAcceptance.version === input.currentAcceptance.version &&
-      priorAcceptance.contractSha256 === input.currentAcceptance.contractSha256;
+      priorAcceptance.baseSha256 === input.currentAcceptance.baseSha256 &&
+      priorAcceptance.contractSha256 === input.currentAcceptance.contractSha256 &&
+      priorAcceptance.amendmentIds.join('\0') === [...input.currentAcceptance.amendmentIds].join('\0');
   const integrationLineage = prior !== null && prior.diffBaseSha !== input.currentDiffBaseSha
     ? probeIntegrationLineage(input.repoPath, {
         priorDiffBaseSha: prior.diffBaseSha,

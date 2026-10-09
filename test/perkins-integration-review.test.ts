@@ -110,6 +110,19 @@ function integrateConflict(repo: FixtureRepo): { readonly b1: string; readonly h
   return { b1, h1: repo.head() };
 }
 
+/** The conflict resolution takes the incoming base verbatim, discarding the
+ * feature's change on the shared path. */
+function integrateConflictTakingBase(repo: FixtureRepo): { readonly b1: string; readonly h1: string } {
+  repo.git(['checkout', 'main']);
+  const b1 = repo.commitFile('src/shared.ts', 'export const shared = "main";\n');
+  repo.git(['checkout', 'feature/integration']);
+  expect(() => repo.git(['merge', 'main'])).toThrow();
+  writeFileSync(join(repo.path, 'src', 'shared.ts'), 'export const shared = "main";\n');
+  repo.git(['add', 'src/shared.ts']);
+  repo.git(['commit', '-m', 'resolve shared (take main)']);
+  return { b1, h1: repo.head() };
+}
+
 describe('native integration review retains prior coverage', () => {
   it('reviews the integration work, retains the feature coverage, and does not restart a whole review', async () => {
     const harness = makeEngine({
@@ -140,6 +153,7 @@ describe('native integration review retains prior coverage', () => {
     const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
     expect(prompt).toContain('REVIEW SCOPE: INTEGRATION ROUND');
     expect(prompt).toContain('--- INTEGRATION UNIT (new integration/conflict-resolution work) ---');
+    expect(prompt).toContain('The retained coverage is whole-complete');
     expect(prompt).not.toContain('REVIEW SCOPE: WHOLE CHANGE');
 
     expect(round2.convergence).toMatchObject({
@@ -238,6 +252,7 @@ describe('native integration review retains prior coverage', () => {
     });
     expect(round2.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
     expect(round2.convergence?.coverageComplete).toBeUndefined();
+    expect(harness.leadCalls.at(-1)!.prompt ?? '').toContain('The retained coverage is only partial');
   });
 
   it('never launders a partial-coverage integration record into whole-complete coverage', async () => {
@@ -330,6 +345,7 @@ describe('native integration review retains prior coverage', () => {
     const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
     expect(round2.convergence?.reviewScope).toBe('whole');
     expect(round2.convergence?.deltaUnavailable).toBeDefined();
+    expect(round2.convergence?.scopeReason).toContain('could not be prepared');
     expect(round2.convergence?.scopeReason).toContain('whole-change re-verification');
     expect(prompt).toContain('REVIEW SCOPE: WHOLE CHANGE');
     expect(prompt).not.toContain('--- INTEGRATION UNIT');
@@ -394,5 +410,38 @@ describe('native integration review retains prior coverage', () => {
     const unitPrompts = harness.childCalls.filter((call) => call.prompt?.includes('--- INTEGRATION UNIT'));
     expect(unitPrompts.length).toBeGreaterThan(0);
     expect(unitPrompts.at(-1)!.prompt).toContain('Unchanged incoming base code is baseline context');
+  });
+
+  it('still owes the whole pass when a resolution discarded prior feature work', async () => {
+    const harness = makeEngine({
+      childAnswer: () => '[]',
+      specialists: [],
+      leadFinding: groundedFinding('lead', 'warning', { title: 'shared warning', location: 'src/shared.ts:1', evidence: 'export const shared = "feature";' }),
+    });
+    featureHead(harness.repo, 'src/shared.ts', 'export const shared = "feature";\n');
+    // A second feature file survives the integration, so the frozen whole diff
+    // is non-empty even though the shared path is dropped by the resolution.
+    harness.repo.commitFile('src/keep.ts', 'export const keep = 1;\n');
+    const covered = harness.repo.head();
+    const frozen1 = freeze(harness, 'dp-round-1', covered);
+    const round1 = await runRound(harness, { roundId: 'dp-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    expect(round1.convergence?.coverageComplete).toBe(true);
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'dp-round-1'), 'consolidated.json');
+
+    // The resolution takes main's version: the reviewed feature change is gone.
+    const { h1 } = integrateConflictTakingBase(harness.repo);
+    const frozen2 = freeze(harness, 'dp-round-2', h1);
+    const round2 = await runRound(harness, {
+      roundId: 'dp-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    expect(round2.convergence?.reviewScope).toBe('integration');
+    // Dropping reviewed feature work means the whole candidate is NOT covered:
+    // the whole-change authority is still owed, even though the prior bit was set.
+    expect(round2.convergence?.coverageComplete).toBeUndefined();
+    expect(round2.convergence?.finalPassRequired).toBe(true);
+    const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
+    expect(prompt).toContain('no longer differ from the incoming base');
+    expect(prompt).not.toContain('the integration was clean');
   });
 });
