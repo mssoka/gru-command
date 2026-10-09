@@ -44,9 +44,9 @@ context: []
 - `test/assert-verify-keepalive-baseline.test.ts`, `tools/assert-verify-keepalive-baseline.mjs` (+ `.d.mts`) — fail-before report classifier.
 - `test/suite-shape.test.ts` — recomputed phantom-check pins (24 / 25 / 3).
 - `docs/FLOW.md` — the `ping` frame in the documented response vocabulary.
-- `.gru-command/worktree.toml` — `verify-idle-keepalive`, `verify-idle-keepalive-static`, `verify-idle-keepalive-baseline`, and `verify-idle-keepalive-capture-baseline` scopes.
+- `.gru-command/worktree.toml` — `verify-idle-keepalive`, `verify-idle-keepalive-static`, `verify-idle-keepalive-baseline`, and `verify-idle-capture-baseline` scopes.
 
-**Fail-before:** every named regression is assertion-first, so the pre-fix base REDs by assertion rather than by a harness timeout. Two scheduler-backed scopes reproduce this on isolated base snapshots and classify the machine-readable Vitest reports with `tools/assert-verify-keepalive-baseline.mjs`, which exits 2 when a claim is broken: `verify-idle-keepalive-baseline` (the four named server regressions) and `verify-idle-keepalive-capture-baseline` (the three capture-reader/helper regressions). Both legs cover every named regression in acceptance 1-4; the classifier treats a matcher `TypeError` on a named test as behavioral RED and rejects only collection/setup/import failures.
+**Fail-before:** every named regression is assertion-first, so the pre-fix base REDs by assertion rather than by a harness timeout. Two scheduler-backed scopes reproduce this on isolated base snapshots and classify the machine-readable Vitest reports with `tools/assert-verify-keepalive-baseline.mjs`, which exits 2 when a claim is broken: `verify-idle-keepalive-baseline` (the four named server regressions) and `verify-idle-capture-baseline` (the three capture-reader/helper regressions). Both legs cover every named regression in acceptance 1-4; the classifier treats a matcher `TypeError` on a named test as behavioral RED and rejects only collection/setup/import failures.
 
 **Review round 1 (BMAD blind hunter, job `verify-idle-keepalive-review-blind-hunter-20261009`, reviewed head 49a219e):** 14 findings, triaged below; the actionable ones were repaired in the first fix cycle. The one finding rejected in round 1 (F4) was re-raised in round 2 and is now patched (R3).
 
@@ -90,7 +90,7 @@ Round 2 — BMAD blind hunter `verify-idle-keepalive-review-round2-blind-hunter-
 - R3 `ping` still not an exported contract — **medium**, patched this round: `PingFrame`/`VerificationStreamFrame` exported and used by `writeFrame`.
 - R4 cadence pinned by shape only; a 147,000 ms default stayed green — **medium**, patched: the default is pinned by value (15,000 ms).
 - R5 a required receipt field was added without back-compat — **medium**, patched: `readCaptureReceipt` normalizes legacy receipts to `pings: 0`.
-- R6 the baseline comment's exclusion claim was factually wrong and dropped a provable RED leg — **medium**, patched: the comment is corrected and `verify-idle-keepalive-capture-baseline` adds the capture leg under its own fast config.
+- R6 the baseline comment's exclusion claim was factually wrong and dropped a provable RED leg — **medium**, patched: the comment is corrected and `verify-idle-capture-baseline` adds the capture leg under its own fast config.
 - R7 the classifier's `AssertionError:`-only rule could mislabel a matcher `TypeError` as a broken claim — **medium**, patched: `isBehavioralRed` accepts both behavioral shapes.
 - R8 no consumer-level reproduction of the client idle deadline — **low**, deferred: real byte arrivals with a bounded gap on an isolated server already prove acceptance 1-3; the stronger `node:http` idle-deadline variant is recorded in `deferred-work.md`.
 - R9 the `ping` frame was undocumented — **medium**, patched: `docs/FLOW.md` now documents it.
