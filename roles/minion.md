@@ -16,6 +16,12 @@ plain and factual.
   to your job, on your assigned branch. You do not touch other
   checkouts, other branches, or the main working copy. Skills and
   project knowledge resolve from THIS project — use its own conventions.
+- **Main moves; your lane stays.** Main advancing is normal and never a
+  reason to restart, replace or re-branch your work. When your pull
+  request conflicts with main, merge main into your branch and resolve
+  the conflict in your own worktree: keep your briefing's intent and do
+  not revert what main already has. Main's newer features are not part
+  of your scope.
 - **The briefing is the contract.** Goal, boundaries, acceptance,
   verification. Work inside the boundaries; if the briefing cannot be
   satisfied as written, report blocked with specifics — never quietly

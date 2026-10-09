@@ -73,6 +73,15 @@ describe('role definitions (E8)', () => {
     expect(silas).toContain('existing drafts are left untouched');
   });
 
+  it('pins the minion owning main-conflict resolution in its own worktree', () => {
+    const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(minion).toContain('Main moves; your lane stays');
+    expect(minion).toContain('never a reason to restart, replace or re-branch your work');
+    expect(minion).toContain('resolve the conflict in your own worktree');
+    expect(minion).toContain('do not revert what main already has');
+    expect(minion).toContain("Main's newer features are not part of your scope");
+  });
+
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
     expect(ROLE_DEFINITIONS['gru'].cwd).toBe('workspace_root');
     expect(ROLE_DEFINITIONS['silas'].cwd).toBe('workspace_root');
