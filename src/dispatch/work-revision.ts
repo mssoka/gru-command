@@ -20,6 +20,10 @@ export function renderRevisionContinuation(input: {
    * amendment is named NOT EFFECTIVE and its body is withheld, so the
    * minion never receives contradictory instructions. */
   readonly supersededBy?: ReadonlyMap<string, number>;
+  /** false = the carrying turn records no delivery of its own (a provider
+   * continuation resuming an interrupted turn): the block must not claim a
+   * revision receipt. Default true. */
+  readonly receipt?: boolean;
 }): string {
   if (input.pending.length === 0) return '';
   const lines: string[] = [
@@ -46,8 +50,15 @@ export function renderRevisionContinuation(input: {
   }
   lines.push(
     '',
-    `The service records the delivery of this turn as contract revision ${input.revision}.`,
-    `Name "contract revision ${input.revision}" in your completion report.`,
+    ...(input.receipt === false
+      ? [
+        'This turn resumes interrupted work: apply the amendments above to it. The lane is reviewed only after a',
+        `delivery carries contract revision ${input.revision}.`,
+      ]
+      : [
+        `The service records the delivery of this turn as contract revision ${input.revision}.`,
+        `Name "contract revision ${input.revision}" in your completion report.`,
+      ]),
     `===== END CONTRACT REVISION ${input.revision} =====`,
   );
   return lines.join('\n');

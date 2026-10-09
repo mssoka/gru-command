@@ -2267,7 +2267,7 @@ export class LedgerApi {
    * owes a passing scheduler verification on its exact head before any
    * review arms. The debt follows the newest delivery while it lasts (a
    * repair of a failed verification owes its own pass) and is discharged
-   * once a review round is created after the corrective delivery. Null =
+   * once a review round ADMITTED after the corrective delivery (went live). Null =
    * no debt; otherwise the revision and the head that must be verified
    * (null when the delivery could not resolve its head: any later pass on
    * the job counts). */
@@ -2284,8 +2284,12 @@ export class LedgerApi {
     // Only the delivery that FIRST carried this revision is corrective: an
     // earlier delivery at the same or a higher revision means the revision
     // is not new (revisions are monotonic per job).
+    // Discharged only by a review that actually ADMITTED the corrected work
+    // (its round went live) — a round created and then refused at
+    // admission/preflight reviewed nothing.
     const reviewedSince = this.db.prepare(
-      `SELECT 1 FROM events WHERE job_id = ? AND kind = 'round.created' AND seq > ? LIMIT 1`,
+      `SELECT 1 FROM events WHERE job_id = ? AND kind = 'round.status'
+         AND json_extract(payload, '$.to') = 'live' AND seq > ? LIMIT 1`,
     ).get(jobId, correctiveSeq) !== undefined;
     if (reviewedSince) return null;
     const payload = typeof newest.payload === 'object' && newest.payload !== null

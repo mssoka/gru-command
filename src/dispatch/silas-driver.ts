@@ -1002,6 +1002,14 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
 }
 
+/** True when the newest round was superseded (owner rule 3) before this
+ * delivery: whatever head it reviewed, it reviewed the old contract. */
+function supersededBefore(ledger: DigestLedger, round: RoundRecord, delivered: EventRecord): boolean {
+  if (round.status !== 'aborted') return false;
+  const superseded = ledger.latestRoundEvent(round.id, 'round.superseded');
+  return superseded !== null && superseded.seq < delivered.seq;
+}
+
 /** Fallback-gate lifecycle phases that answer nothing: the gate never
  * started (`unavailable`), gave up (`blocked`) or was interrupted
  * (`aborted`). A clean-abort re-arm stays eligible after these. */
@@ -1523,7 +1531,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       } else if (
         newestRound !== null &&
         delivered !== null &&
-        followUpChangedTarget(delivered, newestRound) &&
+        // A superseded round reviewed an obsolete contract (owner rule 3):
+        // the delivery after it owes a fresh review even on the same SHA
+        // (a correction needing no code change, or an unresolved head).
+        (followUpChangedTarget(delivered, newestRound) || supersededBefore(input.ledger, newestRound, delivered)) &&
         !reviewAlreadyRequested
       ) {
         digest.prWithoutReview.push({
@@ -2011,6 +2022,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       return job !== null && job.prUrl === null;
     }),
     verificationsOwed: digest.verificationsOwed.filter((row) => {
+      // A failed run on this head owes a REPAIR (verificationFailures), not
+      // another verification of the same bytes.
+      if (digest.verificationFailures.some((failure) => failure.jobId === row.jobId && failure.head === row.head)) return false;
       if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
           input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
           input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;

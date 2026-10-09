@@ -114,12 +114,24 @@ export function amendmentRequestSha256(input: {
   }));
 }
 
-/** The highest version among material amendments (0 when none): the work
- * revision a delivery must carry before its candidate may be reviewed. */
-export function requiredWorkRevision(amendments: readonly Pick<JobAmendmentRecord, 'version' | 'effect'>[]): number {
+/** The highest version among EFFECTIVE material amendments (0 when none):
+ * the work revision a delivery must carry before its candidate may be
+ * reviewed. A material amendment a later amendment superseded (retracted
+ * or replaced) owes no implementation of its own. */
+export function requiredWorkRevision(
+  amendments: readonly (Pick<JobAmendmentRecord, 'version' | 'effect'> & Partial<Pick<JobAmendmentRecord, 'id' | 'supersedes'>>)[],
+): number {
+  const superseded = new Set<string>();
+  for (const amendment of amendments) {
+    for (const entry of amendment.supersedes ?? []) {
+      if (entry.startsWith('amendment:')) superseded.add(entry.slice('amendment:'.length));
+    }
+  }
   let required = 0;
   for (const amendment of amendments) {
-    if (amendment.effect === 'material' && amendment.version > required) required = amendment.version;
+    if (amendment.effect !== 'material') continue;
+    if (amendment.id !== undefined && superseded.has(amendment.id)) continue;
+    if (amendment.version > required) required = amendment.version;
   }
   return required;
 }

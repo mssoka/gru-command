@@ -14,7 +14,7 @@ import { BoardEngine } from './board/engine.js';
 import { createBoardServer } from './board/server.js';
 import { DeployDriftTracker } from './board/deploy-drift.js';
 import { defaultPackageRoot, readBuildInfo } from './build-info.js';
-import { createServiceReviewWave } from './dispatch/service-review-wave.js';
+import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
@@ -1257,10 +1257,7 @@ async function main(): Promise<number> {
     },
     // Supersession proof (owner rule 3): a review session is stopped only
     // when the runtime no longer holds a live handle for it.
-    liveReviewSessions: (agentIds) => agentIds.filter((agentId) => {
-      const handle = registry.getHandle(agentId);
-      return handle !== null && handle.health().state !== 'disposed';
-    }),
+    liveReviewSessions: (agentIds) => liveReviewSessionIds(registry, agentIds),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;

@@ -5,6 +5,8 @@ import type {
 } from '../ledger/api.js';
 import type { LogLevel } from '../logger.js';
 import { rebriefFreshMinion } from '../dispatch/fix-directive.js';
+import { renderRevisionContinuation, withRevisionContinuation } from '../dispatch/work-revision.js';
+import { amendmentSupersessions, pendingMaterialAmendments } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from '../dispatch/fix-directive.js';
 import type { WorktreePort } from '../dispatch/worktree-port.js';
 import { blockedByOwnWallSettle } from './settle-attribution.js';
@@ -223,6 +225,22 @@ async function claimJobMinion(
     continuationPrompt !== null && continuationPrompt.trim() !== ''
       ? `Provider ${wait.provider} recovered. The interrupted turn's prompt is re-delivered below.`
       : `Provider ${wait.provider} recovered. The interrupted turn's prompt could not be recovered — continue the briefing.`;
+  // Owner rule 4: an approved material amendment the lane has not delivered
+  // travels with ANY turn that resumes it — the interrupted turn must not
+  // keep working from pre-amendment instructions. (This turn records no
+  // delivery, so the review fence still waits for a revision-stamped one.)
+  const revisionState = deps.ledger.workRevisionState(job.id);
+  const amendments = deps.ledger.listJobAmendments(job.id);
+  const pendingCorrection = revisionState.required > revisionState.delivered
+    ? renderRevisionContinuation({
+      jobId: job.id,
+      revision: revisionState.required,
+      deliveredRevision: revisionState.delivered,
+      pending: pendingMaterialAmendments(amendments, revisionState.delivered, revisionState.required),
+      supersededBy: amendmentSupersessions(amendments),
+      receipt: false,
+    })
+    : '';
   // r1 #10 (phase3 item 5): ATOMIC claim-BEFORE-spawn. Compare-and-set
   // recovered-pending → claimed; concurrent claimants and replays lose
   // here, before any prompt or spawn side effect can duplicate.
@@ -260,7 +278,7 @@ async function claimJobMinion(
       worktrees: deps.worktrees,
       jobId: wait.jobId as string,
       note,
-      briefing: continuationPrompt ?? job.briefing,
+      briefing: withRevisionContinuation(continuationPrompt ?? job.briefing ?? '', pendingCorrection) || null,
       ...(resumeFile !== null ? { resumeFile } : {}),
       beforeTurnSideEffect: () => {
         // A hold or terminal disposition may land during the awaited

@@ -1193,6 +1193,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // as the intent's revision stamp (owner rule 4): an amendment accepted
       // while the writer gate waits travels with the NEXT continuation.
       const contractAtIntent = options.ledger.effectiveContract(jobId)?.text ?? null;
+      // Owner rule 4: the approved material amendments this lane has not
+      // delivered travel ONCE with this request — canonical text, version
+      // order, stamped with the revision the intent recorded, and rendered
+      // from the amendment set of the SAME tick (a later supersession can
+      // never withhold a body the stamp claims).
+      const workRevision = intent.workRevision ?? 0;
+      const deliveredRevision = options.ledger.workRevisionState(jobId).delivered;
+      const amendmentsAtIntent = options.ledger.listJobAmendments(jobId);
+      const continuation = renderRevisionContinuation({
+        jobId,
+        revision: workRevision,
+        deliveredRevision,
+        pending: pendingMaterialAmendments(amendmentsAtIntent, deliveredRevision, workRevision),
+        supersededBy: amendmentSupersessions(amendmentsAtIntent),
+      });
       // The async turn stays owned and tracked by THIS server instance
       // (the existing directiveControllers/inFlight coordinator — no
       // detached helper, no second chief). Late errors surface durably.
@@ -1219,19 +1234,6 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           });
           return;
         }
-        // Owner rule 4: the approved material amendments this lane has not
-        // delivered travel ONCE with this request — canonical text, version
-        // order, stamped with the revision the intent recorded.
-        const workRevision = intent.workRevision ?? 0;
-        const deliveredRevision = options.ledger.workRevisionState(jobId).delivered;
-        const amendments = options.ledger.listJobAmendments(jobId);
-        const continuation = renderRevisionContinuation({
-          jobId,
-          revision: workRevision,
-          deliveredRevision,
-          pending: pendingMaterialAmendments(amendments, deliveredRevision, workRevision),
-          supersededBy: amendmentSupersessions(amendments),
-        });
         let delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>;
         try {
           delivery = await routeFixDirectiveToMinion({

@@ -1731,7 +1731,12 @@ export class WaveRunner {
         // A terminal marker for a DIFFERENT request does not satisfy this one.
       }
       const delivered = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
-      if (delivered !== null && delivered.seq > queued.seq) void this.startHandoff(job.id, pending);
+      // A pass that paid a corrective delivery's verification (option A)
+      // re-offers the request just like a delivery does.
+      const verifiedAfter = this.opts.ledger.latestJobEvent(job.id, 'verification.completed');
+      if ((delivered !== null && delivered.seq > queued.seq) || (verifiedAfter !== null && verifiedAfter.seq > queued.seq)) {
+        void this.startHandoff(job.id, pending);
+      }
     }
   }
 
@@ -1958,6 +1963,9 @@ export class WaveRunner {
     }
     const roundIds = new Set<string>();
     let operations = 0;
+    // Every tracked operation this pass saw — including one an earlier pass
+    // already aborted that has not settled: it still must be proven gone.
+    let operationsSeen = 0;
     // A fallback gate owns no round: its stop is proven on the job, and an
     // earlier unproven fallback stop is re-proven by this pass.
     let fallbackInvolved = this.fallbackSupersessionUnproven(input.jobId);
@@ -1978,6 +1986,7 @@ export class WaveRunner {
         }
       }
       const ops = [...(this.reviewOperations.get(input.jobId) ?? [])];
+      operationsSeen = Math.max(operationsSeen, ops.length);
       if (ops.length === 0 && active.roundIds.every((id) => roundIds.has(id)) && pass > 0) break;
       for (const op of ops) {
         if (!op.controller.signal.aborted) {
@@ -2004,7 +2013,7 @@ export class WaveRunner {
       ]);
       if (timer !== undefined) clearTimeout(timer);
     }
-    if (roundIds.size === 0 && operations === 0 && !fallbackInvolved) {
+    if (roundIds.size === 0 && operationsSeen === 0 && !fallbackInvolved) {
       return { jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null };
     }
     // Debt already reported action-required (an earlier unconfirmed stop
@@ -3571,7 +3580,16 @@ export class WaveRunner {
     let blockers = 0;
     let notes = 0;
     for (let iteration = 1; iteration <= maxRounds; iteration += 1) {
-      if (signal.aborted) throw new Error('review operation aborted');
+      if (signal.aborted) {
+        // A superseded gate (owner rule 3) — e.g. cancelled while its fix
+        // directive ran — still records its routine terminal; shutdown keeps
+        // its existing unrecorded stop.
+        if (this.supersededFallbackGates.has(job.id)) {
+          this.terminalFallbackSuperseded(job.id, `cancelled before round ${iteration}`, iteration, [...state.reportFiles], fallbackEvent, state);
+          return;
+        }
+        throw new Error('review operation aborted');
+      }
       // The gate can outlive its admission by many rounds (review → fix
       // directive → re-review). Re-prove the CURRENT lane/marker/
       // authorization facts before this round's diff intake: a re-brief
