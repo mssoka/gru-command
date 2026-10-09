@@ -1968,21 +1968,30 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(frozenSpec).not.toContain('result: PASS');
   });
 
-  it('a verification-history read failure aborts the freeze loudly and never fabricates absence or a pass (j-1594)', async () => {
+  it('a verification-history read failure during iteration aborts the freeze loudly and never fabricates absence or a pass (j-1594)', async () => {
     const lane = await verificationHistoryLane('job-lh-fail', 'perkins-long-history-fail', 73);
     const { ledger, job, target } = lane;
     ledger.appendCustomEvent({
       kind: 'verification.completed', jobId: job.id,
       payload: completedRunPayload(target, 'run-binding-ok'),
     });
-    vi.spyOn(ledger, 'iterateJobVerificationCompleted').mockImplementation(() => {
-      throw new Error('simulated verification-history read failure');
+    // The real read is a generator: it cannot fail at the call expression —
+    // a storage failure surfaces while the selector iterates. Yield one
+    // non-binding run, then fail on the next pull.
+    const noise = ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload('f'.repeat(40), 'run-noise-before-failure'),
+    });
+    vi.spyOn(ledger, 'iterateJobVerificationCompleted').mockImplementation(function* failingRead() {
+      yield noise;
+      throw new Error('simulated mid-iteration verification-history read failure');
     });
     const wave = waveFor(lane);
-    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/simulated verification-history read failure/u);
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/simulated mid-iteration verification-history read failure/u);
     const round = ledger.listRounds(job.id)[0]!;
     expect(round.status).toBe('aborted');
-    expect(ledger.listEvents({ limit: 200 }).some((event) => event.kind === 'round.review-no-spawn')).toBe(true);
+    // Round-scoped receipt read — never a global newest-N window.
+    expect(ledger.latestRoundEvent(round.id, 'round.review-no-spawn')).not.toBeNull();
     expect(ledger.listAgents().filter((agent) => agent.roundId === round.id)).toEqual([]);
     expect(ledger.latestJobEvent(job.id, 'round.verdict')).toBeNull();
   });

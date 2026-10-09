@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -71,19 +71,67 @@ describe('completed verification history pagination (j-1594)', () => {
     }
   });
 
-  it('is lazy — the caller stops the read at the first match', () => {
+  it('is lazy — the caller stops the read after exactly one page', () => {
     const { api, db, dir } = seeded();
     try {
       for (let index = 0; index < 5; index += 1) {
         api.appendCustomEvent({ kind: 'verification.completed', jobId: 'lazy', payload: { run_id: `run-${index}` } });
       }
-      const iterator = api.iterateJobVerificationCompleted('lazy', 10);
+      // Observe the actual page reads: the watermark lookup plus one page —
+      // a second page must not be fetched when the caller stops after one
+      // row. (A pre-buffering implementation would read every page here.)
+      const prepare = vi.spyOn(db.handle, 'prepare');
+      const iterator = api.iterateJobVerificationCompleted('lazy', 2);
       const first = iterator.next();
       expect(first.done).toBe(false);
-      // Abandoning the generator fetches no further pages (no side effect
-      // beyond the one bounded page already read).
+      expect(prepare).toHaveBeenCalledTimes(2);
       iterator.return(undefined);
+      expect(prepare).toHaveBeenCalledTimes(2);
       expect(iterator.next().done).toBe(true);
+      prepare.mockRestore();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reads every page to exhaustion, including exact-multiple and single-row boundaries', () => {
+    const { api, db, dir } = seeded();
+    try {
+      const read = (jobId: string, pageSize: number): number[] =>
+        [...api.iterateJobVerificationCompleted(jobId, pageSize)].map((row) => row.seq);
+      // A total that is an exact multiple of pageSize terminates on the
+      // empty next page, not a short page.
+      for (let index = 0; index < 4; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'exact', payload: { run_id: `run-${index}` } });
+      }
+      const exactAtTwo = read('exact', 2);
+      expect(exactAtTwo).toHaveLength(4);
+      expect(new Set(exactAtTwo).size).toBe(4);
+      // pageSize 1 exercises the per-row cursor advance; the selected
+      // sequence is independent of the page size.
+      expect(read('exact', 1)).toEqual(exactAtTwo);
+      // Single-row history (whether or not the page is full).
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'single', payload: { run_id: 'only' } });
+      expect(read('single', 1)).toHaveLength(1);
+      expect(read('single', 200)).toHaveLength(1);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws during iteration when a later page read fails — a partial read never looks empty', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'broken', payload: { run_id: `run-${index}` } });
+      }
+      const iterator = api.iterateJobVerificationCompleted('broken', 1);
+      expect(iterator.next().done).toBe(false); // page one read
+      // Simulate storage failure after the first page was yielded.
+      db.handle.exec('DROP TABLE events');
+      expect(() => iterator.next()).toThrow();
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
@@ -108,13 +156,15 @@ describe('completed verification history pagination (j-1594)', () => {
     }
   });
 
-  it('yields nothing for a job with no completed run and refuses a non-positive page size', () => {
+  it('yields nothing for a job with no completed run and refuses an out-of-range page size eagerly', () => {
     const { api, db, dir } = seeded();
     try {
       api.appendCustomEvent({ kind: 'job.note', jobId: 'empty', payload: { note: 'x' } });
       expect([...api.iterateJobVerificationCompleted('empty')]).toEqual([]);
-      expect(() => [...api.iterateJobVerificationCompleted('empty', 0)]).toThrow(/pageSize must be a positive integer/u);
-      expect(() => [...api.iterateJobVerificationCompleted('empty', 1.5)]).toThrow(/pageSize must be a positive integer/u);
+      // Eager: the refusal happens at the call boundary, before iterating.
+      expect(() => api.iterateJobVerificationCompleted('empty', 0)).toThrow(/pageSize must be an integer in 1\.\./u);
+      expect(() => api.iterateJobVerificationCompleted('empty', 1.5)).toThrow(/pageSize must be an integer in 1\.\./u);
+      expect(() => api.iterateJobVerificationCompleted('empty', 1001)).toThrow(/pageSize must be an integer in 1\.\./u);
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });

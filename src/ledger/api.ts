@@ -132,6 +132,11 @@ import {
 } from './decision-memory.js';
 
 const VERIFICATION_KIND = 'verification.completed';
+
+/** Upper bound on one page of the completed-verification read (j-1594): a
+ * positive integer page size, so a single fetch stays bounded. There is no
+ * bound on the NUMBER of pages — the history is paged to exhaustion. */
+export const VERIFICATION_HISTORY_MAX_PAGE_SIZE = 1000;
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRecoveryHold, DirectiveRequestRecord, DirectiveRetirementRefusalCode, DirectiveState } from './directives.js';
 export { DirectiveRetirementError } from './directives.js';
@@ -1201,14 +1206,23 @@ export class LedgerApi {
    * record: there is NO finite per-job lifetime ceiling, so any history
    * length is reviewable. The scan is lazy — the caller may stop at the
    * first binding run, so the common case fetches one page, while proving
-   * absence exhausts every page. Each fetch is bounded by `pageSize`; a
-   * storage failure throws out of the generator, so a partial read can never
-   * masquerade as an empty history. A first-captured `MAX(seq)` watermark
-   * keeps the page set stable and visits every row exactly once. */
-  *iterateJobVerificationCompleted(jobId: string, pageSize = 200): Generator<EventRecord, void, void> {
-    if (!Number.isInteger(pageSize) || pageSize <= 0) {
-      throw new Error(`iterateJobVerificationCompleted pageSize must be a positive integer (got ${String(pageSize)})`);
+   * absence exhausts every page. Each fetch is bounded by `pageSize`
+   * (validated eagerly, before the generator exists, and capped at
+   * `VERIFICATION_HISTORY_MAX_PAGE_SIZE`); a storage failure throws while
+   * the caller iterates, so a partial read can never masquerade as an empty
+   * history. A first-captured `MAX(seq)` watermark bounds every page
+   * (`cursor` starts one past it and only decreases), so the page set stays
+   * stable and each row is visited exactly once. */
+  iterateJobVerificationCompleted(jobId: string, pageSize = 200): Generator<EventRecord, void, void> {
+    if (!Number.isInteger(pageSize) || pageSize <= 0 || pageSize > VERIFICATION_HISTORY_MAX_PAGE_SIZE) {
+      throw new Error(
+        `iterateJobVerificationCompleted pageSize must be an integer in 1..${VERIFICATION_HISTORY_MAX_PAGE_SIZE} (got ${String(pageSize)})`,
+      );
     }
+    return this.verificationCompletedPages(jobId, pageSize);
+  }
+
+  private *verificationCompletedPages(jobId: string, pageSize: number): Generator<EventRecord, void, void> {
     const ceilingRow = this.db
       .prepare('SELECT MAX(seq) AS ceiling FROM events WHERE job_id = ? AND kind = ?')
       .get(jobId, VERIFICATION_KIND) as Row | undefined;
