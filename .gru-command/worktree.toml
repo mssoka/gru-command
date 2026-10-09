@@ -12,6 +12,8 @@ command = "npm ci"
 [verify]
 full = "npm test"
 
+typecheck = "npm run typecheck"
+
 # Declared focused verification scopes (phase 4; invoked only via the
 # authenticated /api/verify scheduler at the project's documented budgets
 # — process-heavy files route through vitest.heavy.config.ts (120s,
