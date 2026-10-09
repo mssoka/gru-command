@@ -162,6 +162,30 @@ describe('ack consequence copy — honest scope per kind, never parsed prose', (
     expect(ackConsequence('gru.owner-escalation')).toContain('does not by itself prove');
     expect(ackConsequence('something.brand.new')).toContain('does not by itself prove');
   });
+
+  it('the collapsed Next step and the expanded consequence agree on every kind family (one family map, never drifted)', () => {
+    // The face shows ackNextStep; the expanded region shows
+    // ackConsequence. They must classify kinds into the SAME families: a
+    // family added to one and not the other would silently pass every
+    // other test while the two surfaces tell different stories.
+    const unknown = 'something.brand.new';
+    const genericNext = ackNextStep(unknown);
+    const genericConsequence = ackConsequence(unknown);
+    const kinds = [
+      'supervision.provider-wall.agent-1.quota_exceeded',
+      'supervision.breaker',
+      'decisions.degraded.timeout',
+      'worktree-sweep-paused',
+      'port-squat',
+      'roll-port-squat',
+      unknown,
+    ];
+    for (const kind of kinds) {
+      const nextIsGeneric = ackNextStep(kind) === genericNext;
+      const consequenceIsGeneric = ackConsequence(kind) === genericConsequence;
+      expect(nextIsGeneric, `family drift for ${kind}`).toBe(consequenceIsGeneric);
+    }
+  });
 });
 
 describe('safePrUrl', () => {

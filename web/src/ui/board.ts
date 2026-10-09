@@ -97,7 +97,7 @@ function lensProgressLabel(summary: RoundSummary): string {
   }
   return parts.join(' · ');
 }
-import { BoardApiError, type BoardClient } from '../lib/board-client.js';
+import type { BoardClient } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
@@ -170,9 +170,6 @@ export class BoardView {
    * the mock feed carries ack-ready rows without a client; rebound on
    * re-pair). */
   private boardClient: BoardClient | null;
-  /** Bumped on every re-pair: work started for an older client never
-   * changes state, re-renders, or posts through the new one. */
-  private clientGeneration = 0;
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
@@ -181,10 +178,6 @@ export class BoardView {
    * stopped/live-worker inputs so they can never disagree). */
   private currentSections: ReturnType<typeof boardSections> | null = null;
 
-  private jobSignals: {
-    readonly unacked: ReadonlyMap<string, number>;
-    readonly stoppedWorkers: ReadonlyMap<string, WorkerStopView>;
-  } | null = null;
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
   private receiptsNextOffset = 0;
@@ -283,7 +276,6 @@ export class BoardView {
    * previous server's fetched receipts or resume its pagination cursor. */
   bindClient(client: BoardClient): void {
     this.boardClient = client;
-    this.clientGeneration += 1;
     this.sentShown.clear();
     this.extraReceipts = [];
     this.receiptsNextOffset = 0;
@@ -1041,7 +1033,6 @@ export class BoardView {
     // strip counts and section bodies can never disagree).
     const sections = this.sectionsFor(snapshot);
     const stoppedWorkers = stoppedWorkersByJob(snapshot.agents);
-    this.jobSignals = { unacked, stoppedWorkers };
     this.mount.append(this.jobsSection('in-flight', sections.bands.get('in-flight') ?? [], unacked, stoppedWorkers));
     this.mount.append(this.pipelineSection(sections));
     this.mount.append(this.forGruSection(sections.bands.get('needs-you') ?? [], unacked, stoppedWorkers));

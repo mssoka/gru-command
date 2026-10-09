@@ -1,6 +1,7 @@
 // Baseline RED classifier — R3-05 resolution (job dashboard-slim-strip-current-main-20261007).
 //
-// Usage: node tools/classify-baseline.mjs <report.json> [--require-file <substr>] [--require-failing <n>]
+// Usage: node tools/classify-baseline.mjs <report.json> [--require-file <substr>]
+//        (--playwright --require-substr "a,b,c" for Playwright reports)
 //
 // Reads a vitest JSON report produced inside a baseline snapshot (the
 // recorded execution base overlaid with the named fail-before specs) and

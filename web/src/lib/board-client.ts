@@ -469,11 +469,10 @@ export class BoardClient {
     await this.postApi(`/api/notifications/${encodeURIComponent(id)}/ack`, { by: 'web' });
   }
 
+  /** Every POST rides the same bounded deadline budget as the snapshot
+   * GET: an owner action that outlives it is unconfirmed — never
+   * auto-replayed; the authoritative snapshot reconciles. */
   private async postApi(path: string, body: unknown): Promise<unknown> {
-    return (await this.postApiWithStatus(path, body)).body;
-  }
-
-  private async postApiWithStatus(path: string, body: unknown): Promise<{ readonly status: number; readonly body: unknown }> {
     const doFetch = this.fetchImpl;
     const res = await doFetch(path, {
       method: 'POST',
@@ -485,7 +484,7 @@ export class BoardClient {
       signal: AbortSignal.timeout(SNAPSHOT_DEADLINE_MS),
     });
     if (!res.ok) return this.refused(path, res);
-    return { status: res.status, body: await res.json() };
+    return res.json();
   }
 }
 
