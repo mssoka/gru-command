@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-progress'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 12
+review_loop_iteration: 13
 context: []
 ---
 
@@ -129,6 +129,23 @@ context: []
 | N1R-4 | verify | only one of the two `focus({preventScroll:true})` sites was discriminated (the module-removal handback was not) | Fixed: a spy test asserting BOTH restoration calls receive exactly `{ preventScroll: true }`. Would-fail-if-reverted verified by reverting the row-restoration site. |
 | N1R-5 | verify | the baseline classifier's empirical 8 + 32 classification is not reproducible from the reviewed shas | Recorded (documentation honesty): the N1-debt row now attributes the evidence to the preserved producer reports held with the ops wake capture, states that they are not part of any reviewed sha, and notes the classifier fails closed. No code change. |
 
+
+## Restart recovery, integration and verification receipts
+
+- **Contract**: effective contract v2 (`contract_sha256 ff384a58871ec03650108c75eac3055f025b4b06af876188d290ee77eed9a2b9`; base v0 `e3ca2ecab7699bc1ee9be2cc5a250bb8620adc4ad69d4d4d9ba01ed9c5d4521c`). Amendment #1 (retain `f2a334c`) is superseded; amendment #2 is EFFECTIVE and replaces it: ordinary NON-FORCE merges of main INTO this branch are permitted when needed to resolve PR conflicts or validate the integrated candidate, resolved in this same worktree with both the approved feature and main's existing changes preserved, and main merely advancing requires no immediate merge, branch replacement or workflow restart. Merging this PR INTO main remains the owner's separate decision. The six data/interaction acceptance areas are unchanged.
+- **Interrupted gate and its true outcome (owner-approved restart continuation)**: the original full gate request `repo-overview-full-6deb978-1` ran as `e8efed09-b242-4a4d-9864-e8ed18accfca` and was terminated by SIGTERM after 143.6 s — a real non-PASS outcome (`ok: false`, 41 097 output bytes), with its 62 245-byte original capture preserved without a terminal/EOF frame. It was never replayed or relabelled; the stopped client's stale live worktree registration and the old directive's ledger lifecycle were reconciled by a SEPARATE ops bookkeeping repair job (dead pid, no signal sent, product results untouched; old request retired under j-1587). Neither retirement nor reconciliation clears a product gate, and no PASS is claimed from it.
+- **Completed gate at the same pinned head**: a NEW tracked attempt `repo-overview-full-6deb978-2` was submitted. Its first capture client was terminated while the request was still queued behind a foreign lane's run (preserved receipt: outcome `unknown`, `error: terminated`, 99-byte capture); the client was reconnected under the SAME request id with a fresh exclusive sink (the supported attach path, not a re-submission), which attached run `dc762a86-356b-4506-99db-3afb03d7481c` and streamed it to EOF at head `6deb978`: **PASS**, exit 0, output 166 570 bytes sha256 `17c0950002fede7b959936c4b7fc3aa04f582e55d7456bc1f67d151f7a6ceaa7`, capture 221 616 bytes sha256 `8723904debb1619b32a8884d4330ef82fcf18713c430857550021787ea831fef`, 503 frames, `tracked_dirty: false`.
+- **Receipt ledger by candidate** (declared scopes, supported capture helper, exact heads, all `tracked_dirty: false`):
+
+| Candidate | focused | static | browser | baseline (RED by design) | full |
+|---|---|---|---|---|---|
+| `b806aa4` (pre-native-r1) | PASS `29e70952` | PASS `b0900f41` | PASS `ee604186` | exit 1 `5637affe` | PASS `3c52f7d8` |
+| `3f18894` (main integration) | PASS `74700366` | PASS `01bf4b1c` | PASS `0aee7296` | exit 1 `9b37b86b` (claim broken: classifier path) | not run (superseded) |
+| `5aa9319` (classifier-path fix) | PASS `f84cb9b4` | PASS `073ccdef` | PASS `0ce3902b` | exit 1 `e4674685` (8 named RED) | PASS `4a14c614` |
+| `6deb978` (built-in-review test pins) | PASS `a3968841` | PASS `307456fa` | PASS `375b1126` | exit 1 `c0d3acc2` (8 named RED) | PASS `dc762a86` (reconnected stream) |
+
+- **Integration**: `origin/main` `90f91d5` merged into the lane (head `a6a15ac6499fd786cf5b0b49ff92d314444884aa`), one union conflict in `test/suite-shape.test.ts` resolved by keeping BOTH pins (`assert-repo-overview-baseline.test.ts: 4` and main's `assert-verify-keepalive-baseline.test.ts: 7`). Every gate above belongs to a candidate that this integration replaced; the declared scopes are re-run at the integrated head with fresh request ids, and those receipts are reported in the completion handback rather than by moving the verified head.
+- **Prior review records**: the three worker-commissioned `n1fix` report jobs at `5aa9319` were settled `dismissed` by the operations layer (j-1563) on the chief's assessment that they recorded no blocking current defect; their optional test pins and evidence-access notes were nevertheless implemented in `6deb978` as ordinary corrections. They are not native clearance.
 
 ## Design Notes
 
