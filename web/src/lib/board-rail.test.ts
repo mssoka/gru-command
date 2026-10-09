@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { boardKpis, collectJobs } from './board-kpi.js';
+import { boardKpis } from './board-kpi.js';
 import { railChips } from './board-rail.js';
 import type { AgentView, BoardSnapshot, ChildWorkerCounts, JobView } from './board-protocol.js';
 

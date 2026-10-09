@@ -13,7 +13,7 @@ import type {
   VerifyQueueView,
 } from '../lib/board-protocol.js';
 import { memoryStorage } from '../lib/chat-storage.js';
-import { boardKpis, collectJobs } from '../lib/board-kpi.js';
+import { boardKpis } from '../lib/board-kpi.js';
 import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
