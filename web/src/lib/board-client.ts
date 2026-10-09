@@ -103,6 +103,9 @@ export class BoardClient {
   private trailingGeneration = 0;
   /** In-flight snapshot requests, cancelled by stop() (R7-05). */
   private readonly snapshotRequests = new Set<AbortController>();
+  /** Every other request this client owns (bounded GETs and POSTs), so
+   * stop() cancels an owner action or drawer fetch mid-flight too. */
+  private readonly requestControllers = new Set<AbortController>();
 
   constructor(
     options: BoardClientOptions,
@@ -142,6 +145,8 @@ export class BoardClient {
     this.trailingRun = 0;
     for (const request of this.snapshotRequests) request.abort();
     this.snapshotRequests.clear();
+    for (const request of this.requestControllers) request.abort();
+    this.requestControllers.clear();
     this.stopLivenessWatch();
     const socket = this.socket;
     this.socket = null;
@@ -299,13 +304,40 @@ export class BoardClient {
   private async api<T>(path: string, signal?: AbortSignal): Promise<T> {
     // Relative paths: the API is served from the same origin as the UI in
     // production, and vite's dev proxy carries /api to the mock.
+    //
+    // Every GET is bounded: a caller that supplies its own signal (the
+    // snapshot, whose controller stop() aborts) keeps it; otherwise this
+    // client owns a deadline controller tracked with the POSTs, so no
+    // drawer/receipt/transcript fetch can hang forever and re-pairing
+    // cancels it.
     const doFetch = this.fetchImpl;
-    const res = await doFetch(path, {
-      headers: { authorization: `Bearer ${this.options.token}` },
-      ...(signal !== undefined ? { signal } : {}),
+    const controller = new AbortController();
+    const effective = signal ?? controller.signal;
+    if (signal === undefined) this.requestControllers.add(controller);
+    const timer = setTimeout(() => controller.abort(), SNAPSHOT_DEADLINE_MS);
+    const expired = new Promise<never>((_, reject) => {
+      effective.addEventListener(
+        'abort',
+        () => reject(new BoardApiError(path, 0, 'timeout', 'no answer before the deadline — outcome unconfirmed')),
+        { once: true },
+      );
     });
-    if (!res.ok) return this.refused(path, res);
-    return (await res.json()) as T;
+    try {
+      return await Promise.race([
+        (async () => {
+          const res = await doFetch(path, {
+            headers: { authorization: `Bearer ${this.options.token}` },
+            signal: effective,
+          });
+          if (!res.ok) return this.refused(path, res);
+          return (await res.json()) as T;
+        })(),
+        expired,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      this.requestControllers.delete(controller);
+    }
   }
 
   /** A non-2xx answer as a BoardApiError with the server's reason. A
@@ -481,6 +513,7 @@ export class BoardClient {
   private async postApi(path: string, body: unknown): Promise<unknown> {
     const doFetch = this.fetchImpl;
     const request = new AbortController();
+    this.requestControllers.add(request);
     const expired = new Promise<never>((_, reject) => {
       request.signal.addEventListener(
         'abort',
@@ -511,6 +544,7 @@ export class BoardClient {
       ]);
     } finally {
       clearTimeout(timer);
+      this.requestControllers.delete(request);
     }
   }
 }

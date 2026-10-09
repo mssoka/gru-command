@@ -340,6 +340,14 @@ describe('board rail — numeric part splits for the slim strip', () => {
     expect(alerts.valueSplit).toEqual({ lead: '', num: 0, unit: '' });
     expect(alerts.flagSplit).toBeNull();
 
+    // Every chip's split must RECONSTRUCT its exact value: the strip renders
+    // the split, so a split that drifted from `value` would show a wrong
+    // number against a green suite.
+    for (const chip of chips) {
+      if (chip.id === 'trackers') continue;
+      expect(`${chip.valueSplit.lead}${chip.valueSplit.num ?? ''}${chip.valueSplit.unit}`, `${chip.id} split reconstructs value`).toBe(chip.value);
+    }
+
     // The trackers chip is the ONE documented exception: the strip renders
     // it through its groups (kpis), never through label/value/splits. Pin
     // that exemption to exactly one chip — a second exempted chip, or a

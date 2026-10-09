@@ -164,3 +164,32 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
   summary: The `.strip-kpi + .strip-kpi::before` separator glyphs are CSS-generated content exposed to assistive technology.
   evidence: Round-6 blind-hunter follow-up (F-6); replace with a real `aria-hidden` span or non-content separator at the next strip a11y pass.
+
+## v7 review rounds — assessed follow-ups (from the workflow reviewers; not fixed here)
+
+These are real observations that are either outside the approved SLIM
+acceptance, by-design decisions, or carry more risk than the finding
+warrants. They are recorded, not dropped:
+
+- A persistently malformed `200` snapshot joins the rate-bounded trailing
+  chain with no duration cap and no connection-state surface (repeat: round 2
+  and round 3).
+- The e2e fixture's module-global `spec` couples cases under `workers: 1`
+  (asked for twice).
+- The strip has no `aria-live`/`role="status"` region: counts/alerts change
+  silently for screen readers. New a11y feature work, beyond the approved
+  scope.
+- `#board-unacked` stays rendered but permanently hidden (it keeps the
+  id/text/title so the number is not duplicated); documented contract holder.
+- `stripFlagNode` styles every flag with the alert pill regardless of pair
+  tone (carried; pairs other than DEPLOY are unpinned).
+- Group `aria-label` is the tooltip enumeration and the `::before` separators
+  are AT-audible (carried).
+- The `dashboard-slim-strip-baseline` overlay's "base-import-clean" premise is
+  not mechanically guarded; a future slim-only import would turn behavioral
+  evidence into a classifier exit 3 (which fails loud, not silently).
+- `scrollFullyIntoView` in `pipeline-board.spec.ts` scrolls before the
+  reachability assert (the strict-oracle helper from the amendment-#2 repair;
+  changing it risks re-opening that strict-containment work).
+- The visual-capture e2e test always runs and writes fixed ignored paths
+  (that is its purpose: operator/vision evidence).

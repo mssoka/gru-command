@@ -185,6 +185,35 @@ describe('baseline classifier — Playwright (browser) branch', () => {
     expect(result.code).toBe(1);
   });
 
+  it('exits 3 for an empty substring allowlist and for a skipped-only run', () => {
+    const emptyAllow = classifyBaseline(playwrightReport([{ title: 'x', message: 'anything' }]), { playwright: true, substrs: [] });
+    expect(emptyAllow.code).toBe(3);
+    expect(emptyAllow.err).toMatch(/no slim-surface substrings/u);
+    const skippedOnly = classifyBaseline({ stats: { expected: 0, unexpected: 0, skipped: 7, flaky: 0 }, suites: [] }, { playwright: true, substrs: ['strip-groups'] });
+    expect(skippedOnly.code).toBe(3);
+    expect(skippedOnly.err).toMatch(/no Playwright test actually ran/u);
+  });
+
+  it('treats a SKIPPED instrument test as non-evidence (3), a passing one as a broken claim (2)', () => {
+    const skipped = classifyBaseline(
+      vitestReport([{ name: 'slim-strip.baseline.test.ts', status: 'failed', message: '', assertionResults: [
+        assertion('a', 'failed', ['AssertionError: absent']),
+        assertion('b', 'skipped', []),
+      ] }]),
+      { requireFile: 'slim-strip.baseline.test.ts' },
+    );
+    expect(skipped.code).toBe(3);
+    expect(skipped.err).toMatch(/SKIPPED/u);
+    const passed = classifyBaseline(
+      vitestReport([{ name: 'slim-strip.baseline.test.ts', status: 'failed', message: '', assertionResults: [
+        assertion('a', 'failed', ['AssertionError: absent']),
+        assertion('b', 'passed'),
+      ] }]),
+      { requireFile: 'slim-strip.baseline.test.ts' },
+    );
+    expect(passed.code).toBe(2);
+  });
+
   it('exits 3 when none match, and 2 when nothing failed', () => {
     const none = classifyBaseline(playwrightReport([{ title: 'x', message: 'some unrelated failure' }]), { playwright: true, substrs });
     expect(none.code).toBe(3);

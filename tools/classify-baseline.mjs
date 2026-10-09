@@ -43,6 +43,11 @@ export function classifyBaseline(report, { playwright = false, requireFile = nul
 }
 
 function classifyPlaywright(report, substrs) {
+  if (substrs.length === 0) {
+    // An empty allowlist would identify every failure: the per-test cause
+    // check must never be vacuous.
+    return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: no slim-surface substrings supplied — cause cannot be identified' };
+  }
   const stats = (report && report.stats) || {};
   // Playwright's JSON stats carry expected/unexpected/skipped/flaky — there
   // is no `total` field; the run's size is their sum.
@@ -74,14 +79,18 @@ function classifyPlaywright(report, substrs) {
   };
   for (const suite of (report && report.suites) ?? []) walk(suite);
   if (unexpected === 0) {
-    return { code: 2, out: '', err: `FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${total} ran, 0 unexpected)` };
+    const ran = (stats.expected ?? 0) + (stats.flaky ?? 0);
+    if (ran === 0) {
+      return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: no Playwright test actually ran (all skipped?) — not behavioral evidence' };
+    }
+    return { code: 2, out: '', err: `FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${ran} ran, 0 unexpected)` };
   }
   // Per-test cause: EVERY unexpected failure must name a missing slim
   // surface; an unclassified failure is never folded into the RED.
   const identified = [];
   const unidentified = [];
   for (const r of results) {
-    if (substrs.length === 0 || substrs.some((s) => `${r.title}\n${r.message}`.includes(s))) identified.push(r);
+    if (substrs.some((s) => `${r.title}\n${r.message}`.includes(s))) identified.push(r);
     else unidentified.push(r);
   }
   if (identified.length === 0) {
@@ -164,8 +173,15 @@ function classifyVitest(report, requireFile) {
       // fault, never a claim that the baseline passed.
       return { code: 3, out: '', err: `BASELINE SETUP/COLLECTION FAILURE: instrument ${requireFile} registered no tests — not behavioral evidence` };
     }
+    const instrumentSkipped = instrumentAssertions.filter((a) => a.status === 'skipped');
+    if (instrumentSkipped.length > 0) {
+      return { code: 3, out: '', err: `BASELINE SETUP FAILURE: ${instrumentSkipped.length} instrument test(s) were SKIPPED — non-evidence, not a broken or held claim` };
+    }
+    if (instrumentAssertions.some((a) => a.status === 'passed')) {
+      return { code: 2, out: '', err: 'FAILS-BEFORE CLAIM BROKEN: the instrument file has passing tests on the base' };
+    }
     if (!instrumentAssertions.every((a) => a.status === 'failed')) {
-      return { code: 2, out: '', err: 'FAILS-BEFORE CLAIM BROKEN: the instrument file has passing/non-failed tests on the base' };
+      return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: the instrument file has tests in a non-evidence state' };
     }
     const nonAssertion = instrumentAssertions.filter(
       (a) => !(a.failureMessages ?? []).some((m) => /AssertionError/.test(m)),

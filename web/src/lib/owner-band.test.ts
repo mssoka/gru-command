@@ -171,6 +171,10 @@ describe('ack consequence copy — honest scope per kind, never parsed prose', (
     const unknown = 'something.brand.new';
     const genericNext = ackNextStep(unknown);
     const genericConsequence = ackConsequence(unknown);
+    // Both surfaces now derive their family from ONE map, so this list only
+    // has to cover every family once: a new family added to the map without
+    // both surfaces (or a family returning the generic copy on one surface)
+    // fails here.
     const kinds = [
       'supervision.provider-wall.agent-1.quota_exceeded',
       'supervision.breaker',
@@ -180,11 +184,18 @@ describe('ack consequence copy — honest scope per kind, never parsed prose', (
       'roll-port-squat',
       unknown,
     ];
+    const families = new Set<string>();
     for (const kind of kinds) {
-      const nextIsGeneric = ackNextStep(kind) === genericNext;
-      const consequenceIsGeneric = ackConsequence(kind) === genericConsequence;
+      const next = ackNextStep(kind);
+      const consequence = ackConsequence(kind);
+      const nextIsGeneric = next === genericNext;
+      const consequenceIsGeneric = consequence === genericConsequence;
       expect(nextIsGeneric, `family drift for ${kind}`).toBe(consequenceIsGeneric);
+      families.add(consequence);
     }
+    // Every family renders its OWN copy (no two families collapse to one
+    // string, which would hide a typo'd kind from both surfaces).
+    expect(families.size, 'distinct family copy').toBe(5);
   });
 });
 
