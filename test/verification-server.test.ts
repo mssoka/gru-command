@@ -10,7 +10,10 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { EventBus } from '../src/events/bus.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
-import { createVerificationServer, type VerificationServer } from '../src/verify/server.js';
+import {
+  createVerificationServer,
+  type VerificationServer,
+} from '../src/verify/server.js';
 import {
   captureReceiptPath,
   captureReceiptSucceeded,
@@ -669,6 +672,26 @@ function plainFrames(frames: readonly TimedFrame[]): Frame[] {
   return frames.map((entry) => entry.frame);
 }
 
+/**
+ * Poll until at least `target` frames of `type` have landed (or the deadline
+ * passes) and return the count reached. Never throws: a base that never pings
+ * fails the caller's assertion instead of a timeout, so the fail-before
+ * baseline is an assertion RED, not a harness timeout.
+ */
+async function frameCountUntil(
+  frames: readonly TimedFrame[],
+  type: string,
+  target: number,
+  timeoutMs: number,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const count = frameTypes(frames).filter((candidate) => candidate === type).length;
+    if (count >= target || Date.now() > deadline) return count;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 /** The largest gap between consecutive body-line arrivals, in ms. */
 function maxArrivalGap(frames: readonly TimedFrame[]): number {
   let worst = 0;
@@ -708,15 +731,20 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     );
 
     // While the slot is held the waiting body keeps receiving real bytes.
-    await waitFor(() => frameTypes(waiting.frames).filter((type) => type === 'ping').length >= 3);
+    const pingsWhileHeld = await frameCountUntil(waiting.frames, 'ping', 3, 2_000);
+    expect(pingsWhileHeld).toBeGreaterThanOrEqual(3);
     const heldTypes = frameTypes(waiting.frames);
     expect(heldTypes[0]).toBe('queued');
     // Only the queued admission and transport pings so far: the waiting
     // request has not started, and the single slot is not bypassed.
     expect(heldTypes.every((type) => type === 'queued' || type === 'ping')).toBe(true);
     expect(existsSync(join(queuedLane.path, 'gate-started.txt'))).toBe(false);
-    // The idle gap stays strictly under the client's 300 s body limit.
+    // The idle gap stays strictly under the client's 300 s body limit, and
+    // stays near the injected cadence — this proves periodic bytes, not a
+    // single late one. (The 300 s literal is the incident requirement; the
+    // 1 s bound is the cadence evidence.)
     expect(maxArrivalGap(waiting.frames)).toBeLessThan(300_000);
+    expect(maxArrivalGap(waiting.frames)).toBeLessThan(1_000);
 
     // Release the holder; the queued request is admitted, then released.
     writeFileSync(join(harness.lanePath, 'held.txt'), 'go');
@@ -738,11 +766,13 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     expect(
       harness.ledger.listJobEvents(queuedJob.id).filter((event) => event.kind === 'verification.started'),
     ).toHaveLength(1);
-    // The holder's stream stayed clean to EOF too.
-    expect(frameTypes(holder.frames).filter((type) => type === 'completed')).toHaveLength(1);
-    expect(frameTypes(holder.frames).lastIndexOf('ping')).toBeLessThan(
-      frameTypes(holder.frames).indexOf('completed'),
-    );
+    // The holder's stream stayed clean to EOF too: it pings while its silent
+    // gate holds, and nothing follows its terminal frame.
+    const holderTypes = frameTypes(holder.frames);
+    expect(holderTypes.filter((type) => type === 'ping').length).toBeGreaterThanOrEqual(1);
+    expect(holderTypes.filter((type) => type === 'completed')).toHaveLength(1);
+    expect(holderTypes[holderTypes.length - 1]).toBe('completed');
+    expect(holderTypes.lastIndexOf('ping')).toBeLessThan(holderTypes.indexOf('completed'));
     await harness.close();
   });
 
@@ -758,17 +788,26 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
 
     const types = frameTypes(reading.frames);
     const startedAt = types.indexOf('started');
-    const firstPing = types.indexOf('ping');
     const firstOutput = types.indexOf('output');
     const completedAt = types.indexOf('completed');
     expect(startedAt).toBeGreaterThanOrEqual(0);
-    expect(firstPing).toBeGreaterThan(startedAt);
-    expect(firstOutput).toBeGreaterThan(firstPing);
+    expect(firstOutput).toBeGreaterThan(startedAt);
     expect(completedAt).toBeGreaterThan(firstOutput);
     expect(types.filter((type) => type === 'ping').length).toBeGreaterThanOrEqual(3);
-    // The silent window between `started` and the first output carried real
-    // periodic bytes, all strictly under the 300 s client body-idle limit.
+    // The silent window between `started` and the first output is bridged by
+    // pings: assert on ARRIVAL TIMES, not frame order (the scheduler emits
+    // `started` after sync git reads and a spawn, so with a short test cadence
+    // a ping may legitimately precede `started`).
+    const startedReading = reading.frames[startedAt]!;
+    const firstOutputReading = reading.frames[firstOutput]!;
+    const bridging = reading.frames.filter(
+      (entry) =>
+        entry.frame.type === 'ping' && entry.at >= startedReading.at && entry.at <= firstOutputReading.at,
+    );
+    expect(bridging.length).toBeGreaterThanOrEqual(2);
+    // All strictly under the 300 s client limit, and near the injected cadence.
     expect(maxArrivalGap(reading.frames.slice(startedAt, firstOutput + 1))).toBeLessThan(300_000);
+    expect(maxArrivalGap(reading.frames.slice(startedAt, firstOutput + 1))).toBeLessThan(1_000);
     expect(types[types.length - 1]).toBe('completed');
 
     // The keepalive is transport-only: the producer's output byte/hash
@@ -794,16 +833,13 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
       heartbeatMs: 25,
     });
     try {
-      const createdBaseline = setIntervalSpy.mock.calls.length;
-      const clearedBaseline = clearIntervalSpy.mock.calls.length;
-
-      // Terminal: exactly one terminal frame, and no transport frame after it.
+      // Terminal: exactly one terminal frame, and nothing after it (the last
+      // frame IS the terminal, so no transport frame can follow it).
       const terminal = collectNdjson(await streamCall(harness.port, { job_id: harness.jobId, scope: 'full' }));
       await terminal.done;
       const terminalTypes = frameTypes(terminal.frames);
       expect(terminalTypes.filter((type) => type === 'completed')).toHaveLength(1);
       expect(terminalTypes[terminalTypes.length - 1]).toBe('completed');
-      expect(terminalTypes.lastIndexOf('ping')).toBeLessThan(terminalTypes.indexOf('completed'));
 
       // Disconnect: dropping the client neither cancels the producer nor
       // crashes the stream, and the response's heartbeat timer is cleared.
@@ -846,15 +882,92 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
       const after = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
       expect(outcomeOf(completedFrame(after.frames))['ok']).toBe(true);
 
-      // One heartbeat interval per response — every one of them cleared.
-      expect(setIntervalSpy.mock.calls.length - createdBaseline).toBe(3);
-      expect(clearIntervalSpy.mock.calls.length - clearedBaseline).toBeGreaterThanOrEqual(3);
+      // One heartbeat interval per response, each armed at the injected
+      // cadence — scoped to our own intervals (a bare global count would
+      // count unrelated runner/harness timers). Each must be unref'd, and
+      // each must be cleared by the time its response has settled.
+      const ourIntervals = setIntervalSpy.mock.calls
+        .map((call, index) => ({ delay: call[1], result: setIntervalSpy.mock.results[index] }))
+        .filter((entry) => entry.delay === 25);
+      expect(ourIntervals).toHaveLength(3);
+      for (const entry of ourIntervals) {
+        const handle = entry.result?.value as NodeJS.Timeout;
+        expect(handle.hasRef?.()).toBe(false);
+        expect(clearIntervalSpy.mock.calls.some((call) => call[0] === handle)).toBe(true);
+      }
     } finally {
       await harness.close();
-      expect(clearIntervalSpy.mock.calls.length).toBe(setIntervalSpy.mock.calls.length);
       setIntervalSpy.mockRestore();
       clearIntervalSpy.mockRestore();
     }
+  });
+
+  it('pins the heartbeat cadence and refuses an unusable one', async () => {
+    const harness = await boot();
+    // The default path (no injected cadence) arms exactly one heartbeat
+    // interval, at a positive integer cadence whose worst-case idle gap
+    // (2 × interval) stays strictly under the client's 300 s body-idle
+    // limit — a regression to a too-long default cannot stay green.
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
+    try {
+      const reading = collectNdjson(await streamCall(harness.port, { job_id: harness.jobId, scope: 'full' }));
+      await reading.done;
+      const delays = setIntervalSpy.mock.calls
+        .map((call) => call[1])
+        .filter((delay): delay is number => typeof delay === 'number');
+      expect(delays).toHaveLength(1);
+      expect(Number.isInteger(delays[0])).toBe(true);
+      expect(delays[0]!).toBeGreaterThan(0);
+      expect(2 * delays[0]!).toBeLessThan(300_000);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+    // A disabled or oversized cadence is refused before any scheduler or
+    // producer exists: it would reintroduce the truncation the fix removes.
+    for (const unusable of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 150_000, 300_000]) {
+      expect(() =>
+        createVerificationServer({
+          config: harness.config,
+          ledger: harness.ledger,
+          worktrees: harness.worktrees,
+          heartbeatMs: unusable,
+        }),
+      ).toThrow(/heartbeat/u);
+    }
+    await harness.close();
+  });
+
+  it('keeps an attached duplicate stream alive and stops at its terminal', async () => {
+    const harness = await boot({
+      manifest: ['[verify]', 'full = "node quiet.mjs 400"', ''].join('\n'),
+      files: { 'quiet.mjs': QUIET_SCRIPT },
+      maxConcurrent: 2,
+      heartbeatMs: 25,
+    });
+    const first = collectNdjson(
+      await streamCall(harness.port, { job_id: harness.jobId, scope: 'full', request_id: 'req-attach-keepalive-1' }),
+    );
+    await waitFor(() => first.frames.length >= 1);
+    // The duplicate submission attaches to the SAME in-flight producer.
+    const second = collectNdjson(
+      await streamCall(harness.port, { job_id: harness.jobId, scope: 'full', request_id: 'req-attach-keepalive-2' }),
+    );
+    await Promise.all([first.done, second.done]);
+
+    const attachedTypes = frameTypes(second.frames);
+    expect(attachedTypes[0]).toBe('attached');
+    expect(attachedTypes.filter((type) => type === 'ping').length).toBeGreaterThanOrEqual(3);
+    expect(attachedTypes.filter((type) => type === 'completed')).toHaveLength(1);
+    expect(attachedTypes[attachedTypes.length - 1]).toBe('completed');
+    expect(attachedTypes.lastIndexOf('ping')).toBeLessThan(attachedTypes.indexOf('completed'));
+    // One producer only: the duplicate attached, it never spawned a second.
+    expect(
+      harness.ledger.listJobEvents(harness.jobId).filter((event) => event.kind === 'verification.started'),
+    ).toHaveLength(1);
+    expect(outcomeOf(completedFrame(plainFrames(second.frames)))['runId']).toBe(
+      outcomeOf(completedFrame(plainFrames(first.frames)))['runId'],
+    );
+    await harness.close();
   });
 
   it('capture remains honest with keepalive', async () => {
@@ -909,7 +1022,11 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     expect(captured).toContain('"type":"completed"');
     const parsed = parseCapturedNdjson(captured);
     expect(parsed.malformed).toBe(0);
+    // Producer frames and transport pings are recorded separately, and the
+    // receipt's count still matches the honest capture reader's.
     expect(parsed.frames).toBe(receipt!.frames);
+    expect(parsed.pings).toBe(receipt!.pings);
+    expect(receipt!.pings).toBeGreaterThan(0);
     expect((captured.match(/"type":"completed"/gu) ?? [])).toHaveLength(1);
     // Exactly one producer ran: the keepalive never minted a second run.
     expect(

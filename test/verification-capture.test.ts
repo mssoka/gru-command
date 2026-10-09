@@ -121,6 +121,7 @@ describe('capture receipts', () => {
       outcome: 'completed',
       reconciled: false,
       frames: 4,
+      pings: 0,
       capture_bytes: 512,
       capture_sha256: 'c'.repeat(64),
       run_id: 'run-1',
@@ -616,10 +617,12 @@ describe('keepalive pings in the capture stream (incident 2026-10-09)', () => {
 
   it('accepts interleaved pings and still rejects a frame after the terminal', () => {
     const parsed = parseCapturedNdjson(completedWithPings());
-    // Pings are counted as real frames but are never malformed, and the one
-    // terminal completion binds the run/head/output as before.
+    // Pings are counted apart from the producer frames and are never
+    // malformed, and the one terminal completion binds the run/head/output
+    // as before.
     expect(parsed.malformed).toBe(0);
-    expect(parsed.frames).toBe(7);
+    expect(parsed.frames).toBe(4);
+    expect(parsed.pings).toBe(3);
     expect(parsed.started).toBe(true);
     expect(parsed.outcome?.['runId']).toBe('run-capture-1');
 
@@ -646,6 +649,9 @@ describe('keepalive pings in the capture stream (incident 2026-10-09)', () => {
     expect(captureReceiptSucceeded(receipt)).toBe(true);
     expect(receipt.run_id).toBe('run-capture-1');
     expect(receipt.head).toBe('a'.repeat(40));
+    // Producer frames and transport pings are recorded separately.
+    expect(receipt.frames).toBe(4);
+    expect(receipt.pings).toBe(3);
     // Every real body byte to EOF is preserved, pings included.
     expect(readFileSync(sinkPath, 'utf-8')).toBe(body);
   });
@@ -680,7 +686,10 @@ describe('keepalive pings in the capture stream (incident 2026-10-09)', () => {
     expect(receipt.outcome).toBe('unknown');
     expect(receipt.started).toBe(true);
     expect(receipt.error).toContain('socket reset');
-    // Pings never fabricate producer output or a terminal: no output binding.
+    // The keepalive pings were honestly recorded as liveness, not producer
+    // frames, and never fabricate output or a terminal.
+    expect(receipt.pings).toBe(2);
+    expect(receipt.frames).toBe(2);
     expect(receipt.output_bytes).toBeNull();
     expect(captureReceiptSucceeded(receipt)).toBe(false);
   });

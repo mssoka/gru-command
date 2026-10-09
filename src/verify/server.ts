@@ -55,9 +55,12 @@ export interface VerificationServerOptions {
   readonly scheduler?: VerificationScheduler;
   /**
    * Transport heartbeat cadence in milliseconds (test seam; default
-   * {@link VERIFY_HEARTBEAT_MS}). Must be a positive integer: disabling the
-   * heartbeat is exactly the truncation defect this guards against, so an
-   * unusable cadence is refused loudly rather than silently accepted.
+   * {@link VERIFY_HEARTBEAT_MS}). Must be a positive integer whose worst-case
+   * idle gap (`2 × heartbeatMs`) stays strictly under the client's
+   * {@link VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS}: disabling the heartbeat, or
+   * setting it above that bound, is exactly the truncation defect this
+   * guards against, so an unusable cadence is refused loudly rather than
+   * silently accepted.
    */
   readonly heartbeatMs?: number;
   readonly log?: Log;
@@ -83,10 +86,19 @@ const MAX_BODY_BYTES = 64 * 1024;
  * streams aborted at a ~301 s silent gap even though the producer kept
  * running. The response body therefore emits an application-level liveness
  * frame whenever it has been silent for one interval, so a valid stream is
- * never truncated for being idle. Worst-case idle gap is 2 × interval
- * (~30 s), an order of magnitude under the 300 s client limit.
+ * never truncated for being idle. Idle is measured from the stream's first
+ * frame (admission writes it synchronously today); from there the worst-case
+ * gap is 2 × interval (~30 s), an order of magnitude under the client limit.
  */
 export const VERIFY_HEARTBEAT_MS = 15_000;
+
+/**
+ * The streaming client's default HTTP body-idle timeout (Node 22 / undici
+ * `bodyTimeout`). The heartbeat exists to stay strictly under it: because
+ * one idle interval can be skipped when a frame lands just before a tick,
+ * the usable cadence must satisfy `2 × heartbeatMs < this`.
+ */
+export const VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS = 300_000;
 
 /**
  * Application-level keepalive (same idiom as the chat/board surfaces' `ping`):
@@ -123,10 +135,15 @@ export const DEFAULT_VERIFY_SCOPE = 'full';
 export function createVerificationServer(options: VerificationServerOptions): VerificationServer {
   const log = options.log ?? (() => {});
   const heartbeatMs = options.heartbeatMs ?? VERIFY_HEARTBEAT_MS;
-  if (!Number.isInteger(heartbeatMs) || heartbeatMs <= 0) {
+  if (
+    !Number.isInteger(heartbeatMs) ||
+    heartbeatMs <= 0 ||
+    2 * heartbeatMs >= VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS
+  ) {
     throw new Error(
-      `verification heartbeat must be a positive integer of milliseconds, got ${String(options.heartbeatMs)} — ` +
-        'a disabled heartbeat reintroduces the 300 s idle-body truncation',
+      `verification heartbeat must be a positive integer of milliseconds with a worst-case idle gap (2 × heartbeat) ` +
+        `strictly under the client's ${VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS} ms body-idle limit, got ${String(options.heartbeatMs)} — ` +
+        'a disabled or oversized heartbeat reintroduces the idle-body truncation',
     );
   }
   const tokenHash = hashToken(options.config.auth.token);
@@ -344,7 +361,9 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     // Pings only fill silence AFTER the stream has begun: the first frame is
     // always a real protocol frame, never a heartbeat.
     let bodyStarted = false;
-    let lastBodyWriteAt = Date.now();
+    // Monotonic clock: a wall-clock step must never suppress a heartbeat
+    // (or, worse, let a >300 s NTP jump reintroduce the truncation).
+    let lastBodyWriteAt = performance.now();
     let heartbeat: ReturnType<typeof setInterval> | null = null;
     const stopHeartbeat = (): void => {
       if (heartbeat === null) return;
@@ -371,7 +390,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
           });
         }
         bodyStarted = true;
-        lastBodyWriteAt = Date.now();
+        lastBodyWriteAt = performance.now();
       } catch {
         closed = true;
       }
@@ -381,7 +400,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     // holds the process open on its own.
     heartbeat = setInterval(() => {
       if (closed || terminal || !bodyStarted || res.writableEnded) return;
-      if (Date.now() - lastBodyWriteAt < heartbeatMs) return;
+      if (performance.now() - lastBodyWriteAt < heartbeatMs) return;
       void writeFrame({ type: 'ping' } satisfies PingFrame);
     }, heartbeatMs);
     heartbeat.unref?.();
