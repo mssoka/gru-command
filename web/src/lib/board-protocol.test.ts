@@ -395,7 +395,8 @@ describe('board server-frame validator', () => {
       branch: 'main',
       runNumber: 12,
       url: 'https://github.com/example/demo/actions/runs/42',
-      runStartedAt: '2026-01-01T00:00:00.000Z',
+      runCreatedAt: '2026-01-01T00:00:00.000Z',
+      runStartedAt: '2026-01-01T00:01:00.000Z',
       runUpdatedAt: '2026-01-01T00:05:00.000Z',
     };
     const row = {
@@ -416,7 +417,7 @@ describe('board server-frame validator', () => {
     };
     expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [row] } } as unknown)).toBe(true);
     // The exact server-emitted absence shapes (no provider strings) pass.
-    const absence = { ...run, status: null, conclusion: null, workflow: null, runNumber: null, runStartedAt: null, runUpdatedAt: null };
+    const absence = { ...run, status: null, conclusion: null, workflow: null, runNumber: null, runCreatedAt: null, runStartedAt: null, runUpdatedAt: null };
     for (const absent of [
       { ...row, run: { ...absence, state: 'never-run' } },
       { ...row, run: { ...absence, state: 'no-workflow' } },
@@ -504,6 +505,10 @@ describe('board server-frame validator', () => {
       // invisible names and incoherent freshness claims never validate.
       { ...row, host: 'evil.example' },
       { ...row, run: { ...run, url: 'https://evil.example/actions/runs/42' } },
+      // Credentials and alternate ports never validate (fail closed).
+      { ...row, run: { ...run, url: 'https://user:secret@github.com/actions/runs/42' } },
+      { ...row, run: { ...run, url: 'https://github.com:8443/actions/runs/42' } },
+      { ...row, link: 'https://user:secret@github.com/example/demo' },
       { ...row, run: { ...run, status: '' } },
       { ...row, run: { ...run, workflow: '' } },
       { ...row, run: { ...run, branch: '' } },

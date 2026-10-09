@@ -26,6 +26,7 @@ function row(over: Partial<RepoOverviewRowView> = {}): RepoOverviewRowView {
       branch: 'main',
       runNumber: 12,
       url: 'https://github.com/acme/alpha/actions/runs/12',
+      runCreatedAt: CHECKED,
       runStartedAt: CHECKED,
       runUpdatedAt: CHECKED,
     },
@@ -257,6 +258,29 @@ describe('managed repository overview panel', () => {
     // When every control disappears focus stays on the module itself.
     view.render({ rows: [] });
     expect(document.activeElement).toBe(mount);
+  });
+
+  it('fails closed on credential-bearing or alternate-port links even if validation was bypassed', () => {
+    const { mount, view } = panel();
+    view.render({
+      rows: [
+        row({ link: 'https://user:secret@github.com/acme/alpha' }),
+        row({
+          key: 'beta',
+          displayName: 'beta',
+          link: 'https://github.com/acme/beta',
+          fullName: 'acme/beta',
+          run: { ...row().run!, url: 'https://github.com:8443/acme/alpha/actions/runs/12' },
+        }),
+      ],
+    });
+    const articles = mount.querySelectorAll<HTMLElement>('.repo-row');
+    // The credential-bearing repository link renders as text, not an href.
+    expect(articles[0]?.querySelector('a.repo-row__name')).toBeNull();
+    expect(articles[0]?.querySelector('.repo-row__name')?.textContent).toBe('alpha');
+    // The alternate-port run URL is never a link (the valid row link still is).
+    expect(articles[1]?.querySelector('a.repo-row__name')).not.toBeNull();
+    expect(articles[1]?.querySelector('.repo-row__ci-link')).toBeNull();
   });
 
   it('fails closed on a link whose host differs from the row host, even if validation was bypassed', () => {

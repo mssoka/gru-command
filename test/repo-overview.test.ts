@@ -52,6 +52,7 @@ function rawRun(over: Partial<RepoOverviewRunRaw> = {}): RepoOverviewRunRaw {
     url: 'https://github.com/acme/alpha/actions/runs/1',
     runNumber: 1,
     createdAt: '2026-10-07T10:00:00.000Z',
+    startedAt: '2026-10-07T10:00:00.000Z',
     updatedAt: '2026-10-07T10:05:00.000Z',
     ...over,
   };
@@ -690,6 +691,7 @@ describe('managed repo overview — gh adapter', () => {
               conclusion: 'success',
               html_url: 'https://github.com/acme/alpha/actions/runs/42',
               run_number: 12,
+              created_at: '2026-10-07T09:59:00Z',
               run_started_at: '2026-10-07T10:00:00Z',
               updated_at: '2026-10-07T10:05:00Z',
             },
@@ -713,7 +715,8 @@ describe('managed repo overview — gh adapter', () => {
           conclusion: 'success',
           url: 'https://github.com/acme/alpha/actions/runs/42',
           runNumber: 12,
-          createdAt: '2026-10-07T10:00:00Z',
+          createdAt: '2026-10-07T09:59:00Z',
+          startedAt: '2026-10-07T10:00:00Z',
           updatedAt: '2026-10-07T10:05:00Z',
         },
       ],
@@ -838,21 +841,54 @@ describe('managed repo overview tracker — review-round guarantees', () => {
     expect(row(h.tracker.view(), 'alpha').freshness).toBe('fresh');
   });
 
-  it('advances rotation past a partial observation when the budget cannot fit one', async () => {
+  it('prioritizes a discarded observation then rotates fairly when the budget cannot finish one', async () => {
     const api = new FakeApi().set('alpha', {}).set('beta', {}).set('gamma', {});
     const h = harness({ names: ['alpha', 'beta', 'gamma'], api, maxCallsPerRefresh: 3 });
-    await h.tracker.refresh();
-    await h.tracker.refresh();
-    await h.tracker.refresh();
-    // The more likely truncation mode (budget runs out mid-observation)
-    // leaves an operator-visible trace, not just the loop pre-check.
-    expect(h.failure).toContain('budget exhausted');
-    const touched = new Set(api.calls.map((call) => call.split(':')[1]));
-    expect(touched).toEqual(new Set(['acme/alpha', 'acme/beta', 'acme/gamma']));
+    const firstAttempted: string[] = [];
+    for (let pass = 0; pass < 6; pass += 1) {
+      h.api.calls.length = 0;
+      await h.tracker.refresh();
+      firstAttempted.push(h.api.calls[0]?.split(':')[1] ?? '');
+    }
+    // Each discarded repository is resumed FIRST on the next pass, and a
+    // repeated discard rotates on: no repository is starved, and the cursor
+    // never pins to one entry.
+    expect(firstAttempted).toEqual([
+      'acme/alpha',
+      'acme/alpha',
+      'acme/beta',
+      'acme/beta',
+      'acme/gamma',
+      'acme/gamma',
+    ]);
     for (const key of ['alpha', 'beta', 'gamma']) {
       expect(row(h.tracker.view(), key).lastAttemptAt).toBeNull();
       expect(row(h.tracker.view(), key).checkedAt).toBeNull();
     }
+    expect(h.failure).toContain('budget exhausted');
+  });
+
+  it('resumes the truncated last repository on the next pass (production-shaped 21-repo budget)', async () => {
+    const names = Array.from({ length: 21 }, (_, index) => `repo-${String(index).padStart(2, '0')}`);
+    const api = new FakeApi();
+    // The first repository has no workflows (4 calls); the next 19 cost 5
+    // each = 99, so the 21st is truncated mid-observation at the 100-call
+    // budget exactly as the production shape does.
+    api.set(names[0] as string, { workflows: { kind: 'ok', value: 0 } });
+    for (const name of names.slice(1)) {
+      api.set(name, { workflows: { kind: 'ok', value: 1 }, runs: { kind: 'ok', value: [rawRun()] } });
+    }
+    const h = harness({ names, api, maxCallsPerRefresh: 100 });
+    const first = await h.tracker.refresh();
+    expect(row(first, names[20] as string).checkedAt).toBeNull();
+    expect(row(first, names[19] as string).checkedAt).not.toBeNull();
+
+    h.api.calls.length = 0;
+    const second = await h.tracker.refresh();
+    // The truncated tail is the FIRST repository observed on the next pass.
+    expect(h.api.calls[0]).toBe(`fetchRepo:acme/${names[20]}`);
+    expect(row(second, names[20] as string).checkedAt).not.toBeNull();
+    expect(row(second, names[0] as string).checkedAt).not.toBeNull();
   });
 
   it('paces search calls to the sustained GitHub search quota', async () => {
@@ -955,7 +991,10 @@ describe('managed repo overview tracker — review-round guarantees', () => {
     const result = await adapter.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 });
     if (result.kind !== 'ok') throw new Error('expected ok');
     expect(result.value[0]?.runNumber).toBeNull();
+    // `run_started_at` no longer substitutes for the creation key: a run
+    // without `created_at` has no creation time and sorts by id only.
     expect(result.value[0]?.createdAt).toBeNull();
+    expect(result.value[0]?.startedAt).toBeNull();
     expect(result.value[0]?.updatedAt).toBeNull();
     // A malformed run id never participates in the newest-run tie-break.
     expect(result.value[0]?.id).toBe(7);
@@ -967,6 +1006,7 @@ describe('managed repo overview tracker — review-round guarantees', () => {
     expect(badIdResult.value[0]?.id).toBeNull();
     expect(result.value[1]?.runNumber).toBeNull();
     expect(result.value[1]?.createdAt).toBe('2026-10-07T10:00:00.000Z');
+    expect(result.value[1]?.startedAt).toBeNull();
     expect(result.value[1]?.updatedAt).toBe('2026-10-07T10:05:00.000Z');
   });
 
@@ -1452,9 +1492,16 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       'countOpenPulls:acme/beta',
     ]);
     expect(h.failure).toContain('budget exhausted');
-    // The exact unit count is a round-9-only observable: 5 (alpha) + 2
-    // (beta) = 7; a guard-less or phantom-unit build books 8.
+    // The exact unit count is an exact provider-call record: 5 (alpha) +
+    // 2 (beta) = 7; a guard-less or phantom-unit build books 8.
     expect(h.failureFields?.calls).toBe(7);
+
+    // The discarded beta observation resumes FIRST on the next pass rather
+    // than waiting behind alpha for a full rotation.
+    h.api.calls.length = 0;
+    const second = await h.tracker.refresh();
+    expect(h.api.calls[0]).toBe('fetchRepo:acme/beta');
+    expect(row(second, 'beta').freshness).toBe('fresh');
   });
 
   it('queries the port for the branch it discovered, including after a default-branch move', async () => {
@@ -1499,5 +1546,78 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const entry = row(await h.tracker.refresh(), 'alpha');
     expect(entry.run?.state).toBe('passed');
     expect(entry.run?.url).toContain('/runs/9');
+  });
+});
+
+describe('managed repo overview tracker — run timestamp semantics', () => {
+  it('selects by actual creation through the real adapter and tracker (a delayed older run never displaces a newer queued run)', async () => {
+    const olderDelayedStart = {
+      id: 1,
+      name: 'CI',
+      status: 'completed',
+      conclusion: 'success',
+      html_url: 'https://github.com/acme/alpha/actions/runs/1',
+      run_number: 1,
+      created_at: '2026-10-07T10:00:00.000Z',
+      run_started_at: '2026-10-07T12:00:00.000Z',
+      updated_at: '2026-10-07T12:10:00.000Z',
+    };
+    const newerQueued = {
+      id: 2,
+      name: 'CI',
+      status: 'queued',
+      conclusion: null,
+      html_url: 'https://github.com/acme/alpha/actions/runs/2',
+      run_number: 2,
+      created_at: '2026-10-07T11:00:00.000Z',
+      run_started_at: null,
+      updated_at: '2026-10-07T11:00:00.000Z',
+    };
+    const runner: GhCommandRunner = async (args) => {
+      const path = args[3] ?? '';
+      if (path === 'repos/acme/alpha') {
+        return { status: 0, stdout: JSON.stringify({ default_branch: 'main' }), stderr: '' };
+      }
+      if (path.startsWith('search/issues')) {
+        return { status: 0, stdout: JSON.stringify({ total_count: 0, incomplete_results: false }), stderr: '' };
+      }
+      if (path.startsWith('repos/acme/alpha/actions/workflows')) {
+        return { status: 0, stdout: JSON.stringify({ total_count: 1 }), stderr: '' };
+      }
+      if (path.startsWith('repos/acme/alpha/actions/runs')) {
+        return { status: 0, stdout: JSON.stringify({ workflow_runs: [olderDelayedStart, newerQueued] }), stderr: '' };
+      }
+      return { status: 1, stdout: '', stderr: `unexpected path ${path}` };
+    };
+    const adapter = new GhRepoOverviewApi(runner);
+
+    // Adapter level: creation and start are distinct, never conflated.
+    const runs = await adapter.latestRuns({ repo: githubRef('alpha'), branch: 'main', limit: 3 });
+    if (runs.kind !== 'ok') throw new Error('expected ok');
+    expect(runs.value[0]).toMatchObject({
+      createdAt: '2026-10-07T10:00:00.000Z',
+      startedAt: '2026-10-07T12:00:00.000Z',
+    });
+    expect(runs.value[1]).toMatchObject({
+      createdAt: '2026-10-07T11:00:00.000Z',
+      startedAt: null,
+    });
+
+    // Tracker level: the NEWER-CREATED queued run wins even though the
+    // older run has the later start time (never PASSED in its place).
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      api: adapter,
+      scanRepos: () => ['alpha'],
+      resolveRemote: () => githubRef('alpha'),
+      now: () => T0,
+      sleep: async () => {},
+      log: () => {},
+    });
+    const entry = row(await tracker.refresh(), 'alpha');
+    expect(entry.run?.state).toBe('queued');
+    expect(entry.run?.runCreatedAt).toBe('2026-10-07T11:00:00.000Z');
+    expect(entry.run?.runStartedAt).toBeNull();
+    expect(isValidSnapshot(validBoardSnapshot(tracker.view()))).toBe(true);
   });
 });

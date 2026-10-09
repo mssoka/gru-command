@@ -158,6 +158,8 @@ export function repoRunContextTitle(row: RepoOverviewRowView): string | null {
   const parts = [`provider status: ${run.status}`];
   if (run.conclusion !== null) parts.push(`conclusion: ${run.conclusion}`);
   if (run.runNumber !== null) parts.push(`run #${run.runNumber}`);
+  // Creation and start are distinct semantics; both are disclosed.
+  if (run.runCreatedAt !== null) parts.push(`created ${run.runCreatedAt}`);
   if (run.runStartedAt !== null) parts.push(`started ${run.runStartedAt}`);
   if (run.runUpdatedAt !== null) parts.push(`updated ${run.runUpdatedAt}`);
   return parts.join(' · ');

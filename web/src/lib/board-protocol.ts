@@ -417,6 +417,9 @@ export interface RepoOverviewRunView {
   readonly branch: string | null;
   readonly runNumber: number | null;
   readonly url: string | null;
+  /** Actual provider creation time (the newest-run selection key). */
+  readonly runCreatedAt: string | null;
+  /** Actual attempt start; null while queued. Distinct from creation. */
   readonly runStartedAt: string | null;
   readonly runUpdatedAt: string | null;
 }
@@ -967,7 +970,9 @@ function isHttpsUrlOrNull(value: unknown): value is string | null {
   if (value === null) return true;
   if (typeof value !== 'string') return false;
   try {
-    return new URL(value).protocol === 'https:';
+    const url = new URL(value);
+    // Credentials and alternate ports never validate (fail closed).
+    return url.protocol === 'https:' && url.username === '' && url.password === '' && url.port === '';
   } catch {
     return false;
   }
@@ -988,6 +993,7 @@ function isRepoOverviewRunView(value: unknown): value is RepoOverviewRunView {
     (value.runNumber === null ||
       (typeof value.runNumber === 'number' && Number.isSafeInteger(value.runNumber) && value.runNumber >= 0)) &&
     isHttpsUrlOrNull(value.url) &&
+    isNullableIso(value.runCreatedAt) &&
     isNullableIso(value.runStartedAt) &&
     isNullableIso(value.runUpdatedAt)
   );

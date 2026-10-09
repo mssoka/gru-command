@@ -30,7 +30,9 @@ import { discoverManagedReposAsync } from './discovery.js';
  * GitHub reads are server-side through the authenticated `gh` seam,
  * bounded by a per-refresh call budget and a rotating cursor so a large
  * registry cannot starve earlier entries, and coalesced so overlapping
- * refreshes share one run. Rate-limit/auth failures abort the refresh;
+ * refreshes share one run. A truncated (discarded) observation is
+ * PRIORITIZED on the next pass — resumed at that repository — while a
+ * budget too small to complete any observation still rotates fairly. Rate-limit/auth failures abort the refresh;
  * the next cadence re-observes from scratch. A failed repo keeps its
  * last COMPLETE observation (counts and run share one checkedAt), which
  * the board renders as stale with age and the failure — an old green
@@ -91,6 +93,10 @@ export interface RepoOverviewRunView {
   readonly runNumber: number | null;
   /** Validated https run URL on the repository host, or null. */
   readonly url: string | null;
+  /** Actual provider creation time (the newest-run selection key). */
+  readonly runCreatedAt: string | null;
+  /** Actual attempt start (`run_started_at`); null while queued/never
+   * started. Distinct from creation — never conflated with it. */
   readonly runStartedAt: string | null;
   readonly runUpdatedAt: string | null;
 }
@@ -174,7 +180,12 @@ export interface RepoOverviewRunRaw {
   readonly conclusion: string | null;
   readonly url: string | null;
   readonly runNumber: number | null;
+  /** Actual provider creation time (`created_at`) — the selection key. */
   readonly createdAt: string | null;
+  /** Actual attempt start (`run_started_at`), kept DISTINCT from creation:
+   * a queued run has no start yet, and a delayed older run can start after
+   * a newer run was created. Never substituted for the creation key. */
+  readonly startedAt: string | null;
   readonly updatedAt: string | null;
 }
 
@@ -264,9 +275,11 @@ export function runStateOf(status: string | null, conclusion: string | null): Re
   }
 }
 
-/** Newest run wins: max by (createdAt, id). A run without a parseable
- * createdAt only wins over another unparseable one with a larger id — the
- * provider list order is never trusted alone. */
+/** Newest run wins: max by the ACTUAL CREATION time (createdAt), then id.
+ * A run without a parseable creation time only wins over another
+ * unparseable one with a larger id — provider list order is never trusted
+ * alone, and a delayed `run_started_at` can never promote an older run
+ * over a newer queued one. */
 export function selectLatestRun(
   runs: readonly RepoOverviewRunRaw[],
 ): RepoOverviewRunRaw | null {
@@ -375,6 +388,9 @@ export function safeRunUrl(raw: string | null, host: string): string | null {
   }
   if (url.protocol !== 'https:') return null;
   if (url.hostname.toLowerCase() !== host.toLowerCase()) return null;
+  // Credentials must never ride a rendered link, and a non-default port is
+  // a different origin than the repository host.
+  if (url.username !== '' || url.password !== '' || url.port !== '') return null;
   return url.toString();
 }
 
@@ -429,7 +445,8 @@ function runViewOf(raw: RepoOverviewRunRaw, host: string, branch: string): RepoO
     branch,
     runNumber: raw.runNumber,
     url: safeRunUrl(raw.url, host),
-    runStartedAt: raw.createdAt,
+    runCreatedAt: raw.createdAt,
+    runStartedAt: raw.startedAt,
     runUpdatedAt: raw.updatedAt,
   };
 }
@@ -443,6 +460,7 @@ function runUnavailableView(branch: string | null): RepoOverviewRunView {
     branch,
     runNumber: null,
     url: null,
+    runCreatedAt: null,
     runStartedAt: null,
     runUpdatedAt: null,
   };
@@ -466,7 +484,10 @@ function mapRun(value: unknown): RepoOverviewRunRaw | null {
     conclusion: strOrNull(raw['conclusion']),
     url: strOrNull(raw['html_url']),
     runNumber: countOrNull(raw['run_number']),
-    createdAt: isoOrNull(raw['run_started_at']) ?? isoOrNull(raw['created_at']),
+    // Distinct semantics: creation is the selection key; the attempt start
+    // is display context and is never substituted for it.
+    createdAt: isoOrNull(raw['created_at']),
+    startedAt: isoOrNull(raw['run_started_at']),
     updatedAt: isoOrNull(raw['updated_at']),
   };
 }
@@ -714,6 +735,13 @@ export class ManagedRepoOverviewTracker {
   private readonly states = new Map<string, RepoSourceState>();
   private registry: readonly string[] = [];
   private cursor = 0;
+  /** The repository whose observation was discarded incomplete (budget or
+   * wall-clock truncation): the NEXT refresh resumes at it so a partially
+   * observed tail is prioritized instead of starving behind a repeated
+   * prefix. Cleared once honored; a re-discard of an already-prioritized
+   * repository rotates on so a budget too small to complete any
+   * observation still makes fair progress. */
+  private priorityName: string | null = null;
   private classifyCursor = 0;
   private lastSearchAtMs: number | null = null;
   private refreshedOnce = false;
@@ -901,7 +929,13 @@ export class ManagedRepoOverviewTracker {
     this.registry = repos.filter((name) => nextStates.has(name));
     this.states.clear();
     for (const [name, state] of nextStates) this.states.set(name, state);
-    const start = repos.length === 0 ? 0 : this.cursor % repos.length;
+    // Resume at the discarded repository when one is pending (and still
+    // linked); otherwise use the rotation cursor.
+    const priorityIndex = this.priorityName !== null ? repos.indexOf(this.priorityName) : -1;
+    const priorityLinked =
+      priorityIndex >= 0 && this.states.get(this.priorityName as string)?.ref != null;
+    const start =
+      repos.length === 0 ? 0 : priorityLinked ? priorityIndex : this.cursor % repos.length;
     const order = [...repos.slice(start), ...repos.slice(0, start)];
     const fetchable = order.filter((name) => {
       const state = this.states.get(name);
@@ -919,6 +953,7 @@ export class ManagedRepoOverviewTracker {
       deadlineMs: this.now() + REPO_OVERVIEW_FETCH_BUDGET_MS,
     };
     let nextIndex = 0;
+    let discarded: string | null = null;
     let failures = 0;
     let aborted: string | null = null;
     let abortDetail: string | null = null;
@@ -935,12 +970,13 @@ export class ManagedRepoOverviewTracker {
       }
       const outcome = await this.observe(fetchable[index] as string, budget);
       if (outcome.retry) {
-        // A partial observation is discarded and rotation moves on: a
-        // budget smaller than one observation (or a call outliving the
-        // wall-clock bound) must degrade fairly across the registry,
-        // never re-spend every cycle on the same entry.
+        // The partial observation is discarded, and its repository is
+        // prioritized on the next pass (never silently skipped past): a
+        // budget or wall-clock truncation must not starve the tail behind
+        // a repeated prefix.
         aborted = outcome.detail !== null && outcome.detail.includes('wall-clock') ? 'deadline' : 'budget';
-        nextIndex = index + 1;
+        discarded = fetchable[index] as string;
+        nextIndex = index;
         break;
       }
       nextIndex = index + 1;
@@ -963,8 +999,23 @@ export class ManagedRepoOverviewTracker {
         state.error = `refresh aborted before this repository was checked: ${abortDetail}`.slice(0, 300);
       }
     }
-    const resumeName = fetchable[nextIndex] ?? null;
-    this.cursor = resumeName === null ? 0 : Math.max(0, repos.indexOf(resumeName));
+    if (discarded !== null) {
+      if (this.priorityName === discarded) {
+        // The prioritized retry could not complete either (a budget too
+        // small to finish ANY observation): rotate on so every repository
+        // still gets its turn instead of pinning the cursor forever.
+        const discardedIndex = repos.indexOf(discarded);
+        this.priorityName = null;
+        this.cursor = repos.length <= 1 ? 0 : (discardedIndex + 1) % repos.length;
+      } else {
+        this.priorityName = discarded;
+        this.cursor = Math.max(0, repos.indexOf(discarded));
+      }
+    } else {
+      this.priorityName = null;
+      const resumeName = fetchable[nextIndex] ?? null;
+      this.cursor = resumeName === null ? 0 : Math.max(0, repos.indexOf(resumeName));
+    }
     if (aborted === 'budget') {
       this.log('warn', 'repo overview refresh: call budget exhausted — remaining repositories defer', {
         budget: this.maxCallsPerRefresh,
@@ -1015,6 +1066,7 @@ export class ManagedRepoOverviewTracker {
           branch: null,
           runNumber: null,
           url: null,
+          runCreatedAt: null,
           runStartedAt: null,
           runUpdatedAt: null,
         };
@@ -1032,6 +1084,7 @@ export class ManagedRepoOverviewTracker {
             branch,
             runNumber: null,
             url: null,
+            runCreatedAt: null,
             runStartedAt: null,
             runUpdatedAt: null,
           };
@@ -1053,6 +1106,7 @@ export class ManagedRepoOverviewTracker {
                     branch,
                     runNumber: null,
                     url: null,
+                    runCreatedAt: null,
                     runStartedAt: null,
                     runUpdatedAt: null,
                   }

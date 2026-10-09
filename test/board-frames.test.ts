@@ -124,6 +124,7 @@ const SNAPSHOT_VALID = {
           branch: 'main',
           runNumber: 12,
           url: 'https://github.com/example/demo/actions/runs/12',
+          runCreatedAt: '2026-01-01T00:00:00.000Z',
           runStartedAt: '2026-01-01T00:00:00.000Z',
           runUpdatedAt: '2026-01-01T00:01:00.000Z',
         },

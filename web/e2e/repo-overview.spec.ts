@@ -66,7 +66,8 @@ function overview(): RepoOverviewView {
       branch: 'main',
       runNumber: 41,
       url: 'https://github.com/example/demo/actions/runs/41',
-      runStartedAt: at(6),
+      runCreatedAt: at(6),
+      runStartedAt: at(5),
       runUpdatedAt: at(1),
       ...over,
     }) as RepoOverviewView['rows'][number]['run'];
@@ -417,4 +418,29 @@ test('a snapshot without the overview (absent or null) keeps the module hidden',
   // And a real overview brings the module back on the same socket.
   seed.push(seededSnapshot());
   await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+});
+
+test('a snapshot push restores focus without stealing the list scroll position', async ({ page }) => {
+  const seed = await pairAndSeed(page);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  const list = page.locator('.repo-overview__list');
+  const link = page.locator('#board-repos a.repo-row__name').first();
+  await link.focus();
+  // Scroll the list so the focused row is off-screen, then push a fresh
+  // snapshot: focus restoration must not scroll it back into view.
+  await list.evaluate((node) => {
+    node.scrollTop = 240;
+  });
+  const before = await list.evaluate((node) => node.scrollTop);
+  expect(before).toBeGreaterThan(0);
+
+  // Keep the list scrollable (the same row count) so the assertion proves
+  // the restoration, not a scroll-height clamp.
+  seed.push({ ...seededSnapshot(), repoOverview: { rows: overview().rows } });
+  await expect(page.locator('#board-repos .repo-row')).toHaveCount(13);
+  expect(await list.evaluate((node) => node.scrollTop)).toBe(before);
+  const focusStayedOnLink = await page.evaluate(
+    () => document.activeElement?.className?.includes('repo-row__name') ?? false,
+  );
+  expect(focusStayedOnLink).toBe(true);
 });

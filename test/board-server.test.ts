@@ -224,6 +224,7 @@ describe('board server — HTTP API', () => {
             branch: 'main',
             runNumber: 4,
             url: 'https://github.com/acme/alpha/actions/runs/4',
+            runCreatedAt: '2026-10-07T10:00:00.000Z',
             runStartedAt: '2026-10-07T10:00:00.000Z',
             runUpdatedAt: '2026-10-07T10:05:00.000Z',
           },

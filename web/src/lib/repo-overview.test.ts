@@ -32,6 +32,7 @@ function row(over: Partial<RepoOverviewRowView> = {}): RepoOverviewRowView {
       branch: 'main',
       runNumber: 12,
       url: 'https://github.com/acme/alpha/actions/runs/12',
+      runCreatedAt: CHECKED,
       runStartedAt: CHECKED,
       runUpdatedAt: CHECKED,
     },
@@ -240,7 +241,18 @@ describe('managed repository overview — meta and notes', () => {
     expect(repoBadgeTitle(row())).toBe('completed / success');
     expect(repoRunContextTitle(row())).toContain('provider status: completed');
     expect(repoRunContextTitle(row())).toContain('run #12');
+    // Creation and start stay distinct in the disclosure.
+    expect(repoRunContextTitle(row())).toContain('created 2026-10-07T12:00:00.000Z');
     expect(repoRunContextTitle(row())).toContain('started 2026-10-07T12:00:00.000Z');
+    const queued = row({
+      run: {
+        ...row().run!,
+        runStartedAt: null,
+        runCreatedAt: '2026-10-07T11:00:00.000Z',
+      },
+    });
+    expect(repoRunContextTitle(queued)).toContain('created 2026-10-07T11:00:00.000Z');
+    expect(repoRunContextTitle(queued)).not.toContain('started ');
     expect(repoRunContextTitle(row({ run: { ...row().run!, status: null } }))).toBeNull();
     expect(repoRunContextTitle(row({ run: null }))).toBeNull();
   });

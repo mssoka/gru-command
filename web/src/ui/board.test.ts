@@ -3772,6 +3772,7 @@ describe('managed repository overview in the crew rail', () => {
           branch: 'main',
           runNumber: 8,
           url: 'https://github.com/acme/alpha/actions/runs/8',
+          runCreatedAt: checked,
           runStartedAt: checked,
           runUpdatedAt: checked,
         },

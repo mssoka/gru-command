@@ -30,6 +30,8 @@ function safeHref(raw: string | null, host: string | null): string | null {
     const url = new URL(raw);
     if (url.protocol !== 'https:') return null;
     if (host !== null && url.hostname.toLowerCase() !== host.toLowerCase()) return null;
+    // Credentials and alternate ports never render as this row's link.
+    if (url.username !== '' || url.password !== '' || url.port !== '') return null;
     return raw;
   } catch {
     return null;
@@ -90,7 +92,7 @@ export class RepoOverviewPanel {
       // The section is going away (feature off / pre-upgrade): hand
       // keyboard focus back to the CREW tab that owns it rather than
       // dropping it to <body> — including when the module itself held it.
-      if (hadFocus) document.getElementById('rail-tab-agents')?.focus();
+      if (hadFocus) document.getElementById('rail-tab-agents')?.focus({ preventScroll: true });
       return;
     }
     const head = el('div', 'repo-overview__head');
@@ -126,7 +128,9 @@ export class RepoOverviewPanel {
       // module itself) instead of dropping focus to the body.
       const exact = controls.find((node) => node.dataset.focusKey === focusKey);
       const nearest = controls.length === 0 ? null : controls[Math.min(focusIndex, controls.length - 1)];
-      (exact ?? nearest ?? this.mount).focus();
+      // preventScroll: restoring focus must not override the preserved
+      // list scroll position by jumping to an off-screen focused row.
+      (exact ?? nearest ?? this.mount).focus({ preventScroll: true });
     }
   }
 

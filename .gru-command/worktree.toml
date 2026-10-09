@@ -615,7 +615,7 @@ binned-baseline = 'set -e; base=84aec28b04ddc406f26c458383452318f8cb7ed1; headre
 # protocol/pure/DOM suites, invoked only via the authenticated /api/verify
 # scheduler at the project's documented budgets (fast files on the root
 # config), approved RPC patch first, exits never masked.
-repo-overview-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/repo-overview.test.ts test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/board-frames.test.ts test/github-poll.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/repo-overview.test.ts src/lib/board-protocol.test.ts src/ui/repo-overview.test.ts src/ui/board.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts"
+repo-overview-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/repo-overview.test.ts test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/board-frames.test.ts test/github-poll.test.ts test/assert-repo-overview-baseline.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/repo-overview.test.ts src/lib/board-protocol.test.ts src/ui/repo-overview.test.ts src/ui/board.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts"
 
 # Static product checks for the same change: lint, compiler, full build
 # (the pinned Perkins resource verifier included) and the web compiler; no
@@ -631,17 +631,21 @@ repo-overview-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint 
 # approved Option A reference.
 repo-overview-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=repo-overview"
 
-# Fails-before evidence: the FINAL behavioral test bytes for the existing
-# suites the change extends are overlaid onto an isolated git-archive
-# snapshot of the base 49b558f (root+web node_modules symlinked — no
-# download/install; approved RPC patch prerequisite; unchanged configs and
-# budgets). New-module test files are deliberately excluded: they import
-# modules the base cannot resolve, and a module-not-found is not assertion
-# RED. The overlain files must fail by named behavioral assertions (the
-# board-engine repoOverview projection + main-assembly alarm; the web
-# protocol validator's strictness and the BoardView rail integration); a
-# leg that passes, or that has no failed assertion result at all, exits 2.
-# The snapshot directory and the ignored pointer file are preserved for
-# inspection; nothing is deleted or checked out and no branch/worktree
-# holds the sha.
-repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-repo-overview.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts web/src/lib/board-protocol.test.ts web/src/ui/board.test.ts web/src/ui/board-merged-attention.test.ts web/src/ui/owner-chime.test.ts; do mkdir -p "$d/$(dirname "$f")"; git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/repo-overview-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/backend-results.json" test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts; a=$?; cd web; ../node_modules/.bin/vitest run --reporter=json --outputFile="$d/web-results.json" src/lib/board-protocol.test.ts src/ui/board.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts; b=$?; set -e; echo "repo-overview-baseline vitest exits: backend=$a web=$b"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed unexpectedly"; exit 2; fi; node -e "const fs=require(\"node:fs\");let ok=true;for(const f of process.argv.slice(1)){const d=JSON.parse(fs.readFileSync(f,\"utf8\"));const failed=(d.testResults||[]).flatMap(function(s){return s.assertionResults||[]}).filter(function(t){return t.status=== \"failed\" && (t.failureMessages||[]).length>0});if(failed.length===0){console.error(\"no failed assertion results in \"+f);ok=false}else{console.log(f+\": \"+failed.length+\" named failed tests\")}}process.exit(ok?0:2)" "$d/backend-results.json" "$d/web-results.json" || exit 2; echo "EXPECTED-NONZERO: baseline legs failed named behavioral assertions against the pre-change base"; exit 1'
+# Fails-before evidence (feature-specific, native round-1 qualification):
+# the FINAL behavioral test bytes for the existing suites the change
+# extends are overlaid onto an isolated git-archive snapshot of the base
+# 49b558f (root+web node_modules symlinked — no download/install; approved
+# RPC patch prerequisite; unchanged configs and budgets). New-module test
+# files are deliberately excluded: they import modules the base cannot
+# resolve, and a module-not-found is not assertion RED. Because the merged
+# files also carry later-main tests that legitimately fail at the old base,
+# a generic "any named failed test" check would self-confirm from unrelated
+# failures; the classifier (tools/assert-repo-overview-baseline.mjs)
+# therefore requires the EIGHT named Option A absence assertions to fail as
+# AssertionError on their own legs and reports every other failure as
+# excluded context, never as the claim. A leg that passes, has no failed
+# assertion result, fails by collection/setup/import, or is missing a named
+# absence check exits 2. The snapshot directory and the ignored pointer
+# file are preserved for inspection; nothing is deleted or checked out and
+# no branch/worktree holds the sha.
+repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-repo-overview.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts web/src/lib/board-protocol.test.ts web/src/ui/board.test.ts web/src/ui/board-merged-attention.test.ts web/src/ui/owner-chime.test.ts; do mkdir -p "$d/$(dirname "$f")"; git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/repo-overview-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/backend-results.json" test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts; a=$?; cd web; ../node_modules/.bin/vitest run --reporter=json --outputFile="$d/web-results.json" src/lib/board-protocol.test.ts src/ui/board.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts; b=$?; set -e; echo "repo-overview-baseline vitest exits: backend=$a web=$b"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed unexpectedly"; exit 2; fi; node tools/assert-repo-overview-baseline.mjs "$d/backend-results.json" "$d/web-results.json" || exit 2; echo "EXPECTED-NONZERO: baseline legs failed named behavioral assertions against the pre-change base"; exit 1'
