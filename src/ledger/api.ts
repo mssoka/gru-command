@@ -2287,19 +2287,31 @@ export class LedgerApi {
     // Discharged only by a review that actually ADMITTED the corrected work
     // (its round went live) — a round created and then refused at
     // admission/preflight reviewed nothing.
-    const reviewedSince = this.db.prepare(
-      `SELECT 1 FROM events WHERE job_id = ? AND kind = 'round.status'
-         AND json_extract(payload, '$.to') = 'live' AND seq > ? LIMIT 1`,
-    ).get(jobId, correctiveSeq) !== undefined;
-    if (reviewedSince) return null;
     const payload = typeof newest.payload === 'object' && newest.payload !== null
       ? (newest.payload as { sha?: unknown }) : {};
     const head = typeof payload.sha === 'string' && payload.sha !== '' ? payload.sha : null;
+    // A live round of a head delivered at or after the corrective delivery
+    // (any head when the newest is unknown) admitted the corrected work; a
+    // forced round of an unrelated target admits nothing.
+    const reviewedSince = this.db.prepare(
+      `SELECT 1 FROM events e JOIN rounds r ON r.id = e.round_id
+        WHERE e.job_id = ? AND e.kind = 'round.status' AND json_extract(e.payload, '$.to') = 'live' AND e.seq > ?
+          AND (? IS NULL OR r.target_ref IN (
+            SELECT json_extract(d.payload, '$.sha') FROM events d
+             WHERE d.job_id = ? AND d.kind = 'job.delivered' AND d.seq >= ?)) LIMIT 1`,
+    ).get(jobId, correctiveSeq, head, jobId, correctiveSeq) !== undefined;
+    if (reviewedSince) return null;
+    // The pass must post-date the approved correction it answers: a run of
+    // the same bytes recorded before the amendment proves nothing about it.
+    const amendmentSeq = (this.db.prepare(
+      `SELECT MAX(seq) AS seq FROM events WHERE job_id = ? AND kind = 'job.amendment-accepted'
+         AND json_extract(payload, '$.version') = ?`,
+    ).get(jobId, revision) as { seq: number | null } | undefined)?.seq ?? 0;
     const verified = head !== null
       ? this.db.prepare(
         `SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
-           AND json_extract(payload, '$.ok') = 1 AND json_extract(payload, '$.sha') = ? LIMIT 1`,
-      ).get(jobId, head) !== undefined
+           AND json_extract(payload, '$.ok') = 1 AND json_extract(payload, '$.sha') = ? AND seq > ? LIMIT 1`,
+      ).get(jobId, head, amendmentSeq) !== undefined
       : this.db.prepare(
         `SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
            AND json_extract(payload, '$.ok') = 1 AND seq > ? LIMIT 1`,

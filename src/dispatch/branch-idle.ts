@@ -56,6 +56,12 @@ export const BRANCH_BUSY_HINT =
   'wait for lane delivery, re-brief request settlement, a continuation delivering the pending contract revision, ' +
   'or a passing verification of a corrective delivery\'s head; or dispatch with force';
 
+/** The hint when a blocker is a pending material correction: force never
+ * reviews an obsolete candidate (owner rule 2), so it is not offered. */
+export const BRANCH_BUSY_REVISION_HINT =
+  'an approved material correction is pending delivery — send ONE continuation carrying the contract revision ' +
+  '(the service attaches the amendments); force cannot review an obsolete candidate';
+
 /** Statuses whose lane may be mid-flight (dispatched = the lane is about to
  * be created and pushed; working = the attempt is open; in-review = a PR
  * link can land mid-attempt before delivery). */
@@ -114,7 +120,7 @@ export function branchBusyPayload(input: {
         : {}),
       ...(blocker.verification !== undefined ? { verification_required_head: blocker.verification.head } : {}),
     })),
-    hint: BRANCH_BUSY_HINT,
+    hint: input.blockers.some((blocker) => blocker.revision !== undefined) ? BRANCH_BUSY_REVISION_HINT : BRANCH_BUSY_HINT,
   };
 }
 
@@ -128,7 +134,7 @@ export class BranchBusyError extends Error {
     super(
       `branch "${targetBranch}" is busy (${blockers
         .map((blocker) => `${blocker.jobId}: ${blocker.status}`)
-        .join(', ')}); ${BRANCH_BUSY_HINT}`,
+        .join(', ')}); ${blockers.some((blocker) => blocker.revision !== undefined) ? BRANCH_BUSY_REVISION_HINT : BRANCH_BUSY_HINT}`,
     );
     this.name = 'BranchBusyError';
     this.targetBranch = targetBranch;

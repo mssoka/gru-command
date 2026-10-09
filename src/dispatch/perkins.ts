@@ -1993,15 +1993,15 @@ export class WaveRunner {
           if (op.kind === 'fallback') {
             this.supersededFallbackGates.add(input.jobId);
             fallbackInvolved = true;
-          }
-          op.controller.abort(new ReviewSupersededError(input.jobId, input.reason));
-          operations += 1;
-          if (op.roundId === null && op.kind === 'fallback') {
+            // Durable debt FIRST (as for rounds): a crash after the abort
+            // can never lose the fact that this stop is owed a proof.
             this.opts.ledger.appendCustomEvent({
               kind: 'job.review-superseded', jobId: input.jobId,
               payload: { route: 'bmad-review-fallback', reason: input.reason.slice(0, 500), by: input.by },
             });
           }
+          op.controller.abort(new ReviewSupersededError(input.jobId, input.reason));
+          operations += 1;
         }
       }
       const remaining = deadline - Date.now();
@@ -2019,11 +2019,15 @@ export class WaveRunner {
     // Debt already reported action-required (an earlier unconfirmed stop
     // still unproven): a re-proof that fails again is an FYI, not a second
     // alert for the same stuck review.
-    const alreadyReported = (roundIds.size === 0 || [...roundIds].every((id) =>
+    // The job-level receipt carries a stop that owns no round (a setup
+    // before its round, a fallback gate).
+    const jobLevel = roundIds.size === 0 || fallbackInvolved;
+    const jobAlreadyReported = (this.opts.ledger.latestJobEvent(input.jobId, 'job.review-supersession-unconfirmed')?.seq ?? 0) >
+      (this.opts.ledger.latestJobEvent(input.jobId, 'job.review-supersession-confirmed')?.seq ?? 0);
+    const alreadyReported = [...roundIds].every((id) =>
       (this.opts.ledger.latestRoundEvent(id, 'round.supersession-unconfirmed')?.seq ?? 0) >
-        (this.opts.ledger.latestRoundEvent(id, 'round.supersession-confirmed')?.seq ?? 0))) &&
-      (!fallbackInvolved || (this.opts.ledger.latestJobEvent(input.jobId, 'job.review-supersession-unconfirmed')?.seq ?? 0) >
-        (this.opts.ledger.latestJobEvent(input.jobId, 'job.review-supersession-confirmed')?.seq ?? 0));
+        (this.opts.ledger.latestRoundEvent(id, 'round.supersession-confirmed')?.seq ?? 0)) &&
+      (!jobLevel || jobAlreadyReported);
     // Confirmation: no tracked operation left, every superseded round is
     // terminal, and no review session of those rounds still holds a live
     // runtime handle. Anything less is unproven — never "probably stopped".

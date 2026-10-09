@@ -1077,7 +1077,7 @@ describe('review round 2 — durable debts, handoffs and verification (option A)
     expect(ledger.correctiveVerificationDebt('job-debt')).toBeNull();
     // Once a review admitted the corrected work, later ordinary fix
     // deliveries at the same revision are not corrective.
-    const admitted = ledger.addRound({ jobId: 'job-debt', lenses: ['blind'] });
+    const admitted = ledger.addRound({ jobId: 'job-debt', targetRef: 'h2', lenses: ['blind'] });
     ledger.setRoundStatus(admitted.id, 'live');
     ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-debt', payload: { sha: 'h3', work_revision: 1 } });
     expect(ledger.correctiveVerificationDebt('job-debt')).toBeNull();
@@ -1221,7 +1221,7 @@ describe('review round 3 — admitted reviews, retractions, fresh offers', () =>
     const refused = ledger.addRound({ jobId: 'job-live', lenses: ['blind'] });
     ledger.abortReviewSetupWithoutSpawn(refused.id); // created, refused at admission: reviewed nothing
     expect(ledger.correctiveVerificationDebt('job-live')).toEqual({ revision: 1, head: 'hc' });
-    const admitted = ledger.addRound({ jobId: 'job-live', lenses: ['blind'] });
+    const admitted = ledger.addRound({ jobId: 'job-live', targetRef: 'hc', lenses: ['blind'] });
     ledger.setRoundStatus(admitted.id, 'live');
     expect(ledger.correctiveVerificationDebt('job-live')).toBeNull();
   });
@@ -1364,5 +1364,115 @@ describe('review round 3 — admitted reviews, retractions, fresh offers', () =>
     expect(liveReviewSessionIds(registry, ['live', 'gone', 'missing'])).toEqual(['live']);
     const main = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(main).toMatch(/liveReviewSessions:\s*\(agentIds\)\s*=>\s*liveReviewSessionIds\(registry,\s*agentIds\)/);
+  });
+});
+
+describe('review round 4 — fences that cannot be talked around', () => {
+  it('an administrative amendment during a running review supersedes nothing', async () => {
+    const h = await heldReview({ mode: 'running' });
+    const { port } = await serve(h);
+    const roundId = h.wave.activeReview(h.jobId)!.roundIds[0]!;
+    const res = await post(port, '/api/dispatch/amendment', {
+      job_id: h.jobId, body: 'Typo fix in the acceptance wording.', effect: 'administrative',
+      approval: { by: 'gru', reference: 'j-typo' },
+      expected_contract_sha256: h.ledger.effectiveContract(h.jobId)!.contractSha256,
+    });
+    expect(res.json).toMatchObject({ review_supersession: 'none', work_revision: { pending: false } });
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(h.ledger.getRound(roundId)?.status).toBe('live');
+    expect(h.ledger.latestRoundEvent(roundId, 'round.superseded')).toBeNull();
+    expect(h.liveSessions.size).toBeGreaterThan(0);
+  });
+
+  it('a re-brief whose obsolete review cannot be proven stopped is refused before any marker or prompt', async () => {
+    const h = await heldReview({ mode: 'running', closeHangs: true, deadlineMs: 50 });
+    const { port, registry } = await serve(h);
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    const res = await post(port, '/api/silas/rebrief', { job_id: h.jobId, note: 'fresh worker' });
+    expect(res.status).toBe(409);
+    expect(res.json).toMatchObject({ error: 'review_supersession_unconfirmed' });
+    expect(h.ledger.listPendingRebriefs({ jobId: h.jobId })).toEqual([]);
+    expect(registry.prompts).toEqual([]);
+  });
+
+  it('a pending-revision refusal never advises force', async () => {
+    const h = await plainLane('job-hint');
+    deliver(h.ledger, h.jobId);
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    const { port } = await serve(h);
+    const res = await post(port, '/api/dispatch/review', { job_id: h.jobId, by: 'silas' });
+    expect(res.status).toBe(409);
+    expect(res.json).toMatchObject({
+      error: 'branch_busy',
+      blockers: [{ job_id: h.jobId, required_revision: 1, delivered_revision: 0 }],
+    });
+    expect(String(res.json['hint'])).toMatch(/force cannot review an obsolete candidate/);
+    expect(String(res.json['hint'])).not.toMatch(/or dispatch with force/);
+  });
+
+  it('a pass recorded before the approved correction does not pay the corrective debt, even on the same bytes', () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-prior', repo: 'r', title: 't', briefing: BRIEFING });
+    ledger.setJobStatus('job-prior', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-prior', payload: { sha: 'same' } });
+    verified(ledger, 'job-prior', 'same'); // before the amendment
+    amend(ledger, 'job-prior', 'material', 'Correction needing no code change.');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-prior', payload: { sha: 'same', work_revision: 1 } });
+    expect(ledger.correctiveVerificationDebt('job-prior')).toEqual({ revision: 1, head: 'same' });
+    // A live round of ANOTHER head does not admit the corrected work either.
+    const other = ledger.addRound({ jobId: 'job-prior', targetRef: 'other-head', lenses: ['blind'] });
+    ledger.setRoundStatus(other.id, 'live');
+    expect(ledger.correctiveVerificationDebt('job-prior')).toEqual({ revision: 1, head: 'same' });
+    verified(ledger, 'job-prior', 'same');
+    expect(ledger.correctiveVerificationDebt('job-prior')).toBeNull();
+  });
+
+  it('a correction delivered after a READY verdict is offered a fresh review even on the same SHA', async () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-ready', repo: 'r', title: 't', briefing: BRIEFING });
+    ledger.setJobStatus('job-ready', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-ready', payload: { sha: 'ready-sha' } });
+    ledger.setJobPr('job-ready', 'https://github.com/acme/fixture/pull/12');
+    ledger.setJobStatus('job-ready', 'in-review');
+    const round = ledger.addRound({ jobId: 'job-ready', targetRef: 'ready-sha', lenses: ['blind'] });
+    ledger.appendCustomEvent({
+      kind: 'round.review-inputs-frozen', jobId: 'job-ready', roundId: round.id,
+      payload: { acceptance: { version: 0 }, evidence: [], ci: { state: 'unavailable' } },
+    });
+    ledger.setRoundStatus(round.id, 'live');
+    ledger.setRoundVerdict(round.id, 'approved');
+    amend(ledger, 'job-ready', 'material', 'Owner changed a requirement after READY; already satisfied by the code.');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-ready', payload: { sha: 'ready-sha', work_revision: 1 } });
+    verified(ledger, 'job-ready', 'ready-sha');
+    const digest = await computeSilasDigest({
+      ledger, blockersForRound: async () => ({ blockers: [], note: null }), config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+    });
+    expect(digest.prWithoutReview.map((row) => row.jobId)).toEqual(['job-ready']);
+  });
+
+  it('a provider claim re-proves review ownership in the same tick as its claim', async () => {
+    const h = await plainLane('job-provider-race');
+    const claims: string[] = [];
+    let admitted = false;
+    const racingWave = {
+      activeReview: () => (admitted ? { roundIds: ['raced-r1'], operations: 1 } : null),
+      assertWriterAdmissible: () => undefined,
+      clearLaneForWriter: async (input: { jobId: string }) => {
+        admitted = true; // a review arms while the gate awaits
+        return { jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null };
+      },
+      supersedeReviews: async (input: { jobId: string }) => ({ jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null }),
+    } as unknown as WaveRunner;
+    const { port } = await serve({ ledger: h.ledger, wave: racingWave, port: h.port, jobId: h.jobId }, { providerClaims: claims });
+    h.ledger.recordProviderWait({
+      id: 'wait-race', routeKey: 'route-r', provider: 'p', model: 'm', endpoint: 'e', credentialFingerprint: 'fp',
+      waiterKind: 'job-minion', jobId: h.jobId, agentId: null, slotId: null, sessionFile: null, continuation: null,
+      jobStatusAtEstablishment: 'working', lineageKey: null, incidentId: 'incident-r', incidentGeneration: 1,
+      reasonClass: 'temporary-limit',
+    });
+    const res = await post(port, '/api/silas/provider-recovery/claim', { wait_id: 'wait-race', by: 'silas' });
+    expect(res.status).toBe(409);
+    expect(res.json).toMatchObject({ error: 'review_in_progress', round_ids: ['raced-r1'] });
+    expect(claims).toEqual([]);
   });
 });

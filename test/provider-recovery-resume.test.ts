@@ -225,9 +225,12 @@ describe('guarded claim — happy path', () => {
     expect(result).toMatchObject({ outcome: 'continued' });
     const prompted = [...h.registry.handles.values()].flatMap((handle) => handle.prompts);
     expect(prompted).toHaveLength(1);
+    // No session to resume: the FRESH worker reads the effective contract
+    // (original briefing + the amendment) and the interrupted prompt.
+    expect(prompted[0]).toContain('do the work');
     expect(prompted[0]).toContain('continue the work');
-    expect(prompted[0]).toContain('PENDING-CORRECTION: drop the broad import.');
-    expect(prompted[0]).toContain('The lane is reviewed only after a');
+    expect(prompted[0]!.split('PENDING-CORRECTION: drop the broad import.')).toHaveLength(2);
+    expect(prompted[0]).toMatch(/the lane is reviewed only after a delivery carries contract revision 1/i);
     expect(prompted[0]).not.toContain('records the delivery of this turn');
   });
 

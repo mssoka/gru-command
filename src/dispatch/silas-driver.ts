@@ -1010,6 +1010,20 @@ function supersededBefore(ledger: DigestLedger, round: RoundRecord, delivered: E
   return superseded !== null && superseded.seq < delivered.seq;
 }
 
+/** True when the delivery carries a work revision the round never froze
+ * (owner rule 2): even a posted verdict — READY included — judged an older
+ * contract, so the corrected delivery owes a fresh review on any SHA. */
+function revisionNewerThanRound(ledger: DigestLedger, round: RoundRecord, delivered: EventRecord): boolean {
+  const revision = typeof delivered.payload === 'object' && delivered.payload !== null
+    ? (delivered.payload as { work_revision?: unknown }).work_revision : undefined;
+  if (typeof revision !== 'number' || revision <= 0) return false;
+  const frozen = ledger.latestRoundEvent(round.id, 'round.review-inputs-frozen');
+  const acceptance = typeof frozen?.payload === 'object' && frozen.payload !== null
+    ? (frozen.payload as { acceptance?: { version?: unknown } | null }).acceptance : undefined;
+  const version = acceptance?.version;
+  return typeof version === 'number' && revision > version;
+}
+
 /** Fallback-gate lifecycle phases that answer nothing: the gate never
  * started (`unavailable`), gave up (`blocked`) or was interrupted
  * (`aborted`). A clean-abort re-arm stays eligible after these. */
@@ -1534,7 +1548,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
         // A superseded round reviewed an obsolete contract (owner rule 3):
         // the delivery after it owes a fresh review even on the same SHA
         // (a correction needing no code change, or an unresolved head).
-        (followUpChangedTarget(delivered, newestRound) || supersededBefore(input.ledger, newestRound, delivered)) &&
+        (followUpChangedTarget(delivered, newestRound) || supersededBefore(input.ledger, newestRound, delivered) ||
+          revisionNewerThanRound(input.ledger, newestRound, delivered)) &&
         !reviewAlreadyRequested
       ) {
         digest.prWithoutReview.push({

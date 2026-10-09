@@ -1952,6 +1952,18 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           }
           throw error;
         }
+        // Re-proved in the SAME tick as the claim's durable write (the claim
+        // takes no await before `provider.recovery-claimed`, which fences
+        // review): a review admitted while the gate awaited refuses here.
+        const admittedMeanwhile = options.wave.activeReview(waitJobId);
+        if (admittedMeanwhile !== null) {
+          json(res, 409, {
+            error: 'review_in_progress',
+            detail: `job ${waitJobId} came under review while the writer gate waited — retry after the verdict`,
+            round_ids: admittedMeanwhile.roundIds,
+          });
+          return true;
+        }
       }
       const result = await ops.providerRecovery.claim(waitId, by);
       json(res, 200, result as Record<string, unknown>);

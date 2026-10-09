@@ -43,6 +43,26 @@ export interface RecoveryClaimDeps {
   readonly log?: Log;
 }
 
+/** The fresh provider-recovery worker's contract half: the effective
+ * contract, the interrupted turn's prompt, and — when a correction is still
+ * undelivered — a reminder that the lane waits for its revision. */
+function freshBriefing(
+  contract: string | null,
+  continuationPrompt: string | null,
+  revision: { readonly required: number; readonly delivered: number },
+): string | null {
+  const parts = [
+    ...(contract !== null ? [contract] : []),
+    ...(continuationPrompt !== null && continuationPrompt.trim() !== ''
+      ? [`INTERRUPTED TURN'S PROMPT (continue it):\n${continuationPrompt}`] : []),
+    ...(revision.required > revision.delivered
+      ? [`CONTRACT REVISION ${revision.required} is approved but undelivered: implement every effective material ` +
+        `amendment above; the lane is reviewed only after a delivery carries contract revision ${revision.required}.`]
+      : []),
+  ];
+  return parts.length === 0 ? null : parts.join('\n\n');
+}
+
 /** A continuation failure leaves the lane honestly non-working: when this
  * claim re-opened (or kept) the lane `working`, block it with a note so the
  * board and the digest never show an active lane nobody is driving (#160).
@@ -278,7 +298,13 @@ async function claimJobMinion(
       worktrees: deps.worktrees,
       jobId: wait.jobId as string,
       note,
-      briefing: withRevisionContinuation(continuationPrompt ?? job.briefing ?? '', pendingCorrection) || null,
+      // A resumed session keeps its context: the interrupted prompt plus the
+      // pending amendments. A FRESH session reads the effective contract
+      // (owner rule 4) — which already carries every amendment — and the
+      // interrupted prompt it continues.
+      briefing: resumeFile !== null
+        ? withRevisionContinuation(continuationPrompt ?? job.briefing ?? '', pendingCorrection) || null
+        : freshBriefing(deps.ledger.effectiveContract(job.id)?.text ?? job.briefing, continuationPrompt, revisionState),
       ...(resumeFile !== null ? { resumeFile } : {}),
       beforeTurnSideEffect: () => {
         // A hold or terminal disposition may land during the awaited
