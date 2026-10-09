@@ -8,20 +8,26 @@ import { classifyBaseline } from '../tools/classify-baseline.mjs';
 // load failure read as behavioral RED, or an unexpected green read as RED)
 // cannot ship undetected. Mirrors test/assert-binned-baseline.test.ts.
 
-const vitestReport = (files: readonly unknown[]) => ({
-  numTotalTests: files.reduce((n, f) => n + (f.assertionResults?.length ?? 0), 0),
-  numPassedTests: files.reduce(
-    (n, f) => n + (f.assertionResults ?? []).filter((a: { status: string }) => a.status === 'passed').length,
-    0,
-  ),
-  numFailedTests: files.reduce(
-    (n, f) => n + (f.assertionResults ?? []).filter((a: { status: string }) => a.status === 'failed').length,
-    0,
-  ),
+interface AssertionResult {
+  readonly title: string;
+  readonly status: string;
+  readonly failureMessages: readonly string[];
+}
+interface VitestSuite {
+  readonly name: string;
+  readonly status: string;
+  readonly message: string;
+  readonly assertionResults: readonly AssertionResult[];
+}
+
+const vitestReport = (files: readonly VitestSuite[]) => ({
+  numTotalTests: files.reduce((n, f) => n + f.assertionResults.length, 0),
+  numPassedTests: files.reduce((n, f) => n + f.assertionResults.filter((a) => a.status === 'passed').length, 0),
+  numFailedTests: files.reduce((n, f) => n + f.assertionResults.filter((a) => a.status === 'failed').length, 0),
   testResults: files,
 });
 
-const assertion = (title: string, status: string, failureMessages: readonly string[] = []) => ({
+const assertion = (title: string, status: string, failureMessages: readonly string[] = []): AssertionResult => ({
   title,
   status,
   failureMessages,
