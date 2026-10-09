@@ -170,40 +170,44 @@ npm run config:generate                 # refuses an existing file
 npm run config:generate -- --force      # timestamped 0600 backup first
 ```
 
-### Project-local BMAD setup
+### GC-managed BMAD runtime
 
-For each selected managed repo—not the workspace root and never every
-discovered directory—the wizard offers official BMAD setup, default on
-for fresh repos. This release pins `bmad-method@6.12.0` and installs all
-four approved defaults: `bmm,cis,tea,gds` (core is implicit), with
-external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
-follow the selected `pi`/Claude tools. Existing/customized installs
-default to **reuse unchanged**; per-repo skip is always available.
-The pinned set carries `bmad-review` out of the box, and it is a gate:
-0 blockers clear review/fix routing only — the PASS is not a Perkins
-READY — while blockers route back to the implementing minion as fix
-directives, never inform-only. Perkins (GitHub/GitLab) remains the
-stronger gate with exact-head verdicts; the owner holds every merge.
+Gru Command ships the BMAD framework its build workflow uses: a pinned
+`bmad-method@6.12.0` `bmad-build` skill, unchanged, plus a small GC
+customization layer. A managed repository needs no BMAD installation of
+its own. Every job lane binds to the runtime it started with, so a GC
+update never switches a running job's workflow instructions. The bundled
+review layers carry no finding quota: a clean change may get no
+actionable findings. The bmad-review fallback gate still uses an installed
+`bmad-review` skill: 0 blockers clear review/fix routing only (the PASS is
+not a Perkins READY), while blockers route back to the implementing minion
+as fix directives. Perkins (GitHub/GitLab) remains the stronger gate with
+exact-head verdicts, and the owner holds every merge.
 
-Successful setup records exact versions in
-`.gru-command/bmad-install.json`, adds an idempotent owned bootstrap
-block to `.gru-command/worktree.toml`, and uses narrow Git-local excludes
-for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
-or `_bmad-output/`, and never untracks files. Commit the three
-`.gru-command/` bootstrap files so newly-created worktrees can copy an
-isolated project-local BMAD install and discover the build-workflow
-skill this pinned release provides; generated skills/output remain
-local. Network and prerequisite failures name the
-repo and keep retry or explicit skip; deterministic state failures—a
-broken or partial install, a missing/unsafe module directory, a missing
-runtime binding—offer skip-only with deliberate repair guidance
-(install-repair classes additionally name the official repair path
-`npx bmad-method install` in that repository), never an automatic
-overwrite. No false-ready state.
+For each selected managed repo (not the workspace root, and never every
+discovered directory), the wizard offers to **provision** the project
+state the runtime uses. It is on by default, and per-repo skip is always
+available. Provisioning creates only what is missing: `_bmad/custom/`
+(project settings: `config.toml` for the team, `*.user.toml` for you,
+ignored), a self-ignoring `_bmad/render/`, and the configured output
+folders under `_bmad-output/`. It never modifies existing files, an
+existing repo-local BMAD install, or unrelated skills. Commit
+`_bmad/custom/` when fresh worktrees should share team settings.
+Deterministic state failures (a symlinked or wrongly typed project path,
+a malformed settings file) offer skip-only with deliberate repair
+guidance. Prerequisite and I/O failures keep retry or explicit skip. No
+false-ready state.
 
 You need the selected runtime CLI (`pi` or `claude`) for agents and `uv`
 for BMAD workflows. Missing prerequisites are reported before a repo is
-marked BMAD-ready.
+marked BMAD-ready. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
+
+- the bundled set
+- configuration precedence
+- job binding
+- the deliberate upstream-upgrade procedure
+- license notices
+- the tested commands for retiring an old repo-local `_bmad` install by hand
 
 ## Run
 

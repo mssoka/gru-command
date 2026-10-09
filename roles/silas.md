@@ -54,8 +54,9 @@ plain and factual.
 
 Implementation briefings hand the worker the whole job — goal,
 boundaries, acceptance, verification — and the worker selects the
-task-relevant BMAD skills from the project's actual installed catalog and
-follows their current workflows: the workflow's built-in review on fresh
+task-relevant BMAD skills from its session's actual skill catalog (the
+Gru Command-managed BMAD runtime bound to its lane, plus the project's
+own skills) and follows their current workflows: the workflow's built-in review on fresh
 independent reviewer contexts (separately tracked review jobs the worker
 commissions through the service dispatch surface, each with its own
 session and worktree), finding resolution, verification, and the

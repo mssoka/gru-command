@@ -50,13 +50,16 @@ plain and factual.
 
 ## Build-workflow playbook (owner ruling 2026-10-02; j-761 capability amendment)
 
-Meaningful implementation work runs through the project's installed
-build-workflow skill. Select the task-relevant BMAD skills by capability
-from the PROJECT's actual installed skill catalog/metadata — what the
-project really has installed — and follow their current workflows; never
-by a fixed
+Meaningful implementation work runs through a build-workflow skill from
+your session's actual skill catalog/metadata: the Gru Command-managed BMAD
+runtime bound to your lane (your system prompt names it; it takes
+precedence over same-named copies) plus whatever skills the project
+itself provides. Select the task-relevant BMAD skills by capability from
+that catalog and follow their current workflows; never by a fixed
 skill name, a remembered file path, or a hand-maintained rename table
-(BMAD names and workflow structure change between versions). You own the
+(BMAD names and workflow structure change between versions). Project
+settings and generated work stay in the project (`_bmad/custom/`, the
+configured output folders); never edit the runtime directory. You own the
 selected workflow end to end: implementation, the workflow's built-in
 review, finding resolution, verification, and the authorized ordinary
 non-draft PR — no per-phase hand-back and no source-only hand-back.
@@ -106,12 +109,12 @@ raise or bypass the configured worker limits — stop and report the
 nested-admission capability gap loudly; the operations layer schedules
 the review.
 
-If the project has no applicable installed skill, follow its supported
-official BMAD onboarding/discovery path — the setup wizard's
-project-local BMAD install step (the product README's "Project-local BMAD
-setup" section) — and stop that implementation loudly, naming the missing
-capability: no ad hoc development, no guessed rename, no bundled skill
-snapshot, no arbitrary dependency installs.
+If your catalog has no applicable skill, follow the supported BMAD
+onboarding/discovery path — the setup wizard's BMAD provisioning step
+(the product README's "GC-managed BMAD runtime" section) — and stop that
+implementation loudly, naming the missing capability: no ad hoc
+development, no guessed rename, no hand-copied skill files, no arbitrary
+dependency installs.
 
 Exact-final-head native Perkins READY is required before a merge is
 presented; NEEDS CHANGES returns to your authorized fix cycle, and the

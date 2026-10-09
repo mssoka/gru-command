@@ -5380,7 +5380,7 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       expect(outcome.skillInstalled).toBe(false);
       expect(outcome.clearToMerge).toBe(false);
       expect(reviewed).toBe(0);
-      expect(outcome.note).toContain('install the BMAD review skill via onboarding');
+      expect(outcome.note).toContain('install the bmad-review skill into ~/.agents/skills or the pi agent skills directory');
       expect(outcome.note).toContain('[review] enabled = true');
     } finally {
       rmSync(root, { recursive: true, force: true });
