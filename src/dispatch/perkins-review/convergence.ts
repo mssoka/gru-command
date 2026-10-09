@@ -393,7 +393,10 @@ function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<strin
     const header = fields[index]!;
     if (!header.startsWith(':')) continue;
     const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) [A-Z]\d*$/u.exec(header);
-    if (match === null) continue;
+    // A header that starts a raw record but does not parse is unexpected
+    // output: fail closed (the caller reviews whole) rather than silently
+    // shrink the reviewed unit and the carry scope.
+    if (match === null) throw new Error('git diff --raw produced an unparseable record');
     const path = fields[index + 1];
     if (path === undefined || path === '') continue;
     index += 1;
@@ -760,22 +763,28 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       // A round cannot have integrated FROM its own target.
       if (linkage.integrationFromSha === parsed.frozen.targetSha) return null;
     }
-    const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; contractSha256?: unknown } | null | undefined;
-    // A PRESENT but malformed acceptance binding is damaged provenance, not
-    // an absent one: fail closed (no inherited coverage) rather than treat
-    // it as "no acceptance".
-    if (rawAcceptance !== undefined && rawAcceptance !== null &&
-      !(typeof rawAcceptance === 'object' &&
+    const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; baseSha256?: unknown; contractSha256?: unknown; amendmentIds?: unknown } | null | undefined;
+    // A PRESENT acceptance binding must be fully well-formed: a partial or
+    // malformed one is damaged provenance, not an absent one, so it fails
+    // closed (no inherited coverage).
+    if (rawAcceptance !== undefined && rawAcceptance !== null) {
+      const wellFormed = typeof rawAcceptance === 'object' &&
         typeof rawAcceptance.version === 'number' && Number.isSafeInteger(rawAcceptance.version) &&
-        typeof rawAcceptance.contractSha256 === 'string' && /^[a-f0-9]{64}$/u.test(rawAcceptance.contractSha256))) {
-      return null;
+        typeof rawAcceptance.baseSha256 === 'string' && (rawAcceptance.baseSha256 === '' || /^[a-f0-9]{64}$/u.test(rawAcceptance.baseSha256)) &&
+        typeof rawAcceptance.contractSha256 === 'string' && /^[a-f0-9]{64}$/u.test(rawAcceptance.contractSha256) &&
+        Array.isArray(rawAcceptance.amendmentIds) &&
+        rawAcceptance.amendmentIds.every((id) => typeof id === 'string');
+      if (!wellFormed) return null;
     }
     const acceptance = rawAcceptance === null || rawAcceptance === undefined
       ? null
       : { version: rawAcceptance.version as number, contractSha256: rawAcceptance.contractSha256 as string };
+    // A record with NO convergence block predates Stage 5: it was a
+    // whole-change review, so its coverage is whole-complete by construction.
+    const legacyWhole = parsed.convergence === undefined;
     const coverageComplete = parsed.convergence?.coverageComplete === true
       ? (scope === 'whole' || scope === 'integration')
-      : parsed.convergence?.coverageComplete === undefined && scope === 'whole';
+      : parsed.convergence?.coverageComplete === undefined && (legacyWhole || scope === 'whole');
     return {
       seq,
       reviewScope: scope === 'whole' || scope === 'delta' || scope === 'integration' ? scope : 'unknown',
@@ -806,9 +815,16 @@ export function planPerkinsReviewScope(input: {
     readonly integrationCoverage: boolean;
   };
 }): ReviewScopePlan {
-  const prior = input.priorConsolidatedFile !== undefined && input.priorSeq !== undefined
-    ? readPriorConvergenceMeta(input.priorConsolidatedFile, input.priorSeq)
+  const priorFileProvided = input.priorConsolidatedFile !== undefined && input.priorSeq !== undefined;
+  const prior = priorFileProvided
+    ? readPriorConvergenceMeta(input.priorConsolidatedFile!, input.priorSeq!)
     : null;
+  // Distinguish "no prior round" from "a prior record that is not a
+  // conclusive whole-PR record": the latter must be disclosed, not mislabelled
+  // as the job's first review.
+  if (priorFileProvided && prior === null) {
+    return { scope: 'whole', reason: 'a prior review record exists but is not a conclusive whole-PR record — whole-change re-verification' };
+  }
   const priorAcceptance = prior?.acceptance ?? null;
   const acceptanceCompatible = input.currentAcceptance === undefined
     ? priorAcceptance === null

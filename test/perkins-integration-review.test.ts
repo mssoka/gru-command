@@ -36,6 +36,7 @@ interface IntegrationHarness {
   readonly engine: PerkinsWholeReview;
   readonly brain: WholeLeadOptions;
   readonly leadCalls: ReturnType<typeof fakeWholeSpawner>['leadCalls'];
+  readonly childCalls: ReturnType<typeof fakeWholeSpawner>['childCalls'];
 }
 
 function makeEngine(brain: WholeLeadOptions): IntegrationHarness {
@@ -46,7 +47,7 @@ function makeEngine(brain: WholeLeadOptions): IntegrationHarness {
   const root = temp('perkins-integration-artifacts-');
   const fake = fakeWholeSpawner(temp('perkins-integration-sessions-'), brain);
   const engine = new PerkinsWholeReview({ spawner: fake.spawner, policy: loadPerkinsPolicy() });
-  return { repo, root, engine, brain, leadCalls: fake.leadCalls };
+  return { repo, root, engine, brain, leadCalls: fake.leadCalls, childCalls: fake.childCalls };
 }
 
 function freeze(harness: IntegrationHarness, roundId: string, target: string): FrozenReview {
@@ -375,5 +376,23 @@ describe('native integration review retains prior coverage', () => {
     expect(round2.convergence?.reviewScope).toBe('integration');
     expect(round2.convergence?.reverifyPriors).toEqual([0]);
     expect(round2.convergence?.carriedPriors).toBeUndefined();
+  });
+
+  it('gives the specialist lenses the integration unit in their prompt', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: ['blind'] });
+    featureHead(harness.repo, 'src/shared.ts', 'export const shared = "feature";\n');
+    const covered = harness.repo.head();
+    const frozen1 = freeze(harness, 'sp-round-1', covered);
+    await runRound(harness, { roundId: 'sp-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'sp-round-1'), 'consolidated.json');
+    const { h1 } = integrateConflict(harness.repo);
+    const frozen2 = freeze(harness, 'sp-round-2', h1);
+    await runRound(harness, {
+      roundId: 'sp-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    const unitPrompts = harness.childCalls.filter((call) => call.prompt?.includes('--- INTEGRATION UNIT'));
+    expect(unitPrompts.length).toBeGreaterThan(0);
+    expect(unitPrompts.at(-1)!.prompt).toContain('Unchanged incoming base code is baseline context');
   });
 });

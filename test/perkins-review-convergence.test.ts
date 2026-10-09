@@ -462,6 +462,17 @@ describe('production scope planning wiring (planPerkinsReviewScope)', () => {
     });
     expect(mismatched.scope).toBe('whole');
     expect(mismatched.reason).toContain('acceptance');
+
+    // A prior file that is present but not a conclusive whole-PR record is
+    // disclosed as such, never mislabelled as the job's first review.
+    const rejected = join(root, 'prior-v2.json');
+    writeFileSync(rejected, JSON.stringify({ schemaVersion: 2, architecture: 'perkins-hybrid', complete: true, findings: [] }));
+    const refused = planPerkinsReviewScope({
+      priorConsolidatedFile: rejected, priorSeq: 1, repoPath: repo.path,
+      currentTargetSha: h1, currentDiffBaseSha: b1, currentAcceptance: undefined, rules,
+    });
+    expect(refused.scope).toBe('whole');
+    expect(refused.reason).toContain('not a conclusive whole-PR record');
   });
 });
 
@@ -690,6 +701,8 @@ describe('prior convergence meta read (tolerant)', () => {
     });
     writeFileSync(file, JSON.stringify({ ...modern, convergence: undefined }));
     expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('unknown');
+    // A genuine pre-Stage-5 record WAS a whole review: whole-complete.
+    expect(readPriorConvergenceMeta(file, 4)?.coverageComplete).toBe(true);
   });
 
   it('reads an integration record only when its immutable linkage is intact', () => {
@@ -734,9 +747,14 @@ describe('prior convergence meta read (tolerant)', () => {
     };
     writeFileSync(file, JSON.stringify(base));
     expect(readPriorConvergenceMeta(file, 4)).toBeNull();
-    // A present, VALID binding parses and preserves the coverage bit.
+    // A PARTIAL binding (missing amendmentIds/baseSha256) is also damaged.
     writeFileSync(file, JSON.stringify({
       ...base, frozen: { ...base.frozen, acceptance: { version: 2, contractSha256: 'a'.repeat(64) } },
+    }));
+    expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    // A present, FULLY VALID binding parses and preserves the coverage bit.
+    writeFileSync(file, JSON.stringify({
+      ...base, frozen: { ...base.frozen, acceptance: { version: 2, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] } },
     }));
     const meta = readPriorConvergenceMeta(file, 4);
     expect(meta?.acceptance).toEqual({ version: 2, contractSha256: 'a'.repeat(64) });
