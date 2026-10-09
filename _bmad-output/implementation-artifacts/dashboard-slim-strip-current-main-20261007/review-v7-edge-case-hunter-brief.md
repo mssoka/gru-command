@@ -9,7 +9,8 @@ Produce the diff in YOUR OWN worktree and read it there:
 (`git show HEAD:<path>` for any full file).
 
 YOUR RUBRIC (resolved workflow instruction, pinned immutable artifact — read it completely before reviewing):
-    /Users/moses/.gru-command/captures/gru-slim-review-rubric-20261009/edge-case-hunter.md
+    <review-rubric artifact: edge-case-hunter.md>
+    (absolute path supplied in the dispatch briefing; sha256 below)
     sha256 8fc046af1cbf4ecc928207cec75e29c3c260adb86cc7da77537ade3b3a3b9448
 Follow it exactly (including its claims check; the claims file is the lane spec `_bmad-output/implementation-artifacts/dashboard-slim-strip-current-main-20261007/spec-dashboard-slim-strip-current-main.md`, read ONLY when the rubric calls for it). Do not invoke any skill and do not spawn subagents — you are the reviewer. Return your findings as text in your final message.
 

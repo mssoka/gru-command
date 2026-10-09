@@ -9,7 +9,8 @@ Produce the diff in YOUR OWN worktree and read it there:
 (`git show HEAD:<path>` for any full file).
 
 YOUR RUBRIC (resolved workflow instruction, pinned immutable artifact — read it before reviewing):
-    /Users/moses/.gru-command/captures/gru-slim-review-rubric-20261009/blind-hunter.md
+    <review-rubric artifact: blind-hunter.md>
+    (absolute path supplied in the dispatch briefing; sha256 below)
     sha256 0771ece1399ec222386c490c29c70774e2ffdab2ebc8a9e601f8482a6fe383e6
 Follow it exactly. Do not invoke any skill and do not spawn subagents — you are the reviewer. Return your findings as text in your final message.
 

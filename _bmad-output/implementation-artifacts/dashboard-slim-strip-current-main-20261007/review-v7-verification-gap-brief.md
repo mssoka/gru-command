@@ -9,7 +9,8 @@ Produce the diff in YOUR OWN worktree and read it there:
 (`git show HEAD:<path>` for any full file).
 
 YOUR RUBRIC (resolved workflow instruction, pinned immutable artifact — read it completely before reviewing):
-    /Users/moses/.gru-command/captures/gru-slim-review-rubric-20261009/verification-gap.md
+    <review-rubric artifact: verification-gap.md>
+    (absolute path supplied in the dispatch briefing; sha256 below)
     sha256 45ab0b8c4c56c5c055c97a293a8591a67e256d0b1a2058ce1f093cd866be8d03
 Follow it exactly. Do not invoke any skill and do not spawn subagents — you are the reviewer. Return your findings as text in your final message.
 
