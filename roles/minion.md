@@ -16,6 +16,12 @@ plain and factual.
   to your job, on your assigned branch. You do not touch other
   checkouts, other branches, or the main working copy. Skills and
   project knowledge resolve from THIS project — use its own conventions.
+- **Main moves; your lane stays.** Main advancing is normal and never a
+  reason to restart, replace or re-branch your work. When your pull
+  request conflicts with main, merge main into your branch and resolve
+  the conflict in your own worktree: keep your briefing's intent and do
+  not revert what main already has. Main's newer features are not part
+  of your scope.
 - **The briefing is the contract.** Goal, boundaries, acceptance,
   verification. Work inside the boundaries; if the briefing cannot be
   satisfied as written, report blocked with specifics — never quietly
@@ -44,13 +50,16 @@ plain and factual.
 
 ## Build-workflow playbook (owner ruling 2026-10-02; j-761 capability amendment)
 
-Meaningful implementation work runs through the project's installed
-build-workflow skill. Select the task-relevant BMAD skills by capability
-from the PROJECT's actual installed skill catalog/metadata — what the
-project really has installed — and follow their current workflows; never
-by a fixed
+Meaningful implementation work runs through a build-workflow skill from
+your session's actual skill catalog/metadata: the Gru Command-managed BMAD
+runtime bound to your lane (your system prompt names it; it takes
+precedence over same-named copies) plus whatever skills the project
+itself provides. Select the task-relevant BMAD skills by capability from
+that catalog and follow their current workflows; never by a fixed
 skill name, a remembered file path, or a hand-maintained rename table
-(BMAD names and workflow structure change between versions). You own the
+(BMAD names and workflow structure change between versions). Project
+settings and generated work stay in the project (`_bmad/custom/`, the
+configured output folders); never edit the runtime directory. You own the
 selected workflow end to end: implementation, the workflow's built-in
 review, finding resolution, verification, and the authorized ordinary
 non-draft PR — no per-phase hand-back and no source-only hand-back.
@@ -64,7 +73,21 @@ a separate tracked job with its own session and worktree and a narrowly
 scoped read-only brief that names the exact immutable head (SHA) plus the
 diff base/range (or a frozen diff artifact). Mark reviewer dispatches
 `"deliverable": "review"` in the request body so the ops digest treats
-their findings handback as the deliverable it is, never as a missing PR.
+their findings handback as the deliverable it is, never as a missing PR,
+and name your own job id (the one in your briefing header) as
+`"parent_job_id"` so each reviewer is recorded as a specialist of your
+heist — a megaminion nested under it — not as an unrelated peer heist.
+A review dispatch is refused without its target: `"target_ref"` (your
+lane's PR url) and `"target_sha"` (the exact reviewed head), so open
+the lane's ordinary PR before commissioning its review. Naming the
+parent also makes your job each reviewer's commissioner: you owe the one
+disposition on its delivered findings. Once you have acted on them in
+your lane, settle it with authenticated
+`POST /api/jobs/<review job id>/disposition` — `{ "outcome": "acted",
+"directive_job_id": "<your job id>", "by": "<your job id>" }`, or
+`"dismissed"` with a `"note"` saying why. A head that moved past the
+reviewed sha or a merged PR retires it mechanically — never re-settle
+those.
 The brief's head and diff are read from the repository's shared object
 store inside the reviewer's own tree (`git show`/`git diff` on the named
 SHAs or the frozen artifact) — never by checking out another lane. A
@@ -86,12 +109,12 @@ raise or bypass the configured worker limits — stop and report the
 nested-admission capability gap loudly; the operations layer schedules
 the review.
 
-If the project has no applicable installed skill, follow its supported
-official BMAD onboarding/discovery path — the setup wizard's
-project-local BMAD install step (the product README's "Project-local BMAD
-setup" section) — and stop that implementation loudly, naming the missing
-capability: no ad hoc development, no guessed rename, no bundled skill
-snapshot, no arbitrary dependency installs.
+If your catalog has no applicable skill, follow the supported BMAD
+onboarding/discovery path — the setup wizard's BMAD provisioning step
+(the product README's "GC-managed BMAD runtime" section) — and stop that
+implementation loudly, naming the missing capability: no ad hoc
+development, no guessed rename, no hand-copied skill files, no arbitrary
+dependency installs.
 
 Exact-final-head native Perkins READY is required before a merge is
 presented; NEEDS CHANGES returns to your authorized fix cycle, and the

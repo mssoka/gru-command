@@ -15,6 +15,7 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import { TranscriptService } from '../src/transcripts/service.js';
 import { loadConfig } from '../src/config.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
+import { DREAM_FAILED_KIND, dreamFailureIncidents } from '../src/lessons/dream.js';
 import { ROLE_DEFINITIONS } from '../src/roles.js';
 
 const cleanupDirs: string[] = [];
@@ -706,6 +707,37 @@ describe('board server — WS push', () => {
     await client.close();
   });
 
+  it('a refreshed incident detail reaches a connected board at once — same id, first failure kept, no heartbeat needed', async () => {
+    const quiet = await boot('ws-refresh-token', { heartbeatMs: 0 });
+    try {
+      const notifications = new NotificationCenter({ ledger: quiet.api, bus: quiet.bus });
+      const times = ['2026-10-07T09:00:00.000Z', '2026-10-07T21:00:00.000Z'];
+      let tick = 0;
+      const hooks = dreamFailureIncidents(notifications, 'REPAIR', () => new Date(times[tick++]!));
+      hooks.onFailure(new Error('first outage'));
+      const client = new BoardClient(quiet.port);
+      await client.open();
+      client.send({ type: 'auth', token: 'ws-refresh-token' });
+      await client.waitFor((f) => f.type === 'board', 'initial snapshot');
+      type Row = { id: string; kind: string; detail: string | null };
+      const incident = (frame: { type: string }): Row | undefined =>
+        frame.type === 'board'
+          ? (frame as unknown as { snapshot: { notifications: Row[] } }).snapshot.notifications.find((row) => row.kind === DREAM_FAILED_KIND)
+          : undefined;
+      const initial = incident(client.frames.filter((f) => f.type === 'board').at(-1)!)!;
+      expect(initial.detail).toContain('failed pass 1');
+      hooks.onFailure(new Error('second outage'));
+      await client.waitFor((f) => (incident(f)?.detail ?? '').includes('failed pass 2'), 'refreshed incident detail');
+      const refreshed = client.frames.map(incident).filter((row): row is Row => row !== undefined).at(-1)!;
+      expect(refreshed.id).toBe(initial.id);
+      expect(refreshed.detail).toContain(`First failure (${times[0]}): Error: first outage`);
+      expect(refreshed.detail).toContain(`Latest failure (${times[1]}, failed pass 2): Error: second outage`);
+      await client.close();
+    } finally {
+      await quiet.close();
+    }
+  });
+
   it('a bad token is a fatal error + close; a non-auth first frame likewise', async () => {
     const bad = new BoardClient(harness.port);
     await bad.open();
@@ -844,6 +876,32 @@ describe('board server — empty token config locks every door', () => {
       // Unknown id → 404.
       const missing = await postJson(port, '/api/notifications/nope/ack', 'ack-token', { by: 'web' });
       expect(missing.status).toBe(404);
+      // A Book of Lessons proposal closes only through Accept/Reject (owner
+      // decision 2026-10-07): a plain ack is refused and fires no hook.
+      const proposal = notifications.post({
+        kind: 'lessons.proposal',
+        routing: 'fyi',
+        severity: 'info',
+        title: 'Book of Lessons: 1 lesson change proposed',
+      });
+      expect(proposal.routing).toBe('needs-owner');
+      const refused = await postJson(port, `/api/notifications/${proposal.id}/ack`, 'ack-token', { by: 'web' });
+      expect(refused.status).toBe(409);
+      expect(refused.body).toMatchObject({ error: 'decision_required' });
+      expect(api.getNotification(proposal.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
+      expect(acked).toEqual([row.id]);
+      // A failing dream's incident closes only on a completed pass (owner
+      // decision 2026-10-08): Gru's disposition is refused, the row stays open.
+      const dreamFailed = notifications.post({
+        kind: 'lessons.dream-failed',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lesson dream is failing — the Book of Lessons is not being updated',
+      });
+      const disposed = await postJson(port, `/api/notifications/${dreamFailed.id}/disposition`, 'ack-token', { detail: 'opened a repair lane' });
+      expect(disposed.status).toBe(409);
+      expect(disposed.body).toMatchObject({ error: 'producer_resolved', detail: expect.stringContaining('a completed dream pass') });
+      expect(api.getNotification(dreamFailed.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
     } finally {
       await board.dispose();
       await new Promise<void>((resolveClose) => {

@@ -331,6 +331,7 @@ export function finalizeRebriefRequest(input: {
         agentId: input.minionId,
         source: 'silas-rebrief',
         ...(phaseId !== null ? { phaseId } : {}),
+        workRevision: deliveryMarker.workRevision ?? 0,
       });
       deliveredSha = followUp.sha;
       deliveryNote = followUp.note;
@@ -511,6 +512,7 @@ export async function reconcilePendingRebriefs(
           agentId: anchor?.agentId ?? null,
           source: 'silas-rebrief',
           ...(phaseId !== null ? { phaseId } : {}),
+          workRevision: anchor?.workRevision ?? 0,
         });
       } catch (error) {
         if (!(error instanceof PendingRebriefNoLongerCurrent)) throw error;
@@ -603,7 +605,10 @@ async function redispatchGroup(
       result = await runRebriefTurn(deps, {
         jobId,
         note,
-        briefing: job.briefing,
+        // The durable request's own contract (the effective contract at
+        // request time — owner rule 4), never a fresh read that could carry
+        // amendments this request's revision stamp does not cover.
+        briefing: rebriefMarker?.briefing ?? job.briefing,
         group,
         ...(resumeFile !== null ? { resumeFile } : {}),
       });
@@ -616,7 +621,7 @@ async function redispatchGroup(
         resume_file: resumeFile,
         error: String(error),
       });
-      result = await runRebriefTurn(deps, { jobId, note, briefing: job.briefing, group });
+      result = await runRebriefTurn(deps, { jobId, note, briefing: rebriefMarker?.briefing ?? job.briefing, group });
       throwIfTurnInBandError(result);
     }
     const finalized = finalizeRebriefRequest({
@@ -743,6 +748,7 @@ function runRebriefTurn(
     jobId: input.jobId,
     note: input.note,
     briefing: input.briefing,
+    workRevision: input.group.find((marker) => marker.workRevision !== null)?.workRevision ?? null,
     ...(input.resumeFile !== undefined ? { resumeFile: input.resumeFile } : {}),
     beforeTurnSideEffect: () => checkRebriefTurn(deps.ledger, input.jobId, input.group),
     onSpawned: (worker) => {

@@ -40,13 +40,26 @@ export interface HeavyTestEntry {
 }
 
 export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
+  { file: 'admission-retry-service.test.ts', workload: 'real service boot resuming a durable admission retry' },
   {
     file: 'attachments.test.ts',
     workload: 'spawns and reaps a real child process and streams large real files',
   },
   {
+    file: 'bmad-legacy-retirement.test.ts',
+    workload: 'runs the documented retirement commands (python, git worktrees, uv renders) against a disposable repo',
+  },
+  {
     file: 'bmad-onboarding.test.ts',
-    workload: 'real uv/BMAD bootstrap installs plus PTY interaction',
+    workload: 'BMAD project provisioning over many real git repository fixtures',
+  },
+  {
+    file: 'bmad-runtime-packaged.test.ts',
+    workload: 'npm pack staging plus compiled-product uv renders over git worktrees',
+  },
+  {
+    file: 'bmad-runtime.test.ts',
+    workload: 'real uv renders of the bundled BMAD runtime over git repositories and worktrees',
   },
   { file: 'branch-idle-guard.test.ts', workload: 'real service and git lane lifecycle' },
   { file: 'claude-adapter.test.ts', workload: 'real CLI child processes over stdio per test' },
@@ -72,6 +85,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'install.test.ts', workload: 'install.sh CLI contracts through real subprocesses' },
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },
   { file: 'listener-probe.test.ts', workload: 'real child listeners and service port-guard probes' },
+  { file: 'lessons-dream-service.test.ts', workload: 'real compiled service boots: a failing dream pass, and a proposal accepted over HTTP' },
   {
     file: 'perkins-admission-preflight.test.ts',
     workload: 'real git fixture freezes plus frozen-packet corruption scenarios',

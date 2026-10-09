@@ -448,7 +448,7 @@ describe('board client', () => {
     const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answer = resolve; })) as unknown as typeof fetch;
     const events = { connection: vi.fn(), snapshot: vi.fn(), fatal: vi.fn() };
     const old = new BoardClient({ token: TOKEN, host: '127.0.0.1:9', fetchImpl, webSocketCtor: class { close() {} } as unknown as new (url: string) => WebSocket }, events);
-    const loading = old.ackNotification('n1');
+    const loading = old.getLessonProposal();
     old.stop(); // the owner re-paired; the old client's request is still in flight
     answer(new Response('{"error":"unauthorized"}', { status: 401 }));
     await expect(loading).rejects.toThrow();
@@ -972,5 +972,36 @@ describe('board client', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('a malformed review is refused before anything renders it — a valid one passes', async () => {
+    const review = (removed: unknown) => ({
+      id: 'prop-1',
+      createdAt: '2026-10-07T00:00:00.000Z',
+      notificationId: 'lp-1',
+      entries: 1,
+      throughSeq: 1,
+      decision: null,
+      recovery: null,
+      index: [],
+      chapters: [{
+        slug: 'ops',
+        title: { before: 'Ops', after: 'Ops' },
+        retired: false,
+        summary: { before: 'S.', after: 'S.' },
+        tags: { before: [], after: [] },
+        added: [],
+        changed: [],
+        removed: [removed],
+        provenanceTrimmed: 0,
+        bodiesTrimmed: 0,
+      }],
+    });
+    let body: unknown = review({ slug: 'gone', body: 'Text.', recurred: 1, reason: 'cap' }); // no tags
+    const fetchImpl = (async () => new Response(JSON.stringify(body), { status: 200 })) as unknown as typeof fetch;
+    const reviewing = new BoardClient({ token: TOKEN, host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} });
+    await expect(reviewing.getLessonProposal()).rejects.toThrow('lesson proposal review is malformed');
+    body = review({ slug: 'gone', body: 'Text.', recurred: 1, tags: ['ops'], reason: 'cap' });
+    await expect(reviewing.getLessonProposal()).resolves.toMatchObject({ id: 'prop-1' });
   });
 });

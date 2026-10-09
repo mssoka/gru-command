@@ -13,6 +13,7 @@ command = "npm ci"
 full = "npm test"
 
 typecheck = "npm run typecheck"
+directive-recovery = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-retirement.test.ts test/directive-markers.test.ts test/ledger-db.test.ts test/silas-driver.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-sensor.test.ts test/supervisor.test.ts test/board-engine.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/branch-idle-guard.test.ts"
 
 # Declared focused verification scopes (phase 4; invoked only via the
 # authenticated /api/verify scheduler at the project's documented budgets
@@ -506,6 +507,40 @@ perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reli
 # the recomputed suite-shape pins — plain installed Vitest invocations at
 # unchanged budgets, exit codes never masked.
 verification-single-flight = "npx vitest run test/verification-scheduler.test.ts test/verification-capture.test.ts test/verification-evidence.test.ts test/silas-driver.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts && npx vitest run test/suite-shape.test.ts"
+
+# Idle-stream keepalive (incident 2026-10-09): the queued slot wait and
+# quiet running response keep receiving real body bytes under the transport
+# heartbeat, terminal/disconnect cleanup leaves no heartbeat timer, the
+# shipped reader/helper accepts the ping stream honestly, and the recomputed
+# suite-shape pins. Heavy server leg under the classified heavy config;
+# exits never masked.
+verify-idle-keepalive = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-capture.test.ts test/assert-verify-keepalive-baseline.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts && npx vitest run test/suite-shape.test.ts"
+# Static gates for the same change (lint, both compilers via build).
+verify-idle-keepalive-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build"
+
+# Fails-before evidence: the FINAL behavioral suite bytes are overlaid onto
+# an isolated git-archive snapshot of the pre-fix base 32fc2f6 (the incident
+# build, which emits no heartbeat) with dependencies linked by symlink — no
+# download/install, no branch mutation, approved RPC patch prerequisite,
+# unchanged Vitest config/budgets. The base has no keepalive, so EVERY
+# collected test in the -t selection (the named regressions and the
+# additional keepalive guards) REDs by behavioral assertion, and the
+# machine-readable Vitest report is classified by
+# tools/assert-verify-keepalive-baseline.mjs, which exits 2
+# (FAILS-BEFORE CLAIM BROKEN) on a collection/setup/import failure, a named
+# regression that did not fail, any unlisted failure, or a failure that is
+# not behavioral (an AssertionError or a matcher TypeError).
+# The capture-reader leg runs under the default (fast) Vitest config, so it
+# has its own scope: verify-idle-capture-baseline. The Vitest exit
+# is echoed intact and never masked into a PASS; the snapshot directory and
+# ignored pointer file are preserved for inspection.
+verify-idle-keepalive-baseline = 'set -e; base=32fc2f6edfc878b89d05c4d2499dcbdb0ec662d1; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-verify-idle-keepalive.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/verification-server.test.ts > "$d/test/verification-server.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "verify-idle-keepalive-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/verify-idle-keepalive-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/verification-server.test.ts -t "incident 2026-10-09"; a=$?; set -e; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: pre-fix base passed the keepalive regressions unexpectedly"; exit 2; fi; node "$root/tools/assert-verify-keepalive-baseline.mjs" "$d/results.json" server; echo "verify-idle-keepalive-baseline vitest exit=$a EXPECTED-NONZERO: pre-fix base emits no heartbeat"; exit 1'
+
+# Capture-reader fail-before leg (same isolated base snapshot pattern, default
+# fast config): the final capture tests assert the reader accepts and counts
+# keepalive pings apart from producer frames — behavior the base lacks, so
+# they RED by assertion there. Classified by the same tool (capture leg).
+verify-idle-capture-baseline = 'set -e; base=32fc2f6edfc878b89d05c4d2499dcbdb0ec662d1; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-verify-idle-keepalive-capture.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/verification-capture.test.ts > "$d/test/verification-capture.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "verify-idle-capture-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/verify-idle-capture-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/verification-capture.test.ts -t "keepalive pings in the capture stream"; c=$?; set -e; if [ "$c" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: pre-fix base passed the capture keepalive guards"; exit 2; fi; node "$root/tools/assert-verify-keepalive-baseline.mjs" "$d/results.json" capture; echo "verify-idle-capture-baseline vitest exit=$c EXPECTED-NONZERO: base folds pings into producer frames"; exit 1'
 
 # Board PR-number link labels (owner approval j-982): the new pure URL
 # helper plus the board-row label/disclosure DOM contract, via the existing

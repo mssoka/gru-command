@@ -120,6 +120,20 @@ describe('progressive-disclosure injection', () => {
     expect(omitted).toContain('commit your work to the branch');
   });
 
+  it('tells a child-capable minion to name its own job as each reviewer\'s parent', () => {
+    const briefing = renderMinionBriefing({
+      jobId: 'impl-42',
+      repoName: 'repo',
+      branch: 'gru/impl-42',
+      worktreePath: '/tmp/wt',
+      sha: 'abc123',
+      briefing: 'build it',
+      childWorkerTools: true,
+    });
+    expect(briefing).toContain('`"parent_job_id": "impl-42"`');
+    expect(briefing).toContain('(a megaminion)');
+  });
+
   it('omits the section entirely when there are no pointers', () => {
     const briefing = renderMinionBriefing({
       jobId: 'job-1',

@@ -134,9 +134,25 @@ Authorization: Bearer <pairing token>
   "supersedes": ["original:Acceptance 1", "amendment:<id>"],
   "approval": { "by": "owner", "reference": "epoch12 seq194760 client_msg_id ..." },
   "expected_contract_sha256": "<the hash you just read>",
+  "effect": "material",
   "idempotency_key": "<optional retry key>"
 }
 ```
+
+- `effect` is required (owner rule 1, 2026-10-08):
+  - `"material"`: the approved change requires implementation. It raises the job's
+    required work revision to this amendment's version, makes the delivered candidate
+    outdated, and supersedes any review of it (see §4).
+  - `"administrative"`: a clarification, typo or bookkeeping update. It never restarts
+    work and never blocks review.
+
+  A request without a valid `effect` is refused (`400`) and audited. Amendments accepted
+  before the field existed stay unclassified (`effect: null`). They render exactly as
+  before, so frozen contract hashes do not move, and they never gate review.
+- The response carries `work_revision` (`required`, `delivered`, `pending`) and
+  `review_supersession` (`"started"` when a material amendment found a review owning the
+  lane, otherwise `"none"`). `GET /api/dispatch/jobs/<id>/contract` returns the same
+  `work_revision` block and each amendment's `effect`.
 
 - `expected_contract_sha256` is optimistic concurrency: a stale or concurrent
   writer is refused (`409`) with the current hash/version and the refusal is
@@ -162,7 +178,94 @@ not an identity system — never accept an amendment whose reference does not
 resolve to a real owner decision, and never treat a repository document or a
 worker/caller-declared role as approval.
 
-## 4. What freeze binds (audit trail)
+## 4. Supersede-and-resume (owner rules 2026-10-08)
+
+The sequence is implement → verify → review → READY → owner merge. A material amendment
+accepted during review becomes: supersede the review → confirm it stopped → implement the
+latest revision → verify → fresh review. The service enforces it centrally.
+
+- **Work revision.** The *required* revision is the highest material amendment version.
+  Every continuation request records the required revision it was composed with: the
+  directive intent (`work_revision`, echoed on the 202 and the readback), the re-brief
+  marker, and the dispatch turn (always 0). The `job.delivered` that settles the request
+  carries `work_revision`. That delivery is the revision's acknowledgement. The prompt also
+  names the revision, but a text echo alone never counts.
+- **One continuation.** While delivered < required, the next directive or re-brief carries
+  every pending material amendment's canonical text once, in version order. Each request
+  is stamped with its revision. A fresh minion (re-brief, or the resume fallback) is briefed
+  with the full effective contract, not only the original briefing. Silas's digest owes ONE
+  continuation (`revisionContinuations`, rule `revision-continuation`) while no writer owns
+  the lane.
+- **Pending corrections fence review.** The shared branch-idle predicate treats
+  delivered < required as busy, so every route refuses:
+  - arm and freeze;
+  - queued handoff;
+  - fallback admission;
+  - automatic admission retry.
+
+  The `409 branch_busy` blocker carries `required_revision`/`delivered_revision`. A review of
+  an explicit `target_ref` cannot bypass the job's own fence, and neither can `force`: like
+  an open retirement hold, a pending correction is never an overridable blocker. That holds
+  at the arm, at the freeze recheck, and at the fallback gate's admission and iteration
+  boundaries.
+- **Corrective deliveries are verified before review (owner decision 2026-10-09, option A).**
+  The first delivery that carries a new work revision owes a passing scheduler verification
+  (`verification.completed` with `ok: true`) on its exact delivered head. Any scope the lane
+  declares counts. Until that pass exists, the lane stays busy: the blocker carries
+  `verification_required_head`, and the digest offers `verificationsOwed` instead of a
+  review row. A repair after a failed run owes its own pass. Once a review round has
+  admitted the corrected work, later ordinary deliveries keep today's behavior (no
+  verification may be in flight). This debt is a busy fact, so owner `force` may override
+  it; it never overrides a pending revision. A pass re-offers a review request that was
+  waiting on it.
+- **Supersession.** Accepting a material amendment supersedes any review that owns the lane.
+  A queued round is withdrawn, or a running round and its specialists are cancelled.
+  `round.superseded` is recorded first, with the settled specialist checkpoints. Partial
+  findings stay in the round's artifact directory. The stop is then *confirmed*:
+  - every review operation settled within the bound;
+  - every round is terminal;
+  - no review session still holds a live runtime handle.
+
+  The stop is proven the same way the next round's setup proves a predecessor stopped: a
+  trusted no-spawn receipt, or the runtime proving the round's owner marker and every
+  registered session ceased. A superseded fallback gate's reviewer sessions are proven too;
+  its debt lives on the job (`job.review-superseded` / `job.review-supersession-*`). The outcome is recorded as `round.supersession-confirmed`, or as
+  `round.supersession-unconfirmed` plus one action-required escalation. A round whose stop
+  stays unproven keeps owning the lane, even though it is terminal: every later writer
+  re-proves it before prompting. A supersession with no newer confirmation (for example
+  after a restart interrupted it) counts as unproven. A failed re-proof of an
+  already-escalated stop is an FYI, not a second alert. A superseded round records `round.perkins-incomplete` with
+  reason `superseded`. That is routine FYI, never an Ack, including after a restart that
+  interrupted it, and it is never a clean-abort re-arm candidate.
+- **Queued review requests.** A review request queued before the material change (a
+  handoff waiting for delivery) asked for the obsolete candidate. It is withdrawn durably
+  (`job.review-handoff-withdrawn`), so neither the corrective delivery nor a restart replays
+  it. Any queued request older than an accepted material amendment is treated as withdrawn,
+  even if a crash lost the withdrawal. A new request for a candidate that a pending revision
+  already made obsolete is refused rather than queued. The corrected candidate is reviewed through the ordinary rows. A superseded fallback
+  gate stops at its next decision point and records `aborted` with `superseded: true`; it
+  never records a late PASS or sends a fix directive.
+- **Writer gate.** Before a directive or re-brief prompts the lane's minion, the service
+  supersedes and *proves stopped* every review that owns the lane.
+  - **Unproven stop.** The writer is refused and nothing is sent. A directive records a
+    positive no-effect failure; a re-brief answers `409 review_supersession_unconfirmed`
+    before any marker exists.
+  - **Review running, no material revision pending.** The branch stays frozen: directives,
+    re-briefs and provider-recovery claims answer `409 review_in_progress`. A
+    provider-recovery claim on a lane whose review a material correction made obsolete
+    takes the same supersede-and-prove gate first.
+  - **One writer per lane.** A directive while a re-brief stands, or a re-brief while a
+    directive is live, answers `409 writer_conflict`.
+- **READY binds to the reviewed contract.** The board withholds the owner-ready (merge)
+  offer in two cases: while a material correction is pending delivery, and when the
+  approved round froze an older contract than the required revision. An administrative
+  amendment never withdraws READY. A correction retracted after it superseded a review
+  re-offers the standing delivery for review. A superseded review answers no review
+  request.
+- **Restarts.** Boot recovery terminalizes live rounds. The writer's durable intent (the
+  directive row or re-brief marker) keeps fencing review until it settles.
+
+## 5. What freeze binds (audit trail)
 
 Every frozen round records:
 
@@ -179,7 +282,26 @@ Every frozen round records:
   missing inputs (`head-binding`, `frozen-packet:<file>`, `spec-context`,
   `verification-evidence`, `ci-evidence`, `evidence:<id>`). A refused round
   aborts without spawn and escalates naming every missing input; fully
-  accessible material passes and the packet stays frozen head-bound. Missing
+  accessible material passes and the packet stays frozen head-bound. A
+  TRANSIENT refusal — every missing input a `head-binding` git step that
+  failed and PROVED its whole process group stopped (`retryable: true`) —
+  instead retries on its own, 1 minute and then 5 minutes later (owner
+  decision 2026-10-08). Retries live in memory: when one is due, a single
+  check confirms the job is where it was refused, then the same request
+  (never its `force`) runs as an ordinary review request with every
+  ordinary fence. A newer delivery or round, a non-reviewable status,
+  another request under way or a busy branch skips it with an FYI. A fresh
+  request refused while a retry waits keeps that retry (same attempt and
+  due time). Only the last refusal escalates action-required. Nothing
+  resumes a retry after a restart: one still pending escalates
+  action-required once at the next start (`round.admission-retry-
+  scheduled` / `-settled` are bookkeeping for that check only). A git step
+  that would not stop after SIGKILL ("cleanup unconfirmed") is never
+  retried: the round is refused and one action-required alert names the
+  still-running process group — nothing is quarantined (owner decision
+  2026-10-08). Every review git step runs with the repository-routing
+  environment (`GIT_DIR`, `GIT_WORK_TREE`, …) removed.
+  Missing
   evidence never refuses admission by itself: an explicit UNAVAILABLE CI
   record is a PASS at preflight (its missing-vs-failed distinction is a
   display/report duty — see §2); only inaccessible, corrupt or unbound
@@ -204,7 +326,7 @@ RECEIPT (missing evidence, not a measured failure)`, or `NOT-MATCHED` —
 derived only from the frozen manifest record, so missing evidence can never
 read as a CI failure (and a measured failure is never softened).
 
-## 5. Activating a previously blocked PR (owner-controlled, later)
+## 6. Activating a previously blocked PR (owner-controlled, later)
 
 This lane ships the mechanism only. When the owner chooses to supply evidence
 or amendments to an existing PR:

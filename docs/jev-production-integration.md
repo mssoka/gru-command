@@ -245,6 +245,57 @@ Routing rules:
 Provenance gains `profile` (the profile name that produced a `jev` outcome;
 null on deterministic fallbacks).
 
+## Request deadlines and failure evidence
+
+`timeout_ms` bounds the **client-side exchange**, from immediately before
+fetch through response-body consumption and validation. It is not the model's
+inference time. Header wait includes local scheduling, connection setup and
+provider processing; this fetch integration does not separately measure
+DNS, TCP, TLS, gateway queueing or inference. An unauthenticated fast `401`
+probe measures a different path from an authenticated decision and does not
+exonerate either the client or the provider for a historical slow request.
+
+The provider races the whole exchange against its own deadline, in addition
+to signaling transport abort. Even an abort-ignoring fetch/body cannot keep
+its caller or one of the four admission slots pending beyond the local
+deadline. Late response bodies are cancelled best-effort; late answers cannot
+route a decision. Disposal cancels as `disposed`, not `timeout`, and runtime
+generation checks prevent shutdown/reconfiguration from recording a stale
+shadow ask as a new timeout. Cancellation cannot guarantee an uncooperative
+underlying transport has stopped. JavaScript timers need an event-loop turn;
+if the loop is blocked, expiry can run late, but elapsed-time checks also
+reject a response that arrives after the deadline before the timer runs.
+
+New `decisions.shadow` records include `fallback_reason` and
+`request_diagnostics`. Attempted failures retain their actual elapsed
+`latency_ms` rather than replacing it with zero. The diagnostics contain:
+
+- `phase`: `not_started` for an admission refusal, `request` while waiting
+  for headers, `response_headers` while checking HTTP status and declared
+  response size (without reading rejected or oversized bodies),
+  `response_body` while reading an accepted response's body, or
+  `response_validation` while parsing/checking a completed body;
+- `timeoutMs` and `deadlineExpired`: configured client budget and whether
+  this request's own deadline expired (an upstream abort can be classified
+  as `timeout` without our local deadline having expired);
+- `headersMs` and `bodyMs`: elapsed milestones from the same request start,
+  not individual phase durations; `null` means that milestone was not observed
+  before the bounded request settled, not proof a response never arrived later;
+- `httpStatus`: observed HTTP status, or `null` before headers.
+
+`fallback_reason = "capacity_limited"` means the four local admission slots
+were occupied: that ask never contacted the provider. It is logged as a
+`decision provider request fell back` warning with profile, surface, elapsed
+time and diagnostics, but does **not** degrade remote-provider health or
+count as a transient miss. Deterministic stand-ins (for example a missing key
+or an already-degraded runtime) have their actual fallback reason and null
+request diagnostics. These records contain no request state, credentials,
+raw error text or raw provider bodies.
+
+Historical rows without these new fields have **unknown causes**: a
+`deterministic` source and `latency_ms = 0` alone cannot establish a timeout,
+a capacity refusal, a DNS fault, or a long-lived slot deadlock.
+
 ## Credentials
 
 Precedence per slot is:
@@ -340,7 +391,7 @@ schemes, URL userinfo, opaque key formats, private-key blocks).
 | `credential_unsafe` | Remove symlinks; set the credentials directory to `0700` and key file to `0600`; re-provision if ownership is uncertain. |
 | `auth_rejected` / `forbidden` | Verify the OpenRouter credential and access, then recheck. |
 | `provider_degraded` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded after the last one, wait for provider/rate-limit recovery and use Recheck — deterministic behavior remains active. |
-| `timeout` / `network_error` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded, verify DNS/TLS/connectivity to `openrouter.ai` and use Recheck. Repeated timeouts on a healthy network mean `timeout_ms` (default 5000) is too tight for your provider latency — raise it; the section hot-reloads. |
+| `timeout` / `network_error` | Transient: automatic rechecks run on a bounded backoff (1, 5, 15, 60 min); if still degraded, verify DNS/TLS/connectivity to `openrouter.ai` and use Recheck. Inspect the shadow record's `fallback_reason`, or the request warning's `reason` for any mode, plus elapsed time and `request_diagnostics`, before changing `timeout_ms` (default 5000). The section hot-reloads, but increasing the budget is not a diagnosis and will not explain local capacity refusals. |
 | `malformed_response` | Leave deterministic fallback active and inspect the configured model/endpoint compatibility. |
 | `malformed_request` | The provider rejected the request shape (HTTP 422). Check the surface wiring/model name; this is a caller bug, not provider health. |
 | `endpoint_untrusted` | Restore the verified HTTPS endpoint. Resolved portable credentials are never sent elsewhere. |

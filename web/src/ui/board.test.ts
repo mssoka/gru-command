@@ -13,7 +13,8 @@ import type {
   VerifyQueueView,
 } from '../lib/board-protocol.js';
 import { memoryStorage } from '../lib/chat-storage.js';
-import { boardKpis } from '../lib/board-kpi.js';
+import { boardKpis, collectJobs } from '../lib/board-kpi.js';
+import { snapshotSections } from '../lib/board-sections.js';
 import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
@@ -581,7 +582,7 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
       agent('lens', { role: 'perkins', state: 'streaming', lastActivity: new Date(Date.now() - 600_000).toISOString() }),
     ];
     const snapshotValue = snapshot({ jobs, agents });
-    const kpis = boardKpis(snapshotValue, new Date());
+    const kpis = boardKpis(snapshotValue, new Date(), collectJobs(snapshotValue));
     const view = new BoardView(() => {});
     view.render(snapshotValue);
 
@@ -2644,6 +2645,667 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).toBeNull();
   });
 
+  // ---- Book of Lessons proposals (owner decision 2026-10-07) ----
+  const lessonChange = (slug: string, body: string, extra: Record<string, unknown> = {}) => ({
+    slug,
+    body,
+    recurred: 1,
+    tags: [] as string[],
+    previousBody: null,
+    previousRecurred: null,
+    previousTags: null,
+    ...extra,
+  });
+  function proposalReview(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'prop-1',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      notificationId: 'lp-1',
+      entries: 2,
+      throughSeq: 9,
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Ops' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+          tags: { before: ['ops'], after: ['ops'] },
+          added: [lessonChange('close-shell', 'Close the shell first.\nThen restart.')],
+          changed: [
+            lessonChange('drain', 'Drain before a roll.', { recurred: 3, previousBody: 'Drain.', previousRecurred: 2, previousTags: [] }),
+          ],
+          removed: [],
+          provenanceTrimmed: 4,
+          bodiesTrimmed: 0,
+        },
+      ],
+      index: [],
+      decision: null,
+      recovery: null,
+      ...overrides,
+    };
+  }
+  const proposalNotice = notification('lp-1', {
+    routing: 'needs-owner',
+    kind: 'lessons.proposal',
+    title: 'Book of Lessons: 2 lesson changes proposed',
+  });
+  const flush = async () => {
+    for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+  };
+  const decided = (id: string, decision: 'accept' | 'reject') =>
+    Promise.resolve({ id, decision: decision === 'accept' ? 'accepted' : 'rejected' });
+  function proposalClient(decide: (id: string, decision: 'accept' | 'reject') => Promise<unknown> = decided, review = proposalReview()) {
+    return {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      getLessonProposal: vi.fn(() => Promise.resolve(review)),
+      decideLessonProposal: vi.fn(decide),
+      wake: vi.fn(),
+    } as unknown as import('../lib/board-client.js').BoardClient & {
+      getLessonProposal: ReturnType<typeof vi.fn>;
+      decideLessonProposal: ReturnType<typeof vi.fn>;
+      wake: ReturnType<typeof vi.fn>;
+    };
+  }
+  function openReview(): void {
+    const details = document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-owner__review')!;
+    details.open = true;
+    details.dispatchEvent(new Event('toggle'));
+  }
+
+  it('lesson proposal row: Review shows the exact text; a decision stays pending until the snapshot resolves it', async () => {
+    const client = proposalClient(decided);
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(band.textContent).toContain('Accept writes these changes into the Book of Lessons');
+    expect(band.querySelector('[data-action-id="owner-ack:lp-1"]')).toBeNull();
+    openReview();
+    await flush();
+    expect(band.textContent).toContain('Close the shell first.\nThen restart.');
+    expect(band.textContent).toContain('updated · recurred 2 → 3 · drain');
+    expect(band.textContent).toContain('4 oldest journal handle(s) released to fit');
+    band.querySelector<HTMLButtonElement>('[data-action-id="owner-proposal:lp-1"]')!.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    view.render(snapshot({ notifications: [{ ...proposalNotice, resolvedAt: '2026-01-01T00:09:00.000Z' }] }));
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).toBeNull();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+  });
+
+  it('a snapshot push keeps the review open, its text loaded, and an in-flight decision locked', async () => {
+    let finish: () => void = () => {};
+    const client = proposalClient(
+      (id) => new Promise((resolve) => { finish = () => resolve({ id, decision: 'accepted' }); }),
+    );
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    // An unrelated push re-renders everything.
+    view.render(snapshot({ notifications: [proposalNotice, notification('other', { routing: 'fyi' })] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector<HTMLDetailsElement>('.board-owner__review')!.open).toBe(true);
+    expect(band.textContent).toContain('Close the shell first.');
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.textContent, accept.disabled]).toEqual(['accepting…', true]);
+    const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect(reject.disabled).toBe(true);
+    reject.click();
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+    finish();
+  });
+
+  it('a refused decision says why; a network failure says it is unconfirmed; both keep the row and its controls', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const failures: unknown[] = [
+      new BoardApiError('/api/lessons/proposal/prop-1/accept', 409, 'proposal_stale', 'the Book of Lessons changed since this proposal was made'),
+      new TypeError('fetch failed'),
+    ];
+    const client = proposalClient(() => Promise.reject(failures.shift()));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Not applied — the Book of Lessons changed since this proposal was made. A fresh proposal will follow.',
+    );
+    expect(band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(false);
+    band.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toContain('Couldn’t confirm the decision (fetch failed)');
+    expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+  });
+
+  it('the review names summary and tag changes, every removed lesson with its text, and retired chapters plainly', async () => {
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Ops' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart and roll discipline.' },
+          tags: { before: ['ops'], after: ['ops', 'roll'] },
+          added: [],
+          changed: [lessonChange('drain', 'Drain before a roll.', { recurred: 2, tags: ['roll'], previousBody: 'Drain before a roll.', previousRecurred: 1, previousTags: [] })],
+          removed: [{ slug: 'drop-me', body: 'A lesson the cap removes.', recurred: 1, tags: [], reason: 'cap' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'model-policy',
+          title: { before: 'Model policy', after: 'Model policy' },
+          retired: true,
+          summary: { before: 'Which model does what.', after: '' },
+          tags: { before: ['models'], after: [] },
+          added: [],
+          changed: [],
+          removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 1, tags: [], reason: 'retired' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+      ],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    const text = document.getElementById('board-owner')!.textContent ?? '';
+    expect(text).toContain('summary: Restart discipline. → Restart and roll discipline.');
+    expect(text).toContain('tags: ops → ops, roll');
+    expect(text).toContain('tags: — → roll');
+    expect(text).toContain('removed to fit the cap · drop-me');
+    expect(text).toContain('A lesson the cap removes.');
+    expect(text).toContain('Model policy — chapter retired (1 lesson removed)');
+    expect(text).toContain('removed with the chapter · sol-for-silas');
+    expect(text).not.toContain('dropped to fit');
+  });
+
+  it('the archive record is explained wherever it appears — added, changed and removed — with its body and tags (R7-08)', async () => {
+    const ARCHIVE = 'archived-provenance';
+    const archiveBody = 'Lessons trimmed at the chapter cap; provenance retained so the journal remains the ground truth.';
+    const explained = 'archive record (journal handles of dropped lessons)';
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Ops' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+          tags: { before: ['ops'], after: ['ops'] },
+          added: [lessonChange(ARCHIVE, archiveBody, { tags: ['archived'] })],
+          changed: [],
+          removed: [{ slug: 'drop-me', body: 'A lesson the cap removes.', recurred: 1, tags: [], reason: 'cap' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'rounds',
+          title: { before: 'Rounds', after: 'Rounds' },
+          retired: false,
+          summary: { before: 'Review rounds.', after: 'Review rounds.' },
+          tags: { before: [], after: [] },
+          added: [],
+          changed: [lessonChange(ARCHIVE, `${archiveBody} Merged.`, { tags: ['archived', 'rounds'], previousBody: archiveBody, previousRecurred: 1, previousTags: ['archived'] })],
+          removed: [],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'model-policy',
+          title: { before: 'Model policy', after: 'Model policy' },
+          retired: true,
+          summary: { before: 'Which model does what.', after: '' },
+          tags: { before: ['models'], after: [] },
+          added: [],
+          changed: [],
+          removed: [{ slug: ARCHIVE, body: archiveBody, recurred: 2, tags: ['archived'], reason: 'retired' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+      ],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    const lessons = [...document.getElementById('board-owner')!.querySelectorAll<HTMLElement>('.board-owner__review-lesson')]
+      .map((node) => [...node.children].filter((child) => child.tagName === 'DIV').map((child) => child.textContent));
+    expect(lessons).toEqual([
+      [`new · recurred 1 · ${explained}`, archiveBody, 'tags: archived'],
+      ['removed to fit the cap · drop-me (recurred 1)', 'A lesson the cap removes.'],
+      [`updated · recurred 1 · ${explained}`, `${archiveBody} Merged.`, 'tags: archived → archived, rounds'],
+      [`removed with the chapter · ${explained} (recurred 2)`, archiveBody, 'tags: archived'],
+    ]);
+    // The internal slug never stands alone as a label.
+    expect(document.getElementById('board-owner')!.textContent).not.toMatch(new RegExp(`· ${ARCHIVE}\\b`));
+  });
+
+  it('band Accept and band Reject reach the real client’s exact decision endpoints', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const calls: string[] = [];
+    const fetchImpl = (async (path: string, init?: { method?: string }) => {
+      if (path.startsWith('/api/lessons/')) calls.push(`${init?.method ?? 'GET'} ${path}`);
+      const decision = /\/api\/lessons\/proposal\/([^/]+)\/(accept|reject)$/u.exec(path);
+      const body = path === '/api/lessons/proposal'
+        ? proposalReview()
+        : { id: decision?.[1], decision: decision?.[2] === 'accept' ? 'accepted' : 'rejected' };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch;
+    const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    const first = new BoardView(() => {}, client);
+    first.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(calls).toEqual(['GET /api/lessons/proposal', 'POST /api/lessons/proposal/prop-1/accept']);
+    calls.length = 0;
+    const second = new BoardView(() => {}, client);
+    second.render(snapshot({ notifications: [{ ...proposalNotice, id: 'lp-2' }] }));
+    const secondReview = { ...proposalReview(), id: 'prop-2', notificationId: 'lp-2' };
+    (client as unknown as { getLessonProposal: () => Promise<unknown> }).getLessonProposal = async () => {
+      calls.push('GET /api/lessons/proposal');
+      return secondReview;
+    };
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    expect(calls).toEqual(['GET /api/lessons/proposal', 'POST /api/lessons/proposal/prop-2/reject']);
+  });
+
+  it('the review names renames, new chapters, recurrence moves and every INDEX entry the Accept changes', async () => {
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'ops',
+          title: { before: 'Ops', after: 'Operations' },
+          retired: false,
+          summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+          tags: { before: ['ops'], after: ['ops'] },
+          added: [],
+          changed: [lessonChange('drain', 'Drain first.', { recurred: 4, previousBody: 'Drain first.', previousRecurred: 3, previousTags: [] })],
+          removed: [],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'fresh',
+          title: { before: null, after: 'Fresh ground' },
+          retired: false,
+          summary: { before: null, after: 'Brand new.' },
+          tags: { before: [], after: ['new'] },
+          added: [lessonChange('first', 'The first lesson.')],
+          changed: [],
+          removed: [],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+      ],
+      index: [
+        { slug: 'fresh', before: null, after: { summary: 'Brand new.', tags: ['new'] } },
+        { slug: 'gone', before: { summary: 'Old chapter.', tags: ['old'] }, after: null },
+        { slug: 'untouched', before: { summary: 'Was this.', tags: ['a'] }, after: { summary: 'Now this.', tags: ['a', 'b'] } },
+      ],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    const text = document.getElementById('board-owner')!.textContent ?? '';
+    expect(text).toContain('Ops → Operations (renamed)');
+    expect(text).toContain('Fresh ground — new chapter');
+    expect(text).toContain('summary: Brand new.');
+    expect(text).toContain('updated · recurred 3 → 4 · drain');
+    expect(text).toContain('new · recurred 1 · first');
+    expect(text).toContain('INDEX.md (what briefings see)');
+    expect(text).toContain('+ fresh: Brand new. (tags: new)');
+    expect(text).toContain('− gone: Old chapter.');
+    expect(text).toContain('~ untouched: Was this. (tags: a) → Now this. (tags: a, b)');
+  });
+
+  it('a recorded-but-unfinished decision (202) says so and locks the opposite choice — a blocked one too', async () => {
+    const outcomes: Array<() => Promise<unknown>> = [
+      () => Promise.resolve({ id: 'prop-1', decision: 'accepted', incomplete: true, detail: 'the notice could not be resolved' }),
+      // A recovery conflict after recording is "recorded but blocked" (202), never a refusal.
+      () => Promise.resolve({
+        id: 'prop-1',
+        decision: 'rejected',
+        incomplete: true,
+        detail: 'the Reject is recorded but blocked: INDEX.md changed',
+      }),
+    ];
+    const client = proposalClient(() => outcomes.shift()!());
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Your Accept is recorded, but finishing it hit a problem (the notice could not be resolved). Press Accept again to finish it.',
+    );
+    expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
+      .toEqual([false, true]);
+    expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    // A second view (fresh state) whose Reject is recorded but blocked.
+    const second = new BoardView(() => {}, client);
+    second.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.click();
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')?.textContent).toBe(
+      'Your Reject is recorded, but finishing it hit a problem (the Reject is recorded but blocked: INDEX.md changed). Press Reject again to finish it.',
+    );
+    expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
+      .toEqual([true, false]);
+  });
+
+  it('a decision that finds the proposal gone is an unknown outcome — never "Not applied" — and the board refreshes', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const client = proposalClient(() => Promise.reject(new BoardApiError('/api/lessons/proposal/prop-1/accept', 404, 'proposal_none', 'no lesson proposal is pending')));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    const alert = document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent ?? '';
+    expect(alert).toContain('This proposal is no longer pending — it may already have been decided');
+    expect(alert).not.toContain('Not applied');
+    expect(client.wake).toHaveBeenCalledTimes(1);
+  });
+
+  it('the review names what removals take away: tags, a retired chapter’s summary and tags, INDEX tags, left-out lessons', async () => {
+    const review = proposalReview({
+      chapters: [
+        {
+          slug: 'model-policy',
+          title: { before: 'Model policy', after: 'Model policy' },
+          retired: true,
+          summary: { before: 'Which model does what.', after: '' },
+          tags: { before: ['models', 'routing'], after: [] },
+          added: [],
+          changed: [],
+          removed: [{ slug: 'sol-for-silas', body: 'Silas runs on Sol.', recurred: 2, tags: ['silas'], reason: 'retired' }],
+          provenanceTrimmed: 0,
+          bodiesTrimmed: 0,
+        },
+        {
+          slug: 'ops',
+          title: { before: null, after: 'Ops' },
+          retired: false,
+          summary: { before: null, after: 'Ops.' },
+          tags: { before: [], after: ['ops'] },
+          added: [lessonChange('kept', 'Kept lesson.')],
+          changed: [],
+          removed: [{ slug: 'left-out', body: 'An incoming lesson the cap left out.', recurred: 1, tags: ['cap'], reason: 'discarded' }],
+          provenanceTrimmed: 21,
+          bodiesTrimmed: 0,
+        },
+      ],
+      index: [{ slug: 'model-policy', before: { summary: 'Which model does what.', tags: ['models', 'routing'] }, after: null }],
+    });
+    const view = new BoardView(() => {}, proposalClient(decided, review));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    const text = document.getElementById('board-owner')!.textContent ?? '';
+    expect(text).toContain('summary removed: Which model does what.');
+    expect(text).toContain('tags removed: models, routing');
+    expect(text).toContain('removed with the chapter · sol-for-silas (recurred 2)');
+    expect(text).toContain('tags: silas');
+    expect(text).toContain('new, but left out to fit the cap · left-out (recurred 1)');
+    expect(text).toContain('21 oldest journal handle(s) released to fit');
+    expect(text).toContain('− model-policy: Which model does what. (tags: models, routing)');
+  });
+
+  it('the bell only points to For You — no review, no decision there; "Go to For You" lands on the band row', async () => {
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const bell = document.getElementById('notification-list')!;
+    const pointer = bell.querySelector('.board-owner__row--pointer')!;
+    expect(pointer.textContent).toContain('Book of Lessons: 2 lesson changes proposed');
+    expect(pointer.textContent).toContain('waiting for you in For You — review the changes and decide there');
+    expect(bell.querySelector('.board-owner__accept, .board-owner__reject, .board-owner__review')).toBeNull();
+    pointer.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
+    expect(document.getElementById('notification-panel')!.hidden).toBe(true);
+    expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-owner__review > summary'));
+    expect(client.getLessonProposal).not.toHaveBeenCalled();
+  });
+
+  it('"Go to For You" reveals a proposal six newer obligations hid, and never fetches or decides (C3)', async () => {
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    const older = { ...proposalNotice, ts: '2026-01-01T00:00:00.000Z' };
+    const newer = Array.from({ length: 6 }, (_, i) =>
+      notification(`newer-${i}`, { routing: 'needs-owner', ts: `2026-01-02T00:0${i}:00.000Z` }));
+    view.render(snapshot({ notifications: [older, ...newer] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[data-proposal-id="lp-1"]')).toBeNull(); // behind the window
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    document.getElementById('notification-list')!.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
+    expect(document.getElementById('notification-panel')!.hidden).toBe(true);
+    const row = band.querySelector('[data-proposal-id="lp-1"]');
+    expect(row).not.toBeNull();
+    expect(document.activeElement).toBe(row!.querySelector('.board-owner__review > summary'));
+    await flush();
+    expect(client.getLessonProposal).not.toHaveBeenCalled();
+    expect(client.decideLessonProposal).not.toHaveBeenCalled();
+  });
+
+  it('a finished decision asks for the authoritative snapshot at once — no waiting on a silent socket', async () => {
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(client.wake).toHaveBeenCalledTimes(1);
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull(); // the snapshot closes it
+  });
+
+  it('a review that loads on retry clears the earlier failure', async () => {
+    const client = proposalClient();
+    client.getLessonProposal.mockImplementationOnce(() => Promise.reject(new TypeError('fetch failed')));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    expect(document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent).toContain('Couldn’t load the proposal');
+    const details = document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-owner__review')!;
+    details.open = false;
+    details.dispatchEvent(new Event('toggle'));
+    openReview();
+    await flush();
+    const band = document.getElementById('board-owner')!;
+    expect(band.textContent).toContain('Close the shell first.');
+    expect(band.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it('a review gone before this page loaded it is an unknown outcome through the real client — and the board refreshes', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const requests: string[] = [];
+    const fetchImpl = (async (path: string) => {
+      requests.push(path);
+      if (path === '/api/lessons/proposal') {
+        return new Response(JSON.stringify({ error: 'not_found', detail: 'no lesson proposal is pending' }), { status: 404 });
+      }
+      return new Response(JSON.stringify(snapshot({ notifications: [] })), { status: 200 });
+    }) as unknown as typeof fetch;
+    const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    const alert = document.getElementById('board-owner')!.querySelector('[role="alert"]')?.textContent ?? '';
+    expect(alert).toContain('This proposal is no longer pending — it may already have been decided');
+    expect(requests).toContain('/api/board'); // refreshed
+    expect(requests.filter((path) => path.startsWith('/api/lessons/proposal/'))).toEqual([]); // nothing was posted
+  });
+
+  it('a malformed decision reply is not mistaken for success', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const fetchImpl = (async (path: string) => {
+      const body = path === '/api/lessons/proposal' ? proposalReview() : { ok: true };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as unknown as typeof fetch;
+    const client = new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    await expect(client.decideLessonProposal('prop-1', 'accept')).rejects.toThrow("the server's reply (HTTP 200) does not confirm this accept");
+  });
+
+  it('a decision reply must answer THIS request in its own phase — otherwise the outcome is unconfirmed, never "recorded" (C9)', async () => {
+    const { BoardClient } = await import('../lib/board-client.js');
+    const replying = (status: number, body: unknown) => {
+      const fetchImpl = (async () =>
+        new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
+      return new BoardClient({ token: 't', host: 'localhost', fetchImpl }, { connection: () => {}, snapshot: () => {}, fatal: () => {} } as never);
+    };
+    for (const [status, body] of [
+      [202, { id: 'other-proposal', decision: 'rejected', incomplete: true }], // another proposal, the other choice
+      [202, { id: 'prop-1', decision: 'rejected', incomplete: true }], // the other choice
+      [202, { id: 'prop-1', decision: 'accepted' }], // 202 without incomplete
+      [200, { id: 'prop-1', decision: 'accepted', incomplete: true }], // 200 claiming incomplete
+      [200, { id: 'prop-1', decision: 'withdrawn' }], // not an answer to an Accept
+      [201, { id: 'prop-1', decision: 'accepted' }], // an unknown phase
+    ] as const) {
+      await expect(replying(status, body).decideLessonProposal('prop-1', 'accept'), JSON.stringify([status, body])).rejects.toThrow(/does not confirm this accept/);
+    }
+    // R6-08: the right choice and phase, but another proposal — both choices.
+    for (const [status, body] of [
+      [200, { id: 'other-proposal', decision: 'accepted' }],
+      [202, { id: 'other-proposal', decision: 'accepted', incomplete: true }],
+    ] as const) {
+      await expect(replying(status, body).decideLessonProposal('prop-1', 'accept')).rejects.toThrow(/does not confirm this accept/);
+    }
+    for (const [status, body] of [
+      [200, { id: 'other-proposal', decision: 'rejected' }],
+      [202, { id: 'other-proposal', decision: 'rejected', incomplete: true }],
+    ] as const) {
+      await expect(replying(status, body).decideLessonProposal('prop-1', 'reject')).rejects.toThrow(/does not confirm this reject/);
+    }
+    await expect(replying(200, { id: 'prop-1', decision: 'rejected' }).decideLessonProposal('prop-1', 'reject')).resolves.toMatchObject({ decision: 'rejected' });
+    await expect(replying(200, { id: 'prop-1', decision: 'accepted' }).decideLessonProposal('prop-1', 'accept')).resolves.toMatchObject({ decision: 'accepted' });
+    await expect(replying(202, { id: 'prop-1', decision: 'accepted', incomplete: true, detail: 'x' }).decideLessonProposal('prop-1', 'accept')).resolves.toMatchObject({ incomplete: true });
+  });
+
+  it('a recorded decision whose retry fails stays recorded — its message, its row, and only its own button (R6-09)', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    for (const choice of ['accept', 'reject'] as const) {
+      const recorded = choice === 'accept' ? 'accepted' : 'rejected';
+      const label = choice === 'accept' ? 'Accept' : 'Reject';
+      let calls = 0;
+      const client = proposalClient(() => {
+        calls += 1;
+        return calls === 1
+          ? Promise.resolve({ id: 'lp-1', decision: recorded, incomplete: true, detail: 'ledger is busy' })
+          : Promise.reject(new BoardApiError(`/api/lessons/proposal/lp-1/${choice}`, 500, 'proposal_unconfirmed', 'disk I/O error'));
+      });
+      const view = new BoardView(() => {}, client);
+      view.render(snapshot({ notifications: [proposalNotice] }));
+      const button = () => document.getElementById('board-owner')!.querySelector<HTMLButtonElement>(`.board-owner__${choice}`)!;
+      const opposite = () => document.getElementById('board-owner')!.querySelector<HTMLButtonElement>(`.board-owner__${choice === 'accept' ? 'reject' : 'accept'}`)!;
+      button().click();
+      await flush();
+      expect(document.getElementById('board-owner')!.textContent, choice).toContain(`Your ${label} is recorded, but finishing it hit a problem`);
+      button().click();
+      await flush();
+      const band = document.getElementById('board-owner')!;
+      expect(band.textContent, choice).toContain(`Your ${label} is recorded, but finishing it could not be confirmed (the server failed (500: disk I/O error))`);
+      expect(band.textContent, choice).not.toContain('Not applied');
+      expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]'), choice).not.toBeNull(); // the snapshot closes it
+      expect(button().disabled, choice).toBe(false); // the same decision may be pressed again
+      expect(opposite().disabled, choice).toBe(true); // a recorded decision never flips
+      expect(calls, choice).toBe(2);
+    }
+  });
+
+  it('only a proven refusal says "Not applied"; a server failure is unconfirmed and keeps the recorded intent (C8)', async () => {
+    const { BoardApiError } = await import('../lib/board-client.js');
+    const failing = (status: number, error: string) => () =>
+      Promise.reject(new BoardApiError('/api/lessons/proposal/lp-1/accept', status, error, 'disk I/O error'));
+    const client = proposalClient(failing(500, 'proposal_unconfirmed'));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    expect(band.textContent).not.toContain('Not applied');
+    expect(band.textContent).toContain('Couldn’t confirm the decision (the server failed (500: disk I/O error))');
+    expect(client.wake).toHaveBeenCalled();
+    const stale = proposalClient(failing(409, 'proposal_stale'));
+    const second = new BoardView(() => {}, stale);
+    second.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.textContent).toContain('Not applied — disk I/O error. A fresh proposal will follow.');
+  });
+
+  it('an open "before" disclosure and the focused control survive a snapshot push', async () => {
+    const view = new BoardView(() => {}, proposalClient(decided));
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    openReview();
+    await flush();
+    let band = document.getElementById('board-owner')!;
+    const before = [...band.querySelectorAll<HTMLDetailsElement>('.board-owner__review-lesson details')].find((node) =>
+      node.textContent?.includes('Drain.'),
+    )!;
+    before.open = true;
+    before.dispatchEvent(new Event('toggle'));
+    const toggle = before.querySelector<HTMLElement>('summary')!;
+    toggle.focus();
+    const key = toggle.dataset.ownerFocusKey;
+    expect(key).toContain(':before:ops/drain');
+    view.render(snapshot({ notifications: [proposalNotice, notification('other', { routing: 'fyi' })] }));
+    band = document.getElementById('board-owner')!;
+    const restored = [...band.querySelectorAll<HTMLDetailsElement>('.board-owner__review-lesson details')].find((node) =>
+      node.textContent?.includes('Drain.'),
+    )!;
+    expect(restored).not.toBe(before);
+    expect(restored.open).toBe(true);
+    expect((document.activeElement as HTMLElement | null)?.dataset.ownerFocusKey).toBe(key);
+    expect(document.activeElement).toBe(restored.querySelector('summary'));
+  });
+
+  it('a re-pair while the review is loading never sends the decision through either client', async () => {
+    let release: (review: unknown) => void = () => {};
+    const oldClient = proposalClient();
+    oldClient.getLessonProposal.mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+    const newClient = proposalClient();
+    const view = new BoardView(() => {}, oldClient);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(oldClient.getLessonProposal).toHaveBeenCalledTimes(1);
+    view.bindClient(newClient);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    release(proposalReview());
+    await flush();
+    expect(oldClient.decideLessonProposal).not.toHaveBeenCalled();
+    expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[role="alert"]')).toBeNull();
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.textContent, accept.disabled]).toEqual(['Accept', false]);
+  });
+
+  it('the phone layout keeps the proposal review inside the single column', async () => {
+    const { existsSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const file = [join(process.cwd(), 'src/styles/components.css'), join(process.cwd(), 'web/src/styles/components.css')].find((path) =>
+      existsSync(path),
+    )!;
+    const css = readFileSync(file, 'utf8');
+    const phone = css.slice(css.indexOf('@media (max-width: 560px) {'));
+    const rule = /\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(phone.slice(0, phone.indexOf('\n}\n')))?.[1] ?? '';
+    expect(rule.replace(/\s+/gu, ' ')).toContain("grid-template-areas: 'title' 'meta' 'note' 'review' 'action' 'error';");
+  });
+
   it('ready PR row: affected heist + exact-head reason + OPEN PR external link; non-https URLs fail closed', () => {
     const view = new BoardView(() => {});
     view.render(snapshot({ ownerPrs: [ownerPr('job-ready')] }));
@@ -3539,5 +4201,150 @@ describe('board v6 — snapshot-resolved focus fallback (Perkins r2 warning)', (
     expect(active?.tagName).toBe('BUTTON');
     expect((active as HTMLElement).className).toContain('board-band__more');
     expect((active as HTMLElement).closest('.board-band')?.getAttribute('data-section')).toBe('cold');
+  });
+});
+
+describe('board — megaminions nest under their heist', () => {
+  beforeEach(mountBoardDom);
+
+  /** Two implementation heists; one commissioned three specialist
+   * reviewers (two still working, one delivered). */
+  function familySnapshot(extra: readonly JobView[] = []): BoardSnapshot {
+    const laneAt = (offsetMs: number): JobView['lane'] => ({
+      branch: 'gru/rev',
+      sha: 'c3f3b35deadbeef',
+      status: 'active',
+      createdAt: new Date(Date.now() - offsetMs).toISOString(),
+    });
+    return snapshot({
+      jobs: [
+        baseJob({ id: 'impl', title: 'Managed repositories overview', status: 'working', rounds: [] }),
+        baseJob({ id: 'other', title: 'Dashboard slim strip', status: 'working', rounds: [] }),
+        baseJob({ id: 'rev-blind', title: 'Review (blind)', status: 'working', rounds: [], parentJobId: 'impl', lane: laneAt(300_000) }),
+        baseJob({ id: 'rev-edge', title: 'Review (edge)', status: 'working', rounds: [], parentJobId: 'impl', lane: laneAt(290_000) }),
+        baseJob({ id: 'rev-verify', title: 'Review (verify)', status: 'delivered', rounds: [], parentJobId: 'impl', lane: laneAt(280_000) }),
+        ...extra,
+      ],
+    });
+  }
+
+  function rowOf(id: string): HTMLElement {
+    const row = document.querySelector<HTMLElement>(`.board-job[data-job-id="${id}"]`);
+    if (row === null) throw new Error(`row ${id} missing`);
+    return row;
+  }
+
+  it('counts heists only and hangs live megaminions under the parent row', () => {
+    const view = new BoardView(() => {});
+    view.render(familySnapshot());
+
+    const inFlight = document.querySelector<HTMLElement>('#board-section-in-flight');
+    expect(inFlight?.querySelector('.board-band__count')?.textContent).toBe('2 heists');
+    const topLevel = [...(inFlight?.querySelectorAll<HTMLElement>('.board-band__rows > .board-job') ?? [])];
+    expect(topLevel.map((row) => row.dataset.jobId).sort()).toEqual(['impl', 'other']);
+    // The delivered reviewer is part of its heist, not a Settled heist.
+    expect(document.querySelector('#board-section-settled .board-band__count')?.textContent).toBe('0 heists');
+
+    const parent = rowOf('impl');
+    expect(parent.querySelector(':scope > .board-job__meta .board-job__family-chip')?.textContent).toBe(
+      '↳ 3 megaminions · 2 working · 1 delivered',
+    );
+    const live = [...parent.querySelectorAll<HTMLElement>(':scope > .board-job__family--live > .board-job--child')];
+    expect(live.map((row) => row.dataset.jobId)).toEqual(['rev-blind', 'rev-edge']);
+    const blind = rowOf('rev-blind');
+    expect(blind.dataset.megaminion).toBe('true');
+    expect(blind.querySelector('.board-job__agent-age')?.textContent).toMatch(/^megaminion \d+[smhd]$/);
+    // A specialist is not a heist: no repo, no heist age on its row.
+    expect(blind.querySelector('.board-job__repo')).toBeNull();
+    expect(blind.querySelector('.board-job__lane-age')).toBeNull();
+    expect(blind.textContent).not.toContain('heist ');
+    // The parent keeps its own minion word; the concluded reviewer is
+    // folded away until the heist is expanded.
+    expect(parent.querySelector(':scope > .board-job__meta .board-job__agent-age')?.textContent).toMatch(/^minion /);
+    expect(document.querySelector('.board-job[data-job-id="rev-verify"]')).toBeNull();
+    expect(rowOf('other').querySelector('.board-job__family-chip')).toBeNull();
+  });
+
+  it('shows concluded megaminions inside the expanded heist; a nested row toggles itself, not its parent', () => {
+    const view = new BoardView(() => {});
+    view.render(familySnapshot());
+    const parent = rowOf('impl');
+
+    rowOf('rev-blind').querySelector<HTMLElement>('.board-job__meta')?.click();
+    expect(rowOf('rev-blind').dataset.expanded).toBe('true');
+    expect(parent.dataset.expanded).toBe('false');
+
+    parent.querySelector<HTMLButtonElement>(':scope > .board-job__head .board-job__toggle')?.click();
+    expect(parent.dataset.expanded).toBe('true');
+    const concluded = parent.querySelector<HTMLElement>('.board-job__body .board-job__family--concluded');
+    expect(concluded?.querySelector('.board-job__family-label')?.textContent).toBe('megaminions');
+    const verify = rowOf('rev-verify');
+    expect(concluded?.contains(verify)).toBe(true);
+
+    // A nested row inside the parent's body still flips on a summary click.
+    verify.querySelector<HTMLElement>('.board-job__meta')?.click();
+    expect(verify.dataset.expanded).toBe('true');
+    expect(parent.dataset.expanded).toBe('true');
+  });
+
+  it('a blocked megaminion stays surfaced in For Gru and names its heist', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      familySnapshot([
+        baseJob({ id: 'rev-stuck', title: 'Review (stuck)', status: 'blocked', rounds: [], parentJobId: 'impl' }),
+      ]),
+    );
+    expandForGru();
+    const forGru = document.querySelector<HTMLElement>('#board-section-for-gru');
+    expect(forGru?.querySelector('.board-band__count')?.textContent).toBe('1 heist');
+    const stuck = rowOf('rev-stuck');
+    expect(forGru?.contains(stuck)).toBe(true);
+    const link = stuck.querySelector<HTMLButtonElement>('button.board-job__parent');
+    expect(link?.textContent).toBe('↳ megaminion of Managed repositories overview');
+    expect(stuck.querySelector('.board-job__agent-age')?.textContent).toMatch(/^megaminion /);
+    expect(rowOf('impl').querySelector('.board-job__family-chip')?.textContent).toBe('↳ 3 megaminions · 2 working · 1 delivered');
+    // The ↳ link jumps to the heist: its toggle takes focus; the surfaced
+    // row itself does not flip open.
+    link?.click();
+    expect(document.activeElement).toBe(rowOf('impl').querySelector(':scope > .board-job__head .board-job__toggle'));
+    expect(rowOf('rev-stuck').dataset.expanded).toBe('false');
+  });
+
+  it('a running specialist of a COLD heist stays visible in In flight and its link opens Cold to the heist', () => {
+    const view = new BoardView(() => {});
+    const stale = new Date(Date.now() - 6 * 3_600_000).toISOString();
+    view.render(
+      snapshot({
+        jobs: [
+          baseJob({
+            id: 'impl',
+            title: 'Quiet heist',
+            status: 'working',
+            rounds: [],
+            lastAgentActivity: stale,
+            lane: { branch: 'gru/impl', sha: 'c3f3b35deadbeef', status: 'active', createdAt: stale },
+          }),
+          baseJob({ id: 'rev-live', title: 'Review (live)', status: 'working', rounds: [], parentJobId: 'impl' }),
+        ],
+      }),
+    );
+    const inFlight = document.querySelector<HTMLElement>('#board-section-in-flight');
+    expect(inFlight?.querySelector('.board-band__count')?.textContent).toBe('1 heist');
+    const live = rowOf('rev-live');
+    expect(inFlight?.contains(live)).toBe(true);
+    expect(document.querySelector('#board-section-cold .board-band__body')?.hasAttribute('hidden')).toBe(true);
+    live.querySelector<HTMLButtonElement>('button.board-job__parent')?.click();
+    const cold = document.querySelector<HTMLElement>('#board-section-cold');
+    expect(cold?.querySelector('.board-band__body')?.hasAttribute('hidden')).toBe(false);
+    expect(cold?.contains(rowOf('impl'))).toBe(true);
+    expect(document.activeElement).toBe(rowOf('impl').querySelector(':scope > .board-job__head .board-job__toggle'));
+  });
+
+  it('the HEISTS tracker counts the board\'s top-level rows: parents only while their specialists nest', () => {
+    const value = familySnapshot();
+    expect(boardKpis(value, new Date(), snapshotSections(value).topLevel).jobs.total).toBe(2);
+    const view = new BoardView(() => {});
+    view.render(value);
+    expect(document.querySelector('#chip-rail [data-kpi="jobs.total"]')?.textContent).toContain('2');
   });
 });

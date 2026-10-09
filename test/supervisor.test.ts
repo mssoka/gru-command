@@ -157,7 +157,7 @@ class FakeHandle implements AgentHandle {
 class FakeRegistry implements SupervisorRegistry {
   private readonly listeners = new Set<(envelope: AgentEventEnvelope) => void>();
   readonly handlesById = new Map<string, FakeHandle>();
-  readonly spawnCalls: { role: Role; resumeFile: string | null }[] = [];
+  readonly spawnCalls: { role: Role; resumeFile: string | null; cwd?: string }[] = [];
   /** Monotonic: a disposed handle's id is never re-minted. */
   private nextId = 0;
   /** Replace to control spawn behavior (default: resume keeps the
@@ -184,7 +184,7 @@ class FakeRegistry implements SupervisorRegistry {
   }
 
   async spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle> {
-    this.spawnCalls.push({ role, resumeFile: options?.resumeFile ?? null });
+    this.spawnCalls.push({ role, resumeFile: options?.resumeFile ?? null, ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}) });
     const handle = await this.spawnImpl(role, options);
     this.adopt(handle);
     return handle;
@@ -699,6 +699,63 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(handle.disposed).toBe(true);
   });
 
+  it('a retirement fences breaker ACK even after handoff; a genuinely fresh interrupted turn still resumes', async () => {
+    const db = new LedgerDb(tmpDir());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    const registry = new FakeRegistry();
+    let nowMs = 2_000_000;
+    const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 30, restartWindowMs: 600_000,
+      maxRestarts: 1, restartBackoffMs: 1 }, registry, ledger: api, notifications: center, tickMs: 5, now: () => nowMs });
+    api.addJob({ id: 'retired-breaker-job', repo: 'fixture', title: 'retired breaker' });
+    api.setJobStatus('retired-breaker-job', 'working');
+    const intent = api.beginDirectiveIntent({ jobId: 'retired-breaker-job', directive: 'old prompt', holder: 'silas-ops', requestId: 'retired-breaker-request' });
+    api.registerAgent({ id: 'retired-breaker-agent', role: 'minion', jobId: 'retired-breaker-job' });
+    registry.spawnImpl = async () => { throw new Error('fixture failed restart'); };
+    supervisor.start();
+    try {
+      const old = new FakeHandle('minion', 'retired-breaker-agent', null);
+      old.pendingTurnSnapshot = { text: 'old retired prompt', owner: 'silas-directive:retired-breaker-request' };
+      registry.adopt(old);
+      hang(old);
+      nowMs += 60;
+      await sleep(150);
+      expect(supervisor.viewFor(old.id)?.state).toBe('stopped');
+      expect(old.disposed).toBe(true);
+      api.setAgentState(old.id, 'disposed'); // the real fixture disposer acknowledged cessation
+      expect(supervisor.pendingProducerBlockers('retired-breaker-job')).toEqual([]);
+      api.retireInterruptedDirective({ requestId: intent.record.requestId, expectedJobId: 'retired-breaker-job', expectedState: 'dispatching',
+        expectedPayloadHash: intent.record.payloadHash, expectedHead: 'a'.repeat(40), lane: { id: 'breaker-fixture-lane', resolvedHead: 'a'.repeat(40) },
+        reason: 'fixture restart stopped and disposed', by: 'silas-ops' });
+      const stop = api.listNotifications({ limit: 30 }).find((notification) => notification.kind === 'supervision.breaker')!;
+      const before = registry.spawnCalls.length;
+      registry.spawnImpl = async (role) => new FakeHandle(role, 'should-not-replay-retired', null);
+      supervisor.onNotificationAcked(stop.id);
+      await sleep(30);
+      expect(registry.spawnCalls).toHaveLength(before);
+      expect(supervisor.viewFor(old.id)?.breakerOpen).toBe(true);
+      api.beginDirectiveIntent({ jobId: 'retired-breaker-job', directive: 'fresh authority', holder: 'silas-ops', requestId: 'fresh-breaker-request' });
+      supervisor.onNotificationAcked(stop.id);
+      await sleep(30);
+      expect(registry.spawnCalls).toHaveLength(before);
+      expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
+      const fresh = new FakeHandle('minion', 'fresh-breaker-agent', null);
+      api.registerAgent({ id: fresh.id, role: 'minion', jobId: 'retired-breaker-job' });
+      fresh.pendingTurnSnapshot = { text: 'new authorized prompt', owner: 'silas-directive:fresh-breaker-request' };
+      registry.spawnImpl = async (role) => new FakeHandle(role, 'fresh-breaker-resumed', null);
+      registry.adopt(fresh);
+      hang(fresh);
+      nowMs += 60;
+      await sleep(80);
+      expect((registry.getHandle('fresh-breaker-resumed') as FakeHandle | null)?.promptCalls).toEqual([{ text: 'new authorized prompt', owner: 'silas-directive:fresh-breaker-request' }]);
+    } finally {
+      supervisor.dispose();
+      for (const handle of registry.handlesById.values()) await registry.disposeHandle(handle);
+      db.close();
+    }
+  });
+
   it('breaker trips after 3 failed rungs in the window: stop + needs-owner + board mark', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);
@@ -799,6 +856,29 @@ describe('supervisor — watchdog + restart ladder', () => {
 });
 
 describe('supervisor — durable restart association', () => {
+  it('reports failed-restart backoff as producer ownership before any pacing entry exists', async () => {
+    vi.useFakeTimers();
+    const rig = boot();
+    try {
+      rig.api.addJob({ id: 'retirement-backoff', repo: 'fixture', title: 'retirement-backoff' });
+      const original = new FakeHandle('minion', 'retirement-backoff-agent', null);
+      rig.registry.adopt(original);
+      rig.api.registerAgent({ id: original.id, role: 'minion', jobId: 'retirement-backoff' });
+      rig.registry.spawnImpl = async () => { throw new Error('restart transport unavailable'); };
+      expect(rig.supervisor.pendingProducerBlockers('retirement-backoff')).toEqual([]);
+      original.emit({ type: 'error', error: 'session stream died', fatal: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(original.disposed).toBe(true);
+      expect(rig.registry.getHandle(original.id)).toBeNull();
+      rig.api.setAgentState(original.id, 'error', 'restart transport unavailable');
+      expect(rig.supervisor.pendingProducerBlockers('retirement-backoff').join(' ')).toContain('pending recovery/retry');
+      expect(rig.supervisor.pendingProducerBlockers('unrelated-job')).toEqual([]);
+    } finally {
+      rig.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it('carries the known job binding through both fresh-id and same-id minion restarts', async () => {
     for (const sameId of [false, true]) {
       const rig = boot();
@@ -2121,6 +2201,34 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     h.dispose();
   });
 
+  it('a restarted minion resumes in its job lane (keeping the lane-bound BMAD runtime); a gone lane falls back', async () => {
+    const h = boot();
+    const lane = tmpDir();
+    for (const [jobId, path] of [['job-laned', lane], ['job-gone', join(lane, 'swept-away')]] as const) {
+      h.api.addJob({ id: jobId, repo: 'gru-command', title: jobId });
+      h.api.setJobStatus(jobId, 'working');
+      h.api.registerAgent({ id: `minion-${jobId}`, role: 'minion', jobId });
+      h.api.registerWorktree({ id: jobId, kind: 'job', repoPath: '/tmp/repo', repoName: 'gru-command', path, branch: `gru/${jobId}`, sha: 'abc1234', jobId });
+    }
+    for (const jobId of ['job-laned', 'job-gone']) {
+      const sessionFile = join(tmpDir(), 'minion', `${jobId}.jsonl`);
+      mkdirSync(join(sessionFile, '..'), { recursive: true });
+      writeFileSync(sessionFile, '{}\n', 'utf-8');
+      const handle = new FakeHandle('minion', `minion-${jobId}`, sessionFile);
+      h.registry.adopt(handle);
+      handle.enableVerdictAttestation();
+      hang(handle);
+      h.advance(60);
+      await vi.waitFor(() => {
+        expect(h.registry.spawnCalls.some((call) => call.resumeFile === sessionFile)).toBe(true);
+      }, { timeout: 5_000 });
+      const restart = h.registry.spawnCalls.find((call) => call.resumeFile === sessionFile)!;
+      if (jobId === 'job-laned') expect(restart).toEqual({ role: 'minion', resumeFile: sessionFile, cwd: lane });
+      else expect(restart).toEqual({ role: 'minion', resumeFile: sessionFile });
+    }
+    h.dispose();
+  });
+
   it('a restart that cannot snapshot the turn posts a durable recoverable-lane note with job + branch + phase', async () => {
     const h = boot();
     h.api.addJob({ id: 'job-orphan', repo: 'gru-command', title: 'orphan lane' });
@@ -2253,7 +2361,9 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
       sleep: sleeper.sleep,
       jitter: () => 0,
     });
+    h.api.addJob({ id: 'job-bounded', repo: 'fixture', title: 'job-bounded' });
     const handle = new FakeHandle('minion', 'minion-429-bounded', null);
+    h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-bounded' });
     handle.pendingTurnSnapshot = { text: 'finish the lane', owner: 'dispatch:job-bounded' };
     h.registry.adopt(handle);
     // Every delivery fails in-band (pi-style: the failure event arrives
@@ -2263,6 +2373,7 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     };
     emitFailure(handle, '429 too many requests');
     expect(sleeper.delays).toEqual([100]);
+    expect(h.supervisor.pendingProducerBlockers('job-bounded').join(' ')).toContain('pending recovery/retry');
     await sleeper.release(); // attempt 1 fails -> attempt 2 at 200ms
     expect(sleeper.delays).toEqual([100, 200]);
     await sleeper.release(); // attempt 2 fails -> attempt 3 at 400ms

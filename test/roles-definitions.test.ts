@@ -59,6 +59,8 @@ describe('role definitions (E8)', () => {
     ]) expect(silas).toContain(clause);
     expect(silas).toContain('never\nmerge');
     expect(silas).toContain('service-restart clean abort');
+    // Silas-dispatched reports on a lane nest under it as megaminions.
+    expect(silas.replace(/\s+/gu, ' ')).toContain('names that lane\'s job id as `"parent_job_id"`');
     expect(silas).toContain('owner-held');
   });
 
@@ -69,6 +71,15 @@ describe('role definitions (E8)', () => {
     const silas = ROLE_DEFINITIONS['silas'].systemPrompt.replace(/\s+/gu, ' ');
     expect(silas).toContain('New pull requests are ordinary');
     expect(silas).toContain('existing drafts are left untouched');
+  });
+
+  it('pins the minion owning main-conflict resolution in its own worktree', () => {
+    const minion = ROLE_DEFINITIONS['minion'].systemPrompt.replace(/\s+/gu, ' ');
+    expect(minion).toContain('Main moves; your lane stays');
+    expect(minion).toContain('never a reason to restart, replace or re-branch your work');
+    expect(minion).toContain('resolve the conflict in your own worktree');
+    expect(minion).toContain('do not revert what main already has');
+    expect(minion).toContain("Main's newer features are not part of your scope");
   });
 
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
@@ -111,7 +122,9 @@ describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability ame
   const silas = ROLE_DEFINITIONS.silas.systemPrompt.replace(/\s+/gu, ' ');
 
   it('the worker selects the installed build-workflow skill by capability and owns the cycle end to end', () => {
-    expect(minion).toContain("the PROJECT's actual installed skill catalog/metadata");
+    expect(minion).toContain("your session's actual skill catalog/metadata");
+    // Issue #283: the catalog carries the lane-bound GC-managed runtime.
+    expect(minion).toContain('the Gru Command-managed BMAD runtime bound to your lane');
     expect(minion).toContain('task-relevant BMAD skills by capability');
     expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     expect(minion).toContain('You own the');
@@ -128,16 +141,24 @@ describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability ame
     expect(minion).toContain('a separate tracked job with its own session and worktree');
     expect(minion).toContain('read-only brief');
     expect(minion).toContain('"deliverable": "review"');
+    // Each reviewer names the commissioning job so the board nests it
+    // under that heist as a megaminion instead of a peer heist.
+    expect(minion.replace(/\s+/gu, ' ')).toContain('name your own job id (the one in your briefing header) as `"parent_job_id"`');
+    expect(minion).toContain('megaminion');
+    // The commissioning minion owes each reviewer's disposition.
+    const flatMinion = minion.replace(/\s+/gu, ' ');
+    expect(flatMinion).toContain("makes your job each reviewer's commissioner");
+    expect(flatMinion).toContain('POST /api/jobs/<review job id>/disposition');
     expect(minion).toContain('an inline self-review is not a substitute');
-    // The loud missing-capability stop names the official onboarding path.
-    expect(minion).toContain("Project-local BMAD");
+    // The loud missing-capability stop names the supported provisioning path.
+    expect(minion).toContain('"GC-managed BMAD runtime" section');
     expect(minion).not.toContain('pi -p');
     expect(minion).not.toContain('claude -p');
   });
 
   it('the ops persona carries the minion-owned build cycle without fixed names', () => {
     expect(silas).toContain('Minion-owned build cycle');
-    expect(silas).toContain("selects the task-relevant BMAD skills from the project's actual installed catalog");
+    expect(silas).toContain("selects the task-relevant BMAD skills from its session's actual skill catalog");
     expect(silas).toContain('never demand a fixed skill name');
     expect(silas).toContain('"deliverable": "review"');
     expect(silas).toContain('exact-final-head READY');

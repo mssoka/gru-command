@@ -36,6 +36,22 @@ export const AMENDMENT_MAX_IDEMPOTENCY_KEY_CHARS = 200;
  * room for the host-recorded verification and CI blocks appended after it. */
 export const AMENDMENT_CONTRACT_MAX_BYTES = 192 * 1024;
 
+/**
+ * What an accepted amendment asks of the lane (owner rule 1, 2026-10-08).
+ * `material`: the approved change requires implementation — the delivered
+ * candidate is outdated until a continuation carrying this revision
+ * delivers, and a review of the old candidate is superseded. `administrative`:
+ * a clarification, typo or bookkeeping update — it never restarts work and
+ * never blocks review. Rows accepted before the field existed are `null`
+ * (unclassified) and never gate anything: history is not re-decided.
+ */
+export const AMENDMENT_EFFECTS = ['material', 'administrative'] as const;
+export type AmendmentEffect = (typeof AMENDMENT_EFFECTS)[number];
+
+export function isAmendmentEffect(value: unknown): value is AmendmentEffect {
+  return typeof value === 'string' && (AMENDMENT_EFFECTS as readonly string[]).includes(value);
+}
+
 export interface JobAmendmentApproval {
   readonly by: string;
   readonly reference: string;
@@ -49,6 +65,8 @@ export interface JobAmendmentRecord {
   readonly bodySha256: string;
   readonly supersedes: readonly string[];
   readonly approval: JobAmendmentApproval;
+  /** null = accepted before classification existed (never gates work). */
+  readonly effect: AmendmentEffect | null;
   readonly previousContractSha256: string;
   readonly contractSha256: string;
   /** Fingerprint of the exact accepted request (idempotency binding). */
@@ -77,19 +95,75 @@ export function amendmentBodySha256(body: string): string {
   return sha256(body);
 }
 
-/** sha256 of the exact request a writer submitted (idempotency fingerprint). */
+/** sha256 of the exact request a writer submitted (idempotency fingerprint).
+ * The effect joins the fingerprint only when present, so a pre-classification
+ * request keeps the fingerprint it was accepted under. */
 export function amendmentRequestSha256(input: {
   readonly body: string;
   readonly supersedes: readonly string[];
   readonly approval: JobAmendmentApproval;
   readonly expectedContractSha256: string;
+  readonly effect?: AmendmentEffect | null;
 }): string {
   return sha256(JSON.stringify({
     body: input.body,
     supersedes: [...input.supersedes],
     approval: { by: input.approval.by, reference: input.approval.reference },
     expectedContractSha256: input.expectedContractSha256,
+    ...(input.effect !== undefined && input.effect !== null ? { effect: input.effect } : {}),
   }));
+}
+
+/** The highest version among EFFECTIVE material amendments (0 when none):
+ * the work revision a delivery must carry before its candidate may be
+ * reviewed. A material amendment a later amendment superseded (retracted
+ * or replaced) owes no implementation of its own. */
+export function requiredWorkRevision(
+  amendments: readonly (Pick<JobAmendmentRecord, 'version' | 'effect'> & Partial<Pick<JobAmendmentRecord, 'id' | 'supersedes'>>)[],
+): number {
+  const superseded = new Set<string>();
+  for (const amendment of amendments) {
+    for (const entry of amendment.supersedes ?? []) {
+      if (entry.startsWith('amendment:')) superseded.add(entry.slice('amendment:'.length));
+    }
+  }
+  let required = 0;
+  for (const amendment of amendments) {
+    if (amendment.effect !== 'material') continue;
+    if (amendment.id !== undefined && superseded.has(amendment.id)) continue;
+    if (amendment.version > required) required = amendment.version;
+  }
+  return required;
+}
+
+/** A job's work revisions: what review requires vs what the newest
+ * delivery carried. `required > delivered` = a correction is pending. */
+export interface WorkRevisionState {
+  readonly required: number;
+  readonly delivered: number;
+}
+
+/** The work revision a `job.delivered` event carried: its
+ * service-stamped `work_revision` (0 when the event predates revisions or
+ * carries none — a delivery never proves a revision it was not stamped
+ * with). */
+export function deliveredWorkRevision(event: { readonly payload: unknown } | null): number {
+  if (event === null || typeof event.payload !== 'object' || event.payload === null) return 0;
+  const raw = (event.payload as { work_revision?: unknown }).work_revision;
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : 0;
+}
+
+/** The material amendments a delivery at `deliveredRevision` has not yet
+ * carried, in version order: the one continuation's payload (rule 4). */
+export function pendingMaterialAmendments(
+  amendments: readonly JobAmendmentRecord[],
+  deliveredRevision: number,
+  upToRevision: number,
+): readonly JobAmendmentRecord[] {
+  return [...amendments]
+    .filter((amendment) => amendment.effect === 'material' &&
+      amendment.version > deliveredRevision && amendment.version <= upToRevision)
+    .sort((left, right) => left.version - right.version);
 }
 
 function hasDisallowedControl(value: string): boolean {
@@ -150,6 +224,22 @@ export function validateAmendmentDraft(input: {
   return null;
 }
 
+/** Which accepted amendments a later one superseded: amendment id → the
+ * version of the FIRST later amendment naming `amendment:<id>`. One rule
+ * for the rendered contract and the revision continuation. */
+export function amendmentSupersessions(amendments: readonly JobAmendmentRecord[]): ReadonlyMap<string, number> {
+  const ordered = [...amendments].sort((left, right) => left.version - right.version);
+  const supersededBy = new Map<string, number>();
+  for (const amendment of ordered) {
+    for (const entry of amendment.supersedes) {
+      if (!entry.startsWith('amendment:')) continue;
+      const id = entry.slice('amendment:'.length);
+      if (!supersededBy.has(id)) supersededBy.set(id, amendment.version);
+    }
+  }
+  return supersededBy;
+}
+
 /** Render the effective acceptance. Zero amendments return the original
  * briefing bytes EXACTLY (backward compatibility: existing jobs freeze
  * byte-identical specs). */
@@ -170,14 +260,7 @@ export function renderEffectiveContract(
   }
   // First later amendment naming `amendment:<id>` in its supersedes list owns
   // the supersession marker. History stays visible; effectiveness is explicit.
-  const supersededBy = new Map<string, number>();
-  for (const amendment of ordered) {
-    for (const entry of amendment.supersedes) {
-      if (!entry.startsWith('amendment:')) continue;
-      const id = entry.slice('amendment:'.length);
-      if (!supersededBy.has(id)) supersededBy.set(id, amendment.version);
-    }
-  }
+  const supersededBy = amendmentSupersessions(ordered);
   if (briefing === null) {
     // Unreachable through addJobAmendment (no-briefing jobs take no
     // amendments). A caller bypassing that guard must refuse, never invent
@@ -197,6 +280,11 @@ export function renderEffectiveContract(
       `approval: ${amendment.approval.by} — ${amendment.approval.reference}`,
       `supersedes: ${amendment.supersedes.length === 0 ? 'none' : amendment.supersedes.join(', ')}`,
       `body_sha256: ${amendment.bodySha256}`,
+      // Unclassified (pre-effect) rows render byte-identically to before, so
+      // already-frozen contract hashes never move.
+      ...(amendment.effect === null ? [] : [amendment.effect === 'material'
+        ? 'effect: MATERIAL — requires implementation; the candidate must carry this revision before review'
+        : 'effect: ADMINISTRATIVE — no implementation required']),
       superseder === undefined
         ? 'status: EFFECTIVE'
         : `status: NOT EFFECTIVE — superseded by amendment #${superseder}`,

@@ -896,4 +896,86 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_jobs_pr_url ON jobs(pr_url);
     `,
   },
+  {
+    // Job family (megaminions): a job commissioned by another job's minion
+    // — the build workflow's specialist reviewers — records the commissioning
+    // job as its parent so the board nests it under that heist instead of
+    // counting it as a peer. One level deep: a child never parents a child.
+    // The backfill links only what the ledger proves exactly, and only
+    // report-type children under PR-owing parents (so no row can become a
+    // grandchild): (1) a commissioner that names a job in the same repo, and
+    // (2) a target_ref equal to exactly ONE PR-owing job's pr_url in the
+    // same repo. Ambiguous or unmatched rows stay top-level — nothing guessed.
+    // LANDING COLLISION (same convention as migrations 10-21): id 22 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 22,
+    name: 'job-parent',
+    sql: `
+      ALTER TABLE jobs ADD COLUMN parent_job_id TEXT REFERENCES jobs(id);
+      CREATE INDEX idx_jobs_parent ON jobs(parent_job_id);
+      UPDATE jobs SET parent_job_id = commissioner
+       WHERE deliverable IN ('review', 'artifact', 'investigation')
+         AND commissioner IS NOT NULL AND commissioner <> id
+         AND EXISTS (
+           SELECT 1 FROM jobs parent
+            WHERE parent.id = jobs.commissioner AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         );
+      UPDATE jobs SET parent_job_id = (
+           SELECT parent.id FROM jobs parent
+            WHERE parent.pr_url = jobs.target_ref AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         )
+       WHERE parent_job_id IS NULL
+         AND deliverable IN ('review', 'artifact', 'investigation')
+         AND target_ref IS NOT NULL
+         AND (
+           SELECT COUNT(*) FROM jobs parent
+            WHERE parent.pr_url = jobs.target_ref AND parent.repo = jobs.repo
+              AND (parent.deliverable IS NULL OR parent.deliverable = 'pr')
+         ) = 1;
+    `,
+  },
+  {
+    // Guarded interrupted-directive recovery (owner approval j-1348): the
+    // terminal `retired` control closure keeps its audit facts and a
+    // durable continuation hold on the request row. The hold is released
+    // only by a fresh accepted directive/re-brief identity; NULL means
+    // open. Additive and nullable: pre-existing rows keep exact meaning.
+    // LANDING COLLISION (same convention as migrations 10-22): id 23 is a
+    // branch-local next-contiguous number for an UNSHIPPED feature; if
+    // owner-merged main lands first, re-number ONLY this never-applied
+    // migration (never a hole).
+    id: 23,
+    name: 'directive-retirement',
+    sql: `
+      ALTER TABLE pending_directives ADD COLUMN retired_at TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retired_by TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_reason TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_fingerprint TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_state TEXT;
+      ALTER TABLE pending_directives ADD COLUMN retire_expected_head TEXT;
+      ALTER TABLE pending_directives ADD COLUMN hold_released_by TEXT;
+      ALTER TABLE pending_directives ADD COLUMN hold_released_at TEXT;
+      CREATE INDEX idx_pending_directives_hold ON pending_directives(job_id, state, hold_released_by);
+    `,
+  },
+  {
+    // Supersede-and-resume (owner rules 2026-10-08): every new amendment
+    // declares whether it requires implementation (`material`) or not
+    // (`administrative`); pre-existing rows stay NULL = unclassified and
+    // never gate review. A directive request records the required work
+    // revision it was composed with, so its delivery carries that revision
+    // as the service-bound acknowledgement. Additive and nullable.
+    // LANDING COLLISION (same convention as migrations 10-23): renumber
+    // ONLY this never-applied migration if main lands id 24 first.
+    id: 24,
+    name: 'work-revision',
+    sql: `
+      ALTER TABLE job_amendments ADD COLUMN effect TEXT CHECK (effect IS NULL OR effect IN ('material','administrative'));
+      ALTER TABLE pending_directives ADD COLUMN work_revision INTEGER;
+    `,
+  },
 ];

@@ -9,10 +9,14 @@
 import {
   BOARD_WS_PATH,
   isValidDecisionStatus,
+  isValidLessonProposal,
+  isValidLessonProposalDecision,
   isValidSnapshot,
   parseBoardServerFrame,
   type BoardSnapshot,
   type DecisionStatusView,
+  type LessonProposalDecisionView,
+  type LessonProposalView,
   type NotificationView,
   type TranscriptInfo,
   type TranscriptPage,
@@ -372,6 +376,7 @@ export class BoardClient {
     throw new BoardApiError(path, res.status, code, detail);
   }
 
+
   /** One-shot HTTP snapshot fetch (initial load + reconnect catch-up). */
   async refetchSnapshot(): Promise<void> {
     if (this.stopped) return; // a stopped (re-paired) client never re-polls
@@ -507,6 +512,28 @@ export class BoardClient {
     }
   }
 
+  /** The pending Book of Lessons proposal, for the owner's review. */
+  async getLessonProposal(): Promise<LessonProposalView> {
+    const proposal = await this.api<unknown>('/api/lessons/proposal');
+    if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
+    return proposal;
+  }
+
+  /** The owner's decision on a lesson proposal — the ONLY way it closes
+   * (owner decision 2026-10-07); the snapshot then retires the row. */
+  async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<LessonProposalDecisionView> {
+    const { status, body } = await this.postApiWithStatus(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
+    const expected = decision === 'accept' ? 'accepted' : 'rejected';
+    // C9: a reply counts only when it answers THIS request — this proposal,
+    // this choice — in its own phase: 200 finished, 202 recorded but
+    // incomplete. Anything else leaves the outcome unconfirmed.
+    if (!isValidLessonProposalDecision(body) || body.id !== id || body.decision !== expected ||
+      !((status === 200 && body.incomplete !== true) || (status === 202 && body.incomplete === true))) {
+      throw new Error(`the server's reply (HTTP ${status}) does not confirm this ${decision}`);
+    }
+    return body;
+  }
+
   /** E7: human ack (action-required clearance; re-arms an open breaker). */
   async ackNotification(id: string): Promise<void> {
     await this.postApi(`/api/notifications/${encodeURIComponent(id)}/ack`, { by: 'web' });
@@ -520,6 +547,10 @@ export class BoardClient {
    * BoardApiError (code `timeout`, status 0 = no HTTP answer) — callers
    * can tell "the server said no" from "we don't know". */
   private async postApi(path: string, body: unknown): Promise<unknown> {
+    return (await this.postApiWithStatus(path, body)).body;
+  }
+
+  private async postApiWithStatus(path: string, body: unknown): Promise<{ readonly status: number; readonly body: unknown }> {
     const doFetch = this.fetchImpl;
     const request = new AbortController();
     this.requestControllers.add(request);
@@ -534,7 +565,9 @@ export class BoardClient {
     try {
       // The deadline covers the FETCH and the BODY: a reply whose headers
       // arrive and whose body stalls is the same unconfirmed outcome as no
-      // reply at all, and surfaces the same typed timeout.
+      // reply at all, and surfaces the same typed timeout. The reply keeps
+      // main's {status, body} shape (the lesson-proposal decision path
+      // distinguishes 200 from 202 on the status).
       return await Promise.race([
         (async () => {
           const res = await doFetch(path, {
@@ -547,7 +580,7 @@ export class BoardClient {
             signal: request.signal,
           });
           if (!res.ok) return this.refused(path, res);
-          return await res.json();
+          return { status: res.status, body: await res.json() };
         })(),
         expired,
       ]);

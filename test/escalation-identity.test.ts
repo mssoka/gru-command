@@ -202,7 +202,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // 27 of 30 sites carry the bounded context; the three null rows are the
+    // 32 of 35 sites carry the bounded context; the three null rows are the
     // sanctioned residuals (shutdown deadline, live-process pause, sweep
     // error) that stay deliberately context-free and live (A7 rejection
     // stands; a worktree id is never coerced into a round identity).
@@ -210,18 +210,29 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Queued review handoff for job ${job.id} needs reconciliation`', '{ jobId: job.id }'],
       ['`Queued review handoff failed for job ${job.id}`', '{ jobId: job.id }'],
       ["'Perkins review shutdown deadline exceeded'", null],
+      // The wave's one escalation wrapper forwards the caller's own bounded
+      // context unchanged (a superseded round's traffic routes to FYI).
+      ['title', 'context'],
+      // Owner rule 3: an unproven supersession stop blocks the writer.
+      ['`Review of job ${input.jobId} could not be confirmed stopped — its writer is blocked`', '{ jobId: input.jobId, ...(roundIds.size === 1 ? { roundId: [...roundIds][0]! } : {}) }'],
       ['`Review round ${round.id} carries a posted verdict without a provider-bound receipt`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${String(lane.roundId)} could not be processed during startup recovery`', '{ ...(lane.jobId !== null ? { jobId: lane.jobId } : {}), ...(lane.roundId !== null ? { roundId: lane.roundId } : {}), }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Queued review handoff for job ${jobId} is held`', '{ jobId }'],
       ['`Queued review handoff failed for job ${jobId}`', '{ jobId }'],
+      // Owner decision 2026-10-08: a transient refusal retries; only the
+      // last refusal, or a retry that cannot run, is action-required.
+      ['`Perkins review for job ${jobId} refused admission before any specialist started`', '{ jobId, roundId }'],
+      ['`Automatic review retry for job ${jobId} crashed`', '{ jobId, roundId: current.roundId }'],
+      ['`Automatic review retry for job ${jobId} could not start`', '{ jobId, roundId: retry.roundId }'],
+      // Retries live in memory: one a restart interrupted escalates once.
+      ['`Automatic review retry for job ${job.id} was interrupted by a restart`', '{ jobId: job.id, roundId: scheduled.roundId }'],
       ['`Review for job ${job.id} cannot gate: Perkins is unavailable and the fallback is not installed`', '{ jobId: job.id }'],
       ['`Perkins gate unavailable for job ${job.id} — the bmad-review gate is engaged`', '{ jobId: job.id }'],
       ['`bmad-review gate PASS for job ${job.id} — review/fix routing cleared (not a Perkins READY; merge stays user-held)`', '{ jobId: job.id }'],
       ['`bmad-review gate BLOCKED for job ${jobId}`', '{ jobId }'],
       ['`bmad-review gate ABORTED for job ${jobId}`', '{ jobId }'],
-      ['`Perkins review for job ${job.id} refused admission before any specialist started`', '{ jobId: job.id, roundId: round.id }'],
       ['`Perkins delta READY for job ${input.jobId} still owes its final whole-change pass`', '{ jobId: input.jobId, roundId: round.id }'],
       ['`Perkins review for job ${input.job.id} was blocked before any round: the PR head could not be verified`', '{ jobId: input.job.id }'],
       ['`Review round ${round.id} disposal failed after completion`', '{ jobId: job.id, roundId: round.id }'],
@@ -239,7 +250,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(30);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(27);
+    expect(sites).toHaveLength(35);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(32);
   });
 });

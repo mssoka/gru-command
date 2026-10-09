@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { isValidLessonProposal } from './board-protocol.js';
 import {
   agentStateTone,
   isValidSnapshot,
@@ -107,6 +108,22 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(board)).toBe(false);
     job.displayName = '🧑\u200d🚀 launch';
     expect(isValidSnapshot(board)).toBe(true);
+  });
+
+  it('accepts an absent or null parent job (top-level heist), rejects a malformed one', () => {
+    const board = snapshot();
+    const job = board.repos[0]!.jobs[0]! as { id: string; parentJobId?: unknown };
+    expect(isValidSnapshot(board)).toBe(true); // older server: no field
+    job.parentJobId = null;
+    expect(isValidSnapshot(board)).toBe(true);
+    job.parentJobId = 'impl';
+    expect(isValidSnapshot(board)).toBe(true);
+    job.parentJobId = '  ';
+    expect(isValidSnapshot(board)).toBe(false);
+    job.parentJobId = 7;
+    expect(isValidSnapshot(board)).toBe(false);
+    job.parentJobId = job.id; // a job is never its own megaminion
+    expect(isValidSnapshot(board)).toBe(false);
   });
 
   it('rejects malformed frames (wrong shapes, missing fields, non-objects)', () => {
@@ -538,5 +555,23 @@ describe('provider pacing mirror (server parity)', () => {
     const badQueued = pacingSnapshot();
     (badQueued.pacing as { worker: { queued: unknown } }).worker.queued = 'nope';
     expect(isValidSnapshot(badQueued)).toBe(false);
+  });
+});
+
+describe('lesson proposal review validator', () => {
+  it('an INDEX change must have a side — a both-null entry is refused, one side passes', () => {
+    const review = (entry: unknown) => ({
+      id: 'prop-1',
+      createdAt: '2026-10-07T00:00:00.000Z',
+      notificationId: 'lp-1',
+      entries: 1,
+      throughSeq: 1,
+      decision: null,
+      recovery: null,
+      chapters: [],
+      index: [entry],
+    });
+    expect(isValidLessonProposal(review({ slug: 'ops', before: null, after: null }))).toBe(false);
+    expect(isValidLessonProposal(review({ slug: 'ops', before: null, after: { summary: 'S.', tags: [] } }))).toBe(true);
   });
 });

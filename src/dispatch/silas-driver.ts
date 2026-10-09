@@ -12,6 +12,7 @@ import type {
   JobStatus,
   LedgerApi,
   PendingRebriefRecord,
+  ProviderWaitRecord,
   RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
@@ -19,7 +20,8 @@ import { isJobTerminal, type TerminalJobStatus } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import { DECISION_SURFACE_SAME_BLOCKER, fileOfLocation, sameBlockerDecisionRequest } from '../decisions/questions.js';
 import type { DecisionService } from '../decisions/types.js';
-import { openAttemptStartSeq } from './branch-idle.js';
+import { openAttemptStartSeq, pendingWorkRevision } from './branch-idle.js';
+import type { JobAmendmentRecord, WorkRevisionState } from '../review-inputs/amendments.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
@@ -293,6 +295,13 @@ export interface DigestLedger {
   /** Durable re-brief markers; any row for a job is an unresolved request
    * that fences the job's review-eligibility rows (see the digest below). */
   listPendingRebriefs(opts?: { readonly jobId?: string }): readonly PendingRebriefRecord[];
+  /** The job's required vs delivered work revision (owner rule 2). */
+  workRevisionState(jobId: string): WorkRevisionState;
+  /** A corrective delivery's unpaid verification (option A), or null. */
+  correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null;
+  /** Accepted amendments (version order): the revision-continuation row
+   * names the material versions its one continuation carries. */
+  listJobAmendments(jobId: string): readonly JobAmendmentRecord[];
   /** Accepted directive requests still owing completion (`dispatching` or
    * `admitted`). Presence is the lane's single-writer fence: no competing
    * continuation may be offered while one may still be driving the lane. */
@@ -300,6 +309,13 @@ export interface DigestLedger {
     readonly jobId?: string;
     readonly states?: readonly DirectiveState[];
   }): readonly DirectiveRequestRecord[];
+  /** True while a retirement's continuation hold is unreleased: the lane is
+   * fenced exactly like a live request — no competing continuation may be
+   * offered, armed or woken until a fresh accepted request supersedes it. */
+  hasOpenDirectiveRecoveryHold(jobId: string): boolean;
+  listDirectiveRecoveryHolds: LedgerApi['listDirectiveRecoveryHolds'];
+  providerWaitRetirementIdentity: LedgerApi['providerWaitRetirementIdentity'];
+  getProviderWait(id: string): ProviderWaitRecord | null;
   /** Tracked child workers (issue #161/#117): the releaseEligible sweep-ack
    * row fences on non-terminal children exactly like the release endpoint's
    * own refusal — the digest never offers a release that would 409. */
@@ -512,6 +528,40 @@ export interface ReleaseEligibleRow {
   readonly branch: string | null;
 }
 
+/** A lane whose accepted MATERIAL amendments have not been delivered
+ * (owner rules 2 and 4, 2026-10-08): the candidate is outdated and review
+ * is fenced until a delivery carries the required revision. ONE
+ * continuation directive is owed — the service attaches every pending
+ * amendment's canonical text to it and stamps the revision, so the
+ * directive itself only needs to ask for the implementation. Offered only
+ * while no writer owns the lane (no live directive, no unresolved re-brief,
+ * no open attempt, no in-flight verification); retires when a delivery
+ * carries the revision. */
+export interface RevisionContinuationRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly requiredRevision: number;
+  readonly deliveredRevision: number;
+  /** The material amendment versions the continuation will carry. */
+  readonly pendingVersions: readonly number[];
+}
+
+/** A CORRECTIVE delivery (the first carrying a new work revision) that
+ * still owes a passing verification on its exact head before review may
+ * arm (owner decision 2026-10-09, option A). Silas schedules that
+ * verification through the capture helper pinned to `head`; a failure
+ * surfaces as the ordinary verificationFailures row. Offered only while no
+ * writer owns the lane and no verification is in flight; retires on a
+ * passing run on the head (or once a review round admitted it). */
+export interface VerificationOwedRow {
+  readonly jobId: string;
+  readonly repo: string;
+  readonly revision: number;
+  /** The delivered head to verify (null: the delivery could not resolve
+   * it — verify the lane's current head). */
+  readonly head: string | null;
+}
+
 export interface SilasOpsDigest {
   readonly computedAt: string;
   readonly trigger: string;
@@ -525,6 +575,8 @@ export interface SilasOpsDigest {
   readonly providerRecoveryPending: readonly ProviderRecoveryPendingRow[];
   readonly conflictingPrs: readonly ConflictingPrRow[];
   readonly releaseEligible: readonly ReleaseEligibleRow[];
+  readonly revisionContinuations: readonly RevisionContinuationRow[];
+  readonly verificationsOwed: readonly VerificationOwedRow[];
 }
 
 /** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
@@ -539,7 +591,9 @@ export function digestActionCount(digest: SilasOpsDigest): number {
     digest.verificationWaits.length +
     digest.providerRecoveryPending.length +
     digest.conflictingPrs.length +
-    digest.releaseEligible.length
+    digest.releaseEligible.length +
+    digest.revisionContinuations.length +
+    digest.verificationsOwed.length
   );
 }
 
@@ -559,6 +613,8 @@ const DIGEST_ROW_CATEGORIES = [
   'providerRecoveryPending',
   'conflictingPrs',
   'releaseEligible',
+  'revisionContinuations',
+  'verificationsOwed',
 ] as const;
 
 export type DigestRowCategory = (typeof DIGEST_ROW_CATEGORIES)[number];
@@ -574,7 +630,9 @@ export type DigestRow =
   | VerificationWaitingRow
   | ProviderRecoveryPendingRow
   | ConflictingPrRow
-  | ReleaseEligibleRow;
+  | ReleaseEligibleRow
+  | RevisionContinuationRow
+  | VerificationOwedRow;
 
 /**
  * Decision-relevant projection of a digest row (issue #217): identity and
@@ -658,6 +716,22 @@ export function digestRowProjection(category: DigestRowCategory, row: DigestRow)
       const r = row as ReleaseEligibleRow;
       return { jobId: r.jobId, repo: r.repo, status: r.status, branch: r.branch };
     }
+    case 'revisionContinuations': {
+      // Every field: a newer material amendment (or a partial delivery)
+      // changes what the one continuation must carry.
+      const r = row as RevisionContinuationRow;
+      return {
+        jobId: r.jobId,
+        repo: r.repo,
+        requiredRevision: r.requiredRevision,
+        deliveredRevision: r.deliveredRevision,
+        pendingVersions: [...r.pendingVersions],
+      };
+    }
+    case 'verificationsOwed': {
+      const r = row as VerificationOwedRow;
+      return { jobId: r.jobId, repo: r.repo, revision: r.revision, head: r.head };
+    }
   }
 }
 
@@ -686,6 +760,10 @@ export function digestRowKey(category: DigestRowCategory, row: DigestRow): strin
       return `${(row as ConflictingPrRow).jobId} ${(row as ConflictingPrRow).prUrl ?? ''} ${(row as ConflictingPrRow).branch ?? ''}`;
     case 'releaseEligible':
       return (row as ReleaseEligibleRow).jobId;
+    case 'revisionContinuations':
+      return (row as RevisionContinuationRow).jobId;
+    case 'verificationsOwed':
+      return `${(row as VerificationOwedRow).jobId} ${(row as VerificationOwedRow).head ?? ''}`;
   }
 }
 
@@ -920,8 +998,35 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
   const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
   if (trigger !== null) candidates.push(trigger);
   const fallback = ledger.latestJobEvent(jobId, 'job.fallback-review');
-  if (fallback !== null && fallbackPhaseOf(fallback) !== 'unavailable') candidates.push(fallback);
+  // A superseded gate's terminal record (owner rule 3) is not a request.
+  const supersededGate = fallback !== null && typeof fallback.payload === 'object' && fallback.payload !== null &&
+    (fallback.payload as { superseded?: unknown }).superseded === true;
+  if (fallback !== null && fallbackPhaseOf(fallback) !== 'unavailable' && !supersededGate) candidates.push(fallback);
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
+}
+
+/** True when the newest round was superseded (owner rule 3): whatever head
+ * it reviewed, it never reached a verdict on the current contract, so the
+ * current delivery owes a fresh review — whether a correction re-delivered
+ * (any SHA) or the correction was retracted and the old delivery stands.
+ * The revision and verification fences gate the offer until it is due. */
+function supersededBefore(ledger: DigestLedger, round: RoundRecord, _delivered: EventRecord): boolean {
+  if (round.status !== 'aborted') return false;
+  return ledger.latestRoundEvent(round.id, 'round.superseded') !== null;
+}
+
+/** True when the delivery carries a work revision the round never froze
+ * (owner rule 2): even a posted verdict — READY included — judged an older
+ * contract, so the corrected delivery owes a fresh review on any SHA. */
+function revisionNewerThanRound(ledger: DigestLedger, round: RoundRecord, delivered: EventRecord): boolean {
+  const revision = typeof delivered.payload === 'object' && delivered.payload !== null
+    ? (delivered.payload as { work_revision?: unknown }).work_revision : undefined;
+  if (typeof revision !== 'number' || revision <= 0) return false;
+  const frozen = ledger.latestRoundEvent(round.id, 'round.review-inputs-frozen');
+  const acceptance = typeof frozen?.payload === 'object' && frozen.payload !== null
+    ? (frozen.payload as { acceptance?: { version?: unknown } | null }).acceptance : undefined;
+  const version = acceptance?.version;
+  return typeof version === 'number' && revision > version;
 }
 
 /** Fallback-gate lifecycle phases that answer nothing: the gate never
@@ -936,6 +1041,8 @@ const HANDOFF_UNARMED_KINDS: ReadonlySet<string> = new Set([
   'job.review-handoff-failed',
   'job.review-handoff-held',
   'job.review-handoff-skipped',
+  // Owner rule 3: an approved material change withdrew the queued request.
+  'job.review-handoff-withdrawn',
 ]);
 
 /** The job's latest handoff lifecycle event (null when none was recorded). */
@@ -945,6 +1052,7 @@ function latestHandoffEvent(ledger: DigestLedger, jobId: string): EventRecord | 
     'job.review-handoff-failed',
     'job.review-handoff-held',
     'job.review-handoff-skipped',
+    'job.review-handoff-withdrawn',
     'job.review-handoff-requeued',
   ];
   return kinds
@@ -1159,6 +1267,9 @@ function stallStillEligible(
   if (delivered !== null && delivered.seq > phaseStart.seq) return false;
   if (ledger.listPendingRebriefs({ jobId }).length > 0) return false;
   if (ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0) return false;
+  // A retirement's continuation hold fences exactly like a live request:
+  // no woken offer may duplicate work behind a closed control decision.
+  if (ledger.hasOpenDirectiveRecoveryHold(jobId)) return false;
   if (verificationInFlight(ledger, jobId)) return false;
   const review = latestAnsweringReviewRequest(ledger, jobId);
   if (review !== null && review.seq > phaseStart.seq) return false;
@@ -1262,6 +1373,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     providerRecoveryPending: ProviderRecoveryPendingRow[];
     conflictingPrs: ConflictingPrRow[];
     releaseEligible: ReleaseEligibleRow[];
+    revisionContinuations: RevisionContinuationRow[];
+    verificationsOwed: VerificationOwedRow[];
   } = {
     computedAt: new Date(now()).toISOString(),
     trigger: input.trigger,
@@ -1275,6 +1388,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     providerRecoveryPending: [],
     conflictingPrs: [],
     releaseEligible: [],
+    revisionContinuations: [],
+    verificationsOwed: [],
   };
   // One unresolved re-brief request fences the target: a marker exists while
   // a re-brief worker runs (or a restart-recovered request waits for boot
@@ -1320,8 +1435,12 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // A request retires only the state it answered: it must postdate the
     // latest delivery, so a later unreviewed delivery re-arms the row.
     const reviewRequest = latestReviewRequest(input.ledger, job.id);
+    // A review superseded by an approved change (owner rule 3) answered
+    // nothing: the request that started it no longer retires the row — a
+    // retracted correction must re-offer the standing delivery.
+    const supersededSeq = input.ledger.listJobEventsByKinds(job.id, ['round.superseded', 'job.review-superseded'], { limit: 1 })[0]?.seq ?? 0;
     const reviewAlreadyRequested =
-      reviewRequest !== null && (delivered === null || reviewRequest.seq > delivered.seq);
+      reviewRequest !== null && (delivered === null || reviewRequest.seq > delivered.seq) && reviewRequest.seq > supersededSeq;
     const abortProof = newestRound?.status === 'aborted'
       ? input.ledger.latestRoundEvent(newestRound.id, 'round.perkins-incomplete') : null;
     const abortReason = abortProof !== null && abortProof.roundId === newestRound?.id && typeof abortProof.payload === 'object' && abortProof.payload !== null
@@ -1333,6 +1452,9 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     const answeringRequest = latestAnsweringReviewRequest(input.ledger, job.id);
     const cleanAbort = newestRound !== null && delivered !== null &&
       newestRound.status === 'aborted' &&
+      // A superseded round reviewed an obsolete candidate (owner rule 3),
+      // even when a restart interrupted its supersession: never re-armed.
+      input.ledger.latestRoundEvent(newestRound.id, 'round.superseded') === null &&
       (abortReason === 'service_restart' || abortReason === 'service_restart_missing_review_lane') &&
       deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
       !(answeringRequest !== null && answeringRequest.seq > (abortProof?.seq ?? 0));
@@ -1357,15 +1479,45 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // unresolved re-brief owns the lane.
     const rebriefPending = pendingRebriefJobIds.has(job.id);
     const liveDirectiveOwns = input.ledger
-      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0;
+      .listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+      input.ledger.hasOpenDirectiveRecoveryHold(job.id);
     const reviewPending = reviewEligibleStatus(job.status);
+    // Owner rules 2/4: an accepted material amendment the newest delivery
+    // did not carry makes the candidate outdated. Review is fenced (the
+    // shared busy predicate refuses it), so no review row is offered; the
+    // lane owes ONE continuation instead — offered only while no writer
+    // owns the lane.
+    const revision = pendingWorkRevision(input.ledger, job);
+    if (revision !== null && reviewPending && !rebriefPending && !liveDirectiveOwns &&
+        currentPhaseDelivered && !verificationInFlight(input.ledger, job.id)) {
+      digest.revisionContinuations.push({
+        jobId: job.id,
+        repo: job.repo,
+        requiredRevision: revision.required,
+        deliveredRevision: revision.delivered,
+        pendingVersions: input.ledger.listJobAmendments(job.id)
+          .filter((amendment) => amendment.effect === 'material' &&
+            amendment.version > revision.delivered && amendment.version <= revision.required)
+          .map((amendment) => amendment.version),
+      });
+    }
+    // Option A (owner, 2026-10-09): a corrective delivery is reviewed only
+    // on a verified head. While that verification is owed, the PR/review
+    // offers are withheld and the verification itself is the owed action.
+    const verificationDebt = revision === null ? input.ledger.correctiveVerificationDebt(job.id) : null;
+    if (verificationDebt !== null && reviewPending && !rebriefPending && !liveDirectiveOwns &&
+        currentPhaseDelivered && !verificationInFlight(input.ledger, job.id)) {
+      digest.verificationsOwed.push({ jobId: job.id, repo: job.repo, revision: verificationDebt.revision, head: verificationDebt.head });
+    }
 
     // (1) Delivered, no PR yet. Only PR-owing lanes (deliverable
     // null/'pr', E19) belong here: a delivered review/artifact/
     // investigation job completes at its handback, so flagging it as
     // PR-overdue would manufacture ops work and false missing-PR alarms.
+    // A pending material correction (owner rule 2) withholds the PR/review
+    // offer for the outdated candidate until the corrective delivery.
     if (delivered !== null && currentPhaseDelivered && reviewPending && !rebriefPending && !liveDirectiveOwns &&
-        job.prUrl === null && rounds.length === 0 &&
+        revision === null && verificationDebt === null && job.prUrl === null && rounds.length === 0 &&
         (job.deliverable === null || job.deliverable === 'pr')) {
       const lane = (input.worktrees?.listWorktrees({ jobId: job.id }) ?? []).find((candidate) => candidate.kind === 'job');
       // ATTRIBUTION, not routing: this pick names the implementer whose
@@ -1392,7 +1544,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // An unresolved re-brief fences every row: the open re-brief turn is the
     // lane's target-owned work, so an OLDER delivery is never offered for
     // first review, re-review or clean-abort rearm.
-    if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending) {
+    if (currentPhaseDelivered && !liveDirectiveOwns && job.prUrl !== null && reviewPending && !rebriefPending &&
+        revision === null && verificationDebt === null) {
       if (cleanAbort && newestRound !== null) {
         digest.prWithoutReview.push({ jobId: job.id, repo: job.repo, prUrl: job.prUrl,
           priorRounds: rounds.length, cleanAbort: { roundId: newestRound.id, ruleId: 'clean-abort-service-restart' } });
@@ -1401,7 +1554,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       } else if (
         newestRound !== null &&
         delivered !== null &&
-        followUpChangedTarget(delivered, newestRound) &&
+        // A superseded round reviewed an obsolete contract (owner rule 3):
+        // the delivery after it owes a fresh review even on the same SHA
+        // (a correction needing no code change, or an unresolved head).
+        (followUpChangedTarget(delivered, newestRound) || supersededBefore(input.ledger, newestRound, delivered) ||
+          revisionNewerThanRound(input.ledger, newestRound, delivered)) &&
         !reviewAlreadyRequested
       ) {
         digest.prWithoutReview.push({
@@ -1836,7 +1993,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
-      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+      !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
   };
   const reviewOfferFencesHold = (jobId: string): boolean => {
     const job = input.ledger.getJob(jobId);
@@ -1849,15 +2007,59 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       phaseUnchanged(jobId) &&
       jobSeqUnchanged(jobId) &&
       !verificationInFlight(input.ledger, jobId) &&
+      // Owner rule 2: a material correction accepted during the compute
+      // withdraws the PR/review offer for the outdated candidate; a
+      // corrective delivery owing its verification (option A) likewise.
+      pendingWorkRevision(input.ledger, job) === null &&
+      input.ledger.correctiveVerificationDebt(jobId) === null &&
       input.ledger.listPendingRebriefs({ jobId }).length === 0 &&
-      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0;
+      input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+      !input.ledger.hasOpenDirectiveRecoveryHold(jobId);
   };
+  // Retirement closes control, never grants another turn. Every channel
+  // that can wake a continuation must honor the hold, including old
+  // verdict/verification debt and late provider evidence. Recheck after
+  // all awaits; a hold can open after the candidate was computed.
+  const continuationAllowed = (row: { readonly jobId: string }): boolean =>
+    !input.ledger.hasOpenDirectiveRecoveryHold(row.jobId) &&
+    (input.ledger.listDirectiveRecoveryHolds({ jobId: row.jobId }).length === 0 ||
+      (jobSeqUnchanged(row.jobId) &&
+       input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
+       input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0));
   return {
     ...digest,
+    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
+    verificationFailures: digest.verificationFailures.filter(continuationAllowed),
+    verificationWaits: digest.verificationWaits.filter(continuationAllowed),
+    minionErrors: digest.minionErrors.filter(continuationAllowed),
+    providerRecoveryPending: digest.providerRecoveryPending.filter((row) => {
+      if (row.jobId === null) return true;
+      if (!continuationAllowed({ jobId: row.jobId }) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      const wait = input.ledger.getProviderWait(row.waitId);
+      return wait !== null && input.ledger.providerWaitRetirementIdentity(wait) === 'current';
+    }),
     deliveredWithoutPr: digest.deliveredWithoutPr.filter((row) => {
       if (!reviewOfferFencesHold(row.jobId)) return false;
       const job = input.ledger.getJob(row.jobId);
       return job !== null && job.prUrl === null;
+    }),
+    verificationsOwed: digest.verificationsOwed.filter((row) => {
+      // A failed run on this head owes a REPAIR (verificationFailures), not
+      // another verification of the same bytes.
+      if (digest.verificationFailures.some((failure) => failure.jobId === row.jobId && failure.head === row.head)) return false;
+      if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      return input.ledger.correctiveVerificationDebt(row.jobId) !== null;
+    }),
+    revisionContinuations: digest.revisionContinuations.filter((row) => {
+      if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) ||
+          input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+          input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;
+      const job = input.ledger.getJob(row.jobId);
+      return job !== null && pendingWorkRevision(input.ledger, job) !== null;
     }),
     prWithoutReview: digest.prWithoutReview.filter((row) => {
       if (!reviewOfferFencesHold(row.jobId)) return false;
@@ -1951,6 +2153,7 @@ export type SilasTriggerKind =
   | 'provider.restored'
   | 'verification.completed'
   | 'verification.lock-timeout'
+  | 'job.amendment-accepted'
   | 'sweep';
 
 export interface SilasTrigger {
@@ -2059,6 +2262,12 @@ const SILAS_WAKE_EVENTS: readonly string[] = ['job.delivered', 'job.minion-error
 export function silasWakeEvent(event: { readonly kind: string; readonly payload?: unknown }): boolean {
   if (SILAS_WAKE_EVENTS.includes(event.kind)) return true;
   if (event.kind === 'verification.lock-timeout') return true;
+  // Owner rule 4: an accepted MATERIAL amendment owes one continuation now,
+  // not at the next sweep (administrative ones owe nothing).
+  if (event.kind === 'job.amendment-accepted') {
+    return typeof event.payload === 'object' && event.payload !== null &&
+      (event.payload as Record<string, unknown>)['effect'] === 'material';
+  }
   if (event.kind === 'verification.completed') {
     const payload =
       typeof event.payload === 'object' && event.payload !== null

@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:f
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
-import { RuntimeRegistry } from './runtime/registry.js';
+import { RuntimeRegistry, serviceRegistryOptions } from './runtime/registry.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
@@ -14,7 +14,7 @@ import { BoardEngine } from './board/engine.js';
 import { createBoardServer } from './board/server.js';
 import { DeployDriftTracker } from './board/deploy-drift.js';
 import { defaultPackageRoot, readBuildInfo } from './build-info.js';
-import { createServiceReviewWave } from './dispatch/service-review-wave.js';
+import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
@@ -55,7 +55,16 @@ import { uploadsDirNeedsHardening } from './attachments/resolver.js';
 import { JournalStore } from './lessons/journal.js';
 import { BibleStore } from './lessons/bible.js';
 import { createBibleReferences } from './lessons/references.js';
-import { DreamEngine, DreamScheduler, DREAM_STATE_FILE, loadDreamState } from './lessons/dream.js';
+import {
+  DreamEngine,
+  DreamScheduler,
+  DREAM_STATE_FILE,
+  dreamFailureIncidents,
+  LessonProposals,
+  lessonProposalNotifier,
+  loadDreamState,
+  repairCommand,
+} from './lessons/dream.js';
 import { AgentLessonsDistiller } from './lessons/distiller.js';
 import { createSessionLessonsCapture } from './lessons/capture.js';
 import { createReviewOutcomeCapture } from './lessons/review-capture.js';
@@ -517,11 +526,13 @@ async function main(): Promise<number> {
   // BEFORE the server so /health can answer with real signals from the
   // first request. Growth findings also hit the log (SPEC ruling 12).
   const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
-  const registry = new RuntimeRegistry({
+  // Issue #283: the service options carry the binder that gives
+  // build-workflow sessions the GC-managed BMAD runtime of their job lane.
+  const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
     log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
+  }));
   const growth = registry.boot();
   state.store = store;
   state.registry = registry;
@@ -551,7 +562,14 @@ async function main(): Promise<number> {
     indexCapBytes: config.lessons.indexCapBytes,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
-  bible.ensureSeeded();
+  // A pristine book is seeded; a damaged one (chapters or state but no
+  // INDEX.md) is never silently recreated — logged here, and every dream
+  // pass fails loudly on it (an action-required incident).
+  try {
+    bible.ensureSeeded();
+  } catch (error) {
+    logger.log('error', 'the Book of Lessons is damaged — not seeded', { error: String(error) });
+  }
   const lessonReferences = createBibleReferences({
     bible,
     maxReferences: config.lessons.maxReferences,
@@ -559,13 +577,6 @@ async function main(): Promise<number> {
   });
   const lessonsCapture = createSessionLessonsCapture({
     journal,
-    log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
-  const lessonsServer = createLessonsServer({
-    config,
-    journal,
-    bible,
-    references: lessonReferences,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // Perkins verdicts are learning inputs (issue #221): every posted round
@@ -676,6 +687,29 @@ async function main(): Promise<number> {
     ledger,
     bus,
     onNeedsOwner: (notification) => surfaceInChat(notification),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // Owner-approved Book of Lessons (owner decision 2026-10-07): the dream
+  // proposes, the owner decides in For You, and only Accept writes.
+  const lessonProposals = new LessonProposals({
+    bible,
+    notifier: lessonProposalNotifier({ notifications, ledger }),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  // A decision interrupted by a crash or restart is finished, a stale
+  // proposal withdrawn, and a pending one's For You notice re-ensured. A
+  // corrupt record is logged here and fails the next dream pass loudly.
+  try {
+    lessonProposals.reconcile();
+  } catch (error) {
+    logger.log('error', 'lesson proposal reconcile failed at startup', { error: String(error) });
+  }
+  const lessonsServer = createLessonsServer({
+    config,
+    journal,
+    bible,
+    references: lessonReferences,
+    proposals: lessonProposals,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   // Durable follow-through observers: (a) an explicitly marked bounded
@@ -1204,6 +1238,9 @@ async function main(): Promise<number> {
         worktrees: worktreeManager,
         jobId: directiveInput.jobId,
         directive: directiveInput.directive,
+        // A fresh fallback minion is briefed with the effective contract
+        // (original + accepted amendments), never the original alone.
+        contract: ledger.effectiveContract(directiveInput.jobId)?.text ?? null,
         signal: directiveInput.signal,
         owner: 'bmad-review-gate',
         parentTools: parentToolsFor,
@@ -1213,11 +1250,24 @@ async function main(): Promise<number> {
     // notifier binds the row through the existing agentId field only when
     // that identity is consistent (see src/dispatch/escalation-identity.ts).
     escalate: createReviewEscalationNotifier(ledger, notifications),
+    // A transient admission refusal retries on its own (1 min, then 5 min):
+    // each scheduled or skipped retry is an FYI; only the last refusal
+    // escalates action-required through `escalate`. A routine review
+    // supersession (owner rule 3) reports here too — never an Ack.
+    inform: (title, detail) => {
+      notifications.post({ kind: 'review-fyi', routing: 'fyi', severity: 'info', title, detail });
+    },
+    // Supersession proof (owner rule 3): a review session is stopped only
+    // when the runtime no longer holds a live handle for it.
+    liveReviewSessions: (agentIds) => liveReviewSessionIds(registry, agentIds),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;
   await wave.recoverInterruptedRounds();
   wave.resumeQueuedHandoffs();
+  // Automatic admission retries live in memory (owner decision 2026-10-08):
+  // one pending when the service stopped escalates now instead of resuming.
+  wave.escalateInterruptedAdmissionRetries();
   // Re-brief restart safety (Silas finding 2026-09-23): a re-brief request
   // mid-flight at restart left no events and no worker. The durable
   // markers written before each worker spawned are consumed here — the
@@ -1343,8 +1393,21 @@ async function main(): Promise<number> {
           bibleDir: bible.dir,
           log: (level, msg, fields) => logger.log(level, msg, fields),
         }),
+        proposals: lessonProposals,
         log: (level, msg, fields) => logger.log(level, msg, fields),
       }).run(),
+    // A failing dream is an incident, not just a log line (owner incident
+    // 2026-10-07): one open incident per failure streak, carrying the exact
+    // repair command for this instance; the next completed pass resolves it.
+    ...dreamFailureIncidents(
+      notifications,
+      repairCommand({
+        nodePath: process.execPath,
+        toolPath: join(repoRoot, 'tools', 'repair-bible-provenance.mjs'),
+        instanceDir: config.instanceDir,
+        dataDir: config.dataDir,
+      }),
+    ),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.dream = dream;
@@ -1366,6 +1429,7 @@ async function main(): Promise<number> {
     ledger,
     childWorkers,
     workerGate: pacing.gate,
+    pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(pipeline !== null ? { pipeline } : {}),
     ...(config.silas.enabled && silasSlot !== null

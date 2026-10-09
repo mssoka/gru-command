@@ -41,8 +41,11 @@ worker identity. Older jobs without it use a shortened title on minion cards:
    'local-head-fallback'` recorded, never silently). Status `working`.
 3. **Minion** — a fresh agent session spawned with `cwd` = the worktree
    (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
-   the minion discovers the project's own skills/bmad from there). The
-   briefing prompt is delivered as the session's first turn.
+   the minion discovers the project's own skills and BMAD settings from
+   there). The lane is bound to the GC-managed BMAD runtime on its first
+   minion spawn and keeps that binding for its life
+   ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)). The briefing prompt is
+   delivered as the session's first turn.
 
 Failures are loud and leave no half lanes: a spawn failure sweeps the
 fresh worktree back out and blocks the job with a note.
@@ -66,7 +69,11 @@ freezes one exact target/base/diff/spec set in a detached review worktree. An
 arm may carry private evidence uploads; the frozen round binds the effective
 amended acceptance and the exact-target CI receipt, and the amendment/contract
 endpoints (`POST /api/dispatch/amendment`,
-`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. See
+`GET /api/dispatch/jobs/<id>/contract`) manage that acceptance. A
+**material** amendment (owner rules 2026-10-08) makes the delivered candidate
+outdated: review stays fenced until a continuation carrying that revision
+delivers, and a review already owning the lane is superseded — proven stopped
+before any directive or re-brief prompts the minion (REVIEW-INPUTS.md §4). See
 [REVIEW-INPUTS.md](./REVIEW-INPUTS.md); a private-evidence arm is refused on
 the bmad-review fallback route rather than silently reviewed without it. The arm
 first passes the **branch-idle guard**: while any lane is actively
@@ -283,8 +290,9 @@ modify implementation code; every gate decision is the host's. The fallback
 never records a Perkins verdict and never moves merge authority: only an
 exact-head Perkins READY can authorize a merge, and the owner holds every
 merge, everywhere — this repository included. A failed pre-flight is never a silent downgrade — the failed
-legs, their remediations, and both recovery options (install BMAD via
-onboarding / restore Perkins) are escalated and recorded on the job as
+legs, their remediations, and both recovery options (install the global
+bmad-review skill, which the GC-managed BMAD runtime does not bundle /
+restore Perkins) are escalated and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
 delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
@@ -346,8 +354,10 @@ verification budget.
   refuses a rerun — a re-verification mints a NEW request id.
 - **Capture is exclusive and receipted.** The shipped capture helper
   (`dist/verify/capture-cli.js`, named in Silas's wake prompt) opens a
-  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF,
-  and writes `<sink>.receipt.json` binding run id, true head/dirty state,
+  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF
+  (transport `ping` frames included — the receipt records them as
+  `pings`, separate from the producer-frame `frames` count), and writes
+  `<sink>.receipt.json` binding run id, true head/dirty state,
   exit/outcome and output length/hash. A stream without a valid terminal
   completion, with torn/foreign records, or whose single run identity does
   not hold across the whole stream is `unknown` and is never promoted to
@@ -381,7 +391,23 @@ verification budget.
   clearly-delimited evidence block into the review spec context, so the
   tests lens weighs ledger-backed evidence instead of a pasted report.
 - **Progress streams** back as NDJSON: `queued` → `started` → `output…`
-  → `completed` (or `error`).
+  → `completed` (or `error`), with transport `ping` frames interleaved
+  into any silence. A duplicate submission to an in-flight run instead
+  begins with `attached` and then receives only that run's later frames
+  (an already-running attach has no `queued`/`started`; a terminal
+  attach gets `attached` → `completed`). While the body would otherwise
+  be silent —
+  a queued slot wait (up to `lock_wait_timeout_ms`), or a producer that
+  has not written yet — the surface emits application-level `ping`
+  frames (default every 15 s, worst-case gap 2 × cadence ≈ 30 s) so a
+  streaming client's default 300 s HTTP body-idle timeout does not
+  truncate a valid run. A `ping` is transport liveness only: no run
+  identity, never producer output, never a terminal frame, and never
+  written after `completed`/`error`. A `ping` may be the FIRST body
+  frame when the first producer frame is delayed past one cadence, so a
+  consumer must tolerate a leading `ping` (and must never count it as a
+  producer frame). The protection assumes the event loop services the
+  timer; a stall longer than the client's idle limit is outside it.
 
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
@@ -510,8 +536,9 @@ ledger surfaces remain runtime-agnostic).
 ## 4f. Minion-owned build cycle (owner ruling 2026-10-02)
 
 Implementation briefings hand the worker the whole job. The minion selects
-the task-relevant BMAD skills by capability from the PROJECT's actual
-installed skill catalog/metadata and follows their current workflows —
+the task-relevant BMAD skills by capability from its session's actual
+skill catalog/metadata (the lane-bound GC-managed BMAD runtime plus the
+project's own skills) and follows their current workflows —
 names and workflow structure change between BMAD versions, so brief by
 the task, never by a fixed skill name. The selected workflow's built-in
 review runs on fresh, context-free reviewer contexts the minion
