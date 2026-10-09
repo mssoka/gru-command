@@ -48,7 +48,14 @@ function classifyPlaywright(report, substrs) {
     // check must never be vacuous.
     return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: no slim-surface substrings supplied — cause cannot be identified' };
   }
+  if (Array.isArray(report?.errors) && report.errors.length > 0) {
+    // A config/webServer/global failure explains the run, not the feature.
+    return { code: 3, out: '', err: `BASELINE SETUP FAILURE: Playwright reported ${report.errors.length} global error(s) — not behavioral evidence` };
+  }
   const stats = (report && report.stats) || {};
+  if (typeof stats !== 'object' || Array.isArray(stats)) {
+    return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: Playwright report has no stats object — not behavioral evidence' };
+  }
   // Playwright's JSON stats carry expected/unexpected/skipped/flaky — there
   // is no `total` field; the run's size is their sum.
   const total = (stats.expected ?? 0) + (stats.unexpected ?? 0) + (stats.skipped ?? 0) + (stats.flaky ?? 0);
@@ -62,10 +69,10 @@ function classifyPlaywright(report, substrs) {
   }
   const results = [];
   const walk = (suite) => {
-    for (const spec of suite.specs ?? []) {
+    for (const spec of Array.isArray(suite?.specs) ? suite.specs : []) {
       if (spec.ok === false || (spec.tests ?? []).some((t) => t.status === 'unexpected')) {
-        const bad = (spec.tests ?? [])
-          .flatMap((t) => t.results ?? [])
+        const bad = (Array.isArray(spec.tests) ? spec.tests : [])
+          .flatMap((t) => (Array.isArray(t?.results) ? t.results : []))
           // Playwright result statuses: passed/failed/timedOut/interrupted/
           // skipped. A test-level timeout carries the locator in its message,
           // so it must be read, not silently mapped to an empty string.
@@ -75,9 +82,9 @@ function classifyPlaywright(report, substrs) {
         results.push({ title: spec.title ?? spec.file ?? 'unknown', message });
       }
     }
-    for (const child of suite.suites ?? []) walk(child);
+    for (const child of Array.isArray(suite?.suites) ? suite.suites : []) walk(child);
   };
-  for (const suite of (report && report.suites) ?? []) walk(suite);
+  for (const suite of Array.isArray(report?.suites) ? report.suites : []) walk(suite);
   if (unexpected === 0) {
     const ran = (stats.expected ?? 0) + (stats.flaky ?? 0);
     if (ran === 0) {
@@ -224,6 +231,14 @@ function classifyVitest(report, requireFile) {
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
 
   const args = process.argv.slice(2);
+  const knownFlags = new Set(['--require-file', '--require-substr', '--playwright']);
+  const unknown = args
+    .filter((a) => a.startsWith('--'))
+    .find((a) => !knownFlags.has(a));
+  if (unknown !== undefined) {
+    fail(`BASELINE SETUP FAILURE: unknown flag ${unknown} — refusing to classify a typo'd invocation`);
+    process.exit(3);
+  }
   const reportPath = args[0];
   const requireFileIdx = args.indexOf('--require-file');
   const requireFile = requireFileIdx >= 0 ? args[requireFileIdx + 1] : null;

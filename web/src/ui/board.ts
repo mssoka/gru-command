@@ -485,9 +485,9 @@ export class BoardView {
       );
       mount.append(clear);
     } else {
-      const window = ownerWindow(rows, this.ownerExpanded);
+      const bandWindow = ownerWindow(rows, this.ownerExpanded);
       const list = el('div', 'board-band__rows board-owner__rows');
-      for (const row of window.rows) {
+      for (const row of bandWindow.rows) {
         if (row.kind === 'ack') {
           list.append(this.ownerAckRow(row, bandVisible));
         } else {
@@ -495,14 +495,14 @@ export class BoardView {
         }
       }
       mount.append(list);
-      if (window.hidden > 0) {
+      if (bandWindow.hidden > 0) {
         // The older-pending count rides its own reserved numeric slot —
         // it is part of the approved For-you geometry contract.
         const more = el('button', 'board-band__more');
         more.type = 'button';
         more.append(
           document.createTextNode('+'),
-          el('span', 'num board-band__more-num', String(window.hidden)),
+          el('span', 'num board-band__more-num', String(bandWindow.hidden)),
           document.createTextNode(' older pending'),
         );
         more.setAttribute('aria-expanded', String(this.ownerExpanded));

@@ -285,15 +285,6 @@ body {
   text-align: right;
 }
 
-/* The honest em-dash fallback hides the slot outright: an inline-block
-   display beats the UA [hidden] rule, so state it explicitly on every
-   surface that applies .num (the strip's age split is the one that
-   actually hides). */
-#chip-rail .num[hidden],
-#board-owner .num[hidden] {
-  display: none;
-}
-
 /* Four digits must fit INSIDE the floor in each surface's own font
    metrics (measured r6): the mono strip slots overshoot 4ch by up to
    1/64px of sub-pixel rounding, and the sans tabular band slot overshoots
@@ -1968,8 +1959,8 @@ body {
   margin-top: 4px;
 }
 
-/* Control column: reveal-only disclosure (+ OPEN PR on PR rows), stacked
-   beside the content from the 640px container transition. */
+/* Control column: reveal-only disclosure (+ OPEN PR on PR rows), beside
+   the content until the single-column phone layout (max-width: 560px). */
 .board-owner__actions {
   grid-area: action;
   display: grid;

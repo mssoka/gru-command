@@ -311,12 +311,20 @@ export class BoardClient {
     // drawer/receipt/transcript fetch can hang forever and re-pairing
     // cancels it.
     const doFetch = this.fetchImpl;
+    if (signal !== undefined) {
+      // The caller owns the bound (the snapshot's own deadline controller:
+      // stop() aborts it). Do not invent a second, unused timer here.
+      const res = await doFetch(path, { headers: { authorization: `Bearer ${this.options.token}` }, signal });
+      if (!res.ok) return this.refused(path, res);
+      return (await res.json()) as T;
+    }
+    // This client owns the request (drawer/receipt/transcript GETs): bound
+    // it and register it so stop() cancels it on a re-pair.
     const controller = new AbortController();
-    const effective = signal ?? controller.signal;
-    if (signal === undefined) this.requestControllers.add(controller);
+    this.requestControllers.add(controller);
     const timer = setTimeout(() => controller.abort(), SNAPSHOT_DEADLINE_MS);
     const expired = new Promise<never>((_, reject) => {
-      effective.addEventListener(
+      controller.signal.addEventListener(
         'abort',
         () => reject(new BoardApiError(path, 0, 'timeout', 'no answer before the deadline — outcome unconfirmed')),
         { once: true },
@@ -327,7 +335,7 @@ export class BoardClient {
         (async () => {
           const res = await doFetch(path, {
             headers: { authorization: `Bearer ${this.options.token}` },
-            signal: effective,
+            signal: controller.signal,
           });
           if (!res.ok) return this.refused(path, res);
           return (await res.json()) as T;
@@ -366,6 +374,7 @@ export class BoardClient {
 
   /** One-shot HTTP snapshot fetch (initial load + reconnect catch-up). */
   async refetchSnapshot(): Promise<void> {
+    if (this.stopped) return; // a stopped (re-paired) client never re-polls
     const request = ++this.fetchSeq;
     const epoch = this.snapshotEpoch;
     try {

@@ -282,6 +282,59 @@ describe('board client', () => {
     }
   });
 
+  it('a signal-less GET (transcript/receipt) is bounded by the deadline and cancelled by stop()', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let init: RequestInit | undefined;
+      const fetchImpl = vi.fn(
+        (_path: string, options?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init = options;
+            options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          }),
+      ) as unknown as typeof fetch;
+      const client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      // The drawer/receipt path: no caller signal, so the client owns the bound.
+      const fetching = client.fetchReceipts(0);
+      const rejection = expect(fetching).rejects.toThrow(/no answer before the deadline/u);
+      expect(init?.signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(init?.signal?.aborted, 'the owned GET deadline fired').toBe(true);
+      await rejection;
+      expect(vi.mocked(fetchImpl)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop() cancels an in-flight signal-less GET (a re-pair never lets a drawer fetch outlive the pairing)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let init: RequestInit | undefined;
+      const fetchImpl = vi.fn(
+        (_path: string, options?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init = options;
+            options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          }),
+      ) as unknown as typeof fetch;
+      const client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      const fetching = client.fetchReceipts(0);
+      const rejection = expect(fetching).rejects.toThrow();
+      client.stop();
+      await rejection;
+      expect(init?.signal?.aborted, 'stop() aborted the owned GET').toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stop() halts reconnects', async () => {
     client = make({});
     client.connect();

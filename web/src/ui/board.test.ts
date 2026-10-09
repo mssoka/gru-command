@@ -475,6 +475,20 @@ describe('board view resolved-notification rendering', () => {
 });
 
 describe('board v7 — slim status strip (pill rail replaced)', () => {
+  it('every count group renders its own marker tone class (a rename must not silently drop it)', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ children: { active: 1, queued: 2, finished: 3, lifetimeCreations: 4 } }));
+    const tones = [...document.querySelectorAll<HTMLElement>('#chip-rail .strip-group')].map(
+      (group) => `${group.querySelector('.strip-group__name')?.textContent}:${[...group.classList].find((c) => c.startsWith('strip-group--'))}`,
+    );
+    expect(tones).toEqual([
+      'HEISTS:strip-group--work',
+      'PRS:strip-group--rev',
+      'CREW:strip-group--done',
+      'CHILDREN:strip-group--park',
+    ]);
+  });
+
   beforeEach(mountBoardDom);
 
   it('renders the slim status pairs and the three stable groups, disclosing the rail on the first snapshot', () => {
