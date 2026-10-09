@@ -1461,15 +1461,97 @@ test('visual captures for inspection — 1440/1200/768/360 in both themes', asyn
   await waitForCount(page, 'prs.open', 9);
   for (const [width, height] of VIEWPORTS) {
     await page.setViewportSize({ width, height });
+    await settle(page); // a resize re-renders; never capture a blend
     await page.screenshot({ path: `e2e-artifacts/slim-strip-${width}-light.png`, fullPage: false });
   }
   await page.locator('#theme-toggle').click();
   await expect(page.locator('html')).toHaveClass(/dark/);
   for (const [width, height] of VIEWPORTS) {
     await page.setViewportSize({ width, height });
+    await settle(page); // the theme flip transitions body color/background
     await page.screenshot({ path: `e2e-artifacts/slim-strip-${width}-dark.png`, fullPage: false });
   }
 });
+
+/** The 1200x900 dark ambiguity, resolved by measurement: the essential FOR
+ * YOU labels hold >=4.5:1 once transitions settle, and the dim frame is
+ * reproduced as a genuine pre-settlement state (running transition, low
+ * ratio) — a capture-timing artifact, not a retained contrast defect. */
+test('1200x900 dark: the FOR YOU essentials hold >=4.5:1 settled; the dim frame is a transition state', async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 900 });
+  await harness(page, makeSnapshot({ ...familyA(9), pending: 2 }));
+  await waitForCount(page, 'prs.open', 9);
+  await expectStripFamilies(page, familyAFamilies(9));
+
+  const target = '.board-owner__title';
+  await page.locator('#theme-toggle').click();
+  await expect(page.locator('html')).toHaveClass(/dark/);
+
+  // Transient state (no settlement): the body colour transition is running,
+  // so the label measures mid-flight. Reproduce the artifact honestly.
+  const runningAnimations = await page.evaluate(() =>
+    document.getAnimations().filter((a) => a.playState === 'running').length);
+  const transientRatio = await contrastRatio(page, target);
+  expect(runningAnimations, 'a transition really was running (not a sleep)').toBeGreaterThan(0);
+
+  // Settled state: every animation finished, then the SAME label measures
+  // the approved essential-text floor against its effective background.
+  await settle(page);
+  const stillRunning = await page.evaluate(() =>
+    document.getAnimations().filter((a) => a.playState === 'running').length);
+  expect(stillRunning, 'settlement is real: no animation still running').toBe(0);
+  const settledRatio = await contrastRatio(page, target);
+  expect(settledRatio, `settled ${target} contrast (dark, 1200x900)`).toBeGreaterThanOrEqual(4.5);
+  // The artifact and the steady state are different states, and the dim one
+  // is the unsettled one (this is the causal claim, measured not assumed).
+  expect(transientRatio, 'the pre-settlement frame is the low-contrast one').toBeLessThan(settledRatio);
+  await page.screenshot({ path: 'e2e-artifacts/slim-strip-1200-dark-settled.png', fullPage: false });
+  await expect(page.locator('html')).toHaveClass(/dark/);
+});
+
+/**
+ * Await real rendering settlement: every running CSS animation/transition on
+ * the page finishes, then two frames pass, and no animation is running. A
+ * fixed sleep proves nothing; this waits on the actual animation objects the
+ * engine reports (the same discipline the contrast test uses).
+ */
+async function settle(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    for (let pass = 0; pass < 60; pass += 1) {
+      const running = document.getAnimations().filter((a) => a.playState === 'running');
+      if (running.length === 0) break;
+      await Promise.all(running.map((a) => a.finished.catch(() => undefined)));
+    }
+  });
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+}
+
+/** True contrast ratio of a selector's text against its effective
+ * background (foreground/background computed colours, not peak luminance). */
+async function contrastRatio(page: Page, selector: string): Promise<number> {
+  return page.evaluate((sel) => {
+    const lum = (rgb: string): number => {
+      const m = rgb.match(/\d+/g)!.map(Number);
+      const [r, g, b] = m.slice(0, 3).map((v) => {
+        const s = v / 255;
+        return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
+    };
+    const el = document.querySelector<HTMLElement>(sel);
+    if (!el) throw new Error(`missing contrast target ${sel}`);
+    let bgEl: Element | null = el;
+    let bg = 'rgb(250, 246, 239)';
+    while (bgEl) {
+      const c = getComputedStyle(bgEl).backgroundColor;
+      if (c && c !== 'transparent' && !/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0\s*\)/.test(c)) { bg = c; break; }
+      bgEl = bgEl.parentElement;
+    }
+    const l1 = lum(getComputedStyle(el).color);
+    const l2 = lum(bg);
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  }, selector);
+}
 
 /** A1: the reserved numeric utility is scoped to the two approved slim
  * surfaces. An unrelated surface (the heist band host) must keep the app
