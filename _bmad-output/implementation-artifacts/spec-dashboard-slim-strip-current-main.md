@@ -295,6 +295,19 @@ honesty, strip styles.
 | `megaminions-browser` | `c83e144f` | GREEN |
 | `full` | `f91bca9d` | GREEN |
 
+### Final frozen candidate
+
+`7352d73` (product bytes at `b565a32`; the last commit only widens the e2e
+contrast targets and re-proves them on a clean tree). Base
+`49b558f243c7bacbfb46c7bc04f749bf131cefea`. All declared scopes green except
+the two baselines, which return the classified RED (exit 1) by design:
+`dashboard-slim-strip-unit`, `typecheck`, `strip-browser`, `strip-smoke`,
+`pipeline-board-browser`, `strip-themes`, `full`; baselines
+`dashboard-slim-strip-baseline` (134 collected, 0 load errors, 20 identified
+assertion failures, 12 non-assertion failures explicitly NOT claimed) and
+`strip-browser-baseline` (67 unexpected, every failure naming a slim
+surface). Inspected current-byte captures: 1440/768 light, 360/1440 dark.
+
 ### v7 workflow review rounds (owner amendment #7 scope-restoration candidate)
 
 Three workflow-owned, parent-linked, read-only review rounds were commissioned
