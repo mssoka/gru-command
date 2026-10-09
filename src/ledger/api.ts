@@ -1207,7 +1207,9 @@ export class LedgerApi {
    * watermark bounds every page (`cursor` starts one past it and only
    * decreases), so the page set stays stable and each row is visited
    * exactly once. The returned iterator is single-use — consume it once
-   * inside the caller's loop (a second pass yields nothing). */
+   * inside the caller's loop (a second pass yields nothing). The page-size
+   * refusal and the watermark read are taken on the FIRST pull, not at the
+   * call (a generator body does not run until then). */
   *iterateJobVerificationCompleted(jobId: string, pageSize = 200): Generator<EventRecord, void, void> {
     if (!Number.isInteger(pageSize) || pageSize <= 0) {
       throw new Error(`iterateJobVerificationCompleted pageSize must be a positive integer (got ${String(pageSize)})`);

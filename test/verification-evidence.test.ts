@@ -89,6 +89,9 @@ describe('selectNewestBoundVerification', () => {
   });
 
   it('selects a newer signaled or timed-out target run over an older green one', () => {
+    // The array is newest-first, which is the selector's contract; `seq` is
+    // carried for readability only — the production caller satisfies the
+    // ordering with the ledger read's ORDER BY seq DESC.
     const signaled = seqEvent(6, passingPayload({ run_id: 'sig', ok: false, exit_code: null, signal: 'SIGKILL' }));
     const timedOut = seqEvent(4, passingPayload({ run_id: 'to', ok: false, exit_code: null, signal: 'SIGTERM', timed_out: true }));
     const green = seqEvent(1, passingPayload({ run_id: 'green', ok: true, exit_code: 0 }));

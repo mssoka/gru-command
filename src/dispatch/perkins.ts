@@ -4034,6 +4034,9 @@ export class WaveRunner {
         // ceiling — a job with more completed runs than one page stays
         // reviewable. The scan stops at the newest binding run; absence is
         // rendered only after the history is exhausted.
+        // The iterable is newest-first: the ledger read orders by seq DESC
+        // (the selector takes the FIRST binding element, so ordering governs
+        // which run is "newest").
         const bindingVerification = selectNewestBoundVerification(
           this.opts.ledger.iterateJobVerificationCompleted(job.id),
           targetSha,

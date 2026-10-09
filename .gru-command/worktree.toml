@@ -651,7 +651,7 @@ binned-baseline = 'set -e; base=84aec28b04ddc406f26c458383452318f8cb7ed1; headre
 # then the classified heavy wave file (filtered to the long-history, binding-
 # selection and kind-scoped cases) through the heavy config; approved RPC
 # patch prerequisite first, exits never masked.
-verification-history-lookup = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/verification-evidence.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t \"j-1594|gh-169 R7-5|gh-169 R8-2\""
+verification-history-lookup = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/ledger-api.test.ts test/verification-evidence.test.ts test/assert-verification-history-baseline.test.ts test/suite-shape.test.ts test/test-budgets.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts"
 
 # Static product checks for the same change (lint, compiler, build including
 # the pinned Perkins resource verifier), at unchanged budgets/thresholds.
@@ -665,8 +665,12 @@ verification-history-static = "node tools/patch-vitest-rpc-timeout.mjs && npm ru
 # worktree mutation — under the unchanged heavy config/budgets and the
 # approved RPC patch prerequisite. Only the discriminating 208-run host case
 # is selected: on the pre-fix base its `resolves` assertion REDs because the
-# freeze rejects with the recorded window error (source/import/setup failure
-# would not be RED evidence). The vitest exit is echoed intact and never
+# freeze rejects with the recorded window error. A bare nonzero exit is NOT
+# accepted: a Vitest JSON report is written and classified by
+# tools/assert-verification-history-baseline.mjs, which requires the ONE named
+# regression to fail with the recorded window reason — a collection/setup/
+# import failure, an unlisted failure, or an unexpected GREEN exits 2. The
+# vitest exit is echoed intact and never
 # masked into a PASS; the snapshot directory and the ignored pointer file are
 # preserved for inspection.
-verification-history-baseline = 'set -e; base=90f91d5d06602dccede0fdfa8bf5ab6f44e3acdd; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-verification-history.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "verification-history-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/verification-history-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "reviews a job with 208 completed verification runs"; a=$?; set -e; echo "verification-history-baseline vitest exit=$a EXPECTED-NONZERO: pre-fix base refuses the 208-run history with the recorded window assertion"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; exit 1'
+verification-history-baseline = 'set -e; base=90f91d5d06602dccede0fdfa8bf5ab6f44e3acdd; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-verification-history.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "verification-history-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/verification-history-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "reviews a job with 208 completed verification runs"; a=$?; set -e; echo "verification-history-baseline vitest exit=$a EXPECTED-NONZERO: pre-fix base refuses the 208-run history with the recorded window assertion"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-verification-history-baseline.mjs" "$d/results.json"; echo "EXPECTED-NONZERO: behavioral assertion RED vs the pre-fix base"; exit 1'
