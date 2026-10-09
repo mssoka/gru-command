@@ -74,17 +74,29 @@ if (playwright) {
     console.error(`FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${total} ran, 0 unexpected)`);
     process.exit(2);
   }
-  const identified = substrs.length === 0
-    ? results
-    : results.filter((r) => substrs.some((s) => `${r.title}\n${r.message}`.includes(s)));
+  // R3-05 per-test cause: EVERY unexpected failure must name a missing
+  // slim surface. A count alone proves nothing — each failure carries its
+  // own identified cause, and any failure that does not name a surface is
+  // unclassified evidence (setup/load/timing), never folded into the RED.
+  const identified = [];
+  const unidentified = [];
+  for (const r of results) {
+    if (substrs.length === 0 || substrs.some((s) => `${r.title}\n${r.message}`.includes(s))) identified.push(r);
+    else unidentified.push(r);
+  }
   if (identified.length === 0) {
     console.error(`BASELINE SETUP FAILURE: ${results.length} unexpected result(s), none matching the slim-surface substrings (${substrs.join(', ')}) — not identified feature absence`);
     for (const r of results.slice(0, 5)) console.error(`  ${r.title}: ${r.message.slice(0, 140).replace(/\n/g, ' ')}`);
     process.exit(3);
   }
+  if (unidentified.length > 0) {
+    console.error(`BASELINE SETUP FAILURE: ${unidentified.length} of ${results.length} unexpected failure(s) name NO slim surface — unclassified causes are not behavioral feature-absence evidence`);
+    for (const r of unidentified.slice(0, 5)) console.error(`  UNIDENTIFIED ${r.title}: ${r.message.slice(0, 140).replace(/\n/g, ' ')}`);
+    process.exit(3);
+  }
   console.log(
     `BASELINE RED CLASSIFIED: setup clean (Playwright ran ${total} test(s)); ${unexpected} unexpected; ` +
-      `${identified.length} failure(s) name the missing slim surfaces (${substrs.join(', ')})`,
+      `every one of the ${identified.length} failure(s) names a missing slim surface (${substrs.join(', ')}) — per-test cause established`,
   );
   process.exit(1);
 }
