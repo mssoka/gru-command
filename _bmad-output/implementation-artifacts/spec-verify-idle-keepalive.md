@@ -4,7 +4,7 @@ type: 'bugfix'
 created: '2026-10-09'
 status: 'done'
 route: 'oneshot'
-review_loop_iteration: 5
+review_loop_iteration: 6
 context: []
 ---
 
@@ -42,7 +42,7 @@ context: []
 - `test/verification-server.test.ts` — the four named regressions plus the cadence/refusal pin, the leading-ping, error-terminal and attach-stream keepalives and the chatty-producer idle-gate guard (real isolated server and stub-scheduler seams, short heartbeat cadence; scoped spies prove each heartbeat is unref'd and cleared).
 - `test/verification-capture.test.ts` — reader accepts interleaved pings and still rejects post-terminal frames; a completed stream with pings stays promotable through real EOF; a stream severed after pings stays UNKNOWN with no output binding.
 - `test/assert-verify-keepalive-baseline.test.ts`, `tools/assert-verify-keepalive-baseline.mjs` (+ `.d.mts`) — fail-before report classifier.
-- `test/suite-shape.test.ts` — recomputed phantom-check pins (25 / 26 / 5).
+- `test/suite-shape.test.ts` — recomputed phantom-check pins (28 / 27 / 7).
 - `docs/FLOW.md` — the `ping` frame in the documented response vocabulary (leading ping and 2 × cadence bound included), and the capture-receipt `pings`/`frames` split.
 - `_bmad-output/implementation-artifacts/deferred-work.md` — the deferred review follow-ups.
 - `.gru-command/worktree.toml` — `verify-idle-keepalive`, `verify-idle-keepalive-static`, `verify-idle-keepalive-baseline`, and `verify-idle-capture-baseline` scopes.
@@ -154,3 +154,12 @@ Round 5 — BMAD blind hunter `verify-idle-keepalive-review-round5-blind-hunter-
 - R5-12 stale counts in the spec — **low**, patched.
 - R5-13 the ping wire literal is duplicated with no shared constant — **low**, deferred (recorded).
 - R5-14 no reader/CLI fixture starts with a ping — **low**, patched: a leading-ping reader fixture binds the run cleanly.
+
+## Native Perkins round r1 — NEEDS CHANGES fix cycle (frozen head 5de609f)
+
+Native whole-change review (`verify-idle-stream-keepalive-20261009-r1`) returned NEEDS CHANGES with two blockers and two non-blocking warnings. Both blockers are repaired with fail-before regressions; both warnings are resolved rather than deferred.
+
+- **Blocker 1 — identity-bearing pings bypassed the single-run check (`src/verify/capture.ts`).** The ping fast path returned before the identity check, so a foreign `{"type":"ping","runId":"B"}` inside an otherwise valid `completed(A)` stream left zero malformed records and the CLI promoted it. Repaired: an identity-bearing ping now participates in the single-run check — a foreign or leading-foreign run id is malformed; identity-free pings (the server's shape) and a matching identity-bearing ping stay clean. Regressions: reader negative fixtures (foreign-after-admission, leading-foreign, matched clean) in `test/verification-capture.test.ts`, and a CLI negative test (`refuses a capture whose pings carry a foreign run identity`) asserting UNKNOWN / no promotion for both placements. Fail-before: the CLI negative fails at `5de609f` and passes after.
+- **Blocker 2 — disposal left response heartbeats armed behind a stalled sink (`src/verify/server.ts`).** Per-response cleanup (terminal/close/finally) can never run when a back-pressured sink holds scheduler fan-out open and the run never settles. Repaired: the server tracks every owned response heartbeat in a set and `dispose()` clears them all synchronously before awaiting the scheduler — no change to producer outcomes, scheduler concurrency or budgets. Regression: `server disposal clears response heartbeats behind a stalled sink` uses a controlled fake-timer clock and a fake response whose `write` always reports backpressure and never drains, asserting the timer is cleared before `dispose()` resolves. Fail-before: fails at `5de609f`.
+- **Warning 3 — chatty-producer assertion rejected legitimate scheduling gaps.** Replaced the real-child/10 ms-timer producer with a controlled stub scheduler on a real socket: a synchronous 20-frame burst (no macrotask can interleave) must contain zero pings, and a controlled 180 ms silent gap must receive pings. Real-socket coverage retained; no legitimate silence is rejected.
+- **Warning 4 — disconnect cleanup was only checked after producer completion.** The abort path now asserts the disconnected response's OWN heartbeat is cleared while the producer gate is still held (via the scoped interval/clearInterval spies), so removing the close-path cleanup can no longer pass through terminal/finally.

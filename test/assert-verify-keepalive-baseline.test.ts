@@ -48,7 +48,7 @@ describe('keepalive fail-before receipt classifier', () => {
   });
 
   it('resolves the server and capture legs and refuses an unknown one', () => {
-    expect(resolveBaselineLeg('server')).toHaveLength(8);
+    expect(resolveBaselineLeg('server')).toHaveLength(10);
     expect(resolveBaselineLeg('capture')).toHaveLength(3);
     expect(() => resolveBaselineLeg('nope')).toThrow(/unknown baseline leg/u);
   });

@@ -12,10 +12,12 @@ export const EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS = Object.freeze({
   server: Object.freeze([
     'queued verification keeps response alive during slot wait',
     'quiet running verification keeps response alive',
+    'does not add keepalive noise to a chatty producer',
     'verification terminal and disconnect cleanup',
     'verification error terminal clears its heartbeat',
     'keeps the body alive before the first producer frame',
     'pins the heartbeat cadence and refuses an unusable one',
+    'server disposal clears response heartbeats behind a stalled sink',
     'keeps an attached duplicate stream alive and stops at its terminal',
     'capture remains honest with keepalive',
   ]),

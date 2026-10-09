@@ -532,15 +532,26 @@ export class NdjsonCaptureReader {
       this.malformed += 1;
       return;
     }
+    const frameRunId =
+      typeof frame['runId'] === 'string' && frame['runId'] !== '' ? frame['runId'] : null;
     if (frame['type'] === 'ping') {
       // Transport liveness, not producer output: counted apart so the
-      // receipt's producer-frame count keeps its diagnostic meaning.
+      // receipt's producer-frame count keeps its diagnostic meaning. An
+      // IDENTITY-BEARING ping still participates in the single-run check —
+      // a foreign (or leading-foreign) run id is malformed and can never be
+      // promoted. Identity-free pings (the server's shape) are unaffected.
+      if (frameRunId !== null) {
+        if (this.runId === null) {
+          this.runId = frameRunId;
+        } else if (this.runId !== frameRunId) {
+          this.malformed += 1;
+          return;
+        }
+      }
       this.pings += 1;
       return;
     }
     this.frames += 1;
-    const frameRunId =
-      typeof frame['runId'] === 'string' && frame['runId'] !== '' ? frame['runId'] : null;
     if (frameRunId !== null) {
       if (this.runId === null) {
         this.runId = frameRunId;

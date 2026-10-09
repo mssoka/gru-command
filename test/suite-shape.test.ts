@@ -146,7 +146,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'uploads-dir.test.ts': 3,
   'verification-evidence.test.ts': 6,
   'verification-scheduler.test.ts': 34,
-  'verification-server.test.ts': 27,
+  'verification-server.test.ts': 28,
   'verify-perkins-resource.test.ts': 3,
   'wake-e2e.test.ts': 3,
   'wake-policy.test.ts': 20,
@@ -172,7 +172,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 9,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 26,
+  'verification-capture.test.ts': 27,
 
 };
 

@@ -173,6 +173,13 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
   const configured = tokenConfigured(options.config.auth.token);
   const ledger = options.ledger;
   const worktrees = options.worktrees;
+  /**
+   * Every response heartbeat THIS server owns. Per-response cleanup
+   * (terminal/close/finally) is not enough: a back-pressured sink can hold
+   * scheduler fan-out open, so a run may never settle and 'finally' may
+   * never run. dispose() stops them all before awaiting the scheduler.
+   */
+  const responseHeartbeats = new Set<ReturnType<typeof setInterval>>();
 
   const scheduler =
     options.scheduler ??
@@ -394,6 +401,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     const stopHeartbeat = (): void => {
       if (heartbeat === null) return;
       clearInterval(heartbeat);
+      responseHeartbeats.delete(heartbeat);
       heartbeat = null;
     };
     res.on('close', () => {
@@ -437,6 +445,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       });
     }, heartbeatMs);
     heartbeat.unref?.();
+    responseHeartbeats.add(heartbeat);
 
     try {
       await scheduler.run(
@@ -564,6 +573,14 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     },
 
     async dispose(): Promise<void> {
+      // Stop every response heartbeat BEFORE awaiting the scheduler: a
+      // back-pressured sink can leave a response's run unsettled, so its
+      // terminal/close/finally cleanup may not have run yet. Producer
+      // outcomes, scheduler concurrency and budgets are untouched here.
+      for (const timer of [...responseHeartbeats]) {
+        clearInterval(timer);
+        responseHeartbeats.delete(timer);
+      }
       await scheduler.dispose();
     },
   };
