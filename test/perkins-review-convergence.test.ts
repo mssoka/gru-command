@@ -1,4 +1,5 @@
 import { readFileSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -480,7 +481,7 @@ describe('integration scope: same-head adopted base and identical base adoption'
     const plan = planReviewScope({
       prior: {
         seq: 1, reviewScope: 'whole', canonicalVerdict: 'READY TO MERGE', targetSha: h0, diffBaseSha: b0,
-        acceptance: null, coverageComplete: true, legacyWhole: false,
+        acceptance: null, coverageComplete: true, legacyWhole: false, findings: null,
       },
       currentTargetSha: h0, currentDiffBaseSha: currentBase,
       deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true,
@@ -639,6 +640,45 @@ describe('production scope planning wiring (planPerkinsReviewScope)', () => {
     const refused = call(rejected);
     expect(refused.scope).toBe('whole');
     expect(refused.reason).toContain('not a conclusive whole-PR record');
+
+    // (baseline Stage-5 whole receipt) A whole round whose receipt predates the
+    // coverageComplete field is still whole-complete: no whole replay just to
+    // mint metadata.
+    const baseline = writePrior('prior-baseline-whole.json', {
+      ...wholePrior,
+      convergence: { reviewScope: 'whole' },
+    });
+    const baselinePlan = call(baseline, { nativeReceipt: { targetSha: h0, diffBaseSha: b0, reviewScope: 'whole' } });
+    expect(baselinePlan.scope).toBe('integration');
+    expect(baselinePlan.priorCoverageComplete).toBe(true);
+
+    // (tampered retained findings) Swapping a genuine whole NEEDS CHANGES
+    // record's findings to [] must NOT be credited whole-complete coverage.
+    const genuineFindings = [{
+      source: 'lead', severity: 'blocker', category: 'correctness', title: 'unresolved blocker',
+      location: 'src/feature.ts:1', evidence: 'export const feature = 1;', detail: 'the defect remains',
+      recommended_fix: 'fix it', verification: { disposition: 'confirmed', evidence: 'e', reason: 'round 1' },
+      sources: ['lead'], roundOrigin: 1,
+    }];
+    const needsChanges = writePrior('prior-needs-changes.json', {
+      ...wholePrior,
+      canonicalVerdict: 'NEEDS CHANGES',
+      findings: genuineFindings,
+      convergence: { reviewScope: 'whole', coverageComplete: true },
+    });
+    const nativeNeedsChanges = {
+      targetSha: h0, diffBaseSha: b0, reviewScope: 'whole', coverageComplete: true,
+      blockers: 1, retainedFindings: 1,
+      retainedFindingsSha256: createHash('sha256').update(JSON.stringify(genuineFindings)).digest('hex'),
+    };
+    expect(call(needsChanges, { nativeReceipt: nativeNeedsChanges }).scope).toBe('integration');
+    const tampered = writePrior('prior-tampered-findings.json', {
+      ...wholePrior, canonicalVerdict: 'NEEDS CHANGES', findings: [],
+      convergence: { reviewScope: 'whole', coverageComplete: true },
+    });
+    const tamperedPlan = call(tampered, { nativeReceipt: nativeNeedsChanges });
+    expect(tamperedPlan.scope).toBe('whole');
+    expect(tamperedPlan.priorCoverageComplete).toBe(false);
   });
 });
 
@@ -756,6 +796,7 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
     acceptance: null,
     coverageComplete: false,
     legacyWhole: false,
+    findings: null,
     ...overrides,
   });
   const scope = (prior: ReturnType<typeof meta> | null, overrides: Partial<{ currentTargetSha: string; currentDiffBaseSha: string; finalWholePassAtReady: boolean; integrationLineage: { baseAdvanced: boolean; featureIntegrated: boolean; commonBasePinned: boolean; sameHeadAdoptedBase: boolean } | null; integrationCoverage: boolean; acceptanceCompatible: boolean }> = {}) => planReviewScope({
@@ -864,7 +905,7 @@ describe('prior convergence meta read (tolerant)', () => {
     };
     writeFileSync(file, JSON.stringify(modern));
     expect(readPriorConvergenceMeta(file, 4)).toEqual({
-      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null, coverageComplete: false, legacyWhole: false,
+      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null, coverageComplete: false, legacyWhole: false, findings: null,
     });
     writeFileSync(file, JSON.stringify({ ...modern, convergence: undefined }));
     expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('unknown');
@@ -895,9 +936,11 @@ describe('prior convergence meta read (tolerant)', () => {
     // A non-hex linkage field is damaged.
     writeFileSync(file, JSON.stringify({ ...integrated, convergence: { ...integrated.convergence, integrationPriorDiffBase: 'nope' } }));
     expect(readPriorConvergenceMeta(file, 4)).toBeNull();
-    // Linkage that names the record's own target as its source is inconsistent.
+    // A valid same-head adoption linkage (the round integrated from the very
+    // head it reviewed) is NOT damaged: the frozen target and the integration
+    // source legitimately coincide, and the engine persists exactly that.
     writeFileSync(file, JSON.stringify({ ...integrated, convergence: { ...integrated.convergence, integrationFromSha: 'b'.repeat(40) } }));
-    expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('integration');
   });
 
   it('fails closed on a present-but-malformed acceptance binding', () => {

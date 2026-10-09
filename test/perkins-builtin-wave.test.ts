@@ -3143,6 +3143,110 @@ describe('WaveRunner built-in Perkins production path', () => {
     rmSync(artifacts, { recursive: true, force: true });
   }, 180_000);
 
+  it('refuses to promote an approval whose coverage state is absent or damaged, and preserves historical whole recovery', async () => {
+    const build = (name: string): { ledger: LedgerApi; port: GitReviewPort; jobId: string; round: ReturnType<LedgerApi['addRound']>; directory: string; publicationFile: string; publicationSha256: string; prUrl: string; poster: { post: () => Promise<never>; authenticatedActor: () => Promise<string> } } => {
+      const repo = makeFixtureRepo(name);
+      repos.push(repo);
+      repo.git(['config', 'user.name', 'Fixture Tests']);
+      repo.git(['config', 'user.email', 'tests@example.invalid']);
+      repo.git(['checkout', '-b', `feature/${name}`]);
+      const target = repo.commitFile('src/main.ts', 'export const answer = 1;\n');
+      const root = mkdtempSync(join(tmpdir(), `perkins-${name}-port-`));
+      const artifacts = mkdtempSync(join(tmpdir(), `perkins-${name}-artifacts-`));
+      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `perkins-${name}-db-`)));
+      dirs.push(root, artifacts); dbs.push(db);
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      const port = new GitReviewPort(root, `feature/${name}`, target);
+      const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+      ledger.setJobStatus(job.id, 'working');
+      ledger.setJobStatus(job.id, 'in-review');
+      const prUrl = 'https://example.invalid/acme/fixture/pull/77';
+      ledger.setJobPr(job.id, prUrl);
+      const round = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: target });
+      ledger.setRoundStatus(round.id, 'live');
+      const directory = join(artifacts, round.id);
+      mkdirSync(directory, { recursive: true });
+      const publicationBody = '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
+      const publicationFile = join(directory, 'perkins-report.publication.md');
+      writeFileSync(publicationFile, publicationBody, 'utf8');
+      const publicationSha256 = createHash('sha256').update(publicationBody, 'utf8').digest('hex');
+      return {
+        ledger, port, jobId: job.id, round, directory, publicationFile, publicationSha256, prUrl,
+        poster: { post: (() => { throw new Error('unused'); }) as unknown as () => Promise<never>, authenticatedActor: async () => 'gru-bot' },
+      };
+    };
+
+    // (a) A bound approved round whose consolidated state is ABSENT: recovery
+    // refuses to promote rather than assume no debt.
+    const absent = build('refuse-absent');
+    absent.ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: absent.jobId, roundId: absent.round.id,
+      payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: absent.prUrl, host: 'example.invalid',
+        targetSha: absent.round.targetRef, baseSha: 'b'.repeat(40), publicationFile: absent.publicationFile, publicationSha256: absent.publicationSha256, reconciled: false,
+        receipt: { reviewId: '9006', actor: 'gru-bot', event: 'COMMENTED', commitId: absent.round.targetRef, headSha: absent.round.targetRef, baseSha: 'b'.repeat(40), bodySha256: absent.publicationSha256 },
+      },
+    });
+    const absentEscalations: string[] = [];
+    const absentWave = new WaveRunner({ ledger: absent.ledger, worktrees: absent.port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: join(absent.directory, '..'), poster: absent.poster, escalate: (title, detail) => absentEscalations.push(`${title} :: ${detail}`) });
+    expect(await absentWave.recoverInterruptedRounds()).toBe(1);
+    expect(absent.ledger.getRound(absent.round.id)).toMatchObject({ status: 'aborted', verdict: null });
+    expect(absent.ledger.latestRoundEvent(absent.round.id, 'round.post-recovered')).toBeNull();
+    expect(absentEscalations.some((line) => line.includes('missing or damaged'))).toBe(true);
+
+    // (b) A posted integration approval with no debt field: recovery restores
+    // the debt from the persisted scope and withholds owner-readiness.
+    const partial = build('restore-integration');
+    writeFileSync(join(partial.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: partial.round.targetRef },
+      convergence: { reviewScope: 'integration', coverageComplete: false },
+    }));
+    partial.ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: partial.jobId, roundId: partial.round.id,
+      payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: partial.prUrl, host: 'example.invalid',
+        targetSha: partial.round.targetRef, baseSha: 'b'.repeat(40), publicationFile: partial.publicationFile, publicationSha256: partial.publicationSha256, reconciled: false,
+        receipt: { reviewId: '9007', actor: 'gru-bot', event: 'COMMENTED', commitId: partial.round.targetRef, headSha: partial.round.targetRef, baseSha: 'b'.repeat(40), bodySha256: partial.publicationSha256 },
+      },
+    });
+    const partialWave = new WaveRunner({ ledger: partial.ledger, worktrees: partial.port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: join(partial.directory, '..'), poster: partial.poster });
+    expect(await partialWave.recoverInterruptedRounds()).toBe(1);
+    expect(partial.ledger.getRound(partial.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+    const restored = partial.ledger.latestRoundEvent(partial.round.id, 'round.final-pass-required');
+    expect(restored).not.toBeNull();
+    partial.ledger.appendCustomEvent({
+      kind: 'github.branch-state', jobId: partial.jobId,
+      payload: {
+        repo: 'example/fixture', branch: `gru/${partial.jobId}`, sha: partial.round.targetRef, merged: false, pr_open: true,
+        mergeable_state: 'clean', pr_number: 2, pr_url: 'https://example.invalid/acme/fixture/pull/2', merge_commit_sha: null,
+        ci: { sha: partial.round.targetRef, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    expect(new BoardEngine({ ledger: partial.ledger, bus: new EventBus() }).snapshot().ownerPrs).toEqual([]);
+
+    // (c) A historical WHOLE round (readable whole consolidated, no posted
+    // review block) still recovers normally.
+    const whole = build('restore-whole');
+    writeFileSync(join(whole.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: whole.round.targetRef },
+      convergence: { reviewScope: 'whole' },
+    }));
+    whole.ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: whole.jobId, roundId: whole.round.id,
+      payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: whole.prUrl, host: 'example.invalid',
+        targetSha: whole.round.targetRef, baseSha: 'b'.repeat(40), publicationFile: whole.publicationFile, publicationSha256: whole.publicationSha256, reconciled: false,
+        receipt: { reviewId: '9008', actor: 'gru-bot', event: 'COMMENTED', commitId: whole.round.targetRef, headSha: whole.round.targetRef, baseSha: 'b'.repeat(40), bodySha256: whole.publicationSha256 },
+      },
+    });
+    const wholeWave = new WaveRunner({ ledger: whole.ledger, worktrees: whole.port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: join(whole.directory, '..'), poster: whole.poster });
+    expect(await wholeWave.recoverInterruptedRounds()).toBe(1);
+    expect(whole.ledger.getRound(whole.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+    expect(whole.ledger.latestRoundEvent(whole.round.id, 'round.final-pass-required')).toBeNull();
+  }, 180_000);
+
   it('requires old-head writer cessation before admitting a new-head review', async () => {
     const repo = makeFixtureRepo('perkins-historical-head');
     repos.push(repo);

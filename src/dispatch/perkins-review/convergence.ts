@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync } from 'node:fs';
 import { repositoryGitEnv } from './artifacts.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './types.js';
@@ -771,6 +772,10 @@ export interface PriorConvergenceMeta {
    * pre-Stage-5 whole review, whole-complete only when its native receipt
    * also carries no Stage-5 scope/coverage evidence. */
   readonly legacyWhole: boolean;
+  /** The retained findings as the record holds them (null when absent/not an
+   * array): bound to the native submission by count and digest so tampering
+   * can never be credited whole-complete coverage. */
+  readonly findings: { readonly blockers: number; readonly count: number; readonly sha256: string } | null;
 }
 
 const MAX_CONSOLIDATED_META_BYTES = 8 * 1024 * 1024;
@@ -792,6 +797,7 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       complete?: unknown;
       headMoved?: unknown;
       frozen?: { targetSha?: unknown; diffBaseSha?: unknown; acceptance?: unknown };
+      findings?: unknown;
       convergence?: { reviewScope?: unknown; coverageComplete?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
     };
     if (parsed.schemaVersion !== 3 || parsed.architecture !== 'perkins-whole-pr' ||
@@ -811,8 +817,6 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
         if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) return null;
       }
       if (linkage.integrationBaseSha !== parsed.frozen.diffBaseSha) return null;
-      // A round cannot have integrated FROM its own target.
-      if (linkage.integrationFromSha === parsed.frozen.targetSha) return null;
     }
     const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; baseSha256?: unknown; contractSha256?: unknown; amendmentIds?: unknown } | null | undefined;
     // A PRESENT acceptance binding must be fully well-formed: a partial or
@@ -841,6 +845,19 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
     const coverageComplete = parsed.convergence?.coverageComplete === true
       ? (scope === 'whole' || scope === 'integration')
       : parsed.convergence?.coverageComplete === undefined && (legacyWhole || scope === 'whole');
+    // The retained findings are bound to the native submission by their count
+    // and digest: a record whose findings were swapped/emptied can never be
+    // credited whole-complete coverage over unresolved priors.
+    const rawFindings = parsed.findings;
+    const findings = Array.isArray(rawFindings)
+      ? {
+          blockers: rawFindings.filter((entry) => typeof entry === 'object' && entry !== null &&
+            (entry as { severity?: unknown }).severity === 'blocker' &&
+            (entry as { deferredFollowup?: unknown }).deferredFollowup !== true).length,
+          count: rawFindings.length,
+          sha256: createHash('sha256').update(JSON.stringify(rawFindings)).digest('hex'),
+        }
+      : null;
     return {
       seq,
       reviewScope: scope === 'whole' || scope === 'delta' || scope === 'integration' ? scope : 'unknown',
@@ -850,6 +867,7 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       acceptance,
       coverageComplete,
       legacyWhole,
+      findings,
     };
   } catch {
     return null;
@@ -866,6 +884,11 @@ export interface PriorNativeReceipt {
   readonly reviewScope?: unknown;
   readonly coverageComplete?: unknown;
   readonly finalPassRequired?: unknown;
+  /** Non-deferred blocker count of the native submission. */
+  readonly blockers?: unknown;
+  /** Total retained finding count and exact digest of the native submission. */
+  readonly retainedFindings?: unknown;
+  readonly retainedFindingsSha256?: unknown;
 }
 
 /** The prior round's accepted contract binding as recorded on the round's own
@@ -899,6 +922,22 @@ export function authenticatePriorMeta(
   if (typeof receipt.diffBaseSha !== 'string' || receipt.diffBaseSha !== meta.diffBaseSha) return null;
   const receiptScope = typeof receipt.reviewScope === 'string' ? receipt.reviewScope : undefined;
   if (receiptScope !== undefined && receiptScope !== meta.reviewScope) return null;
+  // A Stage-5 scope claim must be corroborated by the receipt; only a genuine
+  // pre-Stage-5 record (no convergence block) may carry no receipt scope.
+  if (receiptScope === undefined && !meta.legacyWhole) return null;
+  // The retained findings must match the native submission exactly: a record
+  // whose findings were swapped/emptied ("[]" over a genuine NEEDS CHANGES
+  // review) can never be credited whole-complete coverage.
+  if (receipt.blockers !== undefined) {
+    if (!Number.isSafeInteger(receipt.blockers) || meta.findings === null || meta.findings.blockers !== receipt.blockers) return null;
+  }
+  if (receipt.retainedFindings !== undefined) {
+    if (!Number.isSafeInteger(receipt.retainedFindings) || meta.findings === null || meta.findings.count !== receipt.retainedFindings) return null;
+  }
+  if (typeof receipt.retainedFindingsSha256 === 'string') {
+    if (!/^[a-f0-9]{64}$/u.test(receipt.retainedFindingsSha256) || meta.findings === null ||
+      meta.findings.sha256 !== receipt.retainedFindingsSha256) return null;
+  }
   const receiptDebt = receipt.finalPassRequired === true;
   const receiptComplete = receipt.coverageComplete === true;
   if (meta.legacyWhole) {
@@ -908,10 +947,18 @@ export function authenticatePriorMeta(
     if (receiptScope !== undefined || receiptComplete || receiptDebt) return null;
     return { ...meta, coverageComplete: true };
   }
-  // A record may never claim whole-complete coverage its receipt contradicts
-  // or does not corroborate.
-  if (meta.coverageComplete && (!receiptComplete || receiptDebt)) return null;
-  return { ...meta, coverageComplete: meta.coverageComplete && receiptComplete && !receiptDebt };
+  if (receiptDebt) {
+    // A round that still owed the final pass can never be whole-complete.
+    if (meta.coverageComplete) return null;
+    return { ...meta, coverageComplete: false };
+  }
+  // A whole-scope round covered the whole candidate by construction. Baseline
+  // Stage-5 receipts predate the coverageComplete field, so the authenticated
+  // SCOPE (not the field) is what credits them — no whole replay just to mint
+  // metadata. A delta/integration round needs an explicit, corroborated bit.
+  if (meta.reviewScope === 'whole') return { ...meta, coverageComplete: true };
+  if (meta.coverageComplete && !receiptComplete) return null;
+  return { ...meta, coverageComplete: meta.coverageComplete && receiptComplete };
 }
 
 /** One call that plans the production round scope: read the prior durable

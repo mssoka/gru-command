@@ -536,6 +536,20 @@ export interface PostedEventPayload {
   readonly publicationSha256: string;
   readonly receipt: PostedReviewReceipt;
   readonly reconciled: boolean;
+  /** The round's authenticated review scope/coverage/debt, persisted with the
+   * posted event so restart recovery never has to infer debt from an absent
+   * or damaged consolidated record. Absent on historical rounds. */
+  readonly review?: PostedReviewState;
+}
+
+/** The durable posted review state: scope, whole-candidate coverage and the
+ * final-pass obligation, plus the integration linkage when applicable. */
+export interface PostedReviewState {
+  readonly reviewScope: 'whole' | 'delta' | 'integration' | 'unknown';
+  readonly coverageComplete: boolean;
+  readonly finalPassRequired: boolean;
+  readonly integrationFromSha?: string;
+  readonly integrationBaseSha?: string;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -581,6 +595,7 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
   ) return null;
   const commitId = receipt['commitId'];
   if (commitId !== null && !nonEmptyString(commitId)) return null;
+  const parsedReview = parsePostedReviewState(value['review']);
   return {
     verdict,
     canonicalVerdict: canonicalVerdict as CanonicalReviewVerdict,
@@ -591,11 +606,34 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
     publicationFile,
     publicationSha256,
     reconciled,
+    ...(parsedReview !== null ? { review: parsedReview } : {}),
     receipt: {
       reviewId: receipt['reviewId'], actor: receipt['actor'], event: receipt['event'],
       commitId: commitId as string | null, headSha: receipt['headSha'], baseSha: receipt['baseSha'],
       bodySha256: receipt['bodySha256'],
     },
+  };
+}
+
+/** Strict, throw-free parse of the optional posted `review` block. A malformed
+ * block is treated as ABSENT (recovery then falls back to the preserved
+ * consolidated record and fails closed when that is unusable). */
+function parsePostedReviewState(value: unknown): PostedReviewState | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const review = value as Record<string, unknown>;
+  const scope = review['reviewScope'];
+  if (scope !== 'whole' && scope !== 'delta' && scope !== 'integration' && scope !== 'unknown') return null;
+  if (typeof review['coverageComplete'] !== 'boolean' || typeof review['finalPassRequired'] !== 'boolean') return null;
+  const from = review['integrationFromSha'];
+  const base = review['integrationBaseSha'];
+  if (from !== undefined && (typeof from !== 'string' || !/^[0-9a-f]{40}$/u.test(from))) return null;
+  if (base !== undefined && (typeof base !== 'string' || !/^[0-9a-f]{40}$/u.test(base))) return null;
+  return {
+    reviewScope: scope,
+    coverageComplete: review['coverageComplete'],
+    finalPassRequired: review['finalPassRequired'],
+    ...(typeof from === 'string' ? { integrationFromSha: from } : {}),
+    ...(typeof base === 'string' ? { integrationBaseSha: base } : {}),
   };
 }
 
@@ -2366,35 +2404,30 @@ export class WaveRunner {
       }
     }
     if (bound && event !== null) {
-      // Restore a partial-coverage round's final-pass debt from its preserved
-      // review state BEFORE approval is committed: a crash between the posted
-      // event and the pre-commit marker must not promote a partial approval
-      // into owner-readiness. The debt is authenticated to the posted head.
-      if (postedVerdict === 'approved' &&
-        this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') === null) {
-        const consolidated = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'consolidated.json');
-        let owesFinalPass = false;
-        try {
-          const info = lstatSync(consolidated);
-          if (info.isFile() && !info.isSymbolicLink() && info.size <= 8 * 1024 * 1024) {
-            const parsed = JSON.parse(readFileSync(consolidated, 'utf8')) as {
-              architecture?: unknown;
-              schemaVersion?: unknown;
-              frozen?: { targetSha?: unknown };
-              convergence?: { finalPassRequired?: unknown; reviewScope?: unknown };
-            };
-            owesFinalPass = parsed.architecture === 'perkins-whole-pr' && parsed.schemaVersion === 3 &&
-              parsed.frozen?.targetSha === event.receipt.headSha &&
-              parsed.convergence?.finalPassRequired === true;
-          }
-        } catch {
-          owesFinalPass = false;
+      // Restore a partial-coverage round's final-pass debt BEFORE approval is
+      // committed: a crash between the posted event and the pre-commit marker
+      // must not promote a partial approval into owner-readiness. The state is
+      // the writer-persisted posted `review` block when present, else the
+      // preserved consolidated record, authenticated to the posted head.
+      // Absent/damaged evidence is NEVER treated as "no debt": the promotion
+      // is refused and the round stays interrupted for inspection.
+      if (postedVerdict === 'approved') {
+        const postedReview = event.review ?? this.readPostedReviewState(round.id, event.receipt.headSha);
+        if (postedReview === null) {
+          this.escalate(
+            `Review round ${round.id} cannot be promoted: its review coverage state is missing or damaged`,
+            'restart recovery refuses to promote an approval whose authenticated scope/coverage/debt cannot be established from the posted receipt or the preserved consolidated record; the round stays interrupted for inspection',
+            { jobId: round.jobId, roundId: round.id },
+          );
+          return 'unbound';
         }
-        if (owesFinalPass) {
+        const owesFinalPass = postedReview.finalPassRequired ||
+          (postedReview.reviewScope === 'integration' && !postedReview.coverageComplete);
+        if (owesFinalPass && this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') === null) {
           try {
             this.opts.ledger.appendCustomEvent({
               kind: 'round.final-pass-required', jobId: round.jobId, roundId: round.id,
-              payload: { targetSha: event.receipt.headSha, reviewScope: 'restored-on-restart' },
+              payload: { targetSha: event.receipt.headSha, reviewScope: postedReview.reviewScope },
             });
           } catch (markerError) {
             throw new Error(`restart recovery could not restore the required final whole-change pass before promoting round ${round.id}: ${String(markerError)}`);
@@ -5193,6 +5226,18 @@ export class WaveRunner {
               commitId: delivered.commitId, headSha: delivered.headSha, baseSha: delivered.baseSha, bodySha256: delivered.bodySha256,
             },
             reconciled,
+            // Persist the authenticated review scope/coverage/debt WITH the
+            // posted event so restart recovery never treats absent/damaged
+            // consolidated state as "no debt".
+            ...(review.convergence !== undefined ? {
+              review: {
+                reviewScope: review.convergence.reviewScope,
+                coverageComplete: review.convergence.coverageComplete === true || review.convergence.reviewScope === 'whole',
+                finalPassRequired: review.convergence.finalPassRequired === true,
+                ...(review.convergence.integrationFromSha !== undefined ? { integrationFromSha: review.convergence.integrationFromSha } : {}),
+                ...(review.convergence.integrationBaseSha !== undefined ? { integrationBaseSha: review.convergence.integrationBaseSha } : {}),
+              },
+            } : {}),
         };
         // R34 writer/reader symmetry invariant: the event about to be
         // persisted MUST parse through the SAME shared contract restart
@@ -5442,6 +5487,11 @@ export class WaveRunner {
           // digest renders it as "verdict with N blocker(s)"). Deferred
           // follow-ups cannot hold the PR, so they are not blockers here.
           blockers: review.findings.filter((finding) => finding.severity === 'blocker' && finding.deferredFollowup !== true).length,
+          // Bind the retained finding CONTENTS to the native submission: a
+          // record whose findings are later swapped/emptied can never be
+          // credited whole-complete coverage over unresolved priors.
+          retainedFindings: review.findings.length,
+          retainedFindingsSha256: createHash('sha256').update(JSON.stringify(review.findings)).digest('hex'),
           targetSha: review.targetSha,
           baseRefSha: frozenReview.manifest.baseRefSha,
           diffBaseSha: review.diffBaseSha,
@@ -5954,6 +6004,42 @@ export class WaveRunner {
     }
   }
 
+  /** Read the review scope/coverage/debt from a round's preserved consolidated
+   * record, authenticated to the posted head. Returns null when the record is
+   * absent, unreadable, malformed or bound to a different head — recovery then
+   * refuses to promote rather than assume no debt. A legacy record with no
+   * convergence block was a whole review and carries no debt. */
+  private readPostedReviewState(roundId: string, headSha: string): PostedReviewState | null {
+    const consolidated = join(reviewArtifactDirectory(this.artifactRoot(), roundId), 'consolidated.json');
+    try {
+      const info = lstatSync(consolidated);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > 8 * 1024 * 1024) return null;
+      const parsed = JSON.parse(readFileSync(consolidated, 'utf8')) as {
+        architecture?: unknown;
+        schemaVersion?: unknown;
+        frozen?: { targetSha?: unknown };
+        convergence?: { reviewScope?: unknown; coverageComplete?: unknown; finalPassRequired?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown };
+      };
+      if (parsed.architecture !== 'perkins-whole-pr' || parsed.schemaVersion !== 3 || parsed.frozen?.targetSha !== headSha) return null;
+      if (parsed.convergence === undefined) {
+        return { reviewScope: 'unknown', coverageComplete: true, finalPassRequired: false };
+      }
+      const scope = parsed.convergence.reviewScope;
+      const reviewScope = scope === 'whole' || scope === 'delta' || scope === 'integration' ? scope : 'unknown';
+      const from = parsed.convergence.integrationFromSha;
+      const base = parsed.convergence.integrationBaseSha;
+      return {
+        reviewScope,
+        coverageComplete: parsed.convergence.coverageComplete === true || reviewScope === 'whole',
+        finalPassRequired: parsed.convergence.finalPassRequired === true,
+        ...(typeof from === 'string' ? { integrationFromSha: from } : {}),
+        ...(typeof base === 'string' ? { integrationBaseSha: base } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /** The prior round's NATIVE ledger receipts: the durable
    * `round.perkins-review` fields (identity + scope/coverage/debt) plus the
    * pre-commit `round.final-pass-required` marker presence, and the accepted
@@ -5992,6 +6078,9 @@ export class WaveRunner {
         reviewScope: payload['reviewScope'],
         coverageComplete: payload['coverageComplete'],
         finalPassRequired: payload['finalPassRequired'] === true || debtMarker,
+        blockers: payload['blockers'],
+        retainedFindings: payload['retainedFindings'],
+        retainedFindingsSha256: payload['retainedFindingsSha256'],
       },
       acceptance,
     };

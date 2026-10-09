@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { freezeReviewInputs, reviewArtifactDirectory, type FrozenReview } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
+import { planPerkinsReviewScope, readPriorConvergenceMeta } from '../src/dispatch/perkins-review/convergence.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
@@ -394,8 +395,67 @@ describe('native integration review retains prior coverage', () => {
     expect(round2.convergence?.carriedPriors).toBeUndefined();
   });
 
-  it('gives the specialist lenses the integration unit in their prompt', async () => {
-    const harness = makeEngine({ childAnswer: () => '[]', specialists: ['blind'] });
+  it('reuses a valid same-head adoption clearance across two successive base advancements', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    harness.repo.git(['config', 'user.name', 'Fixture Tests']);
+    harness.repo.git(['config', 'user.email', 'tests@example.invalid']);
+    harness.repo.git(['checkout', '-b', 'feature/integration']);
+    const c1 = harness.repo.commitFile('src/shared1.ts', 'export const s1 = 1;\n');
+    const c2 = harness.repo.commitFile('src/shared2.ts', 'export const s2 = 2;\n');
+    const h0 = harness.repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    const b0 = harness.repo.git(['rev-parse', 'main']); // main has not advanced yet
+
+    // Round 1 (whole) at H0/B0.
+    const frozen1 = freeze(harness, 'ad-round-1', h0);
+    const round1 = await runRound(harness, { roundId: 'ad-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    expect(round1.canonicalVerdict).toBe('READY TO MERGE');
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'ad-round-1'), 'consolidated.json');
+
+    // main fast-forwards onto C1 (already inside H0's reviewed history).
+    harness.repo.git(['checkout', 'main']);
+    harness.repo.git(['merge', '--ff-only', c1]);
+    harness.repo.git(['checkout', 'feature/integration']);
+    const frozen2 = freeze(harness, 'ad-round-2', h0);
+    const round2 = await runRound(harness, {
+      roundId: 'ad-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    // The engine persists the VALID same-head linkage (integrationFromSha ==
+    // the frozen target).
+    expect(round2.convergence).toMatchObject({
+      reviewScope: 'integration', integrationFromSha: h0, coverageComplete: true,
+    });
+    const consolidated2 = join(reviewArtifactDirectory(harness.root, 'ad-round-2'), 'consolidated.json');
+    // The persisted linkage is READABLE, not rejected as damaged.
+    expect(readPriorConvergenceMeta(consolidated2, 2)?.reviewScope).toBe('integration');
+
+    // main advances again onto C2: the reuse must survive.
+    harness.repo.git(['checkout', 'main']);
+    harness.repo.git(['merge', '--ff-only', c2]);
+    harness.repo.git(['checkout', 'feature/integration']);
+    const frozen3 = freeze(harness, 'ad-round-3', h0);
+    const round3 = await runRound(harness, {
+      roundId: 'ad-round-3', roundNumber: 3, frozen: frozen3,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated2,
+    });
+    expect(round3.convergence).toMatchObject({ reviewScope: 'integration', integrationFromSha: h0 });
+    expect(round3.convergence?.coverageComplete).toBe(true);
+    expect(round3.convergence?.finalPassRequired).toBeUndefined();
+    expect(b0).toMatch(/^[0-9a-f]{40}$/u);
+
+    // The production planner also accepts the persisted same-head linkage.
+    const c2sha = harness.repo.git(['rev-parse', c2]);
+    const plan = planPerkinsReviewScope({
+      priorConsolidatedFile: consolidated2, priorSeq: 2, repoPath: harness.repo.path,
+      currentTargetSha: h0, currentDiffBaseSha: c2sha, currentAcceptance: undefined,
+      nativeReceipt: { targetSha: h0, diffBaseSha: harness.repo.git(['rev-parse', c1]), reviewScope: 'integration', coverageComplete: true },
+      rules: { deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true },
+    });
+    expect(plan.scope).toBe('integration');
+    expect(plan.priorCoverageComplete).toBe(true);
+  });
+
+  it('gives the specialist lenses the integration unit in their prompt', async () => {    const harness = makeEngine({ childAnswer: () => '[]', specialists: ['blind'] });
     featureHead(harness.repo, 'src/shared.ts', 'export const shared = "feature";\n');
     const covered = harness.repo.head();
     const frozen1 = freeze(harness, 'sp-round-1', covered);
