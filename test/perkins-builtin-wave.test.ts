@@ -2847,6 +2847,9 @@ describe('WaveRunner built-in Perkins production path', () => {
   it('Stage-5 integration: a whole-complete prior binds the advanced-base head without chaining a whole pass', async () => {
     const repo = makeFixtureRepo('perkins-wave-integration');
     repos.push(repo);
+    // CI runners have no global git identity; the merge below needs one.
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
     repo.git(['checkout', '-b', 'feature/integration']);
     const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
     const root = mkdtempSync(join(tmpdir(), 'perkins-int-port-'));
@@ -2918,6 +2921,9 @@ describe('WaveRunner built-in Perkins production path', () => {
   it('Stage-5 integration: a partial prior still chains the final whole pass after the advanced base', async () => {
     const repo = makeFixtureRepo('perkins-wave-integration-partial');
     repos.push(repo);
+    // CI runners have no global git identity; the merge below needs one.
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
     repo.git(['checkout', '-b', 'feature/integration']);
     const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
     const root = mkdtempSync(join(tmpdir(), 'perkins-intp-port-'));
