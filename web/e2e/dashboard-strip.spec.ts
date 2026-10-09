@@ -1226,9 +1226,11 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
 
 test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
-  // conflicting > 0 so the loudest KPI ink (`.strip-kpi__num--alert`) is
-  // actually rendered and measured, not merely listed as a target.
-  await harness(page, makeSnapshot(slotSpec({ ...familyA(4), conflicting: 3 })));
+  // Every measured target must actually be RENDERED (an absent target fails
+  // loud): conflicting > 0 for the loudest KPI ink, deferred > 0 for the
+  // wakes deferred slot, and more pending rows than the band window so the
+  // older-pending expander (and its reserved number) exists.
+  await harness(page, makeSnapshot(slotSpec({ ...familyA(4), conflicting: 3, deferredCount: 12, pending: 9 })));
   await expectStripFamilies(page, familyAFamilies(4));
   const measure = (): Promise<Record<string, number>> =>
     page.evaluate(() => {
@@ -1264,13 +1266,22 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
         kpiNum: '.strip-kpi__num',
         groupName: '.strip-group__name',
         groupUnit: '.strip-group__unit',
+        groupTotalNum: '.strip-group__total-num',
         alertKpi: '.strip-kpi__num--alert',
         wakeCount: '.board-wakes__count',
+        wakeDeferred: '.board-wakes__deferred',
+        ageSplitUnit: '.board-age-split__unit',
+        // Every non-deploy status VALUE, not just DEPLOY's (each pair's
+        // number is the element a reader actually scans).
+        reviewsValue: '.strip-pair[data-chip="reviews"] .strip-value__num',
+        silasValue: '.strip-pair[data-chip="silas"] .strip-value__num',
+        cureValue: '.strip-pair[data-chip="cure"] .strip-value__num',
         ownerTitle: '.board-owner__title',
         ownerNext: '.board-owner__next',
         detailMeta: '.board-owner__detail-meta',
         detailNotice: '.board-owner__detail-notice',
         bandCount: '.board-band__count',
+        bandMoreNum: '.board-band__more-num',
       };
       return Object.fromEntries(Object.entries(targets).map(([k, s]) => [k, Math.round(ratioOf(s) * 100) / 100]));
     });
@@ -1311,6 +1322,12 @@ test('CHILDREN group appears only when the server reported counters (absent is n
   await expect(page.locator('#chip-rail .strip-group')).toHaveCount(4);
   const children = page.locator('#chip-rail .strip-group').nth(3);
   await expect(children.locator('.strip-group__name')).toHaveText('CHILDREN');
+  // The 4th group's own identity contract: every KPI key label in document
+  // order, and a reserved numeric slot behind every value (expectStripFamilies
+  // covers the base three groups only).
+  await expect(children.locator('.strip-kpi__k')).toHaveText(['active', 'queued', 'finished', 'created']);
+  await expect(children.locator('.strip-kpi')).toHaveCount(4);
+  expect(await children.locator('.strip-kpi__num.num').count(), 'every CHILDREN value rides a reserved .num slot').toBe(4);
   await expect(children.locator('[data-kpi="children.active"]')).toHaveText('0');
   await expect(children.locator('[data-kpi="children.queued"]')).toHaveText('0');
   await expect(children.locator('[data-kpi="children.finished"]')).toHaveText('0');
@@ -1352,6 +1369,17 @@ test('CHILDREN group appears only when the server reported counters (absent is n
   await expect(children.locator('[data-kpi="children.lifetimeCreations"]')).toHaveText('20');
   const childrenNext = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
   comparePairwise(childrenFirst, childrenNext);
+  // The container-transition band (640–900px) where the 4-group wrap edge
+  // rules engage: measure it at 768 and compare across a value change.
+  await page.setViewportSize({ width: 768, height: 900 });
+  await expect(page.locator('#chip-rail .strip-group')).toHaveCount(4);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const tabletFirst = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
+  await send(makeSnapshot(slotSpec({ gruWakeAgeMs: 300_000, children: { active: 7, queued: 1, finished: 9, lifetimeCreations: 30 } })));
+  await expect(children.locator('[data-kpi="children.active"]')).toHaveText('7');
+  const tabletNext = await geometry(page, { expectedKpis: 17, expectedGroups: 4 });
+  comparePairwise(tabletFirst, tabletNext);
+
   // The extra group wraps honestly: no body or rail overflow at phone width.
   await page.setViewportSize({ width: 360, height: 800 });
   const overflow = await page.evaluate(

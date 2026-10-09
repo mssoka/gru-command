@@ -611,15 +611,15 @@ binned-baseline = 'set -e; base=84aec28b04ddc406f26c458383452318f8cb7ed1; headre
 
 # Scheduler-only browser proof for the slim-strip synthetic suite (job
 # dashboard-slim-strip-current-main-20261007): the scheduler's cwd is the
-# LANE ROOT, where no Playwright config exists — the mock project, its safe
-# ports, and the vite preview that serves web/dist live in
-# web/playwright.config.ts. So run the EXISTING web workspace e2e script
-# from web/: it builds the web artifacts (npm run build inside web/) and
-# invokes Playwright with the web config selected, filtered to ONLY the
-# isolated mock project's dashboard-strip spec (scripted auth/board
-# fixtures; the real service scope is untouched; reuseExistingServer:false;
-# workers 1 / retries 0 / default 30s). Union scope — every scope above
-# stays as-is.
+# LANE ROOT, where no Playwright config exists — the dedicated `strip`
+# project, its safe ports, and the vite preview that serves web/dist live
+# in web/playwright.config.ts (the shared `mock` roster stays at the base
+# smoke/working-flavor pair). Run the EXISTING web workspace e2e script from
+# web/: it builds the web artifacts and invokes Playwright with the web
+# config selected, filtered to ONLY the strip project's dashboard-strip spec
+# (scripted auth/board fixtures; the real service scope is untouched;
+# reuseExistingServer:false; workers 1 / retries 0 / default 30s). Union
+# scope — every scope above stays as-is.
 strip-browser = "(cd web && npm run e2e -- --project=strip e2e/dashboard-strip.spec.ts)"
 
 # Focused smoke migration proof (this lane edits web/e2e/smoke.spec.ts: the
@@ -645,12 +645,14 @@ strip-themes-update = "cd web && node ../node_modules/typescript/bin/tsc --noEmi
 # must pass against the committed PNGs at the exact head.
 strip-themes = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --grep 'dark toggle persists'"
 
-# Focused iteration/debug subset for this lane's FINAL source: the three web
-# unit files that carry the slim-strip regressions, run against the
-# committed head in the lane's own web workspace with the same vitest bin
-# form as the baseline scope. The `full` scope still covers the whole suite;
-# this only narrows a scheduled debug/iteration run so failures are diagnosed
-# against complete, scheduler-captured output instead of an ad-hoc rerun.
+# Focused iteration/debug subset for this lane's FINAL source: the four web
+# unit files that carry the slim-strip regressions (board.test.ts,
+# board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts), run
+# against the committed head in the lane's own web workspace with the same
+# vitest bin form as the baseline scope. The `full` scope still covers the
+# whole suite; this only narrows a scheduled debug/iteration run so failures
+# are diagnosed against complete, scheduler-captured output instead of an
+# ad-hoc rerun.
 dashboard-slim-strip-unit = "cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts src/ui/slim-strip.baseline.test.ts"
 
 # Baseline exit semantics (both slim-strip baselines), R3-05 resolution:
@@ -674,7 +676,7 @@ dashboard-slim-strip-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf13
 # playwright config (git show from the exact head) over the same isolated
 # baseline snapshot of the recorded current-main base, with web+root deps
 # bound by symlink; builds the BASELINE web app (tsc + vite from the
-# archived tree) and runs ONLY the mock project's dashboard-strip spec with
+# archived tree) and runs ONLY the strip project's dashboard-strip spec with
 # the unchanged serial/retry/30s settings. Expected result is RED by
 # behavioral assertion: the spec's harness asserts the slim-strip DOM the
 # baseline app never renders. Exit status left intact for the scheduler's

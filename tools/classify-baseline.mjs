@@ -61,7 +61,10 @@ function classifyPlaywright(report, substrs) {
       if (spec.ok === false || (spec.tests ?? []).some((t) => t.status === 'unexpected')) {
         const bad = (spec.tests ?? [])
           .flatMap((t) => t.results ?? [])
-          .find((r) => r.status === 'failed' || r.status === 'unexpected');
+          // Playwright result statuses: passed/failed/timedOut/interrupted/
+          // skipped. A test-level timeout carries the locator in its message,
+          // so it must be read, not silently mapped to an empty string.
+          .find((r) => r.status === 'failed' || r.status === 'timedOut' || r.status === 'interrupted' || r.status === 'unexpected');
         const message =
           (bad?.error?.message ?? '') + '\n' + String(bad?.errors?.map((e) => e.message).join('\n') ?? '');
         results.push({ title: spec.title ?? spec.file ?? 'unknown', message });
@@ -156,7 +159,12 @@ function classifyVitest(report, requireFile) {
       return { code: 3, out: '', err: `BASELINE SETUP FAILURE: instrument file not in report: ${requireFile}` };
     }
     const instrumentAssertions = instrument.assertionResults ?? [];
-    if (instrumentAssertions.length === 0 || !instrumentAssertions.every((a) => a.status === 'failed')) {
+    if (instrumentAssertions.length === 0) {
+      // The suite is in the report but registered no tests: a collection
+      // fault, never a claim that the baseline passed.
+      return { code: 3, out: '', err: `BASELINE SETUP/COLLECTION FAILURE: instrument ${requireFile} registered no tests — not behavioral evidence` };
+    }
+    if (!instrumentAssertions.every((a) => a.status === 'failed')) {
       return { code: 2, out: '', err: 'FAILS-BEFORE CLAIM BROKEN: the instrument file has passing/non-failed tests on the base' };
     }
     const nonAssertion = instrumentAssertions.filter(
@@ -172,6 +180,15 @@ function classifyVitest(report, requireFile) {
         err: `BASELINE SETUP FAILURE: ${nonAssertion.length} instrument failure(s) are not AssertionErrors — not behavioral evidence\n${lines}`,
       };
     }
+  }
+  if (assertions === 0) {
+    // No named instrument and not one assertion failure: whatever failed is
+    // unclassified (runtime/setup), never behavioral RED.
+    return {
+      code: 3,
+      out: '',
+      err: `BASELINE SETUP FAILURE: ${failed} failure(s) but none is an AssertionError and no --require-file instrument identifies the cause — not behavioral evidence`,
+    };
   }
   return {
     code: 1,

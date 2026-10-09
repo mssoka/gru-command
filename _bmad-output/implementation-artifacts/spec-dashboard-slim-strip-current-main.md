@@ -79,7 +79,7 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 - [x] `web/src/ui/board.test.ts`, `web/src/lib/board-rail.test.ts`, `web/src/lib/owner-band.test.ts` — re-face existing rail assertions, append the lane's deterministic regressions.
 - [x] `web/e2e/dashboard-strip.spec.ts` — port the synthetic suite; extend silas fixtures to main's protocol; add CHILDREN present/absent and deferred-wakes cases; keep 1440/1200/768/360 × light/dark captures.
 - [x] `web/e2e/smoke.spec.ts`, `web/playwright.config.ts` — selector migration + mock testMatch union.
-- [x] `.gru-command/worktree.toml`, `.gitignore` — union scopes (`strip-browser`, `dashboard-slim-strip-unit`, `dashboard-slim-strip-baseline` base-pinned, `strip-browser-baseline` base-pinned) + `web/e2e-artifacts/`.
+- [x] `.gru-command/worktree.toml`, `.gitignore` — union scopes (`strip-browser`, `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts), `dashboard-slim-strip-baseline` base-pinned, `strip-browser-baseline` base-pinned) + `web/e2e-artifacts/`.
 - [ ] Commit, then built-in independent whole-change review via `POST /api/dispatch` (`deliverable: review`) on the exact head; fix findings; re-verify.
 
 **Acceptance Criteria:**
@@ -95,7 +95,7 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 - Merges recorded: wakes chip = lane count/age split + main #219 deferred (count/reasons/truncated), number rendered once on the ALERTS pair with the tracker chip hidden but text/title-complete; silas splits re-derived for main's #163 headline branches (pass failed / turn open / reconciled / wake / no wakes yet) with `FAILED` as pure text (no numeric part); CHILDREN preserved as an additional group only when the server reported counters; Binned KPI preserved; bell panel keeps its prior PR presentation via `ownerPrRow(row, 'panel')`; all six sections/previews/cold-binned behavior untouched.
 - e2e suite refreshed for the current-main protocol: complete SilasView fixtures (no `undefined !== null` branches), 13 data-kpi slots (binned added), CHILDREN present/absent and deferred-wake cases added, reserved-slot geometry kept at 1440/1200/768/360 ± themes.
 - Verification scopes unioned in `.gru-command/worktree.toml`; both baselines pin `49b558f…` (the recorded execution base), not the obsolete 84aec28 planning pin.
-- 2026-10-07 verification round at head `a8847055e3d0c11eddb282458e67c7e6b88a359a` (all through the authenticated scheduler + shipped capture helper; complete NDJSON sinks + receipts under `_bmad-output/verify-captures/current-main-20261007/`): `dashboard-slim-strip-unit` GREEN run 73255daf (137/137); `strip-browser` GREEN run 5d3bc3d2 (67/67, captures inspected at 1440/1200/768/360 light+dark); `dashboard-slim-strip-baseline` RED run e7bf5e64 (23 assertion-level feature-absence failures + 1 missing-export TypeError inside a test for the new `ackNextStep` import; no collection/suite-level error); `strip-browser-baseline` RED run 6bda4166 (67/67 fail on the missing strip DOM, baseline app builds); `typecheck` GREEN run 4cbd19a1; `full` GREEN run 19589690 (lint/typecheck/build + backend 2291 passed + heavy 925 passed + web 537 passed, exit 0). Independent whole-change review is commissioned via `POST /api/dispatch` (`deliverable: review`, three lenses) at this exact head as part of this round.
+- 2026-10-07 verification round at head `a8847055e3d0c11eddb282458e67c7e6b88a359a` (all through the authenticated scheduler + shipped capture helper; complete NDJSON sinks + receipts under `_bmad-output/verify-captures/current-main-20261007/`): `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts) GREEN run 73255daf (137/137); `strip-browser` GREEN run 5d3bc3d2 (67/67, captures inspected at 1440/1200/768/360 light+dark); `dashboard-slim-strip-baseline` RED run e7bf5e64 (23 assertion-level feature-absence failures + 1 missing-export TypeError inside a test for the new `ackNextStep` import; no collection/suite-level error); `strip-browser-baseline` RED run 6bda4166 (67/67 fail on the missing strip DOM, baseline app builds); `typecheck` GREEN run 4cbd19a1; `full` GREEN run 19589690 (lint/typecheck/build + backend 2291 passed + heavy 925 passed + web 537 passed, exit 0). Independent whole-change review is commissioned via `POST /api/dispatch` (`deliverable: review`, three lenses) at this exact head as part of this round.
 ## Spec Change Log
 
 ## Review Triage Log
@@ -123,7 +123,7 @@ Round 1 (whole-change, three tracked lenses) reviewed `6e48023cfba4eade8130548cd
 
 Named checks (not findings): the two baselines overlay final test bytes on base `49b558f` and leave exits unmasked — both RED by feature absence (23 assertion-level failures + 1 missing-export TypeError inside a test; recorded as the honest consequence of the feature's absence, matching the original lane's accepted baseline shape). Dark-theme geometry runs light-only in the boundary loop; the dark coverage is the contrast assertions plus the inspected dark captures at all four widths.
 
-Round-1 resolution: all patch entries landed in commits `b030831` (main fixes + test hardening), `e5ae13e` (A1 probe zero-reservation), `64ab947` (real theme golden refresh for the CHILDREN separator fix, inspected). Re-verification at the fix head `64ab947`: `dashboard-slim-strip-unit` GREEN 137 (run 803e9f62); `strip-browser` GREEN 67 (run 041a281b); `strip-smoke` GREEN (run f9e4f0bf); `strip-themes` GREEN (run 734295fb); `dashboard-slim-strip-baseline` RED (run f5976535); `strip-browser-baseline` RED (run a0cf1b64); `typecheck` GREEN (run 371b6da9); `full` GREEN (run 3f23f291). Round-2 whole-change review commissioned at `ddc42e4`; its blocking scope was the fix delta `6e48023..ddc42e4` (untouched-code findings reported as follow-ups).
+Round-1 resolution: all patch entries landed in commits `b030831` (main fixes + test hardening), `e5ae13e` (A1 probe zero-reservation), `64ab947` (real theme golden refresh for the CHILDREN separator fix, inspected). Re-verification at the fix head `64ab947`: `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts) GREEN 137 (run 803e9f62); `strip-browser` GREEN 67 (run 041a281b); `strip-smoke` GREEN (run f9e4f0bf); `strip-themes` GREEN (run 734295fb); `dashboard-slim-strip-baseline` RED (run f5976535); `strip-browser-baseline` RED (run a0cf1b64); `typecheck` GREEN (run 371b6da9); `full` GREEN (run 3f23f291). Round-2 whole-change review commissioned at `ddc42e4`; its blocking scope was the fix delta `6e48023..ddc42e4` (untouched-code findings reported as follow-ups).
 
 Round 2 reviewed `ddc42e431347443411158aeff50b8f9070c76f9d` (blind-hunter 13: 5 blocking + 8 follow-ups; edge-case 4: 3 blocking + 1 follow-up; verification-gap 6: 3 blocking + 3 follow-ups; plus other observations). Blocking entries were all patch; the cheap follow-ups were folded into the same batch; two breadth items are deferred (deferred-work.md).
 
@@ -202,7 +202,7 @@ Reviewed `e740d96` (blind-hunter 10, edge-case 5, verification-gap 2 + 3 observa
 | VG-2 | Smoke wake content presence-only at the mock boundary | follow-up | recorded |
 
 Exact-head receipts at `e740d96` (all through the authenticated scheduler + shipped capture helper; complete sinks under `_bmad-output/verify-captures/current-main-20261007/`):
-- `dashboard-slim-strip-unit` GREEN 142/142 (run `db137674-9456-45d6-8533-2affb477d1dd`)
+- `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts) GREEN 142/142 (run `db137674-9456-45d6-8533-2affb477d1dd`)
 - `strip-browser` GREEN 67/67 (run `f0ef8869-e700-4382-a6d3-d0056cba3f47`) — screenshots inspected
 - `strip-smoke` GREEN (run `36b79ea1-69d4-4c25-b848-069cf7d99f59`)
 - `strip-themes` GREEN (run `a9ac6aae-7323-4c91-91cd-d66287a9ea7f`)
@@ -286,7 +286,7 @@ honesty, strip styles.
 | Scope | Run | Outcome |
 |---|---|---|
 | `lesson-proposal-browser` | `eedf4c08` | GREEN |
-| `dashboard-slim-strip-unit` | `043cf1cb` | GREEN 142/142 |
+| `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts) | `043cf1cb` | GREEN 142/142 |
 | `strip-browser` | `61201a9d` | GREEN 67/67 |
 | `strip-smoke` | `49263282` | GREEN |
 | `strip-themes` | `b5afe48f` | GREEN |
@@ -299,7 +299,7 @@ honesty, strip styles.
 
 | Scope | Run | Outcome |
 |---|---|---|
-| `dashboard-slim-strip-unit` | `c48c1937` | GREEN 142/142 |
+| `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts) | `c48c1937` | GREEN 142/142 |
 | `strip-browser` | `f0ef8869` | GREEN 67/67 |
 | `strip-smoke` | `47a12ba7` | GREEN |
 | `strip-themes` | `78ee53f2` | GREEN |
@@ -356,7 +356,7 @@ PR #256 was `mergeable_state: dirty` against main `4cc8a83d…` (then `72c73c10�
 | R2-2 | Proposal error text fails light-theme contrast (1.57:1 vs required 4.5:1) | high | **Fixed** at `4ab3e7b`: `.board-owner__error` uses `color: var(--ink)` (12.26:1 light / high dark) + `border-left: 3px solid var(--alert)` for visual alert semantics |
 
 ### Correction-cycle receipts at `cb6adbc` (strict oracle; complete captures)
-- `dashboard-slim-strip-unit` GREEN 142/142 (run `cd27a125-b611-423a-b13d-449fea7004ba`, 11 frames).
+- `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts) GREEN 142/142 (run `cd27a125-b611-423a-b13d-449fea7004ba`, 11 frames).
 - `strip-browser` GREEN 67/67 (run `f83ab022-8c69-4783-bc4e-a342bd1065f2`, 85 frames) — the eight final-head screenshots at 1440/1200/768/360 × light/dark were re-inspected at this head.
 - `strip-smoke` GREEN (run `a9a0eadb-7fc4-4b73-bbd9-7a86077e581f`, 56 frames).
 - `strip-themes` GREEN (run `365626c4-5c09-4f83-b22e-0d04f00003dc`, 16 frames).
@@ -378,9 +378,9 @@ PR #256 was `mergeable_state: dirty` against main `4cc8a83d…` (then `72c73c10�
 
 ## Verification
 
-**Commands (through authenticated `/api/verify` + shipped capture helper; the union this lane added is seven scopes: `strip-browser`, `strip-smoke`, `strip-themes`, `strip-themes-update`, `dashboard-slim-strip-unit`, `dashboard-slim-strip-baseline`, `strip-browser-baseline` — the latter two pinned to base `49b558f…` and expected RED):**
-- `dashboard-slim-strip-unit` — `cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts`; expected GREEN.
-- `strip-browser` — `(cd web && npm run e2e -- --project=mock e2e/dashboard-strip.spec.ts)`; expected GREEN; retain + inspect 1440/1200/768/360 light/dark captures.
+**Commands (through authenticated `/api/verify` + shipped capture helper; the union this lane added is seven scopes: `strip-browser`, `strip-smoke`, `strip-themes`, `strip-themes-update`, `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts), `dashboard-slim-strip-baseline`, `strip-browser-baseline` — the latter two pinned to base `49b558f…` and expected RED):**
+- `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts) — `cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts`; expected GREEN.
+- `strip-browser` — `(cd web && npm run e2e -- --project=strip e2e/dashboard-strip.spec.ts)`; expected GREEN; retain + inspect 1440/1200/768/360 light/dark captures.
 - `strip-smoke` — `(mock smoke suite)`; expected GREEN (migrated main assertions).
 - `strip-themes` — `(mock + real "dark toggle persists" goldens, no update flag)`; expected GREEN; `strip-themes-update` is the deliberate, inspected regeneration scope (never cited as acceptance).
 - `pipeline-board-browser` — the existing main scope; expected GREEN. Its oracle is STRICT full-viewport containment plus the independent strict hit/occlusion check (amendment #2); the measured two-sided nav/rail alignment invariant replaces the stale fixed bound; the interaction path uses deterministic reachability placement (`scrollFullyIntoView`: browser minimal placement plus bounded edge/occlusion corrections), never an off-viewport admission.

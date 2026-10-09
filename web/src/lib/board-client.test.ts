@@ -252,6 +252,36 @@ describe('board client', () => {
     }
   });
 
+  it('a POST whose HEADERS arrive but whose BODY never finishes is abandoned at the same deadline (R3-03)', async () => {
+    // The GET path pins this shape (hang()); the POST must not be weaker: a
+    // stalled body would otherwise leave the owner action pending forever.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const fetchImpl = vi.fn(
+        (_path: string, options?: RequestInit) =>
+          Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+              new Promise((_resolve, reject) => {
+                options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+              }),
+          } as unknown as Response),
+      ) as unknown as typeof fetch;
+      client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      const posting = client.ackNotification('n1');
+      const rejection = expect(posting).rejects.toThrow(/no answer before the deadline/u);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await rejection;
+      expect(vi.mocked(fetchImpl)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stop() halts reconnects', async () => {
     client = make({});
     client.connect();

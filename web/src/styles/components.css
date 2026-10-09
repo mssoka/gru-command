@@ -286,7 +286,10 @@ body {
 }
 
 /* The honest em-dash fallback hides the slot outright: an inline-block
-   display beats the UA [hidden] rule, so state it explicitly. */
+   display beats the UA [hidden] rule, so state it explicitly on every
+   surface that applies .num (the strip's age split is the one that
+   actually hides). */
+#chip-rail .num[hidden],
 #board-owner .num[hidden] {
   display: none;
 }
@@ -2127,6 +2130,14 @@ body {
   .board-owner__row > .board-owner__disclose {
     justify-self: start;
   }
+}
+
+/* The band head is a focus target of last resort (the empty/settled-row
+   fallback): focus that a keyboard operator cannot see is not focus. */
+.board-band__head:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
+  border-radius: 6px;
 }
 
 .board-band__more:hover {

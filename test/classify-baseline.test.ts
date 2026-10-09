@@ -119,6 +119,30 @@ describe('baseline classifier — vitest (unit) branch', () => {
     const result = classifyBaseline(vitestReport(instrument), { requireFile: 'other.baseline.test.ts' });
     expect(result.code).toBe(3);
   });
+
+  it('exits 3 when the instrument suite registered no tests (collection fault, not a broken claim)', () => {
+    // Another suite registers a test, so the run is not globally empty — the
+    // instrument itself is the empty one.
+    const empty = classifyBaseline(
+      vitestReport([
+        { name: 'board.test.ts', status: 'failed', message: '', assertionResults: [assertion('x', 'failed', ['AssertionError: nope'])] },
+        { name: 'slim-strip.baseline.test.ts', status: 'failed', message: '', assertionResults: [] },
+      ]),
+      { requireFile: 'slim-strip.baseline.test.ts' },
+    );
+    expect(empty.code).toBe(3);
+    expect(empty.err).toMatch(/registered no tests/u);
+  });
+
+  it('exits 3 without --require-file when nothing failed by assertion (RED must stay identified)', () => {
+    const result = classifyBaseline(
+      vitestReport([{ name: 'x.test.ts', status: 'failed', message: '', assertionResults: [
+        assertion('renders', 'failed', ["TypeError: Cannot read properties of null (reading 'click')"]),
+      ] }]),
+    );
+    expect(result.code).toBe(3);
+    expect(result.err).toMatch(/none is an AssertionError/u);
+  });
 });
 
 describe('baseline classifier — Playwright (browser) branch', () => {
@@ -146,6 +170,19 @@ describe('baseline classifier — Playwright (browser) branch', () => {
     );
     expect(result.code).toBe(3);
     expect(result.err).toMatch(/name NO slim surface/u);
+  });
+
+  it('reads a timedOut/unexpected result message instead of mapping it to an empty string', () => {
+    const report = {
+      stats: { expected: 0, unexpected: 1, skipped: 0, flaky: 0 },
+      suites: [
+        { specs: [{ title: 'rail', ok: false, tests: [{ status: 'unexpected', results: [
+          { status: 'timedOut', error: { message: "locator('.strip-groups') timeout" } },
+        ] }] }] },
+      ],
+    };
+    const result = classifyBaseline(report, { playwright: true, substrs: ['strip-groups'] });
+    expect(result.code).toBe(1);
   });
 
   it('exits 3 when none match, and 2 when nothing failed', () => {

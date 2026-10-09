@@ -490,20 +490,25 @@ export class BoardClient {
     });
     const timer = setTimeout(() => request.abort(), SNAPSHOT_DEADLINE_MS);
     try {
-      const res = await Promise.race([
-        doFetch(path, {
-          method: 'POST',
-          headers: {
-            authorization: `Bearer ${this.options.token}`,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify(body),
-          signal: request.signal,
-        }),
+      // The deadline covers the FETCH and the BODY: a reply whose headers
+      // arrive and whose body stalls is the same unconfirmed outcome as no
+      // reply at all, and surfaces the same typed timeout.
+      return await Promise.race([
+        (async () => {
+          const res = await doFetch(path, {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${this.options.token}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify(body),
+            signal: request.signal,
+          });
+          if (!res.ok) return this.refused(path, res);
+          return await res.json();
+        })(),
         expired,
       ]);
-      if (!res.ok) return this.refused(path, res);
-      return res.json();
     } finally {
       clearTimeout(timer);
     }
