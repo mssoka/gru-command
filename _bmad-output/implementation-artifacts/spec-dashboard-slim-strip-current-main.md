@@ -295,6 +295,29 @@ honesty, strip styles.
 | `megaminions-browser` | `c83e144f` | GREEN |
 | `full` | `f91bca9d` | GREEN |
 
+### v7 workflow review rounds (owner amendment #7 scope-restoration candidate)
+
+Three workflow-owned, parent-linked, read-only review rounds were commissioned
+through `POST /api/dispatch` (`deliverable: review`, `parent_job_id`
+`dashboard-slim-strip-current-main-20261007`, `target_ref` PR #256, the pinned
+rubric artifact under `captures/gru-slim-review-rubric-20261009/` with its
+sha256 named in each tracked brief):
+
+| Round | Candidate | Lenses / outcome | Disposition |
+|---|---|---|---|
+| 1 | `76912bd9` | blind-hunter 15 findings; edge-case 1 finding; verification-gap 2 findings | all findings triaged; fixed in `24a8c55` (lint + classifier test + bounded-POST proof + project split + docs) |
+| 2 | `4e36d73` | blind-hunter 12; verification-gap 0 gaps + 2 observations; edge-case swept without a report (not coverage) | fixed in `24a8ad5` (body-race deadline, `.num[hidden]` scope, classifier timedOut/empty-instrument/no-instrument branches + 3 pinned tests, band-head focus ring, CHILDREN identity + 768 container-transition coverage, widened contrast targets, acceptance-record sync) |
+| 3 | `24a8ad5` | concluding whole-change pass (three lenses) | this round's findings are triaged against the convergence rule |
+
+A restart-disposed round-0 blind-hunter session left partial investigation
+leads (preserved); the substantive ones (dead `clientGeneration`/`jobSignals`,
+dead `BoardApiError` import, dead `postApiWithStatus` status, family-map
+drift) were assessed by the parent and fixed as ordinary engineering — they
+are leads, not a delivered report. A round-0 edge-case report was dismissed
+as "review not performed" (its brief referenced a rubric path that did not
+exist in the reviewer's tree); its replacement is the round-1 edge-case
+report above.
+
 ### Post-R2-fix exact-head receipts at `4ab3e7b`
 
 | Scope | Run | Outcome |
