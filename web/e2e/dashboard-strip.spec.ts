@@ -1278,6 +1278,10 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
         cureValue: '.strip-pair[data-chip="cure"] .strip-value__num',
         ownerTitle: '.board-owner__title',
         ownerNext: '.board-owner__next',
+        // The bold "Next step:" label is measured in BOTH themes: the dark
+        // capture shows it as the row's least legible text.
+        ownerNextLabel: '.board-owner__next-label',
+        ownerConsequence: '.board-owner__detail-text',
         detailMeta: '.board-owner__detail-meta',
         detailNotice: '.board-owner__detail-notice',
         bandCount: '.board-band__count',
