@@ -10,6 +10,7 @@ import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { Role } from '../src/config.js';
 import type { DecisionRuntimeStatus } from '../src/decisions/runtime.js';
+import type { RepoOverviewView } from '../src/repos/overview.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1058,5 +1059,35 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
       db.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('board engine — managed repository overview wiring', () => {
+  it('carries the late-bound repository overview view additively and defaults to null when unwired', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-repo-overview-'));
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    try {
+      const view: RepoOverviewView = { rows: [] };
+      const wired = new BoardEngine({ ledger, bus, repoOverview: () => view });
+      expect(wired.snapshot().repoOverview).toEqual(view);
+      const unwired = new BoardEngine({ ledger, bus });
+      expect(unwired.snapshot().repoOverview).toBeNull();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the main assembly binds, starts and stops the managed repository overview tracker (assembly alarm)', () => {
+    // The same source-drift alarm shape as the supervisor-stop binding: the
+    // engine unit tests inject their own producer, so dropping the
+    // production tracker stayed green without this pin.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(/new ManagedRepoOverviewTracker\(\{[\s\S]*?workspaceRoot:\s*config\.workspaceRoot/);
+    expect(mainSource).toMatch(/repoOverview:\s*\(\)\s*=>\s*repoOverview\.view\(\)/);
+    expect(mainSource).toMatch(/repoOverview\.start\(\)/);
+    expect(mainSource).toMatch(/state\.repoOverview\?\.stop\(\)/);
   });
 });

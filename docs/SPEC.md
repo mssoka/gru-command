@@ -80,25 +80,32 @@ integrated. Other users can install it on their laptops from GitHub.
 
 17. **Per-project bmad/skills (`.agents/skills` + `_bmad` folders) —
     never at the workspace root.** Every managed repo carries its own
-    `.agents/skills` + `_bmad` folders; the workspace root carries
-    neither (it holds managed repos only — rulings 6/8). The setup
-    wizard scaffolds the folders when missing, or warns-and-proceeds
-    for repos that opt out. Skills discovery follows the PROJECT cwd:
-    the dispatch flow roots minions in the repo they serve, and they
-    find that repo's bmad natively — spawn options carry the repo
-    root. The global agent-dir keeps generic skills unchanged; a
-    project-local skill of the same name shadows the global one.
-    Per-project `bmad-customize` overrides become possible per repo.
-    Fresh worktrees check out tracked files only; discovery inside a
-    worktree resolves via the worktree manager's bootstrap manifest
-    (ruling 18: symlinks/copies), or the folders are tracked by the
-    repo — discovery never falls back to the workspace root. The chat
-    Gru (spawned at the workspace root) discovers the global agent-dir
-    only, by design. This supersedes any workspace-root
-    skills-discovery assumption in the dispatch flow (E8+): all
-    runtime adapters' dispatch cwd is the PROJECT root, never the
-    workspace root.
-
+    project skills (`.agents/skills`) and BMAD project state (`_bmad`:
+    settings in `_bmad/custom/`, a self-ignoring `_bmad/render/`) plus its
+    generated work (`_bmad-output/`); the workspace root carries neither
+    (it holds managed repos only — rulings 6/8). The BMAD *framework* is
+    not per-project (amended by issue #283): Gru Command ships a pinned
+    GC-managed BMAD runtime (`resources/bmad-runtime/`, upstream files
+    unchanged plus a small GC customization layer) and the setup wizard
+    provisions only the missing project state, never a repo-local
+    framework install. Skills discovery follows the PROJECT cwd: the
+    dispatch flow roots minions in the repo they serve, and they find
+    that repo's skills natively — spawn options carry the repo root —
+    while the build-workflow role also receives the runtime bound to its
+    job lane (recorded in the lane's git dir, so a GC update never
+    switches a running job), which wins a same-name collision. The global
+    agent-dir keeps generic skills unchanged; a project-local skill of
+    the same name shadows the global one. Per-project customization lives
+    in `_bmad/custom/` (precedence: GC defaults, then the project's team,
+    then personal layers — docs/BMAD-RUNTIME.md). Fresh worktrees check
+    out tracked files only; project skills inside a worktree resolve via
+    the worktree manager's bootstrap manifest (ruling 18: symlinks/
+    copies), or the folders are tracked by the repo — discovery never
+    falls back to the workspace root. The chat Gru (spawned at the
+    workspace root) discovers the global agent-dir only, by design. This
+    supersedes any workspace-root skills-discovery assumption in the
+    dispatch flow (E8+): all runtime adapters' dispatch cwd is the
+    PROJECT root, never the workspace root.
 18. **Worktree manager:** the product's dispatch flow manages worktrees
     as a first-class subsystem. (a) **Bootstrap manifest** — each
     project repo declares its fresh-worktree needs in-repo at

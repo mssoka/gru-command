@@ -114,6 +114,26 @@ export interface IsolatedReviewPolicy {
   readonly nativeTools?: readonly NativeAgentTool[];
 }
 
+/**
+ * Skills Gru Command supplies to a session from a bound, read-only runtime
+ * directory (issue #283: the GC-managed BMAD runtime). The session keeps its
+ * project cwd; these skills are added beside the project's own and win a
+ * name collision, so the job runs exactly the runtime it is bound to.
+ */
+export interface ManagedSkillSet {
+  /** Provenance label; Claude Code namespaces the skills under it. */
+  readonly source: string;
+  readonly runtimeId: string;
+  readonly contentSha256: string;
+  /** Runtime root (Claude Code loads it as a plugin directory). */
+  readonly root: string;
+  /** `<root>/skills` — one directory per skill. */
+  readonly skillsDir: string;
+  readonly skills: readonly string[];
+  /** True when the binding is recorded for the job lane (survives GC updates). */
+  readonly laneBound: boolean;
+}
+
 /** Options for spawn(). */
 export interface SpawnOptions {
   /** Cancel a queued resident admission without starting an adapter spawn. */
@@ -184,6 +204,14 @@ export interface SpawnOptions {
   readonly reviewLead?: IsolatedReviewPolicy & {
     readonly nativeTools: readonly NativeAgentTool[];
   };
+  /**
+   * Skills the product supplies from a bound, read-only runtime directory
+   * (issue #283: the GC-managed BMAD runtime of the job lane). The registry
+   * fills this for roles that run BMAD build workflows; adapters add the
+   * skills beside the project's own (winning a name collision) and name
+   * the binding in the system prompt. Never applied to review sessions.
+   */
+  readonly managedSkills?: ManagedSkillSet;
 }
 
 /**

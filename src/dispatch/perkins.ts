@@ -3604,7 +3604,7 @@ export class WaveRunner {
       const note = gate === undefined
         ? 'the bmad-review fallback gate is not configured on this service'
         : `the bmad-review skill is not installed at ${gate.skillPath}`;
-      const guidance = `Options: (1) install the BMAD review skill via onboarding; (2) restore the Perkins gate — ${failedLegs.map((leg) => leg.remediation).join(' ')}`;
+      const guidance = `Options: (1) install the bmad-review skill into ~/.agents/skills or the pi agent skills directory (the GC-managed BMAD runtime bundles only the build workflow); (2) restore the Perkins gate — ${failedLegs.map((leg) => leg.remediation).join(' ')}`;
       const message = `${note} ${guidance}`;
       this.opts.ledger.appendCustomEvent({
         kind: 'job.fallback-review',

@@ -793,6 +793,56 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('a lane-bound managed BMAD runtime loads ahead of a same-named skill and is named in the prompt; reviews never get it', async () => {
+    const fx = await fixture();
+    // A global (user) bmad-build would win pi's first-loaded-wins rule.
+    mkdirSync(join(fx.agentDir, 'skills', 'bmad-build'), { recursive: true });
+    writeFileSync(join(fx.agentDir, 'skills', 'bmad-build', 'SKILL.md'), '---\nname: bmad-build\ndescription: stale global copy\n---\nSTALE', 'utf8');
+    mkdirSync(join(fx.agentDir, 'skills', 'unrelated'), { recursive: true });
+    writeFileSync(join(fx.agentDir, 'skills', 'unrelated', 'SKILL.md'), '---\nname: unrelated\ndescription: kept\n---\nKEPT', 'utf8');
+    const runtimeRoot = mkdtempSync(join(tmpdir(), 'gru-command-managed-'));
+    cleanupDirs.push(runtimeRoot);
+    mkdirSync(join(runtimeRoot, 'skills', 'bmad-build'), { recursive: true });
+    writeFileSync(join(runtimeRoot, 'skills', 'bmad-build', 'SKILL.md'), '---\nname: bmad-build\ndescription: bound runtime copy\n---\nBOUND', 'utf8');
+    const managedSkills = {
+      source: 'gru-command-bmad',
+      runtimeId: 'bmad-method@6.12.0+gru-command-bmad.1',
+      contentSha256: 'a'.repeat(64),
+      root: runtimeRoot,
+      skillsDir: join(runtimeRoot, 'skills'),
+      skills: ['bmad-build'],
+      laneBound: true,
+    };
+    type Loader = { getSkills(): { skills: Array<{ name: string; filePath: string }> }; getSystemPrompt(): string | undefined };
+    const handle = await fx.runtime.spawn('minion', { cwd: fx.workspace, managedSkills });
+    try {
+      const loader = (twinGate.lastOptions as { resourceLoader: Loader }).resourceLoader;
+      const skills = loader.getSkills().skills;
+      expect(skills.filter((skill) => skill.name === 'bmad-build').map((skill) => skill.filePath))
+        .toEqual([join(runtimeRoot, 'skills', 'bmad-build', 'SKILL.md')]);
+      expect(skills.map((skill) => skill.name)).toContain('unrelated');
+      const prompt = loader.getSystemPrompt() ?? '';
+      expect(prompt).toContain('## Gru Command BMAD runtime');
+      expect(prompt).toContain('`bmad-method@6.12.0+gru-command-bmad.1`');
+      expect(prompt).toContain(runtimeRoot);
+      expect(prompt).toContain('does not change when Gru Command is updated');
+    } finally {
+      await handle.dispose();
+    }
+    const review = await fx.runtime.spawn('perkins', {
+      cwd: fx.workspace,
+      managedSkills,
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [] },
+    });
+    try {
+      const loader = (twinGate.lastOptions as { resourceLoader: Loader }).resourceLoader;
+      expect(loader.getSkills().skills).toEqual([]);
+      expect(loader.getSystemPrompt()).toBe('isolated policy');
+    } finally {
+      await review.dispose();
+    }
+  });
+
   it('enforces isolated-review tools and strips ambient Pi resources', async () => {
     const fx = await fixture();
     writeFileSync(join(fx.workspace, 'AGENTS.md'), 'PROJECT-CONTEXT-CANARY', 'utf8');

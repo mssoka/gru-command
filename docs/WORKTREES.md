@@ -12,8 +12,8 @@ Each project repo declares its fresh-worktree needs in-repo at
 
 ```toml
 [[link]]                 # symlink created in the fresh worktree
-at = "_bmad"             #   worktree-relative (no ..)
-to = "_bmad"             #   target: repo-root-relative (.. allowed) or absolute
+at = "fixtures/large"    #   worktree-relative (no ..)
+to = "fixtures/large"    #   target: repo-root-relative (.. allowed) or absolute
 
 [[copy]]                 # file copied from the source checkout
 from = ".env.local"      #   repo-root-relative (no ..)
@@ -30,6 +30,12 @@ quick = "npm run lint"
 A missing manifest is a no-op; a malformed one fails loud and rolls the
 worktree back **all the way** (worktree AND the branch the failed call
 created — a leftover `gru/<job>` would wedge the job id forever).
+
+BMAD needs no manifest entry (issue #283): a lane receives the GC-managed
+BMAD runtime when its first minion spawns, and the project's BMAD settings
+travel with the tracked `_bmad/custom/` files. Do not `[[link]]` `_bmad`
+into a lane — rendered workflow snapshots must stay inside the worktree,
+and the runtime refuses a linked `_bmad` ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)).
 
 ## 2. Registry (18b)
 

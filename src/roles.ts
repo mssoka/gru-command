@@ -21,10 +21,16 @@ export interface RoleDefinition {
   /**
    * Skill names the role is trained on (runtime-agnostic ids). They are
    * NOT injected by this service — skills resolve from the PROJECT's own
-   * skills/bmad folders at spawn (SPEC ruling 17: project knowledge
-   * travels with the project, discovered from the session cwd).
+   * skills folders at spawn (SPEC ruling 17: project knowledge travels
+   * with the project, discovered from the session cwd).
    */
   readonly skills: readonly string[];
+  /**
+   * The role runs BMAD build workflows (issue #283): its non-review
+   * sessions also receive the GC-managed BMAD runtime bound to their cwd
+   * (the job lane), beside the project's own skills.
+   */
+  readonly managedBmadRuntime: boolean;
   /**
    * Working-directory policy (SPEC ruling 17): 'workspace_root' hosts at
    * the workspace root (the chat Gru, ops, memory); 'spawn_provided'
@@ -70,6 +76,7 @@ export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
     systemPrompt: loadRoleSystemPrompt('gru'),
     tools: ['read', 'bash', 'grep', 'find', 'ls'],
     skills: [],
+    managedBmadRuntime: false,
     cwd: 'workspace_root',
   },
   silas: {
@@ -77,6 +84,7 @@ export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
     systemPrompt: loadRoleSystemPrompt('silas'),
     tools: ['read', 'bash', 'grep', 'find', 'ls'],
     skills: ['ops-dispatch', 'ledger-closeout'],
+    managedBmadRuntime: false,
     cwd: 'workspace_root',
   },
   minion: {
@@ -84,6 +92,7 @@ export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
     systemPrompt: loadRoleSystemPrompt('minion'),
     tools: ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'],
     skills: ['build-verify', 'worktree-hygiene'],
+    managedBmadRuntime: true,
     cwd: 'spawn_provided',
   },
   perkins: {
@@ -93,6 +102,7 @@ export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
     // Hybrid review sessions never load role skills: the pinned policy is
     // their only prompt authority (lens-* fleet declarations are retired).
     skills: [],
+    managedBmadRuntime: false,
     cwd: 'spawn_provided',
   },
   bob: {
@@ -100,6 +110,7 @@ export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
     systemPrompt: loadRoleSystemPrompt('bob'),
     tools: ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'],
     skills: ['memory-consolidation'],
+    managedBmadRuntime: false,
     cwd: 'workspace_root',
   },
 };
@@ -107,8 +118,8 @@ export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
 /**
  * SPEC ruling 17 guard: a 'spawn_provided' role without an explicit cwd
  * is a dispatch bug (the agent would silently land at the workspace root
- * and lose the project's skills/bmad discovery). Fail loud at the call
- * site instead. Returns the cwd for chaining.
+ * and lose the project's skills and its lane-bound BMAD runtime). Fail
+ * loud at the call site instead. Returns the cwd for chaining.
  */
 export function requireSpawnCwd(role: Role, cwd: string | undefined): string {
   if (ROLE_DEFINITIONS[role].cwd !== 'spawn_provided') return cwd ?? '';

@@ -27,6 +27,7 @@ import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths
 export { normalizeSessionPath, SessionAlreadyActiveError };
 import { capabilitiesForModelInput } from './types.js';
 import { PI_CAPABILITIES } from './capabilities.js';
+import { managedSkillsPromptNote, preferManagedSkills } from './managed-skills.js';
 import { extractProviderRejectionEvidence } from '../provider-recovery/classify.js';
 import type {
   AgentCapabilities,
@@ -750,6 +751,13 @@ export class PiRuntime implements AgentRuntime {
       const isolatedSettings = reviewMode === undefined
         ? undefined
         : SettingsManager.inMemory({}, { projectTrusted: false });
+      // Issue #283: the lane-bound GC-managed BMAD runtime rides beside the
+      // project's own skills and wins a name collision. Review sessions
+      // never carry it (they load no skills at all).
+      const managed = reviewMode === undefined ? options.managedSkills : undefined;
+      const systemPrompt = managed === undefined
+        ? roleDef.systemPrompt
+        : `${roleDef.systemPrompt}\n\n${managedSkillsPromptNote(managed, 'pi')}`;
       const loader = new DefaultResourceLoader({
         cwd,
         agentDir: this.agentDir,
@@ -763,7 +771,8 @@ export class PiRuntime implements AgentRuntime {
               noContextFiles: true,
             }
           : {}),
-        systemPromptOverride: () => reviewMode?.systemPrompt ?? roleDef.systemPrompt,
+        systemPromptOverride: () => reviewMode?.systemPrompt ?? systemPrompt,
+        ...(managed !== undefined ? { skillsOverride: (base) => preferManagedSkills(base, managed) } : {}),
         ...(reviewMode !== undefined
           ? {
               skillsOverride: () => ({ skills: [], diagnostics: [] }),
