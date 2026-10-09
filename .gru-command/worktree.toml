@@ -649,7 +649,7 @@ strip-themes = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p ts
 # form as the baseline scope. The `full` scope still covers the whole suite;
 # this only narrows a scheduled debug/iteration run so failures are diagnosed
 # against complete, scheduler-captured output instead of an ad-hoc rerun.
-dashboard-slim-strip-unit = "cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts"
+dashboard-slim-strip-unit = "cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts src/ui/slim-strip.baseline.test.ts"
 
 # Baseline exit semantics (both slim-strip baselines), R3-05 resolution:
 # the classifier maps the producer outcome to 1 = BASELINE RED CLASSIFIED
