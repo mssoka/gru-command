@@ -586,3 +586,102 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     expect(existsSync(ownerPath)).toBe(false);
   });
 });
+
+describe('keepalive pings in the capture stream (incident 2026-10-09)', () => {
+  const PING_LINE = `${JSON.stringify({ type: 'ping' })}\n`;
+
+  function completedWithPings(outcome: Record<string, unknown> = COMPLETED_OUTCOME): string {
+    return (
+      `${JSON.stringify({ type: 'queued', runId: outcome['runId'], position: 0, active: 0, limit: 1 })}\n` +
+      PING_LINE +
+      `${JSON.stringify({ type: 'started', runId: outcome['runId'], workers: 2, sha: outcome['sha'], queuedMs: 3 })}\n` +
+      PING_LINE +
+      `${JSON.stringify({ type: 'output', runId: outcome['runId'], stream: 'stdout', text: 'ok\n' })}\n` +
+      PING_LINE +
+      `${JSON.stringify({ type: 'completed', runId: outcome['runId'], outcome })}\n`
+    );
+  }
+
+  function cliDeps(fetchImpl: CaptureCliDeps['fetchImpl']): CaptureCliDeps {
+    return {
+      probe: () => liveProbe,
+      cwd: () => '/tmp/lane',
+      argv: ['capture-cli', 'run'],
+      now: () => 1_700_000_000_000,
+      fetchImpl,
+      stdout: () => {},
+      stderr: () => {},
+    };
+  }
+
+  it('accepts interleaved pings and still rejects a frame after the terminal', () => {
+    const parsed = parseCapturedNdjson(completedWithPings());
+    // Pings are counted as real frames but are never malformed, and the one
+    // terminal completion binds the run/head/output as before.
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.frames).toBe(7);
+    expect(parsed.started).toBe(true);
+    expect(parsed.outcome?.['runId']).toBe('run-capture-1');
+
+    // A ping AFTER the terminal frame is still a concatenated/foreign stream:
+    // the keepalive must never loosen the post-terminal rejection.
+    const postTerminal = parseCapturedNdjson(`${completedNdjson()}${PING_LINE}`);
+    expect(postTerminal.malformed).toBe(1);
+  });
+
+  it('a completed capture whose body carried pings stays promotable through real EOF', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'pings-ok.ndjson');
+    const body = completedWithPings();
+    const code = await runCaptureCli(
+      ['run', '--job', 'job-capture', '--scope', 'full', '--sink', sinkPath, '--request-id', 'req-cli-pings', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      cliDeps(
+        async () =>
+          new Response(body, { status: 200, headers: { 'content-type': 'application/x-ndjson' } }),
+      ),
+    );
+    expect(code).toBe(CAPTURE_EXIT.ok);
+    const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+    expect(receipt.outcome).toBe('completed');
+    expect(captureReceiptSucceeded(receipt)).toBe(true);
+    expect(receipt.run_id).toBe('run-capture-1');
+    expect(receipt.head).toBe('a'.repeat(40));
+    // Every real body byte to EOF is preserved, pings included.
+    expect(readFileSync(sinkPath, 'utf-8')).toBe(body);
+  });
+
+  it('a stream severed after keepalive pings stays UNKNOWN, never success', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'pings-severed.ndjson');
+    let step = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (step === 0) {
+          step += 1;
+          controller.enqueue(
+            new TextEncoder().encode(
+              `${JSON.stringify({ type: 'queued', runId: 'run-capture-1', position: 0, active: 0, limit: 1 })}\n` +
+                PING_LINE +
+                PING_LINE +
+                `${JSON.stringify({ type: 'started', runId: 'run-capture-1', workers: 2, sha: 'a'.repeat(40), queuedMs: 1 })}\n`,
+            ),
+          );
+          return;
+        }
+        controller.error(new Error('socket reset before EOF'));
+      },
+    });
+    const code = await runCaptureCli(
+      ['run', '--job', 'job-capture', '--scope', 'full', '--sink', sinkPath, '--request-id', 'req-cli-pings-lost', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      cliDeps(async () => new Response(stream, { status: 200 })),
+    );
+    expect(code).toBe(CAPTURE_EXIT.unknown);
+    const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+    expect(receipt.outcome).toBe('unknown');
+    expect(receipt.started).toBe(true);
+    expect(receipt.error).toContain('socket reset');
+    // Pings never fabricate producer output or a terminal: no output binding.
+    expect(receipt.output_bytes).toBeNull();
+    expect(captureReceiptSucceeded(receipt)).toBe(false);
+  });
+});

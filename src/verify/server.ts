@@ -38,6 +38,13 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * command) submissions share one producer and a duplicate stream attaches.
  * `GET /api/verify/status` answers accepted/running/completed/unknown by
  * request identity so a lost response is reconciled, never replayed blind.
+ *
+ * Idle-stream keepalive (incident 2026-10-09): the response body emits an
+ * application-level `ping` frame whenever no producer frame has been written
+ * for {@link VERIFY_HEARTBEAT_MS}, so a queued slot wait or a quiet producer
+ * can never leave the body silent past a streaming client's 300 s default
+ * body-idle timeout. The ping is transport liveness only — never producer
+ * output, never a terminal frame, and never written after `completed`/`error`.
  */
 
 export interface VerificationServerOptions {
@@ -46,6 +53,13 @@ export interface VerificationServerOptions {
   readonly worktrees: WorktreePort;
   /** Test seam: an externally-owned scheduler (started/disposed here too). */
   readonly scheduler?: VerificationScheduler;
+  /**
+   * Transport heartbeat cadence in milliseconds (test seam; default
+   * {@link VERIFY_HEARTBEAT_MS}). Must be a positive integer: disabling the
+   * heartbeat is exactly the truncation defect this guards against, so an
+   * unusable cadence is refused loudly rather than silently accepted.
+   */
+  readonly heartbeatMs?: number;
   readonly log?: Log;
 }
 
@@ -58,6 +72,31 @@ export interface VerificationServer {
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
+
+/**
+ * Transport heartbeat cadence (idle-stream keepalive incident, 2026-10-09).
+ *
+ * A queued slot wait can legitimately last `lock_wait_timeout_ms` (900 s)
+ * and a quiet producer can be silent for minutes, while a streaming HTTP
+ * client's default body-idle timeout is 300 s (Node 22 / undici built-in
+ * `bodyTimeout`): the observer saw queued and quiet-running `/api/verify`
+ * streams aborted at a ~301 s silent gap even though the producer kept
+ * running. The response body therefore emits an application-level liveness
+ * frame whenever it has been silent for one interval, so a valid stream is
+ * never truncated for being idle. Worst-case idle gap is 2 × interval
+ * (~30 s), an order of magnitude under the 300 s client limit.
+ */
+export const VERIFY_HEARTBEAT_MS = 15_000;
+
+/**
+ * Application-level keepalive (same idiom as the chat/board surfaces' `ping`):
+ * proves the stream is alive while no producer frame exists. It carries no
+ * run identity and no output — it is transport liveness, never producer
+ * output, and never a terminal frame.
+ */
+interface PingFrame {
+  readonly type: 'ping';
+}
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   if (res.headersSent || res.writableEnded) return;
@@ -83,6 +122,13 @@ export const DEFAULT_VERIFY_SCOPE = 'full';
 
 export function createVerificationServer(options: VerificationServerOptions): VerificationServer {
   const log = options.log ?? (() => {});
+  const heartbeatMs = options.heartbeatMs ?? VERIFY_HEARTBEAT_MS;
+  if (!Number.isInteger(heartbeatMs) || heartbeatMs <= 0) {
+    throw new Error(
+      `verification heartbeat must be a positive integer of milliseconds, got ${String(options.heartbeatMs)} — ` +
+        'a disabled heartbeat reintroduces the 300 s idle-body truncation',
+    );
+  }
   const tokenHash = hashToken(options.config.auth.token);
   const configured = tokenConfigured(options.config.auth.token);
   const ledger = options.ledger;
@@ -291,10 +337,30 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       connection: 'close',
     });
     let closed = false;
+    // Terminal for THIS stream: once `completed`/`error` is written, no
+    // transport frame may follow it (a post-terminal frame would be counted
+    // malformed and unpromote an otherwise clean capture).
+    let terminal = false;
+    // Pings only fill silence AFTER the stream has begun: the first frame is
+    // always a real protocol frame, never a heartbeat.
+    let bodyStarted = false;
+    let lastBodyWriteAt = Date.now();
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
+    const stopHeartbeat = (): void => {
+      if (heartbeat === null) return;
+      clearInterval(heartbeat);
+      heartbeat = null;
+    };
     res.on('close', () => {
       closed = true;
+      stopHeartbeat();
     });
     const writeFrame = async (frame: VerificationProgress | Record<string, unknown>): Promise<void> => {
+      const frameType = (frame as { readonly type?: unknown }).type;
+      if (frameType === 'completed' || frameType === 'error') {
+        terminal = true;
+        stopHeartbeat();
+      }
       if (closed || res.writableEnded) return;
       const payload = `${JSON.stringify(frame)}\n`;
       try {
@@ -304,10 +370,21 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
             res.once('close', () => resolveDrain());
           });
         }
+        bodyStarted = true;
+        lastBodyWriteAt = Date.now();
       } catch {
         closed = true;
       }
     };
+    // Armed before the run starts: a queued slot wait is the longest
+    // legitimate silence the response can have. `unref` so the timer never
+    // holds the process open on its own.
+    heartbeat = setInterval(() => {
+      if (closed || terminal || !bodyStarted || res.writableEnded) return;
+      if (Date.now() - lastBodyWriteAt < heartbeatMs) return;
+      void writeFrame({ type: 'ping' } satisfies PingFrame);
+    }, heartbeatMs);
+    heartbeat.unref?.();
 
     try {
       await scheduler.run(
@@ -357,6 +434,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         });
       }
     } finally {
+      stopHeartbeat();
       if (!res.writableEnded) res.end();
     }
   }

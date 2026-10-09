@@ -507,6 +507,29 @@ perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reli
 # unchanged budgets, exit codes never masked.
 verification-single-flight = "npx vitest run test/verification-scheduler.test.ts test/verification-capture.test.ts test/verification-evidence.test.ts test/silas-driver.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts && npx vitest run test/suite-shape.test.ts"
 
+# Idle-stream keepalive (incident 2026-10-09): the queued slot wait and
+# quiet running response keep receiving real body bytes under the transport
+# heartbeat, terminal/disconnect cleanup leaves no heartbeat timer, the
+# shipped reader/helper accepts the ping stream honestly, and the recomputed
+# suite-shape pins. Heavy server leg under the classified heavy config;
+# exits never masked.
+verify-idle-keepalive = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/verification-capture.test.ts && npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts && npx vitest run test/suite-shape.test.ts"
+# Static gates for the same change (lint, both compilers via build).
+verify-idle-keepalive-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build"
+
+# Fails-before evidence: the FINAL behavioral suite bytes are overlaid onto
+# an isolated git-archive snapshot of the pre-fix base 32fc2f6 (the incident
+# build, which emits no heartbeat) with dependencies linked by symlink — no
+# download/install, no branch mutation, approved RPC patch prerequisite,
+# unchanged Vitest config/budgets. The base has no keepalive, so the four
+# named regressions RED by ASSERTION (a setup/import failure would not be
+# RED evidence). The capture-reader guards are deliberately excluded: they
+# pin the reader's pre-existing generic acceptance and pass at the base too.
+# The Vitest exit is echoed intact and never masked into a PASS; a base that
+# passes is called out as a broken fail-before claim. The snapshot directory
+# and ignored pointer file are preserved for inspection.
+verify-idle-keepalive-baseline = 'set -e; base=32fc2f6edfc878b89d05c4d2499dcbdb0ec662d1; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-verify-idle-keepalive.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/verification-server.test.ts > "$d/test/verification-server.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "verify-idle-keepalive-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/verify-idle-keepalive-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --config vitest.heavy.config.ts test/verification-server.test.ts -t "incident 2026-10-09"; a=$?; set -e; echo "verify-idle-keepalive-baseline vitest exit=$a EXPECTED-NONZERO: pre-fix base emits no heartbeat"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed the keepalive regressions unexpectedly"; fi; exit 1'
+
 # Board PR-number link labels (owner approval j-982): the new pure URL
 # helper plus the board-row label/disclosure DOM contract, via the existing
 # installed Vitest CLI under the existing web config/budgets (no

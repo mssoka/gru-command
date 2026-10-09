@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -13,6 +14,7 @@ import { createVerificationServer, type VerificationServer } from '../src/verify
 import {
   captureReceiptPath,
   captureReceiptSucceeded,
+  parseCapturedNdjson,
   readCaptureReceipt,
 } from '../src/verify/capture.js';
 import { runCaptureCli, type CaptureCliDeps } from '../src/verify/capture-cli.js';
@@ -73,6 +75,7 @@ async function boot(opts: {
   lockWaitTimeoutMs?: number;
   maxConcurrent?: number;
   workerBudget?: number;
+  heartbeatMs?: number;
   files?: Readonly<Record<string, string>>;
 } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-verify-server-'));
@@ -108,7 +111,12 @@ async function boot(opts: {
   ledger.addJob({ id: jobId, repo: 'verify-app', title: 'verify the lane', baseBranch: 'main', briefing: 'verify' });
   ledger.setJobStatus(jobId, 'working');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
-  const server = createVerificationServer({ config, ledger, worktrees });
+  const server = createVerificationServer({
+    config,
+    ledger,
+    worktrees,
+    ...(opts.heartbeatMs === undefined ? {} : { heartbeatMs: opts.heartbeatMs }),
+  });
   const http: HttpServer = createServer((req, res) => {
     if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
     res.writeHead(404);
@@ -576,6 +584,334 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     expect(await runCaptureCli(staleArgs, cliDeps)).toBe(2);
     const staleReceipt = readCaptureReceipt(captureReceiptPath(staleSink));
     expect(staleReceipt!.error).toContain('head_changed');
+    expect(
+      harness.ledger.listJobEvents(harness.jobId).filter((event) => event.kind === 'verification.started'),
+    ).toHaveLength(1);
+    await harness.close();
+  });
+});
+
+/**
+ * Idle-stream keepalive (incident 2026-10-09): a queued slot wait (up to
+ * `lock_wait_timeout_ms`) or a quiet producer used to leave the NDJSON body
+ * silent past a streaming client's 300 s default body-idle timeout, so the
+ * client aborted the body and lost a valid capture while the producer kept
+ * running. These tests drive a real isolated server with a short heartbeat
+ * cadence (the injectable test seam) and prove periodic real body bytes,
+ * unchanged producer output, terminal/disconnect cleanup, and that the
+ * shipped capture reader/helper accepts the keepalive stream.
+ */
+const GATE_SCRIPT = [
+  "import { existsSync, writeFileSync } from 'node:fs';",
+  'const release = process.argv[2];',
+  "writeFileSync('gate-started.txt', 'started');",
+  'const deadline = Date.now() + 20000;',
+  'while (!existsSync(release) && Date.now() < deadline) {',
+  '  await new Promise((resolve) => setTimeout(resolve, 25));',
+  '}',
+  'process.exit(existsSync(release) ? 0 : 3);',
+].join('\n');
+
+const QUIET_SCRIPT = [
+  'const delay = Number(process.argv[2] ?? 400);',
+  "setTimeout(() => { console.log('quiet=done'); }, delay);",
+].join('\n');
+
+const HOLD_MANIFEST = [
+  '[verify]',
+  'full = "node verify.mjs pass"',
+  'hold = "node gate.mjs held.txt"',
+  '',
+].join('\n');
+
+interface TimedFrame {
+  readonly at: number;
+  readonly frame: Frame;
+}
+
+/** Read an NDJSON response to EOF, timestamping each body line as it lands. */
+function collectNdjson(response: Response): { readonly frames: TimedFrame[]; readonly done: Promise<void> } {
+  const frames: TimedFrame[] = [];
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const done = (async () => {
+    for (;;) {
+      const { done: finished, value } = await reader.read();
+      if (finished) break;
+      buffer += decoder.decode(value, { stream: true });
+      for (let newline = buffer.indexOf('\n'); newline >= 0; newline = buffer.indexOf('\n')) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line.trim() === '') continue;
+        frames.push({ at: Date.now(), frame: JSON.parse(line) as Frame });
+      }
+    }
+    if (buffer.trim() !== '') frames.push({ at: Date.now(), frame: JSON.parse(buffer) as Frame });
+  })();
+  return { frames, done };
+}
+
+/** POST /api/verify and hand back the streaming response (no body buffering). */
+async function streamCall(port: number, body: unknown): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/api/verify`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+function frameTypes(frames: readonly TimedFrame[]): string[] {
+  return frames.map((entry) => entry.frame.type);
+}
+
+function plainFrames(frames: readonly TimedFrame[]): Frame[] {
+  return frames.map((entry) => entry.frame);
+}
+
+/** The largest gap between consecutive body-line arrivals, in ms. */
+function maxArrivalGap(frames: readonly TimedFrame[]): number {
+  let worst = 0;
+  for (let index = 1; index < frames.length; index += 1) {
+    worst = Math.max(worst, frames[index]!.at - frames[index - 1]!.at);
+  }
+  return worst;
+}
+
+describe('verification stream keepalive (incident 2026-10-09)', () => {
+  it('queued verification keeps response alive during slot wait', async () => {
+    const harness = await boot({
+      manifest: HOLD_MANIFEST,
+      files: { 'gate.mjs': GATE_SCRIPT },
+      maxConcurrent: 1,
+      heartbeatMs: 25,
+    });
+    const queuedJob = harness.ledger.addJob({
+      id: 'job-queued-lane',
+      repo: 'verify-app',
+      title: 'queued lane',
+      baseBranch: 'main',
+      briefing: 'queued',
+    });
+    harness.ledger.setJobStatus(queuedJob.id, 'working');
+    const queuedLane = await harness.worktrees.createJobWorktree({
+      repoPath: harness.repo.path,
+      jobId: queuedJob.id,
+    });
+
+    // The first request owns the single scheduler slot until its gate file
+    // appears; the second request must then WAIT (not attach, not spawn).
+    const holder = collectNdjson(await streamCall(harness.port, { job_id: harness.jobId, scope: 'hold' }));
+    await waitFor(() => existsSync(join(harness.lanePath, 'gate-started.txt')));
+    const waiting = collectNdjson(
+      await streamCall(harness.port, { job_id: queuedJob.id, scope: 'hold', request_id: 'req-queued-keepalive' }),
+    );
+
+    // While the slot is held the waiting body keeps receiving real bytes.
+    await waitFor(() => frameTypes(waiting.frames).filter((type) => type === 'ping').length >= 3);
+    const heldTypes = frameTypes(waiting.frames);
+    expect(heldTypes[0]).toBe('queued');
+    // Only the queued admission and transport pings so far: the waiting
+    // request has not started, and the single slot is not bypassed.
+    expect(heldTypes.every((type) => type === 'queued' || type === 'ping')).toBe(true);
+    expect(existsSync(join(queuedLane.path, 'gate-started.txt'))).toBe(false);
+    // The idle gap stays strictly under the client's 300 s body limit.
+    expect(maxArrivalGap(waiting.frames)).toBeLessThan(300_000);
+
+    // Release the holder; the queued request is admitted, then released.
+    writeFileSync(join(harness.lanePath, 'held.txt'), 'go');
+    await holder.done;
+    await waitFor(() => existsSync(join(queuedLane.path, 'gate-started.txt')));
+    writeFileSync(join(queuedLane.path, 'held.txt'), 'go');
+    await waiting.done;
+
+    const waitingTypes = frameTypes(waiting.frames);
+    expect(waitingTypes.filter((type) => type === 'completed')).toHaveLength(1);
+    expect(waitingTypes[waitingTypes.length - 1]).toBe('completed');
+    expect(waitingTypes.lastIndexOf('ping')).toBeLessThan(waitingTypes.indexOf('completed'));
+    const waitingOutcome = outcomeOf(completedFrame(plainFrames(waiting.frames)));
+    expect(waitingOutcome['ok']).toBe(true);
+    expect(waitingOutcome['sha']).toBe(harness.repo.head());
+    expect(waitingOutcome['queuedMs']).toBeGreaterThan(0);
+    // One producer for the waiting lane: the stream never minted a second
+    // run and never bypassed the FIFO lock wait.
+    expect(
+      harness.ledger.listJobEvents(queuedJob.id).filter((event) => event.kind === 'verification.started'),
+    ).toHaveLength(1);
+    // The holder's stream stayed clean to EOF too.
+    expect(frameTypes(holder.frames).filter((type) => type === 'completed')).toHaveLength(1);
+    expect(frameTypes(holder.frames).lastIndexOf('ping')).toBeLessThan(
+      frameTypes(holder.frames).indexOf('completed'),
+    );
+    await harness.close();
+  });
+
+  it('quiet running verification keeps response alive', async () => {
+    const harness = await boot({
+      manifest: ['[verify]', 'full = "node quiet.mjs 400"', ''].join('\n'),
+      files: { 'quiet.mjs': QUIET_SCRIPT },
+      maxConcurrent: 1,
+      heartbeatMs: 25,
+    });
+    const reading = collectNdjson(await streamCall(harness.port, { job_id: harness.jobId, scope: 'full' }));
+    await reading.done;
+
+    const types = frameTypes(reading.frames);
+    const startedAt = types.indexOf('started');
+    const firstPing = types.indexOf('ping');
+    const firstOutput = types.indexOf('output');
+    const completedAt = types.indexOf('completed');
+    expect(startedAt).toBeGreaterThanOrEqual(0);
+    expect(firstPing).toBeGreaterThan(startedAt);
+    expect(firstOutput).toBeGreaterThan(firstPing);
+    expect(completedAt).toBeGreaterThan(firstOutput);
+    expect(types.filter((type) => type === 'ping').length).toBeGreaterThanOrEqual(3);
+    // The silent window between `started` and the first output carried real
+    // periodic bytes, all strictly under the 300 s client body-idle limit.
+    expect(maxArrivalGap(reading.frames.slice(startedAt, firstOutput + 1))).toBeLessThan(300_000);
+    expect(types[types.length - 1]).toBe('completed');
+
+    // The keepalive is transport-only: the producer's output byte/hash
+    // record is exactly its own stdout, with no ping text folded in.
+    const output = reading.frames
+      .filter((entry) => entry.frame.type === 'output')
+      .map((entry) => String(entry.frame['text']))
+      .join('');
+    expect(output).toBe('quiet=done\n');
+    const outcome = outcomeOf(completedFrame(plainFrames(reading.frames)));
+    expect(outcome['outputBytes']).toBe(Buffer.byteLength('quiet=done\n'));
+    expect(outcome['outputSha256']).toBe(createHash('sha256').update('quiet=done\n').digest('hex'));
+    await harness.close();
+  });
+
+  it('verification terminal and disconnect cleanup', async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
+    const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval');
+    const harness = await boot({
+      manifest: HOLD_MANIFEST,
+      files: { 'gate.mjs': GATE_SCRIPT },
+      maxConcurrent: 1,
+      heartbeatMs: 25,
+    });
+    try {
+      const createdBaseline = setIntervalSpy.mock.calls.length;
+      const clearedBaseline = clearIntervalSpy.mock.calls.length;
+
+      // Terminal: exactly one terminal frame, and no transport frame after it.
+      const terminal = collectNdjson(await streamCall(harness.port, { job_id: harness.jobId, scope: 'full' }));
+      await terminal.done;
+      const terminalTypes = frameTypes(terminal.frames);
+      expect(terminalTypes.filter((type) => type === 'completed')).toHaveLength(1);
+      expect(terminalTypes[terminalTypes.length - 1]).toBe('completed');
+      expect(terminalTypes.lastIndexOf('ping')).toBeLessThan(terminalTypes.indexOf('completed'));
+
+      // Disconnect: dropping the client neither cancels the producer nor
+      // crashes the stream, and the response's heartbeat timer is cleared.
+      const disconnectJob = harness.ledger.addJob({
+        id: 'job-disconnect-lane',
+        repo: 'verify-app',
+        title: 'disconnect lane',
+        baseBranch: 'main',
+        briefing: 'disconnect',
+      });
+      harness.ledger.setJobStatus(disconnectJob.id, 'working');
+      const disconnectLane = await harness.worktrees.createJobWorktree({
+        repoPath: harness.repo.path,
+        jobId: disconnectJob.id,
+      });
+      const controller = new AbortController();
+      const response = await fetch(`http://127.0.0.1:${harness.port}/api/verify`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ job_id: disconnectJob.id, scope: 'hold', request_id: 'req-disconnect-keepalive' }),
+        signal: controller.signal,
+      });
+      const disconnected = collectNdjson(response);
+      await waitFor(() => existsSync(join(disconnectLane.path, 'gate-started.txt')));
+      controller.abort();
+      await disconnected.done.catch(() => {});
+
+      // Producer outcome/cancellation semantics are unchanged: the run is
+      // still running, then reaches its own terminal outcome.
+      expect(harness.ledger.latestJobEvent(disconnectJob.id, 'verification.completed')).toBeNull();
+      writeFileSync(join(disconnectLane.path, 'held.txt'), 'go');
+      await waitFor(
+        () => harness.ledger.latestJobEvent(disconnectJob.id, 'verification.completed') !== null,
+        10_000,
+      );
+      expect(harness.ledger.getJob(disconnectJob.id)?.status).toBe('working');
+      const status = await statusCall(harness.port, 'request_id=req-disconnect-keepalive');
+      expect(status.json).toMatchObject({ state: 'completed', started: true });
+      // A fresh run after the disconnect race still succeeds (no crash).
+      const after = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
+      expect(outcomeOf(completedFrame(after.frames))['ok']).toBe(true);
+
+      // One heartbeat interval per response — every one of them cleared.
+      expect(setIntervalSpy.mock.calls.length - createdBaseline).toBe(3);
+      expect(clearIntervalSpy.mock.calls.length - clearedBaseline).toBeGreaterThanOrEqual(3);
+    } finally {
+      await harness.close();
+      expect(clearIntervalSpy.mock.calls.length).toBe(setIntervalSpy.mock.calls.length);
+      setIntervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
+    }
+  });
+
+  it('capture remains honest with keepalive', async () => {
+    const harness = await boot({
+      manifest: ['[verify]', 'full = "node verify.mjs pass"', 'quiet = "node quiet.mjs 400"', ''].join('\n'),
+      files: { 'quiet.mjs': QUIET_SCRIPT },
+      heartbeatMs: 25,
+    });
+    const sinkPath = join(harness.lanePath, 'verify-capture-pings.ndjson');
+    const cliDeps: CaptureCliDeps = {
+      probe: () => ({
+        alive: true,
+        startTime: 'Mon Oct  6 12:00:00 2026',
+        cwd: harness.lanePath,
+        command: 'node capture-cli run',
+      }),
+      argv: ['capture-cli', 'run'],
+      stdout: () => {},
+      stderr: () => {},
+    };
+    const exitCode = await runCaptureCli(
+      [
+        'run',
+        '--job',
+        harness.jobId,
+        '--scope',
+        'quiet',
+        '--sink',
+        sinkPath,
+        '--request-id',
+        'req-capture-keepalive',
+        '--url',
+        `http://127.0.0.1:${harness.port}`,
+        '--token',
+        TOKEN,
+      ],
+      cliDeps,
+    );
+    // The quiet run's silent window carried keepalives; the shipped helper
+    // still received one terminal plus real EOF and wrote a truthful,
+    // promotable receipt bound to the real head and run.
+    expect(exitCode).toBe(0);
+    const receipt = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(receipt).not.toBeNull();
+    expect(receipt!.outcome).toBe('completed');
+    expect(captureReceiptSucceeded(receipt!)).toBe(true);
+    expect(receipt!.head).toBe(harness.repo.head());
+    const recorded = harness.ledger.latestJobEvent(harness.jobId, 'verification.completed');
+    expect(receipt!.run_id).toBe((recorded?.payload as Record<string, unknown> | undefined)?.['run_id']);
+    const captured = readFileSync(sinkPath, 'utf-8');
+    expect(captured).toContain('"type":"ping"');
+    expect(captured).toContain('"type":"completed"');
+    const parsed = parseCapturedNdjson(captured);
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.frames).toBe(receipt!.frames);
+    expect((captured.match(/"type":"completed"/gu) ?? [])).toHaveLength(1);
+    // Exactly one producer ran: the keepalive never minted a second run.
     expect(
       harness.ledger.listJobEvents(harness.jobId).filter((event) => event.kind === 'verification.started'),
     ).toHaveLength(1);
