@@ -6,9 +6,6 @@
  *
  *   lane / job  → heist / heists   (the unit of work)
  *   worker meta → minion           (never "agent" in a rendered string)
- *   job with a parent job → megaminion / megaminions (a specialist a
- *                  minion commissioned, nested under its heist; never
- *                  "sub-minion", which names #161 child workers)
  *   the agents rail of gru + silas + minions + lens children → CREW
  *
  * One constant so every surface draws the same word. This is a display
@@ -22,10 +19,6 @@ export const BOARD_WORDS = {
   heists: 'heists',
   /** The worker-meta word: api/code say "agent", the screen says minion. */
   minion: 'minion',
-  /** A specialist job a minion commissioned (e.g. a reviewer), nested
-   * under its parent heist rather than counted as one. */
-  megaminion: 'megaminion',
-  megaminions: 'megaminions',
   /** The agents rail's rendered label (gru, silas, minions, lens children). */
   crew: 'crew',
 } as const;
@@ -33,9 +26,4 @@ export const BOARD_WORDS = {
 /** `1 heist` / `3 heists` — the operator-facing count for a band heading. */
 export function heistCount(count: number): string {
   return `${count} ${count === 1 ? BOARD_WORDS.heist : BOARD_WORDS.heists}`;
-}
-
-/** `1 megaminion` / `3 megaminions` — the family chip on a parent heist. */
-export function megaminionCount(count: number): string {
-  return `${count} ${count === 1 ? BOARD_WORDS.megaminion : BOARD_WORDS.megaminions}`;
 }

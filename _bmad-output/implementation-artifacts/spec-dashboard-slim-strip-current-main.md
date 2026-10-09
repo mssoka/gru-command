@@ -213,6 +213,64 @@ Exact-head receipts at `e740d96` (all through the authenticated scheduler + ship
 - `megaminions-browser` GREEN (run `f1482ba1-0d82-4fe2-a56e-7d8738c03d31`)
 - `full` GREEN (run `a52e12a8-beca-4574-9b25-8865aa9969c4`)
 
+### Owner scope restoration (amendment #7, 2026-10-09) — provenance inventory and correction
+
+Amendment #7 (owner chat frames 230126/230296/230406) withdrew the chief-added
+later-main compatibility requirement (former amendments #3/#4, now NOT
+EFFECTIVE): "current main" in the base brief means the recorded creation base
+`49b558f`. No newer-main feature is SLIM acceptance. The FOR-YOU band itself
+predates the base (merged `1d349af`), so the approved scope is the base board
+plus the approved slim strip/compact band.
+
+**Removed as unsupported absorbed-later-main additions (provenance: present
+in `49b558f..main`, absent from the approved feature; the proposal machinery
+was additionally ported under withdrawn amendment #3):**
+
+- Lesson-proposal frontend machinery (chief-added; backend dependency made it
+  a known-dark control): `board-protocol.ts` proposal types/validators/kinds,
+  `board-client.ts` getLessonProposal/decideLessonProposal, `owner-band.ts`
+  OwnerProposalRow/LESSONS_PROPOSAL_CONSEQUENCE/proposal branch, `board.ts`
+  proposalStates/ownerProposalRow/decide flow/ownerProposalPointer/review
+  renderers/error describers/owner-focus helper pair, proposal CSS blocks,
+  `web/e2e/lesson-proposal.spec.ts`, lesson-proposal browser project+scope,
+  and every proposal unit test. R3 findings 1/2/4 are RETIRED with this
+  provenance (removed out-of-scope path; not claims of fixing the old path).
+  Retained in-scope residue of R3-3: every POST (base ack surface) rides a
+  bounded `AbortSignal.timeout`, pinned by a new discriminating unit test.
+- Megaminion nested-row hierarchy (surfacedParents, familyChip/familyRows,
+  nested jobRow recursion, `parentJobId`, 3-arg boardKpis topLevel counting,
+  `board-family.ts`, `board-vocabulary` megaminion words, family/child CSS,
+  `web/e2e/megaminions.spec.ts`, megaminions browser project+scope,
+  megaminion unit tests). Base-supported behavior KEPT: children counts
+  (CHILDREN optional/unknown strip group, Issue #161) and the base family
+  counters on the job subline; `boardKpis` back to the base two-argument
+  derivation ("SAME boardKpis derivation").
+- Wholesale ==main files restored to base blobs (SLIM needs nothing they
+  carried): board-sections.ts, board-kpi.ts, board-vocabulary.ts,
+  board-bands.ts, web/src/main.ts, web/mock/server.ts, board-protocol.ts
+  (now byte-identical to base), board-protocol.test.ts, board-kpi.test.ts,
+  board-vocabulary.test.ts, board-client.test.ts recomposed (base + the
+  lane's R7-R10 hardening tests − proposal tests + the new POST-deadline
+  pin), absorbed `directive-recovery` verify scope removed.
+- R3-5 baseline classification RESOLVED: dedicated fail-before instrument
+  `web/src/ui/slim-strip.baseline.test.ts` (imports only base-existing
+  symbols; asserts slim surfaces after a setup proof) +
+  `tools/classify-baseline.mjs`; both baseline scopes now distinguish
+  1 = RED CLASSIFIED (assertion-named feature absence, setup clean),
+  2 = FAILS-BEFORE BROKEN, 3 = SETUP/COLLECTION FAILURE (never readable as
+  behavioral evidence). owner-band.test.ts is deliberately not overlaid on
+  base (ackNextStep is a slim-added symbol; that import error would be a
+  setup failure); its head coverage stays in the unit scope.
+
+**Kept as approved/base-supported:** the six-section board, six-section order
+and previews, Binned/CHILDREN semantics (base forms), independent GRU/SILAS
+wakes with deferred tallies, compact initially-collapsed FOR YOU with ack +
+OPEN PR controls, reveal-only disclosure and stable focus, R7-R10 client
+hardening (deadline, trailing chain, refused-pairing stop — required by the
+approved "HTTP ambiguity reconciles to the authoritative snapshot"), the R2
+error-contrast fix (retained band error surface), `.num` scoping, wake chip
+honesty, strip styles.
+
 ### R3 native Perkins findings (INCOMPLETE at `2061e59`, triaged and fixed)
 
 | # | Finding | Severity | Verdict | Fix |

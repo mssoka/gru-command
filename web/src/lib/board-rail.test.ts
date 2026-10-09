@@ -189,7 +189,7 @@ describe('board rail — chips (v6)', () => {
         agent('lens', 'streaming', 'perkins'),
       ],
     );
-    const kpis = boardKpis(snap, new Date(NOW), collectJobs(snap));
+    const kpis = boardKpis(snap, new Date(NOW));
     const values = kpiValues(railChips(snap, NOW));
 
     expect(values.get('jobs.total')).toBe(kpis.jobs.total);

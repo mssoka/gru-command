@@ -329,14 +329,10 @@ function startBoard(token: string): void {
     storage, // card disclosure persists per job (safeStorage-wrapped localStorage)
   );
   boardClient?.stop();
-  // Every callback checks it still belongs to the CURRENT board client:
-  // work an older pairing started (a fetch, a late 401) never touches this
-  // session.
-  const current: BoardClient = new BoardClient(
+  boardClient = new BoardClient(
     { token, host: location.host, secure },
     {
       connection: (state) => {
-        if (boardClient !== current) return;
         // The board degrades to its last snapshot; the nav dot carries the
         // connection truth — including the stale window that used to read
         // as "open" while the board was frozen.
@@ -344,7 +340,6 @@ function startBoard(token: string): void {
         commandBar.setBoardState(state);
       },
       snapshot: (snapshot) => {
-        if (boardClient !== current) return;
         boardView?.render(snapshot);
         commandBar.setSnapshot(snapshot);
         // The first snapshot discloses the chip rail — the chrome just
@@ -365,12 +360,10 @@ function startBoard(token: string): void {
         }
       },
       fatal: (message) => {
-        if (boardClient !== current) return;
         failPairing(message);
       },
     },
   );
-  boardClient = current;
   // E7: the view gains the live client (receipts + acks) and the toast
   // surface for newly-arrived notifications. New arrivals also ring the
   // owner chime — it decides on routing (needs-owner only) and throttle.

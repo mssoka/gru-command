@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { BoardSnapshot, NotificationView, OwnerPrView } from './board-protocol.js';
 import {
-  LESSONS_PROPOSAL_CONSEQUENCE,
   OWNER_WINDOW_SIZE,
   ackConsequence,
   ackNextStep,
@@ -81,28 +80,6 @@ describe('owner-band row model', () => {
       }),
     );
     expect(rows.map((row) => row.actionId)).toEqual(['owner-ack:owner', 'owner-ack:seen-ack']);
-  });
-
-  it('a Book of Lessons proposal is a decision row with Accept/Reject copy — never an Ack row (owner decision 2026-10-07)', () => {
-    const rows = ownerRows(
-      snapshot({
-        notifications: [
-          notification('p1', {
-            routing: 'needs-owner',
-            kind: 'lessons.proposal',
-            ts: '2026-09-28T00:00:50.000Z',
-            title: 'Book of Lessons: 2 lesson changes proposed',
-          }),
-          notification('p0', { routing: 'needs-owner', kind: 'lessons.proposal', resolvedAt: '2026-09-28T00:01:00.000Z' }),
-          notification('stop', { routing: 'needs-owner', ts: '2026-09-28T00:00:20.000Z' }),
-        ],
-      }),
-    );
-    expect(rows.map((row) => `${row.kind}:${row.actionId}`)).toEqual(['proposal:owner-proposal:p1', 'ack:owner-ack:stop']);
-    const proposal = rows[0]!;
-    expect(proposal.kind === 'proposal' ? proposal.consequence : null).toBe(LESSONS_PROPOSAL_CONSEQUENCE);
-    expect(LESSONS_PROPOSAL_CONSEQUENCE).toContain('Accept writes these changes into the Book of Lessons');
-    expect(LESSONS_PROPOSAL_CONSEQUENCE).toContain('won’t be proposed again');
   });
 
   it('merges ack rows and PR rows newest-first with stable id tiebreak (deterministic across renders)', () => {

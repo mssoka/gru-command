@@ -149,12 +149,9 @@ export function laneCounts(agents: readonly AgentView[]): LaneCounts {
   };
 }
 
-/** `heists` is the board's top-level row population (the sections
- * derivation's `topLevel`): a nested megaminion is part of its heist and
- * never counted on its own, while a surfaced one is a row like any other. */
-export function boardKpis(snapshot: BoardSnapshot, now: Date, heists: readonly JobView[]): BoardKpis {
+export function boardKpis(snapshot: BoardSnapshot, now = new Date()): BoardKpis {
   return {
-    jobs: jobStatusCounts(heists),
+    jobs: jobStatusCounts(collectJobs(snapshot)),
     prs: prCounts(collectJobs(snapshot), now),
     lanes: laneCounts(snapshot.agents),
     children: childCounts(snapshot),

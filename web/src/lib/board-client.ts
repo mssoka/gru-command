@@ -9,14 +9,10 @@
 import {
   BOARD_WS_PATH,
   isValidDecisionStatus,
-  isValidLessonProposal,
-  isValidLessonProposalDecision,
   isValidSnapshot,
   parseBoardServerFrame,
   type BoardSnapshot,
   type DecisionStatusView,
-  type LessonProposalDecisionView,
-  type LessonProposalView,
   type NotificationView,
   type TranscriptInfo,
   type TranscriptPage,
@@ -466,28 +462,6 @@ export class BoardClient {
     } catch {
       return false; // a lost receipt never blocks rendering
     }
-  }
-
-  /** The pending Book of Lessons proposal, for the owner's review. */
-  async getLessonProposal(): Promise<LessonProposalView> {
-    const proposal = await this.api<unknown>('/api/lessons/proposal', AbortSignal.timeout(SNAPSHOT_DEADLINE_MS));
-    if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
-    return proposal;
-  }
-
-  /** The owner's decision on a lesson proposal — the ONLY way it closes
-   * (owner decision 2026-10-07); the snapshot then retires the row. */
-  async decideLessonProposal(id: string, decision: 'accept' | 'reject'): Promise<LessonProposalDecisionView> {
-    const { status, body } = await this.postApiWithStatus(`/api/lessons/proposal/${encodeURIComponent(id)}/${decision}`, {});
-    const expected = decision === 'accept' ? 'accepted' : 'rejected';
-    // C9: a reply counts only when it answers THIS request — this proposal,
-    // this choice — in its own phase: 200 finished, 202 recorded but
-    // incomplete. Anything else leaves the outcome unconfirmed.
-    if (!isValidLessonProposalDecision(body) || body.id !== id || body.decision !== expected ||
-      !((status === 200 && body.incomplete !== true) || (status === 202 && body.incomplete === true))) {
-      throw new Error(`the server's reply (HTTP ${status}) does not confirm this ${decision}`);
-    }
-    return body;
   }
 
   /** E7: human ack (action-required clearance; re-arms an open breaker). */
