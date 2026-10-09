@@ -95,19 +95,21 @@ describe('completed verification history pagination (j-1594)', () => {
     }
   });
 
-  it('reads every page to exhaustion, including exact-multiple and single-row boundaries', () => {
+  it('reads every page to exhaustion, including exact-full-page and single-row boundaries', () => {
     const { api, db, dir } = seeded();
     try {
       const read = (jobId: string, pageSize: number): number[] =>
         [...api.iterateJobVerificationCompleted(jobId, pageSize)].map((row) => row.seq);
       // A total that is an exact multiple of pageSize terminates on the
-      // empty next page, not a short page.
+      // empty next page, not a short page; an exact-full single page (total
+      // === pageSize) must also terminate there instead of looping.
       for (let index = 0; index < 4; index += 1) {
         api.appendCustomEvent({ kind: 'verification.completed', jobId: 'exact', payload: { run_id: `run-${index}` } });
       }
       const exactAtTwo = read('exact', 2);
       expect(exactAtTwo).toHaveLength(4);
       expect(new Set(exactAtTwo).size).toBe(4);
+      expect(read('exact', 4)).toEqual(exactAtTwo);
       // pageSize 1 exercises the per-row cursor advance; the selected
       // sequence is independent of the page size.
       expect(read('exact', 1)).toEqual(exactAtTwo);
@@ -156,15 +158,13 @@ describe('completed verification history pagination (j-1594)', () => {
     }
   });
 
-  it('yields nothing for a job with no completed run and refuses an out-of-range page size eagerly', () => {
+  it('yields nothing for a job with no completed run and refuses a non-positive page size', () => {
     const { api, db, dir } = seeded();
     try {
       api.appendCustomEvent({ kind: 'job.note', jobId: 'empty', payload: { note: 'x' } });
       expect([...api.iterateJobVerificationCompleted('empty')]).toEqual([]);
-      // Eager: the refusal happens at the call boundary, before iterating.
-      expect(() => api.iterateJobVerificationCompleted('empty', 0)).toThrow(/pageSize must be an integer in 1\.\./u);
-      expect(() => api.iterateJobVerificationCompleted('empty', 1.5)).toThrow(/pageSize must be an integer in 1\.\./u);
-      expect(() => api.iterateJobVerificationCompleted('empty', 1001)).toThrow(/pageSize must be an integer in 1\.\./u);
+      expect(() => [...api.iterateJobVerificationCompleted('empty', 0)]).toThrow(/pageSize must be a positive integer/u);
+      expect(() => [...api.iterateJobVerificationCompleted('empty', 1.5)]).toThrow(/pageSize must be a positive integer/u);
     } finally {
       db.close();
       rmSync(dir, { recursive: true, force: true });
