@@ -20,6 +20,7 @@ import type { GruCommandConfig, Role } from '../config.js';
 import { resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
+import { managedSkillsPromptNote } from './managed-skills.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
 import { buildClaudeCodeAuthArgs, claudeCliModel, claudeReviewIsolationArgs } from './claude-model.js';
@@ -337,6 +338,10 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     if (options.reviewModel !== undefined && reviewMode === undefined) {
       throw new Error('a review model snapshot requires an isolated review lead or lens');
     }
+    // Issue #283: the lane-bound GC-managed BMAD runtime loads as a session
+    // plugin (namespaced, so a repo-local copy can never shadow it). Review
+    // sessions never carry it.
+    const managed = reviewMode === undefined ? options.managedSkills : undefined;
     if (options.reviewModel !== undefined && options.reviewModel.role !== role) {
       throw new Error(`review model snapshot belongs to ${options.reviewModel.role}, not ${role}`);
     }
@@ -509,8 +514,11 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           cwd,
           binary: this.binary,
           tools,
-          systemPrompt: reviewMode?.systemPrompt ?? roleDef.systemPrompt,
+          systemPrompt: reviewMode?.systemPrompt ?? (managed === undefined
+            ? roleDef.systemPrompt
+            : `${roleDef.systemPrompt}\n\n${managedSkillsPromptNote(managed, 'claude-code')}`),
           isolatedReview: reviewMode !== undefined,
+          ...(managed !== undefined ? { managedPluginDir: managed.root } : {}),
           ...(reviewSettings?.file !== undefined ? { reviewSettingsFile: reviewSettings.file } : {}),
           ...(reviewConfiguration !== undefined ? { reviewAuthEnv: claudeReviewProcessEnv(reviewConfiguration) } : {}),
           fileTools,
@@ -607,6 +615,8 @@ interface HandleParams {
   readonly resume: boolean;
   readonly model?: string;
   readonly thinkingLevel?: string;
+  /** Issue #283: the bound GC-managed BMAD runtime, loaded as a plugin dir. */
+  readonly managedPluginDir?: string;
 }
 
 /**
@@ -650,6 +660,9 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
     ];
     if (allowed.length > 0) args.push('--allowedTools', allowed.join(','));
     if (params.mcpConfigFile !== undefined) args.push('--mcp-config', params.mcpConfigFile);
+  }
+  if (params.managedPluginDir !== undefined && !params.isolatedReview) {
+    args.push('--plugin-dir', params.managedPluginDir);
   }
   if (params.model !== undefined) args.push('--model', params.model);
   if (params.thinkingLevel !== undefined) args.push('--effort', params.thinkingLevel);

@@ -41,8 +41,11 @@ worker identity. Older jobs without it use a shortened title on minion cards:
    'local-head-fallback'` recorded, never silently). Status `working`.
 3. **Minion** — a fresh agent session spawned with `cwd` = the worktree
    (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
-   the minion discovers the project's own skills/bmad from there). The
-   briefing prompt is delivered as the session's first turn.
+   the minion discovers the project's own skills and BMAD settings from
+   there). The lane is bound to the GC-managed BMAD runtime on its first
+   minion spawn and keeps that binding for its life
+   ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)). The briefing prompt is
+   delivered as the session's first turn.
 
 Failures are loud and leave no half lanes: a spawn failure sweeps the
 fresh worktree back out and blocks the job with a note.
@@ -514,8 +517,9 @@ ledger surfaces remain runtime-agnostic).
 ## 4f. Minion-owned build cycle (owner ruling 2026-10-02)
 
 Implementation briefings hand the worker the whole job. The minion selects
-the task-relevant BMAD skills by capability from the PROJECT's actual
-installed skill catalog/metadata and follows their current workflows —
+the task-relevant BMAD skills by capability from its session's actual
+skill catalog/metadata (the lane-bound GC-managed BMAD runtime plus the
+project's own skills) and follows their current workflows —
 names and workflow structure change between BMAD versions, so brief by
 the task, never by a fixed skill name. The selected workflow's built-in
 review runs on fresh, context-free reviewer contexts the minion

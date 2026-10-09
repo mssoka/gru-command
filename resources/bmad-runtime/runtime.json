@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "id": "bmad-method@6.12.0+gru-command-bmad.1",
+  "upstream": {
+    "package": "bmad-method",
+    "version": "6.12.0",
+    "tarball": "https://registry.npmjs.org/bmad-method/-/bmad-method-6.12.0.tgz",
+    "integrity": "sha512-gbbHo32TxCPwo4Yy70kqykFRwN5UdYqfnDKTsKAsF9m5qtLeoiCgEawj/LuzLBHLrYA0WTOyL/XWtXpgyDonMQ==",
+    "repository": "https://github.com/bmad-code-org/BMAD-METHOD",
+    "git_head": "05bfbd46d00766ec88eb9b42e76be2c575d64d7b",
+    "license": "MIT",
+    "files": {
+      "LICENSE": "0aa79baf6328b4a1e694ce10a12ffc36d7666554da128dff0e8fcda0fc536a66",
+      "src/bmm-skills/ship/bmad-build/SKILL.md": "1cdf5406965ba24236d2375739d839699eb56b619834490539d1bd3d5111f890",
+      "src/bmm-skills/ship/bmad-build/compile-epic-context.md": "6793b15ae85766cee529e6b349e45f2c6ec9e3212019611c29e8c77b4dc4b924",
+      "src/bmm-skills/ship/bmad-build/customize.toml": "0ee9b033a40640420d1dc3411de7428146d00bf8c1409c9a9cfe6c1743cd53b9",
+      "src/bmm-skills/ship/bmad-build/references/claims-check.md": "50ea17cb89a78ef815286dde2dabfd09f1dc9841d07a10857f88b39ab7b9bd2a",
+      "src/bmm-skills/ship/bmad-build/references/deletion-check.md": "0f1f124e4e957147e89164a272b10bedc694ad0d9ad2618c8610ac74ee9cb0da",
+      "src/bmm-skills/ship/bmad-build/review-prompts/edge-case-hunter.md": "8fc046af1cbf4ecc928207cec75e29c3c260adb86cc7da77537ade3b3a3b9448",
+      "src/bmm-skills/ship/bmad-build/review-prompts/verification-gap.md": "45ab0b8c4c56c5c055c97a293a8591a67e256d0b1a2058ce1f093cd866be8d03",
+      "src/bmm-skills/ship/bmad-build/spec-template.md": "e217325964857ebd90a9508bf171eddc2c4ad1b0b9b32a119775ac5c015695fd",
+      "src/bmm-skills/ship/bmad-build/step-01-clarify-and-route.md": "1e8095b08e9e9c57d9b24678b524e07d0b6bbb5af72ba213622f12a1c7d909cc",
+      "src/bmm-skills/ship/bmad-build/step-02-plan.md": "5c999430f818f58fc5e4f64309a1b0f81358ce0ddcfbd3f44b25d56279ef25d8",
+      "src/bmm-skills/ship/bmad-build/step-03-implement.md": "15fd02d2f655d4102c515134ed6aa40cd055bd9d811e49d529512f8f36d09b03",
+      "src/bmm-skills/ship/bmad-build/step-04-review.md": "f6b3f3fa5d3af0b324db2efee9351d4c348bdc0dfa4dad6c058eb4fd37921333",
+      "src/bmm-skills/ship/bmad-build/step-05-present.md": "551e0847e2ebb64575180a5dacca5786b9b9d7825dcd986e1b3b58442eaf713a",
+      "src/bmm-skills/ship/bmad-build/step-oneshot.md": "241fa52e227c048a5d8e4428bef0f153267475f697640899deb218b58ebfd378",
+      "src/bmm-skills/ship/bmad-build/sync-sprint-status.md": "7ff44d21f5d813f4993780271eec8df2fce1373f525ff80e595b7c10618c4c36",
+      "src/bmm-skills/ship/bmad-build/workflow.md": "481ff00ef349a9c7845feca02bbfd5722b1e318ccabac858355da6c90c2d8a39",
+      "src/scripts/config_utils.py": "48afe2bc18a29201e343cce3703be1e70df9c83ee74eeb68e57ef8ef42e8c651",
+      "src/scripts/render_skill.py": "8496d0d8b449d64c21b42a9aab3b13fc8a813a430c0695ffd84ad75bb1da7942"
+    }
+  },
+  "customization": {
+    "name": "gru-command-bmad",
+    "version": 1,
+    "files": {
+      ".claude-plugin/plugin.json": "9f82a9cd0c7a25b57a3c8787eb0f2505363504b21c1a3c6663055c159c58e5c9",
+      "NOTICE.md": "9a62c1f56114755001237cdfa3261ade7c40c4345f1fcf5d1edfc0e19026ad39",
+      "config/defaults.toml": "a6cf2885e2904542330bb42d6df6d86836b0a7d1266e02c4f6b6ff44f84e8601",
+      "customize/bmad-build.toml": "6b17debef882a3768dafa71eeab7d2cc81c4945af250186e9128e3e37e6d94f3",
+      "scripts/gc_render.py": "95a563f4145a8bfe0b742ffc858f940b0067bdf7a3410e27b6241e766210e762",
+      "skills/bmad-build/SKILL.md": "220aef7cf3edd4daa3fa1b51f3217811227307cc1dcf392e420f9c45367a441c"
+    }
+  },
+  "skills": [
+    "bmad-build"
+  ],
+  "optional_skill_references": [
+    "bmad-advanced-elicitation",
+    "bmad-party-mode",
+    "bmad-walkthrough"
+  ],
+  "layout": [
+    {
+      "path": ".claude-plugin/plugin.json",
+      "from": "gc/.claude-plugin/plugin.json"
+    },
+    {
+      "path": "config/defaults.toml",
+      "from": "gc/config/defaults.toml"
+    },
+    {
+      "path": "customize/bmad-build.toml",
+      "from": "gc/customize/bmad-build.toml"
+    },
+    {
+      "path": "LICENSE",
+      "from": "upstream/LICENSE"
+    },
+    {
+      "path": "NOTICE.md",
+      "from": "gc/NOTICE.md"
+    },
+    {
+      "path": "scripts/config_utils.py",
+      "from": "upstream/src/scripts/config_utils.py"
+    },
+    {
+      "path": "scripts/gc_render.py",
+      "from": "gc/scripts/gc_render.py"
+    },
+    {
+      "path": "scripts/render_skill.py",
+      "from": "upstream/src/scripts/render_skill.py"
+    },
+    {
+      "path": "skills/bmad-build/compile-epic-context.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/compile-epic-context.md"
+    },
+    {
+      "path": "skills/bmad-build/customize.toml",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/customize.toml"
+    },
+    {
+      "path": "skills/bmad-build/references/claims-check.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/references/claims-check.md"
+    },
+    {
+      "path": "skills/bmad-build/references/deletion-check.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/references/deletion-check.md"
+    },
+    {
+      "path": "skills/bmad-build/review-prompts/edge-case-hunter.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/review-prompts/edge-case-hunter.md"
+    },
+    {
+      "path": "skills/bmad-build/review-prompts/verification-gap.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/review-prompts/verification-gap.md"
+    },
+    {
+      "path": "skills/bmad-build/SKILL.md",
+      "from": "gc/skills/bmad-build/SKILL.md",
+      "replaces": "upstream/src/bmm-skills/ship/bmad-build/SKILL.md"
+    },
+    {
+      "path": "skills/bmad-build/spec-template.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/spec-template.md"
+    },
+    {
+      "path": "skills/bmad-build/step-01-clarify-and-route.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/step-01-clarify-and-route.md"
+    },
+    {
+      "path": "skills/bmad-build/step-02-plan.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/step-02-plan.md"
+    },
+    {
+      "path": "skills/bmad-build/step-03-implement.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/step-03-implement.md"
+    },
+    {
+      "path": "skills/bmad-build/step-04-review.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/step-04-review.md"
+    },
+    {
+      "path": "skills/bmad-build/step-05-present.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/step-05-present.md"
+    },
+    {
+      "path": "skills/bmad-build/step-oneshot.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/step-oneshot.md"
+    },
+    {
+      "path": "skills/bmad-build/sync-sprint-status.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/sync-sprint-status.md"
+    },
+    {
+      "path": "skills/bmad-build/workflow.md",
+      "from": "upstream/src/bmm-skills/ship/bmad-build/workflow.md"
+    }
+  ]
+}

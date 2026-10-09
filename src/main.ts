@@ -90,6 +90,7 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
+import { createBmadRuntimeBinder } from './bmad/runtime.js';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
 
@@ -530,6 +531,9 @@ async function main(): Promise<number> {
     config,
     store,
     log: (level, msg, fields) => logger.log(level, msg, fields),
+    // Issue #283: build-workflow sessions get the GC-managed BMAD runtime
+    // bound to their job lane (materialized under the data dir).
+    bmadRuntime: createBmadRuntimeBinder(join(config.dataDir, 'bmad-runtime')),
   });
   const growth = registry.boot();
   state.store = store;

@@ -1211,6 +1211,37 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     );
   });
 
+  it('a lane-bound managed BMAD runtime loads as a session plugin named in the prompt; reviews never get it', async () => {
+    const fx = fixture();
+    const managedSkills = {
+      source: 'gru-command-bmad',
+      runtimeId: 'bmad-method@6.12.0+gru-command-bmad.1',
+      contentSha256: 'b'.repeat(64),
+      root: join(fx.workspace, 'runtime-root'),
+      skillsDir: join(fx.workspace, 'runtime-root', 'skills'),
+      skills: ['bmad-build'],
+      laneBound: true,
+    };
+    const minion = await fx.runtime.spawn('minion', { managedSkills });
+    await minion.prompt('build this');
+    await minion.dispose();
+    const review = await fx.runtime.spawn('perkins', {
+      managedSkills,
+      isolatedReview: { systemPrompt: 'isolated policy', tools: [] },
+    });
+    await review.prompt('frozen diff only');
+    await review.dispose();
+    const [build, isolated] = doubleInvocations(fx);
+    expect(build!.argv[build!.argv.indexOf('--plugin-dir') + 1]).toBe(managedSkills.root);
+    const prompt = build!.argv[build!.argv.indexOf('--append-system-prompt') + 1]!;
+    expect(prompt).toContain('worker agent');
+    expect(prompt).toContain('## Gru Command BMAD runtime');
+    expect(prompt).toContain('`gru-command-bmad:bmad-build`');
+    expect(prompt).toContain('not a repo-local or global skill with the same base name');
+    expect(isolated!.argv).not.toContain('--plugin-dir');
+    expect(isolated!.argv[isolated!.argv.indexOf('--system-prompt') + 1]).toBe('isolated policy');
+  });
+
   it('enforces isolated-review tools and disables ambient Claude resources in argv', async () => {
     const fx = fixture();
     const handle = await fx.runtime.spawn('perkins', {
