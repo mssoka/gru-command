@@ -1489,17 +1489,17 @@ test('1200x900 dark: the FOR YOU essentials hold >=4.5:1 settled; the dim frame 
 
   // Transient state (no settlement): the body colour transition is running,
   // so the label measures mid-flight. Reproduce the artifact honestly.
-  const runningAnimations = await page.evaluate(() =>
-    document.getAnimations().filter((a) => a.playState === 'running').length);
+  const runningTransitions = await page.evaluate(() =>
+    document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState === 'running').length);
   const transientRatio = await contrastRatio(page, target);
-  expect(runningAnimations, 'a transition really was running (not a sleep)').toBeGreaterThan(0);
+  expect(runningTransitions, 'a real transition was running (not a sleep)').toBeGreaterThan(0);
 
   // Settled state: every animation finished, then the SAME label measures
   // the approved essential-text floor against its effective background.
   await settle(page);
   const stillRunning = await page.evaluate(() =>
-    document.getAnimations().filter((a) => a.playState === 'running').length);
-  expect(stillRunning, 'settlement is real: no animation still running').toBe(0);
+    document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState === 'running').length);
+  expect(stillRunning, 'settlement is real: no transition still running').toBe(0);
   const settledRatio = await contrastRatio(page, target);
   expect(settledRatio, `settled ${target} contrast (dark, 1200x900)`).toBeGreaterThanOrEqual(4.5);
   // The artifact and the steady state are different states, and the dim one
@@ -1518,12 +1518,27 @@ test('1200x900 dark: the FOR YOU essentials hold >=4.5:1 settled; the dim frame 
 async function settle(page: Page): Promise<void> {
   await page.evaluate(async () => {
     for (let pass = 0; pass < 60; pass += 1) {
-      const running = document.getAnimations().filter((a) => a.playState === 'running');
+      // Only FINITE transitions (the same discipline the contrast test uses):
+      // the page also runs infinite keyframe animations (conn-pulse,
+      // caret-blink) whose `finished` never resolves.
+      const running = document
+        .getAnimations()
+        .filter((a): a is CSSTransition => a instanceof CSSTransition && a.playState === 'running');
       if (running.length === 0) break;
       await Promise.all(running.map((a) => a.finished.catch(() => undefined)));
     }
   });
-  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    let frames = 0;
+    const tick = (): void => {
+      frames += 1;
+      if (frames >= 2) resolve();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    // rAF is faked under page.clock; a timer fallback keeps this bounded.
+    setTimeout(tick, 50);
+  }));
 }
 
 /** True contrast ratio of a selector's text against its effective
