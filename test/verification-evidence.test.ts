@@ -88,6 +88,17 @@ describe('selectNewestBoundVerification', () => {
     expect(renderRecordedVerification(selected, TARGET)).toContain('result: FAIL (exit 1)');
   });
 
+  it('selects a newer signaled or timed-out target run over an older green one', () => {
+    const signaled = seqEvent(6, passingPayload({ run_id: 'sig', ok: false, exit_code: null, signal: 'SIGKILL' }));
+    const timedOut = seqEvent(4, passingPayload({ run_id: 'to', ok: false, exit_code: null, signal: 'SIGTERM', timed_out: true }));
+    const green = seqEvent(1, passingPayload({ run_id: 'green', ok: true, exit_code: 0 }));
+    expect(selectNewestBoundVerification([signaled, timedOut, green], TARGET)).toBe(signaled);
+    expect(renderRecordedVerification(signaled, TARGET)).toContain('run_id: sig');
+    expect(renderRecordedVerification(signaled, TARGET)).toContain('result: FAIL (signal SIGKILL)');
+    expect(selectNewestBoundVerification([timedOut, green], TARGET)).toBe(timedOut);
+    expect(renderRecordedVerification(timedOut, TARGET)).toContain('result: FAIL (timed out)');
+  });
+
   it('returns null only after the stream is exhausted (complete absence)', () => {
     const history = [
       seqEvent(4, passingPayload({ sha: 'f'.repeat(40) })),

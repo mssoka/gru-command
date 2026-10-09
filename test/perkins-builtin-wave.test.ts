@@ -1925,7 +1925,10 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(frozenSpec).toContain('result: PASS (exit 0)');
     expect(frozenSpec).toContain('run_id: run-binding-newest');
     expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
-    expect(frozenSpec).not.toContain('window exceeded');
+    // Exactly ONE verification section, and the round really bound the
+    // target — not a vacuous "the exception text is absent" check.
+    expect(frozenSpec.match(/--- HOST-RECORDED VERIFICATION \(ledger-backed/gu)).toHaveLength(1);
+    expect(round.targetRef).toBe(target);
   });
 
   it('finds a binding run behind more than 200 newer nonqualifying completed runs (j-1594)', async () => {

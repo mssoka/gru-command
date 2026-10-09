@@ -1206,7 +1206,8 @@ export class LedgerApi {
    * never masquerade as an empty history. A first-captured `MAX(seq)`
    * watermark bounds every page (`cursor` starts one past it and only
    * decreases), so the page set stays stable and each row is visited
-   * exactly once. */
+   * exactly once. The returned iterator is single-use — consume it once
+   * inside the caller's loop (a second pass yields nothing). */
   *iterateJobVerificationCompleted(jobId: string, pageSize = 200): Generator<EventRecord, void, void> {
     if (!Number.isInteger(pageSize) || pageSize <= 0) {
       throw new Error(`iterateJobVerificationCompleted pageSize must be a positive integer (got ${String(pageSize)})`);
