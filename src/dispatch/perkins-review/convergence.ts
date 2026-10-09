@@ -312,8 +312,9 @@ export function parseDeltaHunks(diff: string): readonly DeltaHunk[] {
 }
 
 /** Read one bounded `git diff` and parse it into delta structure. Shared by
- * the commit-to-commit delta and the integration unit (whose `from` is an
- * auto-merge TREE). Throws when git cannot produce the diff. */
+ * the commit-to-commit delta and the integration unit (which is assembled
+ * from explicit paths via `diffForPaths`). Throws when git cannot produce
+ * the diff. */
 function boundedDelta(repoPath: string, fromSha: string, toSha: string, label: string): DeltaSince {
   let diff: string;
   try {
@@ -345,32 +346,38 @@ export function deltaSince(repoPath: string, fromSha: string, toSha: string): De
 
 /** The integration review unit: the feature head H0 a prior round covered,
  * the prior pinned base B0, and the advanced incoming base B1. The unit is
- * the part of the new whole diff `B1..H1` whose per-path content differs from
- * the prior round's frozen whole diff `B0..H0`: unchanged feature work (its
- * per-path diff is byte-identical) and incoming-base-only files (absent from
- * `B1..H1`) drop out, while manual conflict resolutions, new feature edits
- * and BOTH-sides interaction sites are all reviewed. `carryPaths` is every
- * path whose content changed between H0 and H1 — the sound "changed since the
- * prior review" set for carry-forward (a superset of the unit, naming the
- * incoming-base-only files too). */
+ * the part of the new whole diff `B1..H1` whose per-path content OR file
+ * mode differs from the prior round's frozen whole diff `B0..H0`: unchanged
+ * feature work (identical per-path blobs and modes) and incoming-base-only
+ * files (absent from `B1..H1`) drop out, while manual conflict resolutions
+ * that leave the candidate differing from the incoming base, new feature
+ * edits and BOTH-sides interaction sites are all reviewed. A resolution that
+ * makes H1 match B1 on a feature-touched path leaves no candidate change to
+ * review (the path is absent from `B1..H1`), so it is not in the unit.
+ * `carryPaths` is every path whose content or mode changed between H0 and H1
+ * — the sound "changed since the prior covered head" set for carry-forward,
+ * so a base-changed file is re-verified even when it is not in the unit. */
 export interface IntegrationDelta extends DeltaSince {
   readonly priorTargetSha: string;
   readonly priorDiffBaseSha: string;
   readonly incomingBaseSha: string;
   /** The integration-unit paths (new/changed review work). */
   readonly integrationPaths: readonly string[];
-  /** Paths whose content changed between H0 and H1 (carry-forward scope). */
+  /** Paths whose content or mode changed between H0 and H1 (carry scope). */
   readonly carryPaths: ReadonlySet<string>;
 }
 
 interface RawChange {
+  readonly oldMode: string;
+  readonly newMode: string;
   readonly oldSha: string;
   readonly newSha: string;
 }
 
-/** Per-path blob pair of a `git diff --raw -z --no-renames` change set. The
- * NUL-delimited form needs no C-unquote decoding; a path that does not
- * decode as UTF-8 refuses (the caller falls back to a whole review). */
+/** Per-path blob pair and modes of a `git diff --raw -z --no-renames
+ * --abbrev=40` change set. The NUL-delimited form needs no C-unquote
+ * decoding; a path that does not decode as UTF-8 refuses (the caller falls
+ * back to a whole review). Modes are kept so a mode-only change is not lost. */
 function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<string, RawChange> {
   let output: string;
   try {
@@ -385,13 +392,13 @@ function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<strin
   for (let index = 0; index < fields.length; index += 1) {
     const header = fields[index]!;
     if (!header.startsWith(':')) continue;
-    const match = /^:[0-7]{6} [0-7]{6} ([0-9a-f]{40}) ([0-9a-f]{40}) [A-Z]\d*$/u.exec(header);
+    const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) [A-Z]\d*$/u.exec(header);
     if (match === null) continue;
     const path = fields[index + 1];
     if (path === undefined || path === '') continue;
     index += 1;
     if (path.includes('\uFFFD')) throw new Error('a changed path is not valid UTF-8');
-    changes.set(path, { oldSha: match[1]!, newSha: match[2]! });
+    changes.set(path, { oldMode: match[1]!, newMode: match[2]!, oldSha: match[3]!, newSha: match[4]! });
   }
   return changes;
 }
@@ -432,10 +439,11 @@ export function integrationSince(
   const integrationPaths = [...now.keys()].filter((path) => {
     const before = prior.get(path);
     const after = now.get(path)!;
-    // Untouched since the prior review: same old AND new blobs. A path the
-    // feature never changed (absent from the prior diff) is new work.
+    // Untouched since the prior review: same old AND new blobs and modes. A
+    // path the feature never changed (absent from the prior diff) is new work.
     if (before === undefined) return true;
-    return before.oldSha !== after.oldSha || before.newSha !== after.newSha;
+    return before.oldSha !== after.oldSha || before.newSha !== after.newSha ||
+      before.oldMode !== after.oldMode || before.newMode !== after.newMode;
   }).sort();
   if (integrationPaths.length > INTEGRATION_UNIT_MAX_PATHS) {
     throw new Error(`integration unit touches ${integrationPaths.length} paths, over the ${INTEGRATION_UNIT_MAX_PATHS}-path bound`);
@@ -528,10 +536,11 @@ export interface PriorCarryClassification {
   readonly reason: string;
 }
 
-/** Classify every prior finding for a delta round. A prior is CARRIED only
- * when the minion did not claim it fixed, its cited file was untouched by
- * this round's delta, and its quoted evidence still appears verbatim in the
- * frozen tree at that path. Everything else is re-verified by the lead. */
+/** Classify every prior finding for an incremental (delta or integration)
+ * round. A prior is CARRIED only when the minion did not claim it fixed, its
+ * cited file is NOT in the round's "changed since the prior reviewed head"
+ * path set, and its quoted evidence still appears verbatim in the frozen
+ * tree at that path. Everything else is re-verified by the lead. */
 export function classifyPriorFindings(input: {
   readonly prior: readonly VerifiedFinding[];
   readonly touchedPaths: ReadonlySet<string>;
@@ -549,11 +558,11 @@ export function classifyPriorFindings(input: {
       return { priorIndex, status: 'reverify', reason: 'location names no reviewable file path' };
     }
     if (input.touchedPaths.has(parsed.path)) {
-      return { priorIndex, status: 'reverify', reason: 'code at the cited file changed in this round\'s delta' };
+      return { priorIndex, status: 'reverify', reason: 'code at the cited file changed since the prior reviewed head' };
     }
     const evidence = finding.evidence;
     if (evidence !== 'N/A' && evidence.trim() !== '' && input.frozenBlobContains(parsed.path, evidence)) {
-      return { priorIndex, status: 'carried', reason: 'quoted evidence unchanged in the frozen tree and the cited file untouched' };
+      return { priorIndex, status: 'carried', reason: 'quoted evidence unchanged in the frozen tree and the cited file unchanged since the prior reviewed head' };
     }
     return { priorIndex, status: 'reverify', reason: 'quoted evidence could not be confirmed unchanged in the frozen tree' };
   });
@@ -657,9 +666,12 @@ export function planReviewScope(input: {
     if (input.integrationCoverage === true && input.acceptanceCompatible === true &&
       prior.targetSha !== input.currentTargetSha &&
       lineage !== null && lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned) {
+      const coverage = prior.coverageComplete
+        ? 'the retained prior coverage covers the whole candidate'
+        : 'the retained prior coverage is only partial, so this READY still owes the final whole pass';
       return {
         scope: 'integration',
-        reason: `prior coverage retained: merge base ${prior.diffBaseSha.slice(0, 12)} advanced to ${input.currentDiffBaseSha.slice(0, 12)} and reviewed feature head ${prior.targetSha.slice(0, 12)} integrated forward into the current candidate`,
+        reason: `prior coverage retained: merge base ${prior.diffBaseSha.slice(0, 12)} advanced to ${input.currentDiffBaseSha.slice(0, 12)} and reviewed feature head ${prior.targetSha.slice(0, 12)} integrated forward into the current candidate; ${coverage}`,
       };
     }
     const fallback = input.integrationCoverage !== true
@@ -670,7 +682,11 @@ export function planReviewScope(input: {
           ? 'merge base moved but the reviewed feature head did not advance — whole-change re-verification'
           : lineage === null
             ? 'merge base moved and the integration lineage could not be established — whole-change re-verification'
-            : 'merge base moved without a forward integration of the reviewed feature head — whole-change re-verification';
+            : !lineage.baseAdvanced
+              ? 'merge base moved and the prior base no longer descends into the current base (rewritten base) — whole-change re-verification'
+              : !lineage.featureIntegrated
+                ? 'merge base moved and the reviewed feature head no longer descends into the current candidate (rebased/rewritten head) — whole-change re-verification'
+                : 'merge base moved and the prior base is no longer the shared ancestor of the reviewed head and the current base — whole-change re-verification';
     return { scope: 'whole', reason: fallback };
   }
   if (
@@ -698,6 +714,9 @@ export interface PriorConvergenceMeta {
   /** The prior round's bound acceptance (null when none was recorded):
    * retained coverage only applies while the effective acceptance matches. */
   readonly acceptance: { readonly version: number; readonly contractSha256: string } | null;
+  /** The prior round's durable whole-candidate coverage bit (false for a
+   * partial delta/integration round or a legacy record without the field). */
+  readonly coverageComplete: boolean;
 }
 
 const MAX_CONSOLIDATED_META_BYTES = 8 * 1024 * 1024;
@@ -719,7 +738,7 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       complete?: unknown;
       headMoved?: unknown;
       frozen?: { targetSha?: unknown; diffBaseSha?: unknown; acceptance?: unknown };
-      convergence?: { reviewScope?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
+      convergence?: { reviewScope?: unknown; coverageComplete?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
     };
     if (parsed.schemaVersion !== 3 || parsed.architecture !== 'perkins-whole-pr' ||
       parsed.complete !== true || parsed.headMoved !== false ||
@@ -739,12 +758,22 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       }
       if (linkage.integrationBaseSha !== parsed.frozen.diffBaseSha) return null;
     }
-    const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; contractSha256?: unknown } | undefined;
-    const acceptance = rawAcceptance !== null && typeof rawAcceptance === 'object' &&
-      typeof rawAcceptance.version === 'number' && Number.isSafeInteger(rawAcceptance.version) &&
-      typeof rawAcceptance.contractSha256 === 'string' && /^[a-f0-9]{64}$/u.test(rawAcceptance.contractSha256)
-      ? { version: rawAcceptance.version, contractSha256: rawAcceptance.contractSha256 }
-      : null;
+    const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; contractSha256?: unknown } | null | undefined;
+    // A PRESENT but malformed acceptance binding is damaged provenance, not
+    // an absent one: fail closed (no inherited coverage) rather than treat
+    // it as "no acceptance".
+    if (rawAcceptance !== undefined && rawAcceptance !== null &&
+      !(typeof rawAcceptance === 'object' &&
+        typeof rawAcceptance.version === 'number' && Number.isSafeInteger(rawAcceptance.version) &&
+        typeof rawAcceptance.contractSha256 === 'string' && /^[a-f0-9]{64}$/u.test(rawAcceptance.contractSha256))) {
+      return null;
+    }
+    const acceptance = rawAcceptance === null || rawAcceptance === undefined
+      ? null
+      : { version: rawAcceptance.version as number, contractSha256: rawAcceptance.contractSha256 as string };
+    const coverageComplete = parsed.convergence?.coverageComplete === true
+      ? (scope === 'whole' || scope === 'integration')
+      : parsed.convergence?.coverageComplete === undefined && scope === 'whole';
     return {
       seq,
       reviewScope: scope === 'whole' || scope === 'delta' || scope === 'integration' ? scope : 'unknown',
@@ -752,8 +781,53 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       targetSha: parsed.frozen.targetSha,
       diffBaseSha: parsed.frozen.diffBaseSha,
       acceptance,
+      coverageComplete,
     };
   } catch {
     return null;
   }
+}
+
+/** One call that plans the production round scope: read the prior durable
+ * record, compare the effective acceptance, probe the integration lineage in
+ * the repo, and decide. Keeps the perkins.ts wiring testable end to end. */
+export function planPerkinsReviewScope(input: {
+  readonly priorConsolidatedFile?: string;
+  readonly priorSeq?: number;
+  readonly repoPath: string;
+  readonly currentTargetSha: string;
+  readonly currentDiffBaseSha: string;
+  readonly currentAcceptance: { readonly version: number; readonly contractSha256: string } | undefined;
+  readonly rules: {
+    readonly deltaRoundsFrom: number;
+    readonly finalWholePassAtReady: boolean;
+    readonly integrationCoverage: boolean;
+  };
+}): ReviewScopePlan {
+  const prior = input.priorConsolidatedFile !== undefined && input.priorSeq !== undefined
+    ? readPriorConvergenceMeta(input.priorConsolidatedFile, input.priorSeq)
+    : null;
+  const priorAcceptance = prior?.acceptance ?? null;
+  const acceptanceCompatible = input.currentAcceptance === undefined
+    ? priorAcceptance === null
+    : priorAcceptance !== null && priorAcceptance.version === input.currentAcceptance.version &&
+      priorAcceptance.contractSha256 === input.currentAcceptance.contractSha256;
+  const integrationLineage = prior !== null && prior.diffBaseSha !== input.currentDiffBaseSha
+    ? probeIntegrationLineage(input.repoPath, {
+        priorDiffBaseSha: prior.diffBaseSha,
+        priorTargetSha: prior.targetSha,
+        currentDiffBaseSha: input.currentDiffBaseSha,
+        currentTargetSha: input.currentTargetSha,
+      })
+    : null;
+  return planReviewScope({
+    prior,
+    currentTargetSha: input.currentTargetSha,
+    currentDiffBaseSha: input.currentDiffBaseSha,
+    deltaRoundsFrom: input.rules.deltaRoundsFrom,
+    finalWholePassAtReady: input.rules.finalWholePassAtReady,
+    integrationCoverage: input.rules.integrationCoverage,
+    integrationLineage,
+    acceptanceCompatible,
+  });
 }

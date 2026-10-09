@@ -10,6 +10,7 @@ import {
   findingIntersectsDelta,
   integrationSince,
   planReviewScope,
+  planPerkinsReviewScope,
   probeIntegrationLineage,
   parseDeltaHunks,
   parseFindingLocation,
@@ -400,6 +401,68 @@ describe('integration unit (retained coverage across an advanced base)', () => {
       priorDiffBaseSha: 'main', priorTargetSha: h0, currentDiffBaseSha: b1, currentTargetSha: h1,
     })).toBeNull();
   });
+
+  it('keeps a mode-only change inside the unit and the carry scope', () => {
+    const repo = makeFixtureRepo('perkins-integration-mode');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/mode']);
+    const h0 = repo.commitFile('src/script.sh', '#!/bin/sh\necho hi\n');
+    repo.git(['checkout', 'main']);
+    const b1 = repo.commitFile('src/mainonly.ts', 'export const mainonly = 1;\n');
+    repo.git(['checkout', 'feature/mode']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    // A mode-only change after the merge, committed as the new integration head.
+    repo.git(['update-index', '--chmod=+x', 'src/script.sh']);
+    repo.git(['commit', '-m', 'make script executable']);
+    const h1 = repo.head();
+
+    const unit = integrationSince(repo.path, h0, b0, b1, h1);
+    expect(unit.integrationPaths).toContain('src/script.sh');
+    expect(unit.carryPaths.has('src/script.sh')).toBe(true);
+  });
+});
+
+describe('production scope planning wiring (planPerkinsReviewScope)', () => {
+  it('plans integration from a real prior record and repo lineage, and falls back on acceptance mismatch', () => {
+    const repo = makeFixtureRepo('perkins-scope-wiring');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    const root = temp('perkins-scope-wiring-artifacts-');
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/wiring']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    repo.git(['checkout', 'main']);
+    const b1 = repo.commitFile('src/mainonly.ts', 'export const mainonly = 1;\n');
+    repo.git(['checkout', 'feature/wiring']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    const h1 = repo.head();
+    const priorFile = join(root, 'prior.json');
+    writeFileSync(priorFile, JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: h0, diffBaseSha: b0 },
+      convergence: { reviewScope: 'whole', coverageComplete: true },
+    }));
+    const rules = { deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true };
+
+    const plan = planPerkinsReviewScope({
+      priorConsolidatedFile: priorFile, priorSeq: 1, repoPath: repo.path,
+      currentTargetSha: h1, currentDiffBaseSha: b1, currentAcceptance: undefined, rules,
+    });
+    expect(plan.scope).toBe('integration');
+    expect(plan.reason).toContain('whole candidate');
+
+    const mismatched = planPerkinsReviewScope({
+      priorConsolidatedFile: priorFile, priorSeq: 1, repoPath: repo.path,
+      currentTargetSha: h1, currentDiffBaseSha: b1,
+      currentAcceptance: { version: 1, contractSha256: 'a'.repeat(64) }, rules,
+    });
+    expect(mismatched.scope).toBe('whole');
+    expect(mismatched.reason).toContain('acceptance');
+  });
 });
 
 describe('prior carry-forward classification', () => {
@@ -424,7 +487,7 @@ describe('prior carry-forward classification', () => {
       frozenBlobContains: (path, evidence) => path === 'src/kept.ts' && evidence === 'const stable = true;',
     });
     expect(classifications).toEqual([
-      { priorIndex: 0, status: 'carried', reason: 'quoted evidence unchanged in the frozen tree and the cited file untouched' },
+      { priorIndex: 0, status: 'carried', reason: 'quoted evidence unchanged in the frozen tree and the cited file unchanged since the prior reviewed head' },
     ]);
   });
 
@@ -435,7 +498,7 @@ describe('prior carry-forward classification', () => {
       frozenBlobContains: () => true,
     });
     expect(classifications[0]!.status).toBe('reverify');
-    expect(classifications[0]!.reason).toContain('changed in this round\'s delta');
+    expect(classifications[0]!.reason).toContain('changed since the prior reviewed head');
   });
 
   it('re-verifies priors the minion claimed fixed, before any other rule', () => {
@@ -514,6 +577,7 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
     targetSha: TARGET,
     diffBaseSha: BASE,
     acceptance: null,
+    coverageComplete: false,
     ...overrides,
   });
   const scope = (prior: ReturnType<typeof meta> | null, overrides: Partial<{ currentTargetSha: string; currentDiffBaseSha: string; finalWholePassAtReady: boolean; integrationLineage: { baseAdvanced: boolean; featureIntegrated: boolean; commonBasePinned: boolean } | null; integrationCoverage: boolean; acceptanceCompatible: boolean }> = {}) => planReviewScope({
@@ -622,7 +686,7 @@ describe('prior convergence meta read (tolerant)', () => {
     };
     writeFileSync(file, JSON.stringify(modern));
     expect(readPriorConvergenceMeta(file, 4)).toEqual({
-      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null,
+      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null, coverageComplete: false,
     });
     writeFileSync(file, JSON.stringify({ ...modern, convergence: undefined }));
     expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('unknown');
@@ -648,6 +712,29 @@ describe('prior convergence meta read (tolerant)', () => {
     // A damaged linkage is not inherited coverage: it reads as no record.
     writeFileSync(file, JSON.stringify({ ...integrated, convergence: { reviewScope: 'integration', integrationFromSha: 'a'.repeat(40) } }));
     expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+  });
+
+  it('fails closed on a present-but-malformed acceptance binding', () => {
+    const root = temp('perkins-meta-acceptance-');
+    const file = join(root, 'consolidated.json');
+    const base = {
+      schemaVersion: 3,
+      architecture: 'perkins-whole-pr',
+      canonicalVerdict: 'READY TO MERGE',
+      complete: true,
+      headMoved: false,
+      frozen: { targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: { version: 'nope', contractSha256: 'xyz' } },
+      convergence: { reviewScope: 'whole', coverageComplete: true },
+    };
+    writeFileSync(file, JSON.stringify(base));
+    expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    // A present, VALID binding parses and preserves the coverage bit.
+    writeFileSync(file, JSON.stringify({
+      ...base, frozen: { ...base.frozen, acceptance: { version: 2, contractSha256: 'a'.repeat(64) } },
+    }));
+    const meta = readPriorConvergenceMeta(file, 4);
+    expect(meta?.acceptance).toEqual({ version: 2, contractSha256: 'a'.repeat(64) });
+    expect(meta?.coverageComplete).toBe(true);
   });
 
   it('returns null for INCOMPLETE, incomplete, or damaged records', () => {

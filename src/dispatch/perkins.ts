@@ -31,7 +31,7 @@ import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/t
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
-import { planReviewScope, probeIntegrationLineage, readPriorConvergenceMeta } from './perkins-review/convergence.js';
+import { planPerkinsReviewScope } from './perkins-review/convergence.js';
 import {
   freezeReviewInputs,
   compatibleReviewIdentity,
@@ -366,7 +366,7 @@ export function hostDisclosureAppendix(
     ...(prior.length > 0 ? [`- Prior findings revisited: ${prior.length} (${priorFixed} fixed, ${priorStill} still present)`] : []),
     ...(review.convergence === undefined ? [] : [
       `- Review scope: ${review.convergence.reviewScope === 'integration'
-        ? `integration review — prior coverage retained for the unchanged feature work; the review unit is the new integration/conflict-resolution work${review.convergence.integrationFromSha !== undefined ? ` since ${review.convergence.integrationFromSha}` : ''} integrated with base ${review.convergence.integrationBaseSha ?? review.convergence.deltaFromSha ?? 'n/a'}${review.convergence.deltaUnavailable !== undefined ? ` (integration unit UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}`
+        ? `integration review — prior coverage retained for the unchanged feature work; the review unit is the new integration/conflict-resolution work${review.convergence.integrationFromSha !== undefined ? ` since ${review.convergence.integrationFromSha}` : ''} integrated with base ${review.convergence.integrationBaseSha ?? 'n/a'}`
         : review.convergence.reviewScope === 'delta'
           ? `delta since the last reviewed SHA${review.convergence.deltaUnavailable !== undefined ? ` (delta UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}`
           : 'whole change (standing authority)'}`,
@@ -4936,32 +4936,19 @@ export class WaveRunner {
       // the two share exactly the pinned prior base, and the effective
       // acceptance is unchanged — otherwise the round reviews whole (with a
       // durable reason).
-      const priorMeta = priorConsolidatedFile !== undefined && newestPredecessor !== undefined
-        ? readPriorConvergenceMeta(priorConsolidatedFile, newestPredecessor.seq)
-        : null;
-      const currentAcceptance = frozenReview.manifest.acceptance;
-      const priorAcceptance = priorMeta?.acceptance ?? null;
-      const acceptanceCompatible = currentAcceptance === undefined
-        ? priorAcceptance === null
-        : priorAcceptance !== null && priorAcceptance.version === currentAcceptance.version &&
-          priorAcceptance.contractSha256 === currentAcceptance.contractSha256;
-      const integrationLineage = priorMeta !== null && priorMeta.diffBaseSha !== frozenReview.manifest.diffBaseSha
-        ? probeIntegrationLineage(frozenReview.manifest.repoPath, {
-            priorDiffBaseSha: priorMeta.diffBaseSha,
-            priorTargetSha: priorMeta.targetSha,
-            currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
-            currentTargetSha: frozenReview.manifest.targetSha,
-          })
-        : null;
-      const scopePlan = planReviewScope({
-        prior: priorMeta,
+      const scopePlan = planPerkinsReviewScope({
+        ...(priorConsolidatedFile !== undefined && newestPredecessor !== undefined
+          ? { priorConsolidatedFile, priorSeq: newestPredecessor.seq }
+          : {}),
+        repoPath: frozenReview.manifest.repoPath,
         currentTargetSha: frozenReview.manifest.targetSha,
         currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
-        deltaRoundsFrom: policy.portableContract.rules.convergence.deltaRoundsFrom,
-        finalWholePassAtReady: policy.portableContract.rules.convergence.finalWholePassAtReady,
-        integrationCoverage: policy.portableContract.rules.convergence.integrationCoverage,
-        integrationLineage,
-        acceptanceCompatible,
+        currentAcceptance: frozenReview.manifest.acceptance,
+        rules: {
+          deltaRoundsFrom: policy.portableContract.rules.convergence.deltaRoundsFrom,
+          finalWholePassAtReady: policy.portableContract.rules.convergence.finalWholePassAtReady,
+          integrationCoverage: policy.portableContract.rules.convergence.integrationCoverage,
+        },
       });
       review = await workflow.run({
         roundId: round.id,

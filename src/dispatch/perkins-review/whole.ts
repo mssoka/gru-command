@@ -7,7 +7,7 @@ import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
 import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
-import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, integrationSince, type DeltaSince, type PriorCarryClassification } from './convergence.js';
+import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, integrationSince, probeIntegrationLineage, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -1175,6 +1175,9 @@ export class PerkinsWholeReview {
     if (input.reviewScope === 'integration' && reviewScope !== 'integration') {
       scopeReason = 'integration scope requested without a conclusive prior target/base — whole-change re-verification';
     }
+    if (input.reviewScope === 'delta' && reviewScope !== 'delta') {
+      scopeReason = 'delta scope requested without a conclusive prior target/base — whole-change re-verification';
+    }
     let delta: DeltaSince | null = null;
     let deltaUnavailable: string | null = null;
     let integrationLinkage: { readonly priorTargetSha: string; readonly priorDiffBaseSha: string; readonly incomingBaseSha: string; readonly sha256: string } | null = null;
@@ -1187,6 +1190,18 @@ export class PerkinsWholeReview {
       }
     } else if (reviewScope === 'integration') {
       try {
+        // Re-prove the lineage inside the engine before reading the unit: a
+        // direct caller cannot produce a durable integration record whose
+        // provenance the host never checked.
+        const lineage = probeIntegrationLineage(review.manifest.repoPath, {
+          priorDiffBaseSha: priorReview.diffBaseSha!,
+          priorTargetSha: priorReview.targetSha!,
+          currentDiffBaseSha: review.manifest.diffBaseSha,
+          currentTargetSha: review.manifest.targetSha,
+        });
+        if (lineage === null || !lineage.baseAdvanced || !lineage.featureIntegrated || !lineage.commonBasePinned) {
+          throw new Error('integration lineage could not be re-proven for this prior target/base');
+        }
         const integration = integrationSince(
           review.manifest.repoPath, priorReview.targetSha!, priorReview.diffBaseSha!,
           review.manifest.diffBaseSha, review.manifest.targetSha,
@@ -1206,10 +1221,15 @@ export class PerkinsWholeReview {
       } catch (error) {
         // A damaged/unreadable integration unit is a coverage gap: fall back
         // to the whole-change authority with the reason disclosed, never a
-        // silent restart and never inherited coverage.
+        // silent restart and never inherited coverage. ALL derived state is
+        // reset — a stale unit would otherwise render a mislabeled delta
+        // block in the whole-change prompt.
         deltaUnavailable = sanitizeError(error);
         scopeReason = `integration scope planned but the integration unit was unreadable (${deltaUnavailable}) — whole-change re-verification`;
         reviewScope = 'whole';
+        delta = null;
+        integrationCarryPaths = null;
+        integrationLinkage = null;
       }
     }
     const carriesForward = reviewScope === 'delta' || reviewScope === 'integration';
@@ -3029,7 +3049,7 @@ export class PerkinsWholeReview {
       ].join('\n')
       : '';
     const scopeHeader = integrationRound
-      ? `REVIEW SCOPE: INTEGRATION ROUND — the reviewed feature head ${priorTargetSha} was integrated with an advanced base (new frozen diff base ${review.manifest.diffBaseSha}); the host RETAINS the prior review of the unchanged feature work. The review unit is the new integration/conflict-resolution work since the prior covered candidate (below); unchanged incoming base code is baseline context, NOT new PR work. The complete frozen diff above stays your review context — judge the interactions across this boundary. The delta convergence rule does NOT apply in an integration round: a finding the integration introduced holds the PR wherever its evidence lies.`
+      ? `REVIEW SCOPE: INTEGRATION ROUND — the reviewed feature head ${priorTargetSha} was integrated with an advanced base (new frozen diff base ${review.manifest.diffBaseSha}); the host retains the prior review of the unchanged feature work where its evidence still holds. The review unit is the new integration/conflict-resolution work since the prior covered candidate (below); unchanged incoming base code is baseline context, NOT new PR work. The complete frozen diff above stays your review context — judge the interactions across this boundary. The delta convergence rule does NOT apply in an integration round: a finding the integration introduced holds the PR wherever its evidence lies.`
       : deltaRound
         ? `REVIEW SCOPE: DELTA ROUND — the review unit is the delta since the last reviewed SHA (${priorTargetSha}..${review.manifest.targetSha}). Prior lens results stand for lenses with no open findings and no relevance to this delta; run a lens only where the delta or an open finding needs its fresh view.`
         : priorTargetSha !== null

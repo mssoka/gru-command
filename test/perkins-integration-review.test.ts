@@ -1,4 +1,4 @@
-import { readFileSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -84,11 +84,11 @@ function featureHead(repo: FixtureRepo, file: string, content: string): { readon
   return { b0, h0 };
 }
 
-/** Main advances to B1 (touching only its own file) and the feature merges it
- * cleanly into H1: no conflict resolution. */
-function integrateClean(repo: FixtureRepo): { readonly b1: string; readonly h1: string } {
+/** Main advances by one file and the feature merges it cleanly into a new
+ * integration head. */
+function integrateClean(repo: FixtureRepo, file = 'src/mainonly.ts', content = 'export const mainonly = 1;\n'): { readonly b1: string; readonly h1: string } {
   repo.git(['checkout', 'main']);
-  const b1 = repo.commitFile('src/mainonly.ts', 'export const mainonly = 1;\n');
+  const b1 = repo.commitFile(file, content);
   repo.git(['checkout', 'feature/integration']);
   repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
   return { b1, h1: repo.head() };
@@ -238,61 +238,99 @@ describe('native integration review retains prior coverage', () => {
 
   it('never launders a partial-coverage integration record into whole-complete coverage', async () => {
     const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
-    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
     const frozen1 = freeze(harness, 'ch-round-1', h0);
     await runRound(harness, { roundId: 'ch-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'ch-round-1'), 'consolidated.json');
 
-    // A prior `integration` record that itself OWED the final whole pass
-    // (partial coverage) and never got it: the next integration must NOT read
-    // it as whole-complete.
-    const record = JSON.parse(readFileSync(consolidated1, 'utf8')) as { convergence: Record<string, unknown>; frozen: { diffBaseSha: string } };
-    const { b1, h1 } = integrateClean(harness.repo);
-    record.convergence['reviewScope'] = 'integration';
-    record.convergence['integrationFromSha'] = h0;
-    record.convergence['integrationBaseSha'] = b1;
-    record.convergence['integrationPriorDiffBase'] = b0;
-    record.convergence['finalPassRequired'] = true;
-    delete record.convergence['coverageComplete'];
-    record.frozen.diffBaseSha = b1;
-    const partialIntegration = join(harness.root, 'ch-partial-integration.json');
-    writeFileSync(partialIntegration, JSON.stringify(record));
-
-    const frozen2 = freeze(harness, 'ch-round-2', h1);
+    // Round 2: a REAL integration round retaining whole-complete coverage.
+    const first = integrateClean(harness.repo, 'src/main1.ts', 'export const main1 = 1;\n');
+    const frozen2 = freeze(harness, 'ch-round-2', first.h1);
     const round2 = await runRound(harness, {
       roundId: 'ch-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    expect(round2.convergence).toMatchObject({ reviewScope: 'integration', coverageComplete: true });
+
+    // Make it a PARTIAL-coverage integration record (its own READY owed the
+    // final pass and never got it): the next integration must not read it as
+    // whole-complete.
+    const record2 = JSON.parse(readFileSync(join(reviewArtifactDirectory(harness.root, 'ch-round-2'), 'consolidated.json'), 'utf8')) as {
+      convergence: Record<string, unknown>;
+    };
+    delete record2.convergence['coverageComplete'];
+    record2.convergence['finalPassRequired'] = true;
+    const partialIntegration = join(harness.root, 'ch-partial-integration.json');
+    writeFileSync(partialIntegration, JSON.stringify(record2));
+
+    const second = integrateClean(harness.repo, 'src/main2.ts', 'export const main2 = 2;\n');
+    const frozen3 = freeze(harness, 'ch-round-3', second.h1);
+    const round3 = await runRound(harness, {
+      roundId: 'ch-round-3', roundNumber: 3, frozen: frozen3,
       reviewScope: 'integration', priorConsolidatedFile: partialIntegration,
     });
-    // The bit is absent on the prior record, so this READY still owes the pass.
-    expect(round2.canonicalVerdict).toBe('READY TO MERGE');
-    expect(round2.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
+    // The prior carries no whole-candidate bit, so this READY still owes the pass.
+    expect(round3.canonicalVerdict).toBe('READY TO MERGE');
+    expect(round3.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
   });
 
   it('fails closed on a damaged integration coverage link', async () => {
     const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
-    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
     const frozen1 = freeze(harness, 'dl-round-1', h0);
     await runRound(harness, { roundId: 'dl-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'dl-round-1'), 'consolidated.json');
-    const { b1, h1 } = integrateClean(harness.repo);
-    // A shape-valid `integration` claim whose linkage is missing a field is
-    // damaged: it cannot be whole-complete coverage.
-    const record = JSON.parse(readFileSync(consolidated1, 'utf8')) as { convergence: Record<string, unknown>; frozen: { diffBaseSha: string } };
-    record.convergence['reviewScope'] = 'integration';
-    record.convergence['integrationFromSha'] = h0;
-    record.convergence['integrationBaseSha'] = b1;
-    delete record.convergence['integrationPriorDiffBase'];
-    record.frozen.diffBaseSha = b1;
-    const damaged = join(harness.root, 'dl-damaged.json');
-    writeFileSync(damaged, JSON.stringify(record));
-
-    const frozen2 = freeze(harness, 'dl-round-2', h1);
-    const round2 = await runRound(harness, {
+    const first = integrateClean(harness.repo, 'src/main1.ts', 'export const main1 = 1;\n');
+    const frozen2 = freeze(harness, 'dl-round-2', first.h1);
+    await runRound(harness, {
       roundId: 'dl-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    // A shape-valid `integration` record whose linkage is missing a field is
+    // damaged: it cannot be whole-complete coverage.
+    const record2 = JSON.parse(readFileSync(join(reviewArtifactDirectory(harness.root, 'dl-round-2'), 'consolidated.json'), 'utf8')) as {
+      convergence: Record<string, unknown>;
+    };
+    delete record2.convergence['integrationPriorDiffBase'];
+    const damaged = join(harness.root, 'dl-damaged.json');
+    writeFileSync(damaged, JSON.stringify(record2));
+
+    const second = integrateClean(harness.repo, 'src/main2.ts', 'export const main2 = 2;\n');
+    const frozen3 = freeze(harness, 'dl-round-3', second.h1);
+    const round3 = await runRound(harness, {
+      roundId: 'dl-round-3', roundNumber: 3, frozen: frozen3,
       reviewScope: 'integration', priorConsolidatedFile: damaged,
     });
-    expect(round2.canonicalVerdict).toBe('READY TO MERGE');
-    expect(round2.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
+    expect(round3.canonicalVerdict).toBe('READY TO MERGE');
+    expect(round3.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
+  });
+
+  it('discloses a whole fallback with no stale unit when the integration artifact cannot be written', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'aw-round-1', h0);
+    await runRound(harness, { roundId: 'aw-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'aw-round-1'), 'consolidated.json');
+    const { b1, h1 } = integrateClean(harness.repo);
+    const frozen2 = freeze(harness, 'aw-round-2', h1);
+    // Collide with the unit artifact so its write fails (EEXIST): the round
+    // must fall back to whole AND clear every derived unit state.
+    const directory = reviewArtifactDirectory(harness.root, 'aw-round-2');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'integration-delta.patch'), 'collision\n');
+
+    const round2 = await runRound(harness, {
+      roundId: 'aw-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
+    expect(round2.convergence?.reviewScope).toBe('whole');
+    expect(round2.convergence?.deltaUnavailable).toBeDefined();
+    expect(round2.convergence?.scopeReason).toContain('whole-change re-verification');
+    expect(prompt).toContain('REVIEW SCOPE: WHOLE CHANGE');
+    expect(prompt).not.toContain('--- INTEGRATION UNIT');
+    expect(prompt).not.toContain('--- DELTA SINCE LAST REVIEWED');
     expect(b0).toMatch(/^[0-9a-f]{40}$/u);
+    expect(b1).toMatch(/^[0-9a-f]{40}$/u);
   });
 });
