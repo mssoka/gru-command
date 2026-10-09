@@ -104,6 +104,8 @@ describe('review-input handoff through the real wave freeze', () => {
       supersedes: ['original:Acceptance 1'],
       approval: { by: 'owner', reference: 'epoch12 seq194760' },
       expectedContractSha256: base.contractSha256,
+      // A clarification: no implementation owed, so the review still runs.
+      effect: 'administrative',
     });
     expect(added.status).toBe('accepted');
     if (added.status !== 'accepted') throw new Error('unreachable');

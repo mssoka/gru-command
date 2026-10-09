@@ -962,4 +962,20 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_pending_directives_hold ON pending_directives(job_id, state, hold_released_by);
     `,
   },
+  {
+    // Supersede-and-resume (owner rules 2026-10-08): every new amendment
+    // declares whether it requires implementation (`material`) or not
+    // (`administrative`); pre-existing rows stay NULL = unclassified and
+    // never gate review. A directive request records the required work
+    // revision it was composed with, so its delivery carries that revision
+    // as the service-bound acknowledgement. Additive and nullable.
+    // LANDING COLLISION (same convention as migrations 10-23): renumber
+    // ONLY this never-applied migration if main lands id 24 first.
+    id: 24,
+    name: 'work-revision',
+    sql: `
+      ALTER TABLE job_amendments ADD COLUMN effect TEXT CHECK (effect IS NULL OR effect IN ('material','administrative'));
+      ALTER TABLE pending_directives ADD COLUMN work_revision INTEGER;
+    `,
+  },
 ];

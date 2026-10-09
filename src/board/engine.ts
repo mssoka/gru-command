@@ -899,6 +899,18 @@ export class BoardEngine {
             ? null : review.payload as { readonly finalPassRequired?: unknown };
           if (payload?.finalPassRequired === true) return null;
         }
+        // READY is bound to the REVIEWED requirements too (owner rules
+        // 2026-10-08): an approved material correction pending delivery, or
+        // one the approved round never froze, withholds the merge offer.
+        const revision = this.ledger.workRevisionState(job.id);
+        if (revision.required > revision.delivered) return null;
+        if (revision.required > 0 && newest !== undefined) {
+          const frozen = this.ledger.latestRoundEvent(newest.id, 'round.review-inputs-frozen');
+          const acceptance = typeof frozen?.payload === 'object' && frozen.payload !== null
+            ? (frozen.payload as { readonly acceptance?: { readonly version?: unknown } | null }).acceptance : undefined;
+          const version = acceptance?.version;
+          if (typeof version !== 'number' || version < revision.required) return null;
+        }
         return ownerReadyPr(job, readBranchEvidence(this.ledger, job.id));
       })
       .filter((row): row is OwnerPrView => row !== null)

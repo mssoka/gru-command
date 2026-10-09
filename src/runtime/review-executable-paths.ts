@@ -2598,6 +2598,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/dispatch/silas-rules.js",
   "dist/dispatch/tool-call-policy.js",
   "dist/dispatch/worker-rules.js",
+  "dist/dispatch/work-revision.js",
   "dist/dispatch/worktree-port.js",
   "dist/events/bus.js",
   "dist/identity.js",

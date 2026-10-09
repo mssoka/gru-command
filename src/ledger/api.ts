@@ -28,11 +28,16 @@ import {
   AMENDMENT_MAX_IDEMPOTENCY_KEY_CHARS,
   amendmentBodySha256,
   amendmentRequestSha256,
+  deliveredWorkRevision,
+  isAmendmentEffect,
   renderEffectiveContract,
+  requiredWorkRevision,
   validateAmendmentDraft,
+  type AmendmentEffect,
   type EffectiveContract,
   type JobAmendmentApproval,
   type JobAmendmentRecord,
+  type WorkRevisionState,
 } from '../review-inputs/amendments.js';
 import {
   canonicalIsoTimestamp,
@@ -552,6 +557,16 @@ export class DirectiveConflictError extends Error {
  * The lane is single-writer: ANY different request id (identified or not)
  * fails closed with the live request named — only a replay of that same id
  * proceeds, so a fresh id never starts a second concurrent turn. */
+/** Owner rule 5 (2026-10-08): the lane has exactly one writer request at a
+ * time. A directive is refused while a re-brief request stands, and a
+ * re-brief while a directive request is live — never two writers. */
+export class LaneWriterConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LaneWriterConflictError';
+  }
+}
+
 export class AmbiguousDirectiveError extends Error {
   constructor(message: string) {
     super(message);
@@ -851,6 +866,10 @@ export interface PendingRebriefRecord {
    * because the marker is the durable request. */
   readonly ruleId: string | null;
   readonly sourceRoundId: string | null;
+  /** The required work revision the request was composed with (owner rule
+   * 4); the re-brief delivery carries it as its receipt. null = a request
+   * accepted before work revisions existed. */
+  readonly workRevision: number | null;
   readonly requestedAt: string;
 }
 
@@ -2010,6 +2029,9 @@ export class LedgerApi {
     readonly approval: JobAmendmentApproval;
     readonly expectedContractSha256: string;
     readonly idempotencyKey?: string | null;
+    /** Required (owner rule 1, 2026-10-08): does the approved change need
+     * implementation (`material`) or not (`administrative`)? */
+    readonly effect: AmendmentEffect;
   }): AddJobAmendmentResult {
     return this.transaction(() => {
       const job = this.getJob(input.jobId);
@@ -2041,11 +2063,20 @@ export class LedgerApi {
           return this.rejectAmendment(input.jobId, 'invalid', 'idempotency_key must be bounded printable text', input);
         }
       }
+      if (!isAmendmentEffect(input.effect)) {
+        return this.rejectAmendment(
+          input.jobId,
+          'invalid',
+          'effect must be "material" (the change requires implementation) or "administrative" (no implementation)',
+          input,
+        );
+      }
       const requestSha = amendmentRequestSha256({
         body: input.body,
         supersedes,
         approval: input.approval,
         expectedContractSha256: input.expectedContractSha256,
+        effect: input.effect,
       });
       // Retry determinism outranks staleness: the same idempotency key and
       // request fingerprint always resolves to the same accepted amendment,
@@ -2107,6 +2138,7 @@ export class LedgerApi {
         bodySha256: amendmentBodySha256(input.body),
         supersedes: [...supersedes],
         approval: { by: input.approval.by, reference: input.approval.reference },
+        effect: input.effect,
         previousContractSha256: current.contractSha256,
         contractSha256: '',
         requestSha256: requestSha,
@@ -2129,8 +2161,8 @@ export class LedgerApi {
           `INSERT INTO job_amendments (
              id, job_id, version, body, body_sha256, supersedes,
              approval_by, approval_reference, previous_contract_sha256,
-             contract_sha256, request_sha256, idempotency_key, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             contract_sha256, request_sha256, idempotency_key, created_at, effect
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           amendment.id,
@@ -2146,7 +2178,9 @@ export class LedgerApi {
           amendment.requestSha256,
           amendment.idempotencyKey,
           amendment.createdAt,
+          amendment.effect,
         );
+      const revision = requiredWorkRevision([...existing, amendment]);
       this.appendEvent({
         kind: 'job.amendment-accepted',
         jobId: input.jobId,
@@ -2161,6 +2195,8 @@ export class LedgerApi {
           approval_by: amendment.approval.by,
           approval_reference: amendment.approval.reference,
           idempotency_key: amendment.idempotencyKey,
+          effect: amendment.effect,
+          required_work_revision: revision,
         },
       });
       return { status: 'accepted' as const, amendment, contract: rendered, idempotent: false };
@@ -2177,6 +2213,7 @@ export class LedgerApi {
       readonly approval: JobAmendmentApproval;
       readonly expectedContractSha256: string;
       readonly idempotencyKey?: string | null;
+      readonly effect?: unknown;
     },
     current?: { readonly currentContractSha256: string; readonly currentVersion: number },
   ): AddJobAmendmentResult {
@@ -2193,6 +2230,7 @@ export class LedgerApi {
         approval_by: input.approval.by.slice(0, 200),
         approval_reference: input.approval.reference.slice(0, 500),
         ...(input.idempotencyKey != null ? { idempotency_key: input.idempotencyKey.slice(0, 200) } : {}),
+        ...(isAmendmentEffect(input.effect) ? { effect: input.effect } : {}),
         ...(current !== undefined
           ? { current_contract_sha256: current.currentContractSha256, current_version: current.currentVersion }
           : {}),
@@ -2206,6 +2244,82 @@ export class LedgerApi {
         ? { currentContractSha256: current.currentContractSha256, currentVersion: current.currentVersion }
         : {}),
     };
+  }
+
+  private amendmentEffectFromRow(row: Row): AmendmentEffect | null {
+    const raw = nstr(row.effect);
+    if (raw === null) return null;
+    if (!isAmendmentEffect(raw)) throw new Error(`job_amendments row ${str(row.id)} has unknown effect "${raw}"`);
+    return raw;
+  }
+
+  /** The job's work revisions (owner rule 2): `required` is the highest
+   * material amendment version (0 when none); `delivered` is the revision
+   * the newest `job.delivered` carried (0 when it carried none). A review
+   * may freeze only when delivered >= required. */
+  workRevisionState(jobId: string): WorkRevisionState {
+    const required = requiredWorkRevision(this.listJobAmendments(jobId));
+    return { required, delivered: deliveredWorkRevision(this.latestJobEvent(jobId, 'job.delivered')) };
+  }
+
+  /** Owner decision 2026-10-09 (option A): a CORRECTIVE delivery — the
+   * first delivery that carried the job's current work revision (> 0) —
+   * owes a passing scheduler verification on its exact head before any
+   * review arms. The debt follows the newest delivery while it lasts (a
+   * repair of a failed verification owes its own pass) and is discharged
+   * once a review round ADMITTED after the corrective delivery (went live). Null =
+   * no debt; otherwise the revision and the head that must be verified
+   * (null when the delivery could not resolve its head: any later pass on
+   * the job counts). */
+  correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null {
+    const newest = this.latestJobEvent(jobId, 'job.delivered');
+    if (newest === null) return null;
+    const revision = deliveredWorkRevision(newest);
+    if (revision === 0) return null;
+    const first = this.db.prepare(
+      `SELECT MIN(seq) AS seq FROM events
+        WHERE job_id = ? AND kind = 'job.delivered' AND json_extract(payload, '$.work_revision') = ?`,
+    ).get(jobId, revision) as { seq: number | null } | undefined;
+    const correctiveSeq = first?.seq ?? newest.seq;
+    // Only the delivery that FIRST carried this revision is corrective: an
+    // earlier delivery at the same or a higher revision means the revision
+    // is not new (revisions are monotonic per job).
+    // Discharged only by a review that actually ADMITTED the corrected work
+    // (its round went live) — a round created and then refused at
+    // admission/preflight reviewed nothing.
+    const payload = typeof newest.payload === 'object' && newest.payload !== null
+      ? (newest.payload as { sha?: unknown }) : {};
+    const head = typeof payload.sha === 'string' && payload.sha !== '' ? payload.sha : null;
+    // A live round of a head delivered at or after the corrective delivery
+    // (any head when the newest is unknown) admitted the corrected work; a
+    // forced round of an unrelated target admits nothing.
+    const reviewedSince = this.db.prepare(
+      `SELECT 1 FROM events e JOIN rounds r ON r.id = e.round_id
+        WHERE e.job_id = ? AND e.kind = 'round.status' AND json_extract(e.payload, '$.to') = 'live' AND e.seq > ?
+          AND (? IS NULL OR r.target_ref IN (
+            SELECT json_extract(d.payload, '$.sha') FROM events d
+             WHERE d.job_id = ? AND d.kind = 'job.delivered' AND d.seq >= ?)) LIMIT 1`,
+    ).get(jobId, correctiveSeq, head, jobId, correctiveSeq) !== undefined;
+    if (reviewedSince) return null;
+    // The pass must post-date the approved correction it answers: a run of
+    // the same bytes recorded before the amendment proves nothing about it.
+    const amendmentSeq = (this.db.prepare(
+      `SELECT MAX(seq) AS seq FROM events WHERE job_id = ? AND kind = 'job.amendment-accepted'
+         AND json_extract(payload, '$.version') = ?`,
+    ).get(jobId, revision) as { seq: number | null } | undefined)?.seq ?? 0;
+    // The LATEST clean run decides: a later failure on the same head
+    // re-fences review even after an earlier pass.
+    const latest = (head !== null
+      ? this.db.prepare(
+        `SELECT json_extract(payload, '$.ok') AS ok FROM events WHERE job_id = ? AND kind = 'verification.completed'
+           AND json_extract(payload, '$.sha') = ? AND seq > ?
+           AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 ORDER BY seq DESC LIMIT 1`,
+      ).get(jobId, head, amendmentSeq)
+      : this.db.prepare(
+        `SELECT json_extract(payload, '$.ok') AS ok FROM events WHERE job_id = ? AND kind = 'verification.completed'
+           AND seq > ? AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 ORDER BY seq DESC LIMIT 1`,
+      ).get(jobId, newest.seq)) as { ok: number | null } | undefined;
+    return latest?.ok === 1 ? null : { revision, head };
   }
 
   private amendmentFromRow(row: Row): JobAmendmentRecord {
@@ -2226,6 +2340,7 @@ export class LedgerApi {
       bodySha256: str(row.body_sha256),
       supersedes: supersedes as string[],
       approval: { by: str(row.approval_by), reference: str(row.approval_reference) },
+      effect: this.amendmentEffectFromRow(row),
       previousContractSha256: str(row.previous_contract_sha256),
       contractSha256: str(row.contract_sha256),
       requestSha256: str(row.request_sha256),
@@ -3393,14 +3508,18 @@ export class LedgerApi {
     ruleId?: string;
     sourceRoundId?: string;
   }): readonly PendingRebriefRecord[] {
-    const payload = JSON.stringify({
-      note: input.note,
-      briefing: input.briefing,
-      ...(input.ruleId !== undefined ? { rule_id: input.ruleId } : {}),
-      ...(input.sourceRoundId !== undefined ? { source_round_id: input.sourceRoundId } : {}),
-    });
-    const payloadHash = createHash('sha256').update(payload).digest('hex');
     return this.transaction(() => {
+      // The revision is bound in the SAME transaction as the marker: the
+      // fresh worker's prompt carries the effective contract at exactly this
+      // revision, and the re-brief delivery carries it as its receipt.
+      const payload = JSON.stringify({
+        note: input.note,
+        briefing: input.briefing,
+        ...(input.ruleId !== undefined ? { rule_id: input.ruleId } : {}),
+        ...(input.sourceRoundId !== undefined ? { source_round_id: input.sourceRoundId } : {}),
+        work_revision: requiredWorkRevision(this.listJobAmendments(input.jobId)),
+      });
+      const payloadHash = createHash('sha256').update(payload).digest('hex');
       // The HTTP caller pre-checks, but admission is the boundary of
       // record: a terminal transition between that check and the write is
       // refused HERE, so a terminal lane can never receive a fresh marker
@@ -3411,6 +3530,15 @@ export class LedgerApi {
       }
       if (isJobTerminal(job.status)) {
         throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes are never re-briefed`);
+      }
+      // One writer per lane (owner rule 5): a live directive request may
+      // already be prompting the lane's minion.
+      const liveDirective = this.listPendingDirectives({ jobId: input.jobId, states: LIVE_DIRECTIVE_STATES, limit: 1 })[0];
+      if (liveDirective !== undefined) {
+        throw new LaneWriterConflictError(
+          `job "${input.jobId}" has a live directive request (${liveDirective.requestId}, ${liveDirective.state}) — ` +
+            'it owns the lane; wait for it to settle or retire it before re-briefing',
+        );
       }
       this.assertNoProviderProducer(input.jobId);
       let phaseId: string | null = null;
@@ -6576,14 +6704,25 @@ export class LedgerApi {
             'a different request id never starts a second concurrent turn on the lane',
         );
       }
+      // One writer per lane (owner rule 5): an unresolved re-brief request
+      // owns the lane until it genuinely settles.
+      if (this.listPendingRebriefs({ jobId: input.jobId }).length > 0) {
+        throw new LaneWriterConflictError(
+          `job "${input.jobId}" has an unresolved re-brief request — it owns the lane until it settles; ` +
+            'wait for its settlement (or its boot reconciliation) before sending a directive',
+        );
+      }
       this.assertNoProviderProducer(input.jobId);
       const requestId = input.requestId ?? randomUUID();
       const ts = nowIso();
+      // The revision is bound in the SAME transaction as the intent: the
+      // prompt composed for this request carries exactly these amendments.
+      const workRevision = requiredWorkRevision(this.listJobAmendments(input.jobId));
       this.db
         .prepare(
           `INSERT INTO pending_directives
-             (request_id, job_id, payload, payload_hash, state, baseline_seq, claim, attempts, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'dispatching', ?, ?, 0, ?, ?)`,
+             (request_id, job_id, payload, payload_hash, state, baseline_seq, claim, attempts, created_at, updated_at, work_revision)
+           VALUES (?, ?, ?, ?, 'dispatching', ?, ?, 0, ?, ?, ?)`,
         )
         .run(
           requestId,
@@ -6594,6 +6733,7 @@ export class LedgerApi {
           JSON.stringify({ holder: input.holder, since: ts }),
           ts,
           ts,
+          workRevision,
         );
       // A fresh accepted directive is the separately authorized, identity-
       // checked handoff that supersedes an open retirement hold on this
@@ -6602,7 +6742,12 @@ export class LedgerApi {
       this.appendEvent({
         kind: 'silas.directive-intent',
         jobId: input.jobId,
-        payload: { request_id: requestId, holder: input.holder, directive_bytes: Buffer.byteLength(input.directive, 'utf-8') },
+        payload: {
+          request_id: requestId,
+          holder: input.holder,
+          directive_bytes: Buffer.byteLength(input.directive, 'utf-8'),
+          work_revision: workRevision,
+        },
       });
       if (input.handoff !== undefined) {
         this.beginPhaseHandoff({
@@ -7723,6 +7868,7 @@ export class LedgerApi {
       retireExpectedHead: nstr(row.retire_expected_head),
       holdReleasedBy: nstr(row.hold_released_by),
       holdReleasedAt: nstr(row.hold_released_at),
+      workRevision: row.work_revision === null || row.work_revision === undefined ? null : Number(row.work_revision),
     };
   }
   private pendingProviderRecoveryFromRow(row: Row): PendingProviderRecoveryRecord {
@@ -7740,9 +7886,11 @@ export class LedgerApi {
     if (!isPendingRebriefKind(kind)) {
       throw new Error(`pending_rebriefs row has unknown kind "${kind}"`);
     }
-    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown };
+    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; work_revision?: unknown };
     try {
-      payload = JSON.parse(str(row.payload)) as { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown };
+      payload = JSON.parse(str(row.payload)) as {
+        note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; work_revision?: unknown;
+      };
     } catch (error) {
       throw new Error(`pending_rebriefs row ${str(row.id)} payload is not valid JSON: ${String(error)}`);
     }
@@ -7759,6 +7907,8 @@ export class LedgerApi {
       phaseId: nstr(row.phase_id),
       ruleId: nstr(payload.rule_id),
       sourceRoundId: nstr(payload.source_round_id),
+      workRevision: typeof payload.work_revision === 'number' && Number.isSafeInteger(payload.work_revision) &&
+        payload.work_revision >= 0 ? payload.work_revision : null,
       requestedAt: str(row.requested_at),
     };
   }

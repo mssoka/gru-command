@@ -314,6 +314,19 @@ async function awaitDirectiveTerminal(
   }
 }
 
+
+/** A round that already posted its NEEDS CHANGES verdict (the shape a fix
+ * directive answers). A round still pending/live is a running review: a
+ * writer on that lane answers review_in_progress (owner rule 5). */
+function postVerdictRound(
+  h: { readonly ledger: LedgerApi },
+  input: Parameters<LedgerApi['addRound']>[0],
+): ReturnType<LedgerApi['addRound']> {
+  const round = h.ledger.addRound(input);
+  h.ledger.setRoundStatus(round.id, 'live');
+  return h.ledger.setRoundVerdict(round.id, 'changes-requested');
+}
+
 describe('dispatch server (E8)', () => {
   it('rejects unauthenticated and unconfigured access like the board does', async () => {
     const h = await boot();
@@ -934,7 +947,7 @@ describe('dispatch server (E8)', () => {
           verificationWaits: [],
           providerRecoveryPending: [],
           conflictingPrs: [],
-          releaseEligible: [],
+          releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
         };
       },
     });
@@ -1598,6 +1611,10 @@ describe('dispatch server (E8)', () => {
       // A round-bound review-only minion is not an implementer: the
       // retirement pass must never touch its live handle (G1 exclusion).
       const reviewRound = h.ledger.addRound({ jobId: 'rebrief-job', lenses: ['blind'] });
+      // The review-only session's round has ended: a re-brief on a lane
+      // whose review is still running answers review_in_progress (owner
+      // rule 5) — this case pins the G1 exclusion, not the writer gate.
+      h.ledger.setRoundStatus(reviewRound.id, 'aborted');
       h.ledger.registerAgent({
         id: 'review-only-minion',
         role: 'minion',
@@ -2280,7 +2297,7 @@ describe('dispatch server (E8)', () => {
       h.ledger.setJobPr('fresh-noop', PR_URL);
       const noopLane = laneOf('fresh-noop')!;
       const noopHead = headOf(noopLane.path);
-      h.ledger.addRound({ jobId: 'fresh-noop', lenses: ['blind'], targetRef: noopHead });
+      postVerdictRound(h, { jobId: 'fresh-noop', lenses: ['blind'], targetRef: noopHead });
       h.ledger.setJobStatus('fresh-noop', 'in-review');
       const noopMinion = `agent-${h.spawns.length}`;
       h.ledger.registerAgent({ id: noopMinion, role: 'minion', jobId: 'fresh-noop' });
@@ -2316,7 +2333,7 @@ describe('dispatch server (E8)', () => {
       h.ledger.setJobPr('fresh-moved', PR_URL);
       const movedLane = laneOf('fresh-moved')!;
       const reviewedHead = headOf(movedLane.path);
-      h.ledger.addRound({ jobId: 'fresh-moved', lenses: ['blind'], targetRef: reviewedHead });
+      postVerdictRound(h, { jobId: 'fresh-moved', lenses: ['blind'], targetRef: reviewedHead });
       h.ledger.setJobStatus('fresh-moved', 'in-review');
       const moved = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'fresh-moved', directive: 'fix the real thing',
@@ -2809,7 +2826,7 @@ describe('silas firing-rule provenance (issue #117)', () => {
     try {
       await dispatchWithLiveMinion(h, 'rule-dir-job', repo.path);
       h.ledger.setJobStatus('rule-dir-job', 'in-review');
-      const verdictRound = h.ledger.addRound({ jobId: 'rule-dir-job', lenses: ['blind'] });
+      const verdictRound = postVerdictRound(h, { jobId: 'rule-dir-job', lenses: ['blind'] });
       const res = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'rule-dir-job',
         directive: 'Fix the null deref at src/a.ts.',
@@ -2956,7 +2973,7 @@ describe('silas firing-rule provenance (issue #117)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'rule-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'b',
       }, TOKEN);
-      const verdictRound = h.ledger.addRound({ jobId: 'rule-rebrief-job', lenses: ['blind'] });
+      const verdictRound = postVerdictRound(h, { jobId: 'rule-rebrief-job', lenses: ['blind'] });
       const res = await call(h.port, 'POST', '/api/silas/rebrief', {
         job_id: 'rule-rebrief-job',
         note: 'same blocker three rounds; try differently',

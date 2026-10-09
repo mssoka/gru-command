@@ -3,7 +3,7 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import type { GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { ChildWorkerRecord, JobDeliverable, LedgerApi } from '../ledger/api.js';
-import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
+import { JOB_DISPLAY_NAME_MAX_LENGTH, AmbiguousDirectiveError, DirectiveConflictError, LaneWriterConflictError, PhaseHandoffConflictError, PipelineConflictError, RecordNotFound } from '../ledger/api.js';
 import { DirectiveRetirementError, directiveAdmissionClass, type LiveDirectiveState } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -11,7 +11,9 @@ import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger
 import type { PipelineService } from './pipeline.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
-import type { WaveRunner } from './perkins.js';
+import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
+import { amendmentSupersessions, isAmendmentEffect, pendingMaterialAmendments, type AmendmentEffect } from '../review-inputs/amendments.js';
+import { renderFreshRevisionNote, renderRevisionContinuation } from './work-revision.js';
 import { flipJobToWorking, rebriefFreshMinion, recordFollowUpDelivery, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from './rebrief-recovery.js';
 import { retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
@@ -551,6 +553,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             (reason !== 'service_restart' && reason !== 'service_restart_missing_review_lane')) {
           throw new Error('source round is not the latest clean service-restart abort on the unchanged delivered head');
         }
+        // Owner rule 3: a round superseded by an approved change (even one a
+        // restart interrupted mid-supersession) reviewed an obsolete
+        // candidate — it is never re-armed.
+        if (options.ledger.latestRoundEvent(sourceRoundId, 'round.superseded') !== null) {
+          throw new Error(`source round ${sourceRoundId} was superseded by an approved change — it is never re-armed`);
+        }
         if (requestedTargetRef !== undefined && requestedTargetRef !== sha) {
           throw new Error('clean-abort re-arm target_ref must be the proved delivered head sha');
         }
@@ -861,12 +869,20 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       }
       const contract = options.ledger.effectiveContract(jobId);
       const amendments = options.ledger.listJobAmendments(jobId);
+      const revision = options.ledger.workRevisionState(jobId);
       json(res, 200, {
         job_id: jobId,
         version: contract?.version ?? 0,
         base_sha256: contract?.baseSha256 ?? null,
         contract_sha256: contract?.contractSha256 ?? null,
         effective_contract: contract?.text ?? null,
+        // Owner rule 2: review waits until a delivery carries the required
+        // revision (the highest material amendment version).
+        work_revision: {
+          required: revision.required,
+          delivered: revision.delivered,
+          pending: revision.required > revision.delivered,
+        },
         amendments: amendments.map((amendment) => ({
           id: amendment.id,
           version: amendment.version,
@@ -874,6 +890,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           body_sha256: amendment.bodySha256,
           supersedes: amendment.supersedes,
           approval: amendment.approval,
+          effect: amendment.effect,
           previous_contract_sha256: amendment.previousContractSha256,
           contract_sha256: amendment.contractSha256,
         })),
@@ -922,26 +939,47 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         json(res, 400, { error: 'improper_authorization', detail: 'approval {by, reference} is required' });
         return true;
       }
-      let amendmentFields: { body: string; supersedes?: readonly string[]; expectedContractSha256: string; idempotencyKey?: string };
+      let amendmentFields: {
+        body: string;
+        supersedes?: readonly string[];
+        expectedContractSha256: string;
+        idempotencyKey?: string;
+        effect: AmendmentEffect;
+      };
       try {
         const amendmentBody = strField(body, 'body');
         const supersedes = optStrArray(body, 'supersedes');
         const idempotencyKey = optStrField(body, 'idempotency_key');
+        // Owner rule 1 (2026-10-08): the writer declares what the approved
+        // change asks of the lane. Required — never defaulted.
+        const effect = body['effect'];
+        if (!isAmendmentEffect(effect)) {
+          throw new Error(
+            'effect is required: "material" (the approved change requires implementation — the candidate is outdated ' +
+              'and any review of it is superseded) or "administrative" (a clarification, typo or bookkeeping update)',
+          );
+        }
         amendmentFields = {
           body: amendmentBody,
           ...(supersedes !== undefined ? { supersedes } : {}),
           expectedContractSha256: strField(body, 'expected_contract_sha256'),
           ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
+          effect,
         };
       } catch (error) {
         // Malformed shapes are audited like every other refusal; the reply
         // stays generic instead of leaking internal error text.
+        const reason = error instanceof Error ? error.message.slice(0, 300) : 'malformed amendment request';
         options.ledger.appendCustomEvent({
           kind: 'job.amendment-rejected',
           jobId,
-          payload: { code: 'invalid', reason: error instanceof Error ? error.message.slice(0, 300) : 'malformed amendment request' },
+          payload: { code: 'invalid', reason },
         });
-        json(res, 400, { error: 'invalid_request', detail: 'amendment request is malformed' });
+        // The effect refusal is the caller's own contract, safe to echo.
+        json(res, 400, {
+          error: 'invalid_request',
+          detail: reason.startsWith('effect is required') ? reason : 'amendment request is malformed',
+        });
         return true;
       }
       const result = options.ledger.addJobAmendment({
@@ -950,6 +988,30 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         approval: { by: approvalBy, reference: approvalReference },
       });
       if (result.status === 'accepted') {
+        // Owner rule 3: an approved MATERIAL change makes the reviewed
+        // candidate obsolete — stop spending review on it now, before any
+        // continuation is sent. The writer's gate re-proves the stop.
+        const revision = options.ledger.workRevisionState(jobId);
+        let supersession: 'none' | 'started' = 'none';
+        if (!result.idempotent && result.amendment.effect === 'material') {
+          // The pass also withdraws a queued review request for the obsolete
+          // candidate; `started` reports whether a review owned the lane.
+          if (options.wave.activeReview(jobId) !== null) supersession = 'started';
+          track(options.wave.supersedeReviews({
+            jobId,
+            reason: `material amendment #${result.amendment.version} accepted (${result.amendment.approval.reference.slice(0, 120)})`,
+            by: result.amendment.approval.by,
+          }).then(
+            (outcome) => {
+              log(outcome.confirmed ? 'info' : 'warn', 'review superseded by a material amendment', {
+                job: jobId, rounds: outcome.roundIds.join(','), confirmed: outcome.confirmed, detail: outcome.detail,
+              });
+            },
+            (error: unknown) => {
+              log('error', 'review supersession after a material amendment failed', { job: jobId, error: String(error) });
+            },
+          ));
+        }
         json(res, 200, {
           status: 'accepted',
           idempotent: result.idempotent,
@@ -960,6 +1022,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             body_sha256: result.amendment.bodySha256,
             supersedes: result.amendment.supersedes,
             approval: result.amendment.approval,
+            effect: result.amendment.effect,
             previous_contract_sha256: result.amendment.previousContractSha256,
             contract_sha256: result.amendment.contractSha256,
           },
@@ -968,6 +1031,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             base_sha256: result.contract.baseSha256,
             contract_sha256: result.contract.contractSha256,
           },
+          work_revision: {
+            required: revision.required,
+            delivered: revision.delivered,
+            pending: revision.required > revision.delivered,
+          },
+          review_supersession: supersession,
         });
         return true;
       }
@@ -1020,6 +1089,23 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (isJobTerminal(job.status)) {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes take no directives`);
       }
+      // Owner rules 3/5: a NEW writer request on a lane under review is
+      // admitted only when an approved material change made the reviewed
+      // candidate obsolete (the gate below supersedes the review before any
+      // prompt); otherwise the branch stays frozen until the verdict. A
+      // replay of an existing request id starts nothing and skips this.
+      // Synchronous with the intent write below: no review can arm between.
+      if (requestIdField === undefined || options.ledger.getDirective(requestIdField) === null) {
+        try {
+          options.wave.assertWriterAdmissible(jobId);
+        } catch (error) {
+          if (error instanceof ReviewInProgressError) {
+            json(res, 409, { error: 'review_in_progress', detail: error.message, round_ids: error.roundIds });
+            return true;
+          }
+          throw error;
+        }
+      }
       // Durable intent BEFORE any prompt/spawn side effect (the PR133
       // timeout window: the old flow awaited the whole model turn before
       // recording anything). A retry of the same request id replays to the
@@ -1042,6 +1128,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         }
         if (error instanceof DirectiveConflictError || error instanceof PhaseHandoffConflictError) {
           json(res, 409, { error: 'request_conflict', detail: error.message });
+          return true;
+        }
+        if (error instanceof LaneWriterConflictError) {
+          json(res, 409, { error: 'writer_conflict', detail: error.message });
           return true;
         }
         throw error;
@@ -1099,12 +1189,51 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // bin cannot close the job before any minion row exists. A stale
       // historical intent after a crash is NOT permanent runtime ownership.
       const releaseAdmission = options.ledger.beginJobAdmission(jobId, `directive ${intent.requestId}`);
+      // The contract a FRESH fallback session reads is fixed in the same tick
+      // as the intent's revision stamp (owner rule 4): an amendment accepted
+      // while the writer gate waits travels with the NEXT continuation.
+      const contractAtIntent = options.ledger.effectiveContract(jobId)?.text ?? null;
+      // Owner rule 4: the approved material amendments this lane has not
+      // delivered travel ONCE with this request — canonical text, version
+      // order, stamped with the revision the intent recorded, and rendered
+      // from the amendment set of the SAME tick (a later supersession can
+      // never withhold a body the stamp claims).
+      const workRevision = intent.workRevision ?? 0;
+      const deliveredRevision = options.ledger.workRevisionState(jobId).delivered;
+      const amendmentsAtIntent = options.ledger.listJobAmendments(jobId);
+      const continuation = renderRevisionContinuation({
+        jobId,
+        revision: workRevision,
+        deliveredRevision,
+        pending: pendingMaterialAmendments(amendmentsAtIntent, deliveredRevision, workRevision),
+        supersededBy: amendmentSupersessions(amendmentsAtIntent),
+      });
       // The async turn stays owned and tracked by THIS server instance
       // (the existing directiveControllers/inFlight coordinator — no
       // detached helper, no second chief). Late errors surface durably.
       const controller = new AbortController();
       directiveControllers.add(controller);
       const run = (async (): Promise<void> => {
+        // Owner rule 3: writing starts only after every review that owns the
+        // lane has been superseded AND proven stopped. An unproven stop
+        // refuses this request with positive no-effect proof (no prompt was
+        // ever handed to a worker); the gate already escalated to Gru.
+        try {
+          await options.wave.clearLaneForWriter({ jobId, writer: `directive ${intent.requestId}` });
+        } catch (error) {
+          if (!(error instanceof ReviewSupersessionUnconfirmedError)) throw error;
+          const reason = `refused before any prompt: ${error.message}`;
+          options.ledger.failDirective({ requestId: intent.requestId, reason });
+          const phase = options.ledger.findPhaseHandoffByRequest({ jobId, requestId: intent.requestId });
+          if (phase !== null && phase.state === 'awaiting') {
+            options.ledger.closePhaseHandoff({ phaseId: phase.phaseId, reason: `directive request failed: ${reason}` });
+          }
+          directiveControllers.delete(controller);
+          log('warn', 'silas directive refused: the superseded review could not be proven stopped', {
+            job: jobId, request: intent.requestId, detail: error.detail,
+          });
+          return;
+        }
         let delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>;
         try {
           delivery = await routeFixDirectiveToMinion({
@@ -1113,6 +1242,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             worktrees: ops.worktrees,
             jobId,
             directive,
+            ...(continuation !== ''
+              ? { continuation: { block: continuation, freshNote: renderFreshRevisionNote(workRevision) } }
+              : {}),
+            contract: contractAtIntent,
             signal: controller.signal,
             owner: 'silas-ops',
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
@@ -1252,6 +1385,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           // A marked phase carries its host-owned phase id on the delivery:
           // the completion observer matches on that id, never the event seq.
           ...(markedPhaseId !== null ? { phaseId: markedPhaseId } : {}),
+          // The service-bound acknowledgement of the revision this request
+          // carried (owner rule 4).
+          workRevision,
         });
         if (followUp.note !== null) {
           log('warn', 'silas follow-up delivery has no resolvable lane head', {
@@ -1287,6 +1423,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         request_id: intent.requestId,
         job_id: jobId,
         state: 'dispatching',
+        work_revision: intent.workRevision ?? 0,
         note: 'accepted — dispatching is not admission; read back GET /api/silas/directives/{request_id}',
       });
       return true;
@@ -1390,6 +1527,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         delivery_seq: record.deliverySeq,
         attempts: record.attempts,
         fail_reason: record.failReason,
+        // The contract revision this request carried (owner rule 4); null
+        // for a request accepted before work revisions existed.
+        work_revision: record.workRevision,
         ...(record.state === 'retired'
           ? {
               admission_class: directiveAdmissionClass(record),
@@ -1446,17 +1586,66 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (isJobTerminal(job.status)) {
         throw new Error(`job "${jobId}" is ${job.status} — terminal lanes are never re-briefed`);
       }
+      // Owner rules 3/5: same writer admission as a directive — a lane under
+      // review takes a re-brief only when an approved material change made
+      // the reviewed candidate obsolete. That review is superseded and
+      // PROVEN stopped before the durable request exists (a re-brief marker
+      // cannot be withdrawn without fabricating its guarded events), then
+      // admission is re-proved synchronously with the marker write.
+      const admitWriter = (): boolean => {
+        try {
+          options.wave.assertWriterAdmissible(jobId);
+          return true;
+        } catch (error) {
+          if (error instanceof ReviewInProgressError) {
+            json(res, 409, { error: 'review_in_progress', detail: error.message, round_ids: error.roundIds });
+            return false;
+          }
+          throw error;
+        }
+      };
+      if (!admitWriter()) return true;
+      try {
+        await options.wave.clearLaneForWriter({ jobId, writer: `re-brief for job ${jobId}` });
+      } catch (error) {
+        if (!(error instanceof ReviewSupersessionUnconfirmedError)) throw error;
+        log('warn', 'silas re-brief refused: the superseded review could not be proven stopped', {
+          job: jobId, detail: error.detail,
+        });
+        json(res, 409, { error: 'review_supersession_unconfirmed', detail: error.message });
+        return true;
+      }
+      const jobAtMarker = options.ledger.getJob(jobId);
+      if (jobAtMarker === null) throw new Error(`job "${jobId}" not found`);
+      if (isJobTerminal(jobAtMarker.status)) {
+        throw new Error(`job "${jobId}" is ${jobAtMarker.status} — terminal lanes are never re-briefed`);
+      }
+      if (!admitWriter()) return true;
+      // A fresh worker has no memory of accepted amendments: it is briefed
+      // with the EFFECTIVE contract (owner rule 4), recorded on the durable
+      // marker so a restart re-delivers exactly this contract.
+      const contract = options.ledger.effectiveContract(jobId)?.text ?? jobAtMarker.briefing;
       // Restart-safe by construction: the request markers are durable
       // BEFORE any worker exists, and clear only when their events land.
       // A restart mid-turn leaves them for the boot reconciler.
-      const markers = options.ledger.beginPendingRebrief({
-        jobId,
-        note,
-        briefing: job.briefing,
-        ...(ruleId !== null ? { ruleId } : {}),
-        ...(sourceRoundId !== undefined ? { sourceRoundId } : {}),
-        ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
-      });
+      let markers: ReturnType<typeof options.ledger.beginPendingRebrief>;
+      try {
+        markers = options.ledger.beginPendingRebrief({
+          jobId,
+          note,
+          briefing: contract,
+          ...(ruleId !== null ? { ruleId } : {}),
+          ...(sourceRoundId !== undefined ? { sourceRoundId } : {}),
+          ...(completionHandoff !== undefined ? { handoff: completionHandoff } : {}),
+        });
+      } catch (error) {
+        if (error instanceof LaneWriterConflictError) {
+          json(res, 409, { error: 'writer_conflict', detail: error.message });
+          return true;
+        }
+        throw error;
+      }
+      const workRevision = markers.find((marker) => marker.workRevision !== null)?.workRevision ?? 0;
       const rebriefPhaseId = markers.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
       const closeFailedTerminalTurn = (error: unknown): ReturnType<typeof finalizeRebriefRequest> | null => {
         const currentJob = options.ledger.getJob(jobId);
@@ -1490,7 +1679,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             : {}),
           jobId,
           note,
-          briefing: job.briefing,
+          briefing: contract,
+          workRevision,
           beforeTurnSideEffect: () => checkRebriefTurn(options.ledger, jobId, markers),
           onSpawned: (worker) => {
             options.ledger.bindPendingRebriefWorker({
@@ -1741,6 +1931,39 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const by = strField(body, 'by');
       if (by !== 'silas') {
         throw new Error('provider-recovery claims are recorded as silas actions; pass by: "silas"');
+      }
+      // Owner rules 3/5: a provider continuation is a lane writer too, on
+      // the same gate as directives and re-briefs — a current review keeps
+      // the branch frozen (409), an obsolete one (material correction
+      // pending) is superseded and PROVEN stopped before the claim resumes.
+      const waitJobId = options.ledger.getProviderWait(waitId)?.jobId ?? null;
+      if (waitJobId !== null) {
+        try {
+          options.wave.assertWriterAdmissible(waitJobId);
+          await options.wave.clearLaneForWriter({ jobId: waitJobId, writer: `provider continuation ${waitId}` });
+        } catch (error) {
+          if (error instanceof ReviewInProgressError) {
+            json(res, 409, { error: 'review_in_progress', detail: error.message, round_ids: error.roundIds });
+            return true;
+          }
+          if (error instanceof ReviewSupersessionUnconfirmedError) {
+            json(res, 409, { error: 'review_supersession_unconfirmed', detail: error.message });
+            return true;
+          }
+          throw error;
+        }
+        // Re-proved in the SAME tick as the claim's durable write (the claim
+        // takes no await before `provider.recovery-claimed`, which fences
+        // review): a review admitted while the gate awaited refuses here.
+        const admittedMeanwhile = options.wave.activeReview(waitJobId);
+        if (admittedMeanwhile !== null) {
+          json(res, 409, {
+            error: 'review_in_progress',
+            detail: `job ${waitJobId} came under review while the writer gate waited — retry after the verdict`,
+            round_ids: admittedMeanwhile.roundIds,
+          });
+          return true;
+        }
       }
       const result = await ops.providerRecovery.claim(waitId, by);
       json(res, 200, result as Record<string, unknown>);

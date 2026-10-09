@@ -14,7 +14,7 @@ import { BoardEngine } from './board/engine.js';
 import { createBoardServer } from './board/server.js';
 import { DeployDriftTracker } from './board/deploy-drift.js';
 import { defaultPackageRoot, readBuildInfo } from './build-info.js';
-import { createServiceReviewWave } from './dispatch/service-review-wave.js';
+import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
@@ -1236,6 +1236,9 @@ async function main(): Promise<number> {
         worktrees: worktreeManager,
         jobId: directiveInput.jobId,
         directive: directiveInput.directive,
+        // A fresh fallback minion is briefed with the effective contract
+        // (original + accepted amendments), never the original alone.
+        contract: ledger.effectiveContract(directiveInput.jobId)?.text ?? null,
         signal: directiveInput.signal,
         owner: 'bmad-review-gate',
         parentTools: parentToolsFor,
@@ -1247,10 +1250,14 @@ async function main(): Promise<number> {
     escalate: createReviewEscalationNotifier(ledger, notifications),
     // A transient admission refusal retries on its own (1 min, then 5 min):
     // each scheduled or skipped retry is an FYI; only the last refusal
-    // escalates action-required through `escalate`.
+    // escalates action-required through `escalate`. A routine review
+    // supersession (owner rule 3) reports here too — never an Ack.
     inform: (title, detail) => {
-      notifications.post({ kind: 'review-admission-retry', routing: 'fyi', severity: 'info', title, detail });
+      notifications.post({ kind: 'review-fyi', routing: 'fyi', severity: 'info', title, detail });
     },
+    // Supersession proof (owner rule 3): a review session is stopped only
+    // when the runtime no longer holds a live handle for it.
+    liveReviewSessions: (agentIds) => liveReviewSessionIds(registry, agentIds),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;

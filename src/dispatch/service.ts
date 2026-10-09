@@ -501,9 +501,12 @@ export class DispatchService {
             evidence.error ?? 'runtime settled the briefing turn with an in-band error',
           );
         }
+        // The initial briefing carries the original contract only — revision
+        // 0. A material amendment accepted while this turn ran stays pending
+        // until a continuation carrying it delivers (owner rule 2).
         const delivery = recordFollowUpDelivery({ ledger: this.opts.ledger,
           worktrees: this.opts.worktrees, jobId: job.id, agentId: handle.id, source: 'dispatch',
-          ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}) });
+          ...(handoffPhaseId !== null ? { phaseId: handoffPhaseId } : {}), workRevision: 0 });
         deliveredRecorded = true;
         if (delivery.note !== null) this.log('warn', 'initial delivery has no resolvable lane head', {
           job: job.id, note: delivery.note, lane: delivery.lanePath,

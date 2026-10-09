@@ -162,6 +162,10 @@ export interface DirectiveRequestRecord {
    * that superseded this retirement; null while the hold is open. */
   readonly holdReleasedBy: string | null;
   readonly holdReleasedAt: string | null;
+  /** The required work revision this request was composed with (owner
+   * rule 4): its delivery carries it as the service-bound acknowledgement.
+   * null = accepted before work revisions existed. */
+  readonly workRevision: number | null;
 }
 
 /** One open (or released) continuation hold created by a retirement. The
