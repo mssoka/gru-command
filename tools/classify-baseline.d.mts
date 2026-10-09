@@ -11,5 +11,8 @@ export declare function classifyBaseline(
     readonly playwright?: boolean;
     readonly requireFile?: string | null;
     readonly substrs?: readonly string[];
+    /** Required feature-absence causes for the named instrument (a setup
+     * AssertionError must not be accepted as feature absence). */
+    readonly requireFileSubstrs?: readonly string[];
   },
 ): BaselineClassification;

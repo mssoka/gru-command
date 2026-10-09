@@ -134,6 +134,25 @@ describe('baseline classifier — vitest (unit) branch', () => {
     expect(empty.err).toMatch(/registered no tests/u);
   });
 
+  it('rejects a setup AssertionError that names no required feature-absence cause (native r4 warning 1)', () => {
+    const setupOnly = classifyBaseline(
+      vitestReport([{ name: 'slim-strip.baseline.test.ts', status: 'failed', message: '', assertionResults: [
+        // The instrument's own mount guard: a real AssertionError, but not a SLIM absence.
+        assertion('the rail mounts (setup proof)', 'failed', ['AssertionError: board sections rendered (setup proof): expected 0 to be greater than 0']),
+      ] }]),
+      { requireFile: 'slim-strip.baseline.test.ts', requireFileSubstrs: ['slim strip labelled status pairs', 'reserved numeric slot for strip KPIs', 'reveal-only compact disclosure'] },
+    );
+    expect(setupOnly.code).toBe(3);
+    expect(setupOnly.err).toMatch(/name no required feature-absence cause/u);
+    const named = classifyBaseline(
+      vitestReport([{ name: 'slim-strip.baseline.test.ts', status: 'failed', message: '', assertionResults: [
+        assertion('rail carries the strip pairs', 'failed', ['AssertionError: slim strip labelled status pairs: expected null to be truthy']),
+      ] }]),
+      { requireFile: 'slim-strip.baseline.test.ts', requireFileSubstrs: ['slim strip labelled status pairs', 'reserved numeric slot for strip KPIs', 'reveal-only compact disclosure'] },
+    );
+    expect(named.code).toBe(1);
+  });
+
   it('exits 3 without --require-file when nothing failed by assertion (RED must stay identified)', () => {
     const result = classifyBaseline(
       vitestReport([{ name: 'x.test.ts', status: 'failed', message: '', assertionResults: [

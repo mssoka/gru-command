@@ -38,8 +38,8 @@ const LOAD_ERROR = /Cannot find module|does not provide an export|Failed to load
  * @param {{ playwright?: boolean, requireFile?: string | null, substrs?: readonly string[] }} [options]
  * @returns {{ code: number, out: string, err: string }}
  */
-export function classifyBaseline(report, { playwright = false, requireFile = null, substrs = [] } = {}) {
-  return playwright ? classifyPlaywright(report, substrs) : classifyVitest(report, requireFile);
+export function classifyBaseline(report, { playwright = false, requireFile = null, substrs = [], requireFileSubstrs = [] } = {}) {
+  return playwright ? classifyPlaywright(report, substrs) : classifyVitest(report, requireFile, requireFileSubstrs);
 }
 
 function classifyPlaywright(report, substrs) {
@@ -129,7 +129,7 @@ function classifyPlaywright(report, substrs) {
   };
 }
 
-function classifyVitest(report, requireFile) {
+function classifyVitest(report, requireFile, requireFileSubstrs = []) {
   if (report === null || typeof report !== 'object') {
     return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: report unreadable or not an object — not behavioral evidence' };
   }
@@ -190,6 +190,26 @@ function classifyVitest(report, requireFile) {
     if (!instrumentAssertions.every((a) => a.status === 'failed')) {
       return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: the instrument file has tests in a non-evidence state' };
     }
+    if (requireFileSubstrs.length > 0) {
+      // Native r4 warning 1: the instrument's own preliminary MOUNT checks
+      // are assertions too, so an all-setup-guard failure would otherwise
+      // follow the accepted RED branch without reaching a SLIM absence
+      // assertion. Every instrument failure must name one of the required
+      // feature-absence causes.
+      const unnamed = instrumentAssertions.filter(
+        (a) => !(a.failureMessages ?? []).some((m) => requireFileSubstrs.some((s) => m.includes(s))),
+      );
+      if (unnamed.length > 0) {
+        const lines = unnamed
+          .map((a) => `  ${a.title}: ${(a.failureMessages ?? [''])[0].slice(0, 160)}`)
+          .join('\n');
+        return {
+          code: 3,
+          out: '',
+          err: `BASELINE SETUP FAILURE: ${unnamed.length} instrument failure(s) name no required feature-absence cause (${requireFileSubstrs.join(' | ')}) — a setup guard is not feature absence\n${lines}`,
+        };
+      }
+    }
     const nonAssertion = instrumentAssertions.filter(
       (a) => !(a.failureMessages ?? []).some((m) => /AssertionError/.test(m)),
     );
@@ -231,7 +251,7 @@ function classifyVitest(report, requireFile) {
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
 
   const args = process.argv.slice(2);
-  const knownFlags = new Set(['--require-file', '--require-substr', '--playwright']);
+  const knownFlags = new Set(['--require-file', '--require-substr', '--require-file-substr', '--playwright']);
   const unknown = args
     .filter((a) => a.startsWith('--'))
     .find((a) => !knownFlags.has(a));
@@ -245,6 +265,10 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   const playwright = args.includes('--playwright');
   const substrIdx = args.indexOf('--require-substr');
   const substrs = substrIdx >= 0 ? String(args[substrIdx + 1] ?? '').split(',').filter(Boolean) : [];
+  const fileSubstrIdx = args.indexOf('--require-file-substr');
+  const requireFileSubstrs = fileSubstrIdx >= 0
+    ? String(args[fileSubstrIdx + 1] ?? '').split(',').filter(Boolean)
+    : [];
 
   let report = null;
   try {
@@ -254,7 +278,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     process.exit(3);
   }
 
-  const { code, out, err } = classifyBaseline(report, { playwright, requireFile, substrs });
+  const { code, out, err } = classifyBaseline(report, { playwright, requireFile, substrs, requireFileSubstrs });
   if (err !== '') fail(err);
   if (out !== '') say(out);
   process.exit(code);

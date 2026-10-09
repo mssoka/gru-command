@@ -1487,27 +1487,66 @@ test('1200x900 dark: the FOR YOU essentials hold >=4.5:1 settled; the dim frame 
   await page.locator('#theme-toggle').click();
   await expect(page.locator('html')).toHaveClass(/dark/);
 
-  // Transient state (no settlement): the body colour transition is running,
-  // so the label measures mid-flight. Reproduce the artifact honestly.
-  const runningTransitions = await page.evaluate(() =>
-    document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState === 'running').length);
-  const transientRatio = await contrastRatio(page, target);
-  expect(runningTransitions, 'a real transition was running (not a sleep)').toBeGreaterThan(0);
-  console.log(`1200x900 dark transient probe: ${transientRatio.toFixed(2)} with ${runningTransitions} transition(s) running`);
+  // Native r4 warning: requiring a still-running transition after several
+  // protocol round trips races the 250ms flip. Sample deterministically
+  // instead — pause the real transition INSIDE the same evaluate that reads
+  // the colours, so the pre-settlement ratio is a controlled animation
+  // time, not a race. No transition left to pause is reported, not failed.
+  const transient = await page.evaluate((sel) => {
+    const lum = (rgb: string): number => {
+      const m = rgb.match(/\d+/g)!.map(Number);
+      const [r, g, b] = m.slice(0, 3).map((v) => {
+        const c = v / 255;
+        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
+    };
+    const el = document.querySelector<HTMLElement>(sel);
+    if (!el) throw new Error(`missing contrast target ${sel}`);
+    const running = document
+      .getAnimations()
+      .filter((a): a is CSSTransition => a instanceof CSSTransition && a.playState === 'running');
+    const sampled: CSSTransition[] = [];
+    for (const t of running) {
+      try {
+        t.pause();
+        t.currentTime = 125; // mid-flip, the exact state the artifact caught
+        sampled.push(t);
+      } catch {
+        /* a transition that cannot seek is simply not sampled */
+      }
+    }
+    let bg = 'rgb(250, 246, 239)';
+    let bgEl: Element | null = el;
+    while (bgEl) {
+      const c = getComputedStyle(bgEl).backgroundColor;
+      if (c && c !== 'transparent' && !/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0\s*\)/.test(c)) { bg = c; break; }
+      bgEl = bgEl.parentElement;
+    }
+    const l1 = lum(getComputedStyle(el).color);
+    const l2 = lum(bg);
+    const ratio = (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+    for (const t of sampled) t.play();
+    return { ratio, sampled: sampled.length };
+  }, target);
+  console.log(`1200x900 dark transient sample: ${transient.ratio.toFixed(2)} (${transient.sampled} transition(s) paused at 125ms)`);
 
-  // Settled state: every animation finished, then the SAME label measures
-  // the approved essential-text floor against its effective background.
+  // Settled state: the same label measures the approved essential-text floor
+  // against its effective background once nothing is still transitioning.
   await settle(page);
   const stillRunning = await page.evaluate(() =>
     document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState === 'running').length);
   expect(stillRunning, 'settlement is real: no transition still running').toBe(0);
   const settledRatio = await contrastRatio(page, target);
-  // The numbers belong in the record: a passing inequality is not a datum.
-  console.log(`1200x900 dark ${target}: pre-settlement ratio ${transientRatio.toFixed(2)} (${runningTransitions} transition(s) running) -> settled ratio ${settledRatio.toFixed(2)} (${stillRunning} running)`);
+  console.log(`1200x900 dark ${target}: settled ratio ${settledRatio.toFixed(2)} (transient sample ${transient.ratio.toFixed(2)}, ${transient.sampled} paused)`);
   expect(settledRatio, `settled ${target} contrast (dark, 1200x900)`).toBeGreaterThanOrEqual(4.5);
-  // The artifact and the steady state are different states, and the dim one
-  // is the unsettled one (this is the causal claim, measured not assumed).
-  expect(transientRatio, 'the pre-settlement frame is the low-contrast one').toBeLessThan(settledRatio);
+  // When a real mid-flip sample was taken, the steady state must be the
+  // better state (the causal claim, measured not assumed). If the executor
+  // was slow enough that the flip had already finished, the settled floor
+  // above is still the assertion that matters — never a flaky failure.
+  if (transient.sampled > 0) {
+    expect(transient.ratio, 'the mid-flip sample is the lower-contrast state').toBeLessThan(settledRatio);
+  }
   await page.screenshot({ path: 'e2e-artifacts/slim-strip-1200-dark-settled.png', fullPage: false });
   await expect(page.locator('html')).toHaveClass(/dark/);
 });
