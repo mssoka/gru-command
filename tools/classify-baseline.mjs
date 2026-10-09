@@ -47,7 +47,9 @@ try {
 
 if (playwright) {
   const stats = report.stats ?? {};
-  const total = stats.total ?? 0;
+  // Playwright's JSON stats carry expected/unexpected/skipped/flaky — there
+  // is no `total` field; the run's size is their sum.
+  const total = (stats.expected ?? 0) + (stats.unexpected ?? 0) + (stats.skipped ?? 0) + (stats.flaky ?? 0);
   const unexpected = stats.unexpected ?? 0;
   if (total === 0) {
     console.error('BASELINE SETUP/COLLECTION FAILURE: zero Playwright tests ran (build/webServer/spec load?) — not behavioral evidence');
@@ -55,10 +57,14 @@ if (playwright) {
   }
   const results = [];
   const walk = (suite) => {
+    // A spec's own `status`/`ok` carries the outcome; per-test entries
+    // mirror it (`test.status === 'unexpected'`, result.status 'failed').
     for (const spec of suite.specs ?? []) {
-      for (const test of spec.tests ?? []) {
-        const bad = (test.results ?? []).find((r) => r.status === 'unexpected');
-        if (bad) results.push({ title: spec.title ?? spec.file ?? 'unknown', message: (bad.error?.message ?? '') + '\n' + String(bad.errors?.map((e) => e.message).join('\n') ?? '') });
+      if (spec.ok === false || (spec.tests ?? []).some((t) => t.status === 'unexpected')) {
+        const bad = (spec.tests ?? []).flatMap((t) => t.results ?? []).find((r) => r.status === 'failed' || r.status === 'unexpected');
+        const message = (bad?.error?.message ?? '') + '\n' +
+          String(bad?.errors?.map((e) => e.message).join('\n') ?? '');
+        results.push({ title: spec.title ?? spec.file ?? 'unknown', message });
       }
     }
     for (const child of suite.suites ?? []) walk(child);
