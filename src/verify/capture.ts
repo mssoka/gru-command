@@ -383,9 +383,18 @@ export function readCaptureReceipt(path: string): CaptureReceipt | null {
       return null;
     }
     // `pings` shipped after receipts already existed: a pre-keepalive receipt
-    // truthfully carried zero transport frames, so normalize rather than
-    // handing consumers an undefined count.
-    return { ...parsed, pings: typeof parsed.pings === 'number' ? parsed.pings : 0 };
+    // truthfully carried zero transport frames, so an ABSENT field normalizes
+    // to 0. A present-but-corrupt field is refused loudly (null = unreadable)
+    // rather than silently reported as "no transport frames".
+    if (parsed.pings === undefined) return { ...parsed, pings: 0 };
+    if (
+      typeof parsed.pings !== 'number' ||
+      !Number.isInteger(parsed.pings) ||
+      parsed.pings < 0
+    ) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }

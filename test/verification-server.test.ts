@@ -10,6 +10,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { EventBus } from '../src/events/bus.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import type { VerificationScheduler } from '../src/verify/scheduler.js';
 import {
   createVerificationServer,
   type VerificationServer,
@@ -740,9 +741,9 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     expect(heldTypes.every((type) => type === 'queued' || type === 'ping')).toBe(true);
     expect(existsSync(join(queuedLane.path, 'gate-started.txt'))).toBe(false);
     // The idle gap stays strictly under the client's 300 s body limit, and
-    // stays near the injected cadence — this proves periodic bytes, not a
-    // single late one. (The 300 s literal is the incident requirement; the
-    // 1 s bound is the cadence evidence.)
+    // proves repeated pings (`>= 3` above) rather than one late frame. (The
+    // 300 s literal is the incident requirement; the 2 s bound is a generous,
+    // load-tolerant sanity bound, not a cadence measurement.)
     expect(maxArrivalGap(waiting.frames)).toBeLessThan(300_000);
     expect(maxArrivalGap(waiting.frames)).toBeLessThan(2_000);
 
@@ -805,7 +806,9 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
         entry.frame.type === 'ping' && entry.at >= startedReading.at && entry.at <= firstOutputReading.at,
     );
     expect(bridging.length).toBeGreaterThanOrEqual(2);
-    // All strictly under the 300 s client limit, and near the injected cadence.
+    // Pings bridge the silent window (>=2 by arrival time), all strictly
+    // under the 300 s client limit; the 2 s bound is a load-tolerant sanity
+    // bound, not a cadence measurement.
     expect(maxArrivalGap(reading.frames.slice(startedAt, firstOutput + 1))).toBeLessThan(300_000);
     expect(maxArrivalGap(reading.frames.slice(startedAt, firstOutput + 1))).toBeLessThan(2_000);
     expect(types[types.length - 1]).toBe('completed');
@@ -882,10 +885,10 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
       const after = await call(harness.port, { job_id: harness.jobId, scope: 'full' });
       expect(outcomeOf(completedFrame(after.frames))['ok']).toBe(true);
 
-      // One heartbeat interval per response, each armed at the injected
-      // cadence — scoped to our own intervals (a bare global count would
-      // count unrelated runner/harness timers). Each must be unref'd, and
-      // each must be cleared by the time its response has settled.
+      // Every response's heartbeat interval is armed at the injected cadence
+      // — scoped to our own intervals (a bare global count would count
+      // unrelated runner/harness timers). Each must be unref'd, and each must
+      // be cleared by the time its response has settled.
       const ourIntervals = setIntervalSpy.mock.calls
         .map((call, index) => ({ delay: call[1], result: setIntervalSpy.mock.results[index] }))
         .filter((entry) => entry.delay === 25);
@@ -904,10 +907,10 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
 
   it('pins the heartbeat cadence and refuses an unusable one', async () => {
     const harness = await boot();
-    // The default path (no injected cadence) arms exactly one heartbeat
-    // interval, at a positive integer cadence whose worst-case idle gap
-    // (2 × interval) stays strictly under the client's 300 s body-idle
-    // limit — a regression to a too-long default cannot stay green.
+    // The default path (no injected cadence) arms exactly ONE heartbeat
+    // interval, at the shipped 15,000 ms default whose worst-case idle gap
+    // (2 × interval) stays strictly under the client's 300 s body-idle limit
+    // — a regression to a longer default cannot stay green.
     const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
     try {
       const reading = collectNdjson(await streamCall(harness.port, { job_id: harness.jobId, scope: 'full' }));
@@ -915,11 +918,9 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
       const delays = setIntervalSpy.mock.calls
         .map((call) => call[1])
         .filter((delay): delay is number => typeof delay === 'number');
-      // The shipped default cadence is pinned by value, not only by shape.
-      expect(delays).toContain(15_000);
-      expect(Number.isInteger(delays[0])).toBe(true);
-      expect(delays[0]!).toBeGreaterThan(0);
-      expect(2 * delays[0]!).toBeLessThan(300_000);
+      const heartbeatDelays = delays.filter((delay) => delay === 15_000);
+      expect(heartbeatDelays).toHaveLength(1);
+      expect(2 * heartbeatDelays[0]!).toBeLessThan(300_000);
     } finally {
       setIntervalSpy.mockRestore();
     }
@@ -936,6 +937,75 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
       ).toThrow(/heartbeat/u);
     }
     await harness.close();
+  });
+
+  it('keeps the body alive before the first producer frame', async () => {
+    const harness = await boot({ heartbeatMs: 25 });
+    const outcome = {
+      runId: 'run-stub-leading-ping',
+      jobId: harness.jobId,
+      scope: 'full',
+      command: 'node verify.mjs pass',
+      cwd: harness.lanePath,
+      ok: true,
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      queuedMs: 0,
+      durationMs: 1,
+      sha: harness.repo.head(),
+      trackedDirty: false,
+      workers: 1,
+      outputBytes: 0,
+      outputSha256: createHash('sha256').digest('hex'),
+      outputTail: '',
+      error: null,
+    };
+    // A scheduler whose FIRST frame lands after several heartbeat intervals:
+    // the writeHead-anchored idle clock must emit leading pings, never a
+    // silent pre-frame body.
+    const stubScheduler = {
+      start: () => {},
+      dispose: async () => {},
+      view: () => ({ lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 1, workersPerRun: 1 }),
+      run: async (_spec: unknown, sink: (frame: unknown) => void | Promise<void>) => {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        await sink({ type: 'queued', runId: outcome.runId, position: 0, active: 0, limit: 1 });
+        await sink({ type: 'started', runId: outcome.runId, workers: 1, sha: outcome.sha, queuedMs: 0 });
+        await sink({ type: 'completed', runId: outcome.runId, outcome });
+        return outcome;
+      },
+    };
+    const server = createVerificationServer({
+      config: harness.config,
+      ledger: harness.ledger,
+      worktrees: harness.worktrees,
+      scheduler: stubScheduler as unknown as VerificationScheduler,
+      heartbeatMs: 25,
+    });
+    const http: HttpServer = createServer((req, res) => {
+      if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolveListen) => http.listen(0, '127.0.0.1', resolveListen));
+    const port = (http.address() as AddressInfo).port;
+    try {
+      const reading = collectNdjson(await streamCall(port, { job_id: harness.jobId, scope: 'full' }));
+      await reading.done;
+      const types = frameTypes(reading.frames);
+      const firstPing = types.indexOf('ping');
+      const firstFrame = types.findIndex((type) => type !== 'ping');
+      expect(firstPing).toBeGreaterThanOrEqual(0);
+      // A ping precedes the first producer frame: the body is never silent,
+      // even before admission.
+      expect(firstPing).toBeLessThan(firstFrame);
+      expect(types[types.length - 1]).toBe('completed');
+    } finally {
+      await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
+      await server.dispose();
+      await harness.close();
+    }
   });
 
   it('keeps an attached duplicate stream alive and stops at its terminal', async () => {

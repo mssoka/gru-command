@@ -4,7 +4,7 @@ type: 'bugfix'
 created: '2026-10-09'
 status: 'in-progress'
 route: 'oneshot'
-review_loop_iteration: 2
+review_loop_iteration: 3
 context: []
 ---
 
@@ -42,11 +42,12 @@ context: []
 - `test/verification-server.test.ts` — the four named regressions plus the cadence/refusal pin and the attach-stream keepalive (real isolated server, short heartbeat cadence; scoped spies prove one `setInterval` per response, unref'd and cleared).
 - `test/verification-capture.test.ts` — reader accepts interleaved pings and still rejects post-terminal frames; a completed stream with pings stays promotable through real EOF; a stream severed after pings stays UNKNOWN with no output binding.
 - `test/assert-verify-keepalive-baseline.test.ts`, `tools/assert-verify-keepalive-baseline.mjs` (+ `.d.mts`) — fail-before report classifier.
-- `test/suite-shape.test.ts` — recomputed phantom-check pins (24 / 25 / 3).
-- `docs/FLOW.md` — the `ping` frame in the documented response vocabulary.
+- `test/suite-shape.test.ts` — recomputed phantom-check pins (25 / 26 / 5).
+- `docs/FLOW.md` — the `ping` frame in the documented response vocabulary (leading ping and 2 × cadence bound included), and the capture-receipt `pings`/`frames` split.
+- `_bmad-output/implementation-artifacts/deferred-work.md` — the deferred review follow-ups.
 - `.gru-command/worktree.toml` — `verify-idle-keepalive`, `verify-idle-keepalive-static`, `verify-idle-keepalive-baseline`, and `verify-idle-capture-baseline` scopes.
 
-**Fail-before:** every named regression is assertion-first, so the pre-fix base REDs by assertion rather than by a harness timeout. Two scheduler-backed scopes reproduce this on isolated base snapshots and classify the machine-readable Vitest reports with `tools/assert-verify-keepalive-baseline.mjs`, which exits 2 when a claim is broken: `verify-idle-keepalive-baseline` (the four named server regressions) and `verify-idle-capture-baseline` (the three capture-reader/helper regressions). Both legs cover every named regression in acceptance 1-4; the classifier treats a matcher `TypeError` on a named test as behavioral RED and rejects only collection/setup/import failures.
+**Fail-before:** every named regression is assertion-first, so the pre-fix base REDs by assertion rather than by a harness timeout. Two scheduler-backed scopes reproduce this on isolated base snapshots and classify the machine-readable Vitest reports with `tools/assert-verify-keepalive-baseline.mjs`, which exits 2 when a claim is broken: `verify-idle-keepalive-baseline` (7 named server regressions) and `verify-idle-capture-baseline` (3 capture-reader/helper regressions). Every failure in each report must be one of the named regressions failing behaviorally, so a harness timeout or an unlisted failure can never pass as RED.
 
 **Review round 1 (BMAD blind hunter, job `verify-idle-keepalive-review-blind-hunter-20261009`, reviewed head 49a219e):** 14 findings, triaged below; the actionable ones were repaired in the first fix cycle. The one finding rejected in round 1 (F4) was re-raised in round 2 and is now patched (R3).
 
@@ -99,3 +100,23 @@ Round 2 — BMAD blind hunter `verify-idle-keepalive-review-round2-blind-hunter-
 - R12 cadence evidence was wall-clock and load-sensitive (1 s bound over a 25 ms cadence) — **low**, patched: the gap bound is 2 s with `≥ 3` pings required, keeping periodicity evidence without a tight stall-sensitive bound.
 - R13 the guard's largest accepted cadence is untested — **low**, deferred: the guard is fail-safe one-sided and the shipped default is pinned by value, so an edge off-by-one can only reject loudly, never reintroduce truncation; recorded in `deferred-work.md`.
 - R14 the transport abort cause remains cause-blind — **low**, deferred: the incident briefing forbids unrelated error-telemetry expansion; recorded in `deferred-work.md`.
+
+Round 3 — BMAD blind hunter `verify-idle-keepalive-review-round3-blind-hunter-20261009`, reviewed head `11c80ff` (whole change `32fc2f6..11c80ff`); 18 findings. Delta-hunk findings were treated as blocking; findings on untouched code as follow-ups.
+
+- F1/F2 `writeFrame`'s `| Record<string, unknown>` made the exported union non-constraining, and the union omitted the error frame — **medium**, patched: `VerificationErrorFrame` added and `writeFrame` typed to `VerificationStreamFrame`, with `satisfies PingFrame` restored at the ping literal.
+- F3 no test delayed the first frame to prove a leading ping — **medium**, patched: a stub-scheduler test delays the first producer frame past several intervals and asserts a leading ping (and it fails at the pre-fix base).
+- F4 the in-flight ping guard is untested — **low**, deferred (recorded in `deferred-work.md`).
+- F5 the cadence pin lost its population assertion while its comment still claimed one — **medium**, patched: the default path asserts exactly one 15,000 ms interval, and the comment matches.
+- F6 stale "1 s bound" comment after the round-2 widening — **low**, patched: comments corrected.
+- F7 cleanup comment imprecise — **low**, patched.
+- F8 the classifier could accept an unlisted or non-behavioral failure — **medium**, patched: every failure in the report must be one of the named regressions failing behaviorally, and the reported failed count is reconciled (server leg now names all 7).
+- F9 the behavioral-rule prefix was unpinned Vitest internals — **low**, patched: positive/negative matrix plus the observed Vitest version named.
+- F10 the `server|capture` leg selector was untested — **low**, patched: `resolveBaselineLeg` exported and tested.
+- F11 receipt normalization was over-broad (any non-number → 0) — **medium**, patched: only an absent field normalizes to 0; a present-but-corrupt field reads as unreadable (null), never a silent zero.
+- F12 the docs omitted that a ping may be the first body frame and the 2 × cadence bound — **medium**, patched.
+- F13 the docs over-claimed "never truncate" and the TSDoc's 2 × explanation was inverted — **low**, patched (scheduled-tick caveat stated; explanation corrected).
+- F14 the spec was stale again — **medium**, patched.
+- F15 the reader's `frames`/`pings` partition is not pinned — **low**, deferred.
+- F16 the capture-side docs were not updated with the `pings`/`frames` split — **low**, patched in `docs/FLOW.md`.
+- F17 acceptance 3's dispose leg is untested — **low**, deferred.
+- F18 the guard error message printed `options.heartbeatMs` (undefined for a bad default) — **low**, patched: it prints the resolved cadence.

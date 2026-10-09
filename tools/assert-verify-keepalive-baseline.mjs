@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** A keepalive fail-before receipt needs the NAMED regressions to fail as
- * behavioral assertions against the pre-fix base. A nonzero exit from
- * import, collection, or setup is not evidence. */
+ * behavioral assertions against the pre-fix base — and NOTHING else to fail.
+ * A nonzero exit from import, collection, or setup is not evidence. */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import process from 'node:process';
@@ -13,6 +13,9 @@ export const EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS = Object.freeze({
     'queued verification keeps response alive during slot wait',
     'quiet running verification keeps response alive',
     'verification terminal and disconnect cleanup',
+    'keeps the body alive before the first producer frame',
+    'pins the heartbeat cadence and refuses an unusable one',
+    'keeps an attached duplicate stream alive and stops at its terminal',
     'capture remains honest with keepalive',
   ]),
   capture: Object.freeze([
@@ -22,11 +25,21 @@ export const EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS = Object.freeze({
   ]),
 });
 
+/** Resolve a baseline leg name to its expected titles; unknown legs refuse. */
+export function resolveBaselineLeg(leg) {
+  const expected = EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS[leg];
+  if (expected === undefined) {
+    throw new Error(`unknown baseline leg "${String(leg)}" (expected server|capture)`);
+  }
+  return expected;
+}
+
 /**
- * Is this failure a behavioral RED? `AssertionError` is the common shape; a
- * matcher type error (Vitest's `assertTypes`) is a TypeError on the test's own
- * value and is equally behavioral — only a collection/setup/import failure is
- * not RED, and those are caught at the file level below.
+ * Is this failure a behavioral RED? `AssertionError` is the common shape. A
+ * matcher type error is behavioral too: Vitest's `assertTypes` (observed on
+ * vitest 3.2.7) throws `TypeError: expected value must be ...` for a matcher
+ * used on the wrong value type. Only a collection/setup/import failure is not
+ * RED, and those are caught at the file level below.
  */
 export function isBehavioralRed(message) {
   return (
@@ -37,8 +50,9 @@ export function isBehavioralRed(message) {
 
 /**
  * Classify a Vitest JSON report from the pre-fix keepalive baseline. Returns
- * the failing named titles when every expected regression RED by assertion;
- * throws (never a silent pass) on a missing/named-green test, a
+ * the failing named titles when EVERY failure in the report is one of the
+ * expected named regressions failing behaviorally; throws (never a silent
+ * pass) on a missing/named-green test, an unlisted failure, a
  * collection/setup/import failure, or a failure that is not behavioral.
  */
 export function assertKeepaliveBaseline(report, expected = EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS.server) {
@@ -63,6 +77,24 @@ export function assertKeepaliveBaseline(report, expected = EXPECTED_KEEPALIVE_BA
     }
   }
   const assertions = report.testResults.flatMap((file) => file.assertionResults ?? []);
+  const failed = assertions.filter((result) => result?.status === 'failed');
+  if (failed.length !== report.numFailedTests) {
+    throw new Error(
+      `report counts ${String(report.numFailedTests)} failed test(s) but lists ${String(failed.length)} — unreadable report`,
+    );
+  }
+  // EVERY failure must be one of the named regressions: an unlisted failure
+  // (harness timeout, unhandled rejection, unrelated test) is not this claim.
+  const matchesExpected = (result) =>
+    expected.some((title) => typeof result?.title === 'string' && result.title.includes(title));
+  const unlisted = failed.filter((result) => !matchesExpected(result));
+  if (unlisted.length > 0) {
+    throw new Error(
+      `unlisted failure(s) outside the named claim: ${unlisted
+        .map((result) => String(result?.title))
+        .join(', ')}`,
+    );
+  }
   const red = [];
   for (const title of expected) {
     const match = assertions.find(
@@ -87,10 +119,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   try {
     const [path, leg = 'server'] = process.argv.slice(2);
     if (!path) throw new Error('usage: assert-verify-keepalive-baseline.mjs REPORT_JSON [server|capture]');
-    const expected = EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS[leg];
-    if (expected === undefined) {
-      throw new Error(`unknown baseline leg "${leg}" (expected server|capture)`);
-    }
+    const expected = resolveBaselineLeg(leg);
     const red = assertKeepaliveBaseline(JSON.parse(readFileSync(path, 'utf8')), expected);
     process.stdout.write(
       `EXPECTED RED (${leg}): ${String(red.length)} named regression(s) failed by assertion against the pre-fix base\n`,

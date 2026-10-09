@@ -94,9 +94,9 @@ export const VERIFY_HEARTBEAT_MS = 15_000;
 
 /**
  * The streaming client's default HTTP body-idle timeout (Node 22 / undici
- * `bodyTimeout`). The heartbeat exists to stay strictly under it: because
- * one idle interval can be skipped when a frame lands just before a tick,
- * the usable cadence must satisfy `2 × heartbeatMs < this`.
+ * `bodyTimeout`). The heartbeat exists to stay strictly under it: a body
+ * frame that lands just AFTER a tick skips that tick's ping, so the usable
+ * cadence must satisfy `2 × heartbeatMs < this`.
  */
 export const VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS = 300_000;
 
@@ -110,13 +110,21 @@ export interface PingFrame {
   readonly type: 'ping';
 }
 
+/** The typed admission failure the surface writes when `scheduler.run` throws. */
+export interface VerificationErrorFrame {
+  readonly type: 'error';
+  readonly code: string;
+  readonly detail: string;
+  readonly [field: string]: unknown;
+}
+
 /**
- * A frame the `/api/verify` NDJSON stream can carry: the scheduler's progress
- * frames or the transport-liveness {@link PingFrame}. The surface's typed
- * admission `error` frame is written through the same sink but is not part of
- * the scheduler's progress vocabulary.
+ * Every frame the `/api/verify` NDJSON stream can carry: the scheduler's
+ * progress frames, the transport-liveness {@link PingFrame}, and the typed
+ * admission {@link VerificationErrorFrame}. `writeFrame` is typed to exactly
+ * this union, so the stream vocabulary is compiler-enforced.
  */
-export type VerificationStreamFrame = VerificationProgress | PingFrame;
+export type VerificationStreamFrame = VerificationProgress | PingFrame | VerificationErrorFrame;
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   if (res.headersSent || res.writableEnded) return;
@@ -150,7 +158,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
   ) {
     throw new Error(
       `verification heartbeat must be a positive integer of milliseconds with a worst-case idle gap (2 × heartbeat) ` +
-        `strictly under the client's ${VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS} ms body-idle limit, got ${String(options.heartbeatMs)} — ` +
+        `strictly under the client's ${VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS} ms body-idle limit, got ${String(heartbeatMs)} — ` +
         'a disabled or oversized heartbeat reintroduces the idle-body truncation',
     );
   }
@@ -385,7 +393,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       closed = true;
       stopHeartbeat();
     });
-    const writeFrame = async (frame: VerificationStreamFrame | Record<string, unknown>): Promise<void> => {
+    const writeFrame = async (frame: VerificationStreamFrame): Promise<void> => {
       const frameType = (frame as { readonly type?: unknown }).type;
       if (frameType === 'completed' || frameType === 'error') {
         terminal = true;
@@ -412,7 +420,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       if (closed || terminal || heartbeatWritePending || res.writableEnded) return;
       if (performance.now() - lastBodyWriteAt < heartbeatMs) return;
       heartbeatWritePending = true;
-      void writeFrame({ type: 'ping' }).finally(() => {
+      void writeFrame({ type: 'ping' } satisfies PingFrame).finally(() => {
         heartbeatWritePending = false;
       });
     }, heartbeatMs);

@@ -205,6 +205,18 @@ describe('capture receipts', () => {
     expect(read).not.toBeNull();
     expect(read!.pings).toBe(0);
   });
+
+  it('refuses a present-but-corrupt pings field instead of reporting zero', () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'corrupt.ndjson');
+    for (const corrupt of ['3', null, -1, 1.5, Number.NaN]) {
+      writeFileSync(
+        captureReceiptPath(sinkPath),
+        `${JSON.stringify({ ...receipt(), sink: sinkPath, pings: corrupt })}\n`,
+      );
+      expect(readCaptureReceipt(captureReceiptPath(sinkPath))).toBeNull();
+    }
+  });
 });
 
 describe('owner records and identity-validated withdrawal', () => {
