@@ -186,6 +186,11 @@ export interface RunWholeReviewInput {
   readonly reviewScope?: 'whole' | 'delta' | 'integration';
   /** Deterministic host reason for the planned scope (disclosed durably). */
   readonly reviewScopeReason?: string;
+  /** The authenticated whole-candidate coverage of the prior round, as the
+   * production planner authenticated it against the prior round's native
+   * ledger receipt. Absent = fall back to the record's own (unauthenticated)
+   * bit (tests and direct callers). */
+  readonly priorCoverageComplete?: boolean;
   /** Prior indexes the implementing minion claimed fixed (fix-directive
    * receipt); claimed priors are always re-verified by the lead. */
   readonly claimedFixedPriors?: readonly number[];
@@ -1174,7 +1179,9 @@ export class PerkinsWholeReview {
           currentDiffBaseSha: review.manifest.diffBaseSha,
           currentTargetSha: review.manifest.targetSha,
         });
-        if (lineage === null || !lineage.baseAdvanced || !lineage.featureIntegrated || !lineage.commonBasePinned) {
+        if (lineage === null ||
+          !((lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned) ||
+            lineage.sameHeadAdoptedBase)) {
           throw new Error('integration lineage could not be re-proven for this prior target/base');
         }
         const integration = integrationSince(
@@ -1213,7 +1220,7 @@ export class PerkinsWholeReview {
     // Coverage completeness is the PRIOR record's durable bit, never a scope
     // label: an integration round whose own prior was partial carries no bit
     // and can never launder partial coverage into a later integration READY.
-    const priorCoveredWhole = priorReview.coverageComplete;
+    const priorCoveredWhole = input.priorCoverageComplete ?? priorReview.coverageComplete;
     const classifications: readonly PriorCarryClassification[] = carriesForward
       ? delta === null || convergenceRules.carryForwardUntouchedPriors !== true
         ? prior.map((_finding, priorIndex) => ({ priorIndex, status: 'reverify' as const, reason: deltaUnavailable !== null

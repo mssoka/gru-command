@@ -334,7 +334,7 @@ describe('integration unit (retained coverage across an advanced base)', () => {
     // A base-only advance with unchanged feature work is a clean integration.
     expect(probeIntegrationLineage(repo.path, {
       priorDiffBaseSha: b0, priorTargetSha: h0, currentDiffBaseSha: b1, currentTargetSha: h1,
-    })).toEqual({ baseAdvanced: true, featureIntegrated: true, commonBasePinned: true });
+    })).toEqual({ baseAdvanced: true, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false });
   });
 
   it('keeps a clean both-sides file (disjoint hunks) in the unit, and a new feature edit too', () => {
@@ -416,11 +416,11 @@ describe('integration unit (retained coverage across an advanced base)', () => {
 
     expect(probeIntegrationLineage(repo.path, {
       priorDiffBaseSha: b0, priorTargetSha: h0, currentDiffBaseSha: b1, currentTargetSha: h1,
-    })).toEqual({ baseAdvanced: true, featureIntegrated: true, commonBasePinned: true });
+    })).toEqual({ baseAdvanced: true, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false });
     // A prior head that was NOT integrated forward cannot retain coverage.
     expect(probeIntegrationLineage(repo.path, {
       priorDiffBaseSha: b0, priorTargetSha: sibling, currentDiffBaseSha: b1, currentTargetSha: h1,
-    })).toEqual({ baseAdvanced: true, featureIntegrated: false, commonBasePinned: false });
+    })).toEqual({ baseAdvanced: true, featureIntegrated: false, commonBasePinned: false, sameHeadAdoptedBase: false });
     // A malformed SHA can never establish lineage.
     expect(probeIntegrationLineage(repo.path, {
       priorDiffBaseSha: 'main', priorTargetSha: h0, currentDiffBaseSha: b1, currentTargetSha: h1,
@@ -450,8 +450,105 @@ describe('integration unit (retained coverage across an advanced base)', () => {
   });
 });
 
+describe('integration scope: same-head adopted base and identical base adoption', () => {
+  it('retains coverage (no whole reset) when an unchanged candidate adopts a descendant base', () => {
+    const repo = makeFixtureRepo('perkins-same-head-adopted');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/adopted']);
+    repo.commitFile('src/shared.ts', 'export const shared = 1;\n'); // commit C
+    repo.git(['checkout', 'main']);
+    repo.git(['merge', '--ff-only', 'feature/adopted']); // main advances to C
+    const currentBase = repo.head();
+    repo.git(['checkout', 'feature/adopted']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n'); // H0 = C + a feature edit
+
+    const lineage = probeIntegrationLineage(repo.path, {
+      priorDiffBaseSha: b0, priorTargetSha: h0, currentDiffBaseSha: currentBase, currentTargetSha: h0,
+    });
+    expect(lineage).toEqual({
+      baseAdvanced: true, featureIntegrated: true, commonBasePinned: false, sameHeadAdoptedBase: true,
+    });
+    // Nothing new to review: the adopted change is inside the reviewed history
+    // and the candidate is unchanged.
+    const unit = integrationSince(repo.path, h0, b0, currentBase, h0);
+    expect(unit.integrationPaths).toEqual([]);
+    expect(unit.droppedFeaturePaths).toEqual([]);
+
+    const plan = planReviewScope({
+      prior: {
+        seq: 1, reviewScope: 'whole', canonicalVerdict: 'READY TO MERGE', targetSha: h0, diffBaseSha: b0,
+        acceptance: null, coverageComplete: true, legacyWhole: false,
+      },
+      currentTargetSha: h0, currentDiffBaseSha: currentBase,
+      deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true,
+      integrationLineage: lineage, acceptanceCompatible: true,
+    });
+    expect(plan.scope).toBe('integration');
+    expect(plan.priorCoverageComplete).toBe(true);
+    expect(plan.reason).toContain('candidate is unchanged');
+
+    // A base that advanced BEYOND the reviewed head is not adoption: the
+    // candidate unchanged but the new base is not an ancestor of it.
+    const beyond = repo.commitFile('src/feature.ts', 'export const feature = 2;\n'); // move the feature head
+    expect(probeIntegrationLineage(repo.path, {
+      priorDiffBaseSha: b0, priorTargetSha: h0, currentDiffBaseSha: beyond, currentTargetSha: h0,
+    })!.sameHeadAdoptedBase).toBe(false);
+  });
+
+  it('does not mistake a base-adopted identical change for discarded feature work', () => {
+    const repo = makeFixtureRepo('perkins-identical-adoption');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    repo.commitFile('src/p.ts', 'export const p = "orig";\n');
+    repo.commitFile('src/q.ts', 'export const q = "orig";\n');
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/adopt']);
+    repo.commitFile('src/p.ts', 'export const p = "feat";\n');
+    const h0 = repo.commitFile('src/q.ts', 'export const q = "feat";\n');
+    repo.git(['checkout', 'main']);
+    // The base independently adopts the IDENTICAL p change.
+    const b1 = repo.commitFile('src/p.ts', 'export const p = "feat";\n');
+    repo.git(['checkout', 'feature/adopt']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    const h1 = repo.head();
+
+    const unit = integrationSince(repo.path, h0, b0, b1, h1);
+    // p did not change H0..H1: the base adopted it, so it is NOT discarded
+    // feature work and does not force a whole reset. H0 and H1 content are
+    // identical here, so there is no changed-since-prior path at all.
+    expect(unit.droppedFeaturePaths).toEqual([]);
+    expect(unit.carryPaths.size).toBe(0);
+    expect(unit.integrationPaths).toEqual([]);
+
+    // Contrast: a take-main conflict resolution DOES change H0..H1 and is
+    // retained as genuine discarded feature work.
+    const repo2 = makeFixtureRepo('perkins-take-main');
+    repos.push(repo2);
+    repo2.git(['config', 'user.name', 'Fixture Tests']);
+    repo2.git(['config', 'user.email', 'tests@example.invalid']);
+    repo2.commitFile('src/p.ts', 'export const p = "orig";\n');
+    const c0 = repo2.head();
+    repo2.git(['checkout', '-b', 'feature/take']);
+    const d0 = repo2.commitFile('src/p.ts', 'export const p = "feat";\n');
+    repo2.git(['checkout', 'main']);
+    const c1 = repo2.commitFile('src/p.ts', 'export const p = "main";\n');
+    repo2.git(['checkout', 'feature/take']);
+    expect(() => repo2.git(['merge', 'main'])).toThrow();
+    writeFileSync(join(repo2.path, 'src', 'p.ts'), 'export const p = "main";\n');
+    repo2.git(['add', 'src/p.ts']);
+    repo2.git(['commit', '-m', 'resolve p (take main)']);
+    const d1 = repo2.head();
+    const taken = integrationSince(repo2.path, d0, c0, c1, d1);
+    expect(taken.droppedFeaturePaths).toEqual(['src/p.ts']);
+  });
+});
+
 describe('production scope planning wiring (planPerkinsReviewScope)', () => {
-  it('plans integration from a real prior record and repo lineage, and falls back on acceptance mismatch', () => {
+  it('authenticates retained coverage against native receipts, failing closed on mismatches', () => {
     const repo = makeFixtureRepo('perkins-scope-wiring');
     repos.push(repo);
     repo.git(['config', 'user.name', 'Fixture Tests']);
@@ -465,53 +562,81 @@ describe('production scope planning wiring (planPerkinsReviewScope)', () => {
     repo.git(['checkout', 'feature/wiring']);
     repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
     const h1 = repo.head();
-    const priorFile = join(root, 'prior.json');
-    writeFileSync(priorFile, JSON.stringify({
+    const rules = { deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true };
+    const writePrior = (name: string, record: unknown): string => {
+      const file = join(root, name);
+      writeFileSync(file, JSON.stringify(record));
+      return file;
+    };
+    const wholePrior = {
       schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
       complete: true, headMoved: false, frozen: { targetSha: h0, diffBaseSha: b0 },
       convergence: { reviewScope: 'whole', coverageComplete: true },
-    }));
-    const rules = { deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true };
+    };
+    const call = (priorConsolidatedFile: string, extra: Partial<Parameters<typeof planPerkinsReviewScope>[0]> = {}) =>
+      planPerkinsReviewScope({
+        priorConsolidatedFile, priorSeq: 1, repoPath: repo.path,
+        currentTargetSha: h1, currentDiffBaseSha: b1, currentAcceptance: undefined, rules, ...extra,
+      });
+    const nativeWholeReceipt = { targetSha: h0, diffBaseSha: b0, reviewScope: 'whole', coverageComplete: true };
 
-    const plan = planPerkinsReviewScope({
-      priorConsolidatedFile: priorFile, priorSeq: 1, repoPath: repo.path,
-      currentTargetSha: h1, currentDiffBaseSha: b1, currentAcceptance: undefined, rules,
-    });
+    // (happy) An authenticated whole-complete prior retains coverage.
+    const valid = writePrior('prior.json', wholePrior);
+    const plan = call(valid, { nativeReceipt: nativeWholeReceipt });
     expect(plan.scope).toBe('integration');
-    expect(plan.reason).toContain('whole candidate');
+    expect(plan.priorCoverageComplete).toBe(true);
 
-    const mismatched = planPerkinsReviewScope({
-      priorConsolidatedFile: priorFile, priorSeq: 1, repoPath: repo.path,
-      currentTargetSha: h1, currentDiffBaseSha: b1,
-      currentAcceptance: { version: 1, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] }, rules,
+    // (unauthenticated) No native receipt can never manufacture coverage.
+    const unauthenticated = call(valid);
+    expect(unauthenticated.scope).toBe('whole');
+    expect(unauthenticated.reason).toContain('could not be authenticated');
+    expect(unauthenticated.priorCoverageComplete).toBe(false);
+
+    // (stripped convergence on a partial record) The file loses its
+    // convergence block, but the native receipt still records a delta scope.
+    const stripped = writePrior('prior-stripped.json', { ...wholePrior, convergence: undefined });
+    const strippedPlan = call(stripped, { nativeReceipt: { targetSha: h0, diffBaseSha: b0, reviewScope: 'delta' } });
+    expect(strippedPlan.scope).toBe('whole');
+    expect(strippedPlan.priorCoverageComplete).toBe(false);
+
+    // (contradictory complete + debt) The file claims complete coverage while
+    // the native receipt records the round still owed the final pass.
+    const contradictory = call(valid, {
+      nativeReceipt: { ...nativeWholeReceipt, coverageComplete: false, finalPassRequired: true },
+    });
+    expect(contradictory.scope).toBe('whole');
+    expect(contradictory.priorCoverageComplete).toBe(false);
+
+    // (altered acceptance) The record's acceptance no longer matches its own
+    // round's ledger-native freeze binding.
+    const acceptanceReceipt = { version: 2, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] };
+    const altered = writePrior('prior-altered-acceptance.json', {
+      ...wholePrior,
+      frozen: { targetSha: h0, diffBaseSha: b0, acceptance: { ...acceptanceReceipt, contractSha256: 'b'.repeat(64) } },
+    });
+    const alteredPlan = call(altered, { nativeReceipt: nativeWholeReceipt, acceptanceReceipt });
+    expect(alteredPlan.scope).toBe('whole');
+    expect(alteredPlan.priorCoverageComplete).toBe(false);
+
+    // (genuine legacy) No convergence block AND a receipt with no Stage-5
+    // evidence: a real pre-Stage-5 whole review is whole-complete.
+    const legacy = writePrior('prior-legacy.json', { ...wholePrior, convergence: undefined });
+    const legacyPlan = call(legacy, { nativeReceipt: { targetSha: h0, diffBaseSha: b0 } });
+    expect(legacyPlan.scope).toBe('integration');
+    expect(legacyPlan.priorCoverageComplete).toBe(true);
+
+    // (acceptance changed since the retained round) Still whole.
+    const mismatched = call(valid, {
+      nativeReceipt: nativeWholeReceipt,
+      currentAcceptance: { version: 1, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] },
     });
     expect(mismatched.scope).toBe('whole');
     expect(mismatched.reason).toContain('acceptance');
 
-    // A changed briefing hash (baseSha256) or amendment set also revokes
-    // retained coverage even when the contract-prefix hash is identical.
-    const priorWithAcceptance = join(root, 'prior-acceptance.json');
-    writeFileSync(priorWithAcceptance, JSON.stringify({
-      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
-      complete: true, headMoved: false, frozen: { targetSha: h0, diffBaseSha: b0, acceptance: { version: 1, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: [] } },
-      convergence: { reviewScope: 'whole', coverageComplete: true },
-    }));
-    const amendmentMismatch = planPerkinsReviewScope({
-      priorConsolidatedFile: priorWithAcceptance, priorSeq: 1, repoPath: repo.path,
-      currentTargetSha: h1, currentDiffBaseSha: b1,
-      currentAcceptance: { version: 1, baseSha256: '', contractSha256: 'a'.repeat(64), amendmentIds: ['am1'] }, rules,
-    });
-    expect(amendmentMismatch.scope).toBe('whole');
-    expect(amendmentMismatch.reason).toContain('acceptance');
-
-    // A prior file that is present but not a conclusive whole-PR record is
-    // disclosed as such, never mislabelled as the job's first review.
-    const rejected = join(root, 'prior-v2.json');
-    writeFileSync(rejected, JSON.stringify({ schemaVersion: 2, architecture: 'perkins-hybrid', complete: true, findings: [] }));
-    const refused = planPerkinsReviewScope({
-      priorConsolidatedFile: rejected, priorSeq: 1, repoPath: repo.path,
-      currentTargetSha: h1, currentDiffBaseSha: b1, currentAcceptance: undefined, rules,
-    });
+    // (not a conclusive whole-PR record) disclosed, never mistaken for a
+    // first review.
+    const rejected = writePrior('prior-v2.json', { schemaVersion: 2, architecture: 'perkins-hybrid', complete: true, findings: [] });
+    const refused = call(rejected);
     expect(refused.scope).toBe('whole');
     expect(refused.reason).toContain('not a conclusive whole-PR record');
   });
@@ -630,9 +755,10 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
     diffBaseSha: BASE,
     acceptance: null,
     coverageComplete: false,
+    legacyWhole: false,
     ...overrides,
   });
-  const scope = (prior: ReturnType<typeof meta> | null, overrides: Partial<{ currentTargetSha: string; currentDiffBaseSha: string; finalWholePassAtReady: boolean; integrationLineage: { baseAdvanced: boolean; featureIntegrated: boolean; commonBasePinned: boolean } | null; integrationCoverage: boolean; acceptanceCompatible: boolean }> = {}) => planReviewScope({
+  const scope = (prior: ReturnType<typeof meta> | null, overrides: Partial<{ currentTargetSha: string; currentDiffBaseSha: string; finalWholePassAtReady: boolean; integrationLineage: { baseAdvanced: boolean; featureIntegrated: boolean; commonBasePinned: boolean; sameHeadAdoptedBase: boolean } | null; integrationCoverage: boolean; acceptanceCompatible: boolean }> = {}) => planReviewScope({
     prior,
     currentTargetSha: TARGET,
     currentDiffBaseSha: BASE,
@@ -665,7 +791,7 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
       currentTargetSha: 'c'.repeat(40),
       currentDiffBaseSha: 'e'.repeat(40),
       integrationCoverage: true,
-      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true },
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false },
     });
     expect(integrated.scope).toBe('integration');
     expect(integrated.reason).toContain('prior coverage retained');
@@ -675,30 +801,30 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
     const baseMoved = { currentDiffBaseSha: 'e'.repeat(40), currentTargetSha: 'c'.repeat(40) } as const;
     // Rebased/rewritten feature head: the prior target is not an ancestor.
     expect(scope(meta(), { ...baseMoved, integrationCoverage: true,
-      integrationLineage: { baseAdvanced: true, featureIntegrated: false, commonBasePinned: true } }).scope).toBe('whole');
+      integrationLineage: { baseAdvanced: true, featureIntegrated: false, commonBasePinned: true, sameHeadAdoptedBase: false } }).scope).toBe('whole');
     // Rewritten base: B0 no longer descends into B1.
     expect(scope(meta(), { ...baseMoved, integrationCoverage: true,
-      integrationLineage: { baseAdvanced: false, featureIntegrated: true, commonBasePinned: true } }).scope).toBe('whole');
+      integrationLineage: { baseAdvanced: false, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false } }).scope).toBe('whole');
     // One side already contains the other: the pinned prior base is not shared.
     expect(scope(meta(), { ...baseMoved, integrationCoverage: true,
-      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: false } }).scope).toBe('whole');
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: false, sameHeadAdoptedBase: false } }).scope).toBe('whole');
     // Policy off.
     expect(scope(meta(), { ...baseMoved, integrationCoverage: false }).scope).toBe('whole');
     // The effective acceptance changed since the retained round.
     const acceptance = scope(meta(), { ...baseMoved, integrationCoverage: true, acceptanceCompatible: false,
-      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true } });
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false } });
     expect(acceptance.scope).toBe('whole');
     expect(acceptance.reason).toContain('effective acceptance changed');
     // An omitted/absent acceptance-compatibility never retains coverage.
     const omitted = planReviewScope({
       prior: meta(), currentTargetSha: 'c'.repeat(40), currentDiffBaseSha: 'e'.repeat(40),
       deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true,
-      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true },
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false },
     } as unknown as Parameters<typeof planReviewScope>[0]);
     expect(omitted.scope).toBe('whole');
     // A moved base with an UNCHANGED feature head is never an integration.
     expect(scope(meta(), { ...baseMoved, integrationCoverage: true, currentTargetSha: TARGET,
-      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true } }).scope).toBe('whole');
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false } }).scope).toBe('whole');
   });
 
   it('plans the final whole pass exactly when a delta round posted READY', () => {
@@ -738,7 +864,7 @@ describe('prior convergence meta read (tolerant)', () => {
     };
     writeFileSync(file, JSON.stringify(modern));
     expect(readPriorConvergenceMeta(file, 4)).toEqual({
-      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null, coverageComplete: false,
+      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null, coverageComplete: false, legacyWhole: false,
     });
     writeFileSync(file, JSON.stringify({ ...modern, convergence: undefined }));
     expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('unknown');

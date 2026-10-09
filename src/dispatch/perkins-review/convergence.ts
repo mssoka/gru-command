@@ -467,14 +467,21 @@ export function integrationSince(
   }
   const diff = diffForPaths(repoPath, incomingBaseSha, currentTargetSha, integrationPaths);
   const { hunks, paths } = parseDeltaStructure(diff);
-  // Paths the prior round changed that the candidate now matches its base on:
-  // a resolution discarded the reviewed feature change.
-  const droppedFeaturePaths = [...prior.keys()].filter((path) => !now.has(path)).sort();
+  // EVERY path whose content or mode changed between H0 and H1: the sound
+  // "changed since the prior covered head" set for carry-forward.
+  const carryPaths = new Set(rawChanges(repoPath, priorTargetSha, currentTargetSha).keys());
+  // A prior-diff path that vanished from the current candidate is DISCARDED
+  // reviewed work only when its reviewed content actually changed H0..H1. A
+  // base that independently adopted the same blob/mode leaves H0==H1 on that
+  // path, so it is not a loss.
+  const droppedFeaturePaths = [...prior.keys()]
+    .filter((path) => !now.has(path) && carryPaths.has(path))
+    .sort();
   return {
     fromSha: incomingBaseSha, toSha: currentTargetSha, diff, hunks,
     touchedPaths: new Set([...paths, ...hunks.map((hunk) => hunk.path)]),
     priorTargetSha, priorDiffBaseSha, incomingBaseSha, integrationPaths, droppedFeaturePaths,
-    carryPaths: new Set(rawChanges(repoPath, priorTargetSha, currentTargetSha).keys()),
+    carryPaths,
   };
 }
 
@@ -488,6 +495,10 @@ export interface IntegrationLineage {
   readonly baseAdvanced: boolean;
   readonly featureIntegrated: boolean;
   readonly commonBasePinned: boolean;
+  /** The candidate did not change: the frozen target is the SAME commit, and
+   * the new base is a descendant of the prior base AND an ancestor of that
+   * target (the base adopted commits already inside the reviewed history). */
+  readonly sameHeadAdoptedBase: boolean;
 }
 
 function gitIsAncestor(repoPath: string, ancestor: string, descendant: string): boolean {
@@ -514,13 +525,17 @@ export function probeIntegrationLineage(
   try {
     const baseAdvanced = gitIsAncestor(repoPath, input.priorDiffBaseSha, input.currentDiffBaseSha);
     const featureIntegrated = gitIsAncestor(repoPath, input.priorTargetSha, input.currentTargetSha);
+    // Same candidate: the base only advanced onto history already inside the
+    // reviewed target (descendant of the prior base, ancestor of the head).
+    const sameHeadAdoptedBase = input.priorTargetSha === input.currentTargetSha && baseAdvanced &&
+      gitIsAncestor(repoPath, input.currentDiffBaseSha, input.currentTargetSha);
     if (!baseAdvanced || !featureIntegrated) {
-      return { baseAdvanced, featureIntegrated, commonBasePinned: false };
+      return { baseAdvanced, featureIntegrated, commonBasePinned: false, sameHeadAdoptedBase };
     }
     const mergeBase = execFileSync('git', ['-C', repoPath, 'merge-base', input.priorTargetSha, input.currentDiffBaseSha], {
       encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    return { baseAdvanced, featureIntegrated, commonBasePinned: mergeBase === input.priorDiffBaseSha };
+    return { baseAdvanced, featureIntegrated, commonBasePinned: mergeBase === input.priorDiffBaseSha, sameHeadAdoptedBase };
   } catch {
     return null;
   }
@@ -655,6 +670,9 @@ export interface ReviewScopePlan {
   /** Deterministic, durable explanation of the decision (disclosed on the
    * convergence record and in the ledger review event). */
   readonly reason: string;
+  /** The authenticated whole-candidate coverage of the prior round, as the
+   * engine must consume it (false when unauthenticated/partial/mismatched). */
+  readonly priorCoverageComplete: boolean;
 }
 
 export function planReviewScope(input: {
@@ -673,25 +691,32 @@ export function planReviewScope(input: {
   readonly acceptanceCompatible: boolean;
 }): ReviewScopePlan {
   if (input.prior === null) {
-    return { scope: 'whole', reason: 'first review of this change (no conclusive prior record)' };
+    return { scope: 'whole', reason: 'first review of this change (no conclusive prior record)', priorCoverageComplete: false };
   }
   const prior = input.prior;
+  const coverageNote = prior.coverageComplete
+    ? 'the retained prior coverage covers the whole candidate'
+    : 'the retained prior coverage is only partial, so this READY still owes the final whole pass';
   const sameCandidate = prior.targetSha === input.currentTargetSha &&
     prior.diffBaseSha === input.currentDiffBaseSha;
   if (sameCandidate) {
-    return { scope: 'whole', reason: 're-review at an unchanged candidate (target and merge base unchanged)' };
+    return { scope: 'whole', reason: 're-review at an unchanged candidate (target and merge base unchanged)', priorCoverageComplete: prior.coverageComplete };
   }
   if (prior.diffBaseSha !== input.currentDiffBaseSha) {
     const lineage = input.integrationLineage ?? null;
+    const integratedForward = prior.targetSha !== input.currentTargetSha &&
+      lineage !== null && lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned;
+    const sameHeadAdoptedBase = prior.targetSha === input.currentTargetSha &&
+      lineage !== null && lineage.sameHeadAdoptedBase;
     if (input.integrationCoverage === true && input.acceptanceCompatible === true &&
-      prior.targetSha !== input.currentTargetSha &&
-      lineage !== null && lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned) {
-      const coverage = prior.coverageComplete
-        ? 'the retained prior coverage covers the whole candidate'
-        : 'the retained prior coverage is only partial, so this READY still owes the final whole pass';
+      (integratedForward || sameHeadAdoptedBase)) {
+      const kind = sameHeadAdoptedBase
+        ? `the candidate is unchanged (${input.currentTargetSha.slice(0, 12)}) and the base only advanced onto already-reviewed history, so the prior coverage stands`
+        : `reviewed feature head ${prior.targetSha.slice(0, 12)} integrated forward into the current candidate`;
       return {
         scope: 'integration',
-        reason: `prior coverage retained: merge base ${prior.diffBaseSha.slice(0, 12)} advanced to ${input.currentDiffBaseSha.slice(0, 12)} and reviewed feature head ${prior.targetSha.slice(0, 12)} integrated forward into the current candidate; ${coverage}`,
+        reason: `prior coverage retained: merge base ${prior.diffBaseSha.slice(0, 12)} advanced to ${input.currentDiffBaseSha.slice(0, 12)} and ${kind}; ${coverageNote}`,
+        priorCoverageComplete: prior.coverageComplete,
       };
     }
     const fallback = input.integrationCoverage !== true
@@ -699,7 +724,7 @@ export function planReviewScope(input: {
       : input.acceptanceCompatible !== true
         ? 'merge base moved and the effective acceptance changed since the retained round — whole-change re-verification'
         : prior.targetSha === input.currentTargetSha
-          ? 'merge base moved but the reviewed feature head did not advance — whole-change re-verification'
+          ? 'merge base moved with an unchanged candidate, but the new base is not an ancestor of the reviewed head (the base advanced beyond already-reviewed history) — whole-change re-verification'
           : lineage === null
             ? 'merge base moved and the integration lineage could not be established — whole-change re-verification'
             : !lineage.baseAdvanced
@@ -707,18 +732,18 @@ export function planReviewScope(input: {
               : !lineage.featureIntegrated
                 ? 'merge base moved and the reviewed feature head no longer descends into the current candidate (rebased/rewritten head) — whole-change re-verification'
                 : 'merge base moved and the prior base is no longer the shared ancestor of the reviewed head and the current base — whole-change re-verification';
-    return { scope: 'whole', reason: fallback };
+    return { scope: 'whole', reason: fallback, priorCoverageComplete: prior.coverageComplete };
   }
   if (
     input.finalWholePassAtReady &&
     prior.reviewScope === 'delta' &&
     prior.canonicalVerdict === 'READY TO MERGE'
   ) {
-    return { scope: 'whole', reason: 'a delta round posted READY: the final whole-change authority pass is required' };
+    return { scope: 'whole', reason: 'a delta round posted READY: the final whole-change authority pass is required', priorCoverageComplete: prior.coverageComplete };
   }
   return prior.seq + 1 >= input.deltaRoundsFrom
-    ? { scope: 'delta', reason: `incremental fix round ${prior.seq + 1} since the last reviewed SHA` }
-    : { scope: 'whole', reason: 'before the delta-round threshold (standing whole-change authority)' };
+    ? { scope: 'delta', reason: `incremental fix round ${prior.seq + 1} since the last reviewed SHA`, priorCoverageComplete: prior.coverageComplete }
+    : { scope: 'whole', reason: 'before the delta-round threshold (standing whole-change authority)', priorCoverageComplete: prior.coverageComplete };
 }
 
 /** What a caller must know about a completed round's convergence record to
@@ -742,6 +767,10 @@ export interface PriorConvergenceMeta {
   /** The prior round's durable whole-candidate coverage bit (false for a
    * partial delta/integration round or a legacy record without the field). */
   readonly coverageComplete: boolean;
+  /** True when the record carries NO convergence block at all: a genuine
+   * pre-Stage-5 whole review, whole-complete only when its native receipt
+   * also carries no Stage-5 scope/coverage evidence. */
+  readonly legacyWhole: boolean;
 }
 
 const MAX_CONSOLIDATED_META_BYTES = 8 * 1024 * 1024;
@@ -820,22 +849,86 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       diffBaseSha: parsed.frozen.diffBaseSha,
       acceptance,
       coverageComplete,
+      legacyWhole,
     };
   } catch {
     return null;
   }
 }
 
+/** The ledger-native publication receipt for one prior round: the durable
+ * `round.perkins-review` fields plus the pre-commit `round.final-pass-required`
+ * marker presence. A consolidated file's scope/coverage claims are credited
+ * only when this receipt corroborates them. */
+export interface PriorNativeReceipt {
+  readonly targetSha?: unknown;
+  readonly diffBaseSha?: unknown;
+  readonly reviewScope?: unknown;
+  readonly coverageComplete?: unknown;
+  readonly finalPassRequired?: unknown;
+}
+
+/** The prior round's accepted contract binding as recorded on the round's own
+ * `round.review-inputs-frozen` ledger event (authoritative). */
+export interface PriorAcceptanceBinding {
+  readonly version: number;
+  readonly baseSha256: string;
+  readonly contractSha256: string;
+  readonly amendmentIds: readonly string[];
+}
+
+function acceptanceEqual(left: PriorAcceptanceBinding, right: PriorAcceptanceBinding): boolean {
+  return left.version === right.version && left.baseSha256 === right.baseSha256 &&
+    left.contractSha256 === right.contractSha256 &&
+    left.amendmentIds.join('\0') === [...right.amendmentIds].join('\0');
+}
+
+/** Authenticate a prior record's scope/coverage against its round's native
+ * ledger receipt. Returns the meta with an authenticated `coverageComplete`,
+ * or null when the record and the receipt disagree (stripped/forged/corrupted
+ * metadata) — the caller then reviews whole and cannot credit retained
+ * coverage. A genuine pre-Stage-5 whole record is credited only when the
+ * receipt carries NO Stage-5 scope/coverage evidence either. */
+export function authenticatePriorMeta(
+  meta: PriorConvergenceMeta | null,
+  receipt: PriorNativeReceipt | null,
+): PriorConvergenceMeta | null {
+  if (meta === null || receipt === null) return null;
+  // The record's own frozen identity must match the round's native receipt.
+  if (typeof receipt.targetSha !== 'string' || receipt.targetSha !== meta.targetSha) return null;
+  if (typeof receipt.diffBaseSha !== 'string' || receipt.diffBaseSha !== meta.diffBaseSha) return null;
+  const receiptScope = typeof receipt.reviewScope === 'string' ? receipt.reviewScope : undefined;
+  if (receiptScope !== undefined && receiptScope !== meta.reviewScope) return null;
+  const receiptDebt = receipt.finalPassRequired === true;
+  const receiptComplete = receipt.coverageComplete === true;
+  if (meta.legacyWhole) {
+    // A stripped/forged convergence block on a Stage-5 round is caught here:
+    // the legacy credit is granted ONLY when the native receipt also carries
+    // no Stage-5 scope/coverage/debt evidence at all.
+    if (receiptScope !== undefined || receiptComplete || receiptDebt) return null;
+    return { ...meta, coverageComplete: true };
+  }
+  // A record may never claim whole-complete coverage its receipt contradicts
+  // or does not corroborate.
+  if (meta.coverageComplete && (!receiptComplete || receiptDebt)) return null;
+  return { ...meta, coverageComplete: meta.coverageComplete && receiptComplete && !receiptDebt };
+}
+
 /** One call that plans the production round scope: read the prior durable
- * record, compare the effective acceptance, probe the integration lineage in
- * the repo, and decide. Keeps the perkins.ts wiring testable end to end. */
+ * record, authenticate its coverage/acceptance against the round's native
+ * receipt, probe the integration lineage in the repo, and decide. Keeps the
+ * perkins.ts wiring testable end to end. */
 export function planPerkinsReviewScope(input: {
   readonly priorConsolidatedFile?: string;
   readonly priorSeq?: number;
   readonly repoPath: string;
   readonly currentTargetSha: string;
   readonly currentDiffBaseSha: string;
-  readonly currentAcceptance: { readonly version: number; readonly baseSha256: string; readonly contractSha256: string; readonly amendmentIds: readonly string[] } | undefined;
+  readonly currentAcceptance: PriorAcceptanceBinding | undefined;
+  /** The prior round's native ledger receipt; absent = unauthenticated. */
+  readonly nativeReceipt?: PriorNativeReceipt | null;
+  /** The prior round's ledger-native accepted contract binding. */
+  readonly acceptanceReceipt?: PriorAcceptanceBinding | null;
   readonly rules: {
     readonly deltaRoundsFrom: number;
     readonly finalWholePassAtReady: boolean;
@@ -843,22 +936,38 @@ export function planPerkinsReviewScope(input: {
   };
 }): ReviewScopePlan {
   const priorFileProvided = input.priorConsolidatedFile !== undefined && input.priorSeq !== undefined;
-  const prior = priorFileProvided
+  const rawPrior = priorFileProvided
     ? readPriorConvergenceMeta(input.priorConsolidatedFile!, input.priorSeq!)
     : null;
   // Distinguish "no prior round" from "a prior record that is not a
   // conclusive whole-PR record": the latter must be disclosed, not mislabelled
   // as the job's first review.
-  if (priorFileProvided && prior === null) {
-    return { scope: 'whole', reason: 'a prior review record exists but is not a conclusive whole-PR record — whole-change re-verification' };
+  if (priorFileProvided && rawPrior === null) {
+    return {
+      scope: 'whole',
+      reason: 'a prior review record exists but is not a conclusive whole-PR record — whole-change re-verification',
+      priorCoverageComplete: false,
+    };
   }
-  const priorAcceptance = prior?.acceptance ?? null;
-  const acceptanceCompatible = input.currentAcceptance === undefined
+  const prior = authenticatePriorMeta(rawPrior, input.nativeReceipt ?? null);
+  if (priorFileProvided && prior === null) {
+    return {
+      scope: 'whole',
+      reason: 'the prior record\'s scope/coverage could not be authenticated against its native ledger receipt — whole-change re-verification',
+      priorCoverageComplete: false,
+    };
+  }
+  // The record's acceptance must equal its own round's ledger-native freeze
+  // binding; an altered acceptance can never retain coverage.
+  const fileAcceptance = rawPrior?.acceptance ?? null;
+  const receiptAcceptance = input.acceptanceReceipt ?? null;
+  const acceptanceAuthenticated = fileAcceptance === null
+    ? receiptAcceptance === null
+    : receiptAcceptance !== null && acceptanceEqual(fileAcceptance, receiptAcceptance);
+  const priorAcceptance = receiptAcceptance ?? fileAcceptance;
+  const acceptanceCompatible = acceptanceAuthenticated && (input.currentAcceptance === undefined
     ? priorAcceptance === null
-    : priorAcceptance !== null && priorAcceptance.version === input.currentAcceptance.version &&
-      priorAcceptance.baseSha256 === input.currentAcceptance.baseSha256 &&
-      priorAcceptance.contractSha256 === input.currentAcceptance.contractSha256 &&
-      priorAcceptance.amendmentIds.join('\0') === [...input.currentAcceptance.amendmentIds].join('\0');
+    : priorAcceptance !== null && acceptanceEqual(priorAcceptance, input.currentAcceptance));
   const integrationLineage = prior !== null && prior.diffBaseSha !== input.currentDiffBaseSha
     ? probeIntegrationLineage(input.repoPath, {
         priorDiffBaseSha: prior.diffBaseSha,
@@ -867,7 +976,7 @@ export function planPerkinsReviewScope(input: {
         currentTargetSha: input.currentTargetSha,
       })
     : null;
-  return planReviewScope({
+  const plan = planReviewScope({
     prior,
     currentTargetSha: input.currentTargetSha,
     currentDiffBaseSha: input.currentDiffBaseSha,
@@ -877,4 +986,7 @@ export function planPerkinsReviewScope(input: {
     integrationLineage,
     acceptanceCompatible,
   });
+  // A record whose own acceptance is not corroborated by its round's native
+  // freeze binding can never carry retained coverage into the engine.
+  return acceptanceAuthenticated ? plan : { ...plan, priorCoverageComplete: false };
 }

@@ -2918,10 +2918,9 @@ describe('WaveRunner built-in Perkins production path', () => {
     }
   }, 180_000);
 
-  it('Stage-5 integration: a partial prior still chains the final whole pass after the advanced base', async () => {
+  it('Stage-5 integration: a genuinely partial prior still chains the final whole pass after the advanced base', async () => {
     const repo = makeFixtureRepo('perkins-wave-integration-partial');
     repos.push(repo);
-    // CI runners have no global git identity; the merge below needs one.
     repo.git(['config', 'user.name', 'Fixture Tests']);
     repo.git(['config', 'user.email', 'tests@example.invalid']);
     repo.git(['checkout', '-b', 'feature/integration']);
@@ -2929,7 +2928,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     const root = mkdtempSync(join(tmpdir(), 'perkins-intp-port-'));
     const artifacts = mkdtempSync(join(tmpdir(), 'perkins-intp-artifacts-'));
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-intp-db-')));
-    dbs.push(db);
+    dirs.push(root, artifacts); dbs.push(db);
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
     const port = new GitReviewPort(root, 'feature/integration', h0);
     await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-integration-partial' });
@@ -2953,6 +2952,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     });
     const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
 
+    // Round 1 (whole) at H0/B0.
     const first = asWave(await new WaveRunner({
       reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
       ledger, worktrees: port, poster: receiptPoster,
@@ -2960,42 +2960,187 @@ describe('WaveRunner built-in Perkins production path', () => {
       spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-intp-s1-')), { childAnswer: () => '[]', specialists: [] }).spawner,
     }).runRound({ jobId: job.id }));
     expect(first.canonicalVerdict).toBe('READY TO MERGE');
-    // Make the prior round PARTIAL coverage (as a real delta/unknown prior would
-    // be): the next integration must NOT treat it as whole-complete.
+    const b0 = repo.git(['rev-parse', 'main']);
+    // Make the prior round a GENUINE partial (delta-scope) round: the durable
+    // record and its NATIVE receipt both say delta with no whole-candidate bit.
     const priorFile = join(artifacts, first.round.id, 'consolidated.json');
-    const prior = JSON.parse(readFileSync(priorFile, 'utf8')) as { convergence: Record<string, unknown> };
-    // Make the prior round PARTIAL coverage (a delta-scope round with no
-    // whole-candidate bit): the next integration must NOT treat it as complete.
-    prior.convergence['reviewScope'] = 'delta';
-    delete prior.convergence['coverageComplete'];
-    writeFileSync(priorFile, JSON.stringify(prior));
+    const priorRecord = JSON.parse(readFileSync(priorFile, 'utf8')) as { convergence: Record<string, unknown> };
+    priorRecord.convergence['reviewScope'] = 'delta';
+    delete priorRecord.convergence['coverageComplete'];
+    writeFileSync(priorFile, JSON.stringify(priorRecord));
+    ledger.appendCustomEvent({
+      kind: 'round.perkins-review', jobId: job.id, roundId: first.round.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', targetSha: h0, diffBaseSha: b0, blockers: 0, complete: true },
+    });
 
+    // main advances and the feature integrates it forward.
     repo.git(['checkout', 'main']);
     repo.commitFile('src/main1.ts', 'export const main1 = 1;\n');
     repo.git(['checkout', 'feature/integration']);
     repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
     repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/integration']);
 
-    const second = asWave(await new WaveRunner({
+    const outcome = asWave(await new WaveRunner({
       reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
       ledger, worktrees: port, poster: receiptPoster,
       reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
       spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-intp-s2-')), { childAnswer: () => '[]', specialists: [] }).spawner,
     }).runRound({ jobId: job.id }));
-    // The wave AUTO-CHAINS the final whole pass (round 3) for the partial prior.
-    expect(second.round.seq).toBe(3);
+    // The integration round (seq 2) posted READY owing the pass and AUTO-CHAINED
+    // the final whole pass (seq 3).
     const rounds = ledger.listRounds(job.id);
     expect(rounds).toHaveLength(3);
+    expect(outcome.round.seq).toBe(3);
     const integrationRound = rounds.find((round) => round.seq === 2)!;
     expect(ledger.latestRoundEvent(integrationRound.id, 'round.perkins-review')!.payload).toMatchObject({
       canonicalVerdict: 'READY TO MERGE', reviewScope: 'integration', finalPassRequired: true,
     });
+    expect(ledger.latestRoundEvent(outcome.round.id, 'round.perkins-review')!.payload)
+      .toMatchObject({ canonicalVerdict: 'READY TO MERGE', reviewScope: 'whole' });
+    // The debt is durable BEFORE the posted event becomes promotable.
+    const marker = ledger.latestRoundEvent(integrationRound.id, 'round.final-pass-required');
+    const posted = ledger.latestRoundEvent(integrationRound.id, 'round.posted');
+    expect(marker).not.toBeNull();
+    expect(posted).not.toBeNull();
+    expect(marker!.seq).toBeLessThan(posted!.seq);
+
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }, 180_000);
+
+  it('does not credit a stripped prior convergence block; the next round reviews whole', async () => {
+    const repo = makeFixtureRepo('perkins-stripped-prior');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    repo.git(['checkout', '-b', 'feature/stripped']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-stripped-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-stripped-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-stripped-db-')));
+    dirs.push(root, artifacts); dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/stripped', h0);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-stripped' });
+    const job = ledger.addJob({ id: 'job-stripped', repo: 'fixture', title: 'stripped', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/44');
+    attachOrigin(repo, 'feature/stripped', root);
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9005', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/stripped'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-stripped-s1-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+    // Tamper the durable record: strip the convergence block. The round's
+    // native receipt still carries its Stage-5 scope, so the tampering is
+    // detected and coverage is NOT credited.
+    const priorFile = join(artifacts, first.round.id, 'consolidated.json');
+    const prior = JSON.parse(readFileSync(priorFile, 'utf8')) as Record<string, unknown>;
+    delete prior['convergence'];
+    writeFileSync(priorFile, JSON.stringify(prior));
+
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main1.ts', 'export const main1 = 1;\n');
+    repo.git(['checkout', 'feature/stripped']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/stripped']);
+
+    const second = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/stripped'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-stripped-s2-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(second.round.seq).toBe(2);
+    // Stripped convergence cannot retain coverage: the round reviews whole.
     expect(ledger.latestRoundEvent(second.round.id, 'round.perkins-review')!.payload)
       .toMatchObject({ canonicalVerdict: 'READY TO MERGE', reviewScope: 'whole' });
 
-    for (const directory of [root, artifacts]) {
-      rmSync(directory, { recursive: true, force: true });
-    }
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }, 180_000);
+
+  it('restores a partial-integration final-pass debt on restart before committing approval', async () => {
+    const repo = makeFixtureRepo('perkins-restore-debt');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    repo.git(['checkout', '-b', 'feature/restore-debt']);
+    const target = repo.commitFile('src/main.ts', 'export const answer = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-restore-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-restore-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-restore-db-')));
+    dirs.push(root, artifacts); dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/restore-debt', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-restore-debt' });
+    const job = ledger.addJob({ id: 'job-restore-debt', repo: 'fixture', title: 'restore debt', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'in-review');
+    ledger.setJobPr(job.id, 'https://example.invalid/acme/fixture/pull/43');
+    const round = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: target });
+    await port.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: target, jobId: job.id });
+    ledger.setRoundStatus(round.id, 'live');
+    const directory = join(artifacts, round.id);
+    mkdirSync(directory, { recursive: true });
+    const publicationBody = '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
+    const publicationFile = join(directory, 'perkins-report.publication.md');
+    writeFileSync(publicationFile, publicationBody, 'utf8');
+    const publicationSha256 = createHash('sha256').update(publicationBody, 'utf8').digest('hex');
+    // The preserved review state: a partial-coverage integration READY that
+    // still owed the final whole-change pass.
+    writeFileSync(join(directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: target },
+      convergence: { reviewScope: 'integration', finalPassRequired: true },
+    }));
+    // The crash window: the posted event exists, the marker never landed.
+    ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: job.id, roundId: round.id,
+      payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: 'https://example.invalid/acme/fixture/pull/43', host: 'example.invalid',
+        targetSha: target, baseSha: 'b'.repeat(40), publicationFile, publicationSha256, reconciled: false,
+        receipt: { reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: target, headSha: target, baseSha: 'b'.repeat(40), bodySha256: publicationSha256 },
+      },
+    });
+    expect(ledger.latestRoundEvent(round.id, 'round.final-pass-required')).toBeNull();
+    const poster = { post: vi.fn(), authenticatedActor: async () => 'gru-bot' };
+    const wave = new WaveRunner({ ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts, poster });
+    expect(await wave.recoverInterruptedRounds()).toBe(1);
+    // The approval is committed, and its final-pass debt is RESTORED before
+    // that approval can be projected as owner-ready.
+    expect(ledger.getRound(round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+    const marker = ledger.latestRoundEvent(round.id, 'round.final-pass-required');
+    expect(marker).not.toBeNull();
+    expect(marker!.payload).toMatchObject({ targetSha: target });
+    ledger.appendCustomEvent({
+      kind: 'github.branch-state', jobId: job.id,
+      payload: {
+        repo: 'example/fixture', branch: 'gru/job-restore-debt', sha: target, merged: false, pr_open: true,
+        mergeable_state: 'clean', pr_number: 43, pr_url: 'https://example.invalid/acme/fixture/pull/43',
+        merge_commit_sha: null, ci: { sha: target, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    const engine = new BoardEngine({ ledger, bus: new EventBus() });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
   }, 180_000);
 
   it('requires old-head writer cessation before admitting a new-head review', async () => {

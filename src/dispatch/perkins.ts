@@ -31,7 +31,7 @@ import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/t
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
-import { planPerkinsReviewScope } from './perkins-review/convergence.js';
+import { planPerkinsReviewScope, type PriorAcceptanceBinding, type PriorNativeReceipt } from './perkins-review/convergence.js';
 import {
   freezeReviewInputs,
   compatibleReviewIdentity,
@@ -2366,6 +2366,41 @@ export class WaveRunner {
       }
     }
     if (bound && event !== null) {
+      // Restore a partial-coverage round's final-pass debt from its preserved
+      // review state BEFORE approval is committed: a crash between the posted
+      // event and the pre-commit marker must not promote a partial approval
+      // into owner-readiness. The debt is authenticated to the posted head.
+      if (postedVerdict === 'approved' &&
+        this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') === null) {
+        const consolidated = join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'consolidated.json');
+        let owesFinalPass = false;
+        try {
+          const info = lstatSync(consolidated);
+          if (info.isFile() && !info.isSymbolicLink() && info.size <= 8 * 1024 * 1024) {
+            const parsed = JSON.parse(readFileSync(consolidated, 'utf8')) as {
+              architecture?: unknown;
+              schemaVersion?: unknown;
+              frozen?: { targetSha?: unknown };
+              convergence?: { finalPassRequired?: unknown; reviewScope?: unknown };
+            };
+            owesFinalPass = parsed.architecture === 'perkins-whole-pr' && parsed.schemaVersion === 3 &&
+              parsed.frozen?.targetSha === event.receipt.headSha &&
+              parsed.convergence?.finalPassRequired === true;
+          }
+        } catch {
+          owesFinalPass = false;
+        }
+        if (owesFinalPass) {
+          try {
+            this.opts.ledger.appendCustomEvent({
+              kind: 'round.final-pass-required', jobId: round.jobId, roundId: round.id,
+              payload: { targetSha: event.receipt.headSha, reviewScope: 'restored-on-restart' },
+            });
+          } catch (markerError) {
+            throw new Error(`restart recovery could not restore the required final whole-change pass before promoting round ${round.id}: ${String(markerError)}`);
+          }
+        }
+      }
       // R6-1: reconstruct the DEFERRED lens outcomes from durable evidence
       // before promotion — the crash may have landed between the real post
       // and finalization, leaving never-started lenses pending. The
@@ -4934,12 +4969,12 @@ export class WaveRunner {
       }
       // Stage-5 convergence (issue #225) + integration coverage: the scope is
       // planned from the prior round's durable convergence record and the
-      // repo's own ancestry, never from wall-clock heuristics. Integration
-      // coverage is retained only when the prior record is conclusive, the
-      // base only ADVANCED, the reviewed feature head INTEGRATED FORWARD,
-      // the two share exactly the pinned prior base, and the effective
-      // acceptance is unchanged — otherwise the round reviews whole (with a
-      // durable reason).
+      // repo's own ancestry, never from wall-clock heuristics. Retained
+      // coverage is credited only when the prior record's scope/coverage and
+      // acceptance are AUTHENTICATED against the prior round's native ledger
+      // receipts (freeze binding + review/verdict/debt events) — a stripped,
+      // forged or contradicted record reviews whole with a durable reason.
+      const priorEvidence = newestPredecessor === undefined ? null : this.priorNativeEvidence(newestPredecessor);
       const scopePlan = planPerkinsReviewScope({
         ...(priorConsolidatedFile !== undefined && newestPredecessor !== undefined
           ? { priorConsolidatedFile, priorSeq: newestPredecessor.seq }
@@ -4948,6 +4983,7 @@ export class WaveRunner {
         currentTargetSha: frozenReview.manifest.targetSha,
         currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
         currentAcceptance: frozenReview.manifest.acceptance,
+        ...(priorEvidence !== null ? { nativeReceipt: priorEvidence.receipt, acceptanceReceipt: priorEvidence.acceptance } : {}),
         rules: {
           deltaRoundsFrom: policy.portableContract.rules.convergence.deltaRoundsFrom,
           finalWholePassAtReady: policy.portableContract.rules.convergence.finalWholePassAtReady,
@@ -4966,6 +5002,7 @@ export class WaveRunner {
         ...(priorConsolidatedFile !== undefined ? { priorConsolidatedFile } : {}),
         reviewScope: scopePlan.scope,
         reviewScopeReason: scopePlan.reason,
+        priorCoverageComplete: scopePlan.priorCoverageComplete,
         ...(claimedFixedPriors !== undefined ? { claimedFixedPriors } : {}),
       });
     } catch (error) {
@@ -5164,6 +5201,21 @@ export class WaveRunner {
         if (parsePostedEventPayload(postedPayload) === null) {
           throw new Error('internal: refusing to persist a round.posted payload that restart recovery cannot parse');
         }
+        // The final-pass obligation is durable BEFORE the posted event becomes
+        // promotable: a crash between `round.posted` and a later marker write
+        // must never let restart recovery (or the board's owner-ready gate)
+        // promote a partial-coverage approval without its debt.
+        if (verdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved &&
+          this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') === null) {
+          try {
+            this.opts.ledger.appendCustomEvent({
+              kind: 'round.final-pass-required', jobId: job.id, roundId: round.id,
+              payload: { targetSha: review.targetSha, reviewScope: review.convergence.reviewScope },
+            });
+          } catch (markerError) {
+            throw new Error(`could not record the required final whole-change pass before the posted event: ${String(markerError)}`);
+          }
+        }
         this.opts.ledger.appendCustomEvent({
           kind: 'round.posted',
           jobId: job.id,
@@ -5352,11 +5404,12 @@ export class WaveRunner {
     }
     if (recordedVerdict !== null) {
       // Stage-5: the final-pass obligation is durable BEFORE the verdict
-      // commits. A crash between the two must never leave an approved
-      // delta round without its marker (the board's owner-ready gate reads
-      // this event); a failed marker write therefore fails the round
-      // closed instead of approving.
-      if (recordedVerdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved) {
+      // commits. It is normally already written by recordDelivery BEFORE the
+      // posted event; this is the idempotent fallback for any delivery path
+      // that did not. A failed marker write fails the round closed instead of
+      // approving.
+      if (recordedVerdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved &&
+        this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') === null) {
         try {
           this.opts.ledger.appendCustomEvent({
             kind: 'round.final-pass-required', jobId: job.id, roundId: round.id,
@@ -5899,6 +5952,49 @@ export class WaveRunner {
     } catch {
       return false;
     }
+  }
+
+  /** The prior round's NATIVE ledger receipts: the durable
+   * `round.perkins-review` fields (identity + scope/coverage/debt) plus the
+   * pre-commit `round.final-pass-required` marker presence, and the accepted
+   * contract binding recorded on the round's own freeze event. These
+   * authenticate a consolidated file's retained-coverage claims. */
+  private priorNativeEvidence(round: RoundRecord): { receipt: PriorNativeReceipt; acceptance: PriorAcceptanceBinding | null } {
+    const reviewEvent = this.opts.ledger.latestRoundEvent(round.id, 'round.perkins-review');
+    const payload = typeof reviewEvent?.payload === 'object' && reviewEvent.payload !== null
+      ? reviewEvent.payload as Record<string, unknown>
+      : {};
+    const debtMarker = this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') !== null;
+    const frozenEvent = this.opts.ledger.latestRoundEvent(round.id, 'round.review-inputs-frozen');
+    const frozenPayload = typeof frozenEvent?.payload === 'object' && frozenEvent.payload !== null
+      ? frozenEvent.payload as { acceptance?: unknown }
+      : {};
+    const rawAcceptance = frozenPayload.acceptance;
+    const acceptance = typeof rawAcceptance === 'object' && rawAcceptance !== null &&
+      typeof (rawAcceptance as { version?: unknown }).version === 'number' &&
+      Number.isSafeInteger((rawAcceptance as { version?: number }).version) &&
+      typeof (rawAcceptance as { baseSha256?: unknown }).baseSha256 === 'string' &&
+      typeof (rawAcceptance as { contractSha256?: unknown }).contractSha256 === 'string' &&
+      /^[a-f0-9]{64}$/u.test((rawAcceptance as { contractSha256: string }).contractSha256) &&
+      Array.isArray((rawAcceptance as { amendmentIds?: unknown }).amendmentIds) &&
+      ((rawAcceptance as { amendmentIds: unknown[] }).amendmentIds).every((id) => typeof id === 'string')
+      ? {
+          version: (rawAcceptance as { version: number }).version,
+          baseSha256: (rawAcceptance as { baseSha256: string }).baseSha256,
+          contractSha256: (rawAcceptance as { contractSha256: string }).contractSha256,
+          amendmentIds: [...(rawAcceptance as { amendmentIds: string[] }).amendmentIds],
+        }
+      : null;
+    return {
+      receipt: {
+        targetSha: payload['targetSha'],
+        diffBaseSha: payload['diffBaseSha'],
+        reviewScope: payload['reviewScope'],
+        coverageComplete: payload['coverageComplete'],
+        finalPassRequired: payload['finalPassRequired'] === true || debtMarker,
+      },
+      acceptance,
+    };
   }
 
   private async sweepReviewWorktree(worktreeId: string): Promise<void> {
