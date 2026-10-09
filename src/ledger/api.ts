@@ -1194,22 +1194,37 @@ export class LedgerApi {
     ).map((row) => this.eventFromRow(row));
   }
 
-  /** R8-2 (gh-169): a job's completed verification runs, KIND-SCOPED and
-   * newest-first — the binding-target search must not be truncated by a
-   * generic all-kind event window. The bound is a loud ceiling: a job with
-   * more completed verification runs than this window throws instead of
-   * letting absence masquerade as "no binding run". */
-  listJobVerificationCompleted(jobId: string, limit = 200): readonly EventRecord[] {
-    const rows = this.db
-      .prepare('SELECT COUNT(*) AS total FROM events WHERE job_id = ? AND kind = ?')
-      .all(jobId, VERIFICATION_KIND) as Row[];
-    const total = typeof rows[0]?.total === 'number' ? (rows[0] as { total: number }).total : 0;
-    if (total > limit) {
-      throw new Error(`verification history window exceeded for job ${jobId} (${total} completed runs > ${limit}) — cannot prove the newest target-bound run from a truncated search`);
+  /** R8-2 (gh-169, corrected by j-1594 native-verification-history-search):
+   * a job's completed verification runs, KIND-SCOPED and newest-first — the
+   * binding-target search must not be truncated by a generic all-kind event
+   * window. The history is read in bounded keyset pages over the COMPLETE
+   * record: there is NO finite per-job lifetime ceiling, so any history
+   * length is reviewable. The scan is lazy — the caller may stop at the
+   * first binding run, so the common case fetches one page, while proving
+   * absence exhausts every page. Each fetch is bounded by `pageSize`; a
+   * storage failure throws out of the generator, so a partial read can never
+   * masquerade as an empty history. A first-captured `MAX(seq)` watermark
+   * keeps the page set stable and visits every row exactly once. */
+  *iterateJobVerificationCompleted(jobId: string, pageSize = 200): Generator<EventRecord, void, void> {
+    if (!Number.isInteger(pageSize) || pageSize <= 0) {
+      throw new Error(`iterateJobVerificationCompleted pageSize must be a positive integer (got ${String(pageSize)})`);
     }
-    return (this.db
-      .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? ORDER BY seq DESC LIMIT ?')
-      .all(jobId, VERIFICATION_KIND, limit) as Row[]).map((row) => this.eventFromRow(row));
+    const ceilingRow = this.db
+      .prepare('SELECT MAX(seq) AS ceiling FROM events WHERE job_id = ? AND kind = ?')
+      .get(jobId, VERIFICATION_KIND) as Row | undefined;
+    const ceiling = ceilingRow?.ceiling;
+    if (ceiling === null || ceiling === undefined) return;
+    const watermark = Number(ceiling);
+    let cursor = watermark + 1;
+    for (;;) {
+      const rows = this.db
+        .prepare('SELECT * FROM events WHERE job_id = ? AND kind = ? AND seq <= ? AND seq < ? ORDER BY seq DESC LIMIT ?')
+        .all(jobId, VERIFICATION_KIND, watermark, cursor, pageSize) as Row[];
+      if (rows.length === 0) return;
+      for (const row of rows) yield this.eventFromRow(row);
+      if (rows.length < pageSize) return;
+      cursor = Number(rows[rows.length - 1]!.seq);
+    }
   }
 
   /** True while any verification RUN for the job is unsettled: its latest

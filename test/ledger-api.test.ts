@@ -41,6 +41,87 @@ describe('job deliverable kind (E19 durable-write guard)', () => {
 });
 
 
+describe('completed verification history pagination (j-1594)', () => {
+  function seeded(): { api: LedgerApi; db: LedgerDb; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-vhist-'));
+    const db = new LedgerDb(dir);
+    return { api: new LedgerApi(db.handle), db, dir };
+  }
+
+  it('pages the COMPLETE history newest-first with no finite lifetime ceiling', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 208; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'vhist', payload: { run_id: `run-${index}` } });
+      }
+      api.appendCustomEvent({ kind: 'job.note', jobId: 'vhist', payload: { note: 'not a run' } });
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'other', payload: { run_id: 'other-run' } });
+      const rows = [...api.iterateJobVerificationCompleted('vhist', 200)];
+      // Every completed run of THIS job, exactly once, in descending seq.
+      expect(rows).toHaveLength(208);
+      expect(rows.every((row) => row.kind === 'verification.completed' && row.jobId === 'vhist')).toBe(true);
+      const seqs = rows.map((row) => row.seq);
+      expect(seqs).toEqual([...seqs].sort((left, right) => right - left));
+      expect(new Set(seqs).size).toBe(208);
+      expect((rows[0]!.payload as { run_id: string }).run_id).toBe('run-207');
+      expect((rows.at(-1)!.payload as { run_id: string }).run_id).toBe('run-0');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is lazy — the caller stops the read at the first match', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 5; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'lazy', payload: { run_id: `run-${index}` } });
+      }
+      const iterator = api.iterateJobVerificationCompleted('lazy', 10);
+      const first = iterator.next();
+      expect(first.done).toBe(false);
+      // Abandoning the generator fetches no further pages (no side effect
+      // beyond the one bounded page already read).
+      iterator.return(undefined);
+      expect(iterator.next().done).toBe(true);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds a stable watermark: a run appended after the first page is not yielded', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'wm', payload: { run_id: `before-${index}` } });
+      }
+      const iterator = api.iterateJobVerificationCompleted('wm', 2);
+      expect(iterator.next().done).toBe(false); // watermark captured here
+      const late = api.appendCustomEvent({ kind: 'verification.completed', jobId: 'wm', payload: { run_id: 'after' } });
+      const rest = [...iterator];
+      expect(rest.map((row) => (row.payload as { run_id: string }).run_id)).toEqual(['before-1', 'before-0']);
+      expect(rest.some((row) => row.seq === late.seq)).toBe(false);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('yields nothing for a job with no completed run and refuses a non-positive page size', () => {
+    const { api, db, dir } = seeded();
+    try {
+      api.appendCustomEvent({ kind: 'job.note', jobId: 'empty', payload: { note: 'x' } });
+      expect([...api.iterateJobVerificationCompleted('empty')]).toEqual([]);
+      expect(() => [...api.iterateJobVerificationCompleted('empty', 0)]).toThrow(/pageSize must be a positive integer/u);
+      expect(() => [...api.iterateJobVerificationCompleted('empty', 1.5)]).toThrow(/pageSize must be a positive integer/u);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('ledger api — the record of state', () => {
   let api: LedgerApi;
   let bus: EventBus;

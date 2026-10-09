@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   appendRecordedVerification,
   renderRecordedVerification,
+  selectNewestBoundVerification,
   VERIFICATION_COMPLETED_EVENT,
   VERIFICATION_EVIDENCE_MAX_BYTES,
 } from '../src/verify/evidence.js';
@@ -47,6 +48,88 @@ function passingPayload(overrides: Record<string, unknown> = {}): Record<string,
     ...overrides,
   };
 }
+
+function seqEvent(seq: number, payload: Record<string, unknown>, ts = '2026-09-22T12:00:00.000Z'): EventRecord {
+  return { ...event(payload, ts), seq };
+}
+
+describe('selectNewestBoundVerification', () => {
+  it('selects the newest ledger-sequence run that binds the target (competing qualifying runs)', () => {
+    const history = [
+      seqEvent(5, passingPayload({ run_id: 'newest' })),
+      seqEvent(3, passingPayload({ run_id: 'older' })),
+      seqEvent(1, passingPayload({ run_id: 'oldest' })),
+    ];
+    const selected = selectNewestBoundVerification(history, TARGET);
+    expect(selected).toBe(history[0]);
+    expect(renderRecordedVerification(selected, TARGET)).toContain('run_id: newest');
+  });
+
+  it('ignores newer nonqualifying completed runs (other sha, dirty tree, torn receipt)', () => {
+    const expected = seqEvent(2, passingPayload({ run_id: 'bound' }));
+    const history = [
+      seqEvent(9, passingPayload({ run_id: 'other-sha', sha: 'f'.repeat(40) })),
+      seqEvent(8, passingPayload({ run_id: 'dirty', tracked_dirty: true })),
+      seqEvent(7, passingPayload({ run_id: 'torn', output_sha256: undefined })),
+      seqEvent(6, passingPayload({ run_id: 'no-scope', scope: undefined })),
+      expected,
+    ];
+    expect(selectNewestBoundVerification(history, TARGET)).toBe(expected);
+  });
+
+  it('selects a newer FAILING target run over an older green one — never backtracks to green', () => {
+    const history = [
+      seqEvent(4, passingPayload({ run_id: 'red', ok: false, exit_code: 1 })),
+      seqEvent(2, passingPayload({ run_id: 'green', ok: true, exit_code: 0 })),
+    ];
+    const selected = selectNewestBoundVerification(history, TARGET);
+    expect(selected).toBe(history[0]);
+    expect(renderRecordedVerification(selected, TARGET)).toContain('run_id: red');
+    expect(renderRecordedVerification(selected, TARGET)).toContain('result: FAIL (exit 1)');
+  });
+
+  it('returns null only after the stream is exhausted (complete absence)', () => {
+    const history = [
+      seqEvent(4, passingPayload({ sha: 'f'.repeat(40) })),
+      seqEvent(3, passingPayload({ tracked_dirty: true })),
+      seqEvent(2, passingPayload({ run_id: undefined })),
+    ];
+    expect(selectNewestBoundVerification(history, TARGET)).toBeNull();
+    expect(selectNewestBoundVerification([], TARGET)).toBeNull();
+  });
+
+  it('consumes the stream lazily — it stops fetching at the first bound run', () => {
+    const bound = seqEvent(10, passingPayload({ run_id: 'bind-10' }));
+    let pulled = 0;
+    function* stream(): Generator<EventRecord> {
+      pulled += 1;
+      yield seqEvent(12, passingPayload({ sha: 'f'.repeat(40) }));
+      pulled += 1;
+      yield bound;
+      // Anything past the match must never be fetched (a long history is
+      // not walked past the evidence it proves).
+      throw new Error('selection consumed a page past the binding run');
+    }
+    expect(selectNewestBoundVerification(stream(), TARGET)).toBe(bound);
+    expect(pulled).toBe(2);
+  });
+
+  it('matches the recorded 87d predicate applied newest-first over a fully known synthetic history', () => {
+    const history = [
+      seqEvent(20, passingPayload({ run_id: 'r20', sha: 'f'.repeat(40) })),
+      seqEvent(19, passingPayload({ run_id: 'r19', tracked_dirty: true })),
+      seqEvent(18, passingPayload({ run_id: 'r18', output_bytes: undefined })),
+      seqEvent(17, passingPayload({ run_id: 'r17', ok: false, exit_code: 2 })),
+      seqEvent(16, passingPayload({ run_id: 'r16', sha: 'f'.repeat(40) })),
+      seqEvent(15, passingPayload({ run_id: 'r15', signal: 'SIGKILL', ok: false, exit_code: null })),
+    ];
+    const recorded = history.find((entry) => renderRecordedVerification(entry, TARGET) !== null) ?? null;
+    const selected = selectNewestBoundVerification(history, TARGET);
+    expect(selected).toBe(recorded);
+    expect(renderRecordedVerification(selected, TARGET)).toBe(renderRecordedVerification(recorded, TARGET));
+    expect(renderRecordedVerification(selected, TARGET)).toContain('run_id: r17');
+  });
+});
 
 describe('recorded verification evidence', () => {
   it('renders a matching clean run as a delimited, ledger-backed block', () => {
