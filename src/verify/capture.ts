@@ -379,9 +379,13 @@ export function readCaptureReceipt(path: string): CaptureReceipt | null {
   }
   try {
     const parsed = JSON.parse(text) as CaptureReceipt;
-    return parsed !== null && typeof parsed === 'object' && parsed.version === CAPTURE_RECEIPT_VERSION
-      ? parsed
-      : null;
+    if (parsed === null || typeof parsed !== 'object' || parsed.version !== CAPTURE_RECEIPT_VERSION) {
+      return null;
+    }
+    // `pings` shipped after receipts already existed: a pre-keepalive receipt
+    // truthfully carried zero transport frames, so normalize rather than
+    // handing consumers an undefined count.
+    return { ...parsed, pings: typeof parsed.pings === 'number' ? parsed.pings : 0 };
   } catch {
     return null;
   }

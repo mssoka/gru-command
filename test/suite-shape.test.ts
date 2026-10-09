@@ -172,7 +172,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 9,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 24,
+  'verification-capture.test.ts': 25,
 
 };
 

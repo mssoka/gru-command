@@ -13,6 +13,7 @@ import {
   openExclusiveCaptureSink,
   parseCapturedNdjson,
   readCaptureOwner,
+  readCaptureReceipt,
   withdrawCaptureOwner,
   writeCaptureOwner,
   type CaptureOwnerRecord,
@@ -189,6 +190,20 @@ describe('capture receipts', () => {
     );
     expect(parsed.outcome).toBeNull();
     expect(parsed.malformed).toBe(1);
+  });
+
+  it('normalizes a pre-keepalive receipt that has no pings field', () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'legacy.ndjson');
+    // A receipt written before the keepalive shipped carries no `pings`; it
+    // truthfully held zero transport frames and must read back as 0, not
+    // undefined.
+    const legacy = { ...receipt(), sink: sinkPath } as Record<string, unknown>;
+    delete legacy['pings'];
+    writeFileSync(captureReceiptPath(sinkPath), `${JSON.stringify(legacy)}\n`);
+    const read = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(read).not.toBeNull();
+    expect(read!.pings).toBe(0);
   });
 });
 

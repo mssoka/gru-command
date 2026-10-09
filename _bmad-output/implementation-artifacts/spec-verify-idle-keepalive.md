@@ -4,7 +4,7 @@ type: 'bugfix'
 created: '2026-10-09'
 status: 'in-progress'
 route: 'oneshot'
-review_loop_iteration: 1
+review_loop_iteration: 2
 context: []
 ---
 
@@ -30,9 +30,11 @@ context: []
 
 **Decision — encoding:** a well-formed `{"type":"ping"}` frame per line, not bare whitespace. It is the project's established application-level keepalive idiom (`src/chat/frames.ts`, `src/board/frames.ts` both document a `PingFrame` for exactly this "prove the socket is alive while quiet" purpose), it is observable as real body bytes, and the shipped `NdjsonCaptureReader` already accepts unknown frame types without counting them malformed (`acceptLine`/`acceptFrame`). A ping carries no `runId` and no output, so it can never be mistaken for producer output or disturb the single-run identity check.
 
-**Decision — cadence/lifecycle (in `src/verify/server.ts`):** `VERIFY_HEARTBEAT_MS = 15_000`; the heartbeat is an `unref`'d `setInterval` armed right after `writeHead`, before the first scheduler frame. A tick writes a ping only when the stream has already begun (`bodyStarted`) and the last body write is at least one interval old, so worst-case idle gap is 2 × 15 s ≈ 30 s — an order of magnitude under the 300 s client limit, with no ping noise during chatty output. It is cleared on the terminal `completed`/`error` frame, on `res` `close`, and in the `finally` before `res.end()`; a ping is therefore never written after the terminal frame. `heartbeatMs` is a test seam (default `VERIFY_HEARTBEAT_MS`); a non-positive cadence is refused loudly because disabling it reintroduces exactly this defect.
+**Decision — cadence/lifecycle (in `src/verify/server.ts`):** `VERIFY_HEARTBEAT_MS = 15_000`; the heartbeat is an `unref`'d `setInterval` armed right after `writeHead`. The idle clock starts at `writeHead` (not at the first frame), so a first frame delayed past one interval — e.g. an attach queued behind a back-pressured sibling — still gets a ping instead of an unbounded silent body; a leading `ping` is legal and is counted apart by the reader. A tick writes a ping only when the last body write is at least one interval old, so the worst-case idle gap is 2 × 15 s ≈ 30 s — an order of magnitude under the 300 s client limit, with no ping noise during chatty output. At most one ping write may be in flight at a time, so a stalled socket cannot stack drain/close listeners. The timer is cleared on the terminal `completed`/`error` frame, on `res` `close`, and in the `finally` before `res.end()`; a ping is therefore never written after the terminal frame. `heartbeatMs` is a test seam (default `VERIFY_HEARTBEAT_MS`); a cadence that is non-positive or leaves no worst-case margin (`2 × heartbeatMs >= VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS`) is refused loudly.
 
-**Decision — scope:** server-side only. `src/verify/scheduler.ts` is untouched (it is the producer-frame owner and its `queued`/`started`/`output`/`completed` vocabulary is unchanged); `src/verify/capture.ts` is untouched (its honest-failure and post-terminal rejection behaviour already covers pings, and is pinned by new tests). This keeps "transport keepalive is not producer output" structurally true.
+**Decision — wire contract:** `PingFrame` and `VerificationStreamFrame` are exported from `src/verify/server.ts`, and `writeFrame` is typed to them (plus the admission `error` record), so the ping is a documented member of the stream vocabulary rather than a magic string.
+
+**Decision — scope:** server-side fix. `src/verify/scheduler.ts` is untouched (it is the producer-frame owner and its `queued`/`started`/`output`/`completed` vocabulary is unchanged). `src/verify/capture.ts`/`capture-cli.ts` change only to count transport pings apart from producer frames (`pings` vs `frames`), which is causally required to keep the receipt's producer-frame fingerprint honest; the reader's malformed/terminal rejection is unchanged. This keeps "transport keepalive is not producer output" structurally true.
 
 **Files changed:**
 - `src/verify/server.ts` — `VERIFY_HEARTBEAT_MS`, `VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS`, `PingFrame`, the validated `heartbeatMs` seam, heartbeat arm/stop/write on a monotonic clock.
@@ -40,12 +42,13 @@ context: []
 - `test/verification-server.test.ts` — the four named regressions plus the cadence/refusal pin and the attach-stream keepalive (real isolated server, short heartbeat cadence; scoped spies prove one `setInterval` per response, unref'd and cleared).
 - `test/verification-capture.test.ts` — reader accepts interleaved pings and still rejects post-terminal frames; a completed stream with pings stays promotable through real EOF; a stream severed after pings stays UNKNOWN with no output binding.
 - `test/assert-verify-keepalive-baseline.test.ts`, `tools/assert-verify-keepalive-baseline.mjs` (+ `.d.mts`) — fail-before report classifier.
-- `test/suite-shape.test.ts` — recomputed phantom-check pins (24 / 24 / 3).
-- `.gru-command/worktree.toml` — `verify-idle-keepalive`, `verify-idle-keepalive-static`, and `verify-idle-keepalive-baseline` scopes.
+- `test/suite-shape.test.ts` — recomputed phantom-check pins (24 / 25 / 3).
+- `docs/FLOW.md` — the `ping` frame in the documented response vocabulary.
+- `.gru-command/worktree.toml` — `verify-idle-keepalive`, `verify-idle-keepalive-static`, `verify-idle-keepalive-baseline`, and `verify-idle-keepalive-capture-baseline` scopes.
 
-**Fail-before:** every named regression is assertion-first, so the pre-fix base REDs by assertion rather than by a harness timeout. With `src/verify/server.ts` restored to base 32fc2f6 (tests unchanged), all named regressions RED (queued: 0 pings where ≥3 are required; quiet: 0 bridging pings; cleanup: 0 heartbeat intervals; honest capture: no `"type":"ping"`). The scheduler-backed `verify-idle-keepalive-baseline` scope reproduces this on an isolated base snapshot and classifies the Vitest JSON report with `tools/assert-verify-keepalive-baseline.mjs`, which exits 2 when the RED is not four named `AssertionError`s.
+**Fail-before:** every named regression is assertion-first, so the pre-fix base REDs by assertion rather than by a harness timeout. Two scheduler-backed scopes reproduce this on isolated base snapshots and classify the machine-readable Vitest reports with `tools/assert-verify-keepalive-baseline.mjs`, which exits 2 when a claim is broken: `verify-idle-keepalive-baseline` (the four named server regressions) and `verify-idle-keepalive-capture-baseline` (the three capture-reader/helper regressions). Both legs cover every named regression in acceptance 1-4; the classifier treats a matcher `TypeError` on a named test as behavioral RED and rejects only collection/setup/import failures.
 
-**Review round 1 (BMAD blind hunter, job `verify-idle-keepalive-review-blind-hunter-20261009`, reviewed head 49a219e):** 14 findings, triaged below; the actionable ones are repaired in this cycle and the two rejected `low` findings are recorded with their disproof.
+**Review round 1 (BMAD blind hunter, job `verify-idle-keepalive-review-blind-hunter-20261009`, reviewed head 49a219e):** 14 findings, triaged below; the actionable ones were repaired in the first fix cycle. The one finding rejected in round 1 (F4) was re-raised in round 2 and is now patched (R3).
 
 **Workflow note:** this lane is a tracked minion, so the workflow's independent review is commissioned through the service dispatch surface as a separate read-only review job at the frozen head (not a model-native subagent), per the standing build-workflow playbook.
 
@@ -56,12 +59,15 @@ context: []
 - **Monotonic clock:** idle is measured with `performance.now()`, so a backward NTP/wall-clock step can never suppress a ping for the duration of the step.
 - **Cadence upper bound:** `heartbeatMs` must satisfy `2 × heartbeatMs < VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS` (300 000). The error message and the guard now agree that an oversized cadence reintroduces the truncation.
 - **Transport frames are not producer frames:** `NdjsonCaptureReader` counts `ping` into a separate `pings` field and never into `frames`; `CaptureReceipt` carries `pings`. The incident's producer-frame fingerprint (`frames:1` queued, `frames:2` quiet) keeps its meaning. Post-terminal pings are still `malformed` (the terminal check runs first), so the guard is not loosened.
-- **Default cadence pinned behaviorally:** the pin asserts the default path arms exactly one heartbeat interval at a positive integer cadence with `2 × interval < 300 000`. It deliberately does not import a new symbol, so overlaying the final test file onto the pre-fix base still loads (an import of a missing export would be a collection failure, not assertion RED).
-- **Baseline classification:** `verify-idle-keepalive-baseline` writes a Vitest JSON report and runs `tools/assert-verify-keepalive-baseline.mjs`; a collection/setup/import failure, a named regression that passed, or a non-`AssertionError` failure is a broken claim (exit 2), never a silent RED.
-- **Attach coverage:** the keepalive is proven on the duplicate-attach stream too (one producer, pings between `attached` and the first output, nothing after the terminal).
+- **Default cadence pinned by value:** the pin asserts the default path arms the shipped 15,000 ms cadence (positive integer, `2 × interval < 300 000`). It deliberately does not import a new symbol, so overlaying the final test file onto the pre-fix base still loads (an import of a missing export would be a collection failure, not assertion RED).
+- **Baseline classification (two legs):** the scopes write Vitest JSON reports and run `tools/assert-verify-keepalive-baseline.mjs`; a collection/setup/import failure, a named regression that passed, or a non-behavioral failure is a broken claim (exit 2), never a silent RED. A matcher `TypeError` on a named test counts as behavioral RED.
+- **Receipt back-compat:** `readCaptureReceipt` normalizes a pre-keepalive receipt (no `pings` field) to `pings: 0` — truthful, since those captures held no transport frames.
+- **Attach coverage:** the keepalive is proven on the duplicate-attach stream too (one producer, pings while quiet, nothing after the terminal).
+- **Documentation:** `docs/FLOW.md` documents the `ping` frame in the response vocabulary.
 
 ## Review Triage Log
 
+Round 1 — BMAD blind hunter `verify-idle-keepalive-review-blind-hunter-20261009`, reviewed head `49a219e`; 14 findings. Its disposition was settled mechanically by the head move (job already `done`), per the review-supersession rule.
 - F1 shipped cadence unpinned — **medium**, patched: default cadence is now pinned behaviorally (one heartbeat interval, positive integer, `2 × interval < 300 000`).
 - F2 loud refusal untested — **medium**, patched: `0 / -1 / 1.5 / NaN / Infinity / 150 000 / 300 000` all asserted to throw before any scheduler exists.
 - F3 validation accepted a cadence ≥ 300 s — **medium**, patched: the guard rejects any `2 × heartbeatMs ≥ 300 000`.
@@ -76,3 +82,20 @@ context: []
 - F12 wall-clock cadence — **medium**, patched: `performance.now()`.
 - F13 baseline treated any nonzero exit as RED — **medium**, patched: machine-readable report + `tools/assert-verify-keepalive-baseline.mjs` (exit 2 on a broken claim).
 - F14 spec stale at the review head — **medium**, patched: this cycle updates status, iteration, notes, and triage.
+
+Round 2 — BMAD blind hunter `verify-idle-keepalive-review-round2-blind-hunter-20261009`, reviewed head `90b42f8` (whole change `32fc2f6..90b42f8`); 14 findings.
+
+- R1 `bodyStarted` left the pre-first-frame window unprotected (an attach queued behind a stalled sibling could be silent unbounded) — **medium**, patched: the idle clock now starts at `writeHead` and the leading-ping gate is gone.
+- R2 the timer writer had no in-flight guard, stacking drain/close listeners on a stalled socket — **medium**, patched: at most one ping write in flight.
+- R3 `ping` still not an exported contract — **medium**, patched this round: `PingFrame`/`VerificationStreamFrame` exported and used by `writeFrame`.
+- R4 cadence pinned by shape only; a 147,000 ms default stayed green — **medium**, patched: the default is pinned by value (15,000 ms).
+- R5 a required receipt field was added without back-compat — **medium**, patched: `readCaptureReceipt` normalizes legacy receipts to `pings: 0`.
+- R6 the baseline comment's exclusion claim was factually wrong and dropped a provable RED leg — **medium**, patched: the comment is corrected and `verify-idle-keepalive-capture-baseline` adds the capture leg under its own fast config.
+- R7 the classifier's `AssertionError:`-only rule could mislabel a matcher `TypeError` as a broken claim — **medium**, patched: `isBehavioralRed` accepts both behavioral shapes.
+- R8 no consumer-level reproduction of the client idle deadline — **low**, deferred: real byte arrivals with a bounded gap on an isolated server already prove acceptance 1-3; the stronger `node:http` idle-deadline variant is recorded in `deferred-work.md`.
+- R9 the `ping` frame was undocumented — **medium**, patched: `docs/FLOW.md` now documents it.
+- R10 the spec was stale again (capture-untouched claim, validation description, status) — **medium**, patched: this update.
+- R11 cleanup/pin timer accounting selected by cadence value with exact populations — **low**, patched: populations relaxed to presence/`≥` while each handle is still asserted unref'd and cleared.
+- R12 cadence evidence was wall-clock and load-sensitive (1 s bound over a 25 ms cadence) — **low**, patched: the gap bound is 2 s with `≥ 3` pings required, keeping periodicity evidence without a tight stall-sensitive bound.
+- R13 the guard's largest accepted cadence is untested — **low**, deferred: the guard is fail-safe one-sided and the shipped default is pinned by value, so an edge off-by-one can only reject loudly, never reintroduce truncation; recorded in `deferred-work.md`.
+- R14 the transport abort cause remains cause-blind — **low**, deferred: the incident briefing forbids unrelated error-telemetry expansion; recorded in `deferred-work.md`.

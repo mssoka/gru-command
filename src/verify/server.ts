@@ -86,9 +86,9 @@ const MAX_BODY_BYTES = 64 * 1024;
  * streams aborted at a ~301 s silent gap even though the producer kept
  * running. The response body therefore emits an application-level liveness
  * frame whenever it has been silent for one interval, so a valid stream is
- * never truncated for being idle. Idle is measured from the stream's first
- * frame (admission writes it synchronously today); from there the worst-case
- * gap is 2 × interval (~30 s), an order of magnitude under the client limit.
+ * never truncated for being idle. Idle is measured from `writeHead`; the
+ * worst-case gap is 2 × interval (~30 s), an order of magnitude under the
+ * client limit.
  */
 export const VERIFY_HEARTBEAT_MS = 15_000;
 
@@ -106,9 +106,17 @@ export const VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS = 300_000;
  * run identity and no output — it is transport liveness, never producer
  * output, and never a terminal frame.
  */
-interface PingFrame {
+export interface PingFrame {
   readonly type: 'ping';
 }
+
+/**
+ * A frame the `/api/verify` NDJSON stream can carry: the scheduler's progress
+ * frames or the transport-liveness {@link PingFrame}. The surface's typed
+ * admission `error` frame is written through the same sink but is not part of
+ * the scheduler's progress vocabulary.
+ */
+export type VerificationStreamFrame = VerificationProgress | PingFrame;
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   if (res.headersSent || res.writableEnded) return;
@@ -358,13 +366,16 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     // transport frame may follow it (a post-terminal frame would be counted
     // malformed and unpromote an otherwise clean capture).
     let terminal = false;
-    // Pings only fill silence AFTER the stream has begun: the first frame is
-    // always a real protocol frame, never a heartbeat.
-    let bodyStarted = false;
     // Monotonic clock: a wall-clock step must never suppress a heartbeat
-    // (or, worse, let a >300 s NTP jump reintroduce the truncation).
+    // (or, worse, let a >300 s NTP jump reintroduce the truncation). The
+    // idle clock starts at writeHead, so a first frame delayed past one
+    // interval (e.g. an attach queued behind a back-pressured sibling) still
+    // gets a ping rather than an unbounded silent body.
     let lastBodyWriteAt = performance.now();
     let heartbeat: ReturnType<typeof setInterval> | null = null;
+    // One ping write in flight at a time: a tick must not stack drain/close
+    // listeners on a stalled socket (Node warns past ten).
+    let heartbeatWritePending = false;
     const stopHeartbeat = (): void => {
       if (heartbeat === null) return;
       clearInterval(heartbeat);
@@ -374,7 +385,7 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
       closed = true;
       stopHeartbeat();
     });
-    const writeFrame = async (frame: VerificationProgress | Record<string, unknown>): Promise<void> => {
+    const writeFrame = async (frame: VerificationStreamFrame | Record<string, unknown>): Promise<void> => {
       const frameType = (frame as { readonly type?: unknown }).type;
       if (frameType === 'completed' || frameType === 'error') {
         terminal = true;
@@ -389,7 +400,6 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
             res.once('close', () => resolveDrain());
           });
         }
-        bodyStarted = true;
         lastBodyWriteAt = performance.now();
       } catch {
         closed = true;
@@ -399,9 +409,12 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
     // legitimate silence the response can have. `unref` so the timer never
     // holds the process open on its own.
     heartbeat = setInterval(() => {
-      if (closed || terminal || !bodyStarted || res.writableEnded) return;
+      if (closed || terminal || heartbeatWritePending || res.writableEnded) return;
       if (performance.now() - lastBodyWriteAt < heartbeatMs) return;
-      void writeFrame({ type: 'ping' } satisfies PingFrame);
+      heartbeatWritePending = true;
+      void writeFrame({ type: 'ping' }).finally(() => {
+        heartbeatWritePending = false;
+      });
     }, heartbeatMs);
     heartbeat.unref?.();
 

@@ -385,7 +385,13 @@ verification budget.
   clearly-delimited evidence block into the review spec context, so the
   tests lens weighs ledger-backed evidence instead of a pasted report.
 - **Progress streams** back as NDJSON: `queued` → `started` → `output…`
-  → `completed` (or `error`).
+  → `completed` (or `error`). While the body would otherwise be silent —
+  a queued slot wait (up to `lock_wait_timeout_ms`), or a producer that
+  has not written yet — the surface emits application-level `ping`
+  frames (default every 15 s) so a streaming client's HTTP body-idle
+  timeout can never truncate a valid run. A `ping` is transport liveness
+  only: no run identity, never producer output, never a terminal frame,
+  and never written after `completed`/`error`.
 
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
