@@ -521,11 +521,14 @@ verify-idle-keepalive-static = "node tools/patch-vitest-rpc-timeout.mjs && npm r
 # an isolated git-archive snapshot of the pre-fix base 32fc2f6 (the incident
 # build, which emits no heartbeat) with dependencies linked by symlink — no
 # download/install, no branch mutation, approved RPC patch prerequisite,
-# unchanged Vitest config/budgets. The base has no keepalive, so the four
-# named regressions RED by ASSERTION and the machine-readable Vitest report
-# is classified by tools/assert-verify-keepalive-baseline.mjs, which exits 2
+# unchanged Vitest config/budgets. The base has no keepalive, so EVERY
+# collected test in the -t selection (the named regressions and the
+# additional keepalive guards) REDs by behavioral assertion, and the
+# machine-readable Vitest report is classified by
+# tools/assert-verify-keepalive-baseline.mjs, which exits 2
 # (FAILS-BEFORE CLAIM BROKEN) on a collection/setup/import failure, a named
-# regressions that did not fail, or a failure that is not an AssertionError.
+# regression that did not fail, any unlisted failure, or a failure that is
+# not behavioral (an AssertionError or a matcher TypeError).
 # The capture-reader leg runs under the default (fast) Vitest config, so it
 # has its own scope: verify-idle-capture-baseline. The Vitest exit
 # is echoed intact and never masked into a PASS; the snapshot directory and

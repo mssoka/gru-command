@@ -13,6 +13,7 @@ export const EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS = Object.freeze({
     'queued verification keeps response alive during slot wait',
     'quiet running verification keeps response alive',
     'verification terminal and disconnect cleanup',
+    'verification error terminal clears its heartbeat',
     'keeps the body alive before the first producer frame',
     'pins the heartbeat cadence and refuses an unusable one',
     'keeps an attached duplicate stream alive and stops at its terminal',
@@ -83,11 +84,13 @@ export function assertKeepaliveBaseline(report, expected = EXPECTED_KEEPALIVE_BA
       `report counts ${String(report.numFailedTests)} failed test(s) but lists ${String(failed.length)} — unreadable report`,
     );
   }
-  // EVERY failure must be one of the named regressions: an unlisted failure
-  // (harness timeout, unhandled rejection, unrelated test) is not this claim.
-  const matchesExpected = (result) =>
-    expected.some((title) => typeof result?.title === 'string' && result.title.includes(title));
-  const unlisted = failed.filter((result) => !matchesExpected(result));
+  // EVERY failure must be one of the named regressions (EXACT title) — an
+  // unlisted failure (harness timeout, unhandled rejection, unrelated test)
+  // is not this claim, and a title that merely CONTAINS a named title must
+  // not smuggle one in.
+  const unlisted = failed.filter(
+    (result) => !expected.some((title) => result?.title === title),
+  );
   if (unlisted.length > 0) {
     throw new Error(
       `unlisted failure(s) outside the named claim: ${unlisted
@@ -97,10 +100,12 @@ export function assertKeepaliveBaseline(report, expected = EXPECTED_KEEPALIVE_BA
   }
   const red = [];
   for (const title of expected) {
-    const match = assertions.find(
-      (result) => typeof result?.title === 'string' && result.title.includes(title),
-    );
-    if (match === undefined) throw new Error(`named regression "${title}" was not collected`);
+    const matches = assertions.filter((result) => result?.title === title);
+    if (matches.length === 0) throw new Error(`named regression "${title}" was not collected`);
+    if (matches.length > 1) {
+      throw new Error(`named regression "${title}" is ambiguous (${String(matches.length)} collected matches)`);
+    }
+    const match = matches[0];
     if (match.status !== 'failed') {
       throw new Error(`named regression "${title}" did not fail (status ${String(match.status)})`);
     }

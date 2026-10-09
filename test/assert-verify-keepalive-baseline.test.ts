@@ -46,7 +46,7 @@ describe('keepalive fail-before receipt classifier', () => {
   });
 
   it('resolves the server and capture legs and refuses an unknown one', () => {
-    expect(resolveBaselineLeg('server')).toHaveLength(7);
+    expect(resolveBaselineLeg('server')).toHaveLength(8);
     expect(resolveBaselineLeg('capture')).toHaveLength(3);
     expect(() => resolveBaselineLeg('nope')).toThrow(/unknown baseline leg/u);
   });
@@ -76,6 +76,16 @@ describe('keepalive fail-before receipt classifier', () => {
     expect(() =>
       assertKeepaliveBaseline(
         report(...behavioralRed(titles), assertion('something unrelated', 'failed', ['Error: boom'])),
+      ),
+    ).toThrow(/unlisted failure/u);
+    // A title that merely CONTAINS a named title must not smuggle a failure
+    // in: the match is exact.
+    expect(() =>
+      assertKeepaliveBaseline(
+        report(
+          ...behavioralRed(titles),
+          assertion(`${titles[0]} (extra unrelated stray)`, 'failed', ['Error: harness timeout']),
+        ),
       ),
     ).toThrow(/unlisted failure/u);
     // A non-behavioral failure on a listed test is not RED evidence.

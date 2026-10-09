@@ -10,7 +10,7 @@ import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { EventBus } from '../src/events/bus.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
-import type { VerificationScheduler } from '../src/verify/scheduler.js';
+import { VerificationLockTimeoutError, type VerificationScheduler } from '../src/verify/scheduler.js';
 import {
   createVerificationServer,
   type VerificationServer,
@@ -633,7 +633,9 @@ interface TimedFrame {
   readonly frame: Frame;
 }
 
-/** Read an NDJSON response to EOF, timestamping each body line as it lands. */
+/** Read an NDJSON response to EOF, timestamping each parsed body line when
+ * it is observed (a coalesced read shares one timestamp — the counts, not the
+ * gap bound, are the cadence evidence). */
 function collectNdjson(response: Response): { readonly frames: TimedFrame[]; readonly done: Promise<void> } {
   const frames: TimedFrame[] = [];
   const reader = response.body!.getReader();
@@ -735,7 +737,8 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     const pingsWhileHeld = await frameCountUntil(waiting.frames, 'ping', 3, 2_000);
     expect(pingsWhileHeld).toBeGreaterThanOrEqual(3);
     const heldTypes = frameTypes(waiting.frames);
-    expect(heldTypes[0]).toBe('queued');
+    // A leading ping is legal, so assert presence, never index 0.
+    expect(heldTypes).toContain('queued');
     // Only the queued admission and transport pings so far: the waiting
     // request has not started, and the single slot is not bypassed.
     expect(heldTypes.every((type) => type === 'queued' || type === 'ping')).toBe(true);
@@ -997,10 +1000,57 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
       const firstPing = types.indexOf('ping');
       const firstFrame = types.findIndex((type) => type !== 'ping');
       expect(firstPing).toBeGreaterThanOrEqual(0);
+      // The wire shape is exactly the documented liveness frame.
+      expect(reading.frames[firstPing]!.frame).toEqual({ type: 'ping' });
       // A ping precedes the first producer frame: the body is never silent,
       // even before admission.
       expect(firstPing).toBeLessThan(firstFrame);
       expect(types[types.length - 1]).toBe('completed');
+    } finally {
+      await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
+      await server.dispose();
+      await harness.close();
+    }
+  });
+
+  it('verification error terminal clears its heartbeat', async () => {
+    const harness = await boot({ heartbeatMs: 25 });
+    // A queued admission that ends in the typed lock-wait error: the body
+    // must stay alive while waiting, then carry the error as its LAST frame.
+    const stubScheduler = {
+      start: () => {},
+      dispose: async () => {},
+      view: () => ({ lockInUse: false, activeRuns: 0, queuedRuns: 1, workerBudget: 1, workersPerRun: 1 }),
+      run: async (_spec: unknown, sink: (frame: unknown) => void | Promise<void>) => {
+        await sink({ type: 'queued', runId: 'run-stub-error', position: 1, active: 1, limit: 1 });
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        throw new VerificationLockTimeoutError(80, 1, 1);
+      },
+    };
+    const server = createVerificationServer({
+      config: harness.config,
+      ledger: harness.ledger,
+      worktrees: harness.worktrees,
+      scheduler: stubScheduler as unknown as VerificationScheduler,
+      heartbeatMs: 25,
+    });
+    const http: HttpServer = createServer((req, res) => {
+      if (server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) return;
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolveListen) => http.listen(0, '127.0.0.1', resolveListen));
+    const port = (http.address() as AddressInfo).port;
+    try {
+      const reading = collectNdjson(await streamCall(port, { job_id: harness.jobId, scope: 'full' }));
+      await reading.done;
+      const types = frameTypes(reading.frames);
+      expect(types.filter((type) => type === 'ping').length).toBeGreaterThanOrEqual(2);
+      const errorFrame = reading.frames.find((entry) => entry.frame.type === 'error');
+      expect(errorFrame?.frame['code']).toBe('lock_wait_timeout');
+      // The error is the terminal frame: no transport frame follows it.
+      expect(types[types.length - 1]).toBe('error');
+      expect(types.lastIndexOf('ping')).toBeLessThan(types.indexOf('error'));
     } finally {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       await server.dispose();
@@ -1026,7 +1076,7 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     await Promise.all([first.done, second.done]);
 
     const attachedTypes = frameTypes(second.frames);
-    expect(attachedTypes[0]).toBe('attached');
+    expect(attachedTypes).toContain('attached');
     expect(attachedTypes.filter((type) => type === 'ping').length).toBeGreaterThanOrEqual(3);
     expect(attachedTypes.filter((type) => type === 'completed')).toHaveLength(1);
     expect(attachedTypes[attachedTypes.length - 1]).toBe('completed');
@@ -1095,6 +1145,7 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     expect(parsed.malformed).toBe(0);
     // Producer frames and transport pings are recorded separately, and the
     // receipt's count still matches the honest capture reader's.
+    expect(parsed.frames).toBe(4); // queued, started, output, completed
     expect(parsed.frames).toBe(receipt!.frames);
     expect(parsed.pings).toBe(receipt!.pings);
     expect(receipt!.pings).toBeGreaterThan(0);

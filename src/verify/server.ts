@@ -60,7 +60,10 @@ export interface VerificationServerOptions {
    * {@link VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS}: disabling the heartbeat, or
    * setting it above that bound, is exactly the truncation defect this
    * guards against, so an unusable cadence is refused loudly rather than
-   * silently accepted.
+   * silently accepted. The guard enforces the hard 2× bound; the shipped
+   * 15,000 ms default keeps an order-of-magnitude margin (≈30 s worst case),
+   * and a consumer that configures a non-default HTTP body timeout is not
+   * covered by this guard.
    */
   readonly heartbeatMs?: number;
   readonly log?: Log;
@@ -410,7 +413,10 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         }
         lastBodyWriteAt = performance.now();
       } catch {
+        // A dead socket: stop the timer now, never leave it ticking for the
+        // life of a producer that may not settle for up to run_timeout_ms.
         closed = true;
+        stopHeartbeat();
       }
     };
     // Armed before the run starts: a queued slot wait is the longest

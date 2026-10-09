@@ -34,6 +34,13 @@ import { isValidVerificationRequestId } from './scheduler.js';
  */
 
 export const CAPTURE_OWNER_VERSION = 1;
+/**
+ * The capture receipt schema version. Additive fields (like `pings`, added
+ * after v1 receipts already existed) keep version 1: the reader MUST
+ * normalize an absent new field to its pre-change value (see
+ * {@link readCaptureReceipt}) rather than invalidating old receipts. A
+ * breaking change (renamed/removed/retyped field) would need a new version.
+ */
 export const CAPTURE_RECEIPT_VERSION = 1;
 
 // ------------------------------------------------------------------
@@ -383,9 +390,11 @@ export function readCaptureReceipt(path: string): CaptureReceipt | null {
       return null;
     }
     // `pings` shipped after receipts already existed: a pre-keepalive receipt
-    // truthfully carried zero transport frames, so an ABSENT field normalizes
-    // to 0. A present-but-corrupt field is refused loudly (null = unreadable)
-    // rather than silently reported as "no transport frames".
+    // truthfully carried zero transport frames, so an ABSENT `pings` field
+    // normalizes to 0. A present-but-corrupt `pings` value is refused loudly
+    // (null = unreadable) rather than silently reported as "no transport
+    // frames". (Validation of the other, pre-existing receipt fields is
+    // deliberately unchanged by this fix.)
     if (parsed.pings === undefined) return { ...parsed, pings: 0 };
     if (
       typeof parsed.pings !== 'number' ||

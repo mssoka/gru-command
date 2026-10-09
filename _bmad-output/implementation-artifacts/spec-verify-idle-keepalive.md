@@ -4,7 +4,7 @@ type: 'bugfix'
 created: '2026-10-09'
 status: 'in-progress'
 route: 'oneshot'
-review_loop_iteration: 3
+review_loop_iteration: 4
 context: []
 ---
 
@@ -120,3 +120,20 @@ Round 3 — BMAD blind hunter `verify-idle-keepalive-review-round3-blind-hunter-
 - F16 the capture-side docs were not updated with the `pings`/`frames` split — **low**, patched in `docs/FLOW.md`.
 - F17 acceptance 3's dispose leg is untested — **low**, deferred.
 - F18 the guard error message printed `options.heartbeatMs` (undefined for a bad default) — **low**, patched: it prints the resolved cadence.
+
+Round 4 — BMAD blind hunter `verify-idle-keepalive-review-round4-blind-hunter-20261009`, reviewed head `8604d8b` (whole change `32fc2f6..8604d8b`); 14 findings, all addressed.
+
+- R4-1 the classifier's substring title match could accept an unlisted failure whose title merely contains a named one — **medium**, patched: exact title equality plus a per-title uniqueness check, with the smuggling case pinned.
+- R4-2 receipt validation is asymmetric (only `pings` is validated) — **low**, patched comment; full receipt validation deferred (pre-existing).
+- R4-3 a required field under an unchanged version — **low**, patched: the version's additive-field policy is documented (new fields normalize in the reader; breaking changes need a new version).
+- R4-4 no keepalive coverage of the `error` terminal path — **medium**, patched: a stub-scheduler lock-wait-error regression asserts pings while waiting and that `error` is the last frame.
+- R4-5 two tests asserted frame index 0 though the docs allow a leading ping — **low**, patched: presence assertions instead of index-0.
+- R4-6 arrival timestamps measure chunk delivery, not wire cadence — **low**, patched comment (counts are the cadence evidence).
+- R4-7 the ping's wire shape was never asserted — **medium**, patched: the leading ping is asserted exactly `{"type":"ping"}`.
+- R4-8 the guard's accepted range has no stated margin — **low**, patched: the option TSDoc states the hard 2× bound, the shipped default's large margin, and the custom-bodyTimeout caveat.
+- R4-9 a synchronous write failure left the heartbeat armed — **medium**, patched: the write catch stops the timer.
+- R4-10 stale baseline scope comment (four vs eight titles, AssertionError wording) — **low**, patched.
+- R4-11 deferred-work header misattributed round-3 items — **low**, patched.
+- R4-12 the classifier is exercised only against hand-rolled reports — **low**, deferred (real-report fixture).
+- R4-13 no negative "no ping noise" case or pinned producer-frame count — **low**, patched: the capture-honest test pins `frames === 4` alongside `pings > 0`, and an existing default-cadence test pins the exact `queued/started/output/completed` sequence (zero pings for a chatty run).
+- R4-14 the documented vocabulary omitted `attached` — **low**, patched.
