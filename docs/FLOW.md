@@ -354,8 +354,10 @@ verification budget.
   refuses a rerun — a re-verification mints a NEW request id.
 - **Capture is exclusive and receipted.** The shipped capture helper
   (`dist/verify/capture-cli.js`, named in Silas's wake prompt) opens a
-  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF,
-  and writes `<sink>.receipt.json` binding run id, true head/dirty state,
+  unique `wx` sink BEFORE the POST, streams every NDJSON frame to EOF
+  (transport `ping` frames included — the receipt records them as
+  `pings`, separate from the producer-frame `frames` count), and writes
+  `<sink>.receipt.json` binding run id, true head/dirty state,
   exit/outcome and output length/hash. A stream without a valid terminal
   completion, with torn/foreign records, or whose single run identity does
   not hold across the whole stream is `unknown` and is never promoted to
@@ -389,7 +391,23 @@ verification budget.
   clearly-delimited evidence block into the review spec context, so the
   tests lens weighs ledger-backed evidence instead of a pasted report.
 - **Progress streams** back as NDJSON: `queued` → `started` → `output…`
-  → `completed` (or `error`).
+  → `completed` (or `error`), with transport `ping` frames interleaved
+  into any silence. A duplicate submission to an in-flight run instead
+  begins with `attached` and then receives only that run's later frames
+  (an already-running attach has no `queued`/`started`; a terminal
+  attach gets `attached` → `completed`). While the body would otherwise
+  be silent —
+  a queued slot wait (up to `lock_wait_timeout_ms`), or a producer that
+  has not written yet — the surface emits application-level `ping`
+  frames (default every 15 s, worst-case gap 2 × cadence ≈ 30 s) so a
+  streaming client's default 300 s HTTP body-idle timeout does not
+  truncate a valid run. A `ping` is transport liveness only: no run
+  identity, never producer output, never a terminal frame, and never
+  written after `completed`/`error`. A `ping` may be the FIRST body
+  frame when the first producer frame is delayed past one cadence, so a
+  consumer must tolerate a leading `ping` (and must never count it as a
+  producer frame). The protection assumes the event loop services the
+  timer; a stall longer than the client's idle limit is outside it.
 
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
