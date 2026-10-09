@@ -851,7 +851,7 @@ function priorCoverageComplete(parsed: {
  * with the record's own frozen base is damaged and reads as 'unknown' (never
  * as whole-complete coverage). */
 function priorReviewScope(parsed: {
-  frozen?: { diffBaseSha?: unknown };
+  frozen?: { targetSha?: unknown; diffBaseSha?: unknown };
   convergence?: { reviewScope?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
 }): 'whole' | 'delta' | 'integration' | 'unknown' {
   const convergence = parsed.convergence;
@@ -862,6 +862,8 @@ function priorReviewScope(parsed: {
     if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) return 'unknown';
   }
   if (convergence?.integrationBaseSha !== parsed.frozen?.diffBaseSha) return 'unknown';
+  // A round cannot have integrated FROM its own target.
+  if (convergence?.integrationFromSha === parsed.frozen?.targetSha) return 'unknown';
   return 'integration';
 }
 

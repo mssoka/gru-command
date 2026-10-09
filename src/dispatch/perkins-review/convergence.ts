@@ -757,6 +757,8 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
         if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) return null;
       }
       if (linkage.integrationBaseSha !== parsed.frozen.diffBaseSha) return null;
+      // A round cannot have integrated FROM its own target.
+      if (linkage.integrationFromSha === parsed.frozen.targetSha) return null;
     }
     const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; contractSha256?: unknown } | null | undefined;
     // A PRESENT but malformed acceptance binding is damaged provenance, not

@@ -1,4 +1,5 @@
 import { readFileSync, rmSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -154,6 +155,8 @@ describe('native integration review retains prior coverage', () => {
     const unit = readFileSync(join(round2.artifactDirectory, 'integration-delta.patch'), 'utf8');
     expect(unit).toBe('');
     expect(unit).not.toContain('mainonly');
+    // The disclosed digest binds the persisted unit bytes, not some other diff.
+    expect(createHash('sha256').update(unit).digest('hex')).toBe(round2.convergence?.integrationDeltaSha256);
     // Whole-complete retained coverage: the integration READY binds H1 with
     // NO chained whole-PR pass over the same covered work, and records the
     // durable coverage bit for the next round.
@@ -332,5 +335,45 @@ describe('native integration review retains prior coverage', () => {
     expect(prompt).not.toContain('--- DELTA SINCE LAST REVIEWED');
     expect(b0).toMatch(/^[0-9a-f]{40}$/u);
     expect(b1).toMatch(/^[0-9a-f]{40}$/u);
+  });
+
+  it('records whole-candidate coverage even when the whole round requests changes', async () => {
+    const harness = makeEngine({
+      childAnswer: () => '[]',
+      specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/feature.ts:1', evidence: 'export const feature = 1;' }),
+    });
+    const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen = freeze(harness, 'cc-round-1', h0);
+    const round = await runRound(harness, { roundId: 'cc-round-1', roundNumber: 1, frozen, reviewScope: 'whole' });
+    expect(round.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(round.convergence?.coverageComplete).toBe(true);
+  });
+
+  it('re-verifies a prior finding on a base-changed file that is not in the unit', async () => {
+    const harness = makeEngine({
+      childAnswer: () => '[]',
+      specialists: [],
+      leadFinding: groundedFinding('lead', 'warning', {
+        title: 'readme warning', location: 'README.md:1', evidence: '# perkins-integration-round',
+      }),
+    });
+    const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'bc-round-1', h0);
+    await runRound(harness, { roundId: 'bc-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'bc-round-1'), 'consolidated.json');
+
+    // The incoming base changes README.md; the feature does not. The path is
+    // therefore absent from the focused unit but present in the sound carry
+    // set, so the prior must be re-verified, not carried.
+    const { h1 } = integrateClean(harness.repo, 'README.md', '# perkins-integration-round\n\nmain changed\n');
+    const frozen2 = freeze(harness, 'bc-round-2', h1);
+    const round2 = await runRound(harness, {
+      roundId: 'bc-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    expect(round2.convergence?.reviewScope).toBe('integration');
+    expect(round2.convergence?.reverifyPriors).toEqual([0]);
+    expect(round2.convergence?.carriedPriors).toBeUndefined();
   });
 });

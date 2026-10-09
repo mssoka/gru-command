@@ -712,6 +712,12 @@ describe('prior convergence meta read (tolerant)', () => {
     // A damaged linkage is not inherited coverage: it reads as no record.
     writeFileSync(file, JSON.stringify({ ...integrated, convergence: { reviewScope: 'integration', integrationFromSha: 'a'.repeat(40) } }));
     expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    // A non-hex linkage field is damaged.
+    writeFileSync(file, JSON.stringify({ ...integrated, convergence: { ...integrated.convergence, integrationPriorDiffBase: 'nope' } }));
+    expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    // Linkage that names the record's own target as its source is inconsistent.
+    writeFileSync(file, JSON.stringify({ ...integrated, convergence: { ...integrated.convergence, integrationFromSha: 'b'.repeat(40) } }));
+    expect(readPriorConvergenceMeta(file, 4)).toBeNull();
   });
 
   it('fails closed on a present-but-malformed acceptance binding', () => {
