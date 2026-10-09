@@ -465,16 +465,22 @@ export function trackedLanes(input: {
 // ------------------------------------------------------------------
 
 export class GhApiError extends Error {
-  constructor(message: string) {
+  /** The raw failure detail the message was composed from (gh stderr or a
+   * spawn/timeout detail), kept separate from the annotated label so
+   * classification can never read repository names as provider semantics. */
+  readonly causeText: string | null;
+
+  constructor(message: string, causeText: string | null = null) {
     super(message);
     this.name = 'GhApiError';
+    this.causeText = causeText;
   }
 }
 
 /** A rate-limit response — the tick must stop calling, never hammer. */
 export class GhRateLimitedError extends GhApiError {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, causeText: string | null = null) {
+    super(message, causeText);
     this.name = 'GhRateLimitedError';
   }
 }
@@ -544,6 +550,36 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** Read one `gh api` JSON document with the shared fail-loud rules: a
+ * spawn/unavailable failure is named, a rate-limit response is classified
+ * so the caller can abort instead of hammering, and invalid JSON is a hard
+ * error. Used by the tracked-lane signal poll and the repository overview
+ * (one seam, one classification). */
+export async function ghApiJson(
+  run: GhCommandRunner,
+  binary: string,
+  label: string,
+  host: string,
+  path: string,
+): Promise<unknown> {
+  const result = await run(['api', '--hostname', host, path]);
+  if (result.status !== 0) {
+    const stderr = result.stderr.trim().slice(0, 300);
+    if (result.error !== undefined && result.error !== '') {
+      throw new GhApiError(`${label}: gh is unavailable (${result.error})`, result.error);
+    }
+    if (/rate limit/i.test(stderr)) {
+      throw new GhRateLimitedError(`${label}: GitHub rate limit (${stderr})`, stderr);
+    }
+    throw new GhApiError(`${label}: ${binary} exited ${result.status}: ${stderr}`, stderr);
+  }
+  try {
+    return JSON.parse(result.stdout) as unknown;
+  } catch (error) {
+    throw new GhApiError(`${label}: gh returned invalid JSON (${String(error)})`);
+  }
+}
+
 function strOrNull(value: unknown): string | null {
   return typeof value === 'string' && value !== '' ? value : null;
 }
@@ -598,22 +634,7 @@ export class GhCliApi implements GhApiPort {
   ) {}
 
   private async apiJson(label: string, repo: RepoRef, path: string): Promise<unknown> {
-    const result = await this.run(['api', '--hostname', repo.host, path]);
-    if (result.status !== 0) {
-      const stderr = result.stderr.trim().slice(0, 300);
-      if (result.error !== undefined && result.error !== '') {
-        throw new GhApiError(`${label}: gh is unavailable (${result.error})`);
-      }
-      if (/rate limit/i.test(stderr)) {
-        throw new GhRateLimitedError(`${label}: GitHub rate limit (${stderr})`);
-      }
-      throw new GhApiError(`${label}: ${this.binary} exited ${result.status}: ${stderr}`);
-    }
-    try {
-      return JSON.parse(result.stdout) as unknown;
-    } catch (error) {
-      throw new GhApiError(`${label}: gh returned invalid JSON (${String(error)})`);
-    }
+    return ghApiJson(this.run, this.binary, label, repo.host, path);
   }
 
   async listPulls(input: { readonly repo: RepoRef; readonly limit: number }): Promise<readonly GhPull[]> {

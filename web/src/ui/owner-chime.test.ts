@@ -176,6 +176,7 @@ function mountDom(): void {
     <div id="board-jobs"></div>
     <section id="board-owner" hidden></section>
     <div id="board-agents"></div>
+    <section id="board-repos" data-rail-panel="agents"></section>
     <span id="rail-agents-count">0</span>
     <button id="sound-toggle">🔈</button>
     <button id="notification-bell"><span class="board-bell__badge" id="notification-badge">0</span></button>

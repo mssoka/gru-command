@@ -6,6 +6,7 @@ import type { EventBus } from '../events/bus.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 import type { DeployDriftView } from './deploy-drift.js';
+import type { RepoOverviewView } from '../repos/overview.js';
 import type { VerificationQueueView } from '../verify/scheduler.js';
 import type { PacingGateView } from '../runtime/pacing.js';
 import type { PipelineBoardView } from '../ledger/pipeline.js';
@@ -284,6 +285,11 @@ export interface BoardSnapshot {
   };
   /** Running build vs origin/main (null when the tracker is unwired). */
   readonly build: DeployDriftView | null;
+  /** Managed repository overview (owner-approved compact rows A): the
+   * read-only projection of the configured managed-repo registry. Null
+   * until the tracker's first refresh pass or when unwired — the web
+   * hides the section rather than claiming an empty registry. */
+  readonly repoOverview: RepoOverviewView | null;
   /** Silas ops health, derived from the ledger event stream. */
   readonly silas: SilasView;
   /** Verification scheduler queue (null until its API is wired). */
@@ -470,6 +476,9 @@ export interface BoardEngineOptions {
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   /** Board UX v4: deploy drift view (late-bound tracker). */
   readonly buildDrift?: () => DeployDriftView | null;
+  /** Managed repository overview (late-bound tracker; null until its
+   * first refresh pass, and when the feature is not wired). */
+  readonly repoOverview?: () => RepoOverviewView | null;
   /** Board UX v4: verification queue view (late-bound scheduler). */
   readonly verifyQueue?: () => VerificationQueueView | null;
   /** Provider pacing: gate view (late-bound; null when the feature is off). */
@@ -509,6 +518,7 @@ export class BoardEngine {
       generation: 0,
     }));
     this.buildDrift = opts.buildDrift ?? (() => null);
+    this.repoOverview = opts.repoOverview ?? (() => null);
     this.verifyQueue = opts.verifyQueue ?? (() => null);
     this.pacing = opts.pacing ?? (() => null);
     this.pipeline = opts.pipeline ?? (() => null);
@@ -525,6 +535,7 @@ export class BoardEngine {
   private readonly membershipWired: boolean;
   private readonly decisionsStatus: () => DecisionRuntimeStatus;
   private readonly buildDrift: () => DeployDriftView | null;
+  private readonly repoOverview: () => RepoOverviewView | null;
   private readonly verifyQueue: () => VerificationQueueView | null;
   private readonly pacing: () => PacingGateView | null;
   private readonly pipeline: () => PipelineBoardView | null;
@@ -808,6 +819,7 @@ export class BoardEngine {
         deferred: this.deferredWakes(),
       },
       build: this.buildDrift(),
+      repoOverview: this.repoOverview(),
       children: {
         queued: childrenQueued,
         active: childrenActive,

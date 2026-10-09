@@ -4,7 +4,6 @@ import {
   linkSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   renameSync,
   rmSync,
   statSync,
@@ -15,50 +14,25 @@ import { join } from 'node:path';
 import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
 import { configPathFor, DEFAULT_INSTANCE_PORT, expandTilde, type GruCommandConfig, loadConfig } from '../config.js';
+import { discoverManagedRepos } from '../repos/discovery.js';
 import {
   renderReferenceConfig,
   tomlString,
 } from '../config-reference.js';
 import type { WizardAnswers } from './answers.js';
 
-export { tomlString };
+export { tomlString, discoverManagedRepos };
 
 /**
  * Wizard steps (E9): the pure, testable half of the setup wizard —
  * managed-repo discovery, schema-exact config generation, the pairing
  * QR payload, and backup-first config writing. `main.ts` owns prompts,
  * service registration, and the first-boot smoke.
+ *
+ * `discoverManagedRepos` is the ONE canonical registry rule (shared with
+ * the runtime repository overview, `src/repos/discovery.ts`): depth-1
+ * entries under the configured workspace root carrying a `.git`.
  */
-
-/**
- * Scan the workspace root (ruling 6) for managed repos: depth-1 entries
- * carrying a `.git` (directory OR worktree-pointer file). Dot-directories
- * are skipped; symlinked repo directories count (statSync follows the
- * link — a symlink to a repo is a managed repo); the result is sorted
- * for stable display.
- */
-export function discoverManagedRepos(workspaceRoot: string): string[] {
-  let entries;
-  try {
-    entries = readdirSync(workspaceRoot, { withFileTypes: true });
-  } catch {
-    return []; // missing/unreadable workspace root: no repos yet, not an error
-  }
-  return entries
-    .filter((entry) => {
-      if (entry.name.startsWith('.')) return false;
-      if (entry.isDirectory()) return true;
-      if (!entry.isSymbolicLink()) return false;
-      try {
-        return statSync(join(workspaceRoot, entry.name)).isDirectory();
-      } catch {
-        return false; // broken symlink — skip
-      }
-    })
-    .filter((entry) => existsSync(join(workspaceRoot, entry.name, '.git')))
-    .map((entry) => entry.name)
-    .sort();
-}
 
 /** Render the same complete configuration used by config-generate. When
  * `prior` (the previously loaded config) is given, user-set values outside
