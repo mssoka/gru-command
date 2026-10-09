@@ -55,9 +55,7 @@ export default defineConfig({
   projects: [
     {
       name: 'mock',
-      // The slim-strip synthetic proof suite runs in this isolated mock
-      // project too (same dev mock + preview, no real service).
-      testMatch: ['smoke.spec.ts', 'working-flavor.spec.ts', 'dashboard-strip.spec.ts'],
+      testMatch: ['smoke.spec.ts', 'working-flavor.spec.ts'],
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
@@ -85,6 +83,14 @@ export default defineConfig({
       name: 'crew-rail',
       testMatch: 'crew-rail.spec.ts',
       outputDir: 'test-results-crew',
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
+      // The slim-strip synthetic proof suite: its own project so an
+      // unfiltered `--project=mock` run (crew-rail-captures and other
+      // scopes) keeps the base smoke/working-flavor roster unchanged.
+      name: 'strip',
+      testMatch: 'dashboard-strip.spec.ts',
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {

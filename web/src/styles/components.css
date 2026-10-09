@@ -285,6 +285,12 @@ body {
   text-align: right;
 }
 
+/* The honest em-dash fallback hides the slot outright: an inline-block
+   display beats the UA [hidden] rule, so state it explicitly. */
+#board-owner .num[hidden] {
+  display: none;
+}
+
 /* Four digits must fit INSIDE the floor in each surface's own font
    metrics (measured r6): the mono strip slots overshoot 4ch by up to
    1/64px of sub-pixel rounding, and the sans tabular band slot overshoots
@@ -1968,6 +1974,13 @@ body {
   justify-items: end;
 }
 
+.board-owner__row > .board-owner__disclose {
+  /* The ack row's one control sits in the row's action cell — stated
+   * explicitly (it was previously auto-placed into the only free cell). */
+  grid-area: action;
+  justify-self: end;
+}
+
 .board-owner__disclose {
   font: inherit;
   font-size: 12px;
@@ -2109,6 +2122,10 @@ body {
   .board-owner__actions {
     justify-items: start;
     grid-auto-flow: column;
+  }
+
+  .board-owner__row > .board-owner__disclose {
+    justify-self: start;
   }
 }
 
@@ -2330,11 +2347,6 @@ body {
   color: var(--ink);
 }
 
-/* Megaminions: the specialists a heist's minion commissioned nest under
-   it — a family chip on the parent's meta line, live specialists as
-   indented sub-rows hung off one guide line (├/└ ticks), concluded ones
-   inside the expanded body. A nested row is a quieter, single-indent
-   twin of the parent row. */
 /* The expanded row: the v3 detail in one box — the only card allowed. */
 .board-job__body {
   display: grid;

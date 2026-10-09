@@ -339,6 +339,16 @@ describe('board rail — numeric part splits for the slim strip', () => {
     const alerts = chips.find((c) => c.id === 'alerts')!;
     expect(alerts.valueSplit).toEqual({ lead: '', num: 0, unit: '' });
     expect(alerts.flagSplit).toBeNull();
+
+    // The trackers chip is the ONE documented exception: the strip renders
+    // it through its groups (kpis), never through label/value/splits. Pin
+    // that exemption to exactly one chip — a second exempted chip, or a
+    // trackers chip that starts rendering a value, must fail here.
+    const unsplit = chips.filter((c) => c.id === 'trackers');
+    expect(unsplit.map((c) => c.id)).toEqual(['trackers']);
+    expect(unsplit[0]!.valueSplit).toEqual({ lead: '', num: null, unit: '' });
+    expect(unsplit[0]!.flagSplit).toBeNull();
+    expect(unsplit[0]!.value).toBe('');
   });
 
   it('splits the silas wake value; an unparseable stamp stays honest text', () => {

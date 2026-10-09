@@ -1,90 +1,80 @@
 // Baseline RED classifier — R3-05 resolution (job dashboard-slim-strip-current-main-20261007).
 //
-// Usage: node tools/classify-baseline.mjs <report.json> [--require-file <substr>]
-//        (--playwright --require-substr "a,b,c" for Playwright reports)
+// Classifies a baseline report (the recorded execution base overlaid with
+// the named fail-before specs) and maps it to an exit code:
+//   1  — BASELINE RED CLASSIFIED: setup/collection clean, and the failures
+//        are identified feature-absence AssertionErrors (per-test cause).
+//   2  — FAILS-BEFORE CLAIM BROKEN: the baseline passed unexpectedly, or
+//        the named instrument file did not fail.
+//   3  — BASELINE SETUP/COLLECTION FAILURE: unreadable report, zero tests
+//        collected, module load errors, unidentified failure causes. This
+//        is NEVER behavioral evidence and must never be read as a
+//        feature-absence RED.
 //
-// Reads a vitest JSON report produced inside a baseline snapshot (the
-// recorded execution base overlaid with the named fail-before specs) and
-// CLASSIFIES the outcome. Exit codes:
-//   0  — never (a green baseline reaches the caller as exit 2)
-//   2  — FAILS-BEFORE CLAIM BROKEN: the baseline suite passed unexpectedly
-//   3  — BASELINE SETUP/COLLECTION FAILURE: unparsable report, zero tests
-//        collected, or module load errors. This is NEVER behavioral
-//        evidence and must never be read as a feature-absence RED.
-//   1  — BASELINE RED CLASSIFIED: setup clean (report parsed, tests ran,
-//        no load errors), at least one assertion failure, and (with
-//        --require-file) every test of the named instrument file failed
-//        with AssertionError messages naming the missing feature surfaces.
+// The producer's own exit code is never swallowed or rewritten: the scope
+// runs the producer first, keeps its real exit, then classifies.
 //
-// Playwright shape (--playwright): the report is a Playwright JSON
-// (stats + suites). Setup = stats.total > 0 and the run reached test
-// execution; RED = at least one unexpected result whose title or error
-// message matches a required slim-surface substring (--require-substr
-// "a,b,c"), proving the failure is the feature's absence and not a
-// navigation/setup break.
-//
-// The classifier never swallows or rewrites the producer's exit code: the
-// caller runs the producer first, keeps its real exit, then classifies.
+// The classification itself is a pure exported function (unit-tested in
+// test/classify-baseline.test.ts, the same discipline as
+// tools/assert-binned-baseline.mjs); the CLI below owns file and process
+// I/O only.
 
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
-// Node-process output only (the repo lint config defines no browser/node
-// globals): findings go to stderr, the classification line to stdout.
+// Node-process output only (the repo lint config defines no globals):
+// findings go to stderr, the classification line to stdout.
 const fail = (message) => process.stderr.write(`${message}\n`);
 const say = (message) => process.stdout.write(`${message}\n`);
 
-const args = process.argv.slice(2);
-const reportPath = args[0];
-const requireFileIdx = args.indexOf('--require-file');
-const requireFile = requireFileIdx >= 0 ? args[requireFileIdx + 1] : null;
-const playwright = args.includes('--playwright');
-const substrIdx = args.indexOf('--require-substr');
-const substrs = substrIdx >= 0 ? String(args[substrIdx + 1] ?? '').split(',').filter(Boolean) : [];
-
 const LOAD_ERROR = /Cannot find module|does not provide an export|Failed to load url|SyntaxError/i;
 
-let report;
-try {
-  report = JSON.parse(readFileSync(reportPath, 'utf-8'));
-} catch (error) {
-  fail(`BASELINE SETUP FAILURE: report unreadable (${String(error)}) — not behavioral evidence`);
-  process.exit(3);
+/**
+ * Classify an already-parsed report value. Pure: no process I/O, no exits.
+ *
+ * @param {unknown} report
+ * @param {{ playwright?: boolean, requireFile?: string | null, substrs?: readonly string[] }} [options]
+ * @returns {{ code: number, out: string, err: string }}
+ */
+export function classifyBaseline(report, { playwright = false, requireFile = null, substrs = [] } = {}) {
+  return playwright ? classifyPlaywright(report, substrs) : classifyVitest(report, requireFile);
 }
 
-if (playwright) {
-  const stats = report.stats ?? {};
+function classifyPlaywright(report, substrs) {
+  const stats = (report && report.stats) || {};
   // Playwright's JSON stats carry expected/unexpected/skipped/flaky — there
   // is no `total` field; the run's size is their sum.
   const total = (stats.expected ?? 0) + (stats.unexpected ?? 0) + (stats.skipped ?? 0) + (stats.flaky ?? 0);
   const unexpected = stats.unexpected ?? 0;
   if (total === 0) {
-    fail('BASELINE SETUP/COLLECTION FAILURE: zero Playwright tests ran (build/webServer/spec load?) — not behavioral evidence');
-    process.exit(3);
+    return {
+      code: 3,
+      out: '',
+      err: 'BASELINE SETUP/COLLECTION FAILURE: zero Playwright tests ran (build/webServer/spec load?) — not behavioral evidence',
+    };
   }
   const results = [];
   const walk = (suite) => {
-    // A spec's own `status`/`ok` carries the outcome; per-test entries
-    // mirror it (`test.status === 'unexpected'`, result.status 'failed').
     for (const spec of suite.specs ?? []) {
       if (spec.ok === false || (spec.tests ?? []).some((t) => t.status === 'unexpected')) {
-        const bad = (spec.tests ?? []).flatMap((t) => t.results ?? []).find((r) => r.status === 'failed' || r.status === 'unexpected');
-        const message = (bad?.error?.message ?? '') + '\n' +
-          String(bad?.errors?.map((e) => e.message).join('\n') ?? '');
+        const bad = (spec.tests ?? [])
+          .flatMap((t) => t.results ?? [])
+          .find((r) => r.status === 'failed' || r.status === 'unexpected');
+        const message =
+          (bad?.error?.message ?? '') + '\n' + String(bad?.errors?.map((e) => e.message).join('\n') ?? '');
         results.push({ title: spec.title ?? spec.file ?? 'unknown', message });
       }
     }
     for (const child of suite.suites ?? []) walk(child);
   };
-  for (const suite of report.suites ?? []) walk(suite);
+  for (const suite of (report && report.suites) ?? []) walk(suite);
   if (unexpected === 0) {
-    fail(`FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${total} ran, 0 unexpected)`);
-    process.exit(2);
+    return { code: 2, out: '', err: `FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${total} ran, 0 unexpected)` };
   }
-  // R3-05 per-test cause: EVERY unexpected failure must name a missing
-  // slim surface. A count alone proves nothing — each failure carries its
-  // own identified cause, and any failure that does not name a surface is
-  // unclassified evidence (setup/load/timing), never folded into the RED.
+  // Per-test cause: EVERY unexpected failure must name a missing slim
+  // surface; an unclassified failure is never folded into the RED.
   const identified = [];
   const unidentified = [];
   for (const r of results) {
@@ -92,72 +82,132 @@ if (playwright) {
     else unidentified.push(r);
   }
   if (identified.length === 0) {
-    fail(`BASELINE SETUP FAILURE: ${results.length} unexpected result(s), none matching the slim-surface substrings (${substrs.join(', ')}) — not identified feature absence`);
-    for (const r of results.slice(0, 5)) fail(`  ${r.title}: ${r.message.slice(0, 140).replace(/\n/g, ' ')}`);
-    process.exit(3);
+    const lines = results
+      .slice(0, 5)
+      .map((r) => `  ${r.title}: ${r.message.slice(0, 140).replace(/\n/g, ' ')}`)
+      .join('\n');
+    return {
+      code: 3,
+      out: '',
+      err: `BASELINE SETUP FAILURE: ${results.length} unexpected result(s), none matching the slim-surface substrings (${substrs.join(', ')}) — not identified feature absence\n${lines}`,
+    };
   }
   if (unidentified.length > 0) {
-    fail(`BASELINE SETUP FAILURE: ${unidentified.length} of ${results.length} unexpected failure(s) name NO slim surface — unclassified causes are not behavioral feature-absence evidence`);
-    for (const r of unidentified.slice(0, 5)) fail(`  UNIDENTIFIED ${r.title}: ${r.message.slice(0, 140).replace(/\n/g, ' ')}`);
+    const lines = unidentified
+      .slice(0, 5)
+      .map((r) => `  UNIDENTIFIED ${r.title}: ${r.message.slice(0, 140).replace(/\n/g, ' ')}`)
+      .join('\n');
+    return {
+      code: 3,
+      out: '',
+      err: `BASELINE SETUP FAILURE: ${unidentified.length} of ${results.length} unexpected failure(s) name NO slim surface — unclassified causes are not behavioral feature-absence evidence\n${lines}`,
+    };
+  }
+  return {
+    code: 1,
+    out: `BASELINE RED CLASSIFIED: setup clean (Playwright ran ${total} test(s)); ${unexpected} unexpected; every one of the ${identified.length} failure(s) names a missing slim surface (${substrs.join(', ')}) — per-test cause established`,
+    err: '',
+  };
+}
+
+function classifyVitest(report, requireFile) {
+  if (report === null || typeof report !== 'object') {
+    return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: report unreadable or not an object — not behavioral evidence' };
+  }
+  const suites = Array.isArray(report.testResults) ? report.testResults : [];
+  const total = report.numTotalTests ?? 0;
+  const passed = report.numPassedTests ?? 0;
+  const failed = report.numFailedTests ?? 0;
+  if (total === 0) {
+    return { code: 3, out: '', err: 'BASELINE SETUP/COLLECTION FAILURE: zero tests collected — not behavioral evidence' };
+  }
+  const loadErrors = [];
+  for (const suite of suites) {
+    const message = String(suite.message ?? '');
+    if (suite.status === 'failed' && LOAD_ERROR.test(message) && (suite.assertionResults ?? []).length === 0) {
+      loadErrors.push(suite.name ?? 'unknown suite');
+    }
+  }
+  if (loadErrors.length > 0) {
+    return {
+      code: 3,
+      out: '',
+      err: `BASELINE SETUP/COLLECTION FAILURE: module load errors in ${loadErrors.length} suite(s) — not behavioral evidence\n${loadErrors.map((n) => `  load error: ${n}`).join('\n')}`,
+    };
+  }
+  if (failed === 0) {
+    return { code: 2, out: '', err: `FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${passed}/${total} passed)` };
+  }
+  // Per-test cause accounting across the whole overlay: assertion failures
+  // are behavioral; any other failure mode is counted separately and is
+  // never claimed as feature-absence evidence.
+  let assertions = 0;
+  let otherFailures = 0;
+  for (const suite of suites) {
+    for (const a of suite.assertionResults ?? []) {
+      if (a.status !== 'failed') continue;
+      if ((a.failureMessages ?? []).some((m) => /AssertionError/.test(m))) assertions += 1;
+      else otherFailures += 1;
+    }
+  }
+  if (requireFile !== null) {
+    const instrument = suites.find((suite) => String(suite.name).includes(requireFile));
+    if (instrument === undefined) {
+      return { code: 3, out: '', err: `BASELINE SETUP FAILURE: instrument file not in report: ${requireFile}` };
+    }
+    const instrumentAssertions = instrument.assertionResults ?? [];
+    if (instrumentAssertions.length === 0 || !instrumentAssertions.every((a) => a.status === 'failed')) {
+      return { code: 2, out: '', err: 'FAILS-BEFORE CLAIM BROKEN: the instrument file has passing/non-failed tests on the base' };
+    }
+    const nonAssertion = instrumentAssertions.filter(
+      (a) => !(a.failureMessages ?? []).some((m) => /AssertionError/.test(m)),
+    );
+    if (nonAssertion.length > 0) {
+      const lines = nonAssertion
+        .map((a) => `  ${a.title}: ${(a.failureMessages ?? [''])[0].slice(0, 160)}`)
+        .join('\n');
+      return {
+        code: 3,
+        out: '',
+        err: `BASELINE SETUP FAILURE: ${nonAssertion.length} instrument failure(s) are not AssertionErrors — not behavioral evidence\n${lines}`,
+      };
+    }
+  }
+  return {
+    code: 1,
+    out:
+      `BASELINE RED CLASSIFIED: setup clean (report parsed, ${total} tests collected, no load errors); ` +
+      `${assertions} feature-absence assertion failure(s), ${passed} base-behavior pass(es)` +
+      (otherFailures > 0
+        ? `; ${otherFailures} non-assertion failure(s) reported but NOT claimed as behavioral assertions`
+        : '') +
+      (requireFile ? `; instrument ${requireFile}: every test failed by AssertionError` : ''),
+    err: '',
+  };
+}
+
+// --- CLI -------------------------------------------------------------------
+
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+
+  const args = process.argv.slice(2);
+  const reportPath = args[0];
+  const requireFileIdx = args.indexOf('--require-file');
+  const requireFile = requireFileIdx >= 0 ? args[requireFileIdx + 1] : null;
+  const playwright = args.includes('--playwright');
+  const substrIdx = args.indexOf('--require-substr');
+  const substrs = substrIdx >= 0 ? String(args[substrIdx + 1] ?? '').split(',').filter(Boolean) : [];
+
+  let report = null;
+  try {
+    report = JSON.parse(readFileSync(reportPath, 'utf-8'));
+  } catch (error) {
+    fail(`BASELINE SETUP FAILURE: report unreadable (${String(error)}) — not behavioral evidence`);
     process.exit(3);
   }
-  say(
-    `BASELINE RED CLASSIFIED: setup clean (Playwright ran ${total} test(s)); ${unexpected} unexpected; ` +
-      `every one of the ${identified.length} failure(s) names a missing slim surface (${substrs.join(', ')}) — per-test cause established`,
-  );
-  process.exit(1);
-}
 
-const suites = Array.isArray(report.testResults) ? report.testResults : [];
-const total = report.numTotalTests ?? 0;
-const passed = report.numPassedTests ?? 0;
-const failed = report.numFailedTests ?? 0;
-
-if (total === 0) {
-  fail('BASELINE SETUP/COLLECTION FAILURE: zero tests collected — not behavioral evidence');
-  process.exit(3);
+  const { code, out, err } = classifyBaseline(report, { playwright, requireFile, substrs });
+  if (err !== '') fail(err);
+  if (out !== '') say(out);
+  process.exit(code);
 }
-
-const loadErrors = [];
-for (const suite of suites) {
-  const message = String(suite.message ?? '');
-  if (suite.status === 'failed' && LOAD_ERROR.test(message) && (suite.assertionResults ?? []).length === 0) {
-    loadErrors.push(suite.name ?? 'unknown suite');
-  }
-}
-if (loadErrors.length > 0) {
-  fail(`BASELINE SETUP/COLLECTION FAILURE: module load errors in ${loadErrors.length} suite(s) — not behavioral evidence`);
-  for (const name of loadErrors) fail(`  load error: ${name}`);
-  process.exit(3);
-}
-
-if (failed === 0) {
-  fail(`FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${passed}/${total} passed)`);
-  process.exit(2);
-}
-
-if (requireFile !== null) {
-  const instrument = suites.find((suite) => String(suite.name).includes(requireFile));
-  if (instrument === undefined) {
-    fail(`BASELINE SETUP FAILURE: instrument file not in report: ${requireFile}`);
-    process.exit(3);
-  }
-  const assertions = instrument.assertionResults ?? [];
-  if (assertions.length === 0 || !assertions.every((a) => a.status === 'failed')) {
-    fail('FAILS-BEFORE CLAIM BROKEN: the instrument file has passing/non-failed tests on the base');
-    process.exit(2);
-  }
-  const nonAssertion = assertions.filter((a) => !(a.failureMessages ?? []).some((m) => /AssertionError/.test(m)));
-  if (nonAssertion.length > 0) {
-    fail(`BASELINE SETUP FAILURE: ${nonAssertion.length} instrument failure(s) are not AssertionErrors — not behavioral evidence`);
-    for (const a of nonAssertion) fail(`  ${a.title}: ${(a.failureMessages ?? [''])[0].slice(0, 160)}`);
-    process.exit(3);
-  }
-}
-
-say(
-  `BASELINE RED CLASSIFIED: setup clean (report parsed, ${total} tests collected, no load errors); ` +
-    `${failed} feature-absence assertion failure(s), ${passed} base-behavior pass(es)` +
-    (requireFile ? `; instrument ${requireFile}: every test failed by AssertionError` : ''),
-);
-process.exit(1);

@@ -407,9 +407,9 @@ interface Geometry {
  * neighboring a measured numeric slot is captured beside its geometry.
  * The mutable numbers themselves are asserted by the tests BEFORE each
  * measurement — never folded into this comparison. */
-async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?: number; expectedGroups?: number } = {}): Promise<Geometry> {
+async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?: number; expectedGroups?: number; expectAgeSplit?: boolean } = {}): Promise<Geometry> {
   return page.evaluate(
-    ({ expectOlder, expectedKpis, expectedGroups }) => {
+    ({ expectOlder, expectedKpis, expectedGroups, expectAgeSplit }) => {
       const rail = document.getElementById('chip-rail');
       if (!rail) throw new Error('missing #chip-rail');
       const box = (el: Element): { x: number; y: number; w: number; h: number } => {
@@ -425,6 +425,12 @@ async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?
         const el = scope.querySelector(sel);
         if (!el) throw new Error(`missing ${sel}`);
         return el;
+      };
+      // The honest no-wakes / last-wake-unknown states must NOT emit an
+      // age-split node: assert its absence rather than skipping the state.
+      const absent = (scope: ParentNode, sel: string, what: string): null => {
+        if (scope.querySelector(sel) !== null) throw new Error(`unexpected ${what} in the honest-unknown wakes state`);
+        return null;
       };
       const texts = (sel: string): string[] =>
         [...rail.querySelectorAll(sel)].map((el) => el.textContent ?? '');
@@ -466,9 +472,17 @@ async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?
             pick('.strip-flag__txt'),
             positive(need(rail, '.board-wakes__count'), '.board-wakes__count'),
             pick('.board-wakes__deferred'),
-            positive(need(rail, '.board-age-split__num'), '.board-age-split__num'),
-            positive(need(rail, '.board-age-split__lead'), '.board-age-split__lead'),
-            positive(need(rail, '.board-age-split__unit'), '.board-age-split__unit'),
+            // The age slots exist only when a wake fired with a valid stamp;
+            // the honest-unknown mode asserts their ABSENCE instead.
+            expectAgeSplit
+              ? positive(need(rail, '.board-age-split__num'), '.board-age-split__num')
+              : absent(rail, '.board-age-split__num', '.board-age-split__num'),
+            expectAgeSplit
+              ? positive(need(rail, '.board-age-split__lead'), '.board-age-split__lead')
+              : absent(rail, '.board-age-split__lead', '.board-age-split__lead'),
+            expectAgeSplit
+              ? positive(need(rail, '.board-age-split__unit'), '.board-age-split__unit')
+              : absent(rail, '.board-age-split__unit', '.board-age-split__unit'),
             positive(need(rail, '.board-decisions'), '.board-decisions'),
             pick('.strip-group'),
             pick('.strip-group__name'),
@@ -498,7 +512,7 @@ async function geometry(page: Page, opts: { expectOlder?: boolean; expectedKpis?
         },
       };
     },
-    { expectOlder: opts.expectOlder ?? false, expectedKpis: opts.expectedKpis ?? 13, expectedGroups: opts.expectedGroups ?? 3 },
+    { expectOlder: opts.expectOlder ?? false, expectedKpis: opts.expectedKpis ?? 13, expectedGroups: opts.expectedGroups ?? 3, expectAgeSplit: opts.expectAgeSplit ?? true },
   );
 }
 
@@ -1111,10 +1125,22 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
       const s = getComputedStyle(el);
       return { width: s.outlineWidth, style: s.outlineStyle, color: s.outlineColor, offset: s.outlineOffset };
     });
+  // The ring colour is the theme's focus token, read from the document
+  // rather than duplicated here: a legitimate token change keeps the test
+  // meaningful, and a ring that ignores the token still fails (the ring
+  // must EQUAL the token, not merely be a colour).
+  const focusRingColor = await page.evaluate(() => {
+    const probe = document.createElement('span');
+    probe.style.color = 'var(--work)';
+    document.body.append(probe);
+    const computed = getComputedStyle(probe).color;
+    probe.remove();
+    return computed;
+  });
   expect(await ringOf(ackDisclose)).toEqual({
     width: '3px',
     style: 'solid',
-    color: 'rgb(255, 213, 74)',
+    color: focusRingColor,
     offset: '2px',
   });
   // The button is literally labeled Ack; the FULL consequence and the
@@ -1141,13 +1167,13 @@ test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR
   await expectFocusedControl(page, ackButton, 'owner-ack:pend-0000', 'ack');
   // Themed keyboard focus ring survives the restore on the explicit Ack
   // control too (not only on the disclosure).
-  expect(await ringOf(ackButton)).toEqual({ width: '3px', style: 'solid', color: 'rgb(255, 213, 74)', offset: '2px' });
+  expect(await ringOf(ackButton)).toEqual({ width: '3px', style: 'solid', color: focusRingColor, offset: '2px' });
   // Focused OPEN PR survives the same way (10→99) — focused, never activated.
   await prOpen.focus();
   await send(makeSnapshot({ ...familyA(99), pending: 2 }));
   await waitForCount(page, 'prs.open', 99);
   await expectFocusedControl(page, prOpen, 'owner-pr:synthetic', 'open');
-  expect(await ringOf(prOpen)).toEqual({ width: '3px', style: 'solid', color: 'rgb(255, 213, 74)', offset: '2px' });
+  expect(await ringOf(prOpen)).toEqual({ width: '3px', style: 'solid', color: focusRingColor, offset: '2px' });
   // Full reconnect (socket close → re-auth → HTTP refetch) with the OPEN PR
   // control focused: the refetched state is genuinely CHANGED (100).
   send.stage(makeSnapshot({ ...familyA(100), pending: 2 }));
@@ -1373,6 +1399,26 @@ test('deferred Gru wakes stay visible beside count and age (issue #219)', async 
   await expect(wakes).toContainText('no wakes yet');
   await expect(wakes).toContainText('1 deferred');
   await expect(wakes).not.toContainText('last wake unknown');
+  // The honest no-wakes state carries no age-split node: measure its OWN
+  // stability across a count change (1 -> 999 deferred) so the reserved-slot
+  // / no-reflow contract covers this state too, not just the numeric one.
+  const unknown1 = await geometry(page, { expectAgeSplit: false });
+  await send(makeSnapshot(slotSpec({ wakes: 0, gruWakeAgeMs: null, deferredCount: 999 })));
+  await expect(wakes.locator('.board-wakes__deferred')).toHaveText('999');
+  const unknown999 = await geometry(page, { expectAgeSplit: false });
+  comparePairwise(unknown1, unknown999);
+
+  // A count with NO valid stamp is the honest "last wake unknown" state:
+  // same contract — the count slot stays put, the phrase never fabricates a
+  // numeric age.
+  await send(makeSnapshot(slotSpec({ wakes: 12, gruWakeAgeMs: null, deferredCount: 0 })));
+  await expect(wakes).toContainText('last wake unknown');
+  await expect(wakes.locator('.board-wakes__count')).toHaveText('12');
+  const unknownWakes = await geometry(page, { expectAgeSplit: false });
+  await send(makeSnapshot(slotSpec({ wakes: 999, gruWakeAgeMs: null, deferredCount: 0 })));
+  await expect(wakes.locator('.board-wakes__count')).toHaveText('999');
+  const unknownWakes999 = await geometry(page, { expectAgeSplit: false });
+  comparePairwise(unknownWakes, unknownWakes999);
 });
 
 /** Gate F visual evidence: real captures of the synthetic fixture at all

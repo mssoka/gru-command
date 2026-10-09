@@ -177,7 +177,6 @@ export class BoardView {
    * by the shortcut strip and the section bodies — computed from the SAME
    * stopped/live-worker inputs so they can never disagree). */
   private currentSections: ReturnType<typeof boardSections> | null = null;
-
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
   private receiptsNextOffset = 0;
@@ -751,8 +750,8 @@ export class BoardView {
 
   private renderRail(snapshot: BoardSnapshot): void {
     this.chipRail.hidden = false;
-    this.renderTrackers(snapshot);
     const chips = railChips(snapshot);
+    this.renderTrackerChips(snapshot);
     this.chipRail.replaceChildren();
     const row = el('div', 'strip-status');
     for (const chip of chips) {
@@ -851,10 +850,11 @@ export class BoardView {
   }
 
   // ------------------------------------------------------------------
-  // Trackers: decisions chip + NEEDS GRU queue + wake count
+  // Tracker chips: decisions + NEEDS GRU queue + wake count (the tracker
+  // GROUPS themselves render in stripGroupsNode from the same derivation).
   // ------------------------------------------------------------------
 
-  private renderTrackers(snapshot: BoardSnapshot): void {
+  private renderTrackerChips(snapshot: BoardSnapshot): void {
     const decisions = snapshot.decisions;
     this.decisionsChip.className = `pp-chip board-decisions ${decisionChipTone(decisions.status)}`;
     this.decisionsChip.dataset.state = decisions.status;
@@ -2317,4 +2317,3 @@ function formatTs(iso: string): string {
   if (Number.isNaN(date.getTime())) return iso;
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
-

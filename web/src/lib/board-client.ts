@@ -59,7 +59,9 @@ export interface BoardClientOptions {
 const BACKOFF_MS = [800, 1_600, 3_200, 6_400, 12_000] as const;
 const DEFAULT_LIVENESS_WINDOW_MS = 75_000;
 const DEFAULT_LIVENESS_CHECK_MS = 5_000;
-/** R7-05: a snapshot request (fetch AND body) that outlives this is abandoned. */
+/** R7-05: the shared request deadline — a snapshot GET (fetch AND body)
+ * that outlives it is abandoned, and every POST (owner actions) rides the
+ * same bound so an action that outlives it is unconfirmed, never replayed. */
 const SNAPSHOT_DEADLINE_MS = 15_000;
 /** R7-04: trailing refetches run back to back this many times in a chain... */
 const TRAILING_BURST = 2;
@@ -471,20 +473,40 @@ export class BoardClient {
 
   /** Every POST rides the same bounded deadline budget as the snapshot
    * GET: an owner action that outlives it is unconfirmed — never
-   * auto-replayed; the authoritative snapshot reconciles. */
+   * auto-replayed; the authoritative snapshot reconciles. The deadline
+   * rides a controller this client owns (not `AbortSignal.timeout`), so
+   * stop()/tests share one mechanism, and the expiry surfaces as a
+   * BoardApiError (code `timeout`, status 0 = no HTTP answer) — callers
+   * can tell "the server said no" from "we don't know". */
   private async postApi(path: string, body: unknown): Promise<unknown> {
     const doFetch = this.fetchImpl;
-    const res = await doFetch(path, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${this.options.token}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(SNAPSHOT_DEADLINE_MS),
+    const request = new AbortController();
+    const expired = new Promise<never>((_, reject) => {
+      request.signal.addEventListener(
+        'abort',
+        () => reject(new BoardApiError(path, 0, 'timeout', 'no answer before the deadline — outcome unconfirmed')),
+        { once: true },
+      );
     });
-    if (!res.ok) return this.refused(path, res);
-    return res.json();
+    const timer = setTimeout(() => request.abort(), SNAPSHOT_DEADLINE_MS);
+    try {
+      const res = await Promise.race([
+        doFetch(path, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${this.options.token}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(body),
+          signal: request.signal,
+        }),
+        expired,
+      ]);
+      if (!res.ok) return this.refused(path, res);
+      return res.json();
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 

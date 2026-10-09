@@ -217,16 +217,39 @@ describe('board client', () => {
     await expect(client.recheckDecisions()).rejects.toThrow(/malformed status/);
   });
 
-  it('every POST rides a bounded deadline signal — an owner action that outlives it is unconfirmed, never auto-replayed (R3-03)', async () => {
-    const fetchImpl = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch;
-    client = new BoardClient(
-      { token: TOKEN, host: `127.0.0.1:${server.port}`, fetchImpl },
-      { connection: () => {}, snapshot: () => {}, fatal: () => {} },
-    );
-    await client.ackNotification('n1');
-    const [, init] = vi.mocked(fetchImpl).mock.calls[0]!;
-    expect(init).toMatchObject({ method: 'POST' });
-    expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal);
+  it('every POST rides a bounded deadline — an owner action that outlives it is abandoned and rejects, never replayed (R3-03)', async () => {
+    // Presence of a signal is not the contract: the deadline must actually
+    // abort a never-settling POST. A signal that never fires would leave the
+    // Ack control disabled in "acking…" forever, against a green suite.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let init: RequestInit | undefined;
+      const fetchImpl = vi.fn(
+        (_path: string, options?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init = options;
+            options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+            // never settles on its own — the deadline is the only way out
+          }),
+      ) as unknown as typeof fetch;
+      client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      const posting = client.ackNotification('n1');
+      const rejection = expect(posting).rejects.toThrow(/no answer before the deadline/u);
+      expect(init).toMatchObject({ method: 'POST' });
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      expect(init?.signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(init?.signal?.aborted, 'the POST deadline fired').toBe(true);
+      await rejection;
+      // No retry was issued: one POST, one request — the outcome is
+      // unconfirmed and the snapshot reconciles it, not a replay.
+      expect(vi.mocked(fetchImpl)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('stop() halts reconnects', async () => {
