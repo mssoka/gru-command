@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RepoOverviewRowView, RepoOverviewView } from '../lib/board-protocol.js';
 import { el } from './dom.js';
 import { RepoOverviewPanel } from './repo-overview.js';
@@ -330,6 +330,31 @@ describe('managed repository overview panel', () => {
     expect(document.activeElement).toBe(mount);
     view.render(null);
     expect(document.activeElement).toBe(tab);
+  });
+
+  it('restores focus with preventScroll so a rebuild never jumps the list scroll', () => {
+    const { mount, view } = panel();
+    const tab = document.createElement('button');
+    tab.id = 'rail-tab-agents';
+    document.body.append(tab);
+    view.render({ rows: [row()] });
+    // Focus before the spy: the test's own focus() call is not the code
+    // under test.
+    mount.querySelector<HTMLAnchorElement>('a.repo-row__name')!.focus();
+
+    const focusSpy = vi.spyOn(HTMLElement.prototype, 'focus');
+    try {
+      // Row restoration on a rebuild, then the module-removal handback:
+      // both must pass preventScroll, not just the one the e2e spec
+      // discards by scrolling.
+      view.render({ rows: [row()] });
+      view.render(null);
+      const options = focusSpy.mock.calls.map((call) => call[0] as FocusOptions | undefined);
+      expect(options).toHaveLength(2);
+      for (const option of options) expect(option).toStrictEqual({ preventScroll: true });
+    } finally {
+      focusSpy.mockRestore();
+    }
   });
 
   it('links an unnamed workflow run under its run-number label', () => {

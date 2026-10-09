@@ -16,6 +16,7 @@ import {
   GhRepoOverviewApi,
   ManagedRepoOverviewTracker,
   REPO_OVERVIEW_FETCH_BUDGET_MS,
+  REPO_OVERVIEW_REFRESH_MS,
   REPO_OVERVIEW_RESOLVE_BUDGET_MS,
   REPO_OVERVIEW_RUNS_PER_FETCH,
   REPO_OVERVIEW_STALE_AFTER_MS,
@@ -146,6 +147,8 @@ function harness(options: {
   api?: FakeApi;
   maxCallsPerRefresh?: number;
   staleAfterMs?: number;
+  /** Leave `intervalMs` unset so the tracker's own default cadence applies. */
+  defaultCadence?: boolean;
 } = {}): Harness {
   const names = [...(options.names ?? ['alpha'])];
   const api = options.api ?? new FakeApi();
@@ -179,7 +182,7 @@ function harness(options: {
       if (state.resolveDelayMs > 0) state.clock.ms += state.resolveDelayMs;
       return state.refs.get(name) ?? null;
     },
-    intervalMs: 300_000,
+    ...(options.defaultCadence === true ? {} : { intervalMs: 300_000 }),
     ...(options.maxCallsPerRefresh !== undefined ? { maxCallsPerRefresh: options.maxCallsPerRefresh } : {}),
     ...(options.staleAfterMs !== undefined ? { staleAfterMs: options.staleAfterMs } : {}),
     now: () => state.clock.ms,
@@ -486,6 +489,49 @@ describe('managed repo overview tracker — failure, freshness and recovery', ()
     h.clock.ms += 1;
   });
 
+  it('uses the 5-minute cadence by default: the 3-cadence window keeps data fresh to its boundary', async () => {
+    // No `intervalMs` is injected: the tracker's own default must be the
+    // documented 5-minute cadence (300000 ms), whose freshness window is
+    // three cadences. A drift in either value fails here.
+    const h = harness({ names: ['alpha'], defaultCadence: true });
+    await h.tracker.refresh();
+    expect(REPO_OVERVIEW_REFRESH_MS).toBe(5 * 60_000);
+    expect(REPO_OVERVIEW_STALE_AFTER_MS).toBe(REPO_OVERVIEW_REFRESH_MS * 3);
+    expect(row(h.tracker.view(), 'alpha').freshness).toBe('fresh');
+    h.clock.ms += REPO_OVERVIEW_REFRESH_MS * 3;
+    expect(row(h.tracker.view(), 'alpha').freshness).toBe('fresh');
+    h.clock.ms += 1;
+    expect(row(h.tracker.view(), 'alpha').freshness).toBe('stale');
+  });
+
+  it('never publishes a credentialed or alternate-port provider run URL', async () => {
+    // The server-side guard is the layer that keeps a strict client from
+    // rejecting (and freezing) the whole board on a GHE-style run URL.
+    const api = new FakeApi()
+      .set('alpha', {
+        runs: {
+          kind: 'ok',
+          value: [rawRun({ id: 7, url: 'https://user:secret@github.com/acme/alpha/actions/runs/7' })],
+        },
+      })
+      .set('beta', {
+        runs: {
+          kind: 'ok',
+          value: [rawRun({ id: 8, url: 'https://github.com:8443/acme/beta/actions/runs/8' })],
+        },
+      });
+    const h = harness({ names: ['alpha', 'beta'], api });
+    const view = await h.tracker.refresh();
+    const alpha = row(view, 'alpha');
+    const beta = row(view, 'beta');
+    // The rows survive (the observation is complete) but carry no link.
+    expect(alpha.run?.url).toBeNull();
+    expect(beta.run?.url).toBeNull();
+    expect(alpha.openPrs).not.toBeNull();
+    expect(beta.openPrs).not.toBeNull();
+    expect(alpha.run?.runNumber).toBe(1);
+  });
+
   it('computes freshness purely from the fetch completion and attempt ordering', () => {
     const checked = '2026-10-07T12:00:00.000Z';
     expect(freshnessOf({ checkedAt: null, lastAttemptAt: null, nowMs: T0, staleAfterMs: 1000 })).toBe('unchecked');
@@ -626,6 +672,14 @@ describe('managed repo overview — pure helpers', () => {
     expect(safeRunUrl('https://evil.example/actions/runs/1', 'github.com')).toBeNull();
     expect(safeRunUrl('javascript:alert(1)', 'github.com')).toBeNull();
     expect(safeRunUrl(null, 'github.com')).toBeNull();
+    // Credentials never ride a rendered link, and an explicit non-default
+    // port is a different origin than the repository host. The default
+    // https port normalizes away and stays acceptable.
+    expect(safeRunUrl('https://user:secret@github.com/acme/alpha/actions/runs/1', 'github.com')).toBeNull();
+    expect(safeRunUrl('https://github.com:8443/acme/alpha/actions/runs/1', 'github.com')).toBeNull();
+    expect(safeRunUrl('https://github.com:443/acme/alpha/actions/runs/1', 'github.com')).toBe(
+      'https://github.com/acme/alpha/actions/runs/1',
+    );
   });
 
   it('classifies provider failures from the structured cause, never the annotated label', () => {

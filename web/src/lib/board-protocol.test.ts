@@ -509,6 +509,10 @@ describe('board server-frame validator', () => {
       { ...row, run: { ...run, url: 'https://user:secret@github.com/actions/runs/42' } },
       { ...row, run: { ...run, url: 'https://github.com:8443/actions/runs/42' } },
       { ...row, link: 'https://user:secret@github.com/example/demo' },
+      // The round-1 creation stamp is required and discriminated: a
+      // missing or malformed runCreatedAt rejects the run (and the row).
+      { ...row, run: { ...run, runCreatedAt: undefined } },
+      { ...row, run: { ...run, runCreatedAt: 'not-a-date' } },
       { ...row, run: { ...run, status: '' } },
       { ...row, run: { ...run, workflow: '' } },
       { ...row, run: { ...run, branch: '' } },
