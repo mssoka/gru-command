@@ -384,13 +384,19 @@ function assertTarget(repoPath: string, rel: string, kind: 'directory' | 'file')
 }
 
 function ensureDirectory(repoPath: string, rel: string, report: ProvisionReport): void {
-  const path = join(repoPath, rel);
-  if (existsSync(path)) {
+  if (existsSync(join(repoPath, rel))) {
     report.kept.push(rel);
     return;
   }
-  mkdirSync(path, { recursive: true });
-  report.created.push(rel);
+  // One component at a time, so a rollback can remove every directory this
+  // run created (not just the leaf).
+  const parts = rel.split('/');
+  for (let index = 1; index <= parts.length; index += 1) {
+    const partial = parts.slice(0, index).join('/');
+    if (existsSync(join(repoPath, partial))) continue;
+    mkdirSync(join(repoPath, partial));
+    report.created.push(partial);
+  }
 }
 
 function ensureFile(repoPath: string, rel: string, content: string, report: ProvisionReport): void {
@@ -426,11 +432,45 @@ function assertRenderIgnored(repoPath: string): void {
 }
 
 /**
+ * Fresh lanes must hold their own `_bmad` (renders stay inside the
+ * worktree; the runtime refuses a linked `_bmad`). A project manifest that
+ * links it into every lane would break the first build of every job.
+ */
+function assertNoBmadLinkInWorktreeManifest(repoPath: string): void {
+  const rel = '.gru-command/worktree.toml';
+  assertNoSymlinkComponents(repoPath, rel);
+  const path = join(repoPath, rel);
+  if (!existsSync(path)) return;
+  const text = readFileSync(path, 'utf-8');
+  let manifest: Record<string, unknown>;
+  try {
+    manifest = parse(text) as Record<string, unknown>;
+  } catch (error) {
+    throw new BmadDeterministicSetupError(`worktree manifest is malformed: ${path}: ${String(error)}`);
+  }
+  const links = Array.isArray(manifest['link']) ? manifest['link'] as Array<Record<string, unknown>> : [];
+  for (const link of links) {
+    const at = typeof link['at'] === 'string' ? link['at'].replace(/^\.\//u, '').replace(/\/+$/u, '') : '';
+    if (at === '_bmad' || at.startsWith('_bmad/')) {
+      throw new BmadDeterministicSetupError(
+        `${path} links \`${at}\` into every fresh worktree; the GC-managed BMAD runtime needs each lane's own _bmad`,
+        'Remove that [[link]] entry (commit _bmad/custom/ to share settings instead), then re-run the wizard',
+      );
+    }
+  }
+}
+
+/**
  * Create the project-local state the GC-managed runtime uses. Idempotent:
  * an existing path is validated and kept byte-for-byte, never rewritten.
  */
-export function provisionBmadProject(repoPath: string, runtime: BundledBmadRuntime): ProvisionReport {
+export function provisionBmadProject(
+  repoPath: string,
+  runtime: BundledBmadRuntime,
+  env: NodeJS.ProcessEnv = process.env,
+): ProvisionReport {
   const report: ProvisionReport = { created: [], kept: [] };
+  assertNoBmadLinkInWorktreeManifest(repoPath);
   const { outputs } = projectSettings(repoPath, runtime);
   const targets: Array<[string, 'directory' | 'file', string?]> = [
     ['_bmad', 'directory'],
@@ -448,7 +488,7 @@ export function provisionBmadProject(repoPath: string, runtime: BundledBmadRunti
       if (kind === 'directory') ensureDirectory(repoPath, rel, report);
       else ensureFile(repoPath, rel, content!, report);
     }
-    renderCheck(repoPath, runtime);
+    renderCheck(repoPath, runtime, env);
   } catch (error) {
     // A refusal leaves the repo as it found it: undo this run's creations.
     for (const rel of [...report.created].reverse()) {
@@ -471,7 +511,7 @@ export function provisionBmadProject(repoPath: string, runtime: BundledBmadRunti
  * unchanged state (deterministic); a launcher that cannot run is tooling
  * (transient). The runtime is composed in a throwaway store.
  */
-function renderCheck(repoPath: string, runtime: BundledBmadRuntime): void {
+function renderCheck(repoPath: string, runtime: BundledBmadRuntime, env: NodeJS.ProcessEnv): void {
   const store = mkdtempSync(join(tmpdir(), 'gru-command-bmad-check-'));
   try {
     const materialized = materializeBmadRuntime(runtime, store);
@@ -480,7 +520,7 @@ function renderCheck(repoPath: string, runtime: BundledBmadRuntime): void {
       const result = spawnSync('/bin/sh', ['-c', launcher.command], {
         cwd: repoPath,
         encoding: 'utf-8',
-        env: { ...process.env, ...launcher.env },
+        env: { ...env, ...launcher.env },
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 120_000,
       });
@@ -492,6 +532,7 @@ function renderCheck(repoPath: string, runtime: BundledBmadRuntime): void {
           SETTINGS_REPAIR_HINT,
         );
       }
+      // Exit 2 is the renderer's host failure (permissions, disk): retryable.
       if (result.status !== 0 || !/^read and follow \/.+\/workflow\.md$/mu.test(result.stdout ?? '')) {
         throw new Error(
           `the bundled BMAD runtime did not run for ${skill} (${result.error?.message ?? `exit ${String(result.status)}`}): ` +
@@ -529,7 +570,7 @@ export function onboardBmadRepo(
     const repoPath = validateRepo(options.workspaceRoot, repoName, env);
     assertPrerequisites(tools, env, repoPath, options.prerequisiteCheck ?? commandAvailable);
     const runtime = (options.runtime ?? (() => loadBundledBmadRuntime(PACKAGE_ROOT)))();
-    const report = provisionBmadProject(repoPath, runtime);
+    const report = provisionBmadProject(repoPath, runtime, env);
     return {
       repo: repoName,
       action,

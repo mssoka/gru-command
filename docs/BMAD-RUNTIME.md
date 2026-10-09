@@ -150,13 +150,16 @@ Nothing downloads skill instructions during a job.
 ```sh
 mkdir -p /tmp/bmad-upgrade && cd /tmp/bmad-upgrade
 npm view bmad-method@<version> dist.integrity gitHead     # record both
-npm pack bmad-method@<version> && tar -xzf bmad-method-<version>.tgz
+npm pack bmad-method@<version>
 cd <gru-command checkout> && npm run build
-node dist/cli/bmad-runtime.js vendor --from /tmp/bmad-upgrade/package \
+node dist/cli/bmad-runtime.js vendor --tarball /tmp/bmad-upgrade/bmad-method-<version>.tgz \
   --version <version> --integrity <sha512-…> --git-head <sha> \
   [--customization-version <n>] .
 git diff -- resources/bmad-runtime
 ```
+
+`vendor` refuses a tarball whose sha512 differs from `--integrity`, so the
+recorded provenance is checked before any upstream byte is used.
 
 Then review the diff:
 
@@ -214,7 +217,10 @@ to `$BACKUP/plan.json` and prints what each later step will do:
 ```sh
 # bmad-retire:preview
 mkdir -p "$BACKUP" && python3 -I - "$REPO" "$BACKUP" "$GC" <<'PY'
-import csv, hashlib, json, os, re, subprocess, sys, tomllib
+import sys
+if sys.version_info < (3, 11):
+    sys.exit("STOP: these commands need python3 >= 3.11 (tomllib)")
+import csv, hashlib, json, os, re, subprocess, tomllib
 repo, backup, gc = (os.path.realpath(p) for p in sys.argv[1:4])
 def git(*args):
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
@@ -226,9 +232,13 @@ if os.path.commonpath([repo, backup]) == repo:
 cfg = os.path.join(repo, "_bmad", "_config")
 if not os.path.isfile(os.path.join(cfg, "manifest.yaml")):
     sys.exit("STOP: no repo-local BMAD install (_bmad/_config/manifest.yaml); nothing to retire")
-for rel in ("_bmad", "_bmad/custom", "_bmad/custom/config.toml", "_bmad/custom/config.user.toml"):
+for rel in ("_bmad", "_bmad/custom", "_bmad/custom/config.toml", "_bmad/custom/config.user.toml",
+            "_bmad/config.toml", "_bmad/config.user.toml", ".gru-command", ".gru-command/worktree.toml"):
     if os.path.islink(os.path.join(repo, rel)):
-        sys.exit(f"STOP: {rel} is a symlink; settings are re-homed only inside the repository")
+        sys.exit(f"STOP: {rel} is a symlink; these commands read and write only inside the repository")
+for name in ("files-manifest.csv", "skill-manifest.csv"):
+    if not os.path.isfile(os.path.join(cfg, name)):
+        sys.exit(f"STOP: _bmad/_config/{name} is missing; without the installer's own record nothing can be proven installer-owned")
 def sha(rel):
     with open(os.path.join(repo, rel), "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -333,11 +343,16 @@ def flat(data):
                 if not isinstance(v, (dict, list))})
     return out
 default_values = flat(defaults)
-transfer = {}
-for name, scope in (("config.toml", "team"), ("config.user.toml", "personal")):
+def legacy(name):
     path = os.path.join(repo, "_bmad", name)
-    values = flat(tomllib.load(open(path, "rb"))) if os.path.isfile(path) else {}
-    transfer[scope] = {k: v for k, v in values.items() if default_values.get(k) != v}
+    return flat(tomllib.load(open(path, "rb"))) if os.path.isfile(path) else {}
+# Layered like the installer: team answers over GC defaults, personal over both.
+legacy_team, legacy_personal = legacy("config.toml"), legacy("config.user.toml")
+team_effective = {**default_values, **legacy_team}
+transfer = {
+    "team": {k: v for k, v in legacy_team.items() if default_values.get(k) != v},
+    "personal": {k: v for k, v in legacy_personal.items() if team_effective.get(k) != v},
+}
 blocked = []
 for scope, name in (("team", "config.toml"), ("personal", "config.user.toml")):
     path = os.path.join(repo, "_bmad", "custom", name)
@@ -361,7 +376,9 @@ lanes = []
 for line in git("worktree", "list", "--porcelain").stdout.splitlines():
     if line.startswith("worktree ") and os.path.realpath(line[9:]) != repo:
         lanes.append(line[9:])
-plan = {"repo": repo, "framework": framework, "bindings": bindings, "unproven_bindings": unproven,
+proofs = {f: sha(f) for f in installer_files}
+proofs.update({f: sha(f) for b in bindings for f in files_under(b)})
+plan = {"repo": repo, "framework": framework, "bindings": bindings, "unproven_bindings": unproven, "proofs": proofs,
         "unrecognized": unrecognized, "leftovers": leftovers, "module_dirs": module_dirs,
         "gc_files": gc_files, "manifest_block": manifest_block,
         "exclude": exclude, "exclude_block": exclude_block, "git_source": source,
@@ -479,7 +496,7 @@ references, so a later worktree cannot reinstall the old framework:
 ```sh
 # bmad-retire:move
 python3 -I - "$REPO" "$BACKUP" <<'PY'
-import json, os, shutil, subprocess, sys
+import hashlib, json, os, shutil, subprocess, sys
 repo, backup = (os.path.realpath(p) for p in sys.argv[1:3])
 plan = json.load(open(os.path.join(backup, "plan.json"), encoding="utf-8"))
 if plan["repo"] != repo or not os.path.isdir(os.path.join(backup, "copy")):
@@ -495,6 +512,17 @@ def drop_block(path, start, end):
     if before and before[-1].strip() == "" and not after:
         before = before[:-1]
     return "".join(before + after)
+# Nothing moves unless every proven file is still exactly what the preview saw.
+changed = [rel for rel, digest in plan["proofs"].items()
+           if os.path.islink(os.path.join(repo, rel)) or not os.path.isfile(os.path.join(repo, rel))
+           or hashlib.sha256(open(os.path.join(repo, rel), "rb").read()).hexdigest() != digest]
+for b in plan["bindings"]:
+    for dirpath, dirnames, filenames in os.walk(os.path.join(repo, b)):
+        changed += [os.path.relpath(os.path.join(dirpath, n), repo) for n in filenames + dirnames
+                    if os.path.islink(os.path.join(dirpath, n))
+                    or (n in filenames and os.path.relpath(os.path.join(dirpath, n), repo) not in plan["proofs"])]
+if changed:
+    sys.exit("STOP: changed since the preview, re-run it: " + ", ".join(sorted(set(changed))))
 # Work out both edits before anything moves, so a surprise stops cleanly.
 manifest = os.path.join(repo, ".gru-command", "worktree.toml")
 manifest_rest = drop_block(manifest, "# BEGIN GRU COMMAND BMAD BOOTSTRAP", "# END GRU COMMAND BMAD BOOTSTRAP") \
@@ -528,13 +556,10 @@ print(f"moved aside into {moved}")
 PY
 ```
 
-**5. Verify.** This checks that every protected file is unchanged
-(re-homed settings files may only have grown). It also checks that a fresh
-worktree of `HEAD` renders with the bundled runtime and no repo-local
-install, and shows what to commit. The retired bootstrap block is already
-inert before you commit, because the `gru-command.bmad-source` setting it
-depends on was removed in step 4. Commit before dispatching new jobs so
-the cleaned manifest is what fresh lanes check out.
+**5. Verify this checkout.** This checks that every protected file is
+unchanged (re-homed settings files may only have grown). It then checks
+that the retired checkout renders with the bundled runtime and no
+repo-local install, and shows what to commit:
 
 ```sh
 # bmad-retire:verify
@@ -562,18 +587,27 @@ if failed:
 print(f"ok: {len(plan['protected'])} protected files unchanged")
 PY
 then
-  git -C "$REPO" worktree add --detach "$BACKUP/verify-worktree" HEAD >/dev/null &&
-    { node "$GC/dist/cli/bmad-runtime.js" check "$BACKUP/verify-worktree"; rc=$?;
-      git -C "$REPO" worktree remove --force "$BACKUP/verify-worktree"; test "$rc" -eq 0; } &&
-    git -C "$REPO" status --short
+  node "$GC/dist/cli/bmad-runtime.js" check "$REPO" && git -C "$REPO" status --short
 else
   false
 fi
 ```
 
-Commit the resulting changes to tracked files (for example the edited
-`.gru-command/worktree.toml` and the removed bootstrap files). When fresh
-worktrees should share team settings, commit `_bmad/custom/` too.
+**6. Commit, then prove a fresh worktree.** Commit the resulting changes to
+tracked files, for example the edited `.gru-command/worktree.toml` and the
+removed bootstrap files. When fresh worktrees should share team settings,
+commit `_bmad/custom/` too. Then check that a fresh worktree of the new
+`HEAD` (what the next GC lane checks out) renders with the bundled runtime:
+
+```sh
+# bmad-retire:fresh-worktree
+git -C "$REPO" worktree add --detach "$BACKUP/verify-worktree" HEAD >/dev/null &&
+  { node "$GC/dist/cli/bmad-runtime.js" check "$BACKUP/verify-worktree"; rc=$?;
+    git -C "$REPO" worktree remove --force "$BACKUP/verify-worktree"; test "$rc" -eq 0; }
+```
+
+Until you commit, the retired bootstrap block is already inert, because the
+`gru-command.bmad-source` setting it depends on was removed in step 4.
 
 **Undo** (restores everything the steps moved or edited):
 

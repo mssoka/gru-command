@@ -278,7 +278,14 @@ function retirementFlow(shell: string): void {
   const verified = run('verify');
   expect(verified.status, verified.out).toBe(0);
   expect(verified.out).toMatch(/ok: \d+ protected files unchanged/u);
-  expect(verified.out).toMatch(/^ok bmad-build: read and follow \/\S+\/verify-worktree\/_bmad\/render\/bmad-build\/\S+\/workflow\.md$/mu);
+  expect(verified.out).toContain(`ok bmad-build: read and follow ${repo}/_bmad/render/bmad-build/`);
+  // Step 6: commit the tracked changes, then a fresh worktree of HEAD renders.
+  git(repo, ['add', '-u']);
+  git(repo, ['-c', 'user.email=fixture@example.invalid', '-c', 'user.name=fixture', 'commit', '-qm', 'retire repo-local BMAD']);
+  expect(git(repo, ['show', 'HEAD:.gru-command/worktree.toml'])).toBe(USER_MANIFEST.trimEnd());
+  const fresh = run('fresh-worktree');
+  expect(fresh.status, fresh.out).toBe(0);
+  expect(fresh.out).toMatch(/^ok bmad-build: read and follow \/.+\/verify-worktree\/_bmad\/render\/bmad-build\/.+\/workflow\.md$/mu);
   expect(git(repo, ['worktree', 'list', '--porcelain'])).not.toContain('verify-worktree');
   // The re-homed personal setting now reaches the rendered workflow.
   const check = spawnSync('node', [join(repoRoot, 'dist', 'cli', 'bmad-runtime.js'), 'check', repo, '--store', join(home, 'store')], { env, encoding: 'utf-8' });
@@ -344,6 +351,23 @@ describe('retiring a repo-local BMAD install with the documented commands', () =
     expect(unblocked.out).not.toContain('STOP');
     expect(run('backup', base(mergeWs, merge, join(mergeWs, 'backup-2'))).status).toBe(0);
     expect(readFileSync(join(merge, '_bmad', 'custom', 'config.toml'), 'utf-8')).toBe('[core]\nuser_name = "Team"\nproject_name = "legacy-app"\n');
+
+    // Answers transfer layered like the installer read them: a team value a
+    // personal answer set back to the default keeps that personal override.
+    const layeredWs = tempDir('gru-command-retire-layered-');
+    const layered = legacyRepo(layeredWs);
+    writeFileSync(join(layered, '_bmad', 'config.toml'), '[core]\ndocument_output_language = "Deutsch"\n');
+    writeFileSync(join(layered, '_bmad', 'config.user.toml'), '[core]\ndocument_output_language = "English"\n');
+    const layeredEnv = base(layeredWs, layered, join(layeredWs, 'backup'));
+    for (const step of ['preview', 'backup']) expect(run(step, layeredEnv).status, step).toBe(0);
+    expect(readFileSync(join(layered, '_bmad', 'custom', 'config.toml'), 'utf-8')).toContain('[core]\ndocument_output_language = "Deutsch"\n');
+    expect(readFileSync(join(layered, '_bmad', 'custom', 'config.user.toml'), 'utf-8')).toContain('[core]\ndocument_output_language = "English"\n');
+    // A proven binding edited after the preview stops the move before anything moves.
+    writeFileSync(join(layered, '.agents', 'skills', 'bmad-build', 'SKILL.md'), '---\nname: bmad-build\n---\nedited after preview\n');
+    const stale = run('move', layeredEnv);
+    expect(stale.status).not.toBe(0);
+    expect(stale.out).toContain('STOP: changed since the preview, re-run it: .agents/skills/bmad-build/SKILL.md');
+    expect(existsSync(join(layered, '_bmad', '_config', 'manifest.yaml'))).toBe(true);
   });
 
   it('the preview refuses a repository without a repo-local install and a backup inside the repository', () => {
@@ -373,5 +397,19 @@ describe('retiring a repo-local BMAD install with the documented commands', () =
     });
     expect(linkedPreview.status).not.toBe(0);
     expect(linkedPreview.stderr).toContain('STOP: _bmad/custom is a symlink');
+    const previewOf = (repoPath: string, home: string) => spawnSync('/bin/sh', ['-c', docBlock('preview')], {
+      env: { PATH: process.env.PATH ?? '', HOME: home, REPO: repoPath, GC: repoRoot, BACKUP: join(home, 'backup') },
+      encoding: 'utf-8',
+    });
+    const linkedManifestWs = tempDir('gru-command-retire-linked-manifest-');
+    const linkedManifest = legacyRepo(linkedManifestWs);
+    rmSync(join(linkedManifest, '.gru-command', 'worktree.toml'));
+    writeFileSync(join(linkedManifestWs, 'elsewhere.toml'), '');
+    symlinkSync(join(linkedManifestWs, 'elsewhere.toml'), join(linkedManifest, '.gru-command', 'worktree.toml'));
+    expect(previewOf(linkedManifest, linkedManifestWs).stderr).toContain('STOP: .gru-command/worktree.toml is a symlink');
+    const unrecordedWs = tempDir('gru-command-retire-unrecorded-');
+    const unrecorded = legacyRepo(unrecordedWs);
+    rmSync(join(unrecorded, '_bmad', '_config', 'files-manifest.csv'));
+    expect(previewOf(unrecorded, unrecordedWs).stderr).toContain('STOP: _bmad/_config/files-manifest.csv is missing');
   });
 });

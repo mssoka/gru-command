@@ -94,6 +94,8 @@ def _custom_layer(project_root: Path, name: str) -> dict[str, Any]:
     """Load one project layer from _bmad/custom/, never through a link."""
     custom_dir = project_root / "_bmad" / "custom"
     _no_symlink_below(project_root, custom_dir / name)
+    if custom_dir.exists() and not custom_dir.is_dir():
+        raise ProjectStateError(f"{custom_dir} exists but is not a directory")
     return config_utils.load_toml(custom_dir / name)
 
 
@@ -184,10 +186,17 @@ def _assert_render_ignored(project_root: Path, skill_name: str) -> None:
         probe = subprocess.run(
             ["git", "-C", str(project_root), "check-ignore", "-q", "--no-index", f"_bmad/render/{skill_name}/"],
             capture_output=True,
+            text=True,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        return  # no usable git here: nothing can be committed by mistake
+    except FileNotFoundError:
+        return  # no git on this host: nothing can be committed by mistake
+    except (OSError, subprocess.SubprocessError) as error:
+        raise OSError(f"cannot verify the render ignore rule: {error}") from error
+    if probe.returncode not in (0, 1):
+        if "not a git repository" in probe.stderr:
+            return  # not under version control: nothing to keep out of git
+        raise OSError(f"cannot verify the render ignore rule: {probe.stderr.strip()}")
     if probe.returncode == 1:
         raise ProjectStateError(
             f"{project_root / '_bmad' / 'render' / '.gitignore'} does not ignore rendered workflow "
@@ -203,13 +212,21 @@ def ensure_output_folders(project_root: Path, central: dict[str, Any]) -> None:
             value = value.get(part) if isinstance(value, dict) else None
         if not isinstance(value, str):
             continue
-        target = Path(value.replace("{project-root}", str(project_root)))
-        if not target.is_absolute():
+        raw = value.replace("{project-root}", str(project_root))
+        if not Path(raw).is_absolute():
             continue
-        target = Path(os.path.normpath(target))
-        if target == project_root or project_root not in target.parents:
+        # realpath decides containment: an alias of the project path (say
+        # /var vs /private/var) is inside; a link out of the project is not.
+        real = Path(os.path.realpath(raw))
+        if real == project_root:
             continue
-        _no_symlink_below(project_root, target)
+        if project_root not in real.parents:
+            raise ProjectStateError(
+                f"`{'.'.join(path)}` = {value!r} resolves outside this project ({real}); "
+                "generated work stays inside the project it belongs to"
+            )
+        target = Path(os.path.normpath(raw))
+        _no_symlink_below(project_root, target if project_root in target.parents else real)
         target.mkdir(parents=True, exist_ok=True)
 
 
@@ -236,11 +253,15 @@ def main() -> int:
         render_skill.load_central_config = load_central_config
         render_skill.load_customization = load_customization
         entry = render_skill.render(project_root, skill_dir)
+    except OSError as error:
+        # Exit 2: the host failed (permissions, disk, tooling), not the
+        # project's settings; retrying after fixing the host can succeed.
+        sys.stdout.write(f"HALT: {error}\n")
+        return 2
     except (
         config_utils.ConfigError,
         render_skill.RenderError,
         ProjectStateError,
-        OSError,
         UnicodeError,
         ValueError,
     ) as error:

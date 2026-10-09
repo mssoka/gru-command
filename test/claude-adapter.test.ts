@@ -1224,6 +1224,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     };
     const minion = await fx.runtime.spawn('minion', { managedSkills });
     await minion.prompt('build this');
+    await minion.prompt('keep building');
     await minion.dispose();
     const review = await fx.runtime.spawn('perkins', {
       managedSkills,
@@ -1231,8 +1232,10 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     });
     await review.prompt('frozen diff only');
     await review.dispose();
-    const [build, isolated] = doubleInvocations(fx);
-    expect(build!.argv[build!.argv.indexOf('--plugin-dir') + 1]).toBe(managedSkills.root);
+    const [build, resumed, isolated] = doubleInvocations(fx);
+    // Every turn re-launches the CLI; the resumed turn keeps the plugin too.
+    expect(resumed!.argv).toContain('--resume');
+    for (const turn of [build!, resumed!]) expect(turn.argv[turn.argv.indexOf('--plugin-dir') + 1]).toBe(managedSkills.root);
     const prompt = build!.argv[build!.argv.indexOf('--append-system-prompt') + 1]!;
     expect(prompt).toContain('worker agent');
     expect(prompt).toContain('## Gru Command BMAD runtime');

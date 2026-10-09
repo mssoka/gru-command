@@ -305,6 +305,12 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
         /cannot render bmad-build for this repo: .*must not be empty/u, /settings file/u],
       ['invalid-review-layer', { '_bmad/custom/bmad-build.toml': '[[workflow.review_layers]]\nname = "no id"\ninstruction = "x"\n' },
         /cannot render bmad-build for this repo: .*review_layers/u, /settings file/u],
+      // Generated work stays inside its project; nested folders this run
+      // created before the refusal are all rolled back.
+      ['output-outside', { '_bmad/custom/config.toml': '[core]\noutput_folder = "{project-root}/deep/nested/out"\n[modules.bmm]\nimplementation_artifacts = "{project-root}/../other-repo/specs"\n' },
+        /cannot render bmad-build for this repo: .*implementation_artifacts.* resolves outside this project/u, /settings file/u],
+      ['bmad-linked-into-lanes', { '.gru-command/worktree.toml': '[[link]]\nat = "_bmad"\nto = "_bmad"\n' },
+        /links `_bmad` into every fresh worktree/u, /Remove that \[\[link\]\] entry/u],
     ];
     for (const [name, files, message, hint] of cases) {
       const fixture = fixtureRepo(name);

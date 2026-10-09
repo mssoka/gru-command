@@ -7,9 +7,10 @@
  *       this; a failure fails the build).
  *   manifest [package-root] [--customization-version <n>]
  *       Regenerate runtime.json after a deliberate change to the GC layer.
- *   vendor --from <extracted package dir> --version <v> --integrity <sha512-…>
+ *   vendor --tarball <bmad-method-<v>.tgz> --version <v> --integrity <sha512-…>
  *          --git-head <sha> [--customization-version <n>] [package-root]
- *       Replace the bundled upstream files with another bmad-method release.
+ *       Replace the bundled upstream files with another bmad-method release,
+ *       after checking the tarball against its registry integrity.
  *   check <project-root> [--store <dir>] [--package-root <dir>]
  *       Materialize the shipped runtime and run each bundled skill's own
  *       launcher command against a project checkout (a fresh worktree is the
@@ -27,12 +28,12 @@ import {
   PACKAGE_ROOT,
   skillLauncherCommand,
 } from '../bmad/runtime.js';
-import { readBmadRuntimeManifest, vendorBmadUpstream, writeBmadRuntimeManifest } from '../bmad/vendor.js';
+import { readBmadRuntimeManifest, vendorBmadTarball, writeBmadRuntimeManifest } from '../bmad/vendor.js';
 
 const USAGE = [
   'usage: node dist/cli/bmad-runtime.js verify [package-root]',
   '       node dist/cli/bmad-runtime.js manifest [package-root] [--customization-version <n>]',
-  '       node dist/cli/bmad-runtime.js vendor --from <dir> --version <v> --integrity <sha512-…> --git-head <sha>',
+  '       node dist/cli/bmad-runtime.js vendor --tarball <file.tgz> --version <v> --integrity <sha512-…> --git-head <sha>',
   '                                            [--customization-version <n>] [package-root]',
   '       node dist/cli/bmad-runtime.js check <project-root> [--store <dir>] [--package-root <dir>]',
 ].join('\n');
@@ -97,7 +98,7 @@ export function runBmadRuntimeCli(args: readonly string[], write: (line: string)
     return checkBmadRuntime(resolve(projectRoot), resolve(store), resolve(packageRoot), write) ? 0 : 1;
   }
   if (command === 'manifest' || command === 'vendor') {
-    const from = command === 'vendor' ? option(argv, '--from') : undefined;
+    const tarball = command === 'vendor' ? option(argv, '--tarball') : undefined;
     const version = command === 'vendor' ? option(argv, '--version') : undefined;
     const integrity = command === 'vendor' ? option(argv, '--integrity') : undefined;
     const gitHead = command === 'vendor' ? option(argv, '--git-head') : undefined;
@@ -113,10 +114,10 @@ export function runBmadRuntimeCli(args: readonly string[], write: (line: string)
       const manifest = writeBmadRuntimeManifest(bundleRoot, upstreamIdentity, customization);
       write(`wrote ${join(bundleRoot, 'runtime.json')} for ${manifest.id}`);
     } else {
-      if (from === undefined || version === undefined || integrity === undefined || gitHead === undefined) {
-        throw new Error(`vendor requires --from, --version, --integrity and --git-head\n${USAGE}`);
+      if (tarball === undefined || version === undefined || integrity === undefined || gitHead === undefined) {
+        throw new Error(`vendor requires --tarball, --version, --integrity and --git-head\n${USAGE}`);
       }
-      const manifest = vendorBmadUpstream(packageRoot, resolve(from), {
+      const manifest = vendorBmadTarball(packageRoot, resolve(tarball), {
         ...upstreamIdentity,
         version,
         integrity,

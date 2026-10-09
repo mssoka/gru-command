@@ -546,6 +546,11 @@ export function bindBmadRuntime(cwd: string, options: BmadRuntimeBinderOptions):
 /** The runtime a lane's existing binding record names — never another one. */
 function boundRuntime(cwd: string, bindingFile: string, options: BmadRuntimeBinderOptions): BmadRuntimeBinding {
   const record = parseBindingRecord(readFileSync(bindingFile, 'utf-8'), bindingFile);
+  if (dirname(record.runtime_dir) !== options.storeRoot) {
+    throw new BmadRuntimeError(
+      `BMAD runtime binding ${bindingFile} names ${record.runtime_dir}, outside the runtime store ${options.storeRoot}`,
+    );
+  }
   let bound: MaterializedBmadRuntime;
   try {
     bound = inspectMaterializedBmadRuntime(record.runtime_dir);
@@ -563,9 +568,10 @@ function boundRuntime(cwd: string, bindingFile: string, options: BmadRuntimeBind
     }
     bound = materializeBmadRuntime(current, options.storeRoot);
   }
-  if (bound.contentSha256 !== record.content_sha256) {
+  if (bound.contentSha256 !== record.content_sha256 || bound.id !== record.runtime_id) {
     throw new BmadRuntimeError(
-      `job lane ${cwd} is bound to BMAD runtime content ${record.content_sha256}, but ${record.runtime_dir} holds ${bound.contentSha256}`,
+      `job lane ${cwd} is bound to BMAD runtime ${record.runtime_id} (content ${record.content_sha256}), ` +
+        `but ${record.runtime_dir} holds ${bound.id} (content ${bound.contentSha256})`,
     );
   }
   return { ...bound, bindingFile };

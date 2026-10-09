@@ -30,7 +30,7 @@ import {
   skillLauncherCommand,
   type MaterializedBmadRuntime,
 } from '../src/bmad/runtime.js';
-import { readBmadRuntimeManifest, writeBmadRuntimeManifest } from '../src/bmad/vendor.js';
+import { readBmadRuntimeManifest, tarballIntegrity, writeBmadRuntimeManifest } from '../src/bmad/vendor.js';
 import { runBmadRuntimeCli } from '../src/cli/bmad-runtime.js';
 import { loadConfig, type Role, type RuntimeId } from '../src/config.js';
 import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
@@ -401,6 +401,20 @@ describe('rendering for a project with no BMAD installation', () => {
         symlinkSync(elsewhere, join(repo, '_bmad', 'render', 'bmad-build'));
       }],
     ];
+    // Generated work never leaves the project; settings dirs must be dirs.
+    const escaping = cleanRepo('escaping-output');
+    mkdirSync(join(escaping, '_bmad', 'custom'), { recursive: true });
+    writeFileSync(join(escaping, '_bmad', 'custom', 'config.toml'), '[modules.bmm]\nplanning_artifacts = "{project-root}/../neighbour/plans"\n');
+    const escaped = render(sharedRuntime, escaping);
+    expect(escaped.status).toBe(1);
+    expect(escaped.stdout).toContain('`modules.bmm.planning_artifacts`');
+    expect(escaped.stdout).toContain('resolves outside this project');
+    expect(existsSync(join(dirname(escaping), 'neighbour'))).toBe(false);
+    const fileCustom = cleanRepo('file-custom');
+    mkdirSync(join(fileCustom, '_bmad'), { recursive: true });
+    writeFileSync(join(fileCustom, '_bmad', 'custom'), 'not a directory\n');
+    expect(render(sharedRuntime, fileCustom).stdout).toContain('custom exists but is not a directory');
+
     // A kept render ignore file that lets snapshots through is refused.
     const leaky = cleanRepo('leaky-ignore');
     mkdirSync(join(leaky, '_bmad', 'render'), { recursive: true });
@@ -535,6 +549,23 @@ describe('job binding', () => {
     expect(JSON.parse(readFileSync(serviceBinding, 'utf-8')).runtime_dir).toBe(seen[0]!.root);
   });
 
+  it('a binding record naming another runtime or a dir outside the store is refused', () => {
+    const repo = cleanRepo('tampered-record');
+    const lane = join(tempDir('gru-command-bmad-record-lane-'), 'lane');
+    git(repo, ['worktree', 'add', '-q', '-b', 'gru/record', lane]);
+    const store = tempDir('gru-command-bmad-record-store-');
+    const bind = createBmadRuntimeBinder(store, repoRoot);
+    const bound = bind(lane);
+    const bindingFile = join(git(lane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command', 'bmad-runtime.json');
+    const record = JSON.parse(readFileSync(bindingFile, 'utf-8')) as Record<string, unknown>;
+    writeFileSync(bindingFile, JSON.stringify({ ...record, runtime_id: 'bmad-method@9.9.9+gru-command-bmad.7' }));
+    expect(() => bind(lane)).toThrow(/is bound to BMAD runtime bmad-method@9\.9\.9\+gru-command-bmad\.7 .* but .* holds bmad-method@6\.12\.0/u);
+    const elsewhere = join(tempDir('gru-command-bmad-elsewhere-store-'), String(record['runtime_dir']).split('/').at(-1)!);
+    cpSync(bound.root, elsewhere, { recursive: true });
+    writeFileSync(bindingFile, JSON.stringify({ ...record, runtime_dir: elsewhere }));
+    expect(() => bind(lane)).toThrow(/outside the runtime store/u);
+  });
+
   it('a modified materialized runtime is refused, never silently repaired', () => {
     const store = tempDir('gru-command-bmad-tamper-store-');
     const runtime = materializeBmadRuntime(shipped, store);
@@ -628,11 +659,18 @@ describe('maintenance CLI', () => {
     const lines: string[] = [];
     expect(runBmadRuntimeCli(['manifest', root], (line) => lines.push(line))).toBe(0);
     expect(readFileSync(join(bundle, 'runtime.json'), 'utf-8')).toBe(original);
-    // A fake "upstream package" of the wrong version is refused before any write.
-    const fakePackage = tempDir('gru-command-bmad-fake-upstream-');
-    writeFileSync(join(fakePackage, 'package.json'), JSON.stringify({ name: 'bmad-method', version: '6.11.0' }));
+    // A tarball that does not match the recorded integrity is refused before
+    // any byte is used; a matching one of the wrong version is refused too.
+    const fakeRoot = tempDir('gru-command-bmad-fake-upstream-');
+    mkdirSync(join(fakeRoot, 'package'));
+    writeFileSync(join(fakeRoot, 'package', 'package.json'), JSON.stringify({ name: 'bmad-method', version: '6.11.0' }));
+    const tarball = join(fakeRoot, 'bmad-method-6.11.0.tgz');
+    execFileSync('tar', ['-czf', tarball, '-C', fakeRoot, 'package']);
     expect(() => runBmadRuntimeCli([
-      'vendor', '--from', fakePackage, '--version', '6.13.0', '--integrity', 'sha512-x', '--git-head', 'abc', root,
+      'vendor', '--tarball', tarball, '--version', '6.13.0', '--integrity', 'sha512-x', '--git-head', 'abc', root,
+    ], () => {})).toThrow(/has integrity sha512-.*, not the recorded sha512-x/u);
+    expect(() => runBmadRuntimeCli([
+      'vendor', '--tarball', tarball, '--version', '6.13.0', '--integrity', tarballIntegrity(tarball), '--git-head', 'abc', root,
     ], () => {})).toThrow(/is bmad-method@6\.11\.0, not bmad-method@6\.13\.0/u);
     expect(readFileSync(join(bundle, 'runtime.json'), 'utf-8')).toBe(original);
     expect(loadBundledBmadRuntime(root).contentSha256).toBe(shipped.contentSha256);

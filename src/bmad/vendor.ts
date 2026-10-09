@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   BMAD_RUNTIME_MANIFEST,
@@ -116,10 +118,41 @@ export function readBmadRuntimeManifest(bundleRoot: string): BmadRuntimeManifest
   return parseBmadRuntimeManifest(readFileSync(path, 'utf-8'), path);
 }
 
+/** npm's integrity string for a tarball: `sha512-<base64>`. */
+export function tarballIntegrity(tarball: string): string {
+  return `sha512-${createHash('sha512').update(readFileSync(tarball)).digest('base64')}`;
+}
+
+/**
+ * Vendor from the registry tarball itself (`npm pack bmad-method@<version>`):
+ * its sha512 must equal the recorded integrity (`npm view … dist.integrity`)
+ * before any byte is used, so runtime.json's provenance is checked, not
+ * merely declared.
+ */
+export function vendorBmadTarball(
+  packageRoot: string,
+  tarball: string,
+  upstream: UpstreamIdentity,
+  customization: CustomizationIdentity,
+): BmadRuntimeManifest {
+  const actual = tarballIntegrity(tarball);
+  if (actual !== upstream.integrity) {
+    throw new BmadRuntimeError(`${tarball} has integrity ${actual}, not the recorded ${upstream.integrity}`);
+  }
+  const extract = mkdtempSync(join(tmpdir(), 'gru-command-bmad-vendor-'));
+  try {
+    const untar = spawnSync('tar', ['-xzf', tarball, '-C', extract], { encoding: 'utf-8' });
+    if (untar.status !== 0) throw new BmadRuntimeError(`cannot extract ${tarball}: ${untar.stderr || untar.error?.message}`);
+    return vendorBmadUpstream(packageRoot, join(extract, 'package'), upstream, customization);
+  } finally {
+    rmSync(extract, { recursive: true, force: true });
+  }
+}
+
 /**
  * Replace `upstream/` with the declared file set from an extracted upstream
- * package (`npm pack bmad-method@<version>` → `package/`), then regenerate
- * the manifest with the new upstream identity.
+ * package, then regenerate the manifest with the new upstream identity.
+ * Use vendorBmadTarball: it verifies the archive first.
  */
 export function vendorBmadUpstream(
   packageRoot: string,
