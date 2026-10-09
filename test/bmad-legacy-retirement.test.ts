@@ -332,6 +332,12 @@ describe('retiring a repo-local BMAD install with the documented commands', () =
     const absentEnv = base(absentWs, absent, join(absentWs, 'backup'));
     for (const step of ['preview', 'backup', 'move']) expect(run(step, absentEnv).status, step).toBe(0);
     expect(existsSync(join(absent, '_bmad', 'custom', 'config.toml'))).toBe(true);
+    // Undo never drops settings added after the backup.
+    writeFileSync(join(absent, '_bmad', 'custom', 'bmad-build.toml'), '# added after retirement\n');
+    const refusedUndo = run('restore', absentEnv);
+    expect(refusedUndo.status).not.toBe(0);
+    expect(refusedUndo.out).toContain('STOP: added after the backup, move them out of _bmad/custom first: _bmad/custom/bmad-build.toml');
+    rmSync(join(absent, '_bmad', 'custom', 'bmad-build.toml'));
     expect(run('restore', absentEnv).status).toBe(0);
     expect(existsSync(join(absent, '_bmad', 'custom'))).toBe(false);
     expect(tree(absent)).toEqual(original);
@@ -407,6 +413,13 @@ describe('retiring a repo-local BMAD install with the documented commands', () =
     writeFileSync(join(linkedManifestWs, 'elsewhere.toml'), '');
     symlinkSync(join(linkedManifestWs, 'elsewhere.toml'), join(linkedManifest, '.gru-command', 'worktree.toml'));
     expect(previewOf(linkedManifest, linkedManifestWs).stderr).toContain('STOP: .gru-command/worktree.toml is a symlink');
+    const linkedRecordWs = tempDir('gru-command-retire-linked-record-');
+    const linkedRecord = legacyRepo(linkedRecordWs);
+    const recordPath = join(linkedRecord, '_bmad', '_config', 'files-manifest.csv');
+    writeFileSync(join(linkedRecordWs, 'files-manifest.csv'), readFileSync(recordPath));
+    rmSync(recordPath);
+    symlinkSync(join(linkedRecordWs, 'files-manifest.csv'), recordPath);
+    expect(previewOf(linkedRecord, linkedRecordWs).stderr).toContain('STOP: _bmad/_config/files-manifest.csv is a symlink');
     const unrecordedWs = tempDir('gru-command-retire-unrecorded-');
     const unrecorded = legacyRepo(unrecordedWs);
     rmSync(join(unrecorded, '_bmad', '_config', 'files-manifest.csv'));

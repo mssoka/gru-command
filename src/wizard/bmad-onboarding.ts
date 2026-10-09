@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { isAbsolute, join, relative } from 'node:path';
+import { isAbsolute, join, posix, relative } from 'node:path';
 import { parse } from 'smol-toml';
 import type { RuntimeId } from '../config.js';
 import {
@@ -352,8 +352,9 @@ function projectSettings(repoPath: string, runtime: BundledBmadRuntime): Project
   for (const path of OUTPUT_SETTINGS) {
     const value = effective.get(path.join('.'));
     if (typeof value !== 'string') continue;
-    const resolved = value.split('{project-root}').join(repoPath);
-    if (!isAbsolute(resolved) || !insideOrEqual(repoPath, resolved) || resolved === repoPath) continue;
+    const substituted = value.split('{project-root}').join(repoPath);
+    const resolved = isAbsolute(substituted) ? substituted : join(repoPath, substituted);
+    if (!insideOrEqual(repoPath, resolved) || resolved === repoPath) continue;
     outputs.push(relative(repoPath, resolved).split('\\').join('/'));
   }
   return { outputs };
@@ -450,7 +451,7 @@ function assertNoBmadLinkInWorktreeManifest(repoPath: string): void {
   }
   const links = Array.isArray(manifest['link']) ? manifest['link'] as Array<Record<string, unknown>> : [];
   for (const link of links) {
-    const at = typeof link['at'] === 'string' ? link['at'].replace(/^\.\//u, '').replace(/\/+$/u, '') : '';
+    const at = typeof link['at'] === 'string' ? posix.normalize(link['at']).replace(/\/+$/u, '') : '';
     if (at === '_bmad' || at.startsWith('_bmad/')) {
       throw new BmadDeterministicSetupError(
         `${path} links \`${at}\` into every fresh worktree; the GC-managed BMAD runtime needs each lane's own _bmad`,
@@ -481,7 +482,7 @@ export function provisionBmadProject(
     ...outputs.map((rel): [string, 'directory'] => [rel, 'directory']),
   ];
   for (const [rel, kind] of targets) assertTarget(repoPath, rel, kind);
-  for (const skill of runtime.manifest.skills) assertNoSymlinkComponents(repoPath, `_bmad/render/${skill}`);
+  for (const skill of runtime.manifest.skills) assertTarget(repoPath, `_bmad/render/${skill}`, 'directory');
   assertRenderIgnored(repoPath);
   try {
     for (const [rel, kind, content] of targets) {
@@ -494,7 +495,9 @@ export function provisionBmadProject(
     for (const rel of [...report.created].reverse()) {
       const path = join(repoPath, rel);
       try {
-        if (lstatSync(path).isDirectory()) rmdirSync(path);
+        // A render directory this run created holds only this run's derived output.
+        if (rel === '_bmad/render') rmSync(path, { recursive: true, force: true });
+        else if (lstatSync(path).isDirectory()) rmdirSync(path);
         else rmSync(path, { force: true });
       } catch {
         // A directory the render check filled stays; it is derived output.

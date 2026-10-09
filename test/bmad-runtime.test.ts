@@ -410,6 +410,31 @@ describe('rendering for a project with no BMAD installation', () => {
     expect(escaped.stdout).toContain('`modules.bmm.planning_artifacts`');
     expect(escaped.stdout).toContain('resolves outside this project');
     expect(existsSync(join(dirname(escaping), 'neighbour'))).toBe(false);
+    const relative = cleanRepo('relative-escape');
+    mkdirSync(join(relative, '_bmad', 'custom'), { recursive: true });
+    writeFileSync(join(relative, '_bmad', 'custom', 'config.toml'), '[modules.bmm]\nimplementation_artifacts = "../neighbour-relative"\n');
+    const relativeEscape = render(sharedRuntime, relative);
+    expect(relativeEscape.status).toBe(1);
+    expect(relativeEscape.stdout).toContain('resolves outside this project');
+    const fileSkill = cleanRepo('file-render-skill');
+    mkdirSync(join(fileSkill, '_bmad', 'render'), { recursive: true });
+    writeFileSync(join(fileSkill, '_bmad', 'render', '.gitignore'), '*\n');
+    writeFileSync(join(fileSkill, '_bmad', 'render', 'bmad-build'), 'not a directory\n');
+    const fileSkillRender = render(sharedRuntime, fileSkill);
+    expect(fileSkillRender.status).toBe(1);
+    expect(fileSkillRender.stdout).toContain('bmad-build exists but is not a directory');
+    // A settings file the host cannot READ is a host failure (exit 2, retryable).
+    const unreadable = cleanRepo('unreadable-settings');
+    mkdirSync(join(unreadable, '_bmad', 'custom'), { recursive: true });
+    writeFileSync(join(unreadable, '_bmad', 'custom', 'config.toml'), '[core]\n');
+    chmodSync(join(unreadable, '_bmad', 'custom', 'config.toml'), 0o000);
+    try {
+      const denied = render(sharedRuntime, unreadable);
+      expect(denied.status, denied.stdout).toBe(2);
+      expect(denied.stdout).toContain('failed to read');
+    } finally {
+      chmodSync(join(unreadable, '_bmad', 'custom', 'config.toml'), 0o644);
+    }
     const fileCustom = cleanRepo('file-custom');
     mkdirSync(join(fileCustom, '_bmad'), { recursive: true });
     writeFileSync(join(fileCustom, '_bmad', 'custom'), 'not a directory\n');
@@ -659,6 +684,13 @@ describe('maintenance CLI', () => {
     const lines: string[] = [];
     expect(runBmadRuntimeCli(['manifest', root], (line) => lines.push(line))).toBe(0);
     expect(readFileSync(join(bundle, 'runtime.json'), 'utf-8')).toBe(original);
+    // `manifest` never re-blesses edited upstream bytes.
+    const upstreamFile = join(bundle, 'upstream', 'src', 'bmm-skills', 'ship', 'bmad-build', 'step-04-review.md');
+    const pristine = readFileSync(upstreamFile);
+    appendFileSync(upstreamFile, 'find at least 10 issues\n');
+    expect(() => runBmadRuntimeCli(['manifest', root], () => {})).toThrow(/upstream file\(s\) differ from the vendored bytes: src\/bmm-skills\/ship\/bmad-build\/step-04-review\.md/u);
+    expect(readFileSync(join(bundle, 'runtime.json'), 'utf-8')).toBe(original);
+    writeFileSync(upstreamFile, pristine);
     // A tarball that does not match the recorded integrity is refused before
     // any byte is used; a matching one of the wrong version is refused too.
     const fakeRoot = tempDir('gru-command-bmad-fake-upstream-');

@@ -39,7 +39,7 @@
       "NOTICE.md": "9a62c1f56114755001237cdfa3261ade7c40c4345f1fcf5d1edfc0e19026ad39",
       "config/defaults.toml": "a6cf2885e2904542330bb42d6df6d86836b0a7d1266e02c4f6b6ff44f84e8601",
       "customize/bmad-build.toml": "6b17debef882a3768dafa71eeab7d2cc81c4945af250186e9128e3e37e6d94f3",
-      "scripts/gc_render.py": "93f32a7e24a2d8009be952abb4e2cf4ee0926df1ccfe80e6126c8b0e6b587f10",
+      "scripts/gc_render.py": "0042da949ff70110ce8460906df5f9e75def1f6538c6be07ef169dd958f25434",
       "skills/bmad-build/SKILL.md": "220aef7cf3edd4daa3fa1b51f3217811227307cc1dcf392e420f9c45367a441c"
     }
   },

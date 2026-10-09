@@ -259,6 +259,10 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
       }, /_bmad\/render$/u],
       ['dir-ignore', (repo) => mkdirSync(join(repo, '_bmad', 'custom', '.gitignore'), { recursive: true }), /exists but is not a file/u],
       ['file-output-parent', (repo) => writeFileSync(join(repo, '_bmad-output'), 'not a directory\n'), /_bmad-output$/u],
+      ['file-render-skill', (repo) => {
+        mkdirSync(join(repo, '_bmad', 'render'), { recursive: true });
+        writeFileSync(join(repo, '_bmad', 'render', 'bmad-build'), 'not a directory\n');
+      }, /_bmad\/render\/bmad-build$/u],
       ['linked-settings-file', (repo) => {
         mkdirSync(join(repo, '_bmad', 'custom'), { recursive: true });
         writeFileSync(join(outside, 'config.toml'), '[core]\noutput_folder = "{project-root}/x"\n');
@@ -310,6 +314,8 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
       ['output-outside', { '_bmad/custom/config.toml': '[core]\noutput_folder = "{project-root}/deep/nested/out"\n[modules.bmm]\nimplementation_artifacts = "{project-root}/../other-repo/specs"\n' },
         /cannot render bmad-build for this repo: .*implementation_artifacts.* resolves outside this project/u, /settings file/u],
       ['bmad-linked-into-lanes', { '.gru-command/worktree.toml': '[[link]]\nat = "_bmad"\nto = "_bmad"\n' },
+        /links `_bmad` into every fresh worktree/u, /Remove that \[\[link\]\] entry/u],
+      ['bmad-linked-spelled-oddly', { '.gru-command/worktree.toml': '[[link]]\nat = "././_bmad/"\nto = "_bmad"\n' },
         /links `_bmad` into every fresh worktree/u, /Remove that \[\[link\]\] entry/u],
     ];
     for (const [name, files, message, hint] of cases) {

@@ -55,11 +55,14 @@ bundle the same way, and never borrows a BMAD install from somewhere else.
 | Path | Owner | Notes |
 |------|-------|-------|
 | `_bmad/custom/config.toml` | project (team) | commit it to share settings with fresh worktrees |
-| `_bmad/custom/config.user.toml` | project (personal) | ignored by `_bmad/custom/.gitignore` |
+| `_bmad/custom/config.user.toml` | project (personal) | ignored by `_bmad/custom/.gitignore`, so it applies to this checkout only; job lanes do not see it |
 | `_bmad/custom/<skill>.toml` / `<skill>.user.toml` | project | customization overrides (team / personal) |
 | `_bmad-output/` (default) | project | specs, stories, evidence, other generated work; never moved or rewritten |
 | `_bmad/render/` | derived | rendered workflow snapshots; ignores itself (`.gitignore` = `*`) |
 | `_bmad/custom/legacy-install/` | project | verbatim installer answers kept by the retirement commands; not read |
+
+Put every setting a GC job must honor in the committed team file:
+personal files never reach a fresh job lane.
 
 **Configuration precedence** (later wins):
 
@@ -233,7 +236,9 @@ cfg = os.path.join(repo, "_bmad", "_config")
 if not os.path.isfile(os.path.join(cfg, "manifest.yaml")):
     sys.exit("STOP: no repo-local BMAD install (_bmad/_config/manifest.yaml); nothing to retire")
 for rel in ("_bmad", "_bmad/custom", "_bmad/custom/config.toml", "_bmad/custom/config.user.toml",
-            "_bmad/config.toml", "_bmad/config.user.toml", ".gru-command", ".gru-command/worktree.toml"):
+            "_bmad/config.toml", "_bmad/config.user.toml", "_bmad/_config", "_bmad/_config/manifest.yaml",
+            "_bmad/_config/files-manifest.csv", "_bmad/_config/skill-manifest.csv", ".gru-command",
+            ".gru-command/worktree.toml", ".gru-command/bmad-install.json", ".gru-command/bmad-bootstrap.mjs"):
     if os.path.islink(os.path.join(repo, rel)):
         sys.exit(f"STOP: {rel} is a symlink; these commands read and write only inside the repository")
 for name in ("files-manifest.csv", "skill-manifest.csv"):
@@ -513,8 +518,11 @@ def drop_block(path, start, end):
         before = before[:-1]
     return "".join(before + after)
 # Nothing moves unless every proven file is still exactly what the preview saw.
+def through_link(rel):
+    parts = rel.split("/")
+    return any(os.path.islink(os.path.join(repo, *parts[:i])) for i in range(1, len(parts) + 1))
 changed = [rel for rel, digest in plan["proofs"].items()
-           if os.path.islink(os.path.join(repo, rel)) or not os.path.isfile(os.path.join(repo, rel))
+           if through_link(rel) or not os.path.isfile(os.path.join(repo, rel))
            or hashlib.sha256(open(os.path.join(repo, rel), "rb").read()).hexdigest() != digest]
 for b in plan["bindings"]:
     for dirpath, dirnames, filenames in os.walk(os.path.join(repo, b)):
@@ -618,6 +626,18 @@ import json, os, shutil, subprocess, sys
 repo, backup = (os.path.realpath(p) for p in sys.argv[1:3])
 plan = json.load(open(os.path.join(backup, "plan.json"), encoding="utf-8"))
 moved, copy = os.path.join(backup, "moved"), os.path.join(backup, "copy")
+# Undo restores _bmad/custom from the backup; never drop settings added since.
+custom = os.path.join(repo, "_bmad", "custom")
+newer = []
+for dirpath, dirnames, filenames in os.walk(custom):
+    for name in filenames:
+        rel = os.path.relpath(os.path.join(dirpath, name), repo)
+        made_by_retirement = rel.startswith("_bmad/custom/legacy-install/") or \
+            rel in ("_bmad/custom/config.toml", "_bmad/custom/config.user.toml")
+        if not made_by_retirement and not os.path.exists(os.path.join(copy, rel)):
+            newer.append(rel)
+if newer:
+    sys.exit("STOP: added after the backup, move them out of _bmad/custom first: " + ", ".join(sorted(newer)))
 for dirpath, dirnames, filenames in os.walk(moved, topdown=True):
     rel = os.path.relpath(dirpath, moved)
     for name in list(dirnames) + filenames:

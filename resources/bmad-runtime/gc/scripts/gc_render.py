@@ -146,6 +146,8 @@ def check_legacy_answers(project_root: Path, effective: dict[str, Any]) -> None:
     for name in LEGACY_CONFIG_FILES:
         path = project_root / "_bmad" / name
         _no_symlink_below(project_root, path)
+        if path.exists() and not path.is_file():
+            raise ProjectStateError(f"{path} exists but is not a file")
         if path.is_file():
             layers.append(config_utils.load_toml(path))
     legacy = _scalars(config_utils.merge_layers(layers))
@@ -178,6 +180,8 @@ def ensure_render_root(project_root: Path, skill_name: str) -> None:
     # The upstream publisher writes below render/<skill>/; a link anywhere
     # there would carry snapshots out of this checkout.
     _no_symlink_in_tree(render_dir / skill_name)
+    if (render_dir / skill_name).exists() and not (render_dir / skill_name).is_dir():
+        raise ProjectStateError(f"{render_dir / skill_name} exists but is not a directory")
 
 
 def _assert_render_ignored(project_root: Path, skill_name: str) -> None:
@@ -214,7 +218,9 @@ def ensure_output_folders(project_root: Path, central: dict[str, Any]) -> None:
             continue
         raw = value.replace("{project-root}", str(project_root))
         if not Path(raw).is_absolute():
-            continue
+            # A relative location is read from the project root, so it must
+            # stay inside it just the same.
+            raw = str(project_root / raw)
         # realpath decides containment: an alias of the project path (say
         # /var vs /private/var) is inside; a link out of the project is not.
         real = Path(os.path.realpath(raw))
@@ -258,8 +264,11 @@ def main() -> int:
         # project's settings; retrying after fixing the host can succeed.
         sys.stdout.write(f"HALT: {error}\n")
         return 2
+    except config_utils.ConfigError as error:
+        sys.stdout.write(f"HALT: {error}\n")
+        # A settings file that could not be READ is a host failure too.
+        return 2 if isinstance(error.__cause__, OSError) else 1
     except (
-        config_utils.ConfigError,
         render_skill.RenderError,
         ProjectStateError,
         UnicodeError,

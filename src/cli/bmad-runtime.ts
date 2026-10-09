@@ -19,6 +19,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -104,6 +105,7 @@ export function runBmadRuntimeCli(args: readonly string[], write: (line: string)
     const gitHead = command === 'vendor' ? option(argv, '--git-head') : undefined;
     const packageRoot = resolve(argv.find((arg) => !arg.startsWith('--')) ?? '.');
     const bundleRoot = join(packageRoot, BMAD_RUNTIME_RESOURCE_DIR);
+    const currentText = readFileSync(join(bundleRoot, 'runtime.json'), 'utf-8');
     const current = readBmadRuntimeManifest(bundleRoot);
     const customization = {
       name: current.customization.name,
@@ -111,7 +113,17 @@ export function runBmadRuntimeCli(args: readonly string[], write: (line: string)
     };
     const { files: _files, ...upstreamIdentity } = current.upstream;
     if (command === 'manifest') {
+      // Upstream bytes change only through `vendor --tarball`, which checks
+      // them against the registry integrity; `manifest` never re-blesses them.
+      const before = current.upstream.files;
       const manifest = writeBmadRuntimeManifest(bundleRoot, upstreamIdentity, customization);
+      const drifted = [...new Set([...Object.keys(before), ...Object.keys(manifest.upstream.files)])]
+        .filter((file) => before[file] !== manifest.upstream.files[file]);
+      if (drifted.length > 0) {
+        writeFileSync(join(bundleRoot, 'runtime.json'), currentText);
+        throw new Error(`upstream file(s) differ from the vendored bytes: ${drifted.join(', ')}; ` +
+          're-vendor from the registry tarball (vendor --tarball) instead');
+      }
       write(`wrote ${join(bundleRoot, 'runtime.json')} for ${manifest.id}`);
     } else {
       if (tarball === undefined || version === undefined || integrity === undefined || gitHead === undefined) {
