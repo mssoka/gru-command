@@ -386,10 +386,13 @@ verification budget.
   frozen review target SHA (clean tracked tree), the host freezes a
   clearly-delimited evidence block into the review spec context, so the
   tests lens weighs ledger-backed evidence instead of a pasted report.
-- **Progress streams** back as NDJSON: `queued` (or `attached` for a
-  duplicate submission) → `started` → `output…` → `completed` (or
-  `error`), with transport `ping` frames interleaved into any silence.
-  While the body would otherwise be silent —
+- **Progress streams** back as NDJSON: `queued` → `started` → `output…`
+  → `completed` (or `error`), with transport `ping` frames interleaved
+  into any silence. A duplicate submission to an in-flight run instead
+  begins with `attached` and then receives only that run's later frames
+  (an already-running attach has no `queued`/`started`; a terminal
+  attach gets `attached` → `completed`). While the body would otherwise
+  be silent —
   a queued slot wait (up to `lock_wait_timeout_ms`), or a producer that
   has not written yet — the surface emits application-level `ping`
   frames (default every 15 s, worst-case gap 2 × cadence ≈ 30 s) so a

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS,
@@ -35,7 +37,7 @@ describe('keepalive fail-before receipt classifier', () => {
       const typed = assertKeepaliveBaseline(
         report(
           assertion(expected[0]!, 'failed', [
-            'TypeError: expected value must be number or bigint, received "undefined"',
+            'TypeError: actual value must be number or bigint, received "undefined"',
           ]),
           ...behavioralRed(expected.slice(1)),
         ),
@@ -53,7 +55,9 @@ describe('keepalive fail-before receipt classifier', () => {
 
   it('accepts only behavioral failure shapes', () => {
     expect(isBehavioralRed('AssertionError: nope')).toBe(true);
-    expect(isBehavioralRed('TypeError: expected value must be number or bigint, received "undefined"')).toBe(true);
+    expect(isBehavioralRed('TypeError: actual value must be number or bigint, received "undefined"')).toBe(true);
+    // The pre-rename wording (never emitted by the installed Vitest) is not RED.
+    expect(isBehavioralRed('TypeError: expected value must be number or bigint')).toBe(false);
     // A test-code type error, a harness timeout and a setup error are not RED.
     expect(isBehavioralRed('TypeError: Cannot read properties of undefined (reading "x")')).toBe(false);
     expect(isBehavioralRed('Error: waitFor timed out')).toBe(false);
@@ -114,5 +118,31 @@ describe('keepalive fail-before receipt classifier', () => {
     ).toThrow(/collection|setup|import/u);
     expect(() => assertKeepaliveBaseline(null)).toThrow(/no parseable/u);
     expect(() => assertKeepaliveBaseline({ testResults: [] })).toThrow(/no parseable/u);
+  });
+
+  it('rejects an ambiguous duplicate title', () => {
+    const titles = EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS.server;
+    expect(() =>
+      assertKeepaliveBaseline(
+        report(...behavioralRed(titles), assertion(titles[0]!, 'failed', ['AssertionError: duplicate'])),
+      ),
+    ).toThrow(/ambiguous/u);
+  });
+
+  it('keeps every expected title in sync with the suite it claims', () => {
+    const describeTitles = (file: string, describeName: string): string[] => {
+      const source = readFileSync(join(import.meta.dirname, file), 'utf-8');
+      const start = source.indexOf(`describe('${describeName}`);
+      expect(start, `${file}: describe "${describeName}" not found`).toBeGreaterThanOrEqual(0);
+      return [...source.slice(start).matchAll(/\bit\('((?:[^'\\]|\\.)*)'/gu)].map((match) => match[1] ?? '');
+    };
+    const serverTitles = describeTitles('verification-server.test.ts', 'verification stream keepalive');
+    const captureTitles = describeTitles('verification-capture.test.ts', 'keepalive pings in the capture stream');
+    for (const title of EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS.server) {
+      expect(serverTitles, `server baseline names a test the suite does not register: ${title}`).toContain(title);
+    }
+    for (const title of EXPECTED_KEEPALIVE_BASELINE_ASSERTIONS.capture) {
+      expect(captureTitles, `capture baseline names a test the suite does not register: ${title}`).toContain(title);
+    }
   });
 });

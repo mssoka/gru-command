@@ -57,10 +57,10 @@ export interface VerificationServerOptions {
    * Transport heartbeat cadence in milliseconds (test seam; default
    * {@link VERIFY_HEARTBEAT_MS}). Must be a positive integer whose worst-case
    * idle gap (`2 × heartbeatMs`) stays strictly under the client's
-   * {@link VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS}: disabling the heartbeat, or
-   * setting it above that bound, is exactly the truncation defect this
-   * guards against, so an unusable cadence is refused loudly rather than
-   * silently accepted. The guard enforces the hard 2× bound; the shipped
+   * {@link VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS}, and at least 10 ms: disabling
+   * it, flooding it, or setting it above that bound, is exactly the defect
+   * this guards against, so an unusable cadence is refused loudly rather
+   * than silently accepted. The guard enforces the hard bounds; the shipped
    * 15,000 ms default keeps an order-of-magnitude margin (≈30 s worst case),
    * and a consumer that configures a non-default HTTP body timeout is not
    * covered by this guard.
@@ -99,7 +99,9 @@ export const VERIFY_HEARTBEAT_MS = 15_000;
  * The streaming client's default HTTP body-idle timeout (Node 22 / undici
  * `bodyTimeout`). The heartbeat exists to stay strictly under it: a body
  * frame that lands just AFTER a tick skips that tick's ping, so the usable
- * cadence must satisfy `2 × heartbeatMs < this`.
+ * cadence must satisfy `2 × heartbeatMs < this`. Source: the incident report
+ * `verify-queued-capture-loss-investigation-20261009` pins Node 22.22.0 /
+ * bundled undici 6.23.0's default `bodyTimeout` of 300,000 ms.
  */
 export const VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS = 300_000;
 
@@ -156,13 +158,15 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
   const heartbeatMs = options.heartbeatMs ?? VERIFY_HEARTBEAT_MS;
   if (
     !Number.isInteger(heartbeatMs) ||
-    heartbeatMs <= 0 ||
+    heartbeatMs < 10 ||
     2 * heartbeatMs >= VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS
   ) {
     throw new Error(
-      `verification heartbeat must be a positive integer of milliseconds with a worst-case idle gap (2 × heartbeat) ` +
-        `strictly under the client's ${VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS} ms body-idle limit, got ${String(heartbeatMs)} — ` +
-        'a disabled or oversized heartbeat reintroduces the idle-body truncation',
+      `verification heartbeat must be an integer of milliseconds in [10, ${String(
+        Math.ceil(VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS / 2) - 1,
+      )}] with a worst-case idle gap (2 × heartbeat) strictly under the client's ` +
+        `${String(VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS)} ms body-idle limit, got ${String(heartbeatMs)} — ` +
+        'a disabled, flooded or oversized heartbeat reintroduces or worsens the idle-body problem',
     );
   }
   const tokenHash = hashToken(options.config.auth.token);
@@ -413,8 +417,10 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         }
         lastBodyWriteAt = performance.now();
       } catch {
-        // A dead socket: stop the timer now, never leave it ticking for the
+        // A synchronous write failure (write-after-end / destroyed stream /
+        // serialization): stop the timer now, never leave it ticking for the
         // life of a producer that may not settle for up to run_timeout_ms.
+        // A peer disconnect instead surfaces through res' `close` handler.
         closed = true;
         stopHeartbeat();
       }

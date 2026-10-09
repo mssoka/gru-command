@@ -35,11 +35,12 @@ import { isValidVerificationRequestId } from './scheduler.js';
 
 export const CAPTURE_OWNER_VERSION = 1;
 /**
- * The capture receipt schema version. Additive fields (like `pings`, added
- * after v1 receipts already existed) keep version 1: the reader MUST
- * normalize an absent new field to its pre-change value (see
- * {@link readCaptureReceipt}) rather than invalidating old receipts. A
- * breaking change (renamed/removed/retyped field) would need a new version.
+ * The capture receipt schema version. Additive fields keep version 1; the
+ * current example is `pings`, added after v1 receipts already existed and
+ * normalized by {@link readCaptureReceipt} to its pre-change value (`0`)
+ * when absent. A future additive field must be normalized the same way
+ * (absent → pre-change default) so old receipts stay readable; a breaking
+ * change (renamed/removed/retyped field) would need a new version.
  */
 export const CAPTURE_RECEIPT_VERSION = 1;
 

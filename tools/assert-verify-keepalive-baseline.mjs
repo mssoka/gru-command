@@ -37,15 +37,17 @@ export function resolveBaselineLeg(leg) {
 
 /**
  * Is this failure a behavioral RED? `AssertionError` is the common shape. A
- * matcher type error is behavioral too: Vitest's `assertTypes` (observed on
- * vitest 3.2.7) throws `TypeError: expected value must be ...` for a matcher
- * used on the wrong value type. Only a collection/setup/import failure is not
- * RED, and those are caught at the file level below.
+ * matcher type error is behavioral too: Vitest's `assertTypes` (INSTALLED
+ * vitest 3.2.7 — `@vitest/expect/dist/index.js` calls it on the ACTUAL
+ * operand first, `@vitest/utils/dist/helpers.js` renders `${name} value must
+ * be …`) throws `TypeError: actual value must be …`. Only a
+ * collection/setup/import failure is not RED, and those are caught at the
+ * file level below.
  */
 export function isBehavioralRed(message) {
   return (
     typeof message === 'string' &&
-    (message.startsWith('AssertionError:') || message.startsWith('TypeError: expected value must be'))
+    (message.startsWith('AssertionError:') || message.startsWith('TypeError: actual value must be'))
   );
 }
 

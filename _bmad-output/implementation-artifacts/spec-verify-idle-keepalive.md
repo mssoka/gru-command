@@ -2,9 +2,9 @@
 title: 'Keep verification response streams alive during legitimate idle periods'
 type: 'bugfix'
 created: '2026-10-09'
-status: 'in-progress'
+status: 'done'
 route: 'oneshot'
-review_loop_iteration: 4
+review_loop_iteration: 5
 context: []
 ---
 
@@ -39,7 +39,7 @@ context: []
 **Files changed:**
 - `src/verify/server.ts` — `VERIFY_HEARTBEAT_MS`, `VERIFY_CLIENT_BODY_IDLE_TIMEOUT_MS`, `PingFrame`, the validated `heartbeatMs` seam, heartbeat arm/stop/write on a monotonic clock.
 - `src/verify/capture.ts`, `src/verify/capture-cli.ts` — `pings` counted (and receipted) apart from producer `frames`.
-- `test/verification-server.test.ts` — the four named regressions plus the cadence/refusal pin and the attach-stream keepalive (real isolated server, short heartbeat cadence; scoped spies prove one `setInterval` per response, unref'd and cleared).
+- `test/verification-server.test.ts` — the four named regressions plus the cadence/refusal pin, the leading-ping, error-terminal and attach-stream keepalives and the chatty-producer idle-gate guard (real isolated server and stub-scheduler seams, short heartbeat cadence; scoped spies prove each heartbeat is unref'd and cleared).
 - `test/verification-capture.test.ts` — reader accepts interleaved pings and still rejects post-terminal frames; a completed stream with pings stays promotable through real EOF; a stream severed after pings stays UNKNOWN with no output binding.
 - `test/assert-verify-keepalive-baseline.test.ts`, `tools/assert-verify-keepalive-baseline.mjs` (+ `.d.mts`) — fail-before report classifier.
 - `test/suite-shape.test.ts` — recomputed phantom-check pins (25 / 26 / 5).
@@ -47,7 +47,7 @@ context: []
 - `_bmad-output/implementation-artifacts/deferred-work.md` — the deferred review follow-ups.
 - `.gru-command/worktree.toml` — `verify-idle-keepalive`, `verify-idle-keepalive-static`, `verify-idle-keepalive-baseline`, and `verify-idle-capture-baseline` scopes.
 
-**Fail-before:** every named regression is assertion-first, so the pre-fix base REDs by assertion rather than by a harness timeout. Two scheduler-backed scopes reproduce this on isolated base snapshots and classify the machine-readable Vitest reports with `tools/assert-verify-keepalive-baseline.mjs`, which exits 2 when a claim is broken: `verify-idle-keepalive-baseline` (7 named server regressions) and `verify-idle-capture-baseline` (3 capture-reader/helper regressions). Every failure in each report must be one of the named regressions failing behaviorally, so a harness timeout or an unlisted failure can never pass as RED.
+**Fail-before:** every named regression is assertion-first, so the pre-fix base REDs by assertion rather than by a harness timeout. Two scheduler-backed scopes reproduce this on isolated base snapshots and classify the machine-readable Vitest reports with `tools/assert-verify-keepalive-baseline.mjs`, which exits 2 when a claim is broken: `verify-idle-keepalive-baseline` (8 named server regressions) and `verify-idle-capture-baseline` (3 capture-reader/helper regressions). Every failure in each report must be one of the named regressions failing behaviorally, so a harness timeout or an unlisted failure can never pass as RED.
 
 **Review round 1 (BMAD blind hunter, job `verify-idle-keepalive-review-blind-hunter-20261009`, reviewed head 49a219e):** 14 findings, triaged below; the actionable ones were repaired in the first fix cycle. The one finding rejected in round 1 (F4) was re-raised in round 2 and is now patched (R3).
 
@@ -109,7 +109,7 @@ Round 3 — BMAD blind hunter `verify-idle-keepalive-review-round3-blind-hunter-
 - F5 the cadence pin lost its population assertion while its comment still claimed one — **medium**, patched: the default path asserts exactly one 15,000 ms interval, and the comment matches.
 - F6 stale "1 s bound" comment after the round-2 widening — **low**, patched: comments corrected.
 - F7 cleanup comment imprecise — **low**, patched.
-- F8 the classifier could accept an unlisted or non-behavioral failure — **medium**, patched: every failure in the report must be one of the named regressions failing behaviorally, and the reported failed count is reconciled (server leg now names all 7).
+- F8 the classifier could accept an unlisted or non-behavioral failure — **medium**, patched: every failure in the report must be one of the named regressions failing behaviorally, and the reported failed count is reconciled (server leg names all 8).
 - F9 the behavioral-rule prefix was unpinned Vitest internals — **low**, patched: positive/negative matrix plus the observed Vitest version named.
 - F10 the `server|capture` leg selector was untested — **low**, patched: `resolveBaselineLeg` exported and tested.
 - F11 receipt normalization was over-broad (any non-number → 0) — **medium**, patched: only an absent field normalizes to 0; a present-but-corrupt field reads as unreadable (null), never a silent zero.
@@ -137,3 +137,20 @@ Round 4 — BMAD blind hunter `verify-idle-keepalive-review-round4-blind-hunter-
 - R4-12 the classifier is exercised only against hand-rolled reports — **low**, deferred (real-report fixture).
 - R4-13 no negative "no ping noise" case or pinned producer-frame count — **low**, patched: the capture-honest test pins `frames === 4` alongside `pings > 0`, and an existing default-cadence test pins the exact `queued/started/output/completed` sequence (zero pings for a chatty run).
 - R4-14 the documented vocabulary omitted `attached` — **low**, patched.
+
+Round 5 — BMAD blind hunter `verify-idle-keepalive-review-round5-blind-hunter-20261009`, reviewed head `27aa3d4` (whole change `32fc2f6..27aa3d4`, the concluding whole-change pass); 14 findings, all addressed. Residual items the round marked as follow-ups (shared ping-frame constant; reader `frames`/`pings` partition; dispose-leg coverage; real-report classifier fixture; full receipt validation) are recorded in `deferred-work.md`.
+
+- R5-1 the behavioral-RED rule used a Vitest matcher message the installed Vitest never emits (`expected value must be`) — **high**, patched: the rule now matches the reachable `TypeError: actual value must be …` (verified against installed vitest 3.2.7), and the negative case pins the wrong wording as not-RED.
+- R5-2 the uniqueness/ambiguity branch was untested — **low**, patched.
+- R5-3 the expected-title list could drift from the suite — **medium**, patched: a sync test asserts every expected title is registered in the describe it claims.
+- R5-4 the write-failure cleanup was unreachable and its comment misnamed the trigger — **low**, patched comment (the branch stays defensive; a test double for a synchronously throwing `res` is deferred).
+- R5-5 the error-terminal regression did not assert timer cleanup — **medium**, patched.
+- R5-6 the error-terminal ping window was a timing knife-edge — **low**, patched: the queued wait is 150 ms at a 25 ms cadence.
+- R5-7 the documented sequence was wrong for an attached duplicate — **medium**, patched.
+- R5-8 the receipt-version TSDoc stated a general MUST the reader only implements for `pings` — **low**, patched.
+- R5-9 the 300 s constant lacked provenance — **low**, patched (Node 22.22.0 / undici 6.23.0, incident report).
+- R5-10 the cadence guard had no lower bound — **medium**, patched: `heartbeatMs` must be in [10, 149 999], with the below-floor case pinned.
+- R5-11 no upper bound on pings for a chatty producer — **medium**, patched: a chatty-producer guard asserts zero pings between the first and last output (the idle gate suppresses them).
+- R5-12 stale counts in the spec — **low**, patched.
+- R5-13 the ping wire literal is duplicated with no shared constant — **low**, deferred (recorded).
+- R5-14 no reader/CLI fixture starts with a ping — **low**, patched: a leading-ping reader fixture binds the run cleanly.

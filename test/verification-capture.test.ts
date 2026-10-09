@@ -657,6 +657,20 @@ describe('keepalive pings in the capture stream (incident 2026-10-09)', () => {
     // the keepalive must never loosen the post-terminal rejection.
     const postTerminal = parseCapturedNdjson(`${completedNdjson()}${PING_LINE}`);
     expect(postTerminal.malformed).toBe(1);
+
+    // A LEADING ping (legal: the body's first frame) still binds the run and
+    // parses cleanly.
+    const leading = parseCapturedNdjson(
+      PING_LINE +
+        `${JSON.stringify({ type: 'queued', runId: 'run-capture-1', position: 0, active: 0, limit: 1 })}\n` +
+        `${JSON.stringify({ type: 'started', runId: 'run-capture-1', workers: 2, sha: 'a'.repeat(40), queuedMs: 1 })}\n` +
+        `${JSON.stringify({ type: 'completed', runId: 'run-capture-1', outcome: COMPLETED_OUTCOME })}\n`,
+    );
+    expect(leading.malformed).toBe(0);
+    expect(leading.frames).toBe(3);
+    expect(leading.pings).toBe(1);
+    expect(leading.started).toBe(true);
+    expect(leading.outcome?.['runId']).toBe('run-capture-1');
   });
 
   it('a completed capture whose body carried pings stays promotable through real EOF', async () => {

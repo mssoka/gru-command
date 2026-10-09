@@ -616,6 +616,13 @@ const GATE_SCRIPT = [
   'process.exit(existsSync(release) ? 0 : 3);',
 ].join('\n');
 
+const CHATTY_SCRIPT = [
+  'for (let index = 0; index < 30; index += 1) {',
+  '  console.log(`chatty=${index}`);',
+  '  await new Promise((resolve) => setTimeout(resolve, 10));',
+  '}',
+].join('\n');
+
 const QUIET_SCRIPT = [
   'const delay = Number(process.argv[2] ?? 400);',
   "setTimeout(() => { console.log('quiet=done'); }, delay);",
@@ -829,6 +836,29 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     await harness.close();
   });
 
+  it('does not add keepalive noise to a chatty producer', async () => {
+    const harness = await boot({
+      manifest: ['[verify]', 'full = "node chatty.mjs"', ''].join('\n'),
+      files: { 'chatty.mjs': CHATTY_SCRIPT },
+      heartbeatMs: 25,
+    });
+    const reading = collectNdjson(await streamCall(harness.port, { job_id: harness.jobId, scope: 'full' }));
+    await reading.done;
+    const types = frameTypes(reading.frames);
+    const firstOutput = types.indexOf('output');
+    const lastOutput = types.lastIndexOf('output');
+    expect(types.filter((type) => type === 'output').length).toBeGreaterThan(5);
+    // While the producer is writing faster than the cadence the idle gate
+    // must suppress pings: no ping between the first and last output. (A
+    // leading ping before the first output is legitimate quiet-window
+    // protection.) Deleting the gate would flood this stream.
+    expect(
+      types.slice(firstOutput, lastOutput + 1).filter((type) => type === 'ping'),
+    ).toHaveLength(0);
+    expect(types[types.length - 1]).toBe('completed');
+    await harness.close();
+  });
+
   it('verification terminal and disconnect cleanup', async () => {
     const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
     const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval');
@@ -929,7 +959,7 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
     }
     // A disabled or oversized cadence is refused before any scheduler or
     // producer exists: it would reintroduce the truncation the fix removes.
-    for (const unusable of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 150_000, 300_000]) {
+    for (const unusable of [0, -1, 1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 150_000, 300_000]) {
       expect(() =>
         createVerificationServer({
           config: harness.config,
@@ -1015,16 +1045,19 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
 
   it('verification error terminal clears its heartbeat', async () => {
     const harness = await boot({ heartbeatMs: 25 });
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
+    const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval');
     // A queued admission that ends in the typed lock-wait error: the body
-    // must stay alive while waiting, then carry the error as its LAST frame.
+    // must stay alive while waiting, then carry the error as its LAST frame
+    // and leave no heartbeat timer behind.
     const stubScheduler = {
       start: () => {},
       dispose: async () => {},
       view: () => ({ lockInUse: false, activeRuns: 0, queuedRuns: 1, workerBudget: 1, workersPerRun: 1 }),
       run: async (_spec: unknown, sink: (frame: unknown) => void | Promise<void>) => {
         await sink({ type: 'queued', runId: 'run-stub-error', position: 1, active: 1, limit: 1 });
-        await new Promise((resolve) => setTimeout(resolve, 80));
-        throw new VerificationLockTimeoutError(80, 1, 1);
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        throw new VerificationLockTimeoutError(150, 1, 1);
       },
     };
     const server = createVerificationServer({
@@ -1051,10 +1084,21 @@ describe('verification stream keepalive (incident 2026-10-09)', () => {
       // The error is the terminal frame: no transport frame follows it.
       expect(types[types.length - 1]).toBe('error');
       expect(types.lastIndexOf('ping')).toBeLessThan(types.indexOf('error'));
+      // ... and the error terminal cleared the heartbeat.
+      const ourIntervals = setIntervalSpy.mock.calls
+        .map((call, index) => ({ delay: call[1], result: setIntervalSpy.mock.results[index] }))
+        .filter((entry) => entry.delay === 25);
+      expect(ourIntervals.length).toBeGreaterThanOrEqual(1);
+      for (const entry of ourIntervals) {
+        const handle = entry.result?.value as NodeJS.Timeout;
+        expect(clearIntervalSpy.mock.calls.some((call) => call[0] === handle)).toBe(true);
+      }
     } finally {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       await server.dispose();
       await harness.close();
+      setIntervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
     }
   });
 
