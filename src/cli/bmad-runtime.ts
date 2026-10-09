@@ -39,13 +39,27 @@ const USAGE = [
   '       node dist/cli/bmad-runtime.js check <project-root> [--store <dir>] [--package-root <dir>]',
 ].join('\n');
 
-/** The one launcher command a bundled skill tells the agent to run. */
-export function skillLauncherCommand(runtime: MaterializedBmadRuntime, skill: string, projectRoot: string): string {
+/**
+ * The one launcher command a bundled skill tells the agent to run, with its
+ * placeholders bound to environment variables (paths are never spliced
+ * into shell text, so a quote or `$(…)` in a directory name stays inert).
+ */
+export function skillLauncherCommand(
+  runtime: MaterializedBmadRuntime,
+  skill: string,
+  projectRoot: string,
+): { readonly command: string; readonly env: Readonly<Record<string, string>> } {
   const skillRoot = join(runtime.skillsDir, skill);
   const text = readFileSync(join(skillRoot, 'SKILL.md'), 'utf-8');
   const block = /```bash\n([^\n]+)\n```/u.exec(text);
   if (block?.[1] === undefined) throw new BmadRuntimeError(`${skill}/SKILL.md has no launcher command block`);
-  return block[1].split('{project-root}').join(projectRoot).split('{skill-root}').join(skillRoot);
+  if (!/"\{project-root\}/u.test(block[1]) || !/"\{skill-root\}/u.test(block[1])) {
+    throw new BmadRuntimeError(`${skill}/SKILL.md launcher must double-quote its {project-root} and {skill-root} paths`);
+  }
+  return {
+    command: block[1].split('{project-root}').join('${GC_BMAD_PROJECT_ROOT}').split('{skill-root}').join('${GC_BMAD_SKILL_ROOT}'),
+    env: { GC_BMAD_PROJECT_ROOT: projectRoot, GC_BMAD_SKILL_ROOT: skillRoot },
+  };
 }
 
 /** Run every bundled skill's launcher against `projectRoot`; false on any HALT. */
@@ -59,15 +73,16 @@ export function checkBmadRuntime(
   write(`BMAD runtime ${runtime.id} at ${runtime.dir}`);
   let ok = true;
   for (const skill of runtime.skills) {
-    const command = skillLauncherCommand(runtime, skill, projectRoot);
-    const result = spawnSync('/bin/sh', ['-c', command], {
+    const launcher = skillLauncherCommand(runtime, skill, projectRoot);
+    const result = spawnSync('/bin/sh', ['-c', launcher.command], {
       cwd: projectRoot,
+      env: { ...process.env, ...launcher.env },
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 300_000,
     });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
-    const rendered = result.status === 0 && /^read and follow \/\S+\/workflow\.md$/mu.test(result.stdout ?? '');
+    const rendered = result.status === 0 && /^read and follow \/.+\/workflow\.md$/mu.test(result.stdout ?? '');
     write(`${rendered ? 'ok' : 'FAILED'} ${skill}: ${output === '' ? `exit ${String(result.status)}` : output}`);
     ok &&= rendered;
   }

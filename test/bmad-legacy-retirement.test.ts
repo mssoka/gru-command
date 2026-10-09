@@ -1,14 +1,17 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  appendFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -61,15 +64,19 @@ function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-/** Every file under `root` (relative path → bytes as base64), .git excluded. */
+/** Every file and link under `root` (relative path → bytes / link target), .git excluded. */
 function tree(root: string): Map<string, string> {
   const out = new Map<string, string>();
   const visit = (dir: string): void => {
     for (const name of readdirSync(dir).sort()) {
       const path = join(dir, name);
       if (relative(root, path) === '.git') continue;
-      if (lstatSync(path).isDirectory()) visit(path);
-      else out.set(relative(root, path), readFileSync(path).toString('base64'));
+      const info = lstatSync(path);
+      if (info.isSymbolicLink()) out.set(relative(root, path), `link:${readlinkSync(path)}`);
+      else if (info.isDirectory()) {
+        if (readdirSync(path).length === 0) out.set(`${relative(root, path)}/`, 'empty-dir');
+        visit(path);
+      } else out.set(relative(root, path), readFileSync(path).toString('base64'));
     }
   };
   visit(root);
@@ -84,7 +91,8 @@ const BLOCK = [
   'command = "if git config --local --get gru-command.bmad-source >/dev/null 2>&1; then node .gru-command/bmad-bootstrap.mjs; fi"',
   '# END GRU COMMAND BMAD BOOTSTRAP',
 ].join('\n');
-const USER_MANIFEST = '# User-owned setup survives retirement.\n[[setup]]\ncommand = "npm ci"\n\n[verify]\nfull = "npm test"\n';
+// CRLF on purpose: the commands must handle Windows-edited manifests.
+const USER_MANIFEST = '# User-owned setup survives retirement.\r\n[[setup]]\r\ncommand = "npm ci"\r\n\r\n[verify]\r\nfull = "npm test"\r\n';
 const USER_EXCLUDE = '# local scratch\n/scratch/\n';
 
 /** A repo-local install the way the retired onboarding left one. */
@@ -93,7 +101,7 @@ function legacyRepo(workspace: string): string {
   mkdirSync(repo, { recursive: true });
   git(repo, ['init', '-q']);
   write(join(repo, 'README.md'), '# legacy app\n');
-  write(join(repo, '.gru-command', 'worktree.toml'), `${BLOCK}\n\n${USER_MANIFEST}`);
+  write(join(repo, '.gru-command', 'worktree.toml'), `${BLOCK.replaceAll('\n', '\r\n')}\r\n\r\n${USER_MANIFEST}`);
   write(join(repo, '.gru-command', 'bmad-bootstrap.mjs'), '#!/usr/bin/env node\n// Managed by Gru Command BMAD bootstrap v1\n');
   write(join(repo, '.gru-command', 'bmad-install.json'), `${JSON.stringify({
     managed_by: 'gru-command',
@@ -129,6 +137,7 @@ function legacyRepo(workspace: string): string {
     'bmad-build/SKILL.md': '---\nname: bmad-build\n---\nlegacy launcher\n',
     'bmad-build/review-prompts/edge-case-hunter.md': '# edge\n',
     'bmad-help/SKILL.md': '---\nname: bmad-help\n---\nhelp\n',
+    'gds-quick-dev/SKILL.md': '---\nname: gds-quick-dev\n---\nquick dev\n',
     'gds-quick-dev/workflow.md': 'write to {{.implementation_artifacts}}\n',
   };
   const rows = ['type,name,module,path,hash'];
@@ -139,7 +148,8 @@ function legacyRepo(workspace: string): string {
   write(join(repo, '_bmad', '_config', 'files-manifest.csv'), `${rows.join('\n')}\n`);
   write(join(repo, '_bmad', '_config', 'skill-manifest.csv'), [
     'canonicalId,name,description,module,path',
-    '"bmad-build","bmad-build","d","bmm","x"', '"bmad-help","bmad-help","d","core","x"', '"gds-quick-dev","gds-quick-dev","d","gds","x"', '',
+    '"bmad-build","bmad-build","d","bmm","x"', '"bmad-help","bmad-help","d","core","x"', '"gds-quick-dev","gds-quick-dev","d","gds","x"',
+    '"bmad-extra","bmad-extra","d","bmm","x"', '"gds-empty","gds-empty","d","gds","x"', '',
   ].join('\n'));
   for (const root of ['.agents/skills', '.claude/skills']) {
     for (const [rel, text] of Object.entries(bindings)) write(join(repo, root, rel), text);
@@ -148,6 +158,14 @@ function legacyRepo(workspace: string): string {
   write(join(repo, '.agents', 'skills', 'gds-quick-dev', 'workflow.md'), 'write to {{config.modules.gds.implementation_artifacts}}\n');
   // A user edit makes a BMAD-named binding unproven: it must stay.
   write(join(repo, '.claude', 'skills', 'bmad-help', 'SKILL.md'), '---\nname: bmad-help\n---\nmy local edit\n');
+  // Installer-named bindings that are NOT provably installer-owned: one
+  // carries a user-added symlinked directory, one is empty.
+  const extraSkill = '---\nname: bmad-extra\n---\nextra\n';
+  write(join(repo, '.agents', 'skills', 'bmad-extra', 'SKILL.md'), extraSkill);
+  appendFileSync(join(repo, '_bmad', '_config', 'files-manifest.csv'), `"md","x","bmm","bmm/skills/bmad-extra/SKILL.md","${sha256(extraSkill)}"\n`);
+  mkdirSync(join(workspace, 'user-assets'), { recursive: true });
+  symlinkSync(join(workspace, 'user-assets'), join(repo, '.agents', 'skills', 'bmad-extra', 'assets'));
+  mkdirSync(join(repo, '.claude', 'skills', 'gds-empty'), { recursive: true });
   // Unrelated skills.
   write(join(repo, '.agents', 'skills', 'my-skill', 'SKILL.md'), '# mine\n');
   write(join(repo, '.claude', 'skills', 'other-tool', 'SKILL.md'), '# other\n');
@@ -195,6 +213,9 @@ function retirementFlow(shell: string): void {
   expect(preview.out).toContain('_bmad/_config, _bmad/scripts, _bmad/render, _bmad/core, _bmad/bmm, _bmad/cis, _bmad/tea, _bmad/gds, _bmad/config.toml, _bmad/config.user.toml');
   expect(preview.out).toContain('move aside (proven BMAD skill bindings): 5');
   expect(preview.out).toContain('LEFT IN PLACE (not provably installer-owned): .claude/skills/bmad-help');
+  expect(preview.out).toContain('LEFT IN PLACE (not provably installer-owned): .agents/skills/bmad-extra');
+  expect(preview.out).toContain('LEFT IN PLACE (not provably installer-owned): .claude/skills/gds-empty');
+  expect(preview.out).toContain('keep installer answers for reference in _bmad/custom/legacy-install/');
   expect(preview.out).toContain('LEFT IN PLACE (not part of the supported layout): _bmad/_memory');
   expect(preview.out).toContain(`LANE: ${lane}`);
   expect(preview.out).toContain('.gru-command/bmad-install.json, .gru-command/bmad-bootstrap.mjs, worktree.toml block, local exclude block, git config gru-command.bmad-source');
@@ -209,8 +230,10 @@ function retirementFlow(shell: string): void {
 
   // The retired framework and proven bindings moved aside, recoverably.
   expect(readdirSync(join(repo, '_bmad')).sort()).toEqual(['_memory', 'custom']);
-  expect(readdirSync(join(repo, '.agents', 'skills')).sort()).toEqual(['my-skill']);
-  expect(readdirSync(join(repo, '.claude', 'skills')).sort()).toEqual(['bmad-help', 'other-tool']);
+  expect(readdirSync(join(repo, '_bmad', 'custom')).sort()).toEqual(['.gitignore', 'bmad-build.toml', 'config.toml', 'config.user.toml', 'legacy-install']);
+  expect(readdirSync(join(repo, '.agents', 'skills')).sort()).toEqual(['bmad-extra', 'my-skill']);
+  expect(readdirSync(join(repo, '.claude', 'skills')).sort()).toEqual(['bmad-help', 'gds-empty', 'other-tool']);
+  expect(readlinkSync(join(repo, '.agents', 'skills', 'bmad-extra', 'assets'))).toBe(join(workspace, 'user-assets'));
   for (const rel of ['_bmad/_config/manifest.yaml', '_bmad/gds/config.yaml', '_bmad/config.toml', '.agents/skills/bmad-build/SKILL.md',
     '.agents/skills/gds-quick-dev/workflow.md', '.claude/skills/bmad-build/SKILL.md', '.gru-command/bmad-install.json', '.gru-command/bmad-bootstrap.mjs']) {
     expect(readFileSync(join(backup, 'moved', rel)).toString('base64'), rel).toBe(original.get(rel));
@@ -233,6 +256,12 @@ function retirementFlow(shell: string): void {
   expect(team).not.toContain('modules.gds');
   expect(readFileSync(join(repo, '_bmad', 'custom', 'config.user.toml'), 'utf-8'))
     .toContain('[core]\ncommunication_language = "Français"\nuser_name = "Owner"\n');
+  // Every legacy answer, including modules GC does not bundle, stays in the
+  // project verbatim for reference.
+  for (const name of ['config.toml', 'config.user.toml']) {
+    expect(readFileSync(join(repo, '_bmad', 'custom', 'legacy-install', name)).toString('base64'), name)
+      .toBe(original.get(`_bmad/${name}`));
+  }
 
   const verified = run('verify');
   expect(verified.status, verified.out).toBe(0);
@@ -266,6 +295,43 @@ describe('retiring a repo-local BMAD install with the documented commands', () =
 
   it.skipIf(!existsSync('/bin/zsh'))('zsh (the owner shell): the same documented flow passes', () => {
     retirementFlow('/bin/zsh');
+  });
+
+  it('undo removes a _bmad/custom the retirement created; a hand merge unblocks a blocked preview', () => {
+    const run = (step: string, env: NodeJS.ProcessEnv) => {
+      const result = spawnSync('/bin/sh', ['-c', docBlock(step)], { env, encoding: 'utf-8', timeout: 110_000 });
+      return { status: result.status, out: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+    };
+    const base = (home: string, repo: string, backup: string) =>
+      ({ PATH: process.env.PATH ?? '', HOME: home, REPO: repo, GC: repoRoot, BACKUP: backup });
+
+    // No _bmad/custom before retirement: undo must not leave the created one.
+    const absentWs = tempDir('gru-command-retire-absent-');
+    const absent = legacyRepo(absentWs);
+    rmSync(join(absent, '_bmad', 'custom'), { recursive: true });
+    const original = tree(absent);
+    const absentEnv = base(absentWs, absent, join(absentWs, 'backup'));
+    for (const step of ['preview', 'backup', 'move']) expect(run(step, absentEnv).status, step).toBe(0);
+    expect(existsSync(join(absent, '_bmad', 'custom', 'config.toml'))).toBe(true);
+    expect(run('restore', absentEnv).status).toBe(0);
+    expect(existsSync(join(absent, '_bmad', 'custom'))).toBe(false);
+    expect(tree(absent)).toEqual(original);
+
+    // A custom file that already holds settings blocks re-homing until the
+    // owner merges the pending answers by hand; then the preview passes.
+    const mergeWs = tempDir('gru-command-retire-merge-');
+    const merge = legacyRepo(mergeWs);
+    writeFileSync(join(merge, '_bmad', 'custom', 'config.toml'), '[core]\nuser_name = "Team"\n');
+    const blocked = run('preview', base(mergeWs, merge, join(mergeWs, 'backup-1')));
+    expect(blocked.status).toBe(0);
+    expect(blocked.out).toContain('STOP before step 3: _bmad/custom/config.toml: add {"core.project_name": "legacy-app"} by hand');
+    expect(run('backup', base(mergeWs, merge, join(mergeWs, 'backup-1'))).out).toContain('STOP: merge these settings by hand first');
+    writeFileSync(join(merge, '_bmad', 'custom', 'config.toml'), '[core]\nuser_name = "Team"\nproject_name = "legacy-app"\n');
+    const unblocked = run('preview', base(mergeWs, merge, join(mergeWs, 'backup-2')));
+    expect(unblocked.status, unblocked.out).toBe(0);
+    expect(unblocked.out).not.toContain('STOP');
+    expect(run('backup', base(mergeWs, merge, join(mergeWs, 'backup-2'))).status).toBe(0);
+    expect(readFileSync(join(merge, '_bmad', 'custom', 'config.toml'), 'utf-8')).toBe('[core]\nuser_name = "Team"\nproject_name = "legacy-app"\n');
   });
 
   it('the preview refuses a repository without a repo-local install and a backup inside the repository', () => {

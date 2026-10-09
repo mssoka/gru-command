@@ -8,6 +8,8 @@ import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
 import type { AgentHandle, AgentRuntime, ManagedSkillSet, RuntimeEvent, SpawnOptions } from './types.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
+import { createBmadRuntimeBinder } from '../bmad/runtime.js';
+import { join } from 'node:path';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
@@ -100,6 +102,17 @@ export interface RuntimeRegistryOptions {
    * real binder; omitted = no managed runtime (unit tests).
    */
   readonly bmadRuntime?: (cwd: string) => ManagedSkillSet;
+}
+
+/**
+ * The service's registry options (main.ts): the base options plus the
+ * issue #283 binder that gives build-workflow sessions the GC-managed BMAD
+ * runtime of their job lane, materialized under `<dataDir>/bmad-runtime`.
+ */
+export function serviceRegistryOptions(
+  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & { readonly config: { readonly dataDir: string } },
+): RuntimeRegistryOptions {
+  return { ...base, bmadRuntime: createBmadRuntimeBinder(join(base.config.dataDir, 'bmad-runtime')) };
 }
 
 /**
@@ -573,7 +586,14 @@ export class RuntimeRegistry {
     if (!ROLE_DEFINITIONS[role].managedBmadRuntime || this.opts.bmadRuntime === undefined) return undefined;
     if ((options.reviewLead ?? options.isolatedReview) !== undefined) return undefined;
     if (options.cwd === undefined || options.cwd === '') {
-      throw new Error(`role "${role}" needs an explicit cwd to bind its BMAD runtime (SPEC ruling 17)`);
+      // A supervised crash restart resumes with the session file alone; it
+      // is hosted at the workspace root, which has no job lane to bind.
+      // Keep that restart working, visibly without the managed runtime.
+      this.log('warn', 'bmad runtime not bound: spawn has no project cwd', {
+        role,
+        resume_file: options.resumeFile ?? null,
+      });
+      return undefined;
     }
     const managed = this.opts.bmadRuntime(options.cwd);
     this.log('info', 'bmad runtime bound', {

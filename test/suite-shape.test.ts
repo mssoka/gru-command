@@ -19,10 +19,10 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'awareness.test.ts': 80,
 
 
-  'bmad-legacy-retirement.test.ts': 4,
+  'bmad-legacy-retirement.test.ts': 5,
   'bmad-onboarding.test.ts': 11,
   'bmad-runtime-packaged.test.ts': 1,
-  'bmad-runtime.test.ts': 12,
+  'bmad-runtime.test.ts': 14,
   'board-engine-v4.test.ts': 9,
   'board-engine.test.ts': 41,
   'board-frames.test.ts': 3,

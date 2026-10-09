@@ -8,12 +8,13 @@ import {
   readFileSync,
   readlinkSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { loadBundledBmadRuntime } from '../src/bmad/runtime.js';
 import { AnswersError, parseAnswers } from '../src/wizard/answers.js';
@@ -212,7 +213,7 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
     ].join('\n'));
     writeFileSync(
       join(fixture.repo, '_bmad', 'custom', 'config.user.toml'),
-      '[modules.bmm]\nplanning_artifacts = "{project-root}/mine/plans"\n',
+      `[modules.bmm]\nplanning_artifacts = "{project-root}/mine/plans"\nimplementation_artifacts = ${JSON.stringify(join(realpathSync(fixture.repo), 'absolute', 'work'))}\n`,
     );
     const result = onboardBmadRepo(fixture.name, 'provision', {
       workspaceRoot: fixture.workspace,
@@ -222,6 +223,8 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
     expect(lstatSync(join(fixture.repo, 'work')).isDirectory()).toBe(true);
     // The personal layer wins over the team layer, as in the renderer.
     expect(lstatSync(join(fixture.repo, 'mine', 'plans')).isDirectory()).toBe(true);
+    // An absolute path inside the repo needs no placeholder.
+    expect(lstatSync(join(fixture.repo, 'absolute', 'work')).isDirectory()).toBe(true);
     expect(existsSync(join(fixture.repo, 'work', 'plans'))).toBe(false);
     expect(existsSync(join(fixture.workspace, 'outside-the-repo'))).toBe(false);
     expect(existsSync(join(fixture.repo, '_bmad-output'))).toBe(false);
@@ -241,6 +244,18 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
       }, /through symlink/u],
       ['linked-output', (repo) => symlinkSync(outside, join(repo, '_bmad-output')), /through symlink/u],
       ['file-bmad', (repo) => writeFileSync(join(repo, '_bmad'), 'not a directory\n'), /exists but is not a directory/u],
+      // Later targets are validated before the FIRST write, too.
+      ['file-render', (repo) => {
+        mkdirSync(join(repo, '_bmad'));
+        writeFileSync(join(repo, '_bmad', 'render'), 'not a directory\n');
+      }, /_bmad\/render$/u],
+      ['dir-ignore', (repo) => mkdirSync(join(repo, '_bmad', 'custom', '.gitignore'), { recursive: true }), /exists but is not a file/u],
+      ['file-output-parent', (repo) => writeFileSync(join(repo, '_bmad-output'), 'not a directory\n'), /_bmad-output$/u],
+      ['linked-settings-file', (repo) => {
+        mkdirSync(join(repo, '_bmad', 'custom'), { recursive: true });
+        writeFileSync(join(outside, 'config.toml'), '[core]\noutput_folder = "{project-root}/x"\n');
+        symlinkSync(join(outside, 'config.toml'), join(repo, '_bmad', 'custom', 'config.toml'));
+      }, /through symlink/u],
     ];
     for (const [name, arrange, message] of cases) {
       const fixture = fixtureRepo(name);
@@ -255,24 +270,48 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
       expect(result.message, name).toMatch(message);
       expect(snapshot(fixture.repo), name).toBe(before);
     }
-    expect(readdirSync(outside)).toEqual([]);
+    expect(readdirSync(outside)).toEqual(['config.toml']);
   });
 
-  it('a malformed project settings file is a deterministic refusal naming the file', () => {
-    const fixture = fixtureRepo('malformed-settings');
-    mkdirSync(join(fixture.repo, '_bmad', 'custom'), { recursive: true });
-    writeFileSync(join(fixture.repo, '_bmad', 'custom', 'config.toml'), '[core\nbroken = \n');
-    const before = snapshot(fixture.repo);
-    const result = onboardBmadRepo(fixture.name, 'provision', {
-      workspaceRoot: fixture.workspace,
-      answers: answers(fixture.workspace, fixture.name),
-    });
-    expect(result.ready).toBe(false);
-    expect(result.deterministic).toBe(true);
-    expect(result.message).toContain('project BMAD settings file is malformed');
-    expect(result.message).toContain(join('_bmad', 'custom', 'config.toml'));
-    expect(result.repairHint).toContain('settings file');
-    expect(snapshot(fixture.repo)).toBe(before);
+  it('settings the first render would refuse are deterministic refusals, never a false ready', () => {
+    const cases: Array<[string, Record<string, string>, RegExp, RegExp]> = [
+      ['malformed-central', { '_bmad/custom/config.toml': '[core\nbroken = \n' },
+        /project BMAD settings file is malformed: .*_bmad\/custom\/config\.toml/u, /settings file/u],
+      ['malformed-customization', { '_bmad/custom/bmad-build.toml': '[[workflow.review_layers]]\ninstruction = \n' },
+        /project BMAD settings file is malformed: .*_bmad\/custom\/bmad-build\.toml/u, /settings file/u],
+      ['non-string-setting', { '_bmad/custom/config.user.toml': '[core]\ncommunication_language = 7\n' },
+        /setting `core\.communication_language` must be a string, got 7/u, /settings file/u],
+      ['legacy-answer', { '_bmad/config.user.toml': '[core]\ncommunication_language = "Français"\n' },
+        /legacy BMAD installer answer `core\.communication_language` = "Français" differs from the effective value "English"/u,
+        /Retiring a repo-local install/u],
+      ['render-not-ignored', { '_bmad/render/.gitignore': '# kept, but ignores nothing\n' },
+        /does not ignore rendered workflow snapshots/u, /single `\*` line/u],
+    ];
+    for (const [name, files, message, hint] of cases) {
+      const fixture = fixtureRepo(name);
+      for (const [rel, text] of Object.entries(files)) {
+        mkdirSync(dirname(join(fixture.repo, rel)), { recursive: true });
+        writeFileSync(join(fixture.repo, rel), text);
+      }
+      const before = snapshot(fixture.repo);
+      const result = onboardBmadRepo(fixture.name, 'provision', {
+        workspaceRoot: fixture.workspace,
+        answers: answers(fixture.workspace, fixture.name),
+      });
+      expect(result.ready, name).toBe(false);
+      expect(result.deterministic, name).toBe(true);
+      expect(result.message, name).toMatch(message);
+      expect(result.repairHint, name).toMatch(hint);
+      expect(snapshot(fixture.repo), name).toBe(before);
+    }
+    // Legacy answers equal to the effective values (and layered like the
+    // installer's) do not block.
+    const equal = fixtureRepo('legacy-equal');
+    mkdirSync(join(equal.repo, '_bmad'), { recursive: true });
+    writeFileSync(join(equal.repo, '_bmad', 'config.toml'), '[core]\nproject_name = "x"\ncommunication_language = "Deutsch"\n');
+    writeFileSync(join(equal.repo, '_bmad', 'config.user.toml'), '[core]\ncommunication_language = "English"\n');
+    const ok = onboardBmadRepo(equal.name, 'provision', { workspaceRoot: equal.workspace, answers: answers(equal.workspace, equal.name) });
+    expect(ok.ready, ok.message).toBe(true);
   });
 
   it('skip touches nothing; a broken product bundle and a read-only repo stay retryable', () => {

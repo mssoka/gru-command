@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { isAbsolute, join, relative } from 'node:path';
 import { parse } from 'smol-toml';
@@ -27,6 +27,16 @@ export const BMAD_RENDER_GITIGNORE =
 export const BMAD_CUSTOM_GITIGNORE =
   '# Personal BMAD overrides stay local; team settings are committed.\n' +
   '*.user.toml\n';
+
+/** Settings the bundled skills read; each must resolve to a string. */
+const STRING_SETTINGS = new Set([
+  'core.communication_language',
+  'core.document_output_language',
+  'core.output_folder',
+  'modules.bmm.planning_artifacts',
+  'modules.bmm.implementation_artifacts',
+  'modules.bmm.project_knowledge',
+]);
 
 /** Output-location settings provisioning creates when they resolve inside the repo. */
 const OUTPUT_SETTINGS = [
@@ -58,6 +68,9 @@ export interface BmadRepoResult {
 const SYMLINK_REPAIR_HINT =
   'Replace the symlinked path with a real directory deliberately (keep a copy of anything you need), then re-run the wizard';
 const SETTINGS_REPAIR_HINT = 'Fix the reported project BMAD settings file deliberately, then re-run the wizard';
+const LEGACY_ANSWER_REPAIR_HINT =
+  'Move that setting into _bmad/custom/config.toml (team) or config.user.toml (personal) — docs/BMAD-RUNTIME.md ' +
+  '"Retiring a repo-local install" does this for every answer — then re-run the wizard';
 
 /**
  * A provisioning failure caused by unchanged on-disk repo state (a symlinked
@@ -234,7 +247,10 @@ function validateRepo(
   return repoPath;
 }
 
-function readSettingsLayer(path: string): Record<string, unknown> {
+function readSettingsLayer(repoPath: string, rel: string): Record<string, unknown> {
+  // Settings are project state: never read through a link out of the repo.
+  assertNoSymlinkComponents(repoPath, rel);
+  const path = join(repoPath, rel);
   if (!existsSync(path)) return {};
   // Read OUTSIDE the parse catch (gh-32 r1): a read/IO failure stays a
   // plain transient error; only UNPARSEABLE content is deterministic.
@@ -246,42 +262,91 @@ function readSettingsLayer(path: string): Record<string, unknown> {
   }
 }
 
-function settingAt(layers: readonly Record<string, unknown>[], path: readonly string[]): unknown {
-  let found: unknown;
-  for (const layer of layers) {
-    let current: unknown = layer;
-    for (const part of path) {
-      current = typeof current === 'object' && current !== null && !Array.isArray(current)
-        ? (current as Record<string, unknown>)[part]
-        : undefined;
+/** Every scalar leaf as `dotted.path → value` (arrays are not settings). */
+function scalarSettings(data: unknown, prefix = ''): Map<string, unknown> {
+  const out = new Map<string, unknown>();
+  if (typeof data !== 'object' || data === null || Array.isArray(data) || data instanceof Date) return out;
+  for (const [key, value] of Object.entries(data)) {
+    const path = prefix === '' ? key : `${prefix}.${key}`;
+    if (typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date)) {
+      for (const [nested, leaf] of scalarSettings(value, path)) out.set(nested, leaf);
+    } else if (!Array.isArray(value)) {
+      out.set(path, value);
     }
-    if (current !== undefined) found = current;
   }
-  return found;
+  return out;
+}
+
+/** Later layers win, as in the renderer's structural merge. */
+function effectiveSettings(layers: readonly Record<string, unknown>[]): Map<string, unknown> {
+  const merged = new Map<string, unknown>();
+  for (const layer of layers) for (const [path, value] of scalarSettings(layer)) merged.set(path, value);
+  return merged;
+}
+
+function sameSetting(left: unknown, right: unknown): boolean {
+  return left instanceof Date && right instanceof Date ? left.getTime() === right.getTime() : left === right;
+}
+
+interface ProjectSettings {
+  /** Repo-relative output folders to create. */
+  readonly outputs: readonly string[];
 }
 
 /**
- * Output folders from the same layers the runtime's renderer reads (GC
- * defaults, then `_bmad/custom/config.toml`, then `config.user.toml`).
- * Only locations that resolve inside the repository are created.
+ * Validate the project's settings the way the runtime's renderer will read
+ * them — GC defaults, then `_bmad/custom/config.toml`, then
+ * `config.user.toml` — so provisioning never reports ready for a project
+ * whose first render would halt: every `_bmad/custom/*.toml` must parse,
+ * the settings the bundled skills use must be strings, and a legacy
+ * installer answer the runtime no longer reads must not differ from the
+ * effective value (it would be silently dropped otherwise).
  */
-function outputLocations(repoPath: string, runtime: BundledBmadRuntime): string[] {
+function projectSettings(repoPath: string, runtime: BundledBmadRuntime): ProjectSettings {
   const defaults = runtime.files.get('config/defaults.toml');
   if (defaults === undefined) throw new Error(`bundled BMAD runtime ${runtime.id} lacks config/defaults.toml`);
-  const layers = [
+  assertNoSymlinkComponents(repoPath, '_bmad/custom');
+  const customDir = join(repoPath, '_bmad', 'custom');
+  if (existsSync(customDir) && lstatSync(customDir).isDirectory()) {
+    for (const name of readdirSync(customDir).filter((entry) => entry.endsWith('.toml')).sort()) {
+      readSettingsLayer(repoPath, `_bmad/custom/${name}`);
+    }
+  }
+  const effective = effectiveSettings([
     parse(defaults.toString('utf-8')) as Record<string, unknown>,
-    readSettingsLayer(join(repoPath, '_bmad', 'custom', 'config.toml')),
-    readSettingsLayer(join(repoPath, '_bmad', 'custom', 'config.user.toml')),
-  ];
-  const locations: string[] = [];
+    readSettingsLayer(repoPath, '_bmad/custom/config.toml'),
+    readSettingsLayer(repoPath, '_bmad/custom/config.user.toml'),
+  ]);
+  for (const [path, value] of effective) {
+    if (STRING_SETTINGS.has(path) && typeof value !== 'string') {
+      throw new BmadDeterministicSetupError(
+        `project BMAD setting \`${path}\` must be a string, got ${JSON.stringify(value)}`,
+        SETTINGS_REPAIR_HINT,
+      );
+    }
+  }
+  const legacy = effectiveSettings([
+    readSettingsLayer(repoPath, '_bmad/config.toml'),
+    readSettingsLayer(repoPath, '_bmad/config.user.toml'),
+  ]);
+  for (const [path, value] of legacy) {
+    if (effective.has(path) && !sameSetting(effective.get(path), value)) {
+      throw new BmadDeterministicSetupError(
+        `legacy BMAD installer answer \`${path}\` = ${JSON.stringify(value)} differs from the effective value ` +
+          `${JSON.stringify(effective.get(path))}; the GC-managed runtime does not read installer answers, so builds would stop`,
+        LEGACY_ANSWER_REPAIR_HINT,
+      );
+    }
+  }
+  const outputs: string[] = [];
   for (const path of OUTPUT_SETTINGS) {
-    const value = settingAt(layers, path);
-    if (typeof value !== 'string' || !value.includes('{project-root}')) continue;
+    const value = effective.get(path.join('.'));
+    if (typeof value !== 'string') continue;
     const resolved = value.split('{project-root}').join(repoPath);
     if (!isAbsolute(resolved) || !insideOrEqual(repoPath, resolved) || resolved === repoPath) continue;
-    locations.push(relative(repoPath, resolved).split('\\').join('/'));
+    outputs.push(relative(repoPath, resolved).split('\\').join('/'));
   }
-  return locations;
+  return { outputs };
 }
 
 interface ProvisionReport {
@@ -289,13 +354,28 @@ interface ProvisionReport {
   readonly kept: string[];
 }
 
-function ensureDirectory(repoPath: string, rel: string, report: ProvisionReport): void {
+/**
+ * Refuse a target (or any existing ancestor below the repo root) that is a
+ * link or the wrong kind of entry — checked for EVERY target before the
+ * first write, so a refusal never leaves a half-provisioned repo behind.
+ */
+function assertTarget(repoPath: string, rel: string, kind: 'directory' | 'file'): void {
   assertNoSymlinkComponents(repoPath, rel);
+  const parts = rel.split('/');
+  for (let index = 1; index <= parts.length; index += 1) {
+    const path = join(repoPath, ...parts.slice(0, index));
+    if (!existsSync(path)) return;
+    const wanted = index === parts.length ? kind : 'directory';
+    const info = lstatSync(path);
+    if (wanted === 'directory' ? !info.isDirectory() : !info.isFile()) {
+      throw new BmadDeterministicSetupError(`BMAD project path exists but is not a ${wanted}: ${path}`);
+    }
+  }
+}
+
+function ensureDirectory(repoPath: string, rel: string, report: ProvisionReport): void {
   const path = join(repoPath, rel);
   if (existsSync(path)) {
-    if (!lstatSync(path).isDirectory()) {
-      throw new BmadDeterministicSetupError(`BMAD project path exists but is not a directory: ${path}`);
-    }
     report.kept.push(rel);
     return;
   }
@@ -304,12 +384,8 @@ function ensureDirectory(repoPath: string, rel: string, report: ProvisionReport)
 }
 
 function ensureFile(repoPath: string, rel: string, content: string, report: ProvisionReport): void {
-  assertNoSymlinkComponents(repoPath, rel);
   const path = join(repoPath, rel);
   if (existsSync(path)) {
-    if (!lstatSync(path).isFile()) {
-      throw new BmadDeterministicSetupError(`BMAD project path exists but is not a file: ${path}`);
-    }
     report.kept.push(rel);
     return;
   }
@@ -318,24 +394,46 @@ function ensureFile(repoPath: string, rel: string, content: string, report: Prov
   report.created.push(rel);
 }
 
+/** A kept `_bmad/render/.gitignore` must still keep rendered snapshots out of git. */
+function assertRenderIgnored(repoPath: string): void {
+  if (!existsSync(join(repoPath, '_bmad', 'render', '.gitignore'))) return;
+  const probe = spawnSync('git', ['-C', repoPath, 'check-ignore', '-q', '--no-index', '_bmad/render/bmad-build/probe/workflow.md'], {
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10_000,
+  });
+  if (probe.error !== undefined || (probe.status !== 0 && probe.status !== 1)) {
+    throw new Error(`git check-ignore failed in ${repoPath}: ${probe.error?.message ?? probe.stderr}; retry or skip this repo`);
+  }
+  if (probe.status === 1) {
+    throw new BmadDeterministicSetupError(
+      `existing ${join(repoPath, '_bmad', 'render', '.gitignore')} does not ignore rendered workflow snapshots`,
+      'Make that file ignore everything (a single `*` line) or delete it so provisioning recreates it, then re-run the wizard',
+    );
+  }
+}
+
 /**
  * Create the project-local state the GC-managed runtime uses. Idempotent:
  * an existing path is validated and kept byte-for-byte, never rewritten.
  */
 export function provisionBmadProject(repoPath: string, runtime: BundledBmadRuntime): ProvisionReport {
   const report: ProvisionReport = { created: [], kept: [] };
-  // Validate every target before the first write, so a refusal never leaves
-  // a half-provisioned repo behind.
-  const outputs = outputLocations(repoPath, runtime);
-  for (const rel of ['_bmad', '_bmad/custom', '_bmad/custom/.gitignore', '_bmad/render', '_bmad/render/.gitignore', ...outputs]) {
-    assertNoSymlinkComponents(repoPath, rel);
+  const { outputs } = projectSettings(repoPath, runtime);
+  const targets: Array<[string, 'directory' | 'file', string?]> = [
+    ['_bmad', 'directory'],
+    ['_bmad/custom', 'directory'],
+    ['_bmad/custom/.gitignore', 'file', BMAD_CUSTOM_GITIGNORE],
+    ['_bmad/render', 'directory'],
+    ['_bmad/render/.gitignore', 'file', BMAD_RENDER_GITIGNORE],
+    ...outputs.map((rel): [string, 'directory'] => [rel, 'directory']),
+  ];
+  for (const [rel, kind] of targets) assertTarget(repoPath, rel, kind);
+  assertRenderIgnored(repoPath);
+  for (const [rel, kind, content] of targets) {
+    if (kind === 'directory') ensureDirectory(repoPath, rel, report);
+    else ensureFile(repoPath, rel, content!, report);
   }
-  ensureDirectory(repoPath, '_bmad', report);
-  ensureDirectory(repoPath, '_bmad/custom', report);
-  ensureFile(repoPath, '_bmad/custom/.gitignore', BMAD_CUSTOM_GITIGNORE, report);
-  ensureDirectory(repoPath, '_bmad/render', report);
-  ensureFile(repoPath, '_bmad/render/.gitignore', BMAD_RENDER_GITIGNORE, report);
-  for (const rel of outputs) ensureDirectory(repoPath, rel, report);
   return report;
 }
 

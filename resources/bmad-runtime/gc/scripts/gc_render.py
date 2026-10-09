@@ -21,8 +21,10 @@ Skill customization (later layers win):
   4. {project-root}/_bmad/custom/<skill>.user.toml (project, personal)
 
 Rendered snapshots are written to {project-root}/_bmad/render/ exactly as the
-upstream renderer does; that directory ignores itself in git. The runtime
-directory is never written.
+upstream renderer does; that directory ignores itself in git. Configured
+output folders inside the project are created on demand. Project state is
+never read or written through a symlink, and the runtime directory is never
+written.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse  # noqa: E402
+import os  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any  # noqa: E402
 
@@ -47,6 +50,12 @@ RENDER_IGNORE = (
 )
 # Legacy repo-local installer answers that the bundled runtime no longer reads.
 LEGACY_CONFIG_FILES = ("config.toml", "config.user.toml")
+# Output locations created on demand when they resolve inside the project.
+OUTPUT_SETTINGS = (
+    ("core", "output_folder"),
+    ("modules", "bmm", "planning_artifacts"),
+    ("modules", "bmm", "implementation_artifacts"),
+)
 
 
 class ProjectStateError(ValueError):
@@ -62,41 +71,49 @@ def _no_symlink(path: Path) -> None:
         )
 
 
-def ensure_render_root(project_root: Path) -> None:
-    """Create the project-local render location; refuse links out of the project."""
-    bmad_dir = project_root / "_bmad"
-    _no_symlink(bmad_dir)
-    if bmad_dir.exists() and not bmad_dir.is_dir():
-        raise ProjectStateError(f"{bmad_dir} exists but is not a directory")
-    render_dir = bmad_dir / "render"
-    _no_symlink(render_dir)
-    render_dir.mkdir(parents=True, exist_ok=True)
-    ignore = render_dir / ".gitignore"
-    _no_symlink(ignore)
-    if not ignore.exists():
-        ignore.write_text(RENDER_IGNORE, encoding="utf-8")
+def _no_symlink_below(root: Path, target: Path) -> None:
+    """Refuse a symlink in any component from `root` (exclusive) down to `target`."""
+    current = root
+    for part in target.relative_to(root).parts:
+        current = current / part
+        _no_symlink(current)
+
+
+def _no_symlink_in_tree(root: Path) -> None:
+    """Refuse a symlink at or anywhere below `root`."""
+    _no_symlink(root)
+    if not root.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in (*dirnames, *filenames):
+            _no_symlink(Path(dirpath) / name)
+
+
+def _custom_layer(project_root: Path, name: str) -> dict[str, Any]:
+    """Load one project layer from _bmad/custom/, never through a link."""
+    custom_dir = project_root / "_bmad" / "custom"
+    _no_symlink_below(project_root, custom_dir / name)
+    return config_utils.load_toml(custom_dir / name)
 
 
 def load_central_config(project_root: Path) -> dict[str, Any]:
-    custom_dir = project_root / "_bmad" / "custom"
     return config_utils.merge_layers(
         (
             config_utils.load_toml(RUNTIME_ROOT / "config" / "defaults.toml", required=True),
-            config_utils.load_toml(custom_dir / "config.toml"),
-            config_utils.load_toml(custom_dir / "config.user.toml"),
+            _custom_layer(project_root, "config.toml"),
+            _custom_layer(project_root, "config.user.toml"),
         )
     )
 
 
 def load_customization(project_root: Path | None, skill_dir: Path) -> dict[str, Any]:
     skill_name = skill_dir.name
-    custom_dir = project_root / "_bmad" / "custom" if project_root else None
     return config_utils.merge_layers(
         (
             config_utils.load_toml(skill_dir / "customize.toml", required=True),
             config_utils.load_toml(RUNTIME_ROOT / "customize" / f"{skill_name}.toml"),
-            config_utils.load_toml(custom_dir / f"{skill_name}.toml") if custom_dir else {},
-            config_utils.load_toml(custom_dir / f"{skill_name}.user.toml") if custom_dir else {},
+            _custom_layer(project_root, f"{skill_name}.toml") if project_root else {},
+            _custom_layer(project_root, f"{skill_name}.user.toml") if project_root else {},
         )
     )
 
@@ -117,23 +134,63 @@ def check_legacy_answers(project_root: Path, effective: dict[str, Any]) -> None:
     """Refuse to silently drop a legacy installer answer the runtime would use.
 
     A repo-local install kept its answers in _bmad/config.toml and
-    _bmad/config.user.toml. The bundled runtime reads _bmad/custom/ instead;
-    when a legacy answer for a setting the runtime resolves differs from the
-    effective value, rendering stops until the owner moves that setting.
+    _bmad/config.user.toml (the personal file wins). The bundled runtime reads
+    _bmad/custom/ instead; when the legacy answer for a setting the runtime
+    resolves differs from the effective value, rendering stops until the owner
+    moves that setting.
     """
-    resolved = _scalars(effective)
+    layers = []
     for name in LEGACY_CONFIG_FILES:
         path = project_root / "_bmad" / name
-        if not path.is_file():
+        _no_symlink_below(project_root, path)
+        if path.is_file():
+            layers.append(config_utils.load_toml(path))
+    legacy = _scalars(config_utils.merge_layers(layers))
+    resolved = _scalars(effective)
+    for key, value in legacy.items():
+        if key in resolved and resolved[key] != value:
+            raise ProjectStateError(
+                f"legacy BMAD installer answer `{key}` = {value!r} in {project_root / '_bmad'} differs from "
+                f"the effective value {resolved[key]!r}. The Gru Command BMAD runtime does not read "
+                "installer answers; move the setting to _bmad/custom/config.toml (team) or "
+                "_bmad/custom/config.user.toml (personal) — see docs/BMAD-RUNTIME.md."
+            )
+
+
+def ensure_render_root(project_root: Path, skill_name: str) -> None:
+    """Create the project-local render location; refuse links out of the project."""
+    bmad_dir = project_root / "_bmad"
+    _no_symlink(bmad_dir)
+    if bmad_dir.exists() and not bmad_dir.is_dir():
+        raise ProjectStateError(f"{bmad_dir} exists but is not a directory")
+    render_dir = bmad_dir / "render"
+    _no_symlink(render_dir)
+    render_dir.mkdir(parents=True, exist_ok=True)
+    ignore = render_dir / ".gitignore"
+    _no_symlink(ignore)
+    if not ignore.exists():
+        ignore.write_text(RENDER_IGNORE, encoding="utf-8")
+    # The upstream publisher writes below render/<skill>/; a link anywhere
+    # there would carry snapshots out of this checkout.
+    _no_symlink_in_tree(render_dir / skill_name)
+
+
+def ensure_output_folders(project_root: Path, central: dict[str, Any]) -> None:
+    """Create configured output folders that resolve inside this project."""
+    for path in OUTPUT_SETTINGS:
+        value: Any = central
+        for part in path:
+            value = value.get(part) if isinstance(value, dict) else None
+        if not isinstance(value, str):
             continue
-        for key, value in _scalars(config_utils.load_toml(path)).items():
-            if key in resolved and resolved[key] != value:
-                raise ProjectStateError(
-                    f"legacy BMAD installer answer `{key}` = {value!r} in {path} differs from the "
-                    f"effective value {resolved[key]!r}. The Gru Command BMAD runtime does not read "
-                    "installer answers; move the setting to _bmad/custom/config.toml (team) or "
-                    "_bmad/custom/config.user.toml (personal) — see docs/BMAD-RUNTIME.md."
-                )
+        target = Path(value.replace("{project-root}", str(project_root)))
+        if not target.is_absolute():
+            continue
+        target = Path(os.path.normpath(target))
+        if target == project_root or project_root not in target.parents:
+            continue
+        _no_symlink_below(project_root, target)
+        target.mkdir(parents=True, exist_ok=True)
 
 
 def main() -> int:
@@ -151,8 +208,11 @@ def main() -> int:
             raise ProjectStateError(
                 f"skill {skill_dir} is not part of this Gru Command BMAD runtime ({RUNTIME_ROOT})"
             )
-        check_legacy_answers(project_root, load_central_config(project_root))
-        ensure_render_root(project_root)
+        _no_symlink(project_root / "_bmad")
+        central = load_central_config(project_root)
+        check_legacy_answers(project_root, central)
+        ensure_render_root(project_root, skill_dir.name)
+        ensure_output_folders(project_root, central)
         render_skill.load_central_config = load_central_config
         render_skill.load_customization = load_customization
         entry = render_skill.render(project_root, skill_dir)

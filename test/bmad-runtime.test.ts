@@ -16,10 +16,11 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { parse } from 'smol-toml';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
+  bindBmadRuntime,
   BmadRuntimeError,
   createBmadRuntimeBinder,
   inspectMaterializedBmadRuntime,
@@ -30,7 +31,7 @@ import {
 import { readBmadRuntimeManifest, writeBmadRuntimeManifest } from '../src/bmad/vendor.js';
 import { runBmadRuntimeCli, skillLauncherCommand } from '../src/cli/bmad-runtime.js';
 import { loadConfig, type Role, type RuntimeId } from '../src/config.js';
-import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
 import type { AgentHandle, AgentRuntime, ManagedSkillSet, SpawnOptions } from '../src/runtime/types.js';
 import type { SessionStore } from '../src/sessions/store.js';
 
@@ -93,10 +94,11 @@ interface Rendered {
 
 /** Run the skill's OWN launcher line, as an agent would, with an empty HOME. */
 function render(runtime: MaterializedBmadRuntime, projectRoot: string, skill = 'bmad-build'): Rendered {
-  const result = spawnSync('/bin/sh', ['-c', skillLauncherCommand(runtime, skill, projectRoot)], {
+  const launcher = skillLauncherCommand(runtime, skill, projectRoot);
+  const result = spawnSync('/bin/sh', ['-c', launcher.command], {
     cwd: projectRoot,
     encoding: 'utf-8',
-    env: { PATH: process.env.PATH ?? '', HOME: emptyHome },
+    env: { PATH: process.env.PATH ?? '', HOME: emptyHome, ...launcher.env },
     timeout: 110_000,
   });
   const entry = /^read and follow (\/\S+)\/workflow\.md$/mu.exec(result.stdout ?? '');
@@ -161,6 +163,11 @@ describe('GC-managed BMAD runtime bundle', () => {
         symlinkSync(copy, target);
       }, /symlink/u],
       ['missing manifest', (b) => rmSync(join(b, 'runtime.json')), /cannot read runtime\.json/u],
+      ['symlinked bundle area', (b) => {
+        cpSync(join(b, 'gc'), `${b}-gc-elsewhere`, { recursive: true });
+        rmSync(join(b, 'gc'), { recursive: true });
+        symlinkSync(`${b}-gc-elsewhere`, join(b, 'gc'));
+      }, /bundle gc\/ is not a real directory/u],
     ];
     for (const [label, mutate, message] of cases) {
       const root = packageCopy();
@@ -282,6 +289,11 @@ describe('rendering for a project with no BMAD installation', () => {
       }
     }
     expect(readFileSync(join(generation, 'step-04-review.md'), 'utf-8')).toContain(join(repo, '_bmad-output', 'implementation-artifacts'));
+    // A fresh checkout needs nothing provisioned: the configured output
+    // folders are created on demand, and nothing shows up in git.
+    for (const dir of ['_bmad-output/planning-artifacts', '_bmad-output/implementation-artifacts']) {
+      expect(lstatSync(join(repo, dir)).isDirectory(), dir).toBe(true);
+    }
     expect(git(repo, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
   });
 
@@ -357,13 +369,37 @@ describe('rendering for a project with no BMAD installation', () => {
     writeFileSync(join(legacy, '_bmad', 'config.user.toml'), '[core]\nuser_name = "Owner"\ncommunication_language = "English"\n');
     expect(render(sharedRuntime, legacy).status).toBe(0);
 
-    const linked = cleanRepo('linked-state');
-    const elsewhere = tempDir('gru-command-bmad-elsewhere-');
-    symlinkSync(elsewhere, join(linked, '_bmad'));
-    const refused = render(sharedRuntime, linked);
-    expect(refused.status).toBe(1);
-    expect(refused.stdout).toContain('is a symlink');
-    expect(readdirSync(elsewhere)).toEqual([]);
+    // Legacy layers merge like the installer's (personal wins): a team
+    // answer superseded by a faithfully re-homed personal one is no conflict.
+    writeFileSync(join(legacy, '_bmad', 'config.toml'), '[core]\ncommunication_language = "English"\n');
+    writeFileSync(join(legacy, '_bmad', 'config.user.toml'), '[core]\ncommunication_language = "Deutsch"\n');
+    mkdirSync(join(legacy, '_bmad', 'custom'), { recursive: true });
+    writeFileSync(join(legacy, '_bmad', 'custom', 'config.user.toml'), '[core]\ncommunication_language = "Deutsch"\n');
+    expect(render(sharedRuntime, legacy).status).toBe(0);
+
+    // Project state is never read or written through a link out of the checkout.
+    const links: Array<[string, (repo: string, elsewhere: string) => void]> = [
+      ['_bmad', (repo, elsewhere) => symlinkSync(elsewhere, join(repo, '_bmad'))],
+      ['_bmad/custom', (repo, elsewhere) => {
+        mkdirSync(join(repo, '_bmad'), { recursive: true });
+        writeFileSync(join(elsewhere, 'config.toml'), '[core]\ncommunication_language = "English"\n');
+        symlinkSync(elsewhere, join(repo, '_bmad', 'custom'));
+      }],
+      ['_bmad/render/bmad-build', (repo, elsewhere) => {
+        mkdirSync(join(repo, '_bmad', 'render'), { recursive: true });
+        symlinkSync(elsewhere, join(repo, '_bmad', 'render', 'bmad-build'));
+      }],
+    ];
+    for (const [label, arrange] of links) {
+      const linked = cleanRepo(`linked-${label.replaceAll('/', '-')}`);
+      const elsewhere = tempDir('gru-command-bmad-elsewhere-');
+      arrange(linked, elsewhere);
+      const before = readdirSync(elsewhere);
+      const refused = render(sharedRuntime, linked);
+      expect(refused.status, label).toBe(1);
+      expect(refused.stdout, label).toContain('is a symlink');
+      expect(readdirSync(elsewhere), label).toEqual(before);
+    }
   });
 });
 
@@ -424,6 +460,61 @@ describe('job binding', () => {
     // … only restored when the current build ships exactly A's bytes.
     expect(bindA(laneOne)).toMatchObject({ root: a.root, contentSha256: a.contentSha256 });
     expect(existsSync(join(a.root, 'skills', 'bmad-build', 'SKILL.md'))).toBe(true);
+  });
+
+  it('a concurrent first bind adopts the binding that won; production service options carry the binder', async () => {
+    const repo = cleanRepo('race');
+    const lane = join(tempDir('gru-command-bmad-race-lane-'), 'lane');
+    git(repo, ['worktree', 'add', '-q', '-b', 'gru/race', lane]);
+    const store = tempDir('gru-command-bmad-race-store-');
+    const packageB = runtimeB();
+    const bundleA = loadBundledBmadRuntime(repoRoot);
+    const bundleB = loadBundledBmadRuntime(packageB);
+    // Another process binds the lane to A just before this one publishes B.
+    const loser = bindBmadRuntime(lane, {
+      storeRoot: store,
+      bundled: () => bundleB,
+      beforePublish: () => {
+        bindBmadRuntime(lane, { storeRoot: store, bundled: () => bundleA });
+      },
+    });
+    expect(loser.id).toBe(bundleA.id);
+    expect(loser.contentSha256).toBe(bundleA.contentSha256);
+    const bindingFile = join(git(lane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command', 'bmad-runtime.json');
+    expect(JSON.parse(readFileSync(bindingFile, 'utf-8')).runtime_id).toBe(bundleA.id);
+    expect(readdirSync(dirname(bindingFile))).toEqual(['bmad-runtime.json']);
+
+    // The options main.ts builds its registry from bind a minion's lane under the data dir.
+    const home = tempDir('gru-command-bmad-service-');
+    const config = loadConfig({ GRU_COMMAND_HOME: home });
+    const options = serviceRegistryOptions({ config, store: {} as SessionStore });
+    const seen: Array<ManagedSkillSet | undefined> = [];
+    const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+    const adapter: AgentRuntime = {
+      id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {},
+      spawn: async (role: Role, opts: SpawnOptions = {}): Promise<AgentHandle> => {
+        seen.push(opts.managedSkills);
+        return {
+          id: 'service-minion', role, sessionFile: join(home, 'minion.jsonl'), capabilities: caps,
+          health: () => ({ state: 'idle', lastActivity: null, sessionFile: join(home, 'minion.jsonl') }),
+          subscribe: () => () => {}, prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+          promptWithVerdict: async () => ({ ok: true, error: null }),
+          hasLiveProcess: () => false, isCompacting: () => false, dispose: async () => {},
+        };
+      },
+    };
+    class ServiceRegistry extends RuntimeRegistry {
+      override runtimeIdFor(): RuntimeId { return 'pi'; }
+      override runtimeFor(): AgentRuntime { return adapter; }
+    }
+    const serviceLane = join(tempDir('gru-command-bmad-service-lane-'), 'lane');
+    git(repo, ['worktree', 'add', '-q', '-b', 'gru/service', serviceLane]);
+    const handle = await new ServiceRegistry(options).spawn('minion', { cwd: serviceLane });
+    await handle.dispose();
+    expect(seen[0]).toMatchObject({ runtimeId: shipped.id, laneBound: true, skills: ['bmad-build'] });
+    expect(seen[0]!.root.startsWith(join(config.dataDir, 'bmad-runtime'))).toBe(true);
+    const serviceBinding = join(git(serviceLane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command', 'bmad-runtime.json');
+    expect(JSON.parse(readFileSync(serviceBinding, 'utf-8')).runtime_dir).toBe(seen[0]!.root);
   });
 
   it('a modified materialized runtime is refused, never silently repaired', () => {
@@ -487,11 +578,31 @@ describe('job binding', () => {
     ]);
     expect(bound).toEqual([lane]);
     await expect(registry.spawn('minion', { cwd: join(lane, 'broken') })).rejects.toThrow('bound runtime missing');
-    await expect(registry.spawn('minion')).rejects.toThrow(/needs an explicit cwd to bind its BMAD runtime/u);
+    // A cwd-less spawn (a supervised crash restart resumes by session file
+    // alone) still starts, without the managed runtime, and never binds.
+    const restarted = await registry.spawn('minion');
+    await restarted.dispose();
+    expect(seen.at(-1)).toEqual({ role: 'minion', managed: undefined });
+    expect(bound).toEqual([lane, join(lane, 'broken')]);
   });
 });
 
 describe('maintenance CLI', () => {
+  it('check passes paths through the environment, so shell syntax in a directory name stays inert', () => {
+    const parent = tempDir('gru-command-bmad-quoted-');
+    const repo = join(parent, 'it\'s "$(touch pwned)" `touch pwned2`');
+    mkdirSync(repo);
+    git(repo, ['init', '-q']);
+    const lines: string[] = [];
+    expect(runBmadRuntimeCli(['check', repo, '--store', sharedStore, '--package-root', repoRoot], (line) => lines.push(line))).toBe(0);
+    expect(lines.at(-1)).toMatch(/^ok bmad-build: read and follow \//u);
+    expect(lines.at(-1)).toContain(repo);
+    for (const dir of [parent, repo, process.cwd()]) {
+      expect(existsSync(join(dir, 'pwned')), dir).toBe(false);
+      expect(existsSync(join(dir, 'pwned2')), dir).toBe(false);
+    }
+  });
+
   it('manifest regeneration is reproducible and vendor refuses a mismatched upstream package', () => {
     const root = packageCopy();
     const bundle = join(root, 'resources', 'bmad-runtime');

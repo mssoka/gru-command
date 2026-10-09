@@ -59,6 +59,7 @@ bundle the same way, and never borrows a BMAD install from somewhere else.
 | `_bmad/custom/<skill>.toml` / `<skill>.user.toml` | project | customization overrides (team / personal) |
 | `_bmad-output/` (default) | project | specs, stories, evidence, other generated work; never moved or rewritten |
 | `_bmad/render/` | derived | rendered workflow snapshots; ignores itself (`.gitignore` = `*`) |
+| `_bmad/custom/legacy-install/` | project | verbatim installer answers kept by the retirement commands; not read |
 
 **Configuration precedence** (later wins):
 
@@ -80,17 +81,31 @@ one of them holds a value for a setting it uses that differs from the
 effective value. A setting is never dropped silently. The retirement commands
 below re-home those answers into `_bmad/custom/`.
 
-Rendering writes only into the project checkout it renders for
-(`_bmad/render/` of that worktree). It never writes into the runtime or
-another project, and it refuses a `_bmad` or `_bmad/render` symlink.
+Rendering writes only into the project checkout it renders for. It writes
+`_bmad/render/` of that worktree and creates configured output folders that
+resolve inside the project on demand, so a fresh worktree needs nothing
+provisioned. It never writes into the runtime or another project. It
+refuses to read or write project state through a symlink: `_bmad`,
+`_bmad/custom` and its settings files, and anything under
+`_bmad/render/<skill>`.
 
 **Provisioning.** The setup wizard's BMAD step (`provision`, the default for
 each selected repo; `skip` leaves a repo untouched) creates only what is
 missing: `_bmad/custom/` with its `.gitignore`, `_bmad/render/` with its
 `.gitignore`, and the configured output folders that resolve inside the repo.
 It never modifies an existing file or directory. It never touches a legacy
-install or unrelated skills, and never runs the upstream installer. The
-headless answers values `install` and `reuse` were retired with the
+install or unrelated skills, and never runs the upstream installer.
+
+Before creating anything, it checks the project the way the renderer will
+read it, so it never reports ready for a repo whose first build would stop:
+
+- every `_bmad/custom/*.toml` parses;
+- the settings the bundled skills read are strings;
+- no legacy installer answer differs from the effective value;
+- a kept `_bmad/render/.gitignore` still ignores snapshots;
+- no target is a symlink or the wrong kind of entry.
+
+The headless answers values `install` and `reuse` were retired with the
 repo-local installer and fail loud.
 
 ## How a job binds to a runtime
@@ -109,6 +124,9 @@ repo-local installer and fail loud.
 - A recorded runtime that is missing or modified fails the spawn loudly. GC
   restores it only when the current build ships the very same bytes.
 - A cwd that is not a linked worktree uses the current runtime unrecorded.
+  A spawn with no project cwd at all gets no runtime, and the service logs a
+  warning. Supervised crash restarts are such spawns: they resume from the
+  session file and are hosted at the workspace root.
 - Sessions receive the runtime beside the project's own skills. pi gets the
   bundled skills first, so a repo-local or global `bmad-build` can't shadow
   them. Claude Code loads the runtime with `--plugin-dir`, which lists the
@@ -243,8 +261,12 @@ def unpatched(data):
             text = text.replace("{{config.modules.%s.%s}}" % (module, key), "{{.%s}}" % key)
     return text.encode("utf-8")
 def proven(rel, name):
-    if name not in ids or os.path.islink(os.path.join(repo, rel)):
+    root = os.path.join(repo, rel)
+    if name not in ids or os.path.islink(root) or not os.path.isfile(os.path.join(root, "SKILL.md")):
         return False
+    for dirpath, dirnames, filenames in os.walk(root):
+        if any(os.path.islink(os.path.join(dirpath, n)) for n in dirnames + filenames):
+            return False
     for f in files_under(rel):
         if os.path.islink(os.path.join(repo, f)):
             return False
@@ -293,8 +315,12 @@ for name, scope in (("config.toml", "team"), ("config.user.toml", "personal")):
 blocked = []
 for scope, name in (("team", "config.toml"), ("personal", "config.user.toml")):
     path = os.path.join(repo, "_bmad", "custom", name)
-    if transfer[scope] and os.path.isfile(path) and tomllib.load(open(path, "rb")):
-        blocked.append(f"_bmad/custom/{name}")
+    custom = tomllib.load(open(path, "rb")) if os.path.isfile(path) else {}
+    present = flat(custom)
+    transfer[scope] = {k: v for k, v in transfer[scope].items() if present.get(k) != v}
+    if transfer[scope] and custom:
+        blocked.append(f"_bmad/custom/{name}: add {json.dumps(transfer[scope], ensure_ascii=False)}")
+legacy_answers = [n for n in ("config.toml", "config.user.toml") if os.path.isfile(os.path.join(repo, "_bmad", n))]
 moving = framework + bindings + gc_files
 tracked = git("ls-files", "-z").stdout.split("\0")
 protected = {}
@@ -312,7 +338,8 @@ for line in git("worktree", "list", "--porcelain").stdout.splitlines():
 plan = {"repo": repo, "framework": framework, "bindings": bindings, "unproven_bindings": unproven,
         "unrecognized": unrecognized, "gc_files": gc_files, "manifest_block": manifest_block,
         "exclude": exclude, "exclude_block": exclude_block, "git_source": source,
-        "transfer": transfer, "transfer_blocked": blocked, "protected": protected}
+        "transfer": transfer, "transfer_blocked": blocked, "legacy_answers": legacy_answers,
+        "custom_existed": os.path.isdir(os.path.join(repo, "_bmad", "custom")), "protected": protected}
 with open(os.path.join(backup, "plan.json"), "w", encoding="utf-8") as f:
     json.dump(plan, f, indent=2)
 print(f"Plan for {repo} (saved to {backup}/plan.json)")
@@ -320,14 +347,16 @@ print("  move aside (framework):", ", ".join(framework) or "nothing")
 print(f"  move aside (proven BMAD skill bindings): {len(bindings)}")
 print("  GC-owned bootstrap references:", ", ".join(gc_files + (["worktree.toml block"] if manifest_block else [])
       + (["local exclude block"] if exclude_block else []) + (["git config gru-command.bmad-source"] if source else [])) or "none")
-print("  re-home settings:", json.dumps(transfer) if any(transfer.values()) else "none differ from GC defaults")
+print("  re-home settings:", json.dumps(transfer, ensure_ascii=False) if any(transfer.values()) else "none pending")
+if legacy_answers:
+    print("  keep installer answers for reference in _bmad/custom/legacy-install/ (not read by the runtime):", ", ".join(legacy_answers))
 print("  keep untouched:", "_bmad/custom/, _bmad-output/,", len(protected), "protected files")
 for rel in unproven:
     print(f"  LEFT IN PLACE (not provably installer-owned): {rel}")
 for rel in unrecognized:
     print(f"  LEFT IN PLACE (not part of the supported layout): {rel}")
-for rel in blocked:
-    print(f"  STOP before step 3: {rel} already has settings; add {json.dumps(transfer)} by hand, then re-run this preview")
+for item in blocked:
+    print(f"  STOP before step 3: {item} by hand (the file already has settings), then re-run this preview")
 ignored = git("check-ignore", "-v", "_bmad/custom/config.toml").stdout.strip()
 if ignored:
     print(f"  NOTE: _bmad/custom/config.toml is git-ignored by `{ignored}`; team settings stay local until you change that rule")
@@ -338,9 +367,13 @@ PY
 
 **3. Back up and re-home settings.** This copies everything the next step
 edits in place into `$BACKUP/copy/`. It then writes legacy answers that
-differ from the GC defaults (only `[core]` and `[modules.bmm]`, the sections
-the bundled runtime uses) into `_bmad/custom/config.toml` (team) and
-`_bmad/custom/config.user.toml` (personal):
+differ from the GC defaults into `_bmad/custom/config.toml` (team) and
+`_bmad/custom/config.user.toml` (personal). Only `[core]` and
+`[modules.bmm]` move, because those are the sections the bundled runtime
+uses; answers already there are skipped. It also keeps both legacy answer
+files verbatim, including the settings of modules GC does not bundle, in
+`_bmad/custom/legacy-install/`. The runtime does not read that copy; it is
+there for reference.
 
 ```sh
 # bmad-retire:backup
@@ -355,6 +388,9 @@ if plan["transfer_blocked"]:
 copy = os.path.join(backup, "copy")
 if os.path.exists(copy):
     sys.exit(f"STOP: {copy} already exists; use a fresh BACKUP")
+os.makedirs(copy)
+if not plan["custom_existed"]:
+    open(os.path.join(copy, "custom-was-absent"), "w").close()
 for rel in ("_bmad/custom", ".gru-command/worktree.toml"):
     src, dst = os.path.join(repo, rel), os.path.join(copy, rel)
     if os.path.isdir(src) and not os.path.islink(src):
@@ -395,6 +431,14 @@ for scope, name in (("team", "config.toml"), ("personal", "config.user.toml")):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     print(f"re-homed {len(values)} setting(s) into {path}")
+for name in plan["legacy_answers"]:
+    dst = os.path.join(repo, "_bmad", "custom", "legacy-install", name)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.exists(dst):
+        sys.exit(f"STOP: {dst} already exists")
+    shutil.copy2(os.path.join(repo, "_bmad", name), dst)
+if plan["legacy_answers"]:
+    print("kept the installer answers in _bmad/custom/legacy-install/ (the runtime does not read them)")
 print(f"backup copies in {copy}")
 PY
 ```
@@ -410,6 +454,23 @@ repo, backup = (os.path.realpath(p) for p in sys.argv[1:3])
 plan = json.load(open(os.path.join(backup, "plan.json"), encoding="utf-8"))
 if plan["repo"] != repo or not os.path.isdir(os.path.join(backup, "copy")):
     sys.exit("STOP: run the preview and backup steps for this repository first")
+def drop_block(path, start, end):
+    text = open(path, encoding="utf-8", newline="").read()
+    lines = text.splitlines(keepends=True)
+    first = next(i for i, l in enumerate(lines) if l.rstrip("\r\n") == start)
+    last = next(i for i, l in enumerate(lines) if l.rstrip("\r\n") == end and i > first)
+    before, after = lines[:first], lines[last + 1:]
+    if after and after[0].strip() == "" and (not before or before[-1].strip() == ""):
+        after = after[1:]
+    if before and before[-1].strip() == "" and not after:
+        before = before[:-1]
+    return "".join(before + after)
+# Work out both edits before anything moves, so a surprise stops cleanly.
+manifest = os.path.join(repo, ".gru-command", "worktree.toml")
+manifest_rest = drop_block(manifest, "# BEGIN GRU COMMAND BMAD BOOTSTRAP", "# END GRU COMMAND BMAD BOOTSTRAP") \
+    if plan["manifest_block"] else None
+exclude_rest = drop_block(plan["exclude"], "# BEGIN GRU COMMAND BMAD GENERATED", "# END GRU COMMAND BMAD GENERATED") \
+    if plan["exclude_block"] else None
 moved = os.path.join(backup, "moved")
 for rel in plan["framework"] + plan["bindings"] + plan["gc_files"]:
     src, dst = os.path.join(repo, rel), os.path.join(moved, rel)
@@ -419,28 +480,14 @@ for rel in plan["framework"] + plan["bindings"] + plan["gc_files"]:
         sys.exit(f"STOP: {dst} already exists")
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.move(src, dst)
-def drop_block(path, start, end):
-    text = open(path, encoding="utf-8").read()
-    lines = text.splitlines(keepends=True)
-    first = next(i for i, l in enumerate(lines) if l.rstrip("\n") == start)
-    last = next(i for i, l in enumerate(lines) if l.rstrip("\n") == end and i > first)
-    before, after = lines[:first], lines[last + 1:]
-    if after and after[0].strip() == "" and (not before or before[-1].strip() == ""):
-        after = after[1:]
-    if before and before[-1].strip() == "" and not after:
-        before = before[:-1]
-    return "".join(before + after)
-manifest = os.path.join(repo, ".gru-command", "worktree.toml")
-if plan["manifest_block"]:
-    rest = drop_block(manifest, "# BEGIN GRU COMMAND BMAD BOOTSTRAP", "# END GRU COMMAND BMAD BOOTSTRAP")
-    if rest.strip():
-        open(manifest, "w", encoding="utf-8").write(rest)
+if manifest_rest is not None:
+    if manifest_rest.strip():
+        open(manifest, "w", encoding="utf-8", newline="").write(manifest_rest)
     else:
         os.makedirs(os.path.join(moved, ".gru-command"), exist_ok=True)
         shutil.move(manifest, os.path.join(moved, ".gru-command", "worktree.toml"))
-if plan["exclude_block"]:
-    rest = drop_block(plan["exclude"], "# BEGIN GRU COMMAND BMAD GENERATED", "# END GRU COMMAND BMAD GENERATED")
-    open(plan["exclude"], "w", encoding="utf-8").write(rest)
+if exclude_rest is not None:
+    open(plan["exclude"], "w", encoding="utf-8", newline="").write(exclude_rest)
 if plan["git_source"]:
     subprocess.run(["git", "-C", repo, "config", "--local", "--unset", "gru-command.bmad-source"], check=True)
 print(f"moved aside into {moved}")
@@ -518,6 +565,8 @@ for rel in ("_bmad/custom", ".gru-command/worktree.toml"):
         shutil.copytree(src, dst, symlinks=True)
     elif os.path.isfile(src):
         shutil.copy2(src, dst)
+if os.path.isfile(os.path.join(copy, "custom-was-absent")):
+    shutil.rmtree(os.path.join(repo, "_bmad", "custom"), ignore_errors=True)
 if os.path.isfile(os.path.join(copy, "info-exclude")):
     shutil.copy2(os.path.join(copy, "info-exclude"), plan["exclude"])
 if plan["git_source"]:

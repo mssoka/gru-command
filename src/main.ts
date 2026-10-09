@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:f
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
-import { RuntimeRegistry } from './runtime/registry.js';
+import { RuntimeRegistry, serviceRegistryOptions } from './runtime/registry.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
@@ -90,7 +90,6 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import { createBmadRuntimeBinder } from './bmad/runtime.js';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
 
@@ -527,14 +526,13 @@ async function main(): Promise<number> {
   // BEFORE the server so /health can answer with real signals from the
   // first request. Growth findings also hit the log (SPEC ruling 12).
   const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
-  const registry = new RuntimeRegistry({
+  // Issue #283: the service options carry the binder that gives
+  // build-workflow sessions the GC-managed BMAD runtime of their job lane.
+  const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
     log: (level, msg, fields) => logger.log(level, msg, fields),
-    // Issue #283: build-workflow sessions get the GC-managed BMAD runtime
-    // bound to their job lane (materialized under the data dir).
-    bmadRuntime: createBmadRuntimeBinder(join(config.dataDir, 'bmad-runtime')),
-  });
+  }));
   const growth = registry.boot();
   state.store = store;
   state.registry = registry;

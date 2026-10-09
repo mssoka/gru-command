@@ -19,7 +19,8 @@ export function managedSkillsPromptNote(managed: ManagedSkillSet, runtime: Runti
     '## Gru Command BMAD runtime',
     '',
     `This session is bound to the Gru Command-managed BMAD runtime \`${managed.runtimeId}\` ` +
-      `(content sha256 \`${managed.contentSha256.slice(0, 16)}\`), installed read-only at \`${managed.root}\`. ` +
+      `(content sha256 \`${managed.contentSha256.slice(0, 16)}\`), installed at \`${managed.root}\` ` +
+      '(read-only files, verified against that hash whenever a session starts). ' +
       (managed.laneBound
         ? 'The binding is recorded for this job lane and does not change when Gru Command is updated. '
         : '') +

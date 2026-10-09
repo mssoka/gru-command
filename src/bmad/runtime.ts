@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -292,6 +293,8 @@ export function loadBundledBmadRuntime(packageRoot: string = PACKAGE_ROOT): Bund
   for (const area of ['upstream', 'gc']) {
     const root = join(bundleRoot, area);
     try {
+      const info = lstatSync(root);
+      if (info.isSymbolicLink() || !info.isDirectory()) throw new BmadRuntimeError(`bundle ${area}/ is not a real directory`);
       for (const rel of listRegularFiles(root, `bundle ${area}/`)) present.add(`${area}/${rel}`);
     } catch (error) {
       if (error instanceof BmadRuntimeError) throw failure(error.message);
@@ -470,6 +473,8 @@ export interface BmadRuntimeBinderOptions {
   readonly storeRoot: string;
   /** The verified runtime this GC build ships (memoize it: one bundle per process). */
   readonly bundled: () => BundledBmadRuntime;
+  /** Test seam: runs just before a first binding is published (race proofs). */
+  readonly beforePublish?: () => void;
 }
 
 /**
@@ -484,32 +489,7 @@ export function bindBmadRuntime(cwd: string, options: BmadRuntimeBinderOptions):
     return { ...materializeBmadRuntime(options.bundled(), options.storeRoot), bindingFile: null };
   }
   const bindingFile = join(gitDir, BINDING_FILE);
-  if (existsSync(bindingFile)) {
-    const record = parseBindingRecord(readFileSync(bindingFile, 'utf-8'), bindingFile);
-    let bound: MaterializedBmadRuntime;
-    try {
-      bound = inspectMaterializedBmadRuntime(record.runtime_dir);
-    } catch (error) {
-      // The very same bytes still ship with this build: restoring them is
-      // not a switch. Anything else fails loud — the job keeps its runtime.
-      const current = options.bundled();
-      if (current.contentSha256 !== record.content_sha256 ||
-          join(options.storeRoot, current.dirName) !== record.runtime_dir) {
-        throw new BmadRuntimeError(
-          `job lane ${cwd} is bound to BMAD runtime ${record.runtime_id} at ${record.runtime_dir}, ` +
-            `which is unusable: ${(error as Error).message}. A running job never switches runtimes ` +
-            'silently: restore that runtime directory, or retire the lane and dispatch the job again.',
-        );
-      }
-      bound = materializeBmadRuntime(current, options.storeRoot);
-    }
-    if (bound.contentSha256 !== record.content_sha256) {
-      throw new BmadRuntimeError(
-        `job lane ${cwd} is bound to BMAD runtime content ${record.content_sha256}, but ${record.runtime_dir} holds ${bound.contentSha256}`,
-      );
-    }
-    return { ...bound, bindingFile };
-  }
+  if (existsSync(bindingFile)) return boundRuntime(cwd, bindingFile, options);
   const runtime = materializeBmadRuntime(options.bundled(), options.storeRoot);
   const record: BindingRecord = {
     schema_version: 1,
@@ -519,14 +499,48 @@ export function bindBmadRuntime(cwd: string, options: BmadRuntimeBinderOptions):
     bound_at: new Date().toISOString(),
   };
   mkdirSync(dirname(bindingFile), { recursive: true });
-  const tmp = `${bindingFile}.tmp-${process.pid}`;
+  const tmp = `${bindingFile}.tmp-${process.pid}-${Date.now()}`;
   try {
-    writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf-8', flag: 'w', mode: 0o644 });
-    renameSync(tmp, bindingFile);
+    writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf-8', flag: 'wx', mode: 0o644 });
+    options.beforePublish?.();
+    // Publish without replacement: when another process bound this lane
+    // first (possibly to a different runtime), its binding wins.
+    linkSync(tmp, bindingFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    return boundRuntime(cwd, bindingFile, options);
   } finally {
     rmSync(tmp, { force: true });
   }
   return { ...runtime, bindingFile };
+}
+
+/** The runtime a lane's existing binding record names — never another one. */
+function boundRuntime(cwd: string, bindingFile: string, options: BmadRuntimeBinderOptions): BmadRuntimeBinding {
+  const record = parseBindingRecord(readFileSync(bindingFile, 'utf-8'), bindingFile);
+  let bound: MaterializedBmadRuntime;
+  try {
+    bound = inspectMaterializedBmadRuntime(record.runtime_dir);
+  } catch (error) {
+    // The very same bytes still ship with this build: restoring them is
+    // not a switch. Anything else fails loud — the job keeps its runtime.
+    const current = options.bundled();
+    if (current.contentSha256 !== record.content_sha256 ||
+        join(options.storeRoot, current.dirName) !== record.runtime_dir) {
+      throw new BmadRuntimeError(
+        `job lane ${cwd} is bound to BMAD runtime ${record.runtime_id} at ${record.runtime_dir}, ` +
+          `which is unusable: ${(error as Error).message}. A running job never switches runtimes ` +
+          'silently: restore that runtime directory, or retire the lane and dispatch the job again.',
+      );
+    }
+    bound = materializeBmadRuntime(current, options.storeRoot);
+  }
+  if (bound.contentSha256 !== record.content_sha256) {
+    throw new BmadRuntimeError(
+      `job lane ${cwd} is bound to BMAD runtime content ${record.content_sha256}, but ${record.runtime_dir} holds ${bound.contentSha256}`,
+    );
+  }
+  return { ...bound, bindingFile };
 }
 
 /** A process-wide binder: the bundle is read and verified once, on first use. */
