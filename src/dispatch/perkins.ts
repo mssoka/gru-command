@@ -1966,6 +1966,7 @@ export class WaveRunner {
     // Every tracked operation this pass saw — including one an earlier pass
     // already aborted that has not settled: it still must be proven gone.
     let operationsSeen = 0;
+    const sessionRoundIds = new Set<string>();
     // A fallback gate owns no round: its stop is proven on the job, and an
     // earlier unproven fallback stop is re-proven by this pass.
     let fallbackInvolved = this.fallbackSupersessionUnproven(input.jobId);
@@ -1987,6 +1988,9 @@ export class WaveRunner {
       }
       const ops = [...(this.reviewOperations.get(input.jobId) ?? [])];
       operationsSeen = Math.max(operationsSeen, ops.length);
+      // A run whose round is already terminal (finishing its cleanup) still
+      // owns sessions: prove them too, without re-superseding the round.
+      for (const op of ops) if (op.roundId !== null) sessionRoundIds.add(op.roundId);
       if (ops.length === 0 && active.roundIds.every((id) => roundIds.has(id)) && pass > 0) break;
       for (const op of ops) {
         if (!op.controller.signal.aborted) {
@@ -2042,7 +2046,7 @@ export class WaveRunner {
     // fallback gate was superseded (they register without a round id).
     const sessions = this.opts.ledger.listAgents()
       .filter((agent) => agent.role === 'perkins' && (
-        (agent.roundId !== null && roundIds.has(agent.roundId)) ||
+        (agent.roundId !== null && (roundIds.has(agent.roundId) || sessionRoundIds.has(agent.roundId))) ||
         (fallbackInvolved && agent.roundId === null && agent.jobId === input.jobId && agent.label === 'fallback-review')));
     const live = this.opts.liveReviewSessions !== undefined
       ? this.opts.liveReviewSessions(sessions.map((agent) => agent.id))

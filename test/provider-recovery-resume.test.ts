@@ -212,6 +212,27 @@ class ClaimHarness {
 }
 
 describe('guarded claim — happy path', () => {
+  it('a RESUMED session receives the pending material amendments once, after its interrupted prompt', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-session-amended-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'minion.jsonl');
+    const jobId = 'j-resumed-amended';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    const amended = h.ledger.addJobAmendment({
+      jobId, body: 'RESUMED-CORRECTION: restore the strict viewport tests.', effect: 'material',
+      approval: { by: 'gru', reference: 'j-amend-resume' }, expectedContractSha256: h.ledger.effectiveContract(jobId)!.contractSha256,
+    });
+    expect(amended.status).toBe('accepted');
+    expect(await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas')).toMatchObject({ outcome: 'continued', path: 'resumed' });
+    const prompted = [...h.registry.handles.values()].flatMap((handle) => handle.prompts);
+    expect(prompted).toHaveLength(1);
+    expect(prompted[0]).toContain('continue the work');
+    expect(prompted[0]!.split('RESUMED-CORRECTION: restore the strict viewport tests.')).toHaveLength(2);
+    expect(prompted[0]).toContain('CONTRACT REVISION 1');
+    expect(prompted[0]).not.toContain('records the delivery of this turn');
+  });
+
   it('a resumed interrupted turn carries the approved material amendments it has not delivered (owner rule 4)', async () => {
     const h = new ClaimHarness();
     const jobId = 'j-amended';

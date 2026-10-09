@@ -1002,12 +1002,14 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
 }
 
-/** True when the newest round was superseded (owner rule 3) before this
- * delivery: whatever head it reviewed, it reviewed the old contract. */
-function supersededBefore(ledger: DigestLedger, round: RoundRecord, delivered: EventRecord): boolean {
+/** True when the newest round was superseded (owner rule 3): whatever head
+ * it reviewed, it never reached a verdict on the current contract, so the
+ * current delivery owes a fresh review — whether a correction re-delivered
+ * (any SHA) or the correction was retracted and the old delivery stands.
+ * The revision and verification fences gate the offer until it is due. */
+function supersededBefore(ledger: DigestLedger, round: RoundRecord, _delivered: EventRecord): boolean {
   if (round.status !== 'aborted') return false;
-  const superseded = ledger.latestRoundEvent(round.id, 'round.superseded');
-  return superseded !== null && superseded.seq < delivered.seq;
+  return ledger.latestRoundEvent(round.id, 'round.superseded') !== null;
 }
 
 /** True when the delivery carries a work revision the round never froze

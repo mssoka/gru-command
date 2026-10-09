@@ -1476,3 +1476,42 @@ describe('review round 4 — fences that cannot be talked around', () => {
     expect(claims).toEqual([]);
   });
 });
+
+describe('review round 5 — nothing strands the heist', () => {
+  it('a correction retracted after it superseded the review re-offers a review of the standing delivery', async () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-retracted', repo: 'r', title: 't', briefing: BRIEFING });
+    ledger.setJobStatus('job-retracted', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-retracted', payload: { sha: 'stand-sha' } });
+    ledger.setJobPr('job-retracted', 'https://github.com/acme/fixture/pull/13');
+    ledger.setJobStatus('job-retracted', 'in-review');
+    const round = ledger.addRound({ jobId: 'job-retracted', targetRef: 'stand-sha', lenses: ['blind'] });
+    ledger.setRoundStatus(round.id, 'live');
+    const material = amend(ledger, 'job-retracted', 'material', 'Add the review chip.');
+    ledger.appendCustomEvent({ kind: 'round.superseded', jobId: 'job-retracted', roundId: round.id, payload: { reason: 'material' } });
+    ledger.setRoundStatus(round.id, 'aborted');
+    const digest = () => computeSilasDigest({
+      ledger, blockersForRound: async () => ({ blockers: [], note: null }), config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+    });
+    expect((await digest()).prWithoutReview).toEqual([]); // the correction is owed first
+    accepted(ledger.addJobAmendment({
+      jobId: 'job-retracted', body: 'Retracted: no chip.', supersedes: [`amendment:${material.id}`],
+      approval: { by: 'gru', reference: 'j-retract-2' }, expectedContractSha256: ledger.effectiveContract('job-retracted')!.contractSha256,
+      effect: 'administrative',
+    }));
+    expect((await digest()).prWithoutReview.map((row) => row.jobId)).toEqual(['job-retracted']);
+  });
+
+  it('a pending revision fences a review of a FOREIGN target too, and force cannot waive it', async () => {
+    const h = await plainLane('job-foreign-target');
+    deliver(h.ledger, h.jobId);
+    amend(h.ledger, h.jobId, 'material', 'Approved correction.');
+    for (const force of [false, true]) {
+      await expect(h.wave.requestReview({ jobId: h.jobId, targetRef: 'main', ...(force ? { force: true } : {}) }))
+        .rejects.toThrow(/force cannot review an obsolete candidate/);
+    }
+    const refusal = h.ledger.latestJobEvent(h.jobId, 'branch-idle.refused');
+    expect(refusal?.payload).toMatchObject({ forced: false, blockers: [{ jobId: h.jobId, revision: { required: 1, delivered: 0 } }] });
+    expect(h.ledger.listRounds(h.jobId)).toHaveLength(0);
+  });
+});
