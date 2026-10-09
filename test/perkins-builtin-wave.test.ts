@@ -2844,6 +2844,154 @@ describe('WaveRunner built-in Perkins production path', () => {
     }
   }, 180_000);
 
+  it('Stage-5 integration: a whole-complete prior binds the advanced-base head without chaining a whole pass', async () => {
+    const repo = makeFixtureRepo('perkins-wave-integration');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/integration']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-int-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-int-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-int-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/integration', h0);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-integration' });
+    const job = ledger.addJob({
+      id: 'job-integration', repo: 'fixture', title: 'integration', baseBranch: 'main', briefing: 'review',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
+    attachOrigin(repo, 'feature/integration', root);
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9003', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    // Round 1 (whole) at H0 on the pinned base B0.
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-int-s1-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+    expect(ledger.latestRoundEvent(first.round.id, 'round.perkins-review')!.payload)
+      .toMatchObject({ canonicalVerdict: 'READY TO MERGE', reviewScope: 'whole', coverageComplete: true });
+
+    // Main advances and the feature integrates it forward into H1.
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main1.ts', 'export const main1 = 1;\n');
+    repo.git(['checkout', 'feature/integration']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/integration']);
+
+    // Round 2 plans integration from the durable prior + real ancestry and
+    // binds H1 with NO chained whole pass.
+    const second = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-int-s2-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(second.round.seq).toBe(2);
+    expect(second.canonicalVerdict).toBe('READY TO MERGE');
+    expect(second.finalPass).toBeUndefined();
+    const secondReview = ledger.latestRoundEvent(second.round.id, 'round.perkins-review')!;
+    expect(secondReview.payload).toMatchObject({ canonicalVerdict: 'READY TO MERGE', reviewScope: 'integration', coverageComplete: true });
+    expect((secondReview.payload as { finalPassRequired?: unknown }).finalPassRequired).toBeUndefined();
+    expect(ledger.listRounds(job.id)).toHaveLength(2);
+
+    for (const directory of [root, artifacts]) {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  it('Stage-5 integration: a partial prior still chains the final whole pass after the advanced base', async () => {
+    const repo = makeFixtureRepo('perkins-wave-integration-partial');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/integration']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-intp-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-intp-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-intp-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/integration', h0);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-integration-partial' });
+    const job = ledger.addJob({
+      id: 'job-integration-partial', repo: 'fixture', title: 'integration partial', baseBranch: 'main', briefing: 'review',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/40');
+    attachOrigin(repo, 'feature/integration', root);
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9004', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-intp-s1-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+    // Make the prior round PARTIAL coverage (as a real delta/unknown prior would
+    // be): the next integration must NOT treat it as whole-complete.
+    const priorFile = join(artifacts, first.round.id, 'consolidated.json');
+    const prior = JSON.parse(readFileSync(priorFile, 'utf8')) as { convergence: Record<string, unknown> };
+    // Make the prior round PARTIAL coverage (a delta-scope round with no
+    // whole-candidate bit): the next integration must NOT treat it as complete.
+    prior.convergence['reviewScope'] = 'delta';
+    delete prior.convergence['coverageComplete'];
+    writeFileSync(priorFile, JSON.stringify(prior));
+
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main1.ts', 'export const main1 = 1;\n');
+    repo.git(['checkout', 'feature/integration']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/integration']);
+
+    const second = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-intp-s2-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    // The wave AUTO-CHAINS the final whole pass (round 3) for the partial prior.
+    expect(second.round.seq).toBe(3);
+    const rounds = ledger.listRounds(job.id);
+    expect(rounds).toHaveLength(3);
+    const integrationRound = rounds.find((round) => round.seq === 2)!;
+    expect(ledger.latestRoundEvent(integrationRound.id, 'round.perkins-review')!.payload).toMatchObject({
+      canonicalVerdict: 'READY TO MERGE', reviewScope: 'integration', finalPassRequired: true,
+    });
+    expect(ledger.latestRoundEvent(second.round.id, 'round.perkins-review')!.payload)
+      .toMatchObject({ canonicalVerdict: 'READY TO MERGE', reviewScope: 'whole' });
+
+    for (const directory of [root, artifacts]) {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 180_000);
+
   it('requires old-head writer cessation before admitting a new-head review', async () => {
     const repo = makeFixtureRepo('perkins-historical-head');
     repos.push(repo);
