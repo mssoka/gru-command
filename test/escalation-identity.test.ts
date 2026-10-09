@@ -202,7 +202,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // 32 of 35 sites carry the bounded context; the three null rows are the
+    // 33 of 36 sites carry the bounded context; the three null rows are the
     // sanctioned residuals (shutdown deadline, live-process pause, sweep
     // error) that stay deliberately context-free and live (A7 rejection
     // stands; a worktree id is never coerced into a round identity).
@@ -215,6 +215,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['title', 'context'],
       // Owner rule 3: an unproven supersession stop blocks the writer.
       ['`Review of job ${input.jobId} could not be confirmed stopped — its writer is blocked`', '{ jobId: input.jobId, ...(roundIds.size === 1 ? { roundId: [...roundIds][0]! } : {}) }'],
+      ['`Review round ${round.id} cannot be promoted: its review coverage state is missing or damaged`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} carries a posted verdict without a provider-bound receipt`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${String(lane.roundId)} could not be processed during startup recovery`', '{ ...(lane.jobId !== null ? { jobId: lane.jobId } : {}), ...(lane.roundId !== null ? { roundId: lane.roundId } : {}), }'],
@@ -250,7 +251,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(35);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(32);
+    expect(sites).toHaveLength(36);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(33);
   });
 });
