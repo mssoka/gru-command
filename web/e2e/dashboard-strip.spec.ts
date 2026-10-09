@@ -1493,6 +1493,7 @@ test('1200x900 dark: the FOR YOU essentials hold >=4.5:1 settled; the dim frame 
     document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState === 'running').length);
   const transientRatio = await contrastRatio(page, target);
   expect(runningTransitions, 'a real transition was running (not a sleep)').toBeGreaterThan(0);
+  console.log(`1200x900 dark transient probe: ${transientRatio.toFixed(2)} with ${runningTransitions} transition(s) running`);
 
   // Settled state: every animation finished, then the SAME label measures
   // the approved essential-text floor against its effective background.
@@ -1501,6 +1502,8 @@ test('1200x900 dark: the FOR YOU essentials hold >=4.5:1 settled; the dim frame 
     document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState === 'running').length);
   expect(stillRunning, 'settlement is real: no transition still running').toBe(0);
   const settledRatio = await contrastRatio(page, target);
+  // The numbers belong in the record: a passing inequality is not a datum.
+  console.log(`1200x900 dark ${target}: pre-settlement ratio ${transientRatio.toFixed(2)} (${runningTransitions} transition(s) running) -> settled ratio ${settledRatio.toFixed(2)} (${stillRunning} running)`);
   expect(settledRatio, `settled ${target} contrast (dark, 1200x900)`).toBeGreaterThanOrEqual(4.5);
   // The artifact and the steady state are different states, and the dim one
   // is the unsettled one (this is the causal claim, measured not assumed).
