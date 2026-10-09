@@ -269,7 +269,7 @@ export function hostDisclosureAppendix(
       readonly deltaFromSha?: string;
       readonly integrationFromSha?: string;
       readonly integrationBaseSha?: string;
-      readonly integrationAutoMergeTree?: string;
+      readonly integrationPriorDiffBase?: string;
       readonly integrationDeltaSha256?: string;
       readonly carriedPriors?: readonly number[];
       readonly deferredFollowups?: readonly { readonly title: string; readonly location: string; readonly severity: string }[];
@@ -5410,7 +5410,8 @@ export class WaveRunner {
             ...(review.convergence.scopeReason !== undefined ? { scopeReason: review.convergence.scopeReason } : {}),
             ...(review.convergence.integrationFromSha !== undefined ? { integrationFromSha: review.convergence.integrationFromSha } : {}),
             ...(review.convergence.integrationBaseSha !== undefined ? { integrationBaseSha: review.convergence.integrationBaseSha } : {}),
-            ...(review.convergence.integrationAutoMergeTree !== undefined ? { integrationAutoMergeTree: review.convergence.integrationAutoMergeTree } : {}),
+            ...(review.convergence.integrationPriorDiffBase !== undefined ? { integrationPriorDiffBase: review.convergence.integrationPriorDiffBase } : {}),
+            ...(review.convergence.coverageComplete === true ? { coverageComplete: true } : {}),
             ...(review.convergence.integrationDeltaSha256 !== undefined ? { integrationDeltaSha256: review.convergence.integrationDeltaSha256 } : {}),
             ...(review.convergence.carriedPriors !== undefined ? { carriedPriors: review.convergence.carriedPriors.length } : {}),
             ...(review.convergence.carriedLenses !== undefined ? { carriedLenses: review.convergence.carriedLenses } : {}),

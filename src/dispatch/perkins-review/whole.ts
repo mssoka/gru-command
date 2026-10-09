@@ -241,9 +241,8 @@ export interface ReviewConvergence {
   readonly integrationFromSha?: string;
   /** Integration scope only: the advanced incoming base B1. */
   readonly integrationBaseSha?: string;
-  /** Integration scope only: the clean auto-merge tree `merge(H0,B1)` the
-   * reviewed integration unit is diffed from (a TREE object, not a commit). */
-  readonly integrationAutoMergeTree?: string;
+  /** Integration scope only: the prior round's own pinned base B0. */
+  readonly integrationPriorDiffBase?: string;
   /** sha256 of the persisted `integration-delta.patch` review unit. */
   readonly integrationDeltaSha256?: string;
   /** Prior indexes carried forward without lead re-verification. */
@@ -263,6 +262,12 @@ export interface ReviewConvergence {
   /** Set only when the host recomputed the canonical verdict because a
    * deferred blocker changed the converged blocker set. */
   readonly verdictRecomputed?: { readonly from: CanonicalReviewVerdict; readonly to: CanonicalReviewVerdict };
+  /** Set only when this round's scope + retained coverage covers the WHOLE
+   * current candidate (a whole round, or an integration round whose prior
+   * was itself whole-complete). Persisted so the NEXT round reads a durable
+   * bit instead of inferring coverage from a scope label — a partial-coverage
+   * integration round records NO such bit and can never launder into one. */
+  readonly coverageComplete?: true;
   /** A delta round that posted READY still owes the final whole-change
    * pass: approval must never be credited before that pass runs. */
   readonly finalPassRequired?: true;
@@ -737,17 +742,20 @@ interface PriorReview {
   /** Valid lens results of the prior round ([] for legacy records without
    * a specialistRuns field). */
   readonly validLenses: readonly PerkinsLens[];
-  /** The prior round's own review scope ('unknown' for legacy records):
-   * only a whole-complete prior scope can carry whole-change coverage into
-   * an integration round without also owing the final whole pass. */
+  /** The prior round's own review scope ('unknown' for legacy records). */
   readonly reviewScope: 'whole' | 'delta' | 'integration' | 'unknown';
+  /** Durable whole-candidate coverage bit: true only when the prior round's
+   * scope + retained coverage covered the whole candidate. A legacy `whole`
+   * record without the bit is whole-complete by construction; a `delta` or a
+   * partial `integration` record is not. */
+  readonly coverageComplete: boolean;
 }
 
 /** Load the prior round's consolidated record. schemaVersion 2 is the retired
  * chunk-protocol shape (read-only compatibility; its `chunks` field is
  * tolerated and ignored); schemaVersion 3 is the whole-PR shape. */
 function loadPriorReview(file: string | undefined): PriorReview {
-  if (file === undefined) return { findings: [], targetSha: null, diffBaseSha: null, validLenses: [], reviewScope: 'unknown' };
+  if (file === undefined) return { findings: [], targetSha: null, diffBaseSha: null, validLenses: [], reviewScope: 'unknown', coverageComplete: false };
   const size = statSync(file).size;
   if (size > 8 * 1024 * 1024) throw new Error('prior consolidated review exceeds 8 MiB');
   const bytes = readFileSync(file);
@@ -758,7 +766,7 @@ function loadPriorReview(file: string | undefined): PriorReview {
     schemaVersion?: unknown; findings?: unknown;
     frozen?: { targetSha?: unknown; diffBaseSha?: unknown };
     specialistRuns?: unknown;
-    convergence?: { reviewScope?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationAutoMergeTree?: unknown };
+    convergence?: { reviewScope?: unknown; coverageComplete?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
   };
   if (
     (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3) ||
@@ -819,24 +827,41 @@ function loadPriorReview(file: string | undefined): PriorReview {
     diffBaseSha: typeof parsed.frozen.diffBaseSha === 'string' ? parsed.frozen.diffBaseSha : null,
     validLenses,
     reviewScope: priorReviewScope(parsed),
+    coverageComplete: priorCoverageComplete(parsed),
   };
 }
 
+/** Durable whole-candidate coverage of the prior round. Only a recognized
+ * scope with an explicit `coverageComplete: true` (new records), or a legacy
+ * `whole` scope without the field, qualifies; a partial integration or delta
+ * round never does, and a `coverageComplete` claim on a record whose
+ * integration linkage is damaged reads as no coverage (fail closed). */
+function priorCoverageComplete(parsed: {
+  frozen?: { diffBaseSha?: unknown };
+  convergence?: { reviewScope?: unknown; coverageComplete?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
+}): boolean {
+  const convergence = parsed.convergence;
+  const scope = priorReviewScope(parsed);
+  if (convergence?.coverageComplete === true) return scope === 'whole' || scope === 'integration';
+  return convergence?.coverageComplete === undefined && scope === 'whole';
+}
+
 /** The prior round's review scope, validated against its immutable linkage:
- * an `integration` claim whose linkage is missing is damaged and reads as
- * 'unknown' (never as whole-complete coverage). */
+ * an `integration` claim whose linkage is missing, non-hex, or inconsistent
+ * with the record's own frozen base is damaged and reads as 'unknown' (never
+ * as whole-complete coverage). */
 function priorReviewScope(parsed: {
-  convergence?: { reviewScope?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationAutoMergeTree?: unknown };
+  frozen?: { diffBaseSha?: unknown };
+  convergence?: { reviewScope?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
 }): 'whole' | 'delta' | 'integration' | 'unknown' {
   const convergence = parsed.convergence;
   const scope = convergence?.reviewScope;
   if (scope === 'whole' || scope === 'delta') return scope;
   if (scope !== 'integration') return 'unknown';
-  if (typeof convergence?.integrationFromSha !== 'string' || !/^[0-9a-f]{40}$/u.test(convergence.integrationFromSha) ||
-    typeof convergence?.integrationBaseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(convergence.integrationBaseSha) ||
-    typeof convergence?.integrationAutoMergeTree !== 'string' || !/^[0-9a-f]{40}$/u.test(convergence.integrationAutoMergeTree)) {
-    return 'unknown';
+  for (const sha of [convergence?.integrationFromSha, convergence?.integrationBaseSha, convergence?.integrationPriorDiffBase]) {
+    if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) return 'unknown';
   }
+  if (convergence?.integrationBaseSha !== parsed.frozen?.diffBaseSha) return 'unknown';
   return 'integration';
 }
 
@@ -1148,11 +1173,12 @@ export class PerkinsWholeReview {
           : 'whole';
     let scopeReason = input.reviewScopeReason ?? null;
     if (input.reviewScope === 'integration' && reviewScope !== 'integration') {
-      scopeReason = `${scopeReason ?? 'integration scope requested'} — no conclusive prior target/base, whole-change re-verification`;
+      scopeReason = 'integration scope requested without a conclusive prior target/base — whole-change re-verification';
     }
     let delta: DeltaSince | null = null;
     let deltaUnavailable: string | null = null;
-    let integrationLinkage: { readonly priorTargetSha: string; readonly incomingBaseSha: string; readonly autoMergeTreeSha: string; readonly sha256: string } | null = null;
+    let integrationLinkage: { readonly priorTargetSha: string; readonly priorDiffBaseSha: string; readonly incomingBaseSha: string; readonly sha256: string } | null = null;
+    let integrationCarryPaths: ReadonlySet<string> | null = null;
     if (reviewScope === 'delta') {
       try {
         delta = deltaSince(review.manifest.repoPath, priorReview.targetSha!, review.manifest.targetSha);
@@ -1162,17 +1188,19 @@ export class PerkinsWholeReview {
     } else if (reviewScope === 'integration') {
       try {
         const integration = integrationSince(
-          review.manifest.repoPath, priorReview.targetSha!, review.manifest.diffBaseSha!, review.manifest.targetSha,
+          review.manifest.repoPath, priorReview.targetSha!, priorReview.diffBaseSha!,
+          review.manifest.diffBaseSha, review.manifest.targetSha,
         );
         delta = integration;
+        integrationCarryPaths = integration.carryPaths;
         const deltaSha256 = createHash('sha256').update(integration.diff, 'utf8').digest('hex');
         // Persist the exact reviewed unit so a stranger can distinguish the
         // newly reviewed integration work from retained coverage.
         writeReviewArtifact(review, 'integration-delta.patch', integration.diff);
         integrationLinkage = {
           priorTargetSha: integration.priorTargetSha,
+          priorDiffBaseSha: integration.priorDiffBaseSha,
           incomingBaseSha: integration.incomingBaseSha,
-          autoMergeTreeSha: integration.autoMergeTreeSha,
           sha256: deltaSha256,
         };
       } catch (error) {
@@ -1180,12 +1208,15 @@ export class PerkinsWholeReview {
         // to the whole-change authority with the reason disclosed, never a
         // silent restart and never inherited coverage.
         deltaUnavailable = sanitizeError(error);
-        scopeReason = `${scopeReason ?? 'integration scope planned'} — integration unit unreadable (${deltaUnavailable}); whole-change re-verification`;
+        scopeReason = `integration scope planned but the integration unit was unreadable (${deltaUnavailable}) — whole-change re-verification`;
         reviewScope = 'whole';
       }
     }
     const carriesForward = reviewScope === 'delta' || reviewScope === 'integration';
-    const priorCoverageComplete = priorReview.reviewScope === 'whole' || priorReview.reviewScope === 'integration';
+    // Coverage completeness is the PRIOR record's durable bit, never a scope
+    // label: an integration round whose own prior was partial carries no bit
+    // and can never launder partial coverage into a later integration READY.
+    const priorCoveredWhole = priorReview.coverageComplete;
     const classifications: readonly PriorCarryClassification[] = carriesForward
       ? delta === null || convergenceRules.carryForwardUntouchedPriors !== true
         ? prior.map((_finding, priorIndex) => ({ priorIndex, status: 'reverify' as const, reason: deltaUnavailable !== null
@@ -1193,7 +1224,11 @@ export class PerkinsWholeReview {
           : 'carry-forward disabled by policy' }))
         : classifyPriorFindings({
           prior,
-          touchedPaths: delta.touchedPaths,
+          // For integration, "changed since the prior review" is every path
+          // whose content changed H0..H1 (including incoming-base-only
+          // files), not merely the unit — a prior on a base-changed file is
+          // re-verified against its new content.
+          touchedPaths: integrationCarryPaths ?? delta.touchedPaths,
           ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
           frozenBlobContains: (path, evidence) => frozenBlobContains(review, path, evidence),
         })
@@ -2401,6 +2436,14 @@ export class PerkinsWholeReview {
               canonicalVerdict = expected;
             }
           }
+          // Whole-candidate coverage of THIS round: a whole round always
+          // covers the candidate; an integration round covers it only when
+          // the retained prior coverage was itself whole-complete (read from
+          // the prior record's durable bit, never a scope label). A delta
+          // round never does. A round that ended INCOMPLETE or on a moved
+          // head certifies nothing.
+          const coversWhole = reviewScope === 'whole' ||
+            (reviewScope === 'integration' && priorCoveredWhole);
           const convergence: ReviewConvergence = {
             reviewScope,
             ...(scopeReason !== null ? { scopeReason } : {}),
@@ -2409,7 +2452,7 @@ export class PerkinsWholeReview {
             ...(reviewScope === 'integration' && integrationLinkage !== null ? {
               integrationFromSha: integrationLinkage.priorTargetSha,
               integrationBaseSha: integrationLinkage.incomingBaseSha,
-              integrationAutoMergeTree: integrationLinkage.autoMergeTreeSha,
+              integrationPriorDiffBase: integrationLinkage.priorDiffBaseSha,
               integrationDeltaSha256: integrationLinkage.sha256,
             } : {}),
             ...(carriedPriors.length > 0 ? { carriedPriors: carriedPriors.map((classification) => classification.priorIndex).sort((left, right) => left - right) } : {}),
@@ -2422,16 +2465,16 @@ export class PerkinsWholeReview {
               })),
             } : {}),
             ...(verdictRecomputed !== undefined ? { verdictRecomputed } : {}),
-            // A delta READY still owes the final whole-change pass: approval
-            // must never be credited before that pass runs (see perkins.ts,
-            // which chains it immediately, and the board's owner-ready gate,
-            // which refuses a round still carrying this flag after a crash).
-            // An integration round that RETAINED whole-complete prior
-            // coverage has already covered the whole candidate — it binds the
-            // head itself, so it owes no whole replay. A partial prior
-            // coverage (delta/unknown prior scope) still owes the pass.
-            ...(((reviewScope === 'delta') || (reviewScope === 'integration' && !priorCoverageComplete)) &&
-              canonicalVerdict === 'READY TO MERGE' && headMovedAtSubmit === null
+            // Durable whole-candidate coverage for the NEXT round's decision.
+            ...(coversWhole && canonicalVerdict !== 'INCOMPLETE' && headMovedAtSubmit === null
+              ? { coverageComplete: true as const }
+              : {}),
+            // A READY round that does NOT cover the whole candidate still owes
+            // the final whole-change pass: approval must never be credited
+            // before that pass runs (see perkins.ts, which chains it
+            // immediately, and the board's owner-ready gate, which refuses a
+            // round still carrying this flag after a crash).
+            ...(!coversWhole && canonicalVerdict === 'READY TO MERGE' && headMovedAtSubmit === null
               ? { finalPassRequired: true as const }
               : {}),
           };
@@ -2565,6 +2608,7 @@ export class PerkinsWholeReview {
       delta,
       deltaUnavailable,
       integrationBaseSha: review.manifest.diffBaseSha,
+      integrationPriorBaseSha: integrationLinkage?.priorDiffBaseSha ?? null,
       carriedPriors,
       reverifyPriors,
       carriedLenses: carriedLensCandidates,
@@ -2953,6 +2997,7 @@ export class PerkinsWholeReview {
       readonly delta: DeltaSince | null;
       readonly deltaUnavailable: string | null;
       readonly integrationBaseSha?: string | null;
+      readonly integrationPriorBaseSha?: string | null;
       readonly carriedPriors: readonly PriorCarryClassification[];
       readonly reverifyPriors: readonly PriorCarryClassification[];
       readonly carriedLenses: readonly PerkinsLens[];
@@ -3000,10 +3045,10 @@ export class PerkinsWholeReview {
       ? [
         '--- INTEGRATION UNIT (new integration/conflict-resolution work) ---',
         `Prior covered feature head: ${priorTargetSha}`,
-        `Incoming base: ${plan.integrationBaseSha ?? review.manifest.diffBaseSha}`,
-        `Clean auto-merge baseline (tree): ${plan.delta.fromSha}`,
-        `Touched paths (${plan.delta.touchedPaths.size}): ${[...plan.delta.touchedPaths].sort().join(', ') || 'none'}`,
-        'This unit is exactly the manual conflict resolutions plus any new feature edits since the prior covered candidate: incoming-base-only files and unchanged feature files are NOT in it. The complete frozen diff above is still your review context; use it to judge the integration boundary. The delta convergence rule does NOT apply — any finding you ground can hold the PR wherever its evidence lies.',
+        `Prior pinned base: ${plan.integrationPriorBaseSha ?? 'n/a'}`,
+        `Incoming base (this round's frozen diff base): ${plan.integrationBaseSha ?? review.manifest.diffBaseSha}`,
+        `Unit paths (${plan.delta.touchedPaths.size}): ${[...plan.delta.touchedPaths].sort().join(', ') || 'none'}`,
+        'This unit is exactly the part of the new whole diff (`base..target`) whose per-path content differs from the prior covered round: unchanged feature work (identical per-path diff) and incoming-base-only files (absent from the new whole diff) are NOT in it, while manual conflict resolutions, new feature edits and files BOTH sides changed ARE. The complete frozen diff above is still your review context; use it to judge the integration boundary. The delta convergence rule does NOT apply — any finding you ground can hold the PR wherever its evidence lies.',
         plan.delta.diff === '' ? '(no conflict-resolution or new feature change: the integration was clean and the retained coverage stands)' : plan.delta.diff,
       ].join('\n')
       : '';

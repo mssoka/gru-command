@@ -115,12 +115,14 @@ describe('native integration review retains prior coverage', () => {
       specialists: [],
       leadFinding: groundedFinding('lead', 'warning', { title: 'round1 feature warning', location: 'src/feature.ts:1', evidence: 'export const feature = 1;' }),
     });
-    const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
 
     // Round 1: the ordinary whole review of the feature head H0 on B0.
     const frozen1 = freeze(harness, 'int-round-1', h0);
     const round1 = await runRound(harness, { roundId: 'int-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     expect(round1.canonicalVerdict).toBe('READY TO MERGE');
+    // A whole round records durable whole-candidate coverage.
+    expect(round1.convergence?.coverageComplete).toBe(true);
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'int-round-1'), 'consolidated.json');
 
     // Main advances and the feature integrates it cleanly into H1.
@@ -142,8 +144,9 @@ describe('native integration review retains prior coverage', () => {
       reviewScope: 'integration',
       integrationFromSha: h0,
       integrationBaseSha: b1,
+      integrationPriorDiffBase: b0,
     });
-    expect(round2.convergence?.integrationAutoMergeTree).toMatch(/^[0-9a-f]{40}$/u);
+    expect(round2.convergence?.integrationDeltaSha256).toMatch(/^[0-9a-f]{64}$/u);
     // The unchanged feature finding is retained (host-carried), not re-litigated.
     expect(round2.convergence?.carriedPriors).toEqual([0]);
     // A clean integration has no conflict-resolution unit: incoming base-only
@@ -152,43 +155,56 @@ describe('native integration review retains prior coverage', () => {
     expect(unit).toBe('');
     expect(unit).not.toContain('mainonly');
     // Whole-complete retained coverage: the integration READY binds H1 with
-    // NO chained whole-PR pass over the same covered work.
+    // NO chained whole-PR pass over the same covered work, and records the
+    // durable coverage bit for the next round.
+    expect(round2.convergence?.coverageComplete).toBe(true);
     expect(round2.convergence?.finalPassRequired).toBeUndefined();
     expect(round2.canonicalVerdict).toBe('READY TO MERGE');
   });
 
-  it('reviews an actual conflict resolution and keeps a boundary defect blocking across the resolution hunk', async () => {
+  it('reviews an actual conflict resolution and keeps a boundary defect blocking across the resolution hunk at round 3', async () => {
     const harness = makeEngine({
       childAnswer: () => '[]',
       specialists: [],
       leadFinding: groundedFinding('lead', 'warning', { title: 'round1 shared warning', location: 'src/shared.ts:1', evidence: 'export const shared = "feature";' }),
     });
-    const { h0 } = featureHead(harness.repo, 'src/shared.ts', 'export const shared = "feature";\n');
+    featureHead(harness.repo, 'src/shared.ts', 'export const shared = "feature";\n');
+    // A second feature file, UNCHANGED by the integration: it is in the frozen
+    // diff but NOT in the integration unit. A boundary defect there must still
+    // block (the old delta convergence rule would defer it from round 3).
+    harness.repo.commitFile('src/feature2.ts', 'export const feature2 = 1;\n');
+    const covered = harness.repo.head();
 
-    const frozen1 = freeze(harness, 'ci-round-1', h0);
+    const frozen1 = freeze(harness, 'ci-round-1', covered);
     const round1 = await runRound(harness, { roundId: 'ci-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     expect(round1.canonicalVerdict).toBe('READY TO MERGE');
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'ci-round-1'), 'consolidated.json');
 
     const { h1 } = integrateConflict(harness.repo);
-    // The integration round raises a blocker whose evidence is on the
-    // resolution: the old delta-convergence deferral must not silently
-    // exempt it, and the resolution is inside the integration unit.
     const brain = harness.brain as { leadFinding?: unknown };
     brain.leadFinding = groundedFinding('lead', 'blocker', {
-      title: 'integration boundary defect', location: 'src/shared.ts:1', evidence: 'export const shared = "resolved";',
+      title: 'integration boundary defect', location: 'src/feature2.ts:1', evidence: 'export const feature2 = 1;',
     });
+    // Run the integration round at round 3 (the convergence-rule threshold):
+    // if integration wrongly inherited the delta deferral, this finding would
+    // be filed as a follow-up and the verdict would not hold.
     const frozen2 = freeze(harness, 'ci-round-2', h1);
     const round2 = await runRound(harness, {
-      roundId: 'ci-round-2', roundNumber: 2, frozen: frozen2,
+      roundId: 'ci-round-2', roundNumber: 3, frozen: frozen2,
       reviewScope: 'integration', priorConsolidatedFile: consolidated1,
     });
 
+    const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
+    expect(prompt).toContain('REVIEW SCOPE: INTEGRATION ROUND');
+    expect(prompt).not.toContain('CONVERGENCE RULE');
     expect(round2.convergence?.reviewScope).toBe('integration');
     // The resolution is the review unit; the main-only incoming file is not.
     const unit = readFileSync(join(round2.artifactDirectory, 'integration-delta.patch'), 'utf8');
     expect(unit).toContain('src/shared.ts');
     expect(unit).not.toContain('mainonly');
+    // src/feature2.ts is retained unchanged and NOT in the unit, yet the
+    // finding still holds: integration scope never defers.
+    expect(unit).not.toContain('src/feature2.ts');
     expect(round2.convergence?.deferredFollowups).toBeUndefined();
     expect(round2.canonicalVerdict).toBe('NEEDS CHANGES');
   });
@@ -201,11 +217,12 @@ describe('native integration review retains prior coverage', () => {
     const round1 = await runRound(harness, { roundId: 'pc-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     expect(round1.canonicalVerdict).toBe('READY TO MERGE');
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'pc-round-1'), 'consolidated.json');
-    // Simulate a prior round whose own coverage was PARTIAL (a delta round):
-    // the retained coverage cannot certify the whole candidate, so the
-    // integration READY must still chain the final whole pass.
-    const record = JSON.parse(readFileSync(consolidated1, 'utf8')) as { convergence: { reviewScope: string } };
-    record.convergence.reviewScope = 'delta';
+    // Simulate a prior round whose own coverage was PARTIAL (no durable
+    // whole-candidate bit): the retained coverage cannot certify the whole
+    // candidate, so the integration READY must still chain the final pass.
+    const record = JSON.parse(readFileSync(consolidated1, 'utf8')) as { convergence: Record<string, unknown> };
+    record.convergence['reviewScope'] = 'delta';
+    delete record.convergence['coverageComplete'];
     const partial = join(harness.root, 'pc-partial.json');
     writeFileSync(partial, JSON.stringify(record));
 
@@ -216,5 +233,66 @@ describe('native integration review retains prior coverage', () => {
       reviewScope: 'integration', priorConsolidatedFile: partial,
     });
     expect(round2.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
+    expect(round2.convergence?.coverageComplete).toBeUndefined();
+  });
+
+  it('never launders a partial-coverage integration record into whole-complete coverage', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'ch-round-1', h0);
+    await runRound(harness, { roundId: 'ch-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'ch-round-1'), 'consolidated.json');
+
+    // A prior `integration` record that itself OWED the final whole pass
+    // (partial coverage) and never got it: the next integration must NOT read
+    // it as whole-complete.
+    const record = JSON.parse(readFileSync(consolidated1, 'utf8')) as { convergence: Record<string, unknown>; frozen: { diffBaseSha: string } };
+    const { b1, h1 } = integrateClean(harness.repo);
+    record.convergence['reviewScope'] = 'integration';
+    record.convergence['integrationFromSha'] = h0;
+    record.convergence['integrationBaseSha'] = b1;
+    record.convergence['integrationPriorDiffBase'] = b0;
+    record.convergence['finalPassRequired'] = true;
+    delete record.convergence['coverageComplete'];
+    record.frozen.diffBaseSha = b1;
+    const partialIntegration = join(harness.root, 'ch-partial-integration.json');
+    writeFileSync(partialIntegration, JSON.stringify(record));
+
+    const frozen2 = freeze(harness, 'ch-round-2', h1);
+    const round2 = await runRound(harness, {
+      roundId: 'ch-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: partialIntegration,
+    });
+    // The bit is absent on the prior record, so this READY still owes the pass.
+    expect(round2.canonicalVerdict).toBe('READY TO MERGE');
+    expect(round2.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
+  });
+
+  it('fails closed on a damaged integration coverage link', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'dl-round-1', h0);
+    await runRound(harness, { roundId: 'dl-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'dl-round-1'), 'consolidated.json');
+    const { b1, h1 } = integrateClean(harness.repo);
+    // A shape-valid `integration` claim whose linkage is missing a field is
+    // damaged: it cannot be whole-complete coverage.
+    const record = JSON.parse(readFileSync(consolidated1, 'utf8')) as { convergence: Record<string, unknown>; frozen: { diffBaseSha: string } };
+    record.convergence['reviewScope'] = 'integration';
+    record.convergence['integrationFromSha'] = h0;
+    record.convergence['integrationBaseSha'] = b1;
+    delete record.convergence['integrationPriorDiffBase'];
+    record.frozen.diffBaseSha = b1;
+    const damaged = join(harness.root, 'dl-damaged.json');
+    writeFileSync(damaged, JSON.stringify(record));
+
+    const frozen2 = freeze(harness, 'dl-round-2', h1);
+    const round2 = await runRound(harness, {
+      roundId: 'dl-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: damaged,
+    });
+    expect(round2.canonicalVerdict).toBe('READY TO MERGE');
+    expect(round2.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
+    expect(b0).toMatch(/^[0-9a-f]{40}$/u);
   });
 });

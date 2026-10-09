@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { lstatSync, readFileSync } from 'node:fs';
 import { repositoryGitEnv } from './artifacts.js';
 import type { CanonicalReviewVerdict, VerifiedFinding } from './types.js';
@@ -344,49 +344,109 @@ export function deltaSince(repoPath: string, fromSha: string, toSha: string): De
 }
 
 /** The integration review unit: the feature head H0 a prior round covered,
- * the advanced incoming base B1, and the clean auto-merge tree `merge(H0,B1)`
- * git would have produced using their common base (B0). `diff(autoTree, H1)`
- * is therefore exactly the manual conflict resolutions plus any genuinely
- * new feature edits since H0 — incoming-base-only files and unchanged
- * feature files are identical in both trees and drop out. */
+ * the prior pinned base B0, and the advanced incoming base B1. The unit is
+ * the part of the new whole diff `B1..H1` whose per-path content differs from
+ * the prior round's frozen whole diff `B0..H0`: unchanged feature work (its
+ * per-path diff is byte-identical) and incoming-base-only files (absent from
+ * `B1..H1`) drop out, while manual conflict resolutions, new feature edits
+ * and BOTH-sides interaction sites are all reviewed. `carryPaths` is every
+ * path whose content changed between H0 and H1 — the sound "changed since the
+ * prior review" set for carry-forward (a superset of the unit, naming the
+ * incoming-base-only files too). */
 export interface IntegrationDelta extends DeltaSince {
   readonly priorTargetSha: string;
+  readonly priorDiffBaseSha: string;
   readonly incomingBaseSha: string;
-  readonly autoMergeTreeSha: string;
+  /** The integration-unit paths (new/changed review work). */
+  readonly integrationPaths: readonly string[];
+  /** Paths whose content changed between H0 and H1 (carry-forward scope). */
+  readonly carryPaths: ReadonlySet<string>;
 }
 
-/** `git merge-tree --write-tree` writes the auto-merge TREE and exits 0 when
- * clean, 1 when the merge CONFLICTS (the tree still carries conflict
- * markers). Both statuses are expected; only an unusable tree refuses.
- * merge-tree writes Git objects, never the index or checkout. */
-function autoMergeTree(repoPath: string, priorTargetSha: string, incomingBaseSha: string): string {
-  const result = spawnSync('git', ['-C', repoPath, 'merge-tree', '--write-tree', priorTargetSha, incomingBaseSha], {
-    encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 16 * 1024 * 1024, timeout: GIT_TIMEOUT_MS,
-  });
-  if (result.error !== undefined && result.error !== null) {
-    throw new Error(`integration auto-merge tree could not be read: ${String(result.error)}`);
-  }
-  if (result.status !== 0 && result.status !== 1) {
-    throw new Error(`integration auto-merge tree failed (status ${String(result.status)}): ${(result.stderr ?? '').trim().replace(/[\r\n]+/gu, ' ').slice(0, 300)}`);
-  }
-  const tree = (result.stdout ?? '').split('\n')[0]?.trim() ?? '';
-  if (!/^[0-9a-f]{40}$/u.test(tree)) throw new Error('integration auto-merge produced no merged tree');
-  return tree;
+interface RawChange {
+  readonly oldSha: string;
+  readonly newSha: string;
 }
+
+/** Per-path blob pair of a `git diff --raw -z --no-renames` change set. The
+ * NUL-delimited form needs no C-unquote decoding; a path that does not
+ * decode as UTF-8 refuses (the caller falls back to a whole review). */
+function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<string, RawChange> {
+  let output: string;
+  try {
+    output = execFileSync('git', ['-C', repoPath, 'diff', '--raw', '-z', '--no-ext-diff', '--no-renames', '--abbrev=40', fromSha, toSha, '--'], {
+      encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 16 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch (error) {
+    throw new Error(`change set ${fromSha.slice(0, 12)}..${toSha.slice(0, 12)} could not be read: ${String(error)}`);
+  }
+  const changes = new Map<string, RawChange>();
+  const fields = output.split('\0');
+  for (let index = 0; index < fields.length; index += 1) {
+    const header = fields[index]!;
+    if (!header.startsWith(':')) continue;
+    const match = /^:[0-7]{6} [0-7]{6} ([0-9a-f]{40}) ([0-9a-f]{40}) [A-Z]\d*$/u.exec(header);
+    if (match === null) continue;
+    const path = fields[index + 1];
+    if (path === undefined || path === '') continue;
+    index += 1;
+    if (path.includes('\uFFFD')) throw new Error('a changed path is not valid UTF-8');
+    changes.set(path, { oldSha: match[1]!, newSha: match[2]! });
+  }
+  return changes;
+}
+
+/** The exact new-whole-diff bytes for a selected path set, bounded like the
+ * frozen diff. Read-only git — no `merge-tree`, no object-store writes. */
+function diffForPaths(repoPath: string, fromSha: string, toSha: string, paths: readonly string[]): string {
+  if (paths.length === 0) return '';
+  let diff: string;
+  try {
+    diff = execFileSync('git', [
+      '-C', repoPath, 'diff', '--no-ext-diff', '--no-color', '--find-renames', '--find-copies', '--unified=3',
+      fromSha, toSha, '--', ...paths.map((path) => `:(literal)${path}`),
+    ], { encoding: 'utf8', env: repositoryGitEnv(false), maxBuffer: 128 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch (error) {
+    throw new Error(`integration unit for ${toSha.slice(0, 12)} could not be read: ${String(error)}`);
+  }
+  if (Buffer.byteLength(diff, 'utf8') > DELTA_DIFF_MAX_BYTES) {
+    throw new Error(`integration unit for ${toSha.slice(0, 12)} exceeds ${DELTA_DIFF_MAX_BYTES} UTF-8 bytes`);
+  }
+  return diff;
+}
+
+/** A path argument list this long is well past any bounded review diff; the
+ * round then refuses rather than truncate (the caller reviews whole). */
+const INTEGRATION_UNIT_MAX_PATHS = 4000;
 
 /** Read the integration review unit for a forward-integrated candidate. The
  * caller must already have proven the lineage (see probeIntegrationLineage);
  * this only reads bytes and fails closed when git cannot produce the unit. */
 export function integrationSince(
-  repoPath: string, priorTargetSha: string, incomingBaseSha: string, currentTargetSha: string,
+  repoPath: string, priorTargetSha: string, priorDiffBaseSha: string, incomingBaseSha: string, currentTargetSha: string,
 ): IntegrationDelta {
-  if (!/^[0-9a-f]{40}$/u.test(priorTargetSha) || !/^[0-9a-f]{40}$/u.test(incomingBaseSha) || !/^[0-9a-f]{40}$/u.test(currentTargetSha)) {
-    throw new Error('integration endpoints must be full commit SHAs');
+  const endpoints = [priorTargetSha, priorDiffBaseSha, incomingBaseSha, currentTargetSha];
+  if (endpoints.some((sha) => !/^[0-9a-f]{40}$/u.test(sha))) throw new Error('integration endpoints must be full commit SHAs');
+  const prior = rawChanges(repoPath, priorDiffBaseSha, priorTargetSha);
+  const now = rawChanges(repoPath, incomingBaseSha, currentTargetSha);
+  const integrationPaths = [...now.keys()].filter((path) => {
+    const before = prior.get(path);
+    const after = now.get(path)!;
+    // Untouched since the prior review: same old AND new blobs. A path the
+    // feature never changed (absent from the prior diff) is new work.
+    if (before === undefined) return true;
+    return before.oldSha !== after.oldSha || before.newSha !== after.newSha;
+  }).sort();
+  if (integrationPaths.length > INTEGRATION_UNIT_MAX_PATHS) {
+    throw new Error(`integration unit touches ${integrationPaths.length} paths, over the ${INTEGRATION_UNIT_MAX_PATHS}-path bound`);
   }
-  const autoMergeTreeSha = autoMergeTree(repoPath, priorTargetSha, incomingBaseSha);
-  const delta = boundedDelta(repoPath, autoMergeTreeSha, currentTargetSha, `integration unit for ${currentTargetSha.slice(0, 12)}`);
+  const diff = diffForPaths(repoPath, incomingBaseSha, currentTargetSha, integrationPaths);
+  const { hunks, paths } = parseDeltaStructure(diff);
   return {
-    ...delta, priorTargetSha, incomingBaseSha, autoMergeTreeSha,
+    fromSha: incomingBaseSha, toSha: currentTargetSha, diff, hunks,
+    touchedPaths: new Set([...paths, ...hunks.map((hunk) => hunk.path)]),
+    priorTargetSha, priorDiffBaseSha, incomingBaseSha, integrationPaths,
+    carryPaths: new Set(rawChanges(repoPath, priorTargetSha, currentTargetSha).keys()),
   };
 }
 
@@ -578,9 +638,10 @@ export function planReviewScope(input: {
   readonly integrationCoverage?: boolean;
   /** Git-probed lineage; null when the probe could not be established. */
   readonly integrationLineage?: IntegrationLineage | null;
-  /** False when the prior and current rounds bind different effective
-   * acceptance: retained coverage then no longer applies. */
-  readonly acceptanceCompatible?: boolean;
+  /** Whether the prior and current rounds bind the SAME effective acceptance.
+   * Retained coverage requires an explicit true; an absent field never
+   * retains coverage. */
+  readonly acceptanceCompatible: boolean;
 }): ReviewScopePlan {
   if (input.prior === null) {
     return { scope: 'whole', reason: 'first review of this change (no conclusive prior record)' };
@@ -593,7 +654,8 @@ export function planReviewScope(input: {
   }
   if (prior.diffBaseSha !== input.currentDiffBaseSha) {
     const lineage = input.integrationLineage ?? null;
-    if (input.integrationCoverage === true && input.acceptanceCompatible !== false &&
+    if (input.integrationCoverage === true && input.acceptanceCompatible === true &&
+      prior.targetSha !== input.currentTargetSha &&
       lineage !== null && lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned) {
       return {
         scope: 'integration',
@@ -602,11 +664,13 @@ export function planReviewScope(input: {
     }
     const fallback = input.integrationCoverage !== true
       ? 'merge base moved and integration coverage is disabled by policy — whole-change re-verification'
-      : input.acceptanceCompatible === false
+      : input.acceptanceCompatible !== true
         ? 'merge base moved and the effective acceptance changed since the retained round — whole-change re-verification'
-        : lineage === null
-          ? 'merge base moved and the integration lineage could not be established — whole-change re-verification'
-          : 'merge base moved without a forward integration of the reviewed feature head — whole-change re-verification';
+        : prior.targetSha === input.currentTargetSha
+          ? 'merge base moved but the reviewed feature head did not advance — whole-change re-verification'
+          : lineage === null
+            ? 'merge base moved and the integration lineage could not be established — whole-change re-verification'
+            : 'merge base moved without a forward integration of the reviewed feature head — whole-change re-verification';
     return { scope: 'whole', reason: fallback };
   }
   if (
@@ -655,7 +719,7 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       complete?: unknown;
       headMoved?: unknown;
       frozen?: { targetSha?: unknown; diffBaseSha?: unknown; acceptance?: unknown };
-      convergence?: { reviewScope?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationAutoMergeTree?: unknown };
+      convergence?: { reviewScope?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
     };
     if (parsed.schemaVersion !== 3 || parsed.architecture !== 'perkins-whole-pr' ||
       parsed.complete !== true || parsed.headMoved !== false ||
@@ -667,7 +731,13 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
     const scope = parsed.convergence?.reviewScope;
     if (scope === 'integration') {
       const linkage = parsed.convergence!;
-      if (typeof linkage.integrationFromSha !== 'string' || typeof linkage.integrationBaseSha !== 'string') return null;
+      // Every immutable linkage field must be a full SHA, and the recorded
+      // incoming base must be exactly this record's own frozen diff base —
+      // a shape-valid but inconsistent linkage is damaged, never coverage.
+      for (const sha of [linkage.integrationFromSha, linkage.integrationBaseSha, linkage.integrationPriorDiffBase]) {
+        if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) return null;
+      }
+      if (linkage.integrationBaseSha !== parsed.frozen.diffBaseSha) return null;
     }
     const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; contractSha256?: unknown } | undefined;
     const acceptance = rawAcceptance !== null && typeof rawAcceptance === 'object' &&
