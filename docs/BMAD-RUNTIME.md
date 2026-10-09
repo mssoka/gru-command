@@ -105,6 +105,10 @@ read it, so it never reports ready for a repo whose first build would stop:
 - a kept `_bmad/render/.gitignore` still ignores snapshots;
 - no target is a symlink or the wrong kind of entry.
 
+Last, it runs every bundled skill's own launcher against the repo, exactly
+as a build would. A `HALT` is a deterministic refusal, and the entries this
+run created are removed again.
+
 The headless answers values `install` and `reuse` were retired with the
 repo-local installer and fail loud.
 
@@ -124,9 +128,10 @@ repo-local installer and fail loud.
 - A recorded runtime that is missing or modified fails the spawn loudly. GC
   restores it only when the current build ships the very same bytes.
 - A cwd that is not a linked worktree uses the current runtime unrecorded.
-  A spawn with no project cwd at all gets no runtime, and the service logs a
-  warning. Supervised crash restarts are such spawns: they resume from the
-  session file and are hosted at the workspace root.
+- A supervised crash restart resumes a minion in its job's live worktree, so
+  it keeps the lane's recorded runtime. A spawn with no project cwd at all
+  gets no runtime, and the service logs a warning. A restart whose lane is
+  gone is such a spawn.
 - Sessions receive the runtime beside the project's own skills. pi gets the
   bundled skills first, so a repo-local or global `bmad-build` can't shadow
   them. Claude Code loads the runtime with `--plugin-dir`, which lists the
@@ -185,6 +190,8 @@ moves goes to `$BACKUP`, so it can be restored. Nothing is deleted.
 **What stays:**
 
 - `_bmad-output/` and `_bmad/custom/`
+- every file inside the old module and script directories that is not in
+  the installer's hash record (notes you kept there, edited files)
 - your settings
 - every unrelated or modified skill, because only bindings whose every file
   matches the installer's own hash record (`_bmad/_config/files-manifest.csv`)
@@ -219,6 +226,9 @@ if os.path.commonpath([repo, backup]) == repo:
 cfg = os.path.join(repo, "_bmad", "_config")
 if not os.path.isfile(os.path.join(cfg, "manifest.yaml")):
     sys.exit("STOP: no repo-local BMAD install (_bmad/_config/manifest.yaml); nothing to retire")
+for rel in ("_bmad", "_bmad/custom", "_bmad/custom/config.toml", "_bmad/custom/config.user.toml"):
+    if os.path.islink(os.path.join(repo, rel)):
+        sys.exit(f"STOP: {rel} is a symlink; settings are re-homed only inside the repository")
 def sha(rel):
     with open(os.path.join(repo, rel), "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -237,14 +247,30 @@ for line in open(os.path.join(cfg, "manifest.yaml"), encoding="utf-8"):
     match = re.match(r"^\s*-\s+name:\s*['\"]?([A-Za-z0-9_-]+)", line)
     if section == "modules" and match:
         modules.append(match.group(1))
-framework = [f"_bmad/{n}" for n in ["_config", "scripts", "render", *modules, "config.toml", "config.user.toml"]
-             if os.path.lexists(os.path.join(repo, "_bmad", n))]
-known = {p.split("/", 1)[1] for p in framework} | {"custom"}
-unrecognized = sorted(f"_bmad/{n}" for n in os.listdir(os.path.join(repo, "_bmad")) if n not in known)
 def read_csv(name):
     path = os.path.join(cfg, name)
     return list(csv.DictReader(open(path, encoding="utf-8"))) if os.path.isfile(path) else []
 rows = read_csv("files-manifest.csv")
+recorded = {row["path"]: row["hash"] for row in rows}
+# Installer metadata, derived renders and answer files move whole; module and
+# script files move only when they match the installer's own hash record.
+whole = [f"_bmad/{n}" for n in ("_config", "render", "config.toml", "config.user.toml")
+         if os.path.lexists(os.path.join(repo, "_bmad", n))]
+module_dirs = [n for n in ("scripts", *modules)
+               if os.path.isdir(os.path.join(repo, "_bmad", n)) and not os.path.islink(os.path.join(repo, "_bmad", n))]
+installer_files, leftovers = [], []
+for n in module_dirs:
+    for f in files_under(f"_bmad/{n}"):
+        path = os.path.join(repo, f)
+        if not os.path.islink(path) and recorded.get(f[len("_bmad/"):]) == sha(f):
+            installer_files.append(f)
+        else:
+            leftovers.append(f)
+    for dirpath, dirnames, filenames in os.walk(os.path.join(repo, "_bmad", n)):
+        leftovers += [os.path.relpath(os.path.join(dirpath, d), repo) for d in dirnames if os.path.islink(os.path.join(dirpath, d))]
+framework = whole + installer_files
+known = {"_config", "render", "config.toml", "config.user.toml", "custom", *module_dirs}
+unrecognized = sorted(f"_bmad/{n}" for n in os.listdir(os.path.join(repo, "_bmad")) if n not in known)
 ids = {row["canonicalId"] for row in read_csv("skill-manifest.csv")}
 def gc_owned_json(rel):
     try:
@@ -324,7 +350,7 @@ legacy_answers = [n for n in ("config.toml", "config.user.toml") if os.path.isfi
 moving = framework + bindings + gc_files
 tracked = git("ls-files", "-z").stdout.split("\0")
 protected = {}
-for rel in (*files_under("_bmad-output"), *files_under("_bmad/custom"),
+for rel in (*files_under("_bmad-output"), *files_under("_bmad/custom"), *leftovers,
             *(f for root in (".agents/skills", ".claude/skills") for f in files_under(root)),
             *(t for t in tracked if t)):
     if any(rel == m or rel.startswith(m + "/") for m in moving) or rel == ".gru-command/worktree.toml":
@@ -336,14 +362,16 @@ for line in git("worktree", "list", "--porcelain").stdout.splitlines():
     if line.startswith("worktree ") and os.path.realpath(line[9:]) != repo:
         lanes.append(line[9:])
 plan = {"repo": repo, "framework": framework, "bindings": bindings, "unproven_bindings": unproven,
-        "unrecognized": unrecognized, "gc_files": gc_files, "manifest_block": manifest_block,
+        "unrecognized": unrecognized, "leftovers": leftovers, "module_dirs": module_dirs,
+        "gc_files": gc_files, "manifest_block": manifest_block,
         "exclude": exclude, "exclude_block": exclude_block, "git_source": source,
         "transfer": transfer, "transfer_blocked": blocked, "legacy_answers": legacy_answers,
         "custom_existed": os.path.isdir(os.path.join(repo, "_bmad", "custom")), "protected": protected}
 with open(os.path.join(backup, "plan.json"), "w", encoding="utf-8") as f:
     json.dump(plan, f, indent=2)
 print(f"Plan for {repo} (saved to {backup}/plan.json)")
-print("  move aside (framework):", ", ".join(framework) or "nothing")
+print("  move aside (framework):", ", ".join(whole) or "nothing",
+      f"+ {len(installer_files)} installer-recorded files under _bmad/{{{','.join(module_dirs)}}}")
 print(f"  move aside (proven BMAD skill bindings): {len(bindings)}")
 print("  GC-owned bootstrap references:", ", ".join(gc_files + (["worktree.toml block"] if manifest_block else [])
       + (["local exclude block"] if exclude_block else []) + (["git config gru-command.bmad-source"] if source else [])) or "none")
@@ -355,6 +383,8 @@ for rel in unproven:
     print(f"  LEFT IN PLACE (not provably installer-owned): {rel}")
 for rel in unrecognized:
     print(f"  LEFT IN PLACE (not part of the supported layout): {rel}")
+for rel in leftovers:
+    print(f"  LEFT IN PLACE (not in the installer's hash record): {rel}")
 for item in blocked:
     print(f"  STOP before step 3: {item} by hand (the file already has settings), then re-run this preview")
 ignored = git("check-ignore", "-v", "_bmad/custom/config.toml").stdout.strip()
@@ -488,6 +518,10 @@ if manifest_rest is not None:
         shutil.move(manifest, os.path.join(moved, ".gru-command", "worktree.toml"))
 if exclude_rest is not None:
     open(plan["exclude"], "w", encoding="utf-8", newline="").write(exclude_rest)
+for n in plan["module_dirs"]:
+    for dirpath, dirnames, filenames in os.walk(os.path.join(repo, "_bmad", n), topdown=False):
+        if not os.listdir(dirpath):
+            os.rmdir(dirpath)
 if plan["git_source"]:
     subprocess.run(["git", "-C", repo, "config", "--local", "--unset", "gru-command.bmad-source"], check=True)
 print(f"moved aside into {moved}")
@@ -495,8 +529,12 @@ PY
 ```
 
 **5. Verify.** This checks that every protected file is unchanged
-(re-homed settings files may only have grown), that a fresh worktree renders
-with the bundled runtime, and shows what to commit:
+(re-homed settings files may only have grown). It also checks that a fresh
+worktree of `HEAD` renders with the bundled runtime and no repo-local
+install, and shows what to commit. The retired bootstrap block is already
+inert before you commit, because the `gru-command.bmad-source` setting it
+depends on was removed in step 4. Commit before dispatching new jobs so
+the cleaned manifest is what fresh lanes check out.
 
 ```sh
 # bmad-retire:verify

@@ -586,9 +586,9 @@ export class RuntimeRegistry {
     if (!ROLE_DEFINITIONS[role].managedBmadRuntime || this.opts.bmadRuntime === undefined) return undefined;
     if ((options.reviewLead ?? options.isolatedReview) !== undefined) return undefined;
     if (options.cwd === undefined || options.cwd === '') {
-      // A supervised crash restart resumes with the session file alone; it
-      // is hosted at the workspace root, which has no job lane to bind.
-      // Keep that restart working, visibly without the managed runtime.
+      // No project cwd (for example a crash restart whose job lane is gone):
+      // there is no lane to bind. Keep the spawn working, visibly without
+      // the managed runtime.
       this.log('warn', 'bmad runtime not bound: spawn has no project cwd', {
         role,
         resume_file: options.resumeFile ?? null,

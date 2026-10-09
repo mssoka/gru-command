@@ -1,4 +1,4 @@
-import { statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import type { Role, SupervisionConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, AgentState, PendingTurn, SpawnOptions } from '../runtime/types.js';
@@ -1052,6 +1052,21 @@ export class Supervisor {
     }
   }
 
+  /** The live job worktree of a minion's job, when it is still on disk. */
+  private jobLanePath(agentId: string): string | undefined {
+    try {
+      const agent = this.ledger.getAgent(agentId);
+      if (agent === null || agent.jobId === null) return undefined;
+      const lane = this.ledger
+        .listWorktrees({ jobId: agent.jobId })
+        .find((worktree) => worktree.kind === 'job' && worktree.status !== 'swept');
+      return lane !== undefined && existsSync(lane.path) ? lane.path : undefined;
+    } catch (error) {
+      this.log('warn', 'job lane lookup for restart failed', { agent_id: agentId, error: String(error) });
+      return undefined;
+    }
+  }
+
   /** Best-effort durable lane context for recoverable-lane signals. */
   private laneContext(agentId: string): string {
     try {
@@ -1825,8 +1840,13 @@ export class Supervisor {
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
+        // SPEC ruling 17: a minion resumes in the job lane it serves (which
+        // also keeps the lane's bound BMAD runtime, issue #283), unless its
+        // owning subsystem's policy names the cwd itself.
+        const laneCwd = agent.role === 'minion' ? this.jobLanePath(agent.agentId) : undefined;
         const spawnOptions: SpawnOptions = {
           ...(resumeFile !== null ? { resumeFile } : {}),
+          ...(laneCwd !== undefined ? { cwd: laneCwd } : {}),
           ...(policy !== undefined && 'options' in policy ? policy.options : {}),
         };
         const spawned =

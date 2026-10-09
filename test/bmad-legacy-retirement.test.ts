@@ -145,7 +145,14 @@ function legacyRepo(workspace: string): string {
     const module = rel.startsWith('gds-') ? 'gds' : 'bmm';
     rows.push(`"md","x","${module}","${module}/skills/${rel}","${sha256(text)}"`);
   }
+  // Module and script files are installer-recorded too; a user note and a
+  // post-install edit inside module directories are not.
+  for (const rel of ['core/config.yaml', 'bmm/config.yaml', 'cis/config.yaml', 'tea/config.yaml', 'gds/config.yaml', 'scripts/render_skill.py']) {
+    rows.push(`"yaml","x","x","${rel}","${sha256(readFileSync(join(repo, '_bmad', rel), 'utf-8'))}"`);
+  }
   write(join(repo, '_bmad', '_config', 'files-manifest.csv'), `${rows.join('\n')}\n`);
+  write(join(repo, '_bmad', 'bmm', 'project-notes.md'), '# notes the team kept here\n');
+  appendFileSync(join(repo, '_bmad', 'cis', 'config.yaml'), 'edited: after install\n');
   write(join(repo, '_bmad', '_config', 'skill-manifest.csv'), [
     'canonicalId,name,description,module,path',
     '"bmad-build","bmad-build","d","bmm","x"', '"bmad-help","bmad-help","d","core","x"', '"gds-quick-dev","gds-quick-dev","d","gds","x"',
@@ -210,7 +217,9 @@ function retirementFlow(shell: string): void {
 
   const preview = run('preview');
   expect(preview.status, preview.out).toBe(0);
-  expect(preview.out).toContain('_bmad/_config, _bmad/scripts, _bmad/render, _bmad/core, _bmad/bmm, _bmad/cis, _bmad/tea, _bmad/gds, _bmad/config.toml, _bmad/config.user.toml');
+  expect(preview.out).toContain('move aside (framework): _bmad/_config, _bmad/render, _bmad/config.toml, _bmad/config.user.toml + 5 installer-recorded files under _bmad/{scripts,core,bmm,cis,tea,gds}');
+  expect(preview.out).toContain("LEFT IN PLACE (not in the installer's hash record): _bmad/bmm/project-notes.md");
+  expect(preview.out).toContain("LEFT IN PLACE (not in the installer's hash record): _bmad/cis/config.yaml");
   expect(preview.out).toContain('move aside (proven BMAD skill bindings): 5');
   expect(preview.out).toContain('LEFT IN PLACE (not provably installer-owned): .claude/skills/bmad-help');
   expect(preview.out).toContain('LEFT IN PLACE (not provably installer-owned): .agents/skills/bmad-extra');
@@ -229,12 +238,14 @@ function retirementFlow(shell: string): void {
   expect(moved.status, moved.out).toBe(0);
 
   // The retired framework and proven bindings moved aside, recoverably.
-  expect(readdirSync(join(repo, '_bmad')).sort()).toEqual(['_memory', 'custom']);
+  expect(readdirSync(join(repo, '_bmad')).sort()).toEqual(['_memory', 'bmm', 'cis', 'custom']);
+  expect(readdirSync(join(repo, '_bmad', 'bmm'))).toEqual(['project-notes.md']);
+  expect(readdirSync(join(repo, '_bmad', 'cis'))).toEqual(['config.yaml']);
   expect(readdirSync(join(repo, '_bmad', 'custom')).sort()).toEqual(['.gitignore', 'bmad-build.toml', 'config.toml', 'config.user.toml', 'legacy-install']);
   expect(readdirSync(join(repo, '.agents', 'skills')).sort()).toEqual(['bmad-extra', 'my-skill']);
   expect(readdirSync(join(repo, '.claude', 'skills')).sort()).toEqual(['bmad-help', 'gds-empty', 'other-tool']);
   expect(readlinkSync(join(repo, '.agents', 'skills', 'bmad-extra', 'assets'))).toBe(join(workspace, 'user-assets'));
-  for (const rel of ['_bmad/_config/manifest.yaml', '_bmad/gds/config.yaml', '_bmad/config.toml', '.agents/skills/bmad-build/SKILL.md',
+  for (const rel of ['_bmad/_config/manifest.yaml', '_bmad/gds/config.yaml', '_bmad/scripts/render_skill.py', '_bmad/config.toml', '.agents/skills/bmad-build/SKILL.md',
     '.agents/skills/gds-quick-dev/workflow.md', '.claude/skills/bmad-build/SKILL.md', '.gru-command/bmad-install.json', '.gru-command/bmad-bootstrap.mjs']) {
     expect(readFileSync(join(backup, 'moved', rel)).toString('base64'), rel).toBe(original.get(rel));
   }
@@ -244,6 +255,7 @@ function retirementFlow(shell: string): void {
   expect(spawnSync('git', ['-C', repo, 'config', '--local', '--get', 'gru-command.bmad-source']).status).toBe(1);
   // Protected bytes: generated work, customization, unrelated and unproven skills.
   for (const rel of ['_bmad-output/implementation-artifacts/spec-gh-1.md', '_bmad-output/planning-artifacts/prd.md',
+    '_bmad/bmm/project-notes.md', '_bmad/cis/config.yaml',
     '_bmad/custom/bmad-build.toml', '_bmad/custom/.gitignore', '_bmad/_memory/notes.md', '.agents/skills/my-skill/SKILL.md',
     '.claude/skills/other-tool/SKILL.md', '.claude/skills/bmad-help/SKILL.md', 'README.md']) {
     expect(readFileSync(join(repo, rel)).toString('base64'), rel).toBe(original.get(rel));
@@ -349,5 +361,17 @@ describe('retiring a repo-local BMAD install with the documented commands', () =
     const inside = preview(join(repo, 'backup'));
     expect(inside.status).not.toBe(0);
     expect(inside.stderr).toContain('STOP: BACKUP must be outside the repository');
+    // Settings are never re-homed through a link out of the repository.
+    const linkedWs = tempDir('gru-command-retire-linked-');
+    const linked = legacyRepo(linkedWs);
+    rmSync(join(linked, '_bmad', 'custom'), { recursive: true });
+    mkdirSync(join(linkedWs, 'elsewhere'));
+    symlinkSync(join(linkedWs, 'elsewhere'), join(linked, '_bmad', 'custom'));
+    const linkedPreview = spawnSync('/bin/sh', ['-c', docBlock('preview')], {
+      env: { PATH: process.env.PATH ?? '', HOME: linkedWs, REPO: linked, GC: repoRoot, BACKUP: join(linkedWs, 'backup') },
+      encoding: 'utf-8',
+    });
+    expect(linkedPreview.status).not.toBe(0);
+    expect(linkedPreview.stderr).toContain('STOP: _bmad/custom is a symlink');
   });
 });

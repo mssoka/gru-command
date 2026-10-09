@@ -21,6 +21,17 @@ import {
 import type { GruCommandConfig } from '../src/config.js';
 
 /**
+ * A `uv` on PATH that answers the prerequisite probe itself and hands
+ * everything else (the provisioning render check runs `uv run …`) to the
+ * real uv, which the BMAD runtime needs.
+ */
+const REAL_UV = execFileSync('/bin/sh', ['-c', 'command -v uv'], { encoding: 'utf-8' }).trim();
+function uvStub(versionExit = 'exit 0'): string {
+  return `#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then ${versionExit}; fi\nexec ${JSON.stringify(REAL_UV)} "$@"\n`;
+}
+
+
+/**
  * Setup wizard units (E9): answers validation (fail-loud, nothing
  * written), schema-exact config generation (proven against the REAL
  * loader), backup-on-rerun, QR payload shape parity with the web pairing
@@ -383,7 +394,7 @@ describe('wizard CLI surface', () => {
     // deterministic class (provisioning never writes through a link).
     symlinkSync(tempDir('gru-command-wizard-det-elsewhere-'), join(repoA, '_bmad'));
     const bin = tempDir('gru-command-wizard-det-bin-');
-    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
     const baseEnv = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` };
     // Explicit objects (no string surgery): each leg names its repo and
     // action directly. Port 0 keeps the fixed-port pre-check out of the
@@ -432,7 +443,7 @@ describe('wizard CLI surface', () => {
     // neutral deliberate-repair fallback renders.
     writeFileSync(join(repoA, '_bmad'), 'not a directory\n');
     const bin = tempDir('gru-command-wizard-fallback-bin-');
-    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
     const answersJson = JSON.stringify({
       workspace_root: workspace,
       repos: ['repo-a'],
@@ -465,7 +476,7 @@ describe('wizard CLI surface', () => {
     mkdirSync(join(repoA, '_bmad-output', 'specs'), { recursive: true });
     writeFileSync(join(repoA, '_bmad-output', 'specs', 'brief.md'), '# brief\n');
     const bin = tempDir('gru-command-wizard-provision-bin-');
-    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
     const answersJson = JSON.stringify({ workspace_root: workspace, repos: ['repo-a'], runtime: 'pi', port: 0, smoke: false });
     const runWizard = (home: string) => spawnSync(
       process.execPath,

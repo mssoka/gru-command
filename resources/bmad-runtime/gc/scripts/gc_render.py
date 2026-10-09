@@ -36,6 +36,7 @@ sys.dont_write_bytecode = True
 
 import argparse  # noqa: E402
 import os  # noqa: E402
+import subprocess  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any  # noqa: E402
 
@@ -170,9 +171,28 @@ def ensure_render_root(project_root: Path, skill_name: str) -> None:
     _no_symlink(ignore)
     if not ignore.exists():
         ignore.write_text(RENDER_IGNORE, encoding="utf-8")
+    else:
+        _assert_render_ignored(project_root, skill_name)
     # The upstream publisher writes below render/<skill>/; a link anywhere
     # there would carry snapshots out of this checkout.
     _no_symlink_in_tree(render_dir / skill_name)
+
+
+def _assert_render_ignored(project_root: Path, skill_name: str) -> None:
+    """A kept render ignore file must still keep snapshots out of git."""
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(project_root), "check-ignore", "-q", "--no-index", f"_bmad/render/{skill_name}/"],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return  # no usable git here: nothing can be committed by mistake
+    if probe.returncode == 1:
+        raise ProjectStateError(
+            f"{project_root / '_bmad' / 'render' / '.gitignore'} does not ignore rendered workflow "
+            "snapshots; make it a single `*` line or delete it so the runtime recreates it."
+        )
 
 
 def ensure_output_folders(project_root: Path, central: dict[str, Any]) -> None:

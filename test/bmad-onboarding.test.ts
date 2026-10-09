@@ -192,7 +192,10 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
     // Only missing entries were added; every pre-existing byte survives.
     const after = snapshot(fixture.repo).split('\n');
     for (const line of before) expect(after).toContain(line);
-    expect(after.filter((line) => !before.includes(line)).map((line) => line.split('\0')[1]).sort()).toEqual([
+    // (The readiness render adds derived, self-ignored snapshots under
+    // _bmad/render/bmad-build/; those are not project state.)
+    expect(after.filter((line) => !before.includes(line)).map((line) => line.split('\0')[1])
+      .filter((rel) => !rel!.startsWith('_bmad/render/bmad-build')).sort()).toEqual([
       '_bmad-output/implementation-artifacts',
       '_bmad-output/planning-artifacts',
       '_bmad/render',
@@ -243,6 +246,11 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
         symlinkSync(join(outside, 'missing'), join(repo, '_bmad', 'render'));
       }, /through symlink/u],
       ['linked-output', (repo) => symlinkSync(outside, join(repo, '_bmad-output')), /through symlink/u],
+      ['linked-render-skill', (repo) => {
+        mkdirSync(join(repo, '_bmad', 'render'), { recursive: true });
+        writeFileSync(join(repo, '_bmad', 'render', '.gitignore'), '*\n');
+        symlinkSync(outside, join(repo, '_bmad', 'render', 'bmad-build'));
+      }, /refusing BMAD project path through symlink: .*_bmad\/render\/bmad-build$/u],
       ['file-bmad', (repo) => writeFileSync(join(repo, '_bmad'), 'not a directory\n'), /exists but is not a directory/u],
       // Later targets are validated before the FIRST write, too.
       ['file-render', (repo) => {
@@ -286,6 +294,17 @@ describe('per-selected-repo BMAD provisioning (GC-managed runtime)', () => {
         /Retiring a repo-local install/u],
       ['render-not-ignored', { '_bmad/render/.gitignore': '# kept, but ignores nothing\n' },
         /does not ignore rendered workflow snapshots/u, /single `\*` line/u],
+      ['render-partly-ignored', { '_bmad/render/.gitignore': 'workflow.md\n' },
+        /does not ignore rendered workflow snapshots/u, /single `\*` line/u],
+      ['settings-path-dir', { '_bmad/custom/config.toml/keep': '' },
+        /project BMAD settings path is not a file: .*_bmad\/custom\/config\.toml/u, /settings file/u],
+      // Only the renderer itself can judge these; provisioning runs it.
+      ['structural-override', { '_bmad/custom/config.toml': 'modules = "flat"\n' },
+        /the bundled BMAD runtime cannot render bmad-build for this repo: /u, /settings file/u],
+      ['empty-string', { '_bmad/custom/config.toml': '[modules.bmm]\nimplementation_artifacts = "  "\n' },
+        /cannot render bmad-build for this repo: .*must not be empty/u, /settings file/u],
+      ['invalid-review-layer', { '_bmad/custom/bmad-build.toml': '[[workflow.review_layers]]\nname = "no id"\ninstruction = "x"\n' },
+        /cannot render bmad-build for this repo: .*review_layers/u, /settings file/u],
     ];
     for (const [name, files, message, hint] of cases) {
       const fixture = fixtureRepo(name);

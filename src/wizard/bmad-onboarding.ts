@@ -1,9 +1,16 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { isAbsolute, join, relative } from 'node:path';
 import { parse } from 'smol-toml';
 import type { RuntimeId } from '../config.js';
-import { loadBundledBmadRuntime, PACKAGE_ROOT, type BundledBmadRuntime } from '../bmad/runtime.js';
+import {
+  loadBundledBmadRuntime,
+  materializeBmadRuntime,
+  PACKAGE_ROOT,
+  skillLauncherCommand,
+  type BundledBmadRuntime,
+} from '../bmad/runtime.js';
 import type { BmadRepoAction, WizardAnswers } from './answers.js';
 
 /**
@@ -252,6 +259,9 @@ function readSettingsLayer(repoPath: string, rel: string): Record<string, unknow
   assertNoSymlinkComponents(repoPath, rel);
   const path = join(repoPath, rel);
   if (!existsSync(path)) return {};
+  if (!lstatSync(path).isFile()) {
+    throw new BmadDeterministicSetupError(`project BMAD settings path is not a file: ${path}`, SETTINGS_REPAIR_HINT);
+  }
   // Read OUTSIDE the parse catch (gh-32 r1): a read/IO failure stays a
   // plain transient error; only UNPARSEABLE content is deterministic.
   const text = readFileSync(path, 'utf-8');
@@ -397,7 +407,9 @@ function ensureFile(repoPath: string, rel: string, content: string, report: Prov
 /** A kept `_bmad/render/.gitignore` must still keep rendered snapshots out of git. */
 function assertRenderIgnored(repoPath: string): void {
   if (!existsSync(join(repoPath, '_bmad', 'render', '.gitignore'))) return;
-  const probe = spawnSync('git', ['-C', repoPath, 'check-ignore', '-q', '--no-index', '_bmad/render/bmad-build/probe/workflow.md'], {
+  // Probe the render directory itself: an ignore file that only names some
+  // files (say `workflow.md`) would still let other snapshots through.
+  const probe = spawnSync('git', ['-C', repoPath, 'check-ignore', '-q', '--no-index', '_bmad/render/bmad-build/'], {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 10_000,
@@ -429,12 +441,67 @@ export function provisionBmadProject(repoPath: string, runtime: BundledBmadRunti
     ...outputs.map((rel): [string, 'directory'] => [rel, 'directory']),
   ];
   for (const [rel, kind] of targets) assertTarget(repoPath, rel, kind);
+  for (const skill of runtime.manifest.skills) assertNoSymlinkComponents(repoPath, `_bmad/render/${skill}`);
   assertRenderIgnored(repoPath);
-  for (const [rel, kind, content] of targets) {
-    if (kind === 'directory') ensureDirectory(repoPath, rel, report);
-    else ensureFile(repoPath, rel, content!, report);
+  try {
+    for (const [rel, kind, content] of targets) {
+      if (kind === 'directory') ensureDirectory(repoPath, rel, report);
+      else ensureFile(repoPath, rel, content!, report);
+    }
+    renderCheck(repoPath, runtime);
+  } catch (error) {
+    // A refusal leaves the repo as it found it: undo this run's creations.
+    for (const rel of [...report.created].reverse()) {
+      const path = join(repoPath, rel);
+      try {
+        if (lstatSync(path).isDirectory()) rmdirSync(path);
+        else rmSync(path, { force: true });
+      } catch {
+        // A directory the render check filled stays; it is derived output.
+      }
+    }
+    throw error;
   }
   return report;
+}
+
+/**
+ * The authoritative readiness proof: run every bundled skill's own launcher
+ * against the repo, exactly as a build would. A HALT is the project's
+ * unchanged state (deterministic); a launcher that cannot run is tooling
+ * (transient). The runtime is composed in a throwaway store.
+ */
+function renderCheck(repoPath: string, runtime: BundledBmadRuntime): void {
+  const store = mkdtempSync(join(tmpdir(), 'gru-command-bmad-check-'));
+  try {
+    const materialized = materializeBmadRuntime(runtime, store);
+    for (const skill of materialized.skills) {
+      const launcher = skillLauncherCommand(materialized, skill, repoPath);
+      const result = spawnSync('/bin/sh', ['-c', launcher.command], {
+        cwd: repoPath,
+        encoding: 'utf-8',
+        env: { ...process.env, ...launcher.env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 120_000,
+      });
+      const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+      const halt = /^HALT: (.+)$/mu.exec(result.stdout ?? '');
+      if (result.status === 1 && halt?.[1] !== undefined) {
+        throw new BmadDeterministicSetupError(
+          `the bundled BMAD runtime cannot render ${skill} for this repo: ${halt[1]}`,
+          SETTINGS_REPAIR_HINT,
+        );
+      }
+      if (result.status !== 0 || !/^read and follow \/.+\/workflow\.md$/mu.test(result.stdout ?? '')) {
+        throw new Error(
+          `the bundled BMAD runtime did not run for ${skill} (${result.error?.message ?? `exit ${String(result.status)}`}): ` +
+            `${output.slice(-500)}; check uv and retry, or skip this repo`,
+        );
+      }
+    }
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
 }
 
 function legacyInstallNote(repoPath: string): string {

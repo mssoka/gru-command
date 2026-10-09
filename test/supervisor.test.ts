@@ -157,7 +157,7 @@ class FakeHandle implements AgentHandle {
 class FakeRegistry implements SupervisorRegistry {
   private readonly listeners = new Set<(envelope: AgentEventEnvelope) => void>();
   readonly handlesById = new Map<string, FakeHandle>();
-  readonly spawnCalls: { role: Role; resumeFile: string | null }[] = [];
+  readonly spawnCalls: { role: Role; resumeFile: string | null; cwd?: string }[] = [];
   /** Monotonic: a disposed handle's id is never re-minted. */
   private nextId = 0;
   /** Replace to control spawn behavior (default: resume keeps the
@@ -184,7 +184,7 @@ class FakeRegistry implements SupervisorRegistry {
   }
 
   async spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle> {
-    this.spawnCalls.push({ role, resumeFile: options?.resumeFile ?? null });
+    this.spawnCalls.push({ role, resumeFile: options?.resumeFile ?? null, ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}) });
     const handle = await this.spawnImpl(role, options);
     this.adopt(handle);
     return handle;
@@ -2198,6 +2198,34 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     const note = h.notificationsOfKind('supervision.turn-orphaned.minion-resume-abort')[0]!;
     expect(note.routing).toBe('action-required');
     expect(note.detail).toContain('This operation was aborted');
+    h.dispose();
+  });
+
+  it('a restarted minion resumes in its job lane (keeping the lane-bound BMAD runtime); a gone lane falls back', async () => {
+    const h = boot();
+    const lane = tmpDir();
+    for (const [jobId, path] of [['job-laned', lane], ['job-gone', join(lane, 'swept-away')]] as const) {
+      h.api.addJob({ id: jobId, repo: 'gru-command', title: jobId });
+      h.api.setJobStatus(jobId, 'working');
+      h.api.registerAgent({ id: `minion-${jobId}`, role: 'minion', jobId });
+      h.api.registerWorktree({ id: jobId, kind: 'job', repoPath: '/tmp/repo', repoName: 'gru-command', path, branch: `gru/${jobId}`, sha: 'abc1234', jobId });
+    }
+    for (const jobId of ['job-laned', 'job-gone']) {
+      const sessionFile = join(tmpDir(), 'minion', `${jobId}.jsonl`);
+      mkdirSync(join(sessionFile, '..'), { recursive: true });
+      writeFileSync(sessionFile, '{}\n', 'utf-8');
+      const handle = new FakeHandle('minion', `minion-${jobId}`, sessionFile);
+      h.registry.adopt(handle);
+      handle.enableVerdictAttestation();
+      hang(handle);
+      h.advance(60);
+      await vi.waitFor(() => {
+        expect(h.registry.spawnCalls.some((call) => call.resumeFile === sessionFile)).toBe(true);
+      }, { timeout: 5_000 });
+      const restart = h.registry.spawnCalls.find((call) => call.resumeFile === sessionFile)!;
+      if (jobId === 'job-laned') expect(restart).toEqual({ role: 'minion', resumeFile: sessionFile, cwd: lane });
+      else expect(restart).toEqual({ role: 'minion', resumeFile: sessionFile });
+    }
     h.dispose();
   });
 

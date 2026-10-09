@@ -25,11 +25,13 @@ import {
   createBmadRuntimeBinder,
   inspectMaterializedBmadRuntime,
   loadBundledBmadRuntime,
+  BMAD_RUNTIME_SOURCE,
   materializeBmadRuntime,
+  skillLauncherCommand,
   type MaterializedBmadRuntime,
 } from '../src/bmad/runtime.js';
 import { readBmadRuntimeManifest, writeBmadRuntimeManifest } from '../src/bmad/vendor.js';
-import { runBmadRuntimeCli, skillLauncherCommand } from '../src/cli/bmad-runtime.js';
+import { runBmadRuntimeCli } from '../src/cli/bmad-runtime.js';
 import { loadConfig, type Role, type RuntimeId } from '../src/config.js';
 import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
 import type { AgentHandle, AgentRuntime, ManagedSkillSet, SpawnOptions } from '../src/runtime/types.js';
@@ -143,6 +145,14 @@ describe('GC-managed BMAD runtime bundle', () => {
     expect(sharedRuntime.dir).toBe(join(sharedStore, `bmad-method-6.12.0-gru-command-bmad-1-${shipped.contentSha256.slice(0, 20)}`));
     expect(readFileSync(join(sharedRuntime.dir, 'LICENSE'), 'utf-8')).toContain('MIT License');
     expect(readFileSync(join(sharedRuntime.dir, 'NOTICE.md'), 'utf-8')).toContain('bmad-method');
+    // Claude Code namespaces plugin skills by the manifest name; sessions are
+    // told to use `<source>:<skill>`, so the two must agree, and each skill
+    // must sit where Claude Code discovers plugin skills.
+    const plugin = JSON.parse(readFileSync(join(sharedRuntime.dir, '.claude-plugin', 'plugin.json'), 'utf-8')) as { name: string };
+    expect(plugin.name).toBe(BMAD_RUNTIME_SOURCE);
+    for (const skill of sharedRuntime.skills) {
+      expect(readFileSync(join(sharedRuntime.dir, 'skills', skill, 'SKILL.md'), 'utf-8')).toMatch(new RegExp(`^---\\nname: ${skill}\\n`, 'u'));
+    }
     // The CLI the build runs reports the same identity.
     const lines: string[] = [];
     expect(runBmadRuntimeCli(['verify', repoRoot], (line) => lines.push(line))).toBe(0);
@@ -163,6 +173,7 @@ describe('GC-managed BMAD runtime bundle', () => {
         symlinkSync(copy, target);
       }, /symlink/u],
       ['missing manifest', (b) => rmSync(join(b, 'runtime.json')), /cannot read runtime\.json/u],
+      ['extra bundle-root entry', (b) => writeFileSync(join(b, 'stray.txt'), 'x\n'), /bundle root must hold exactly gc, runtime\.json, upstream/u],
       ['symlinked bundle area', (b) => {
         cpSync(join(b, 'gc'), `${b}-gc-elsewhere`, { recursive: true });
         rmSync(join(b, 'gc'), { recursive: true });
@@ -390,6 +401,13 @@ describe('rendering for a project with no BMAD installation', () => {
         symlinkSync(elsewhere, join(repo, '_bmad', 'render', 'bmad-build'));
       }],
     ];
+    // A kept render ignore file that lets snapshots through is refused.
+    const leaky = cleanRepo('leaky-ignore');
+    mkdirSync(join(leaky, '_bmad', 'render'), { recursive: true });
+    writeFileSync(join(leaky, '_bmad', 'render', '.gitignore'), 'workflow.md\n');
+    const leak = render(sharedRuntime, leaky);
+    expect(leak.status).toBe(1);
+    expect(leak.stdout).toContain('does not ignore rendered workflow snapshots');
     for (const [label, arrange] of links) {
       const linked = cleanRepo(`linked-${label.replaceAll('/', '-')}`);
       const elsewhere = tempDir('gru-command-bmad-elsewhere-');

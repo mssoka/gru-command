@@ -5,6 +5,17 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 /**
+ * A `uv` on PATH that answers the prerequisite probe itself and hands
+ * everything else (the provisioning render check runs `uv run …`) to the
+ * real uv, which the BMAD runtime needs.
+ */
+const REAL_UV = execFileSync('/bin/sh', ['-c', 'command -v uv'], { encoding: 'utf-8' }).trim();
+function uvStub(versionExit = 'exit 0'): string {
+  return `#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then ${versionExit}; fi\nexec ${JSON.stringify(REAL_UV)} "$@"\n`;
+}
+
+
+/**
  * Interactive wizard under a REAL PTY (Perkins r2 T1): the documented
  * front door (post-B1 the two-step runs the wizard interactively) is
  * driven end-to-end with expect(1) — each answer is sent only after its
@@ -148,7 +159,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     execFileSync('git', ['-C', join(workspace, 'repo-a'), 'init', '-q']);
     const instance = tempDir('gru-command-pty-bmad-default-');
     const bin = tempDir('gru-command-pty-bmad-bin-');
-    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
     const { output, status } = ptyWizard(
       [
         { expect: WS_PROMPT, send: workspace },
@@ -188,7 +199,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     symlinkSync(tempDir('gru-command-pty-det-elsewhere-'), join(repoA, '_bmad'));
     const instance = tempDir('gru-command-pty-det-home-');
     const bin = tempDir('gru-command-pty-det-bin-');
-    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
     const { output, status } = ptyWizard(
       [
         { expect: WS_PROMPT, send: workspace },
@@ -225,14 +236,12 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
   /** A `uv` whose first `--version` probe fails (a transient tool blip), then works. */
   function flakyUv(bin: string): void {
     const counter = join(bin, 'uv-invocations');
-    writeFileSync(join(bin, 'uv'), [
-      '#!/usr/bin/env bash',
+    writeFileSync(join(bin, 'uv'), uvStub([
       `count=$(cat ${JSON.stringify(counter)} 2>/dev/null || echo 0)`,
       'count=$((count + 1))',
       `echo "$count" > ${JSON.stringify(counter)}`,
-      '[ "$count" -gt 1 ]',
-      '',
-    ].join('\n'), { mode: 0o755 });
+      '[ "$count" -gt 1 ]; exit $?',
+    ].join('; ')), { mode: 0o755 });
   }
 
   it('transient BMAD failure still offers retry; a successful retried attempt completes (gh-32)', () => {
@@ -281,7 +290,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     symlinkSync(tempDir('gru-command-pty-eof-det-elsewhere-'), join(repoA, '_bmad'));
     const instance = tempDir('gru-command-pty-eof-det-home-');
     const bin = tempDir('gru-command-pty-eof-det-bin-');
-    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
     const { output, status } = ptyWizard(
       [
         { expect: WS_PROMPT, send: workspace },
@@ -351,7 +360,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     writeFileSync(join(repoA, '_bmad'), 'not a directory\n');
     const instance = tempDir('gru-command-pty-hintless-home-');
     const bin = tempDir('gru-command-pty-hintless-bin-');
-    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
     const { output, status } = ptyWizard(
       [
         { expect: WS_PROMPT, send: workspace },
@@ -386,7 +395,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     mkdirSync(repoA, { recursive: true });
     execFileSync('git', ['init', '-q'], { cwd: repoA });
     const bin = tempDir('gru-command-pty-unbind-bin-');
-    writeFileSync(join(bin, 'uv'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
     const answersFor = (bmad: string) => [
       { expect: WS_PROMPT, send: workspace },
       { expect: REPOS_PROMPT, send: '1' },

@@ -290,8 +290,9 @@ modify implementation code; every gate decision is the host's. The fallback
 never records a Perkins verdict and never moves merge authority: only an
 exact-head Perkins READY can authorize a merge, and the owner holds every
 merge, everywhere — this repository included. A failed pre-flight is never a silent downgrade — the failed
-legs, their remediations, and both recovery options (install BMAD via
-onboarding / restore Perkins) are escalated and recorded on the job as
+legs, their remediations, and both recovery options (install the global
+bmad-review skill, which the GC-managed BMAD runtime does not bundle /
+restore Perkins) are escalated and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
 delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
