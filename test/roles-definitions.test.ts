@@ -122,7 +122,9 @@ describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability ame
   const silas = ROLE_DEFINITIONS.silas.systemPrompt.replace(/\s+/gu, ' ');
 
   it('the worker selects the installed build-workflow skill by capability and owns the cycle end to end', () => {
-    expect(minion).toContain("the PROJECT's actual installed skill catalog/metadata");
+    expect(minion).toContain("your session's actual skill catalog/metadata");
+    // Issue #283: the catalog carries the lane-bound GC-managed runtime.
+    expect(minion).toContain('the Gru Command-managed BMAD runtime bound to your lane');
     expect(minion).toContain('task-relevant BMAD skills by capability');
     expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
     expect(minion).toContain('You own the');
@@ -148,15 +150,15 @@ describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability ame
     expect(flatMinion).toContain("makes your job each reviewer's commissioner");
     expect(flatMinion).toContain('POST /api/jobs/<review job id>/disposition');
     expect(minion).toContain('an inline self-review is not a substitute');
-    // The loud missing-capability stop names the official onboarding path.
-    expect(minion).toContain("Project-local BMAD");
+    // The loud missing-capability stop names the supported provisioning path.
+    expect(minion).toContain('"GC-managed BMAD runtime" section');
     expect(minion).not.toContain('pi -p');
     expect(minion).not.toContain('claude -p');
   });
 
   it('the ops persona carries the minion-owned build cycle without fixed names', () => {
     expect(silas).toContain('Minion-owned build cycle');
-    expect(silas).toContain("selects the task-relevant BMAD skills from the project's actual installed catalog");
+    expect(silas).toContain("selects the task-relevant BMAD skills from its session's actual skill catalog");
     expect(silas).toContain('never demand a fixed skill name');
     expect(silas).toContain('"deliverable": "review"');
     expect(silas).toContain('exact-final-head READY');
