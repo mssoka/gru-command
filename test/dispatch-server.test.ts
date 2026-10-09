@@ -171,6 +171,7 @@ async function boot(opts: {
     ...(opts.fallbackGate !== undefined ? { fallbackGate: opts.fallbackGate } : {}),
   });
   const server = createDispatchServer({
+    pendingProducerBlockers: () => [],
     config: cfg,
     dispatch,
     wave,
@@ -313,6 +314,19 @@ async function awaitDirectiveTerminal(
   }
 }
 
+
+/** A round that already posted its NEEDS CHANGES verdict (the shape a fix
+ * directive answers). A round still pending/live is a running review: a
+ * writer on that lane answers review_in_progress (owner rule 5). */
+function postVerdictRound(
+  h: { readonly ledger: LedgerApi },
+  input: Parameters<LedgerApi['addRound']>[0],
+): ReturnType<LedgerApi['addRound']> {
+  const round = h.ledger.addRound(input);
+  h.ledger.setRoundStatus(round.id, 'live');
+  return h.ledger.setRoundVerdict(round.id, 'changes-requested');
+}
+
 describe('dispatch server (E8)', () => {
   it('rejects unauthenticated and unconfigured access like the board does', async () => {
     const h = await boot();
@@ -388,6 +402,73 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+
+  it('records a megaminion\'s parent job from parent_job_id and refuses a bad parent before any job exists', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-http-parent');
+    cleanupRepos.push(repo);
+    try {
+      const parent = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        { job_id: 'http-impl', repo_path: repo.path, title: 'implementation', briefing: 'build it' },
+        TOKEN,
+      );
+      expect(parent.status).toBe(202);
+      const review = {
+        repo_path: repo.path,
+        title: 'review (blind)',
+        briefing: 'read-only review brief',
+        deliverable: 'review',
+        target_ref: 'https://git.example.invalid/o/r/pull/9',
+        target_sha: 'c3f3b35',
+      };
+      const child = await call(h.port, 'POST', '/api/dispatch', { ...review, job_id: 'http-impl-blind', parent_job_id: 'http-impl' }, TOKEN);
+      expect(child.status).toBe(202);
+      expect(h.ledger.getJob('http-impl-blind')?.parentJobId).toBe('http-impl');
+      expect(h.ledger.getJob('http-impl')?.parentJobId).toBeNull();
+      // The parent job owes the megaminion's disposition by default (owner
+      // ruling 2026-10-08); an explicit commissioner still wins.
+      expect(h.ledger.getJob('http-impl-blind')?.commissioner).toBe('http-impl');
+      const named = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        { ...review, job_id: 'http-impl-edge', parent_job_id: 'http-impl', commissioner: 'silas' },
+        TOKEN,
+      );
+      expect(named.status).toBe(202);
+      expect(h.ledger.getJob('http-impl-edge')?.commissioner).toBe('silas');
+      // A PR-owing lane never hides under another heist.
+      const lane = await call(
+        h.port,
+        'POST',
+        '/api/dispatch',
+        { job_id: 'http-sub-lane', repo_path: repo.path, title: 'sub lane', briefing: 'b', parent_job_id: 'http-impl' },
+        TOKEN,
+      );
+      expect(lane.status).toBe(400);
+      expect(String(field<unknown>(lane.json, 'detail'))).toMatch(/not a report-type job/u);
+      expect(h.ledger.getJob('http-sub-lane')).toBeNull();
+      // Unknown parent, non-string parent, and a grandchild all fail loud
+      // with a 400 and leave no job row behind.
+      for (const [id, value, detail] of [
+        ['http-orphan', 'no-such-job', /does not exist/u],
+        ['http-number-parent', 7, /parent_job_id must be a non-empty job id/u],
+        ['http-blank-parent', '  ', /parent_job_id must be a non-empty job id/u],
+        ['http-null-parent', null, /parent_job_id must be a non-empty job id/u],
+        ['http-grandchild', 'http-impl-blind', /one level deep/u],
+      ] as const) {
+        const bad = await call(h.port, 'POST', '/api/dispatch', { ...review, job_id: id, parent_job_id: value }, TOKEN);
+        expect(bad.status).toBe(400);
+        expect(String(field<unknown>(bad.json, 'detail'))).toMatch(detail);
+        expect(h.ledger.getJob(id)).toBeNull();
+      }
+    } finally {
+      await h.close();
+    }
+  });
   it('dispatches a job: 202 with the lane, minion spawned in the worktree, board record lives', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-http');
@@ -866,7 +947,7 @@ describe('dispatch server (E8)', () => {
           verificationWaits: [],
           providerRecoveryPending: [],
           conflictingPrs: [],
-          releaseEligible: [],
+          releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
         };
       },
     });
@@ -1530,6 +1611,10 @@ describe('dispatch server (E8)', () => {
       // A round-bound review-only minion is not an implementer: the
       // retirement pass must never touch its live handle (G1 exclusion).
       const reviewRound = h.ledger.addRound({ jobId: 'rebrief-job', lenses: ['blind'] });
+      // The review-only session's round has ended: a re-brief on a lane
+      // whose review is still running answers review_in_progress (owner
+      // rule 5) — this case pins the G1 exclusion, not the writer gate.
+      h.ledger.setRoundStatus(reviewRound.id, 'aborted');
       h.ledger.registerAgent({
         id: 'review-only-minion',
         role: 'minion',
@@ -2212,7 +2297,7 @@ describe('dispatch server (E8)', () => {
       h.ledger.setJobPr('fresh-noop', PR_URL);
       const noopLane = laneOf('fresh-noop')!;
       const noopHead = headOf(noopLane.path);
-      h.ledger.addRound({ jobId: 'fresh-noop', lenses: ['blind'], targetRef: noopHead });
+      postVerdictRound(h, { jobId: 'fresh-noop', lenses: ['blind'], targetRef: noopHead });
       h.ledger.setJobStatus('fresh-noop', 'in-review');
       const noopMinion = `agent-${h.spawns.length}`;
       h.ledger.registerAgent({ id: noopMinion, role: 'minion', jobId: 'fresh-noop' });
@@ -2248,7 +2333,7 @@ describe('dispatch server (E8)', () => {
       h.ledger.setJobPr('fresh-moved', PR_URL);
       const movedLane = laneOf('fresh-moved')!;
       const reviewedHead = headOf(movedLane.path);
-      h.ledger.addRound({ jobId: 'fresh-moved', lenses: ['blind'], targetRef: reviewedHead });
+      postVerdictRound(h, { jobId: 'fresh-moved', lenses: ['blind'], targetRef: reviewedHead });
       h.ledger.setJobStatus('fresh-moved', 'in-review');
       const moved = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'fresh-moved', directive: 'fix the real thing',
@@ -2741,7 +2826,7 @@ describe('silas firing-rule provenance (issue #117)', () => {
     try {
       await dispatchWithLiveMinion(h, 'rule-dir-job', repo.path);
       h.ledger.setJobStatus('rule-dir-job', 'in-review');
-      const verdictRound = h.ledger.addRound({ jobId: 'rule-dir-job', lenses: ['blind'] });
+      const verdictRound = postVerdictRound(h, { jobId: 'rule-dir-job', lenses: ['blind'] });
       const res = await call(h.port, 'POST', '/api/silas/directive', {
         job_id: 'rule-dir-job',
         directive: 'Fix the null deref at src/a.ts.',
@@ -2888,7 +2973,7 @@ describe('silas firing-rule provenance (issue #117)', () => {
       await call(h.port, 'POST', '/api/dispatch', {
         job_id: 'rule-rebrief-job', repo_path: repo.path, title: 'stuck lane', briefing: 'b',
       }, TOKEN);
-      const verdictRound = h.ledger.addRound({ jobId: 'rule-rebrief-job', lenses: ['blind'] });
+      const verdictRound = postVerdictRound(h, { jobId: 'rule-rebrief-job', lenses: ['blind'] });
       const res = await call(h.port, 'POST', '/api/silas/rebrief', {
         job_id: 'rule-rebrief-job',
         note: 'same blocker three rounds; try differently',

@@ -1858,6 +1858,70 @@ body {
   cursor: default;
 }
 
+/* Book of Lessons proposal (owner decision 2026-10-07): the review spans
+   the row under the copy; Accept/Reject sit together in the action slot. */
+.board-owner__row--proposal {
+  grid-template-areas:
+    'title action'
+    'meta action'
+    'note action'
+    'review review'
+    'error error';
+}
+
+.board-owner__error {
+  grid-area: error;
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--alert);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__actions {
+  grid-area: action;
+  display: flex;
+  gap: 6px;
+  align-self: center;
+}
+
+.board-owner__review {
+  grid-area: review;
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.board-owner__review > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.board-owner__review-chapter {
+  margin-top: 8px;
+}
+
+.board-owner__review-heading {
+  font-weight: 800;
+  font-size: 12px;
+}
+
+.board-owner__review-lesson {
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid color-mix(in srgb, var(--line) 40%, transparent);
+}
+
+.board-owner__review-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.board-owner__review-text--before {
+  color: var(--muted);
+}
+
 .board-owner__open {
   display: inline-flex;
   align-items: center;
@@ -1886,6 +1950,18 @@ body {
       'note'
       'action';
     row-gap: 6px;
+  }
+
+  /* A proposal row keeps its review area in the single column — without
+     it the review becomes an implicit column and squeezes the title. */
+  .board-owner__row--proposal {
+    grid-template-areas:
+      'title'
+      'meta'
+      'note'
+      'review'
+      'action'
+      'error';
   }
 
   .board-owner__ack,
@@ -2111,6 +2187,56 @@ body {
   font-size: 11px;
   font-weight: 800;
   color: var(--ink);
+}
+
+/* Megaminions: the specialists a heist's minion commissioned nest under
+   it — a family chip on the parent's meta line, live specialists as
+   indented sub-rows hung off one guide line (├/└ ticks), concluded ones
+   inside the expanded body. A nested row is a quieter, single-indent
+   twin of the parent row. */
+.board-job__family-chip,
+.board-job__parent {
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.board-job__family {
+  display: grid;
+  margin: 2px 0 0 42px;
+  border-left: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  cursor: auto;
+}
+
+.board-job__family--concluded {
+  margin-left: 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 30%, transparent);
+  padding-top: 8px;
+}
+
+.board-job__family-label {
+  padding-left: 12px;
+  font-size: 10px;
+  color: var(--faint);
+  text-transform: uppercase;
+}
+
+.board-job--child {
+  position: relative;
+  padding: 4px 6px 5px 12px;
+  border-bottom: 0;
+}
+
+.board-job--child::before {
+  content: '';
+  position: absolute;
+  top: 15px;
+  left: 0;
+  width: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+
+.board-job--child .board-job__meta {
+  padding-left: 30px;
 }
 
 /* The expanded row: the v3 detail in one box — the only card allowed. */

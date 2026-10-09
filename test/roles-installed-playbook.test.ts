@@ -230,6 +230,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('bounded client wait');
     expect(flat).toContain('never raise or bypass the configured worker limits');
     expect(flat).toContain('"deliverable": "review"');
+    expect(flat).toContain('`"parent_job_id"`');
     // j-810/j-811: the retired untracked headless-launcher wording must never return.
     expect(flat).not.toContain('pi -p');
     expect(flat).not.toContain('claude -p');

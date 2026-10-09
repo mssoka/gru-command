@@ -105,6 +105,9 @@ export interface JobView {
   readonly lane: LaneView | null;
   /** Newest lastActivity across the job's bound agents (null when none). */
   readonly lastAgentActivity: string | null;
+  /** The commissioning job when this one is a megaminion (a specialist a
+   * minion dispatched); null for a top-level heist. */
+  readonly parentJobId: string | null;
 }
 
 /** Issue #171 runtime ownership: the agent ids the LIVE process owns
@@ -377,6 +380,10 @@ const SILAS_ACTION_KINDS = [
   // it actually advanced durable work (a generic phase-completion or
   // obligation event from an unrelated lane is deliberately NOT counted).
   'silas.reconcile-advanced',
+  // `silas.directive-retired` is deliberately NOT counted here: retirement
+  // is an operator/owner control closure (no work was advanced, no turn
+  // ran) — counting it as Silas follow-through yield would misattribute
+  // activity the record explicitly declines to claim as progress.
 ] as const;
 
 /** PR state from the record: a terminal `merged` job is merged; a
@@ -904,6 +911,18 @@ export class BoardEngine {
             ? null : review.payload as { readonly finalPassRequired?: unknown };
           if (payload?.finalPassRequired === true) return null;
         }
+        // READY is bound to the REVIEWED requirements too (owner rules
+        // 2026-10-08): an approved material correction pending delivery, or
+        // one the approved round never froze, withholds the merge offer.
+        const revision = this.ledger.workRevisionState(job.id);
+        if (revision.required > revision.delivered) return null;
+        if (revision.required > 0 && newest !== undefined) {
+          const frozen = this.ledger.latestRoundEvent(newest.id, 'round.review-inputs-frozen');
+          const acceptance = typeof frozen?.payload === 'object' && frozen.payload !== null
+            ? (frozen.payload as { readonly acceptance?: { readonly version?: unknown } | null }).acceptance : undefined;
+          const version = acceptance?.version;
+          if (typeof version !== 'number' || version < revision.required) return null;
+        }
         return ownerReadyPr(job, readBranchEvidence(this.ledger, job.id));
       })
       .filter((row): row is OwnerPrView => row !== null)
@@ -964,6 +983,25 @@ export class BoardEngine {
       if (directive !== undefined) {
         return `directive ${directive.requestId}: ${directive.state} (${directive.jobId})`;
       }
+      // A retirement's open continuation hold is durable debt too: the lane
+      // will not self-continue, and the board must say so truthfully. A
+      // hold on a terminal job is inert (terminal lanes take no work and
+      // can never accept the releasing request) — showing it would name a
+      // dead lane forever and mask newer live holds.
+      const damaged: string[] = [];
+      const hold = this.ledger.listDirectiveRecoveryHolds({ openOnly: true,
+        onMalformed: (requestId, jobId, error) => {
+          this.log?.('error', 'silas health: retired directive audit is inconsistent', { requestId, jobId, error: String(error) });
+          damaged.push(`directive ${requestId}: inconsistent retirement audit requires repair (${jobId})`);
+        },
+      }).find((candidate) => {
+        const job = this.ledger.getJob(candidate.jobId);
+        return job !== null && !isJobTerminal(job.status);
+      });
+      if (hold !== undefined) {
+        return `directive ${hold.requestId}: retired — continuation requires a fresh request (${hold.jobId})`;
+      }
+      if (damaged.length > 0) return damaged[0] ?? null;
     } catch (error) {
       // One malformed directive row must never take the board down; the
       // malformed debt stays visible to the boot reconciler instead.
@@ -1055,6 +1093,7 @@ export class BoardEngine {
           ? null
           : { branch: lane.branch, sha: lane.sha, status: lane.status, createdAt: lane.createdAt },
       lastAgentActivity,
+      parentJobId: job.parentJobId,
     };
   }
 

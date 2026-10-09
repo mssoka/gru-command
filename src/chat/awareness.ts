@@ -89,9 +89,11 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
   'stage the rest. After acting on an action-required alert, explicitly resolve its ' +
   'notification ID with POST /api/notifications/{id}/disposition and a nonempty detail; ' +
-  'prompt delivery alone never clears it. When the right outcome is a hold or "needs no ' +
+  'prompt delivery alone never clears it. A producer-resolved alert (lessons.dream-failed) refuses ' +
+  'a disposition: fix its cause and leave it open — it closes itself when its producer succeeds. When the right outcome is a hold or "needs no ' +
   'action", record that decision FIRST with POST /api/decisions (subject, covers, ' +
-  'basis_fingerprint, recheck_at, by: "gru") and then disposition the alert — a hold ' +
+  'basis_fingerprint, recheck_at, by: "gru") and then disposition the alert — unless it is ' +
+  'producer-resolved, which stays open even under a hold (R10-02) — a hold ' +
   'recorded as state keeps the incident from re-waking you; prose does not. Use the ' +
   'subject the wake path consults: for job-scoped alert kinds that is "job:<job id>" — use ' +
   'the head SHA as basis_fingerprint only when the kind embeds one (github.ci-failed:<job>:<sha>); ' +

@@ -425,6 +425,51 @@ describe('silas digest conflictingPrs rows (issue #215)', () => {
     }
   });
 
+  it('a conflict offer is retracted when a retirement hold opens during the compute await', async () => {
+    const h = makeLedger();
+    try {
+      // Same deterministic ordering as the directive-admission race above: 
+      // the await job is created first, the conflict candidate a second later.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T10:10:00.000Z'));
+      h.ledger.addJob({ id: 'job-await-hold', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-await-hold', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-await-hold', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-await-hold', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T10:10:01.000Z'));
+      addDirtyJob(h, 'job-race-hold');
+      vi.useRealTimers();
+      // Isolate the explicit hold recheck from the independent event
+      // watermark fence; otherwise the new retirement event masks a
+      // missing hold clause and this test cannot pin that boundary.
+      const readEvents = h.ledger.listJobEvents.bind(h.ledger);
+      const candidateEvents = readEvents('job-race-hold', { limit: 1 });
+      const events = vi.spyOn(h.ledger, 'listJobEvents').mockImplementation((jobId, opts) =>
+        jobId === 'job-race-hold' && opts?.limit === 1 ? candidateEvents : readEvents(jobId, opts));
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            retireInterruptedForTest(h.ledger, 'job-race-hold');
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(raced).toBe(true);
+      expect(h.ledger.hasOpenDirectiveRecoveryHold('job-race-hold')).toBe(true);
+      expect(digest.conflictingPrs).toEqual([]);
+      events.mockRestore();
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('a pre-#215 dirty stretch (no transition event) still retires on its head directive', async () => {
     const h = makeLedger();
     try {
@@ -563,8 +608,26 @@ function makeLedger(): Harness {
   };
 }
 
-function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string; deliverable?: JobDeliverable } = {}): JobRecord {
-  const job = ledger.addJob({
+/** Drive one interrupted request to the guarded `retired` state on the
+ * ledger seam (no lane port needed: the ledger takes resolved evidence).
+ * Used by the digest fence tests below. */
+function retireInterruptedForTest(ledger: LedgerApi, jobId: string, directive = 'fix it'): string {
+  const intent = ledger.beginDirectiveIntent({ jobId, directive, holder: 'silas-ops' });
+  const head = 'a'.repeat(40);
+  ledger.retireInterruptedDirective({
+    requestId: intent.record.requestId,
+    expectedJobId: jobId,
+    expectedState: 'dispatching',
+    expectedPayloadHash: intent.record.payloadHash,
+    expectedHead: head,
+    lane: { id: `lane-${jobId}`, resolvedHead: head },
+    reason: 'writer ceased; verification race',
+    by: 'silas-ops',
+  });
+  return intent.record.requestId;
+}
+
+function addJobWithDelivery(ledger: LedgerApi, jobId: string, opts: { prUrl?: string; deliverable?: JobDeliverable } = {}): JobRecord {  const job = ledger.addJob({
     id: jobId, repo: 'fixture-app', title: `t-${jobId}`, briefing: 'b',
     ...(opts.deliverable !== undefined ? { deliverable: opts.deliverable } : {}),
   });
@@ -599,6 +662,51 @@ describe('silas digest (the four actionable states)', () => {
       expect(after.deliveredWithoutPr).toEqual([]);
       // registration alone flips the state to review-due
       expect(after.prWithoutReview.map((row) => row.jobId)).toEqual(['job-a']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it('a review offer is retracted when a retirement hold opens during the compute await', async () => {
+    const h = makeLedger();
+    try {
+      // Deterministic ordering: the await job is created first, the review
+      // candidate a second later, so the candidate is visited first.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-04T12:00:00.000Z'));
+      h.ledger.addJob({ id: 'job-await-review', repo: 'fixture-app', title: 'other', briefing: 'b' });
+      h.ledger.setJobStatus('job-await-review', 'working');
+      const round = h.ledger.addRound({ jobId: 'job-await-review', lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setRoundVerdict(round.id, 'changes-requested');
+      h.ledger.setJobStatus('job-await-review', 'in-review');
+      vi.setSystemTime(new Date('2026-10-04T12:00:01.000Z'));
+      addJobWithDelivery(h.ledger, 'job-race-review', { prUrl: 'https://github.com/acme/app/pull/41' });
+      h.ledger.setJobStatus('job-race-review', 'in-review');
+      vi.useRealTimers();
+      // Keep the independent event watermark fixed so the hold query,
+      // rather than a changed event seq, must retract this review offer.
+      const readEvents = h.ledger.listJobEvents.bind(h.ledger);
+      const candidateEvents = readEvents('job-race-review', { limit: 1 });
+      const events = vi.spyOn(h.ledger, 'listJobEvents').mockImplementation((jobId, opts) =>
+        jobId === 'job-race-review' && opts?.limit === 1 ? candidateEvents : readEvents(jobId, opts));
+      let raced = false;
+      const digest = await computeSilasDigest({
+        ledger: h.ledger,
+        blockersForRound: async () => {
+          if (!raced) {
+            raced = true;
+            retireInterruptedForTest(h.ledger, 'job-race-review');
+          }
+          return { blockers: [], note: null };
+        },
+        config: DEFAULT_SILAS_CONFIG,
+        trigger: 'sweep',
+      });
+      expect(raced).toBe(true);
+      expect(h.ledger.hasOpenDirectiveRecoveryHold('job-race-review')).toBe(true);
+      expect(digest.prWithoutReview).toEqual([]);
+      events.mockRestore();
     } finally {
       h.cleanup();
     }
@@ -2144,6 +2252,30 @@ describe('silas digest: stalled current phases (issue #162)', () => {
     }
   });
 
+  it('an open retirement hold fences the stall channel until a fresh request supersedes it', async () => {
+    const h = makeLedger();
+    try {
+      reopenRepairPhase(h, 'job-retire-hold');
+      const at = farFuture();
+      // The guarded control closure leaves a hold open with NO live request;
+      // the lane is still fenced (removing the hold clause makes this row
+      // appear while the retired request sits in the past).
+      retireInterruptedForTest(h.ledger, 'job-retire-hold');
+      expect((await digestAt(h, at)).stalledWorking).toEqual([]);
+      // A fresh accepted request releases the hold; once that request fails
+      // with positive no-effect proof, the stall channel owns the lane again.
+      const next = h.ledger.beginDirectiveIntent({
+        jobId: 'job-retire-hold',
+        directive: 'fresh repair',
+        holder: 'silas-ops',
+      });
+      h.ledger.failDirective({ requestId: next.record.requestId, reason: 'no lane and no minion' });
+      expect((await digestAt(h, at)).stalledWorking.map((row) => row.jobId)).toEqual(['job-retire-hold']);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   it('an in-flight verification owns the checkout; only its own run settlement releases it', async () => {
     const h = makeLedger();
     try {
@@ -2775,7 +2907,7 @@ describe('silas skills and wake prompt', () => {
       deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
       verdictsAwaitingDirective: [], stalledWorking: [], minionErrors: [],
-      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [], releaseEligible: [] },
+      verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [], releaseEligible: [], revisionContinuations: [], verificationsOwed: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
     expect(prompt).toContain('The owner holds every merge');
@@ -2813,7 +2945,7 @@ describe('silas skills and wake prompt', () => {
         verificationWaits: [],
         providerRecoveryPending: [],
         conflictingPrs: [],
-        releaseEligible: [],
+        releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
       },
       trigger: { kind: 'job.delivered', jobId: 'job-a' },
       skills,
@@ -3193,6 +3325,7 @@ describe('silas digest fingerprint (issue #217)', () => {
     providerRecoveryPending: [],
     conflictingPrs: [],
     releaseEligible: [],
+    revisionContinuations: [], verificationsOwed: [],
     ...over,
   });
 
@@ -3327,7 +3460,7 @@ describe('silas digest delta (issue #217)', () => {
       verificationWaits: [],
       providerRecoveryPending: [],
       conflictingPrs: [],
-      releaseEligible: [],
+      releaseEligible: [], revisionContinuations: [], verificationsOwed: [],
     };
     const current: import('../src/dispatch/silas-driver.js').SilasOpsDigest = {
       ...previous,

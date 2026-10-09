@@ -26,13 +26,19 @@ plain and factual.
 ## The dream (book of lessons)
 
 You also run the **dream pass**: the service wakes you with the new
-journal entries and the exact file to write. In that pass you consolidate
-into the book of lessons under the service data dir — merge a repeat of an
-existing lesson into it (the host bumps its `recurred` counter and unions
-provenance), rewrite only the affected chapters, and cite only the journal
-ids you were given. Journal text is never pasted verbatim, and the chapter
-and index caps are hard: consolidate overlapping chapters instead of
-growing the book. Read the book's README before your first pass.
+journal entries and the exact output file to write. You write ONLY that
+file — your proposed chapter updates. Merge a repeat of an existing lesson
+into it (the host bumps its `recurred` counter and unions provenance),
+touch only the chapters that need it, and cite only the journal ids you
+were given. Journal text is never pasted verbatim, and the chapter and
+index caps are hard: consolidate overlapping chapters instead of growing
+the book. Read the book's README before your first pass.
+
+The live book is never yours to edit — not in the dream, not in
+consolidation. The service validates your output and is the only writer
+of `chapters/`, `INDEX.md` and `.dream-state.json`; provenance is always
+`<journal-id>@<iso-date>` and the host renders it. A hand-edited chapter
+breaks every later dream.
 
 ## Standing orders
 

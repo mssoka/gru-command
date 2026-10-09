@@ -67,6 +67,7 @@ function fakeLedger(job: { deliverable?: 'review' | 'artifact' | 'investigation'
             commissioner: null,
             targetRef: null,
             targetSha: null,
+            parentJobId: null,
             status: 'delivered' as const,
             baseBranch: null,
             prUrl: null,
@@ -315,12 +316,13 @@ describe('recordFollowUpDelivery (the loop-closing signal)', () => {
       jobId: 'job-1',
       agentId: 'minion-1',
       source: 'silas-directive',
+      workRevision: 0,
     });
     expect(result.sha).toBe(head);
     expect(result.lanePath).toBe(lane.path);
     expect(result.note).toBeNull();
     expect(ledger.events).toEqual([
-      { kind: 'job.delivered', jobId: 'job-1', payload: { agentId: 'minion-1', source: 'silas-directive', sha: head } },
+      { kind: 'job.delivered', jobId: 'job-1', payload: { agentId: 'minion-1', source: 'silas-directive', sha: head, work_revision: 0 } },
     ]);
   });
 
@@ -336,11 +338,12 @@ describe('recordFollowUpDelivery (the loop-closing signal)', () => {
       jobId: 'job-1',
       agentId: null,
       source: 'silas-rebrief',
+      workRevision: 0,
     });
     expect(result.sha).toBeNull();
     expect(result.note).toContain('lane head unresolved');
     expect(ledger.events).toEqual([
-      { kind: 'job.delivered', jobId: 'job-1', payload: { agentId: null, source: 'silas-rebrief', sha: null } },
+      { kind: 'job.delivered', jobId: 'job-1', payload: { agentId: null, source: 'silas-rebrief', sha: null, work_revision: 0 } },
     ]);
   });
 
@@ -361,6 +364,7 @@ describe('recordFollowUpDelivery (the loop-closing signal)', () => {
       jobId: 'job-1',
       agentId: 'minion-2',
       source: 'silas-directive',
+      workRevision: 0,
     });
     expect(result.sha).toBe(head);
     expect(result.note).toBeNull();
@@ -375,11 +379,12 @@ describe('recordFollowUpDelivery (the loop-closing signal)', () => {
       jobId: 'job-1',
       agentId: 'minion-3',
       source: 'silas-rebrief',
+      workRevision: 0,
     });
     expect(result.sha).toBeNull();
     expect(result.lanePath).toBeNull();
     expect(result.note).toContain('no job lane');
-    expect(ledger.events[0]?.payload).toEqual({ agentId: 'minion-3', source: 'silas-rebrief', sha: null });
+    expect(ledger.events[0]?.payload).toEqual({ agentId: 'minion-3', source: 'silas-rebrief', sha: null, work_revision: 0 });
   });
 });
 

@@ -74,6 +74,18 @@ const FAKE_CAPABILITIES: AgentCapabilities = {
   followUp: false,
 };
 
+
+/** A review owner with no review on any lane: the writer gate admits and
+ * supersedes nothing (owner rules 3/5 — exercised in review-supersession). */
+function idleReviewOwner(): WaveRunner {
+  return {
+    activeReview: () => null,
+    assertWriterAdmissible: () => undefined,
+    clearLaneForWriter: async (input: { jobId: string }) => ({ jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null }),
+    supersedeReviews: async (input: { jobId: string }) => ({ jobId: input.jobId, roundIds: [], operations: 0, confirmed: true, detail: null }),
+  } as unknown as WaveRunner;
+}
+
 describe('directive requests — durable ledger contract', () => {
   it('accepts an intent atomically (dispatching + claim) BEFORE any side effect; replay is the same row', () => {
     const api = new LedgerApi(new LedgerDb(tmpDir()).handle, { bus: new EventBus() });
@@ -468,12 +480,14 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     ledger.setJobStatus('job-h1', 'working');
     ledger.registerAgent({ id: 'minion-h1', role: 'minion', sessionFile: null, jobId: 'job-h1' });
     registry.register('minion-h1');
-    // The directive route touches only the silas ops surface + ledger; the
-    // dispatch/wave doubles are never reached on /api/silas/* paths.
+    // The directive route touches the silas ops surface + ledger, and asks
+    // the review owner whether a review holds the lane (owner rule 5): this
+    // lane is never under review, so the writer gate is an idle double.
     const server = createDispatchServer({
+      pendingProducerBlockers: () => [],
       config: cfg,
       dispatch: null as unknown as DispatchService,
-      wave: null as unknown as WaveRunner,
+      wave: idleReviewOwner(),
       ledger,
       silasOps: { registry, worktrees, notifications },
     });

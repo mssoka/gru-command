@@ -42,6 +42,13 @@ context: []
 
 </frozen-after-approval>
 
+## Recovery / integration log (continued undertaking)
+
+- **Effective contract acknowledged** (2026-10-09 continuation): `GET /api/dispatch/jobs/managed-repo-overview-compact-rows-20261007/contract` → version 0, `contract_sha256 e3ca2ecab7699bc1ee9be2cc5a250bb8620adc4ad69d4d4d9ba01ed9c5d4521c`, 0 amendments; text hash re-computed and equal. Six data/interaction acceptance areas unchanged.
+- **Blind-review handback consumed** (`repo-overview-review-blind-20261007`, preserved at `/Users/moses/.gru-command/captures/repo-overview-blind-handback-20261007T201308Z/report.md`, sha256 `414f0393ac954a7c50f8a6b643bc7f20a937d6ca73d79c4d7d2c77a116c020ee`): byte-identical to the round-1 blind findings already consumed from the live transcript (only a trailing-newline difference, sha256 `e0b56d8c…`). All 14 findings are accounted for in the Review Triage Log rows B1–B14 (each fixed, or — B5 — resolved as a documented spec correction); no un-triaged finding and no new defect. No rerun, no re-review, no head rollback for it.
+- **Ordinary main integration** (project policy `roles/minion.md` from main's j-1517 commit `51f3f77`: the worker merges main and resolves conflicts in its own worktree, keeping the briefing's intent and not treating main's newer features as scope): merged `origin/main` (`32fc2f6`) into the lane at head `a67a6d5`. Conflicts in three files resolved as unions — `test/suite-shape.test.ts` (merged-tree pin counts: board-engine 43, board-frames 4, board-server 27), `web/playwright.config.ts` (my `repo-overview` project + main's `megaminions` and `lesson-proposal` projects), `web/src/ui/board.test.ts` (my overview describe + main's megaminion describe). One real merge interaction fixed: main's `web/src/ui/lesson-proposal-roundtrip.test.ts` mount shim now provides the `#board-repos` element every `BoardView` mount requires (the same contract the other three shims already carry).
+- **Merged-tree verification before committing the merge**: typecheck, lint, web tsc and `npm run build` all clean; focused backend 7 files / 188 tests PASS; web unit 49 files / 611 tests PASS; `repo-overview` Playwright project 4 tests PASS. The scheduled scopes then bind the merge head.
+
 ## Code Map
 
 - `src/wizard/steps.ts` -- `discoverManagedRepos` (depth-1 `.git`, dot-dirs skipped, symlinks count, sorted) is the registry rule; extract to shared module and re-export here.
