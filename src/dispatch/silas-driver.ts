@@ -998,7 +998,10 @@ function latestReviewRequest(ledger: DigestLedger, jobId: string): EventRecord |
   const trigger = ledger.latestJobEvent(jobId, 'silas.review-triggered');
   if (trigger !== null) candidates.push(trigger);
   const fallback = ledger.latestJobEvent(jobId, 'job.fallback-review');
-  if (fallback !== null && fallbackPhaseOf(fallback) !== 'unavailable') candidates.push(fallback);
+  // A superseded gate's terminal record (owner rule 3) is not a request.
+  const supersededGate = fallback !== null && typeof fallback.payload === 'object' && fallback.payload !== null &&
+    (fallback.payload as { superseded?: unknown }).superseded === true;
+  if (fallback !== null && fallbackPhaseOf(fallback) !== 'unavailable' && !supersededGate) candidates.push(fallback);
   return candidates.sort((a, b) => b.seq - a.seq)[0] ?? null;
 }
 
@@ -1432,8 +1435,12 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // A request retires only the state it answered: it must postdate the
     // latest delivery, so a later unreviewed delivery re-arms the row.
     const reviewRequest = latestReviewRequest(input.ledger, job.id);
+    // A review superseded by an approved change (owner rule 3) answered
+    // nothing: the request that started it no longer retires the row — a
+    // retracted correction must re-offer the standing delivery.
+    const supersededSeq = input.ledger.listJobEventsByKinds(job.id, ['round.superseded', 'job.review-superseded'], { limit: 1 })[0]?.seq ?? 0;
     const reviewAlreadyRequested =
-      reviewRequest !== null && (delivered === null || reviewRequest.seq > delivered.seq);
+      reviewRequest !== null && (delivered === null || reviewRequest.seq > delivered.seq) && reviewRequest.seq > supersededSeq;
     const abortProof = newestRound?.status === 'aborted'
       ? input.ledger.latestRoundEvent(newestRound.id, 'round.perkins-incomplete') : null;
     const abortReason = abortProof !== null && abortProof.roundId === newestRound?.id && typeof abortProof.payload === 'object' && abortProof.payload !== null

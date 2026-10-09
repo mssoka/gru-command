@@ -28,6 +28,8 @@ import { createDispatchServer } from '../src/dispatch/server.js';
 import type { DispatchService } from '../src/dispatch/service.js';
 import { computeSilasDigest, silasWakeEvent } from '../src/dispatch/silas-driver.js';
 import { MIGRATIONS } from '../src/ledger/db.js';
+import { BoardEngine } from '../src/board/engine.js';
+import { createHash } from 'node:crypto';
 import { renderRevisionContinuation } from '../src/dispatch/work-revision.js';
 import { liveReviewSessionIds } from '../src/dispatch/service-review-wave.js';
 import { readFileSync } from 'node:fs';
@@ -1190,7 +1192,16 @@ describe('review round 2 — durable debts, handoffs and verification (option A)
       approval: { by: 'owner', reference: 'j-old' }, effect: null, previousContractSha256: 'p', contractSha256: '',
       requestSha256: 'r', idempotencyKey: null, createdAt: '2026-10-01T00:00:00.000Z',
     };
-    const contractSha256 = renderEffectiveContract(BRIEFING, [legacy]).contractSha256;
+    // The pre-migration rendering, spelled out byte for byte (NOT via the
+    // current renderer): an unclassified row must keep exactly this hash.
+    const legacyText = [
+      BRIEFING, '',
+      '===== CANONICAL AMENDMENTS (append-only; accepted amendments affect later review rounds only) =====',
+      '', '## Amendment #1 — accepted 2026-10-01T00:00:00.000Z', 'approval: owner — j-old', 'supersedes: none',
+      'body_sha256: b', 'status: EFFECTIVE', '', 'A historical clarification.',
+    ].join('\n');
+    const contractSha256 = createHash('sha256').update(legacyText, 'utf8').digest('hex');
+    expect(renderEffectiveContract(BRIEFING, [legacy]).contractSha256).toBe(contractSha256);
     old.handle.prepare(
       `INSERT INTO job_amendments (id, job_id, version, body, body_sha256, supersedes, approval_by, approval_reference,
          previous_contract_sha256, contract_sha256, request_sha256, idempotency_key, created_at)
@@ -1486,6 +1497,8 @@ describe('review round 5 — nothing strands the heist', () => {
     ledger.setJobPr('job-retracted', 'https://github.com/acme/fixture/pull/13');
     ledger.setJobStatus('job-retracted', 'in-review');
     const round = ledger.addRound({ jobId: 'job-retracted', targetRef: 'stand-sha', lenses: ['blind'] });
+    // The arm that started the round is newer than the standing delivery.
+    ledger.appendCustomEvent({ kind: 'silas.review-triggered', jobId: 'job-retracted', payload: { route: 'perkins', round_id: round.id } });
     ledger.setRoundStatus(round.id, 'live');
     const material = amend(ledger, 'job-retracted', 'material', 'Add the review chip.');
     ledger.appendCustomEvent({ kind: 'round.superseded', jobId: 'job-retracted', roundId: round.id, payload: { reason: 'material' } });
@@ -1513,5 +1526,119 @@ describe('review round 5 — nothing strands the heist', () => {
     const refusal = h.ledger.latestJobEvent(h.jobId, 'branch-idle.refused');
     expect(refusal?.payload).toMatchObject({ forced: false, blockers: [{ jobId: h.jobId, revision: { required: 1, delivered: 0 } }] });
     expect(h.ledger.listRounds(h.jobId)).toHaveLength(0);
+  });
+});
+
+describe('review round 6 — READY binds to the reviewed contract', () => {
+  const SHA = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
+  const PR_URL = 'https://github.com/example/demo/pull/7';
+
+  function stageReady(api: LedgerApi, id: string, frozenVersion: number): string {
+    api.addJob({ id, repo: 'demo', title: `Heist ${id}`, briefing: BRIEFING });
+    api.setJobPr(id, PR_URL);
+    api.setJobStatus(id, 'working');
+    api.setJobStatus(id, 'in-review');
+    approveRound(api, id, frozenVersion);
+    api.appendCustomEvent({
+      kind: 'github.branch-state', jobId: id,
+      payload: {
+        repo: 'example/demo', branch: `gru/${id}`, sha: SHA, merged: false, pr_open: true, mergeable_state: 'clean',
+        pr_number: 7, pr_url: PR_URL, merge_commit_sha: null,
+        ci: { sha: SHA, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    return id;
+  }
+
+  function approveRound(api: LedgerApi, id: string, frozenVersion: number): void {
+    const round = api.addRound({ jobId: id, targetRef: SHA, lenses: ['blind'] });
+    api.appendCustomEvent({
+      kind: 'round.review-inputs-frozen', jobId: id, roundId: round.id,
+      payload: { acceptance: { version: frozenVersion }, evidence: [], ci: { state: 'green' } },
+    });
+    api.setRoundStatus(round.id, 'live');
+    api.setRoundVerdict(round.id, 'approved');
+  }
+
+  it('a material amendment withdraws READY until a review of the corrected contract approves it', () => {
+    const db = new LedgerDb(temp('supersession-ready-db-'));
+    closers.push(async () => db.close());
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const engine = new BoardEngine({ ledger: api, bus });
+    stageReady(api, 'job-ready-gate', 0);
+    expect(engine.snapshot().ownerPrs.map((row) => row.jobId)).toEqual(['job-ready-gate']);
+    amend(api, 'job-ready-gate', 'material', 'Owner changed a requirement after READY.');
+    expect(engine.snapshot().ownerPrs).toEqual([]); // correction pending delivery
+    api.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-ready-gate', payload: { sha: SHA, work_revision: 1 } });
+    expect(engine.snapshot().ownerPrs).toEqual([]); // the approval judged contract version 0
+    approveRound(api, 'job-ready-gate', 1);
+    expect(engine.snapshot().ownerPrs.map((row) => row.jobId)).toEqual(['job-ready-gate']);
+    // An administrative amendment never withdraws READY.
+    amend(api, 'job-ready-gate', 'administrative', 'Typo.');
+    expect(engine.snapshot().ownerPrs.map((row) => row.jobId)).toEqual(['job-ready-gate']);
+  });
+});
+
+describe('review round 6 — verification evidence and explicit targets', () => {
+  it('a dirty-tree pass never pays the corrective debt', () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-dirty', repo: 'r', title: 't', briefing: BRIEFING });
+    ledger.setJobStatus('job-dirty', 'working');
+    amend(ledger, 'job-dirty', 'material', 'Correction.');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-dirty', payload: { sha: 'hd', work_revision: 1 } });
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: 'job-dirty',
+      payload: { run_id: 'dirty-1', scope: 'unit', sha: 'hd', ok: true, exit_code: 0, tracked_dirty: true },
+    });
+    expect(ledger.correctiveVerificationDebt('job-dirty')).toEqual({ revision: 1, head: 'hd' });
+    verified(ledger, 'job-dirty', 'hd');
+    expect(ledger.correctiveVerificationDebt('job-dirty')).toBeNull();
+  });
+
+  it('a retracted correction re-offers the standing delivery after a superseded FALLBACK gate too', async () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-fb-retract', repo: 'r', title: 't', briefing: BRIEFING });
+    ledger.setJobStatus('job-fb-retract', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-fb-retract', payload: { sha: 'fb-sha' } });
+    ledger.setJobPr('job-fb-retract', 'https://github.com/acme/fixture/pull/14');
+    ledger.setJobStatus('job-fb-retract', 'in-review');
+    ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'job-fb-retract', payload: { phase: 'engaged' } });
+    const material = amend(ledger, 'job-fb-retract', 'material', 'Correction.');
+    ledger.appendCustomEvent({ kind: 'job.review-superseded', jobId: 'job-fb-retract', payload: { route: 'bmad-review-fallback' } });
+    ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: 'job-fb-retract', payload: { phase: 'aborted', superseded: true } });
+    accepted(ledger.addJobAmendment({
+      jobId: 'job-fb-retract', body: 'Retracted.', supersedes: [`amendment:${material.id}`],
+      approval: { by: 'gru', reference: 'j-fb' }, expectedContractSha256: ledger.effectiveContract('job-fb-retract')!.contractSha256,
+      effect: 'administrative',
+    }));
+    const digest = await computeSilasDigest({
+      ledger, blockersForRound: async () => ({ blockers: [], note: null }), config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+    });
+    expect(digest.prWithoutReview.map((row) => row.jobId)).toEqual(['job-fb-retract']);
+  });
+
+  it('an unpaid corrective verification fences an explicit foreign target', async () => {
+    const h = await plainLane('job-verify-foreign');
+    amend(h.ledger, h.jobId, 'material', 'Correction.');
+    deliver(h.ledger, h.jobId, 1);
+    await expect(h.wave.requestReview({ jobId: h.jobId, targetRef: 'main' })).rejects.toThrow(/is busy/);
+    expect(h.ledger.latestJobEvent(h.jobId, 'branch-idle.refused')?.payload).toMatchObject({
+      forced: false, blockers: [{ jobId: h.jobId, verification: { revision: 1, head: 'fixture-settled' } }],
+    });
+    expect(h.ledger.listRounds(h.jobId)).toHaveLength(0);
+  });
+
+  it('owner force MAY review over an unpaid verification (the escape hatch), audited — unlike a pending revision', async () => {
+    const h = await plainLane('job-verify-force');
+    amend(h.ledger, h.jobId, 'material', 'Correction.');
+    deliver(h.ledger, h.jobId, 1);
+    const outcome = await h.wave.requestReview({ jobId: h.jobId, force: true });
+    expect(outcome.route).toBe('perkins');
+    if (outcome.route === 'perkins') await outcome.run.catch(() => undefined);
+    expect(h.ledger.latestJobEvent(h.jobId, 'branch-idle.forced')?.payload).toMatchObject({
+      forced: true, blockers: [{ jobId: h.jobId, verification: { revision: 1 } }],
+    });
+    expect(h.ledger.listRounds(h.jobId)).toHaveLength(1);
   });
 });

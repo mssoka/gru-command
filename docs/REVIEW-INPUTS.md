@@ -256,6 +256,12 @@ latest revision → verify → fresh review. The service enforces it centrally.
     takes the same supersede-and-prove gate first.
   - **One writer per lane.** A directive while a re-brief stands, or a re-brief while a
     directive is live, answers `409 writer_conflict`.
+- **READY binds to the reviewed contract.** The board withholds the owner-ready (merge)
+  offer in two cases: while a material correction is pending delivery, and when the
+  approved round froze an older contract than the required revision. An administrative
+  amendment never withdraws READY. A correction retracted after it superseded a review
+  re-offers the standing delivery for review. A superseded review answers no review
+  request.
 - **Restarts.** Boot recovery terminalizes live rounds. The writer's durable intent (the
   directive row or re-brief marker) keeps fencing review until it settles.
 

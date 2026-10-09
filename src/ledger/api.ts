@@ -2310,11 +2310,13 @@ export class LedgerApi {
     const verified = head !== null
       ? this.db.prepare(
         `SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
-           AND json_extract(payload, '$.ok') = 1 AND json_extract(payload, '$.sha') = ? AND seq > ? LIMIT 1`,
+           AND json_extract(payload, '$.ok') = 1 AND json_extract(payload, '$.sha') = ? AND seq > ?
+           AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 LIMIT 1`,
       ).get(jobId, head, amendmentSeq) !== undefined
       : this.db.prepare(
         `SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
-           AND json_extract(payload, '$.ok') = 1 AND seq > ? LIMIT 1`,
+           AND json_extract(payload, '$.ok') = 1 AND seq > ?
+           AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 LIMIT 1`,
       ).get(jobId, newest.seq) !== undefined;
     return verified ? null : { revision, head };
   }
