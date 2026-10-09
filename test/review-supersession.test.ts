@@ -1642,3 +1642,72 @@ describe('review round 6 — verification evidence and explicit targets', () => 
     expect(h.ledger.listRounds(h.jobId)).toHaveLength(1);
   });
 });
+
+describe('review round 7 — latest evidence and quiet withdrawal', () => {
+  it('the LATEST clean run on the head decides: a later failure re-fences review', () => {
+    const { ledger } = bootLedger();
+    ledger.addJob({ id: 'job-flaky', repo: 'r', title: 't', briefing: BRIEFING });
+    ledger.setJobStatus('job-flaky', 'working');
+    amend(ledger, 'job-flaky', 'material', 'Correction.');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-flaky', payload: { sha: 'hx', work_revision: 1 } });
+    verified(ledger, 'job-flaky', 'hx');
+    expect(ledger.correctiveVerificationDebt('job-flaky')).toBeNull();
+    verified(ledger, 'job-flaky', 'hx', false);
+    expect(ledger.correctiveVerificationDebt('job-flaky')).toEqual({ revision: 1, head: 'hx' });
+  });
+
+  it('a queued request whose replay setup is superseded is withdrawn quietly — no failure, no Ack', async () => {
+    const repo = makeFixtureRepo('review-supersession-held-setup');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/review']);
+    const target = repo.commitFile('src/main.ts', 'export const rows = 1;\n');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    class HeldSetupPort extends GitReviewPort {
+      override async createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }) {
+        entered = true;
+        await gate;
+        return super.createReviewWorktree(input);
+      }
+    }
+    const port = new HeldSetupPort(temp('supersession-held-setup-port-'), 'feature/review', target);
+    const db = new LedgerDb(temp('gru-supersession-held-setup-db-'));
+    closers.push(async () => db.close());
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    const jobId = 'job-held-setup';
+    await port.createJobWorktree({ repoPath: repo.path, jobId });
+    ledger.addJob({ id: jobId, repo: 'fixture', title: 'held setup', baseBranch: 'main', briefing: BRIEFING });
+    ledger.setJobStatus(jobId, 'working');
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, bus,
+      spawner: async () => {
+        throw new Error('no spawn');
+      },
+      reviewArtifactRoot: temp('supersession-held-setup-artifacts-'),
+      reconcileReviewAgent: async () => true,
+      escalate: (title) => escalations.push(title),
+    });
+    closers.push(async () => {
+      release();
+      await wave.shutdown();
+    });
+    const queued = await wave.requestReview({ jobId, handoff: true });
+    expect(queued.route).toBe('queued');
+    deliver(ledger, jobId); // the replay starts and its setup holds at the review worktree
+    for (let spins = 0; spins < 400 && !entered; spins += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(entered).toBe(true);
+    amend(ledger, jobId, 'material', 'Approved correction.');
+    const superseding = wave.supersedeReviews({ jobId, reason: 'material amendment #1 accepted', by: 'gru' });
+    release();
+    expect((await superseding).confirmed).toBe(true);
+    for (let spins = 0; spins < 200; spins += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(ledger.listEvents().filter((event) => event.jobId === jobId && event.kind === 'job.review-handoff-withdrawn')).toHaveLength(1);
+    expect(ledger.latestJobEvent(jobId, 'job.review-handoff-failed')).toBeNull();
+    expect(escalations).toEqual([]);
+  });
+});

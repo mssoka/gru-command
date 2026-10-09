@@ -2307,18 +2307,19 @@ export class LedgerApi {
       `SELECT MAX(seq) AS seq FROM events WHERE job_id = ? AND kind = 'job.amendment-accepted'
          AND json_extract(payload, '$.version') = ?`,
     ).get(jobId, revision) as { seq: number | null } | undefined)?.seq ?? 0;
-    const verified = head !== null
+    // The LATEST clean run decides: a later failure on the same head
+    // re-fences review even after an earlier pass.
+    const latest = (head !== null
       ? this.db.prepare(
-        `SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
-           AND json_extract(payload, '$.ok') = 1 AND json_extract(payload, '$.sha') = ? AND seq > ?
-           AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 LIMIT 1`,
-      ).get(jobId, head, amendmentSeq) !== undefined
+        `SELECT json_extract(payload, '$.ok') AS ok FROM events WHERE job_id = ? AND kind = 'verification.completed'
+           AND json_extract(payload, '$.sha') = ? AND seq > ?
+           AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 ORDER BY seq DESC LIMIT 1`,
+      ).get(jobId, head, amendmentSeq)
       : this.db.prepare(
-        `SELECT 1 FROM events WHERE job_id = ? AND kind = 'verification.completed'
-           AND json_extract(payload, '$.ok') = 1 AND seq > ?
-           AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 LIMIT 1`,
-      ).get(jobId, newest.seq) !== undefined;
-    return verified ? null : { revision, head };
+        `SELECT json_extract(payload, '$.ok') AS ok FROM events WHERE job_id = ? AND kind = 'verification.completed'
+           AND seq > ? AND COALESCE(json_extract(payload, '$.tracked_dirty'), 0) != 1 ORDER BY seq DESC LIMIT 1`,
+      ).get(jobId, newest.seq)) as { ok: number | null } | undefined;
+    return latest?.ok === 1 ? null : { revision, head };
   }
 
   private amendmentFromRow(row: Row): JobAmendmentRecord {

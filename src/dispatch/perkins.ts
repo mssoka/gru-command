@@ -2850,6 +2850,21 @@ export class WaveRunner {
         );
         return;
       }
+      // Owner rule 3: a replay whose setup an approved material change
+      // superseded was withdrawn on purpose — a routine terminal, never a
+      // failure or an action-required incident.
+      if (error instanceof ReviewSupersededError) {
+        const withdrawn = this.opts.ledger.latestJobEvent(jobId, 'job.review-handoff-withdrawn');
+        const recorded = typeof withdrawn?.payload === 'object' && withdrawn.payload !== null &&
+          (withdrawn.payload as { requestSeq?: unknown }).requestSeq === pending.seq;
+        if (!recorded) {
+          this.opts.ledger.appendCustomEvent({
+            kind: 'job.review-handoff-withdrawn', jobId,
+            payload: { requestSeq: pending.seq, reason: error.reason.slice(0, 500) },
+          });
+        }
+        return;
+      }
       // Same-job re-busy preserves the durable intent: re-queue for the
       // NEXT delivery; only foreign blockers terminalize the handoff.
       if (error instanceof BranchBusyError && !this.shuttingDown &&
