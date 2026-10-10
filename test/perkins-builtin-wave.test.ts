@@ -24,6 +24,7 @@ import { PerkinsAppPrPoster, type AppFetch, type AppFetchInit } from '../src/dis
 import {
   PUBLICATION_ABSENT_EVENT,
   PUBLICATION_ATTEMPT_EVENT,
+  PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
   parsePublicationReceiptEvidencePayload,
   pendingPublicationAttempt,
@@ -9275,6 +9276,64 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     expect(fix.ledger.getRound(outcome.round.id)?.verdict).toBeNull();
     // …and closes a same-head re-arm until it is reconciled.
     expect(pendingPublicationAttempt(fix.ledger, outcome.round.id)?.kind).toBe('uncredited-receipt');
+  }, 180_000);
+
+  it('holds a recorded-but-unbound delivery against same-head re-arm and still promotes a bindable one (formal GitHub)', async () => {
+    // The crash-after-round.posted state: the provider committed, the
+    // delivery was credited durably, and the process died before the round
+    // finalized. At restart promotion re-proves the posting actor; a
+    // transient probe failure leaves the recorded delivery unbound.
+    async function crashedRound(name: string, actorProbe: () => Promise<string>) {
+      const fix = durabilityFixture(name);
+      const jobId = `job-rebind-${name}`;
+      fix.ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+      fix.ledger.setJobStatus(jobId, 'working');
+      const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+      fix.ledger.setRoundStatus(round.id, 'live');
+      const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target);
+      fix.ledger.setJobPr(jobId, attemptPayload.url);
+      fix.ledger.appendCustomEvent({
+        kind: 'round.posted', jobId, roundId: round.id,
+        payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: attemptPayload.url, host: attemptPayload.host,
+          targetSha: fix.target, baseSha: 'b'.repeat(40),
+          publicationFile: attemptPayload.publicationFile, publicationSha256: attemptPayload.publicationSha256,
+          reviewEvent: 'APPROVE',
+          receipt: {
+            reviewId: '9999', actor: 'gru-bot', event: 'APPROVED', commitId: fix.target,
+            headSha: fix.target, baseSha: 'b'.repeat(40), bodySha256: attemptPayload.publicationSha256,
+          },
+          reconciled: false,
+        },
+      });
+      const post = vi.fn();
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger: fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: fix.artifacts,
+        spawner: vi.fn() as unknown as AgentSpawner,
+        poster: { post, reconcile: vi.fn(), authenticatedActor: actorProbe },
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      return { fix, round, post, wave, escalations };
+    }
+
+    // Unbindable at restart: the recorded delivery stays unresolved, is
+    // durably held, and no same-head re-publication may be re-armed.
+    const failing = await crashedRound('rebind-fail', async () => { throw new Error('actor probe unavailable'); });
+    await failing.wave.recoverInterruptedRounds();
+    expect(failing.post).not.toHaveBeenCalled();
+    expect(failing.fix.ledger.latestRoundEvent(failing.round.id, PUBLICATION_REBIND_UNRESOLVED_EVENT)).not.toBeNull();
+    expect(pendingPublicationAttempt(failing.fix.ledger, failing.round.id)?.kind).toBe('unresolved-rebinding');
+    expect(failing.fix.ledger.getRound(failing.round.id)?.status).toBe('aborted');
+    expect(failing.escalations.join('\n')).toMatch(/could not be re-bound/u);
+
+    // Bindable at restart: the SAME recorded delivery promotes normally and
+    // leaves no rebind hold (valid already-bound promotion is preserved).
+    const bindable = await crashedRound('rebind-ok', async () => 'gru-bot');
+    await bindable.wave.recoverInterruptedRounds();
+    expect(bindable.post).not.toHaveBeenCalled();
+    expect(bindable.fix.ledger.latestRoundEvent(bindable.round.id, PUBLICATION_REBIND_UNRESOLVED_EVENT)).toBeNull();
+    expect(bindable.fix.ledger.getRound(bindable.round.id)?.status).toBe('verdict-posted');
   }, 180_000);
 
   it('reconciles an unresolved publication attempt on restart without a second POST and holds the proven receipt uncredited (formal GitHub)', async () => {

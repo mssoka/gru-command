@@ -219,6 +219,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       // Native correction cycle (PR #289 blockers 2/3): durable publication
       // attempt reconciliation after restart, each bound to its round.
       ['`Perkins publication attempt for round ${round.id} is malformed`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication for round ${round.id} could not be re-bound at restart and stays held`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication for round ${round.id} was proven at the provider but never credited`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} could not be reconciled after restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
@@ -226,6 +227,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Perkins publication attempt for round ${round.id} did not land`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication for round ${round.id} was found at the provider after restart and is retained UNCREDITED`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} stays unresolved after restart`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication rebind for round ${round.id} could not be recorded durably`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${String(lane.roundId)} could not be processed during startup recovery`', '{ ...(lane.jobId !== null ? { jobId: lane.jobId } : {}), ...(lane.roundId !== null ? { roundId: lane.roundId } : {}), }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
@@ -260,9 +262,10 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    // 35 pre-existing wave call sites + the 8 durable-publication-recovery
-    // escalations added by the PR #289 native correction cycle.
-    expect(sites).toHaveLength(43);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(40);
+    // 35 pre-existing wave call sites + the 10 durable-publication-recovery
+    // escalations added by the PR #289 native correction cycle and its
+    // amendment #1 rebind hold.
+    expect(sites).toHaveLength(45);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(42);
   });
 });
