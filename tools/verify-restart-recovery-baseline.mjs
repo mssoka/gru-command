@@ -6,6 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symli
 import { join, resolve } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import ts from 'typescript';
+import { assertRestartRecoveryBaseline, BaselineRecoveryGateError } from './assert-restart-recovery-baseline.mjs';
 
 const BASELINE = '32fc2f6edfc878b89d05c4d2499dcbdb0ec662d1';
 const TEST_FILE = 'test/pi-adapter.test.ts';
@@ -13,9 +14,6 @@ const TEST_NAME = 'restart recovery records actual admission while the native pr
 const root = process.cwd();
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' });
-class BaselineRecoveryGateError extends Error {
-  constructor(message) { super(message); this.name = 'BaselineRecoveryGateError'; }
-}
 function requireEvidence(condition, message) {
   if (!condition) throw new BaselineRecoveryGateError(message);
 }
@@ -123,11 +121,9 @@ try {
   const rawJson = readFileSync(jsonPath);
   manifest = { ...manifest, vitestJsonSha256: sha256(rawJson) }; save();
   const report = JSON.parse(rawJson.toString('utf8'));
-  requireEvidence(report.testResults?.length === 1 && report.numFailedTests === 1 && report.numPassedTests === 0 && report.numRuntimeErrorTestSuites === 0 && report.testResults[0].message === '', 'collection/result counts do not prove one named assertion RED');
-  const failures = report.testResults[0].assertionResults.filter((entry) => entry.status === 'failed');
-  requireEvidence(failures.length === 1 && failures[0].title === TEST_NAME && failures[0].failureMessages?.length === 1, 'failure is not uniquely the named admission regression');
-  const message = failures[0].failureMessages[0].replaceAll('\\', '/');
-  requireEvidence(/AssertionError: expected \[\] to have a length of 1 but got \+?0/.test(message) && message.includes(`test/pi-adapter.test.ts:${assertionLine}:`), 'failure must be admission-length AssertionError at the extracted assertion, not setup/import/collection');
+  const message = assertRestartRecoveryBaseline(report, {
+    testName: TEST_NAME, testFile: TEST_FILE, assertionLine, output: readFileSync(log, 'utf8'),
+  });
   requireEvidence(git('rev-parse', 'HEAD').trim() === head && git('status', '--porcelain', '--untracked-files=normal').trim() === '', 'final authority changed during baseline probe; not attested RED');
   manifest = { ...manifest, classification: 'baseline-assertion-red', admissionAssertion: message, completedAt: new Date().toISOString() }; save();
   console.log(`baseline-assertion-red: baseline=${BASELINE}, final-test=${head}, childExit=1; retained ${attempt}. BEFORE-PROOF ONLY, NOT current-head PASS or READY.`);
