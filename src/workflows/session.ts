@@ -24,7 +24,6 @@ export function registeredWorkflowLane(
   ledger: {
     getAgent(id: string): WorkflowAgent | null;
     listAgents(): readonly WorkflowAgent[];
-    listJobAdmissions(jobId: string): readonly string[];
   },
 ): WorktreeLane | null {
   const resumed = options.resumeFile === undefined ? [] : ledger.listAgents().filter((agent) => agent.sessionFile === options.resumeFile);
@@ -56,9 +55,6 @@ export function registeredWorkflowLane(
   if (candidate?.kind === 'job') {
     if (ledger.listAgents().some((owner) => owner.jobId === candidate.jobId && owner.role === 'minion' && owner.parentage !== 'child')) {
       throw new WorkflowSessionError(`registered job ${candidate.jobId} already has a logical worker; resume its recorded session/identity instead of attaching an unknown worker by cwd`);
-    }
-    if (!ledger.listJobAdmissions(candidate.id).includes('initial dispatch')) {
-      throw new WorkflowSessionError(`fresh workflow worker for ${candidate.id} requires its recorded initial dispatch admission; restore missing worker ownership records rather than replacing it by cwd`);
     }
   }
   return candidate ?? null;
@@ -134,7 +130,6 @@ export function ownedFallbackReviewResources(
 export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<WorktreePort, 'getWorktree' | 'listWorktrees'> & {
   getAgent(id: string): WorkflowAgent | null;
   listAgents(): readonly WorkflowAgent[];
-  listJobAdmissions(jobId: string): readonly string[];
   getJob(id: string): Pick<JobRecord, 'id' | 'deliverable'> | null;
 }, packageRoot = PACKAGE_ROOT): {
   readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;

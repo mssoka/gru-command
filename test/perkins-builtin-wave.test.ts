@@ -6033,6 +6033,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Make the fallback turn reject after writing its report (a transport
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
+    inBandError?: boolean;
     missingReportTool?: boolean;
     conflictingReport?: boolean;
     onPrompt?: () => void;
@@ -6103,7 +6104,8 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         async steer() {},
         async followUp() {},
         subscribe() { return () => {}; },
-        health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
+        health() { return { state: options.inBandError === true ? 'error' : 'idle', lastActivity: null, sessionFile: file,
+          ...(options.inBandError === true ? { error: 'review turn failed in-band after submitting' } : {}) }; },
         async dispose() { disposed.push(`prod-minion-${spawnCwds.length}`); },
       };
     };
@@ -6178,7 +6180,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const h = await makeProductionGateHarness({ findingToWrite: [] });
     writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 2;\n');
     const baseRef = h.repo.git(['rev-parse', 'main']); const headRef = h.repo.head();
-    const diff = execFileSync('git', ['-C', h.repo.path, 'diff', '--no-ext-diff', '--no-color', baseRef], { encoding: 'utf8' });
+    const diff = execFileSync('git', ['-C', h.repo.path, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--full-index', baseRef], { encoding: 'utf8' });
     const diffSha256 = createHash('sha256').update(diff).digest('hex');
     const outcome = await h.wave.runRound({ jobId: h.job.id });
     if (!('route' in outcome)) throw new Error('expected fallback route');
@@ -6203,6 +6205,54 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       expect(outcome.note).toContain('working diff or HEAD changed');
       expect(h.ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
     }
+  });
+
+  it('invalidates binary mutations even when their abbreviated Git blob identities collide', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    const path = join(h.repo.path, 'binary.bin');
+    const first = Buffer.from('\0' + '00006161'); const second = Buffer.from('\0' + '00031931');
+    writeFileSync(path, Buffer.from('\0base')); h.repo.git(['add', 'binary.bin']); h.repo.git(['commit', '-qm', 'binary baseline']);
+    // Both candidate payloads stay uncommitted, so Git's object database
+    // cannot widen their same-prefix abbreviated identities to disambiguate.
+    writeFileSync(path, first);
+    const shortBefore = h.repo.git(['diff', 'main', '--']);
+    mutate = () => {
+      writeFileSync(path, second);
+      // Deterministic SHA-1-prefix collision: old/default diff text is identical.
+      expect(h.repo.git(['diff', 'main', '--'])).toBe(shortBefore);
+    };
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+    expect(h.prompts[0]).toContain('GIT binary patch');
+  });
+
+  it('never lets configured textconv hide working-byte movement from the complete input identity', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    h.repo.git(['update-ref', 'refs/heads/main', 'HEAD']);
+    h.repo.git(['config', 'diff.hidden.textconv', `node -e 'process.stdout.write("constant\\n")'`]);
+    h.repo.commitFile('.gitattributes', 'src/prod.ts diff=hidden\n');
+    const convertedBefore = h.repo.git(['diff', 'main', '--']);
+    mutate = () => {
+      writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 4;\n');
+      expect(h.repo.git(['diff', 'main', '--'])).toBe(convertedBefore);
+    };
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+  });
+
+  it('never passes a submitted empty report when the fulfilled turn settled in-band error', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], inBandError: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('fallback reviewer turn did not successfully complete');
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
   });
 
   it('blocks when intent-to-add preparation fails instead of claiming an incomplete diff is complete', async () => {

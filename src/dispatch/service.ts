@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { requireArtifactJobId } from '../artifacts/context.js';
 import type { LogLevel } from '../logger.js';
 import type { JobDeliverable, LedgerApi, JobRecord } from '../ledger/api.js';
 import type { CompletionHandoffIntent } from '../ledger/obligations.js';
@@ -194,6 +195,7 @@ export class DispatchService {
     if (input.jobId.trim() === '' || input.title.trim() === '' || input.briefing.trim() === '') {
       throw new Error('dispatch requires a non-empty job id, title, and briefing');
     }
+    requireArtifactJobId(input.jobId);
     const isReportKind = input.deliverable !== undefined && input.deliverable !== 'pr';
     if (isReportKind) {
       if (input.targetRef !== undefined && input.targetRef.trim() === '') {

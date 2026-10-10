@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { createBmadRuntimeBinder, readBmadRuntimeBinding } from '../src/bmad/runtime.js';
 import { loadConfig } from '../src/config.js';
 import { DispatchService } from '../src/dispatch/service.js';
+import { rebriefFreshMinion, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { preflightFailure } from '../src/dispatch/review-path.js';
 import { UnavailableWorktreePort } from '../src/dispatch/worktree-port.js';
@@ -95,7 +96,7 @@ describe('production owned workflow session binding', () => {
     const f = fixture();
     const file = join(f.dataDir, 'worker.jsonl'); writeFileSync(file, '');
     const worker = { id: 'worker', jobId: f.lane.id, sessionFile: file, role: 'minion' as const, parentage: 'top-level' as const };
-    const records = { getAgent: () => worker, listAgents: () => [worker], listJobAdmissions: () => [],
+    const records = { getAgent: () => worker, listAgents: () => [worker],
       getJob: () => ({ id: f.lane.id, deliverable: 'pr' as const }),
       getWorktree: (id: string) => id === f.lane.id ? f.lane : null, listWorktrees: () => [f.lane],
     };
@@ -296,16 +297,14 @@ describe('production owned workflow session binding', () => {
   it('resolves resumes only through recorded ownership, refusing conflicts and swept/missing assignments', () => {
     const f = fixture();
     const records = [{ id: 'worker', jobId: f.lane.id, sessionFile: '/private/session.jsonl', role: 'minion' as const, parentage: 'top-level' as const }];
-    const ledger = { getAgent: (id: string) => records.find((r) => r.id === id) ?? null, listAgents: () => records, listJobAdmissions: () => [] };
+    const ledger = { getAgent: (id: string) => records.find((r) => r.id === id) ?? null, listAgents: () => records };
     const port = { getWorktree: (id: string) => id === f.lane.id ? f.lane : null, listWorktrees: () => [f.lane] };
     const resolve = (options: SpawnOptions) => registeredWorkflowLane(options, port, ledger);
     expect(resolve({ resumeFile: records[0]!.sessionFile })).toEqual(f.lane);
     expect(() => resolve({ cwd: f.lane.path })).toThrow(/already has a logical worker/u);
     expect(() => resolve({ agentId: 'unknown-fresh-id', cwd: f.lane.path })).toThrow(/already has a logical worker/u);
-    expect(() => registeredWorkflowLane({ agentId: 'unknown-without-records', cwd: f.lane.path }, port,
-      { getAgent: () => null, listAgents: () => [], listJobAdmissions: () => [] })).toThrow(/initial dispatch admission/u);
     expect(registeredWorkflowLane({ agentId: 'admitted-fresh', cwd: f.lane.path }, port,
-      { getAgent: () => null, listAgents: () => [], listJobAdmissions: () => ['initial dispatch'] })).toEqual(f.lane);
+      { getAgent: () => null, listAgents: () => [] })).toEqual(f.lane);
     expect(() => resolve({ agentId: 'worker', cwd: '/foreign' })).toThrow(/conflicts/u);
     expect(() => resolve({ resumeFile: '/private/unowned.jsonl', cwd: f.lane.path })).toThrow(/registered session owner/u);
     expect(() => resolve({ resumeFile: '/private/unowned.jsonl', agentId: 'worker' })).toThrow(/registered session owner/u);
@@ -315,13 +314,43 @@ describe('production owned workflow session binding', () => {
     expect(resolve({ cwd: join(f.lane.path, '..', 'guessed-job') })).toBeNull();
   });
 
+  it('production sessionless fix and re-brief recovery preserve the recorded identity, parentage and retained owned lane', async () => {
+    for (const mode of ['fix', 'rebrief'] as const) for (const parentage of [null, 'top-level'] as const) {
+      const f = fixture(); const db = new LedgerDb(f.dataDir); const ledger = new LedgerApi(db.handle);
+      ledger.addJob({ id: f.lane.id, repo: f.lane.repoName, title: 'original job', briefing: 'original contract' });
+      ledger.registerWorktree(f.lane);
+      ledger.registerAgent({ id: 'original-minion', role: 'minion', jobId: f.lane.id, sessionFile: null, parentage });
+      const authority = serviceWorkflowAuthority(f.dataDir, () => ledger);
+      authority.resolveReviewResources(f.lane.id);
+      const retained = readBmadRuntimeBinding(f.lane.path, join(f.dataDir, 'bmad-runtime'))!;
+      class Port extends UnavailableWorktreePort {
+        override getWorktree(id: string) { return id === f.lane.id ? f.lane : null; }
+        override listWorktrees() { return [f.lane]; }
+      }
+      const h = host('pi', f, authority); const worktrees = new Port();
+      try {
+        const result = mode === 'fix'
+          ? await routeFixDirectiveToMinion({ registry: h.registry, ledger, worktrees, jobId: f.lane.id,
+              directive: 'accepted fix', contract: 'effective contract', signal: new AbortController().signal })
+          : await rebriefFreshMinion({ registry: h.registry, ledger, worktrees, jobId: f.lane.id,
+              note: 'accepted re-brief', briefing: 'effective contract' });
+        expect(result.minionId).toBe('original-minion');
+        expect(h.seen[0]!.resumeFile).toBeUndefined();
+        expect(h.seen[0]!.cwd).toBe(f.lane.path);
+        expect(h.seen[0]!.managedSkills!.contentSha256).toBe(retained.contentSha256);
+        expect(ledger.getAgent('original-minion')!.parentage).toBe(parentage);
+        expect(ledger.listImplementerMinions(f.lane.id).map((agent) => agent.id)).toEqual(['original-minion']);
+      } finally { await h.registry.dispose(); db.close(); }
+    }
+  });
+
   it('refuses cross-job ID collisions and never redirects a missing child assignment into the parent lane', () => {
     const a = fixture(); const b = fixture();
     const records = [
       { id: 'worker', jobId: a.lane.id, sessionFile: '/owner.jsonl', role: 'minion' as const, parentage: 'top-level' as const },
       { id: 'child', jobId: a.lane.id, sessionFile: '/child.jsonl', role: 'minion' as const, parentage: 'child' as const },
     ];
-    const ledger = { getAgent: (id: string) => records.find((record) => record.id === id) ?? null, listAgents: () => records, listJobAdmissions: () => [] };
+    const ledger = { getAgent: (id: string) => records.find((record) => record.id === id) ?? null, listAgents: () => records };
     const port = { getWorktree: (id: string) => id === 'worker' ? { ...b.lane, id: 'worker', jobId: 'worker' } : id === a.lane.id ? a.lane : null,
       listWorktrees: () => [a.lane, b.lane],
     };

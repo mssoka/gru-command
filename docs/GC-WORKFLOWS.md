@@ -11,8 +11,15 @@ Both Pi and Claude receive the owned skill, verified rendered instructions and
 explicit registered assignment through the existing managed-skill mechanism.
 Resume resolves the same worktree from recorded agent/session ownership when cwd
 is absent. Unknown/conflicting/swept assignments fail loudly, never at a guessed
-workspace. An owned job requires its recorded logical worker, not a new identity
-attached by cwd; child assignments never fall back into their parent's lane. Bounded child/report tasks do not start another top-level build cycle.
+workspace. Once a job has an implementer record, it requires that logical minion,
+not an unknown identity attached by cwd. Authorized sessionless fix/re-brief
+recovery keeps its recorded identity and parentage as well as the retained lane.
+A job with no implementer record can still admit its first minion by registered
+assignment; merely retaining helper bytes is not worker execution. Child assignments
+never fall back into their parent's lane. Bounded child/report tasks do not start
+another top-level build cycle. Fresh dispatch validates the safe lowercase job-id
+storage contract before creating any ledger or worktree state; historical IDs and
+bindings are not migrated.
 Project AGENTS.md, testing conventions and approved source documents still apply.
 No project/global skill or malformed `_bmad/custom`/legacy answer selects GC's
 workflow. Setup provisioning is still transitional until #295; independent BMAD
@@ -27,11 +34,15 @@ runs one ambient-free read-only report task using the existing isolated review
 host on both adapters. Its only write capability is `gc_submit_fallback_findings`,
 a host-bound private report submission; ordinary shell/Edit/Write tools are absent.
 The host supplies the verified helper and canonical base/HEAD/complete working-diff
-hash. Failed Git preparation and oversize input block before spawning, never
+hash, including full binary patches/full blob identities and disabling configured
+textconv (which could otherwise hide code bytes). Failed Git preparation and
+oversize input block before spawning, never
 pass an incomplete/truncated diff. Before triage, the host captures the input
 again; moved HEAD or changed working bytes invalidate the old report even when
 no ledger event was emitted. Conflicting report submissions also block, including
-when the model ignores the tool error and replies DONE.
+when the model ignores the tool error and replies DONE. A submitted report alone
+cannot pass: the runtime must positively attest the review turn's terminal
+completion (or its authoritative successful automatic retry settlement).
 Missing owned resources or the required report-tool capability record an actionable
 blocked result, never borrow an
 ambient skill. Stable `bmad-review-fallback` API/event identifiers are retained;

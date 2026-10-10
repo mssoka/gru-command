@@ -398,6 +398,14 @@ function sourceIdentities(values: readonly ArtifactSource[]): readonly ArtifactS
   })));
 }
 
+/** Share the storage precondition with fresh dispatch BEFORE it creates
+ * ledger/worktree state. Historical record identities are not migrated. */
+export function requireArtifactJobId(jobId: string): void {
+  if (!/^[a-z0-9][a-z0-9._-]{0,127}$/u.test(jobId)) {
+    throw new ArtifactContextError('private GC artifacts require a safe lowercase job id (1–128 letters/digits, dot, underscore or dash, beginning with a letter/digit); choose such an id before dispatch');
+  }
+}
+
 /** New GC-owned workflow storage contract (#293). This is a caller-driven
  * primitive, not session wiring (#294), intake/approval (#296/#297), a ledger
  * migration or a cleanup policy. Historical bindings and stores are untouched. */
@@ -408,10 +416,10 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
     const assignedWorktree = absolute(input.worktree.path, 'assigned worktree path');
     const jobId = input.worktree.id;
     if (input.worktree.kind !== 'job' || input.worktree.jobId !== jobId ||
-        (input.worktree.status !== 'active' && input.worktree.status !== 'paused') ||
-        !/^[a-z0-9][a-z0-9._-]{0,127}$/u.test(jobId)) {
+        (input.worktree.status !== 'active' && input.worktree.status !== 'paused')) {
       throw new ArtifactContextError('artifact context requires a live registered job lane with a safe lowercase owning job id');
     }
+    requireArtifactJobId(jobId);
     const workflow = workflowIdentity(input.workflow);
     verifyLane(registeredRepo, assignedWorktree);
     const repoPath = realpathSync(registeredRepo);

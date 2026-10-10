@@ -3324,6 +3324,27 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
     } finally { await h.wave.shutdown(); await registry.dispose(); await fx.runtime.dispose(); h.close(); }
   });
 
+  it('real Pi in-band error after host submission cannot turn the empty fallback report into PASS', async () => {
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'fallback-submit-before-error', name: 'gc_submit_fallback_findings', args: { findings: [] } } },
+      { deltas: [], error: 'review failed in-band', stopReason: 'error' },
+    ]);
+    const dataDir = realpathSync(fx.home);
+    const h = makeFallbackRuntimeHarness((role, opts) => registry.spawn(role, opts), dataDir);
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+      workflowLaneFor: h.authority.workflowLaneFor, workflowBuildFor: h.authority.workflowBuildFor }),
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('fallback reviewer turn did not successfully complete');
+      expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
+      expect(h.ledger.listEvents().some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally { await h.wave.shutdown(); await registry.dispose(); await fx.runtime.dispose(); h.close(); }
+  });
+
   it('fails loud on a relative or nonexistent cwd (never a silent fallback)', async () => {
     const fx = await fixture();
     await expect(fx.runtime.spawn('minion', { cwd: 'relative/path' })).rejects.toThrowError(

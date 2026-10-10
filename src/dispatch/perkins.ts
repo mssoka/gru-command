@@ -1,4 +1,5 @@
-import type { AgentHandle } from '../runtime/types.js';
+import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
+import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -1472,7 +1473,7 @@ function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackR
   if (prepared.error !== undefined || prepared.status !== 0) {
     throw new Error(`cannot prepare the complete fallback working diff: ${prepared.error?.message ?? prepared.stderr.trim().slice(0, 200)}`);
   }
-  const result = spawnSync('git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-color', baseRef],
+  const result = spawnSync('git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--full-index', baseRef],
     { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
   const restored = spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { encoding: 'utf8', timeout: 10_000 });
   if (restored.error !== undefined || restored.status !== 0) {
@@ -3905,6 +3906,7 @@ export class WaveRunner {
       if (input.signal.aborted) throw new Error('review operation aborted');
       const session = handle;
       let promptError: unknown = null;
+      let terminalVerdict: PromptTurnVerdict | null = null;
       try {
         // The transport wait is a still-running REPORT boundary, never a
         // worker lifetime: a live review turn keeps running on its own
@@ -3915,10 +3917,10 @@ export class WaveRunner {
         let sliceTimer: ReturnType<typeof setTimeout> | null = null;
         let abortListener: (() => void) | null = null;
         try {
-          const settled = new Promise<'settled'>((resolve) => {
-            void session.prompt(prompt, { owner: 'bmad-review-gate' }).then(
-              () => resolve('settled'),
-              (error) => { promptError = error; resolve('settled'); },
+          const settled = new Promise<PromptTurnVerdict | null>((resolve) => {
+            void promptWithTerminalVerdict(session, prompt, { owner: 'bmad-review-gate' }).then(
+              resolve,
+              (error) => { promptError = error; resolve(null); },
             );
           });
           const aborted = new Promise<never>((_resolve, reject) => {
@@ -3931,7 +3933,7 @@ export class WaveRunner {
               sliceTimer = setTimeout(() => resolve('slice'), FALLBACK_REVIEW_TIMEOUT_MS);
               sliceTimer.unref?.();
             });
-            let outcome: 'settled' | 'slice';
+            let outcome: PromptTurnVerdict | null | 'slice';
             try {
               outcome = await Promise.race([settled, aborted, slice]);
             } finally {
@@ -3940,7 +3942,7 @@ export class WaveRunner {
                 sliceTimer = null;
               }
             }
-            if (outcome === 'settled') break;
+            if (outcome !== 'slice') { terminalVerdict = outcome; break; }
             waitedMs += FALLBACK_REVIEW_TIMEOUT_MS;
             const sessionState = session.health().state;
             if (sessionState === 'disposed' || sessionState === 'error') {
@@ -3976,6 +3978,9 @@ export class WaveRunner {
       // report file the retried turn wrote is parsed below; only a
       // rejection with no recovered retry keeps the fail-loud throw.
       if (promptError !== null && disposition !== 'recovered') throw promptError;
+      if (disposition !== 'recovered' && terminalVerdict?.ok !== true) {
+        throw new Error(`fallback reviewer turn did not successfully complete: ${terminalVerdict?.error ?? 'no terminal completion evidence'}`);
+      }
       policy.assertReportValid();
     } finally {
       try { await handle?.dispose(); } finally { lease?.release(); }
