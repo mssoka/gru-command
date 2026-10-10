@@ -8777,32 +8777,34 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       return { fire: calls[0]![0] as () => void, ms: calls[0]![1] as number };
     };
     try {
+      // Freeze Date only: real Git/rollback latency must not be included
+      // in the production retry delay. Timers and async polling stay real.
+      vi.setSystemTime(Date.now());
+      expect(vi.isFakeTimers()).toBe(false);
       let mark = timers.mock.calls.length;
       let refusedAt = Date.now();
       await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
       const first = armed(mark);
-      expect(first.ms).toBeGreaterThan(59_000);
-      expect(first.ms).toBeLessThanOrEqual(60_000);
+      expect(first.ms).toBe(60_000);
       const due1 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[0] as { dueAt: string }).dueAt);
-      expect(due1 - refusedAt).toBeGreaterThanOrEqual(59_000);
-      expect(due1 - refusedAt).toBeLessThanOrEqual(61_000);
+      expect(due1 - refusedAt).toBe(60_000);
       await new Promise((resolve) => setTimeout(resolve, 200));
       expect(f.ledger.listRounds(f.jobId)).toHaveLength(1); // no early dispatch
       // The minute is up: fire it (standing in for the clock).
       mark = timers.mock.calls.length;
+      vi.setSystemTime(due1);
       refusedAt = Date.now();
       first.fire();
       await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled').length === 2);
       await until(() => timers.mock.calls.slice(mark).some(([, ms]) => typeof ms === 'number' && ms > 30_000));
       const second = armed(mark);
-      expect(second.ms).toBeGreaterThan(299_000);
-      expect(second.ms).toBeLessThanOrEqual(300_000);
+      expect(second.ms).toBe(300_000);
       const due2 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[1] as { dueAt: string }).dueAt);
-      expect(due2 - refusedAt).toBeGreaterThanOrEqual(299_000);
-      expect(due2 - refusedAt).toBeLessThanOrEqual(305_000);
+      expect(due2 - refusedAt).toBe(300_000);
       expect(f.ledger.listRounds(f.jobId)).toHaveLength(2);
     } finally {
       timers.mockRestore();
+      vi.useRealTimers();
       f.restorePath();
       await wave.shutdown();
     }

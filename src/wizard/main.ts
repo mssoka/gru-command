@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { createInterface } from 'node:readline/promises';
 import { stdout } from 'node:process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { existsSync, openSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, openSync, realpathSync } from 'node:fs';
 import { ReadStream, WriteStream } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 import * as QRCode from 'qrcode';
@@ -46,7 +46,7 @@ import {
   seedAnswersFromConfig,
   writeConfigText,
 } from './steps.js';
-import { onboardBmadRepo } from './bmad-onboarding.js';
+import { validateRepositorySetup } from './repository-setup.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -117,32 +117,6 @@ async function ask(rl: ReturnType<typeof createInterface>, question: string): Pr
   return (await rl.question(question)).trim();
 }
 
-/** Failure-prompt line where EOF (Ctrl-D / closed stdin) is a first-class
- * outcome: readline/promises' question() never settles once the input
- * stream ends (observed on Node 22), so race it against the interface's
- * close event. A closed prompt must reach the documented skip path, never
- * wedge the wizard. Default prompts keep `ask` and are never offered here. */
-async function askOrEof(
-  rl: ReturnType<typeof createInterface>,
-  question: string,
-): Promise<string | null> {
-  return new Promise<string | null>((resolve) => {
-    let settled = false;
-    const settle = (value: string | null): void => {
-      if (settled) return;
-      settled = true;
-      rl.off('close', onClose);
-      resolve(value);
-    };
-    const onClose = (): void => settle(null);
-    rl.once('close', onClose);
-    void rl.question(question).then(
-      (answer) => settle(answer.trim()),
-      () => settle(null),
-    );
-  });
-}
-
 function yn(value: string): boolean {
   return value.toLowerCase() === 'y' || value.toLowerCase() === 'yes';
 }
@@ -178,7 +152,15 @@ async function interactiveAnswers(
   }
 
   const workspaceAbs = workspaceRoot.replace(/^~(?=\/|$)/, homedir());
-  const found = discoverManagedRepos(workspaceAbs);
+  const discovered = discoverManagedRepos(workspaceAbs);
+  // The board still discovers linked entries; setup only validates real
+  // repository directories and must not offer defaults it then rejects.
+  const found = discovered.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
+  const linked = discovered.filter((name) => !found.includes(name));
+  if (linked.length > 0) {
+    out.write(`\nLinked repo entries excluded from setup validation: ${linked.join(', ')}.\n` +
+      'Use their real directory under the workspace root to validate them; links stay unchanged.\n');
+  }
   let repos: string[] = [];
   if (found.length > 0) {
     out.write('\nRepos under the workspace root:\n');
@@ -186,7 +168,7 @@ async function interactiveAnswers(
     for (;;) {
       const answer = await ask(
         rl,
-        `Managed repos — comma-separated numbers or names [all ${found.length}]: `,
+        `Repos to validate — comma-separated numbers or names [all ${found.length}]: `,
       );
       if (answer === '') {
         repos = [...found];
@@ -210,32 +192,9 @@ async function interactiveAnswers(
     }
   } else {
     out.write(
-      `\nNo git repos found under ${workspaceRoot} yet — the board will be empty\n` +
-        'until you add repos there.\n',
+      `\nNo real repository directories available for setup validation under ${workspaceRoot}.\n` +
+        'The board discovers Git entries independently; add a real repository here to validate it.\n',
     );
-  }
-
-  const bmad: Record<string, 'provision' | 'skip'> = {};
-  for (const repo of repos) {
-    const hasLegacy = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'));
-    for (;;) {
-      const answer = (
-        await ask(
-          rl,
-          `BMAD in ${repo}: provision project state for the GC-managed BMAD runtime` +
-            `${hasLegacy ? ' (the existing repo-local install stays untouched)' : ''}? [Y/n]: `,
-        )
-      ).toLowerCase();
-      if (['', 'y', 'yes', 'provision'].includes(answer)) {
-        bmad[repo] = 'provision';
-        break;
-      }
-      if (['skip', 'n', 'no'].includes(answer)) {
-        bmad[repo] = 'skip';
-        break;
-      }
-      out.write('  ✗ enter yes or no\n');
-    }
   }
 
   const runtimeDefault = prior?.runtimes.default ?? defaultRuntimeId(probe);
@@ -313,7 +272,6 @@ async function interactiveAnswers(
     JSON.stringify({
       workspace_root: workspaceRoot,
       repos,
-      bmad,
       runtime,
       model,
       thinking_level: thinkingLevel,
@@ -631,14 +589,8 @@ async function main(argv: readonly string[]): Promise<number> {
   const configText = generateConfigToml({ answers, instanceDir, prior });
 
   stdout.write(
-    `\nSelected repos for BMAD onboarding: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
+    `\nRepositories selected for setup validation: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
   );
-  if (answers.repos.length > 0) {
-    stdout.write('BMAD per-repo plan (no workspace-root or unselected-repo writes):\n');
-    for (const repo of answers.repos) {
-      stdout.write(`  ${repo}: ${answers.bmad[repo] ?? 'skip'}\n`);
-    }
-  }
 
   if (answers.port !== 0) {
     const holder = await findPortHolder(answers.host, answers.port);
@@ -654,74 +606,15 @@ async function main(argv: readonly string[]): Promise<number> {
 
   const workspaceAbs = expandTilde(answers.workspaceRoot, homedir());
   for (const repo of answers.repos) {
-    let action = answers.bmad[repo] ?? 'skip';
-    for (;;) {
-      const result = onboardBmadRepo(repo, action, { workspaceRoot: workspaceAbs, answers });
-      if (result.ready) {
-        stdout.write(`BMAD ready in ${repo}: ${result.message}\n`);
-        stdout.write(
-          `  Commit ${repo}/_bmad/custom/ (team settings, its .gitignore) when fresh worktrees should share ` +
-            'them; generated output and personal *.user.toml settings stay local.\n',
-        );
-        break;
-      }
-      if (action === 'skip') {
-        stdout.write(`BMAD not ready in ${repo}: ${result.message}; repo remains managed.\n`);
-        break;
-      }
-      if (result.deterministic) {
-        // Deterministic state failure (gh-32): the check ran against
-        // unchanged on-disk state, so another identical retry can never
-        // succeed. Offer skip-only plus the class-appropriate deliberate
-        // repair path; other classes fall back to neutral wording. The
-        // wizard never repairs or overwrites existing repo state itself.
-        const repairHint = result.repairHint ??
-          'Repair the reported condition deliberately, then re-run the wizard';
-        if (terminal === null) {
-          fail(
-            `BMAD setup for ${repo} is not ready (deterministic failure — retrying cannot fix it): ${result.message}\n` +
-              `${repairHint}, or explicitly set answers.bmad.${repo}="skip".`,
-          );
-        }
-        terminal.output.write(
-          `BMAD setup for ${repo} failed (deterministic — retrying cannot fix it): ${result.message}\n` +
-            `  ${repairHint}; Gru never repairs existing repo state automatically.\n`,
-        );
-        for (;;) {
-          const skipRl = createInterface({ input: terminal.input, output: terminal.output });
-          const answer = await askOrEof(skipRl, 'Skip this repo? [skip]: ');
-          skipRl.close();
-          if (answer === null) {
-            terminal.output.write('  input closed (EOF) — taking the skip path\n');
-          }
-          const choice = (answer ?? 'skip').toLowerCase();
-          if (['', 'skip', 's', 'y', 'yes'].includes(choice)) {
-            action = 'skip';
-            break;
-          }
-          terminal.output.write('  ✗ this failure is deterministic — retry cannot fix it; enter skip\n');
-        }
-        continue;
-      }
-      if (terminal === null) {
-        fail(
-          `BMAD setup for ${repo} is not ready: ${result.message}\n` +
-            `Retry after fixing it, or explicitly set answers.bmad.${repo}="skip".`,
-        );
-      }
-      terminal.output.write(`BMAD setup for ${repo} failed: ${result.message}\n`);
-      const retryRl = createInterface({ input: terminal.input, output: terminal.output });
-      const answer = await askOrEof(retryRl, 'Retry or skip this repo? [retry/skip]: ');
-      retryRl.close();
-      if (answer === null) {
-        terminal.output.write('  input closed (EOF) — taking the skip path\n');
-      }
-      const choice = (answer ?? 'skip').toLowerCase();
-      action = choice === 'skip' ? 'skip' : action;
+    try {
+      validateRepositorySetup(workspaceAbs, repo);
+    } catch (error) {
+      fail((error as Error).message);
     }
+    stdout.write(`Repository ready in ${repo}: GC setup validated; project files unchanged.\n`);
   }
 
-  // BMAD setup may take minutes. Recheck the fixed port immediately
+  // Recheck the fixed port immediately
   // before writing config so a late listener cannot turn a completed
   // setup into a knowingly unbootable instance.
   if (answers.port !== 0) {
