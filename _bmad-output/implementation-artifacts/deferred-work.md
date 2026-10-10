@@ -173,3 +173,21 @@
   evidence: R8-repair blind review follow-up at `src/dispatch/perkins-review/whole.ts:760` (populated at `:869`); the file was untouched by the R8 repair. Settled by: removing it or wiring it into a real cross-check.
 
 - source_spec: `spec-perkins-integration-review-coverage.md` — RESOLVED by contract revision 2 / amendment #2 (j-1762): the redaction-span follow-up recorded above is repaired reader-side. The scope-disclosure decoder now refuses evidence whose absence is consistent with a publication-redaction span (no anchored heading with a redaction placeholder present, or an in-region placeholder with no scope line), while genuine pre-disclosure legacy records (no placeholder) keep whole-complete credit. Regression: `redaction-erased disclosure cannot grant historical whole clearance` (real assembler/redactor + recovery/readiness assertions, fail-before at b930417 via `perkins-int-r9-baseline-heavy`).
+
+## CI cohort repair round (head f99158e, 2026-10-10) — recorded follow-ups
+
+- `test/test-budgets.test.ts` carries a duplicated `perkins-stage1-baseline` /
+  `wizard-bmad-retry-baseline` exemption block (~lines 204-231) — pre-existing
+  at the PR base, untouched code (blind lens, non-blocking).
+- `perkins-stage1-baseline`'s `-t` alternative `join an identical` matches no
+  test name anywhere (real title: `joins an identical in-flight request …` in
+  `review-mcp-transport.test.ts:116`) — pre-existing scope defect, untouched
+  code, not fixed by widening this round (verify lens finding 3).
+- `perkins-integration-r4-focused` heavy leg has no per-file collection
+  assertion (verify lens finding 1, optional): absence is caught by the fast
+  leg's suite-shape pin, misclassification by the full-suite test-budgets
+  scope guard and the five baseline scopes (exit 2, "not collected").
+- `perkins-integration-r4-focused` comment at worktree.toml:726 still says
+  "the classified heavy wave and whole-review files" (now also recovery) —
+  comment-only nit; fold into the next edit that touches that line rather
+  than moving the verified CI-green head.
