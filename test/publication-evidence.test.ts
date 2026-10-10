@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   PUBLICATION_ABSENT_EVENT,
   PUBLICATION_ATTEMPT_EVENT,
+  PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
   pendingPublicationAttempt,
   type PublicationEvidenceReader,
