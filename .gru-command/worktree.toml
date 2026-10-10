@@ -725,7 +725,7 @@ repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea;
 # skill trees through the shipped loaders, so the scope builds the current
 # committed head first (the suite refuses a stale dist); approved RPC
 # patch prerequisite first, exits never masked.
-merge-authority-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/roles-definitions.test.ts test/roles-gru.test.ts test/roles-installed-playbook.test.ts test/silas-driver.test.ts test/silas-rules.test.ts test/github-poll.test.ts test/awareness.test.ts test/assert-merge-authority-baseline.test.ts test/test-budgets.test.ts test/suite-shape.test.ts"
+merge-authority-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/roles-definitions.test.ts test/roles-gru.test.ts test/roles-installed-playbook.test.ts test/silas-driver.test.ts test/silas-rules.test.ts test/github-poll.test.ts test/awareness.test.ts test/assert-merge-authority-baseline.test.ts test/config-generate.test.ts test/test-budgets.test.ts test/suite-shape.test.ts"
 
 # Static product checks for the same change (lint, compiler, full build
 # including the pinned Perkins resource verifier); approved RPC patch first.

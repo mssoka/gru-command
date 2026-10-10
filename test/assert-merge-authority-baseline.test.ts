@@ -1,3 +1,7 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   EXPECTED_BASELINE_ASSERTIONS,
@@ -83,5 +87,30 @@ describe('merge-authority fail-before classifier', () => {
       numFailedTests: 3,
       testResults: [{ assertionResults: [assertion(EXPECTED_BASELINE_ASSERTIONS[0] ?? '', 'failed', ['AssertionError: x'])] }],
     })).toThrow(/unreadable report/u);
+  });
+
+  it('the CLI entry really classifies: proof marker on accept, loud refusal on reject', () => {
+    // The verify scope invokes the tool as a subprocess and reads its exit
+    // code/markers. A broken entry guard would exit 0 with no output and
+    // let the scope's own `exit 1` masquerade as the fail-before proof.
+    const dir = mkdtempSync(join(tmpdir(), 'gru-merge-authority-classifier-'));
+    const tool = join(import.meta.dirname, '..', 'tools', 'assert-merge-authority-baseline.mjs');
+    const acceptPath = join(dir, 'accept.json');
+    const refusePath = join(dir, 'refuse.json');
+    writeFileSync(acceptPath, JSON.stringify(report(...RED)));
+    writeFileSync(refusePath, JSON.stringify({ numFailedTests: 0, testResults: [] }));
+    const accept = execFileSync(process.execPath, [tool, acceptPath], { encoding: 'utf-8' });
+    expect(accept).toContain('EXPECTED RED:');
+    let status = -1;
+    let stderr = '';
+    try {
+      execFileSync(process.execPath, [tool, refusePath], { encoding: 'utf-8' });
+    } catch (error) {
+      const failure = error as { readonly status?: number; readonly stderr?: string };
+      status = failure.status ?? -1;
+      stderr = failure.stderr ?? '';
+    }
+    expect(status).toBe(2);
+    expect(stderr).toContain('FAILS-BEFORE CLAIM BROKEN');
   });
 });

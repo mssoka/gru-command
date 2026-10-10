@@ -48,8 +48,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   0 disables) observes tracked branches through authenticated `gh api`
  *   (POLL-ONLY — the webhook route is descoped) and mechanically applies
  *   the GitHub state-change mappings: a merged PR closes its lane, a
- *   conflicting PR cascades an action-required notification, CI failure
- *   posts a tiered notification with the run URL, CI green records the
+ *   conflicting PR cascades an fyi notification (mechanical tier — Silas
+ *   coordinates the conflict integration); CI failure posts a tiered
+ *   notification with the run URL; CI green records the
  *   review-gate signal event. Dedupe is by observed state-change; the tier
  *   ladder and the wake kinds are unchanged.
  * - Concurrency follows the decisions runtime's one-slot replay: a trigger
