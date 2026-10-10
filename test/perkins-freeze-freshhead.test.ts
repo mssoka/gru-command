@@ -22,6 +22,14 @@ import { GitReviewPort } from './helpers/git-review-port.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
+
 /** Wraps GitReviewPort so the JOB LANE lives at a real linked worktree
  * (path ≠ the host checkout) — the divergence shape the stock double
  * cannot model, and exactly how production lanes differ from the host
@@ -314,8 +322,8 @@ describe('freeze-time integration on PR rounds', () => {
     settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/13');
     const poster = {
-      post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+      post: vi.fn(async (input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha,
         headSha: input.targetSha, baseSha: 'stub-base',
         bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
       })),
@@ -407,8 +415,8 @@ describe('freeze-time integration on PR rounds', () => {
       worktrees: port,
       spawner: fakeWholeSpawner(sessions, { childAnswer: () => '[]' }).spawner,
       poster: {
-        post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
-          reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+        post: vi.fn(async (input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) => ({
+          reviewId: '9002', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha,
           headSha: input.targetSha, baseSha: 'stub-base',
           bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
         })),
@@ -448,8 +456,8 @@ describe('freeze-time integration on PR rounds', () => {
     settleLane(ledger, job.id);
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/16');
     const poster = {
-      post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({
-        reviewId: '9003', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+      post: vi.fn(async (input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9003', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha,
         headSha: input.targetSha, baseSha: 'stub-base',
         bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
       })),

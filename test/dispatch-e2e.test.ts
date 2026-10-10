@@ -33,6 +33,14 @@ import type { Role } from '../src/config.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
 
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
+
 /**
  * End-to-end dispatch on a fixture repo (EPICS E8 story 4): briefing →
  * job + worktree + minion rooted in the project (ruling 17) → board arc →
@@ -154,7 +162,7 @@ function makeDispatchHarness(opts: {
       },
     ],
   });
-  const poster = { post: vi.fn(async (input: { readonly targetSha: string; readonly body: string }) => ({ reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'e2e-delivered-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') })) };
+  const poster = { post: vi.fn(async (input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) => ({ reviewId: '9001', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha, headSha: input.targetSha, baseSha: 'e2e-delivered-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') })) };
   const wave = new WaveRunner({
     ledger,
     worktrees,

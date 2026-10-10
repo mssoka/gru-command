@@ -2,7 +2,7 @@ import { createHash, createPrivateKey, createSign } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { PostedReviewReceipt, PrIdentity, VerdictPoster, VerdictPosterInput, VerdictReconcileContext } from './perkins.js';
-import { AutoVerdictPoster, GhPrPoster, verifyPostedReceipt } from './perkins.js';
+import { AutoVerdictPoster, cancelAwareSignal, enactedStateFor, GhPrPoster, verifyPostedReceipt } from './perkins.js';
 import { repoRemote } from './review-path.js';
 
 /**
@@ -540,25 +540,39 @@ function usableProviderReviewId(id: unknown): string | null {
 }
 
 /** The delivery predicate without the provider-id requirement: author
- * login+type, event state, frozen head, and byte-identical body. With a
+ * login+type, the ENACTED state this delivery intended, frozen head, and
+ * byte-identical body. With a
  * recency bound (the ambiguous-POST path) only submissions inside this
  * round's window — POST start minus the 60 s clock-skew margin — count;
  * null (the idempotent recovery seam) matches any identical publication.
  * Older rounds' identical bytes outside the margin are never credited as
- * this delivery. */
-function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+ * this delivery, and a review in any other state (a COMMENTED review
+ * beside an approval intent, an unexpected APPROVED beside a change-request
+ * intent) is never a match. A null `wantedState` matches ANY enacted state
+ * — the wrong-state evidence test below, never a credit predicate. */
+function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string | null, notBeforeMs: number | null): boolean {
   if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
-  if (review.state !== 'COMMENTED' || review.commit_id !== targetSha || review.body !== body) return false;
+  if ((wantedState !== null && review.state !== wantedState) || review.commit_id !== targetSha || review.body !== body) return false;
   if (notBeforeMs === null) return true;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
   return Number.isFinite(submittedAt) && submittedAt >= notBeforeMs;
 }
 
+/** A review matching this publication's author, frozen head, body and
+ * window in ANY SUBMITTED state — evidence the publication exists, but NOT
+ * in the state this delivery intended. It can neither be credited nor read
+ * as absence: the delivery stays explicitly unresolved. A PENDING draft is
+ * not delivered evidence at all (it was never submitted), so it is skipped
+ * exactly like any unrelated review. */
+function isMatchingAppReviewInAnyState(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+  return review.state !== 'PENDING' && matchesDeliveryPredicates(review, botLogin, targetSha, body, null, notBeforeMs);
+}
+
 /** Provider-proved evidence that OUR App bot published exactly this review
  * during this round: every delivery predicate plus a usable provider id
  * (a receipt can only be certified with one). */
-function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
-  return usableProviderReviewId(review.id) !== null && matchesDeliveryPredicates(review, botLogin, targetSha, body, notBeforeMs);
+function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string, notBeforeMs: number | null): boolean {
+  return usableProviderReviewId(review.id) !== null && matchesDeliveryPredicates(review, botLogin, targetSha, body, wantedState, notBeforeMs);
 }
 
 /** A review matching every delivery predicate but carrying an unusable (or
@@ -566,18 +580,22 @@ function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha
  * this round's landed publication. The walk must neither credit it nor
  * silently skip it into an absence certificate — one such review keeps the
  * delivery unresolved. */
-function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
-  return usableProviderReviewId(review.id) === null && matchesDeliveryPredicates(review, botLogin, targetSha, body, notBeforeMs);
+function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string, notBeforeMs: number | null): boolean {
+  return usableProviderReviewId(review.id) === null && matchesDeliveryPredicates(review, botLogin, targetSha, body, wantedState, notBeforeMs);
 }
 
-/** A review identical on author/state/commit/body whose submission time is
+/** A review identical on author/commit/body whose submission time is
  * missing or unparseable: with a recency bound it can be neither credited
  * (its window is unprovable) nor excluded as an older round's, so it also
- * forbids an absence certificate. */
+ * forbids an absence certificate — REGARDLESS of the enacted state. A
+ * body-identical review in a different state with an unverifiable window may
+ * be this attempt's publication in the wrong state, so it must hold the
+ * delivery unresolved instead of letting a fully covered list claim the
+ * POST did not land. A PENDING draft is undelivered and is skipped. */
 function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
   if (notBeforeMs === null) return false;
   if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
-  if (review.state !== 'COMMENTED' || review.commit_id !== targetSha || review.body !== body) return false;
+  if (review.state === 'PENDING' || review.commit_id !== targetSha || review.body !== body) return false;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
   return !Number.isFinite(submittedAt);
 }
@@ -717,15 +735,27 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
+    // The wanted formal event travels WITH the delivery (owner ruling
+    // j-1615): an eligible native READY enacts APPROVE, a confirmed blocker
+    // set enacts REQUEST_CHANGES, everything else stays a COMMENT. The
+    // provider's enacted state is verified against exactly this below.
+    const wantedState = enactedStateFor(input.reviewEvent);
     const { grant, botLogin, owner, repo, prNumber, headSha, baseSha } = await this.prepare(input);
     const postStartMs = this.now();
+    // The round may have been cancelled/superseded while the preparation
+    // probes were outstanding: never start the irreversible POST for an
+    // already-cancelled round (the round signal is combined with every
+    // probe and POST timeout above and below).
+    if (input.signal?.aborted) {
+      throw new PerkinsAppError('review delivery cancelled before the irreversible POST — no review was created');
+    }
     let review: unknown;
     try {
       review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
         method: 'POST',
         headers: this.bearerHeaders(grant.token),
-        body: JSON.stringify({ body: input.body, event: 'COMMENT', commit_id: input.targetSha }),
-        signal: AbortSignal.timeout(this.postTimeoutMs),
+        body: JSON.stringify({ body: input.body, event: input.reviewEvent, commit_id: input.targetSha }),
+        signal: cancelAwareSignal(input.signal, this.postTimeoutMs),
       }, { ambiguousOutcome: true })).body;
     } catch (error) {
       // Only a 4xx is the provider's definitive refusal — no review exists;
@@ -743,12 +773,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         }
         throw error;
       }
-      return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
+      return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, baseSha, error, postStartMs, input.signal);
     }
     try {
       return verifyPostedReceipt(
-        this.receiptFromReview(review, botLogin, input.targetSha, headSha, baseSha, input.body),
-        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+        this.receiptFromReview(review, botLogin, input.targetSha, headSha, baseSha, input.body, wantedState),
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState },
       );
     } catch (error) {
       if (error instanceof PerkinsAppError) {
@@ -756,7 +786,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // event, wrong commit, mismatched or unreadable body) leaves the
         // delivery identity ambiguous — the same bounded reconciliation
         // decides it, never a blind retry.
-        return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
+        return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, baseSha, error, postStartMs, input.signal);
       }
       throw error;
     }
@@ -782,11 +812,20 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       );
     }
     const { grant, botLogin, owner, repo, prNumber, baseSha } = await this.prepare(input);
-    const { matched, provablyAbsent, matchedButUnreceiptable } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, null);
+    const wantedState = enactedStateFor(input.reviewEvent);
+    const { matched, provablyAbsent, matchedButUnreceiptable, matchedButWrongState } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, null, input.signal);
     if (matched !== null) {
       return verifyPostedReceipt(
-        this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body),
-        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+        this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body, wantedState),
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState },
+      );
+    }
+    if (matchedButWrongState !== null) {
+      // A body-identical review in the wrong state is real evidence of a
+      // DIFFERENT delivery: it neither fulfills the intent nor certifies
+      // that the intended review is absent.
+      throw new PerkinsAppError(
+        `review reconciliation found a review matching the intended publication's author, frozen head and body in state ${sanitize(matchedButWrongState)} instead of the intended ${wantedState} — delivery stays unresolved; verify that review manually before any retry, never assume absence`,
       );
     }
     if (matchedButUnreceiptable) {
@@ -858,9 +897,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
 
     const nowMs = this.now();
     const jwt = mintAppJwt(config.appId, privateKeyPem, nowMs);
-    const grant = await this.mintInstallationToken(jwt, installationId, owner, repo, nowMs);
-    const botLogin = await this.verifyAppIdentity(jwt, config.appId);
-    const { headSha, baseSha } = await this.verifyPullRequest(grant, owner, repo, prNumber, input.targetSha);
+    const grant = await this.mintInstallationToken(jwt, installationId, owner, repo, nowMs, input.signal);
+    const botLogin = await this.verifyAppIdentity(jwt, config.appId, input.signal);
+    const { headSha, baseSha } = await this.verifyPullRequest(grant, owner, repo, prNumber, input.targetSha, input.signal);
     return { grant, botLogin, owner, repo, prNumber, headSha, baseSha };
   }
 
@@ -942,6 +981,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     owner: string,
     repo: string,
     nowMs: number,
+    cancel?: AbortSignal,
   ): Promise<TokenGrant> {
     let body: unknown;
     try {
@@ -954,7 +994,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
           repositories: [repo],
           permissions: { 'pull_requests': 'write', 'metadata': 'read' },
         }),
-        signal: AbortSignal.timeout(this.probeTimeoutMs),
+        signal: cancelAwareSignal(cancel, this.probeTimeoutMs),
       }));
     } catch (error) {
       if (error instanceof PerkinsAppHttpError) {
@@ -1005,10 +1045,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     return { token, expiresAtMs: expiresAt };
   }
 
-  private async verifyAppIdentity(jwt: string, expectedAppId: number): Promise<string> {
+  private async verifyAppIdentity(jwt: string, expectedAppId: number, cancel?: AbortSignal): Promise<string> {
     const { body } = await this.callApi('App identity', `${API_ROOT}/app`, {
       headers: { ...API_HEADERS, 'AUTHORIZATION': `Bearer ${jwt}` },
-      signal: AbortSignal.timeout(this.probeTimeoutMs),
+      signal: cancelAwareSignal(cancel, this.probeTimeoutMs),
     });
     const parsed = body as { id?: unknown; slug?: unknown } | null;
     if (parsed?.id !== expectedAppId) {
@@ -1034,10 +1074,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     repo: string,
     prNumber: string,
     targetSha: string,
+    cancel?: AbortSignal,
   ): Promise<PrIdentity> {
     const { body } = await this.callApi('pull request identity', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}`, {
       headers: this.bearerHeaders(grant.token),
-      signal: AbortSignal.timeout(this.probeTimeoutMs),
+      signal: cancelAwareSignal(cancel, this.probeTimeoutMs),
     });
     const parsed = body as { head?: { sha?: unknown }; base?: { sha?: unknown } } | null;
     const headSha = typeof parsed?.head?.sha === 'string' ? parsed.head.sha : '';
@@ -1057,10 +1098,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
 
   /** Parse the provider's review object into a PostedReviewReceipt,
    * proving on the way: the author is the verified App bot (a Bot), the
-   * enacted event is COMMENTED, the provider bound the review to the
-   * reviewed commit, and the echoed body is byte-identical to what this
-   * delivery published. Any failure throws — the delivery identity stays
-   * unproven. */
+   * enacted event is the state this delivery intended, the provider bound
+   * the review to the reviewed commit, and the echoed body is byte-
+   * identical to what this delivery published. Any failure throws — the
+   * delivery identity stays unproven. */
   private receiptFromReview(
     review: unknown,
     botLogin: string,
@@ -1068,6 +1109,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     headSha: string,
     baseSha: string,
     publishedBody: string,
+    wantedState: string,
   ): PostedReviewReceipt {
     const parsed = review as { id?: unknown; user?: { login?: unknown; type?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown } | null;
     const reviewId = usableProviderReviewId(parsed?.id);
@@ -1083,9 +1125,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         `review publication identity mismatch: provider review ${reviewId} is authored by ${sanitize(loginText)} (${sanitize(typeText)}), expected the verified App bot ${botLogin} — delivery identity is unproven`,
       );
     }
-    if (parsed?.state !== 'COMMENTED') {
+    if (parsed?.state !== wantedState) {
       throw new PerkinsAppError(
-        `review publication state mismatch: provider review ${reviewId} enacted ${parsed?.state === undefined || parsed?.state === null ? '(none)' : sanitize(String(parsed?.state))} instead of COMMENTED — delivery identity is unproven`,
+        `review publication state mismatch: provider review ${reviewId} enacted ${parsed?.state === undefined || parsed?.state === null ? '(none)' : sanitize(String(parsed?.state))} instead of the required ${wantedState} — delivery identity is unproven`,
       );
     }
     if (parsed?.commit_id !== targetSha) {
@@ -1102,7 +1144,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     return {
       reviewId,
       actor: botLogin,
-      event: 'COMMENTED',
+      event: wantedState,
       commitId: parsed?.commit_id ?? null,
       headSha,
       baseSha,
@@ -1212,9 +1254,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     botLogin: string,
     targetSha: string,
     body: string,
+    wantedState: string,
     baseSha: string,
     cause: unknown,
     postStartMs: number,
+    cancel?: AbortSignal,
   ): Promise<PostedReviewReceipt> {
     const causeText = cause instanceof Error ? sanitize(cause.message) : 'network error';
     const unproven = (what: string): PerkinsAppError => new PerkinsAppError(
@@ -1224,9 +1268,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // counts as this round's (provider clock drift); anything older is
     // another round's bytes.
     const notBeforeMs = postStartMs - 60_000;
-    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean };
+    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean; readonly matchedButWrongState: string | null };
     try {
-      walked = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, targetSha, body, notBeforeMs);
+      walked = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, targetSha, body, wantedState, notBeforeMs, cancel);
     } catch (lookupError) {
       throw unproven(
         `the bounded proof lookup itself failed (${lookupError instanceof Error ? sanitize(lookupError.message) : 'lookup error'})`,
@@ -1234,8 +1278,13 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     }
     if (walked.matched !== null) {
       return verifyPostedReceipt(
-        this.receiptFromReview(walked.matched, botLogin, targetSha, targetSha, baseSha, body),
-        { targetSha, bodySha256: receiptDigest(body) },
+        this.receiptFromReview(walked.matched, botLogin, targetSha, targetSha, baseSha, body, wantedState),
+        { targetSha, bodySha256: receiptDigest(body), event: wantedState },
+      );
+    }
+    if (walked.matchedButWrongState !== null) {
+      throw unproven(
+        `a review matching this publication's author, frozen head and body was found in state ${sanitize(walked.matchedButWrongState)} instead of the intended ${wantedState}; whether the intended delivery landed stays unresolved`,
       );
     }
     if (walked.matchedButUnreceiptable) {
@@ -1258,7 +1307,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * Skipped pages are backfilled within the same request bound.
    * `notBeforeMs` bounds credit to this round's submissions when given;
    * null matches any identical publication (the idempotent recovery
-   * seam). `provablyAbsent` is true ONLY when the walk provably covered
+   * seam). `wantedState` is the enacted state this delivery intended —
+   * only a review in that exact state can be this publication.
+   * `provablyAbsent` is true ONLY when the walk provably covered
    * the ENTIRE review list: the last-page number is tracked as the MAXIMUM
    * any response reported, so a list that grows mid-walk can never be
    * certified absent from a stale snapshot, and the short-page end signal
@@ -1276,8 +1327,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     botLogin: string,
     targetSha: string,
     body: string,
+    wantedState: string,
     notBeforeMs: number | null,
-  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean }> {
+    cancel?: AbortSignal,
+  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean; readonly matchedButWrongState: string | null }> {
     const visited = new Set<number>();
     let lastPage: number | null = null;
     // Set when a response's rel="last" evidence is malformed or
@@ -1297,12 +1350,16 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       return null;
     };
     let matchedButUnreceiptable = false;
+    // The enacted state observed on a review that matches this publication's
+    // author, frozen head, body and window but NOT the intended state: it
+    // forbids an absence certificate exactly like an unusable id does.
+    let matchedButWrongState: string | null = null;
     for (let fetched = 0; fetched < this.maxReconciliationPages; fetched += 1) {
       visited.add(page);
       const result = await this.callApi(
         'review reconciliation',
         `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100&page=${page}`,
-        { headers: this.bearerHeaders(grant.token), signal: AbortSignal.timeout(this.probeTimeoutMs) },
+        { headers: this.bearerHeaders(grant.token), signal: cancelAwareSignal(cancel, this.probeTimeoutMs) },
       );
       const list = result.body;
       const linkHeader = result.header('link');
@@ -1328,14 +1385,20 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
       const reviews = list as readonly ProviderReview[];
-      const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
+      const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, wantedState, notBeforeMs));
       if (match !== undefined) {
-        return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false };
+        return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false, matchedButWrongState: null };
+      }
+      if (matchedButWrongState === null) {
+        const wrongState = reviews.find((review) => isMatchingAppReviewInAnyState(review, botLogin, targetSha, body, notBeforeMs));
+        if (wrongState !== undefined) {
+          matchedButWrongState = typeof wrongState.state === 'string' && wrongState.state !== '' ? wrongState.state : '(none)';
+        }
       }
       if (
         !matchedButUnreceiptable &&
         reviews.some((review) =>
-          isMatchingAppReviewWithUnusableId(review, botLogin, targetSha, body, notBeforeMs) ||
+          isMatchingAppReviewWithUnusableId(review, botLogin, targetSha, body, wantedState, notBeforeMs) ||
           isMatchingAppReviewWithUnverifiableTime(review, botLogin, targetSha, body, notBeforeMs))
       ) {
         // A predicate-complete publication that cannot form a this-round
@@ -1384,7 +1447,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     const provablyAbsent = !contradictoryPagination &&
       [...observedNextPages].every((nextPage) => visited.has(nextPage) && (lastPage === null || nextPage <= lastPage)) &&
       (lastPage !== null ? coveredThrough(lastPage) : shortEndPage !== null && coveredThrough(shortEndPage));
-    return { matched: null, provablyAbsent, matchedButUnreceiptable };
+    return { matched: null, provablyAbsent, matchedButUnreceiptable, matchedButWrongState };
   }
 }
 

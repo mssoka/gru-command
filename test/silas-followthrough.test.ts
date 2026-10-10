@@ -22,6 +22,14 @@ import type { Role } from '../src/config.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
 
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
+
 const FAKE_CAPABILITIES: AgentCapabilities = {
   streaming: true,
   steer: 'native',
@@ -272,7 +280,7 @@ async function bootFollowThrough(input: {
     ledger,
     worktrees,
     spawner,
-    poster: { async post(input: { readonly targetSha: string; readonly body: string }) { return { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
+    poster: { async post(input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) { return { reviewId: '9001', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
     prHeadProbe: originHeadProbe(),
   });

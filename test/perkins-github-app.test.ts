@@ -202,6 +202,9 @@ const PR_INPUT = {
   body: 'review body\n',
   targetSha: HEAD,
   baseSha: BASE,
+  // The non-formal COMMENT intent: the delivery-contract cases below prove
+  // identity/binding/receipt discipline, not the eligible-judgment mapping.
+  reviewEvent: 'COMMENT',
 } as const;
 
 function repoPathOf(fixture: BundleFixture): string {
@@ -588,6 +591,7 @@ describe('startup poster selection (the seam main wires)', () => {
       body: 'x',
       targetSha: HEAD,
       baseSha: BASE,
+      reviewEvent: 'COMMENT',
     });
     expect(gitlabCalls).toEqual(['https://gitlab.example.test/acme/widget/-/merge_requests/7']);
   });
@@ -3351,5 +3355,184 @@ describe('startup wiring pin (src/main.ts)', () => {
     expect(main).toContain('poster: createStartupVerdictPoster(config),');
     expect(main).not.toContain('poster: new AutoVerdictPoster()');
     expect(main).not.toMatch(/poster:\s*new GhPrPoster\(/u);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Formal GitHub verdict publication (owner ruling j-1615)
+// ---------------------------------------------------------------------------
+
+describe('formal GitHub verdict publication', () => {
+  /** A provider review object the App bot enacted for `state`. `submittedAt`
+   * defaults to the fixture clock (inside the strict reconciliation window);
+   * pass null to model a provider record with no usable submission time. */
+  const botReview = (state: string, submittedAt: string | null = new Date(NOW).toISOString()) => ({
+    id: 987654,
+    user: { login: 'perkins-review[bot]', type: 'Bot', id: 308038895 },
+    commit_id: HEAD,
+    state,
+    body: 'review body\n',
+    ...(submittedAt === null ? {} : { submitted_at: submittedAt }),
+  });
+
+  it('delivers a formal APPROVE bound to the frozen head and proves the APPROVED state (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('APPROVED') }) },
+    ]);
+    const receipt = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' });
+    expect(receipt).toEqual({ ...RECEIPT, event: 'APPROVED' });
+    const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
+    expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'APPROVE', commit_id: HEAD });
+  });
+
+  it('delivers a formal REQUEST_CHANGES bound to the frozen head and proves the CHANGES_REQUESTED state (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('CHANGES_REQUESTED') }) },
+    ]);
+    const receipt = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' });
+    expect(receipt).toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' });
+    const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
+    expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'REQUEST_CHANGES', commit_id: HEAD });
+  });
+
+  it('never credits a COMMENTED review beside an approval intent and never re-posts (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      // The provider ignored the requested event and enacted a plain comment.
+      { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('COMMENTED') }) },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED')] }) },
+    ]);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' })
+      .then(() => null, (cause: unknown) => cause as Error);
+    // The wrong-state delivery MUST be refused: an unresolved (or resolved)
+    // publication here means the false absence or a credited comment.
+    expect(error, 'the wrong-state delivery must be refused as an error').toBeInstanceOf(PerkinsAppError);
+    // The submission time IS parseable here, so the wrong-state branch must
+    // be the one that refuses — never the false "did not land" certificate.
+    expect(error!.message).toMatch(/found in state COMMENTED instead of the intended APPROVED/u);
+    expect(error!.message).not.toContain('did not land');
+    // One POST, one bounded lookup — the ambiguous outcome is never retried,
+    // and a comment review is never promoted into the intended approval.
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(1);
+  });
+
+  it('keeps a same-body review with an unverifiable submission time unresolved in every state, for both formal intents (formal GitHub)', async () => {
+    for (const [intent, wrongState] of [['APPROVE', 'COMMENTED'], ['REQUEST_CHANGES', 'APPROVED']] as const) {
+      for (const unverifiable of [null, 'not-a-timestamp'] as const) {
+        const fixture = bundleFixture();
+        // The provider committed the review but the response was lost; the
+        // list holds the same body/head/author in the WRONG state with no
+        // usable submission time. It can be neither credited nor excluded.
+        const { poster, calls } = posterWith(fixture, [
+          { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+          { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview(wrongState, unverifiable)] }) },
+        ]);
+        const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: intent })
+          .then(() => null, (cause: unknown) => cause as Error);
+        expect(error, `${intent} / ${String(unverifiable)}`).toBeInstanceOf(PerkinsAppError);
+        expect(error?.message, `${intent} / ${String(unverifiable)}`).not.toContain('did not land');
+        expect(error?.message, `${intent} / ${String(unverifiable)}`).toMatch(/submission time|unresolved/u);
+        expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), `${intent} / ${String(unverifiable)}`).toHaveLength(1);
+      }
+    }
+  });
+
+  it('cancels before the irreversible POST when the round aborts during a suspended preparation probe (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const controller = new AbortController();
+    let releaseMint: (() => void) | null = null;
+    const mintGate = new Promise<void>((resolve) => { releaseMint = resolve; });
+    let mintRequested = false;
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/app\/installations\/164552969\/access_tokens$/,
+        handler: async () => {
+          mintRequested = true;
+          await mintGate;
+          return {
+            status: 201,
+            body: {
+              token: 'stub-installation-token-not-a-real-credential',
+              expires_at: new Date(NOW + 3_600_000).toISOString(),
+              permissions: { 'pull_requests': 'write', 'metadata': 'read' },
+              repositories: [{ full_name: 'acme/widget', id: 1 }],
+            },
+          };
+        },
+      },
+    ]);
+    const pending = poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE', signal: controller.signal });
+    // Wait until the mint probe is suspended, then let the round abort and
+    // only afterwards resolve the probe: the poster must refuse before the
+    // irreversible write, not approve an already-cancelled round.
+    while (!mintRequested) await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    releaseMint!();
+    const error = await pending.then(() => null, (cause: unknown) => cause as Error);
+    expect(error).toBeInstanceOf(PerkinsAppError);
+    expect(error?.message).toMatch(/cancelled before the irreversible POST/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+    expect(calls.some((call) => call.url.endsWith('/reviews'))).toBe(false);
+  });
+
+  it('starts no provider work at all when the round is already cancelled (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const controller = new AbortController();
+    controller.abort();
+    const { poster, calls } = posterWith(fixture);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE', signal: controller.signal })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(error).toBeInstanceOf(PerkinsAppError);
+    expect(error?.message).toMatch(/cancelled before the irreversible POST/u);
+    expect(calls.some((call) => call.url.endsWith('/reviews'))).toBe(false);
+  });
+
+  it('reconciles an approval against provider proof of the APPROVED state only (formal GitHub)', async () => {
+    const approvedFixture = bundleFixture();
+    const approved = posterWith(approvedFixture, [
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED'), botReview('APPROVED')] }) },
+    ]);
+    await expect(approved.poster.reconcile({ ...PR_INPUT, repoPath: repoPathOf(approvedFixture), reviewEvent: 'APPROVE' }))
+      .resolves.toEqual({ ...RECEIPT, event: 'APPROVED' });
+
+    // A covered list with only a comment review is an explicit UNRESOLVED,
+    // never a null absence certificate for an intended approval.
+    const commentedFixture = bundleFixture();
+    const commented = posterWith(commentedFixture, [
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED')] }) },
+    ]);
+    await expect(commented.poster.reconcile({ ...PR_INPUT, repoPath: repoPathOf(commentedFixture), reviewEvent: 'APPROVE' }))
+      .rejects.toThrow(/no provider-proved matching App review|unresolved/u);
+  });
+
+  it('keeps the GitLab note contract and refuses a formal intent a note cannot enact (formal GitHub)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'perkins-gl-formal-'));
+    try {
+      const repoPath = join(root, 'repo');
+      execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+      execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://gitlab.example.test/acme/widget.git']);
+      const calls: Array<{ url: string; method?: string }> = [];
+      const poster = new GitLabMrPoster({
+        token: 'glpat-token',
+        fetchImpl: async (url: string, init?: { method?: string }) => {
+          calls.push({ url, method: init?.method });
+          if (init?.method === 'POST' && url.includes('/notes')) {
+            return { ok: true, status: 201, text: async () => JSON.stringify({ id: 71, body: 'review body\n', author: { username: 'gru-bot' } }) };
+          }
+          if (url.endsWith('/user')) return { ok: true, status: 200, text: async () => JSON.stringify({ username: 'gru-bot' }) };
+          return { ok: true, status: 200, text: async () => JSON.stringify({ sha: HEAD, diff_refs: { base_sha: BASE } }) };
+        },
+      });
+      await expect(poster.post({
+        prUrl: 'https://gitlab.example.test/acme/widget/-/merge_requests/7', host: 'gitlab.example.test', repoPath,
+        body: 'review body\n', targetSha: HEAD, baseSha: BASE, reviewEvent: 'APPROVE',
+      })).rejects.toThrow(/cannot enact review event APPROVE/u);
+      expect(calls.filter((call) => call.method === 'POST')).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

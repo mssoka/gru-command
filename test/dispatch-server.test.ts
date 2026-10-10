@@ -17,6 +17,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
+import { PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
@@ -32,6 +33,14 @@ const FAKE_CAPABILITIES: AgentCapabilities = {
 import type { Role } from '../src/config.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
+
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
 
 /**
  * Dispatch HTTP surface (E8 story 2): authenticated flow endpoints —
@@ -164,7 +173,7 @@ async function boot(opts: {
     worktrees,
     spawner,
     bus,
-    poster: { async post(input: { readonly targetSha: string; readonly body: string }) { return { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
+    poster: { async post(input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) { return { reviewId: '9001', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
     reviewArtifactRoot: join(dir, 'reviews'),
     prHeadProbe: originHeadProbe(),
     ...(opts.reviewPreflight !== undefined ? { reviewPreflight: opts.reviewPreflight } : {}),
@@ -1093,6 +1102,81 @@ describe('dispatch server (E8)', () => {
         detail: expect.stringMatching(/no trusted no-spawn proof or owner marker; ownership is unknown/) } });
       expect(h.ledger.latestJobEvent('clean-abort', 'silas.review-triggered')).toBeNull();
       expect(h.ledger.listRounds('clean-abort')).toHaveLength(1);
+    } finally { await h.close(); }
+  }, 90_000);
+
+  it('refuses a clean-abort re-arm while a recorded delivery stays unbound (formal GitHub)', async () => {
+    // Native correction cycle amendment #1: the automatic same-head re-arm
+    // must refuse while a durable publication attempt holds an unresolved
+    // rebind — the provider write may already exist for this head.
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-held');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const { sha, roundId } = await prepareCleanAbort(h, repo, 'clean-abort-held');
+      const body = {
+        job_id: 'clean-abort-held', by: 'silas',
+        rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      };
+      // The pre-upgrade failure shape: a recorded delivery with NO durable
+      // publication intent whose re-binding failed at restart.
+      h.ledger.appendCustomEvent({
+        kind: 'round.posted', jobId: 'clean-abort-held', roundId,
+        payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
+          targetSha: sha, baseSha: 'b'.repeat(40),
+          publicationFile: '/tmp/held/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+          // Historical COMMENT-era record: no reviewEvent, COMMENTED receipt.
+          receipt: {
+            reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: sha,
+            headSha: sha, baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64),
+          },
+          reconciled: false,
+        },
+      });
+      h.ledger.appendCustomEvent({
+        kind: PUBLICATION_REBIND_UNRESOLVED_EVENT, jobId: 'clean-abort-held', roundId,
+        payload: { targetSha: sha, reviewId: '9001', detail: 'recorded delivery could not be re-bound' },
+      });
+      const refused = await call(h.port, 'POST', '/api/dispatch/review', body, TOKEN);
+      expect(refused).toMatchObject({
+        status: 400,
+        json: { error: 'bad_request', detail: expect.stringMatching(/could not be re-bound|reconcile it before re-arming/u) },
+      });
+      expect(h.ledger.latestJobEvent('clean-abort-held', 'silas.review-triggered')).toBeNull();
+      expect(h.ledger.listRounds('clean-abort-held')).toHaveLength(1);
+    } finally { await h.close(); }
+  }, 90_000);
+
+  it('refuses a clean-abort re-arm for an already-aborted round with a recorded historical delivery (revision 3)', async () => {
+    // Amendment #3 (j-1717): the mechanical dispatch admission must refuse
+    // an already-terminal historical delivery with no intent and no marker.
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-historical');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const { sha, roundId } = await prepareCleanAbort(h, repo, 'clean-abort-historical');
+      h.ledger.appendCustomEvent({ kind: 'round.posted', jobId: 'clean-abort-historical', roundId, payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
+        targetSha: sha, baseSha: 'b'.repeat(40),
+        publicationFile: '/tmp/historical/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+        receipt: {
+          reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: sha,
+          headSha: sha, baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64),
+        },
+        reconciled: false,
+      } });
+      const refused = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'clean-abort-historical', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      }, TOKEN);
+      expect(refused).toMatchObject({
+        status: 400,
+        json: { error: 'bad_request', detail: expect.stringMatching(/was never credited|reconcile it before re-arming/u) },
+      });
+      expect(h.ledger.latestJobEvent('clean-abort-historical', 'silas.review-triggered')).toBeNull();
+      expect(h.ledger.listRounds('clean-abort-historical')).toHaveLength(1);
     } finally { await h.close(); }
   }, 90_000);
 

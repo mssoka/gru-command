@@ -27,6 +27,7 @@ import type { AgentSupervisionView } from '../supervision/supervisor.js';
 import type { GitHubPollTickResult } from './github-poll.js';
 import { BRANCH_STATE_EVENT } from './github-poll.js';
 import { pendingRecoveryRows } from '../provider-recovery/sensor.js';
+import { pendingPublicationAttempt } from './publication-evidence.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -1457,6 +1458,11 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       input.ledger.latestRoundEvent(newestRound.id, 'round.superseded') === null &&
       (abortReason === 'service_restart' || abortReason === 'service_restart_missing_review_lane') &&
       deliveredTargetSha(delivered) !== null && deliveredTargetSha(delivered) === newestRound.targetRef &&
+      // A durable publication attempt without a conclusive outcome may
+      // describe an unreported provider write: never re-arm a publication
+      // on the same head until it is reconciled (recovery does; this guard
+      // only fails closed).
+      pendingPublicationAttempt(input.ledger, newestRound.id) === null &&
       !(answeringRequest !== null && answeringRequest.seq > (abortProof?.seq ?? 0));
 
     // The CURRENT phase's opening evidence: the shared attempt start plus
