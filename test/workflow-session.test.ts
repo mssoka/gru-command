@@ -42,7 +42,7 @@ function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>) {
 }
 
 describe('production owned workflow session binding', () => {
-  for (const runtimeId of ['pi', 'claude-code'] as const) it(`${runtimeId}: actual registry spawn carries exact identity/context and resume keeps original cwd/worker`, async () => {
+  async function assertHost(runtimeId: RuntimeId): Promise<void> {
     const f = fixture();
     const h = host(runtimeId, f);
     const worker = await h.registry.spawn('minion', { cwd: f.lane.path, agentId: 'original-worker' });
@@ -77,7 +77,10 @@ describe('production owned workflow session binding', () => {
     const isolated = await h.registry.spawn('minion', { cwd: f.lane.path, isolatedReview: { systemPrompt: 'frozen native policy', tools: [] } });
     await isolated.dispose();
     expect(h.seen[2]!.managedSkills).toBeUndefined();
-  });
+  }
+
+  it('Pi registry spawn carries exact identity/context and resumes the same cwd/worker', async () => assertHost('pi'));
+  it('Claude registry spawn carries exact identity/context and resumes the same cwd/worker', async () => assertHost('claude-code'));
 
   it('ambient name collisions/malformed BMAD answers cannot replace authority or write paths', () => {
     const f = fixture();

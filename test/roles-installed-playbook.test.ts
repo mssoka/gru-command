@@ -219,7 +219,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('explicit project/job artifact context');
     expect(flat).toContain('GC-owned build workflow bound to your registered lane');
     expect(flat).toContain('takes precedence over same-named copies');
-    expect(flat).toContain('never edit the runtime directory');
+    expect(flat).toContain('Never edit the runtime directory');
     expect(flat).toContain('not an ambient project/global BMAD workflow');
     expect(flat).toContain('`gru-output/`');
     expect(flat).toContain('You own the');
