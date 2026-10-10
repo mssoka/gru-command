@@ -2793,6 +2793,12 @@ export class WaveRunner {
     for (const job of this.opts.ledger.listJobs()) {
       for (const round of this.opts.ledger.listRounds(job.id)) {
         if ((round.status !== 'pending' && round.status !== 'live') || registeredRoundIds.has(round.id)) continue;
+        // One failing row must never abort startup recovery of the
+        // remaining rounds (same discipline as the lane loop above): a
+        // round whose hold write fails stays live/untouched (so the
+        // automatic re-arm, which requires an aborted round, stays closed)
+        // and is escalated for inspection and the next restart.
+        try {
         // A round whose review lane registration was lost can still carry a
         // fully bound, actor-evidenced round.posted event: recover the
         // publication first, and only terminalize when there is nothing
@@ -2822,6 +2828,18 @@ export class WaveRunner {
         });
         this.escalate(`Review round ${round.id} is INCOMPLETE after service restart`, note, { jobId: round.jobId, roundId: round.id });
         recovered += 1;
+        } catch (error) {
+          this.log('error', 'startup recovery failed for one review round', {
+            round: round.id,
+            job: job.id,
+            error: String(error),
+          });
+          this.escalate(
+            `Review round ${String(round.id)} could not be processed during startup recovery`,
+            `${String(error)} — the round is left as recorded for inspection; other rounds continue to recover`,
+            { jobId: job.id, roundId: round.id },
+          );
+        }
       }
     }
     return recovered;
