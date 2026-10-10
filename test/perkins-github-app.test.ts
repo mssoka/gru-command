@@ -3406,10 +3406,13 @@ describe('formal GitHub verdict publication', () => {
     ]);
     const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' })
       .then(() => null, (cause: unknown) => cause as Error);
+    // The wrong-state delivery MUST be refused: an unresolved (or resolved)
+    // publication here means the false absence or a credited comment.
+    expect(error, 'the wrong-state delivery must be refused as an error').toBeInstanceOf(PerkinsAppError);
     // The submission time IS parseable here, so the wrong-state branch must
     // be the one that refuses — never the false "did not land" certificate.
-    expect(error?.message).toMatch(/found in state COMMENTED instead of the intended APPROVED/u);
-    expect(error?.message).not.toContain('did not land');
+    expect(error!.message).toMatch(/found in state COMMENTED instead of the intended APPROVED/u);
+    expect(error!.message).not.toContain('did not land');
     // One POST, one bounded lookup — the ambiguous outcome is never retried,
     // and a comment review is never promoted into the intended approval.
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
