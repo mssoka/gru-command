@@ -683,3 +683,35 @@ repo-overview-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && no
 # file are preserved for inspection; nothing is deleted or checked out and
 # no branch/worktree holds the sha.
 repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-repo-overview.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts web/src/lib/board-protocol.test.ts web/src/ui/board.test.ts web/src/ui/board-merged-attention.test.ts web/src/ui/owner-chime.test.ts; do mkdir -p "$d/$(dirname "$f")"; git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/repo-overview-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/backend-results.json" test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts; a=$?; cd web; ../node_modules/.bin/vitest run --reporter=json --outputFile="$d/web-results.json" src/lib/board-protocol.test.ts src/ui/board.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts; b=$?; set -e; echo "repo-overview-baseline vitest exits: backend=$a web=$b"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed unexpectedly"; exit 2; fi; node "$root/tools/assert-repo-overview-baseline.mjs" "$d/backend-results.json" "$d/web-results.json" || exit 2; echo "EXPECTED-NONZERO: baseline legs failed named behavioral assertions against the pre-change base"; exit 1'
+
+# Formal GitHub verdict publication (job perkins-github-formal-verdicts-20261010;
+# owner ruling j-1615): the host and both GitHub publishers carry a WANTED
+# formal review event — APPROVE for an eligible whole-change READY,
+# REQUEST_CHANGES for confirmed blockers, COMMENT otherwise — and refuse any
+# receipt that did not enact it. Declared for the authenticated /api/verify
+# scheduler only; the classified heavy files route through the heavy config
+# (the scope-composition guard), the approved RPC patch runs first, and no
+# exit is masked.
+formal-verdicts-app = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts"
+formal-verdicts-wave = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts"
+formal-verdicts-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts test/review-build-identity.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/dispatch-e2e.test.ts test/dispatch-server.test.ts test/silas-followthrough.test.ts && npx vitest run test/directive-retirement.test.ts test/perkins-crash-child.test.ts"
+
+# Static product checks for the same change: lint, both compilers through
+# the build (the pinned Perkins resource verifier included) and the web
+# compiler; approved RPC patch first, no npm chain beyond the existing
+# scripts.
+formal-verdicts-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+
+# Fail-before evidence (feature-specific): the FINAL behavioral test files
+# are overlaid onto an isolated git-archive snapshot of the recorded base
+# d0e6389 (the COMMENT-only publisher) with dependencies linked by symlink —
+# no download/install, no branch mutation, approved RPC patch prerequisite,
+# unchanged Vitest configs/budgets. The new regressions import only APIs the
+# base already exposes, and their fixture posters enact the intent they are
+# handed (the base passes none), so every selected case REDs by BEHAVIORAL
+# assertion: the old host sends `event: "COMMENT"` and records no wanted
+# formal event. A collection/setup/import failure is not RED evidence. The
+# vitest exit is echoed intact and never masked; the snapshot directory and
+# the ignored pointer file are preserved for inspection; nothing is deleted
+# or checked out and no branch/worktree holds the sha.
+formal-verdicts-baseline = 'set -e; base=d0e638936b5b4afb000a1920a126dfa2125666de; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-formal-verdicts.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; for f in test/perkins-github-app.test.ts test/perkins-builtin-wave.test.ts; do mkdir -p "$d/$(dirname "$f")"; git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; printf "formal-verdicts-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/formal-verdicts-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run test/perkins-github-app.test.ts -t "formal GitHub"; a=$?; npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "formal GitHub"; b=$?; set -e; echo "formal-verdicts-baseline vitest exits: app=$a wave=$b"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed the formal-event regressions unexpectedly"; exit 2; fi; echo "EXPECTED-NONZERO: both legs failed the formal-event behavioral assertions against the COMMENT-only base"; exit 1'
