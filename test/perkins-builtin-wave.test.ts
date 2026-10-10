@@ -72,6 +72,19 @@ function completedRunPayload(
   };
 }
 
+/** Complete persisted `verification.completed` rows for the named jobs — the
+ * read-only before/after proof that host selection neither adds, deletes,
+ * reorders nor rewrites historical verification records (j-1594 acceptance 4).
+ * Read through a kind-scoped list (never the iterator under test) with a
+ * limit above any fixture history, so truncation cannot fake equality. */
+function persistedVerificationRows(ledger: LedgerApi, jobIds: readonly string[]): Record<string, unknown> {
+  const rows: Record<string, unknown> = {};
+  for (const jobId of jobIds) {
+    rows[jobId] = ledger.listJobEventsByKinds(jobId, ['verification.completed'], { limit: 1000 });
+  }
+  return rows;
+}
+
 /** A delivered job lane whose target is a fresh commit on its own branch —
  * the fixture shape the recorded-verification wave pins use. The caller
  * appends the synthetic verification history through the returned ledger. */
@@ -1918,8 +1931,17 @@ describe('WaveRunner built-in Perkins production path', () => {
       });
     }
     expect(ledger.listJobEventsByKinds(job.id, ['verification.completed'], { limit: 1000 })).toHaveLength(208);
+    // BEFORE: every persisted verification row of BOTH jobs (the reviewed
+    // lane and the other job's unrelated history).
+    const verificationBefore = persistedVerificationRows(ledger, [job.id, 'job-other']);
     const wave = waveFor(lane);
     await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // AFTER: host selection is read-only — the complete persisted history of
+    // both jobs is identical row-for-row (same seqs, order, payloads and
+    // outcomes). An added, deleted or rewritten receipt (including an OLDER
+    // one) fails here, while ordinary round/status bookkeeping — different
+    // event kinds — cannot mask it.
+    expect(persistedVerificationRows(ledger, [job.id, 'job-other'])).toEqual(verificationBefore);
     const round = ledger.listRounds(job.id)[0]!;
     const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
     expect(frozenSpec).toContain('result: PASS (exit 0)');
@@ -1946,8 +1968,11 @@ describe('WaveRunner built-in Perkins production path', () => {
         payload: completedRunPayload('e'.repeat(40), `run-newer-${index}`),
       });
     }
+    const verificationBefore = persistedVerificationRows(ledger, [job.id]);
     const wave = waveFor(lane);
     await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // Paging past two pages to the oldest row rewrote nothing.
+    expect(persistedVerificationRows(ledger, [job.id])).toEqual(verificationBefore);
     const round = ledger.listRounds(job.id)[0]!;
     const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
     expect(frozenSpec).toContain('run_id: run-binding-old');
@@ -1963,8 +1988,20 @@ describe('WaveRunner built-in Perkins production path', () => {
         payload: completedRunPayload('d'.repeat(40), `run-absent-${index}`),
       });
     }
+    // A second job's unrelated completed history must survive an exhausted
+    // absence proof untouched, too.
+    for (let index = 0; index < 3; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: 'job-other-absent',
+        payload: completedRunPayload('c'.repeat(40), `run-absent-other-${index}`),
+      });
+    }
+    const verificationBefore = persistedVerificationRows(ledger, [job.id, 'job-other-absent']);
     const wave = waveFor(lane);
     await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // Exhausted absence is still read-only: no record was added to fill the
+    // gap, none deleted to shorten the search, none rewritten to look absent.
+    expect(persistedVerificationRows(ledger, [job.id, 'job-other-absent'])).toEqual(verificationBefore);
     const round = ledger.listRounds(job.id)[0]!;
     const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
     expect(frozenSpec).toContain('state: UNAVAILABLE — NO BOUND VERIFICATION RUN');

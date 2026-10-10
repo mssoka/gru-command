@@ -46,6 +46,21 @@ describe('verification-history fail-before classifier', () => {
       .toThrow(/before its assertion/u);
   });
 
+  it('refuses a second error hiding behind the expected window assertion, and zero messages', () => {
+    // The window assertion PLUS a separate teardown error is not a clean
+    // before-proof: messages are validated individually, never joined.
+    expect(() =>
+      assertVerificationHistoryBaseline(
+        report(red([
+          'Error: promise rejected "Error: verification history window exceed…" instead of resolving',
+          'TypeError: cleanup failed after the assertion',
+        ])),
+      )
+    ).toThrow(/2 failure message\(s\); exactly one assertion failure/u);
+    expect(() => assertVerificationHistoryBaseline(report({ title: TITLE, status: 'failed', failureMessages: [] })))
+      .toThrow(/0 failure message\(s\)/u);
+  });
+
   it('refuses an unparseable report and a missing named regression', () => {
     expect(() => assertVerificationHistoryBaseline(null)).toThrow(/not behavioral RED/u);
     expect(() => assertVerificationHistoryBaseline(report())).toThrow(/not collected/u);

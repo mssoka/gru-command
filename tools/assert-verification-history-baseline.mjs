@@ -70,11 +70,21 @@ export function assertVerificationHistoryBaseline(report) {
     throw new Error(`the named regression did not fail (status ${String(match.status)})`);
   }
   const messages = Array.isArray(match.failureMessages) ? match.failureMessages : [];
-  const joined = messages.filter((message) => typeof message === 'string').join('\n');
-  if (!isBehavioralAssertion(joined)) {
+  // Exactly ONE failure message: the expected window assertion. Validating
+  // each message individually (never a joined blob) keeps a separate
+  // cleanup TypeError or unhandled rejection from hiding behind the claim —
+  // a report carrying the window assertion PLUS another error is not a
+  // clean before-proof.
+  if (messages.length !== 1) {
+    throw new Error(
+      `the named regression carries ${String(messages.length)} failure message(s); exactly one assertion failure is before-proof evidence`,
+    );
+  }
+  const message = messages[0];
+  if (typeof message !== 'string' || !isBehavioralAssertion(message)) {
     throw new Error('the named regression failed before its assertion; setup/import failure is not RED evidence');
   }
-  if (!joined.includes(EXPECTED_BASELINE_REASON)) {
+  if (!message.includes(EXPECTED_BASELINE_REASON)) {
     throw new Error(
       `the named regression failed without the recorded window reason ("${EXPECTED_BASELINE_REASON}") — not the discriminating failure`,
     );
