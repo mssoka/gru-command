@@ -32,6 +32,9 @@ describe('GC-owned workflows in the actual distributable layout', () => {
     for (const path of ['src', '_bmad', '_bmad-output', '.agents', 'node_modules']) expect(existsSync(join(stage, path)), path).toBe(false);
     expect(existsSync(join(stage, 'resources/gc-workflows/scripts/render.mjs'))).toBe(true);
     expect(existsSync(join(stage, 'docs/GC-WORKFLOWS.md'))).toBe(true);
+    const retirementGuide = readFileSync(join(stage, 'docs/BMAD-RUNTIME.md'), 'utf-8');
+    expect(retirementGuide).toContain('Retire only the GC bootstrap');
+    expect(retirementGuide).toContain('# gc-bootstrap-retire:run');
     const home = temp();
     const workspace = temp();
     const repo = join(workspace, 'registered-app');

@@ -425,5 +425,21 @@ describe('retiring a repo-local BMAD install with the documented commands', () =
     const unrecorded = legacyRepo(unrecordedWs);
     rmSync(join(unrecorded, '_bmad', '_config', 'files-manifest.csv'));
     expect(previewOf(unrecorded, unrecordedWs).stderr).toContain('STOP: _bmad/_config/files-manifest.csv is missing');
+    // The historical full procedure also must not infer ownership from
+    // marker text inside a user string, or silently skip edited markers.
+    for (const manifest of [
+      `[[setup]]\ncommand = '''\n${BLOCK}\n'''\n`,
+      BLOCK.replaceAll('# BEGIN', '#  BEGIN').replaceAll('# END', '#END'),
+    ]) {
+      const foreignWs = tempDir('gru-command-retire-foreign-marker-');
+      const foreign = legacyRepo(foreignWs);
+      writeFileSync(join(foreign, '.gru-command', 'worktree.toml'), manifest);
+      const before = tree(foreign);
+      const refused = previewOf(foreign, foreignWs);
+      expect(refused.status).not.toBe(0);
+      expect(refused.stderr).toContain('STOP:');
+      expect(tree(foreign)).toEqual(before);
+      expect(existsSync(join(foreignWs, 'backup/plan.json'))).toBe(false);
+    }
   });
 });

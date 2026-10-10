@@ -60,7 +60,7 @@ Run this same block first with `MODE=preview` (repository read-only; saves exact
 before/after bytes outside it). Inspect the plan and backup, then explicitly set
 `MODE=retire` and run it again. `MODE=restore` restores the original bytes only
 if the manifest has not since been edited. Edited, foreign, duplicate or incomplete
-blocks stop without changing the repository: preserve them and remove only the
+blocks or altered backup bytes stop without changing the repository: preserve them and remove only the
 confirmed obsolete command by hand after a backup. Never guess ownership from a
 BMAD name. The two supported generated block versions are checked byte-for-byte,
 apart from LF/CRLF line endings.
@@ -83,8 +83,7 @@ manifest = repo / ".gru-command/worktree.toml"
 if (repo / ".gru-command").is_symlink() or manifest.is_symlink() or not manifest.is_file():
     sys.exit("STOP: the GC manifest must be a regular repository-local file; preserve uncertain ownership")
 original, retired, identity = (backup / n for n in ("original-worktree.toml", "retired-worktree.toml", "repo.txt"))
-if mode == "preview":
-    data = manifest.read_bytes()
+def derive_retired(data):
     lines = data.decode("utf-8").splitlines(keepends=True)
     begin, end = "# BEGIN GRU COMMAND BMAD BOOTSTRAP", "# END GRU COMMAND BMAD BOOTSTRAP"
     starts = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == begin]
@@ -108,6 +107,11 @@ if mode == "preview":
             sys.exit("STOP: markers are user string data, not GC-owned comments")
     clean = "".join(lines[:first] + lines[last + 1:]).encode("utf-8")
     tomllib.loads(clean.decode("utf-8"))
+    return clean
+
+if mode == "preview":
+    data = manifest.read_bytes()
+    clean = derive_retired(data)
     backup.mkdir(parents=True, exist_ok=False)
     original.write_bytes(data)
     retired.write_bytes(clean)
@@ -120,10 +124,13 @@ if mode == "preview":
 else:
     if identity.read_text(encoding="utf-8") != str(repo):
         sys.exit("STOP: BACKUP belongs to a different repository")
-    expected, replacement = (original, retired) if mode == "retire" else (retired, original)
-    if manifest.read_bytes() != expected.read_bytes():
+    before, after = original.read_bytes(), retired.read_bytes()
+    if derive_retired(before) != after:
+        sys.exit("STOP: backup bytes changed; preserve the repository and preview again")
+    expected, replacement = (before, after) if mode == "retire" else (after, before)
+    if manifest.read_bytes() != expected:
         sys.exit("STOP: manifest changed since preview/retirement; preserve it and preview again")
-    manifest.write_bytes(replacement.read_bytes())
+    manifest.write_bytes(replacement)
     print(mode + ": manifest only; all other files and existing lanes unchanged")
 PY
 ```
@@ -459,8 +466,12 @@ gc_files = []
 def has_block(path, start, end):
     if not os.path.isfile(path):
         return False
-    lines = open(path, encoding="utf-8").read().splitlines()
+    text = open(path, encoding="utf-8").read()
+    lines = text.splitlines()
     if start not in lines and end not in lines:
+        if start == "# BEGIN GRU COMMAND BMAD BOOTSTRAP" and any(re.match(
+                r"^[\t ]*#[\t ]*(?:BEGIN|END)[\t ]+GRU[\t ]+COMMAND[\t ]+BMAD[\t ]+BOOTSTRAP\b", line) for line in lines):
+            sys.exit(f"STOP: edited/foreign GC bootstrap markers in {path}; preserve them and repair deliberately")
         return False
     if lines.count(start) != 1 or lines.count(end) != 1 or lines.index(start) >= lines.index(end):
         sys.exit(f"STOP: incomplete/duplicate owned block in {path}; preserve it and repair deliberately")
@@ -474,6 +485,9 @@ def has_block(path, start, end):
         ]
         if block not in supported:
             sys.exit(f"STOP: edited/foreign GC bootstrap block in {path}; preserve it and repair deliberately")
+        for index in (lines.index(start), lines.index(end)):
+            if tomllib.loads("\n".join(lines[:index] + lines[index + 1:])) != tomllib.loads(text):
+                sys.exit(f"STOP: markers are user string data, not GC-owned comments in {path}")
     return True
 manifest_block = has_block(os.path.join(repo, ".gru-command", "worktree.toml"),
                            "# BEGIN GRU COMMAND BMAD BOOTSTRAP", "# END GRU COMMAND BMAD BOOTSTRAP")
@@ -746,7 +760,8 @@ fi
 
 **6. Commit, then prove a fresh worktree.** Commit the resulting changes to
 tracked files, for example the edited `.gru-command/worktree.toml` and the
-removed bootstrap files. When fresh worktrees should share team settings,
+retired bootstrap references; keep the historical copier and install record.
+When fresh worktrees should share team settings,
 commit `_bmad/custom/` too. Then check that a fresh worktree of the new
 `HEAD` (what the next GC lane checks out) renders with the bundled runtime:
 

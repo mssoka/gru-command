@@ -114,6 +114,7 @@ describe('owner-run, GC-bootstrap-only retirement (#295)', () => {
       GUARDED.replace('then node', 'then echo user-command; node'),
       SIMPLE.replace('node .gru-command/bmad-bootstrap.mjs', 'echo foreign BMAD'),
       `${SIMPLE}\n${SIMPLE}`, SIMPLE.replace(END, ''), SIMPLE.replace(BEGIN, ''),
+      SIMPLE.replaceAll('# BEGIN', '#  BEGIN').replaceAll('# END', '#END'),
     ]) {
       const f = fixture(block);
       const before = tree(f.repo);
@@ -138,6 +139,23 @@ describe('owner-run, GC-bootstrap-only retirement (#295)', () => {
     writeFileSync(f.manifest, `${USER}# owner added after retirement\n`);
     expect(run(f, 'restore').status).not.toBe(0);
     expect(readFileSync(f.manifest, 'utf-8')).toBe(`${USER}# owner added after retirement\n`);
+  });
+
+  it('altered preview backups cannot overwrite the manifest during retirement or restoration', () => {
+    for (const mode of ['retire', 'restore']) {
+      for (const name of ['original-worktree.toml', 'retired-worktree.toml']) {
+        const f = fixture();
+        expect(run(f, 'preview').status).toBe(0);
+        if (mode === 'restore') expect(run(f, 'retire').status).toBe(0);
+        const file = join(f.backup, name);
+        writeFileSync(file, `${readFileSync(file, 'utf-8')}# altered backup\n`);
+        const before = tree(f.repo);
+        const result = run(f, mode);
+        expect(result.status).not.toBe(0);
+        expect(result.out).toContain('STOP: backup bytes changed');
+        expect(tree(f.repo)).toEqual(before);
+      }
+    }
   });
 
   it('a backup inside the repository and linked GC manifests are refused without touching their targets', () => {

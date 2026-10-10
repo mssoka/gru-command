@@ -153,17 +153,71 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
     expect(row.status).toBe('active');
   });
 
-  it('rejects a configured but invalid BMAD source rather than skipping bootstrap', async () => {
+  it('an invalid historical BMAD source is inert; fresh GC lanes verify normally and preserve old records', async () => {
     const h = harness();
     const repo = h.make('fixture-invalid-bmad');
+    seedOfflineNpmFixture(repo);
     const root = join(import.meta.dirname, '..');
     repo.commitFile('.gru-command/worktree.toml', readFileSync(join(root, '.gru-command', 'worktree.toml'), 'utf-8'));
     repo.commitFile('.gru-command/bmad-bootstrap.mjs', readFileSync(join(root, '.gru-command', 'bmad-bootstrap.mjs'), 'utf-8'));
-    repo.git(['config', '--local', 'gru-command.bmad-source', join(repo.path, 'missing-source')]);
+    const record = '{"managed_by":"foreign","keep":true}\n';
+    repo.commitFile('.gru-command/bmad-install.json', record);
+    const source = join(repo.path, 'missing-source');
+    repo.git(['config', '--local', 'gru-command.bmad-source', source]);
     ledgerJob(h, 'job-invalid-bmad', repo);
-    await expect(h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-invalid-bmad' }))
-      .rejects.toThrow(/worktree setup command exited/);
-    expect(h.ledger.getWorktree('job-invalid-bmad')).toBeNull();
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-invalid-bmad' });
+    expect(row.status).toBe('active');
+    expect(execFileSync('npm', ['test'], { cwd: row.path, encoding: 'utf-8' })).toContain('fixture-wt');
+    expect(repo.git(['config', '--local', '--get', 'gru-command.bmad-source'])).toBe(source);
+    for (const path of [repo.path, row.path]) {
+      expect(readFileSync(join(path, '.gru-command/bmad-install.json'), 'utf-8')).toBe(record);
+      for (const name of ['_bmad', '_bmad-output', '.agents', '.claude']) expect(existsSync(join(path, name)), name).toBe(false);
+    }
+  });
+
+  it('a fetched job HEAD with retired bootstrap is refused even after local source retirement, with complete rollback', async () => {
+    const h = harness();
+    const repo = h.make('fixture-retired-fetched-head');
+    const retired = '# BEGIN GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "node .gru-command/bmad-bootstrap.mjs"\n# END GRU COMMAND BMAD BOOTSTRAP\n';
+    repo.commitFile('.gru-command/worktree.toml', retired);
+    attachBareOrigin(repo);
+    const clean = '[[setup]]\ncommand = "echo user-setup > .boot-marker"\n';
+    writeFileSync(join(repo.path, '.gru-command/worktree.toml'), clean);
+    ledgerJob(h, 'job-retired-head', repo);
+    await expect(h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-retired-head' }))
+      .rejects.toThrow(/retired GC-managed BMAD bootstrap/u);
+    expect(h.ledger.getWorktree('job-retired-head')).toBeNull();
+    expect(repo.git(['worktree', 'list'])).not.toContain('job-retired-head');
+    expect(repo.git(['branch', '--list', 'gru/job-retired-head'])).toBe('');
+    expect(readFileSync(join(repo.path, '.gru-command/worktree.toml'), 'utf-8')).toBe(clean);
+  });
+
+  it('writer children refuse their parent committed retired manifest while read-only and existing lanes remain intact', async () => {
+    const h = harness();
+    const repo = h.make('fixture-retired-parent-head');
+    repo.commitFile('.gru-command/worktree.toml', '[[setup]]\ncommand = "echo user-setup > .boot-marker"\n');
+    ledgerJob(h, 'job-retired-parent', repo);
+    const parent = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-retired-parent' });
+    const retired = '# BEGIN GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "node .gru-command/bmad-bootstrap.mjs"\n# END GRU COMMAND BMAD BOOTSTRAP\n[verify]\nfull = "npm test"\n';
+    writeFileSync(join(parent.path, '.gru-command/worktree.toml'), retired);
+    repo.git(['add', '.gru-command/worktree.toml'], parent.path);
+    repo.git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'historical parent manifest'], parent.path);
+    const gitDir = repo.git(['rev-parse', '--path-format=absolute', '--git-dir'], parent.path);
+    mkdirSync(join(gitDir, 'gru-command'), { recursive: true });
+    const binding = join(gitDir, 'gru-command/bmad-runtime.json');
+    writeFileSync(binding, '{"runtime_id":"historical","keep":true}\n');
+    const before = readFileSync(binding, 'utf-8');
+    await expect(h.manager.createChildWorktree({ repoPath: repo.path, jobId: 'job-retired-parent',
+      childId: 'refused-writer', parentPath: parent.path, authority: 'writer' }))
+      .rejects.toThrow(/retired GC-managed BMAD bootstrap/u);
+    expect(h.ledger.getWorktree('refused-writer')).toBeNull();
+    expect(repo.git(['branch', '--list', 'gru/job-retired-parent-child-refused-writer'])).toBe('');
+    const reader = await h.manager.createChildWorktree({ repoPath: repo.path, jobId: 'job-retired-parent',
+      childId: 'historical-reader', parentPath: parent.path, authority: 'read-only' });
+    expect(readFileSync(join(reader.path, '.gru-command/worktree.toml'), 'utf-8')).toBe(retired);
+    expect(readFileSync(join(parent.path, '.gru-command/worktree.toml'), 'utf-8')).toBe(retired);
+    expect(readFileSync(binding, 'utf-8')).toBe(before);
+    expect(h.ledger.getWorktree(parent.id)?.status).toBe('active');
   });
 
   it('rolls the worktree back when the bootstrap manifest fails', async () => {

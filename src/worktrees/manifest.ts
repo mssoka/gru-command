@@ -157,7 +157,7 @@ export function parseWorktreeManifest(text: string, source = MANIFEST_PATH): Wor
 
   // Distinguish actual comment markers from the same text inside a user's
   // multiline setup string. Removing a comment cannot alter parsed TOML.
-  const retired = [...text.matchAll(/^[\t ]*# (?:BEGIN|END) GRU COMMAND BMAD BOOTSTRAP\b[^\r\n]*/gmu)].some((match) => {
+  const retired = [...text.matchAll(/^[\t ]*#[\t ]*(?:BEGIN|END)[\t ]+GRU[\t ]+COMMAND[\t ]+BMAD[\t ]+BOOTSTRAP\b[^\r\n]*/gmu)].some((match) => {
     const withoutLine = text.slice(0, match.index) + text.slice(match.index + match[0].length);
     try { return JSON.stringify(parse(withoutLine)) === JSON.stringify(raw); } catch { return false; }
   });

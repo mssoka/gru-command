@@ -409,7 +409,7 @@ describe('wizard CLI surface', () => {
         workspace_root: workspace, repos: ['repo-a'], port: 0, smoke: false,
       })], { env: { ...process.env, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 30_000 });
       expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain('Selected managed repos: repo-a');
+      expect(result.stdout).toContain('Repositories selected for setup validation: repo-a');
       expect(readFileSync(join(repoA, '_bmad-output/brief.md'), 'utf-8')).toBe('# brief\n');
       expect(existsSync(join(repoA, '_bmad'))).toBe(false);
       expect(existsSync(join(repoA, '.agents'))).toBe(false);

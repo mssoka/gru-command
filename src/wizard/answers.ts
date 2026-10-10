@@ -16,7 +16,7 @@ import { DEFAULT_INSTANCE_PORT, expandTilde, ROLES, RUNTIME_IDS, type Role, type
 export interface WizardAnswers {
   /** Raw workspace-root string as answered (`~`-form preserved in output). */
   readonly workspaceRoot: string;
-  /** Managed-repo names picked under the workspace root (informational —
+  /** Repo names selected for setup validation (not a management whitelist —
    * the config schema has no repos key; the board discovers repos live). */
   readonly repos: readonly string[];
   readonly runtime: RuntimeId;

@@ -40,9 +40,17 @@ export function validateRepositorySetup(workspaceRoot: string, repoName: string)
     throw new RepositorySetupError(`Git probe failed for ${repoPath}: ${result.error?.message ?? result.signal}; ensure Git runs on this host, then re-run setup`);
   }
   if (result.status !== 0) {
-    throw new RepositorySetupError(`selected directory is not a usable Git repo: ${repoPath}; repair the reported Git ownership/configuration condition, then re-run setup:\n${result.stderr.trim()}`);
+    throw new RepositorySetupError(`selected directory is not a usable Git repo: ${repoPath}; inspect the Git diagnostic below and repair the repository before re-running setup:\n${result.stderr.trim()}`);
   }
-  if (result.stdout.trim() === '' || realpathSync(result.stdout.trim()) !== repoPath) {
+  const reportedPath = result.stdout.trim();
+  if (reportedPath === '') throw new RepositorySetupError(`Git reported no repository root for ${repoPath}; inspect its Git configuration and re-run setup`);
+  let reportedRoot: string;
+  try {
+    reportedRoot = realpathSync(reportedPath);
+  } catch (error) {
+    throw new RepositorySetupError(`Git reported an unavailable repository root: ${reportedPath} (${(error as Error).message}); inspect core.worktree/Git configuration and re-run setup`);
+  }
+  if (reportedRoot !== repoPath) {
     throw new RepositorySetupError(`selected directory is not the Git repository root: ${repoPath}`);
   }
   try {

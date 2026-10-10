@@ -54,7 +54,7 @@ function expectAvailable(): boolean {
   try { execFileSync('which', ['expect'], { stdio: 'ignore' }); return true; } catch { return false; }
 }
 const WS_PROMPT = 'Workspace root (holds ONLY your managed repos)';
-const REPOS_PROMPT = 'Managed repos — comma-separated numbers or names';
+const REPOS_PROMPT = 'Repos to validate — comma-separated numbers or names';
 const RUNTIME_PROMPT = 'Default runtime — ';
 const MODEL_PROMPT = 'Model reference';
 const THINKING_PROMPT = 'Thinking level';
@@ -81,11 +81,13 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
   it('all-defaults happy path has no BMAD prompt or generated state and smoke is green', () => {
     const workspace = fixtureWorkspace();
     const instance = tempDir('gru-command-pty-home-');
+    symlinkSync(join(workspace, 'repo-a'), join(workspace, 'repo-link'));
     const { output, status } = ptyWizard([
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps(''),
     ], { GRU_COMMAND_HOME: instance });
     expect(status, output).toBe(0);
-    expect(output).toContain('Selected managed repos: repo-a, repo-b');
+    expect(output).toContain('Repositories selected for setup validation: repo-a, repo-b');
+    expect(output).toContain('Linked repo entries excluded from setup validation: repo-link');
     expect(output).toContain('Smoke green');
     expect(output).toContain('Setup complete');
     expect(output).not.toContain('BMAD in ');
@@ -98,6 +100,24 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(config).toContain('port = 0');
     expect(config).toContain(`workspace_root = "${workspace}"`);
   }, 90_000);
+
+  it('an all-linked workspace can complete setup without selecting entries validation must reject', () => {
+    const workspace = tempDir('gru-command-pty-only-linked-');
+    const outside = fixtureWorkspace();
+    symlinkSync(join(outside, 'repo-a'), join(workspace, 'repo-link'));
+    const before = readFileSync(join(outside, 'repo-a', '.git/config'), 'utf-8');
+    const instance = tempDir('gru-command-pty-only-linked-home-');
+    const { output, status } = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, ...finishSteps(),
+    ], { GRU_COMMAND_HOME: instance });
+    expect(status, output).toBe(0);
+    expect(output).toContain('Linked repo entries excluded from setup validation: repo-link');
+    expect(output).toContain('Repositories selected for setup validation: (none)');
+    expect(output).not.toContain(REPOS_PROMPT);
+    expect(readFileSync(join(outside, 'repo-a', '.git/config'), 'utf-8')).toBe(before);
+    expect(existsSync(join(outside, 'repo-a', '_bmad'))).toBe(false);
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).workspaceRoot).toBe(workspace);
+  });
 
   it('malformed/conflicting and linked user BMAD require no provision, repair or skip step', () => {
     const workspace = fixtureWorkspace();
@@ -142,8 +162,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '1' }, ...finishSteps(),
     ], { GRU_COMMAND_HOME: tempDir('gru-command-pty-index-') });
     expect(status, output).toBe(0);
-    expect(output).toContain('Selected managed repos: repo-a');
-    expect(output).not.toContain('Selected managed repos: repo-a, repo-b');
+    expect(output).toContain('Repositories selected for setup validation: repo-a');
+    expect(output).not.toContain('Repositories selected for setup validation: repo-a, repo-b');
   }, 90_000);
 
   it('managed-repo multi-pick by NAME preserves the answered order', () => {
@@ -152,7 +172,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: 'repo-b, repo-a' }, ...finishSteps(),
     ], { GRU_COMMAND_HOME: tempDir('gru-command-pty-name-') });
     expect(status, output).toBe(0);
-    expect(output).toContain('Selected managed repos: repo-b, repo-a');
+    expect(output).toContain('Repositories selected for setup validation: repo-b, repo-a');
   }, 90_000);
 
   it('bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config', () => {

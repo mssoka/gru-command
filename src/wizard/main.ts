@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { createInterface } from 'node:readline/promises';
 import { stdout } from 'node:process';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { existsSync, openSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, openSync, realpathSync } from 'node:fs';
 import { ReadStream, WriteStream } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 import * as QRCode from 'qrcode';
@@ -152,7 +152,15 @@ async function interactiveAnswers(
   }
 
   const workspaceAbs = workspaceRoot.replace(/^~(?=\/|$)/, homedir());
-  const found = discoverManagedRepos(workspaceAbs);
+  const discovered = discoverManagedRepos(workspaceAbs);
+  // The board still discovers linked entries; setup only validates real
+  // repository directories and must not offer defaults it then rejects.
+  const found = discovered.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
+  const linked = discovered.filter((name) => !found.includes(name));
+  if (linked.length > 0) {
+    out.write(`\nLinked repo entries excluded from setup validation: ${linked.join(', ')}.\n` +
+      'Use their real directory under the workspace root to validate them; links stay unchanged.\n');
+  }
   let repos: string[] = [];
   if (found.length > 0) {
     out.write('\nRepos under the workspace root:\n');
@@ -160,7 +168,7 @@ async function interactiveAnswers(
     for (;;) {
       const answer = await ask(
         rl,
-        `Managed repos — comma-separated numbers or names [all ${found.length}]: `,
+        `Repos to validate — comma-separated numbers or names [all ${found.length}]: `,
       );
       if (answer === '') {
         repos = [...found];
@@ -184,8 +192,8 @@ async function interactiveAnswers(
     }
   } else {
     out.write(
-      `\nNo git repos found under ${workspaceRoot} yet — the board will be empty\n` +
-        'until you add repos there.\n',
+      `\nNo real repository directories available for setup validation under ${workspaceRoot}.\n` +
+        'The board discovers Git entries independently; add a real repository here to validate it.\n',
     );
   }
 
@@ -581,7 +589,7 @@ async function main(argv: readonly string[]): Promise<number> {
   const configText = generateConfigToml({ answers, instanceDir, prior });
 
   stdout.write(
-    `\nSelected managed repos: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
+    `\nRepositories selected for setup validation: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
   );
 
   if (answers.port !== 0) {

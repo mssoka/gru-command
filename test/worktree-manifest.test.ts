@@ -66,12 +66,15 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     for (const text of [
       '# BEGIN GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "echo edited"',
       '# END GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "echo user"',
+      '#  BEGIN GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "echo edited"\n#  END GRU COMMAND BMAD BOOTSTRAP',
+      '#BEGIN\tGRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "echo edited"',
     ]) expect(parseWorktreeManifest(text).retiredGcBmadBootstrap).toBe(true);
   });
 
   it('foreign multiline setup strings may mention BMAD markers without becoming GC-owned blocks', () => {
     const foreign = "[[setup]]\ncommand = '''\n# BEGIN GRU COMMAND BMAD BOOTSTRAP\necho independent-BMAD\n# END GRU COMMAND BMAD BOOTSTRAP\n'''\n";
     expect(parseWorktreeManifest(foreign).retiredGcBmadBootstrap).toBeUndefined();
+    expect(parseWorktreeManifest(foreign.replaceAll('# BEGIN', '#  BEGIN').replaceAll('# END', '#END')).retiredGcBmadBootstrap).toBeUndefined();
     expect(parseWorktreeManifest(`${foreign}# BEGIN GRU COMMAND BMAD BOOTSTRAP\n`).retiredGcBmadBootstrap).toBe(true);
   });
 

@@ -156,8 +156,22 @@ describe('BMAD-agnostic GC repository setup (#295)', () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain('GC repository setup');
       expect(result.stderr).toContain('not a usable Git repo');
+      expect(result.stderr).toContain('inspect the Git diagnostic');
+      expect(result.stderr).not.toContain('reported Git ownership/configuration');
       expect(existsSync(join(f.home, 'config.toml'))).toBe(false);
     }
+  });
+
+  it('a successful Git probe reporting an unavailable root has named actionable guidance before writes', () => {
+    const f = fixture();
+    git(f.repo, 'config', '--local', 'core.worktree', join(f.workspace, 'missing-root'));
+    const before = tree(f.repo);
+    const result = run(f);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('GC repository setup: Git reported an unavailable repository root');
+    expect(result.stderr).toContain('core.worktree/Git configuration');
+    expect(tree(f.repo)).toEqual(before);
+    expect(existsSync(join(f.home, 'config.toml'))).toBe(false);
   });
 
   it('GC repository-root validation refuses selected symlinks, not user BMAD links', () => {

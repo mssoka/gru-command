@@ -131,7 +131,8 @@ See [the prerequisite decision](docs/decisions/gh-168-darwin-python-review-enume
 That single invocation clones to `~/gru-command`, installs dependencies,
 builds the service and web UI, and runs the setup wizard through
 `/dev/tty` even though the script itself is piped. The wizard detects
-`pi`/Claude Code, selects managed repos, writes the complete commented
+`pi`/Claude Code, selects real repository directories for setup validation
+(not a management whitelist; the board discovers workspace repos live), writes the complete commented
 live config at `~/.gru-command/config.toml`, smoke-tests first boot, and
 can register/start the owned OS service. A truly headless environment
 fails immediately with the exact `--no-interact` command instead of

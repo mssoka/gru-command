@@ -18,11 +18,15 @@ The config file is always `<instance dir>/config.toml`.
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
 the supported installation path. It reads prompts from `/dev/tty`, so a
 `curl | bash` install remains one invocation, probes runtime CLIs, asks
-for managed repos, validates Git roots and GC worktree setup without provisioning
+which real repository directories to validate during setup, checks Git roots and GC worktree setup without provisioning
 or inspecting independent BMAD ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same
 **complete teaching config** as the generator below. Every concrete
 default is active; optional role/runtime overrides are shown commented
-because activating a placeholder would change precedence.
+because activating a placeholder would change precedence. The selection is not
+a management whitelist: the board discovers workspace Git entries live. Interactive
+setup excludes linked repo entries from validation defaults, without changing their
+links or the board's discovery behavior; explicit headless selection of a linked
+repo still fails before writes.
 
 True headless use is explicit: `--no-interact` accepts documented
 defaults, and optional `--answers '<json>'` may contain only non-secret
