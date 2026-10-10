@@ -724,9 +724,9 @@ repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea;
 # scheduler only; the classified heavy files route through the heavy config
 # (the scope-composition guard), the approved RPC patch runs first, and no
 # exit is masked.
-formal-verdicts-app = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts"
+formal-verdicts-app = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts test/publication-evidence.test.ts"
 formal-verdicts-wave = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts"
-formal-verdicts-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts test/review-build-identity.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/dispatch-e2e.test.ts test/dispatch-server.test.ts test/silas-followthrough.test.ts && npx vitest run test/directive-retirement.test.ts test/perkins-crash-child.test.ts"
+formal-verdicts-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts test/publication-evidence.test.ts test/review-build-identity.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/dispatch-e2e.test.ts test/dispatch-server.test.ts test/silas-followthrough.test.ts && npx vitest run test/directive-retirement.test.ts test/perkins-crash-child.test.ts"
 
 # Static product checks for the same change: lint, both compilers through
 # the build (the pinned Perkins resource verifier included) and the web
