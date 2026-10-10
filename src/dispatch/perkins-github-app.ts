@@ -559,11 +559,13 @@ function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, tar
 }
 
 /** A review matching this publication's author, frozen head, body and
- * window in ANY enacted state — evidence the publication exists, but NOT in
- * the state this delivery intended. It can neither be credited nor read as
- * absence: the delivery stays explicitly unresolved. */
+ * window in ANY SUBMITTED state — evidence the publication exists, but NOT
+ * in the state this delivery intended. It can neither be credited nor read
+ * as absence: the delivery stays explicitly unresolved. A PENDING draft is
+ * not delivered evidence at all (it was never submitted), so it is skipped
+ * exactly like any unrelated review. */
 function isMatchingAppReviewInAnyState(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
-  return matchesDeliveryPredicates(review, botLogin, targetSha, body, null, notBeforeMs);
+  return review.state !== 'PENDING' && matchesDeliveryPredicates(review, botLogin, targetSha, body, null, notBeforeMs);
 }
 
 /** Provider-proved evidence that OUR App bot published exactly this review

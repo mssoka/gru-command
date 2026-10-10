@@ -849,7 +849,9 @@ export class GhPrPoster implements VerdictPoster {
       review.commit_id === input.targetSha &&
       typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body) &&
       typeof review.user?.login === 'string' && review.user.login.toLowerCase() === authenticatedLogin.toLowerCase();
-    const wrongState = reviews.find((review) => samePublication(review) && review.state !== wantedEvent);
+    // A PENDING review is an unsubmitted draft — never delivered evidence —
+    // so it can neither be credited nor treated as wrong-state proof.
+    const wrongState = reviews.find((review) => samePublication(review) && review.state !== wantedEvent && review.state !== 'PENDING');
     const matches = reviews.filter((review): boolean => samePublication(review) && review.state === wantedEvent);
     // Newest usable match wins; a later match with an unusable review id
     // must not mask an earlier fully bound one (R13/R28). If EVERY match
