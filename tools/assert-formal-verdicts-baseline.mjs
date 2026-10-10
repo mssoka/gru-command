@@ -20,16 +20,16 @@ import { pathToFileURL } from 'node:url';
 
 export const EXPECTED_FORMAL_EVENT_ASSERTIONS = Object.freeze({
   app: Object.freeze([
-    'formal GitHub verdict publication > delivers a formal APPROVE bound to the frozen head and proves the APPROVED state (formal GitHub)',
-    'formal GitHub verdict publication > delivers a formal REQUEST_CHANGES bound to the frozen head and proves the CHANGES_REQUESTED state (formal GitHub)',
-    'formal GitHub verdict publication > never credits a COMMENTED review beside an approval intent and never re-posts (formal GitHub)',
-    'formal GitHub verdict publication > reconciles an approval against provider proof of the APPROVED state only (formal GitHub)',
-    'formal GitHub verdict publication > keeps the GitLab note contract and refuses a formal intent a note cannot enact (formal GitHub)',
+    'formal GitHub verdict publication delivers a formal APPROVE bound to the frozen head and proves the APPROVED state (formal GitHub)',
+    'formal GitHub verdict publication delivers a formal REQUEST_CHANGES bound to the frozen head and proves the CHANGES_REQUESTED state (formal GitHub)',
+    'formal GitHub verdict publication never credits a COMMENTED review beside an approval intent and never re-posts (formal GitHub)',
+    'formal GitHub verdict publication reconciles an approval against provider proof of the APPROVED state only (formal GitHub)',
+    'formal GitHub verdict publication keeps the GitLab note contract and refuses a formal intent a note cannot enact (formal GitHub)',
   ]),
   wave: Object.freeze([
-    'GitHub SHA-bound Perkins delivery > never certifies absence when the frozen head carries a body-identical review in the wrong state (formal GitHub)',
-    'formal GitHub verdict publication from native judgments > publishes a real approval, a real change request, keeps a final-pass-debt READY a comment, and clears the change request with a later eligible READY (formal GitHub)',
-    'formal GitHub verdict publication from native judgments > refuses a publisher receipt that did not enact the intended formal state, and never retries it (formal GitHub)',
+    'GitHub SHA-bound Perkins delivery never certifies absence when the frozen head carries a body-identical review in the wrong state (formal GitHub)',
+    'formal GitHub verdict publication from native judgments publishes a real approval, a real change request, keeps a final-pass-debt READY a comment, and clears the change request with a later eligible READY (formal GitHub)',
+    'formal GitHub verdict publication from native judgments refuses a publisher receipt that did not enact the intended formal state, and never retries it (formal GitHub)',
   ]),
 });
 
