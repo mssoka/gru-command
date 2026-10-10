@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PERKINS_POLICY_ID = 'perkins-code-review';
 export const PERKINS_CANONICAL_SOURCE_SHA256 = 'f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7';
-export const PERKINS_POLICY_SHA256 = '5d522298979a140a2c6fd385da9512470aec4f00811534fd1cd307b21eb032b6';
+export const PERKINS_POLICY_SHA256 = '097be56ca2f6ecb6e1c75e1b320c6d3b50e481cc39a439ccd80134ea665d040d';
 
 export const PERKINS_LENSES = [
   'blind',

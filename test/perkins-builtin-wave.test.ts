@@ -26,6 +26,7 @@ import { configPathFor, loadConfig } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
 import { SessionStore } from '../src/sessions/store.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
+import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { createReviewEscalationNotifier } from '../src/dispatch/escalation-identity.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -3518,6 +3519,24 @@ describe('WaveRunner built-in Perkins production path', () => {
         integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40),
       },
     }), '9013');
+    // A present-but-MISTYPED coverage or debt field is damaged state, never a
+    // coerced boolean: the reader refuses both fields independently.
+    await refuseDamaged('refuse-mistyped-coverage', (target) => ({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: target, diffBaseSha: 'c'.repeat(40) },
+      convergence: {
+        reviewScope: 'integration', coverageComplete: 'yes', finalPassRequired: false,
+        integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40), integrationPriorDiffBase: 'e'.repeat(40),
+      },
+    }), '9020');
+    await refuseDamaged('refuse-mistyped-debt', (target) => ({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: target, diffBaseSha: 'c'.repeat(40) },
+      convergence: {
+        reviewScope: 'integration', coverageComplete: true, finalPassRequired: 'true',
+        integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40), integrationPriorDiffBase: 'e'.repeat(40),
+      },
+    }), '9021');
 
     // (f) An INCONSISTENT posted integration base (incoming base differs from
     // the block's own frozen diff base) is DAMAGED posted state: the event is
@@ -3944,6 +3963,93 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(review['integrationFromSha']).toBe(h1);
     expect(thirdFake.leadCalls.at(-1)!.prompt ?? '').toContain('promotion boundary blocker');
     expect(third.canonicalVerdict).toBe('NEEDS CHANGES');
+
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }, 180_000);
+
+  it('refuses a WaveRunner predecessor mutated between the authenticated plan and engine consumption', async () => {
+    const repo = makeFixtureRepo('perkins-pin-passthrough');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    repo.git(['checkout', '-b', 'feature/integration']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-pin-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-pin-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-pin-db-')));
+    dirs.push(root, artifacts); dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/integration', h0);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-pin-passthrough' });
+    const job = ledger.addJob({ id: 'job-pin-passthrough', repo: 'fixture', title: 'pin passthrough', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/48');
+    attachOrigin(repo, 'feature/integration', root);
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9019', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+      authenticatedActor: async () => 'gru-bot',
+    };
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    // Round 1 (whole) at H0/B0.
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster, reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-pin-s1-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+
+    // Main advances and the feature integrates it into H1.
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main1.ts', 'export const main1 = 1;\n');
+    repo.git(['checkout', 'feature/integration']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/integration']);
+
+    // The production WaveRunner plans and then calls the engine. Interpose on
+    // the engine entry — exactly the plan→consumption window — so the prior
+    // record changes AFTER its bytes were pinned. The engine must refuse it,
+    // which is only possible because the production caller forwards the pin.
+    const originalRun = PerkinsWholeReview.prototype.run;
+    const runSpy = vi.spyOn(PerkinsWholeReview.prototype, 'run').mockImplementation(function (
+      this: PerkinsWholeReview,
+      input: Parameters<typeof originalRun>[0],
+    ) {
+      const file = input.priorConsolidatedFile;
+      if (file !== undefined) {
+        const record = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+        writeFileSync(file, JSON.stringify({ ...record, findings: [] }));
+      }
+      return originalRun.call(this, input);
+    });
+    try {
+      const outcome = asWave(await new WaveRunner({
+        reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+        ledger, worktrees: port, poster, reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+        spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-pin-s2-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+      }).runRound({ jobId: job.id }));
+      // The mutated predecessor is refused before any coverage credit and no
+      // review runs on it: no verdict, no posted event, no consolidated record.
+      expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+      expect(outcome.posted).toBe(false);
+      const incomplete = ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete');
+      expect(incomplete).not.toBeNull();
+      expect(String((incomplete!.payload as { error?: unknown }).error)).toContain('changed between scope planning and engine consumption');
+      expect(ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+      expect(existsSync(join(artifacts, outcome.round.id, 'consolidated.json'))).toBe(false);
+    } finally {
+      runSpy.mockRestore();
+    }
 
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });

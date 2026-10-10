@@ -27,6 +27,7 @@ export const BASELINE_TITLES = {
   heavy: [
     'keeps a verdict-committed round as predecessor when the normal annotation write is interrupted',
     'keeps a verdict-committed round as predecessor when the promotion annotation write is interrupted',
+    'refuses a WaveRunner predecessor mutated between the authenticated plan and engine consumption',
   ],
 };
 
