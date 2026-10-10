@@ -754,3 +754,8 @@ formal-verdicts-baseline = "sh tools/formal-verdicts-baseline.sh"
 # marker). Expected RED by behavioral assertion; classified inside the
 # script; the snapshot is preserved for inspection.
 formal-verdicts-rev3-baseline = "sh tools/formal-verdicts-rev3-baseline.sh"
+
+# Native R2 (F1-F3) fail-before proof: the FINAL recovery/absence regressions
+# run against an isolated archive of the uncorrected head 89f3a71; the two
+# discriminating legs are classified by exact named AssertionErrors.
+formal-verdicts-r2-baseline = "sh tools/formal-verdicts-r2-baseline.sh"

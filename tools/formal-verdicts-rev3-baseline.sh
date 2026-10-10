@@ -33,7 +33,7 @@ done
 ln -s "$root/node_modules" "$d/node_modules"
 printf '%s base=%s head=%s\n' "$d" "$base" "$headrev" > "$prep/formal-verdicts-rev3-baseline.last-snapshot.txt"
 cd "$d"
-for pair in "silas-driver.test.ts:170" "dispatch-server.test.ts:63"; do
+for pair in "silas-driver.test.ts:171" "dispatch-server.test.ts:64"; do
   file=${pair%%:*}
   expected=${pair##*:}
   registered=$(grep -oE '\bit\(|\bit\.skipIf\(' "test/$file" | wc -l | tr -d ' ')
@@ -44,9 +44,9 @@ for pair in "silas-driver.test.ts:170" "dispatch-server.test.ts:63"; do
 done
 node tools/patch-vitest-rpc-timeout.mjs
 set +e
-npx vitest run test/silas-driver.test.ts -t "revision 3"
+npx vitest run --reporter=json --outputFile="$d/silas-results.json" test/silas-driver.test.ts -t "revision 3"
 a=$?
-npx vitest run --config vitest.heavy.config.ts test/dispatch-server.test.ts -t "revision 3"
+npx vitest run --reporter=json --outputFile="$d/dispatch-results.json" --config vitest.heavy.config.ts test/dispatch-server.test.ts -t "revision 3"
 b=$?
 set -e
 echo "formal-verdicts-rev3-baseline vitest exits: silas=$a dispatch=$b"
@@ -54,5 +54,12 @@ if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then
   echo "FAILS-BEFORE CLAIM BROKEN: an uncorrected-head leg passed the revision-3 refusals unexpectedly" >&2
   exit 2
 fi
-echo "EXPECTED-NONZERO: the revision-3 admission refusals failed against the uncorrected head"
+# W1 repair: classify the legs by their exact named AssertionErrors instead
+# of trusting the exit codes alone (a setup/import failure or a missing case
+# now breaks the claim with exit 2).
+node "$root/tools/assert-named-red-baseline.mjs" silas "$d/silas-results.json" \
+  "silas digest (the four actionable states) does not offer a clean-abort re-arm for an already-aborted round with a recorded historical delivery (revision 3)" || exit 2
+node "$root/tools/assert-named-red-baseline.mjs" dispatch "$d/dispatch-results.json" \
+  "dispatch server (E8) refuses a clean-abort re-arm for an already-aborted round with a recorded historical delivery (revision 3)" || exit 2
+echo "EXPECTED-NONZERO: the revision-3 admission refusals failed behaviorally against the uncorrected head"
 exit 1
