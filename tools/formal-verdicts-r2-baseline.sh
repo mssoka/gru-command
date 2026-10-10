@@ -59,6 +59,6 @@ node "$root/tools/assert-named-red-baseline.mjs" wave "$d/wave-results.json" \
   "formal GitHub publication durability and restart reconciliation holds a restart whose gh lookup met an undecidable review list (native R2 F3)" \
   "GitHub SHA-bound Perkins delivery refuses an undecidable gh review list instead of reporting absence (native R2 F3)" || exit 2
 node "$root/tools/assert-named-red-baseline.mjs" silas "$d/silas-results.json" \
-  "does not offer a clean-abort re-arm after a held recovery whose absence certificate would have been false (native R2 F1/F2)" || exit 2
+  "silas digest (the four actionable states) does not offer a clean-abort re-arm after a held recovery whose absence certificate would have been false (native R2 F1/F2)" || exit 2
 echo "EXPECTED-NONZERO: the native R2 false-absence regressions failed behaviorally against the uncorrected head"
 exit 1
