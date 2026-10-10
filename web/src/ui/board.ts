@@ -82,6 +82,7 @@ import {
   type RoundSummary,
 } from '../lib/board-signals.js';
 import {
+  ackNextStep,
   ownerRows,
   ownerWindow,
   safePrUrl,
@@ -123,6 +124,13 @@ const LENS_STATE_LABEL: Readonly<Record<string, string>> = {
   done: '✓',
   error: '✕',
   unused: '—',
+};
+
+/** Slim-strip group marker tones (Heists / PRs / Crew), by group label. */
+const STRIP_GROUP_TONE: Readonly<Record<string, string>> = {
+  HEISTS: 'work',
+  PRS: 'rev',
+  CREW: 'done',
 };
 
 export interface TranscriptOpenRequest {
@@ -224,6 +232,14 @@ export class BoardView {
   /** FOR YOU: the older pending tail lives behind the expander
    * (session-expanded, like the SETTLED window). */
   private ownerExpanded = false;
+  /** Per-row disclosure state keyed by stable action id; survives
+   * snapshot pushes and retires only when the row itself leaves the full
+   * owner list (a row hidden by the older-pending window keeps state). */
+  private readonly expandedOwnerRows = new Set<string>();
+  /** Collision-free DOM identity: actionId → allocated region id (never
+   * slugged, so `a_b` and `a-b` can never share a region/focus target). */
+  private readonly ownerRegionIds = new Map<string, string>();
+  private nextOwnerRegionId = 0;
 
   constructor(
     onOpenTranscript: (request: TranscriptOpenRequest) => void,
@@ -464,22 +480,35 @@ export class BoardView {
   private renderOwnerActions(snapshot: BoardSnapshot): void {
     const mount = this.ownerMount;
     const rows = ownerRows(snapshot);
+    // Retire identities only when an actionId left the FULL row list — a
+    // row merely hidden by the older-pending window keeps its id, state
+    // and region, so re-revealing it never resurrects a lookalike.
+    const currentIds = new Set(rows.map((row) => row.actionId));
+    for (const id of [...this.ownerRegionIds.keys()]) {
+      if (!currentIds.has(id)) {
+        this.ownerRegionIds.delete(id);
+        this.expandedOwnerRows.delete(id);
+      }
+    }
     // Focus preservation: a snapshot push re-renders the band; a focused
-    // control keeps its place (stable action ids make it the same
-    // control, not a lookalike).
+    // control keeps its place by action id AND control kind (disclosure
+    // vs Ack vs OPEN PR are distinct targets, never lookalikes).
     const active = document.activeElement;
-    const focusId =
-      active instanceof HTMLElement && mount.contains(active)
-        ? active.dataset.actionId ?? null
-        : null;
+    const inBand = active instanceof HTMLElement && mount.contains(active);
+    const moreFocused = inBand && active.classList.contains('board-band__more');
+    const headFocused = inBand && active.classList.contains('board-band__head');
+    const focusId = inBand ? active.dataset.actionId ?? null : null;
+    const focusControl = inBand ? active.dataset.control ?? '' : '';
     const bandVisible = !mount.hidden && mount.closest('[hidden]') === null;
     mount.replaceChildren();
     const head = el('h2', 'board-band__head');
     head.id = 'board-owner-head';
-    head.append(
-      el('span', 'board-band__label', 'FOR YOU'),
-      el('span', 'board-band__count lbl', `${rows.length} pending`),
-    );
+    // Programmatically focusable so the fallback path can anchor focus on
+    // the band itself when no control remains (never <body>).
+    head.tabIndex = -1;
+    const count = el('span', 'board-band__count lbl');
+    count.append(el('span', 'num board-band__count-num', String(rows.length)), document.createTextNode(' pending'));
+    head.append(el('span', 'board-band__label', 'FOR YOU'), count);
     mount.append(head);
     mount.hidden = false;
     if (rows.length === 0) {
@@ -493,9 +522,9 @@ export class BoardView {
       );
       mount.append(clear);
     } else {
-      const window = ownerWindow(rows, this.ownerExpanded);
+      const bandWindow = ownerWindow(rows, this.ownerExpanded);
       const list = el('div', 'board-band__rows board-owner__rows');
-      for (const row of window.rows) {
+      for (const row of bandWindow.rows) {
         if (row.kind === 'ack') {
           list.append(this.ownerAckRow(row, bandVisible));
         } else if (row.kind === 'proposal') {
@@ -505,27 +534,101 @@ export class BoardView {
         }
       }
       mount.append(list);
-      if (window.hidden > 0) {
-        const more = el('button', 'board-band__more', `+${window.hidden} older pending`);
+      if (bandWindow.hidden > 0) {
+        // The older-pending count rides its own reserved numeric slot —
+        // it is part of the approved For-you geometry contract.
+        const more = el('button', 'board-band__more');
         more.type = 'button';
+        more.append(
+          document.createTextNode('+'),
+          el('span', 'num board-band__more-num', String(bandWindow.hidden)),
+          document.createTextNode(' older pending'),
+        );
         more.setAttribute('aria-expanded', String(this.ownerExpanded));
         more.addEventListener('click', () => {
+          // The first row beyond the current window is what this reveals;
+          // focus it (the disclosure) so the operator lands on the newly
+          // available content, falling back to an in-band anchor.
+          const rowsNow = this.snapshot === null ? null : ownerRows(this.snapshot);
+          const firstHidden =
+            rowsNow === null ? null : rowsNow[ownerWindow(rowsNow, false).rows.length]?.actionId ?? null;
           this.ownerExpanded = true;
           if (this.snapshot !== null) this.render(this.snapshot);
+          if (firstHidden === null || !this.refocusAction(firstHidden, 'disclose')) this.focusBandFallback();
         });
         mount.append(more);
       }
     }
-    if (focusId !== null) this.refocusAction(focusId);
+    if (focusId !== null) {
+      // The exact control is gone (row settled, or pushed outside the
+      // older-pending window): focus must land on an intentional band
+      // target, never fall to <body>.
+      if (!this.refocusAction(focusId, focusControl)) this.focusBandFallback();
+    } else if (moreFocused || headFocused) {
+      // The older-pending control or the band heading (the fallback anchor
+      // itself) was focused: both are recreated on every render, so
+      // re-anchor to an intentional target on the NEXT push too.
+      this.focusBandFallback();
+    }
   }
 
-  private refocusAction(actionId: string): void {
+  /** Focus target inside the owner band when the previously focused
+   * control is gone: the older-pending control when it still exists, else
+   * the first remaining control, else the band heading (programmatically
+   * focusable) — never <body>. */
+  private focusBandFallback(): void {
+    (this.ownerMount.querySelector<HTMLElement>('.board-band__more') ??
+      this.ownerMount.querySelector<HTMLElement>('[data-action-id]') ??
+      this.ownerMount.querySelector<HTMLElement>('.board-band__head'))?.focus();
+  }
+
+  /** Collision-free DOM identity: region ids are ALLOCATED per action id
+   * (never slugged), stable across re-renders. */
+  private ownerRegionId(actionId: string): string {
+    let id = this.ownerRegionIds.get(actionId);
+    if (id === undefined) {
+      this.nextOwnerRegionId += 1;
+      id = `fy-detail-${this.nextOwnerRegionId}`;
+      this.ownerRegionIds.set(actionId, id);
+    }
+    return id;
+  }
+
+  private refocusAction(actionId: string, control: string): boolean {
     for (const node of this.ownerMount.querySelectorAll<HTMLElement>('[data-action-id]')) {
-      if (node.dataset.actionId === actionId) {
+      if (node.dataset.actionId === actionId && (node.dataset.control ?? '') === control) {
         node.focus();
-        return;
+        return true;
       }
     }
+    return false;
+  }
+
+  /** The reveal-only disclosure control: toggles local visibility keyed by
+   * stable action id and sends NO request — reviewing never acks,
+   * approves, re-arms, or clears a pending count. */
+  private ownerDiscloseNode(actionId: string, label: string): HTMLElement {
+    const disclose = document.createElement('button');
+    disclose.type = 'button';
+    disclose.className = 'board-owner__disclose';
+    disclose.textContent = 'Review decision';
+    // Unique accessible name per row: N indistinguishable "Review decision"
+    // buttons are not usable in a screen reader's control list; the action
+    // id disambiguates rows that share a title.
+    disclose.setAttribute('aria-label', `Review decision: ${label} (${actionId})`);
+    disclose.dataset.actionId = actionId;
+    disclose.dataset.control = 'disclose';
+    disclose.setAttribute('aria-controls', this.ownerRegionId(actionId));
+    disclose.setAttribute('aria-expanded', String(this.expandedOwnerRows.has(actionId)));
+    disclose.addEventListener('click', () => {
+      const expanded = !this.expandedOwnerRows.has(actionId);
+      if (expanded) this.expandedOwnerRows.add(actionId);
+      else this.expandedOwnerRows.delete(actionId);
+      disclose.setAttribute('aria-expanded', String(expanded));
+      const region = disclose.closest('.board-owner__row')?.querySelector<HTMLElement>('.board-owner__detail');
+      if (region !== null && region !== undefined) region.hidden = !expanded;
+    });
+    return disclose;
   }
 
   /** One pending ack obligation: what it is, why it is owed, what the
@@ -533,24 +636,42 @@ export class BoardView {
    * ambiguity — only the authoritative snapshot closes the row. */
   private ownerAckRow(row: OwnerAckRow, bandVisible: boolean): HTMLElement {
     const item = row.notification;
-    // The interactive control carries the action id (focus/addressing
-    // target); the wrapper stays anonymous so a query always lands on
-    // the control, never a lookalike parent.
+    // The interactive controls carry the action id + control kind (focus
+    // addressing targets); the wrappers stay anonymous so a query always
+    // lands on a control, never a lookalike parent.
     const node = el('article', `board-owner__row board-owner__row--${item.severity}`);
-    node.append(
-      el('div', 'board-owner__title', `🔔 ${item.title}`),
-      el(
-        'div',
-        'board-owner__meta lbl',
-        `${formatTs(item.ts)} · owner ack owed${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
-      ),
-      el('div', 'lbl board-owner__consequence', row.consequence),
+    // Collapsed face: the supplied title IS the Problem; one SHORT typed
+    // Next step. No timestamp/kind, no full consequence paragraph here.
+    const face = el('div', 'board-owner__face');
+    face.append(el('h3', 'board-owner__title', item.title));
+    const next = el('p', 'board-owner__next');
+    next.append(
+      el('b', 'board-owner__next-label', 'Next step:'),
+      document.createTextNode(` ${ackNextStep(item.kind)}`),
+    );
+    face.append(next);
+    node.append(face, this.ownerDiscloseNode(row.actionId, item.title));
+    // Expanded region: authoritative metadata, the complete original
+    // detail (verbatim, rendered as text), and the full consequence
+    // directly beside the Ack control — consequences stay visible before
+    // activation; disclosure never performs the action.
+    const detail = el('div', 'board-owner__detail');
+    detail.id = this.ownerRegionId(row.actionId);
+    detail.hidden = !this.expandedOwnerRows.has(row.actionId);
+    detail.append(el('p', 'lbl board-owner__detail-meta', `${formatTs(item.ts)} · kind ${item.kind} · ${item.routing}`));
+    if (item.detail !== null && item.detail !== '') {
+      detail.append(el('p', 'board-owner__detail-text', item.detail));
+    }
+    detail.append(
+      el('p', 'board-owner__detail-text', row.consequence),
+      el('p', 'lbl board-owner__detail-notice', 'Reviewing never acks or approves — Ack stays a separate control.'),
     );
     const ack = document.createElement('button');
     ack.type = 'button';
     ack.className = 'board-owner__ack';
     ack.textContent = 'Ack';
     ack.dataset.actionId = row.actionId;
+    ack.dataset.control = 'ack';
     ack.addEventListener('click', () => {
       ack.disabled = true;
       ack.textContent = 'acking…';
@@ -567,7 +688,8 @@ export class BoardView {
           ack.textContent = 'Ack';
         });
     });
-    node.append(ack);
+    detail.append(ack);
+    node.append(detail);
     // Display receipt for what the band actually displayed (shown:true
     // doctrine) — a receipt is proof of display, never of completion.
     if (bandVisible) this.sendShown(item, 'web-board');
@@ -797,112 +919,201 @@ export class BoardView {
   /** One evidence-bound ready PR: affected heist, the exact head every
    * piece of evidence is bound to, and OPEN PR — an external link, not
    * an in-app merge. Nothing here claims the merge happened. */
-  private ownerPrRow(row: OwnerPrRow): HTMLElement {
+  private ownerPrRow(row: OwnerPrRow, surface: 'band' | 'panel' = 'band'): HTMLElement {
     const pr = row.pr;
+    if (surface === 'panel') {
+      // Bell panel: the PRIOR full presentation (outside the compact band
+      // redesign) — evidence inline, OPEN PR link, no disclosure and no
+      // detail region, so band and panel never share an id or aria target.
+      const panel = el('article', 'board-owner__row board-owner__row--pr board-owner__row--panel');
+      panel.append(
+        el('div', 'board-owner__title', `🔀 ${pr.jobTitle}`),
+        el('span', 'pp-chip pp-chip--done board-owner__ready', 'ready for you'),
+        el(
+          'div',
+          'board-owner__meta lbl',
+          `📦 ${pr.repo} · review approved @ ${pr.sha.slice(0, 8)} · CI green at that head · mergeable`,
+        ),
+      );
+      const panelHref = safePrUrl(pr.prUrl);
+      if (panelHref !== null) {
+        const panelOpen = el('a', 'board-owner__open', 'OPEN PR ↗');
+        panelOpen.href = panelHref;
+        panelOpen.target = '_blank';
+        panelOpen.rel = 'noreferrer';
+        panelOpen.dataset.actionId = row.actionId;
+        panelOpen.dataset.control = 'open';
+        panelOpen.title = 'Opens the PR on GitHub — merging stays your call there';
+        panel.append(panelOpen);
+      } else {
+        panel.append(el('span', 'lbl board-owner__nolink', 'PR link unavailable'));
+      }
+      return panel;
+    }
     const node = el('article', 'board-owner__row board-owner__row--pr');
-    node.append(
-      el('div', 'board-owner__title', `🔀 ${pr.jobTitle}`),
-      el(
-        'span',
-        'pp-chip pp-chip--done board-owner__ready',
-        'ready for you',
-      ),
-      el(
-        'div',
-        'board-owner__meta lbl',
-        `📦 ${pr.repo} · review approved @ ${pr.sha.slice(0, 8)} · CI green at that head · mergeable`,
-      ),
+    // Collapsed face: supplied job title, the server-projected readiness
+    // chip, and one short typed Next step. OPEN PR stays an explicit,
+    // separate control beside the content — never a disclosure alias.
+    const face = el('div', 'board-owner__face');
+    face.append(
+      el('h3', 'board-owner__title', pr.jobTitle),
+      el('span', 'pp-chip pp-chip--done board-owner__ready', 'ready for you'),
     );
+    const next = el('p', 'board-owner__next');
+    next.append(
+      el('b', 'board-owner__next-label', 'Next step:'),
+      document.createTextNode(' Open the pull request on GitHub — merging stays your call there.'),
+    );
+    face.append(next);
+    const actions = el('div', 'board-owner__actions');
+    actions.append(this.ownerDiscloseNode(row.actionId, pr.jobTitle));
     const href = safePrUrl(pr.prUrl);
     if (href !== null) {
+      // OPEN PR is an external link, not an in-app merge. Nothing here
+      // claims the merge happened.
       const open = el('a', 'board-owner__open', 'OPEN PR ↗');
       open.href = href;
       open.target = '_blank';
       open.rel = 'noreferrer';
       open.dataset.actionId = row.actionId;
+      open.dataset.control = 'open';
       open.title = 'Opens the PR on GitHub — merging stays your call there';
-      node.append(open);
+      actions.append(open);
     } else {
       // Fail closed: an unsafe URL never becomes a link (the server
       // already refuses to project these; this is the browser guard).
-      node.append(el('span', 'lbl board-owner__nolink', 'PR link unavailable'));
+      actions.append(el('span', 'lbl board-owner__nolink', 'PR link unavailable'));
     }
+    node.append(face, actions);
+    // Expanded evidence: the server-projected readiness detail, verbatim.
+    const detail = el('div', 'board-owner__detail');
+    detail.id = this.ownerRegionId(row.actionId);
+    detail.hidden = !this.expandedOwnerRows.has(row.actionId);
+    detail.append(
+      el(
+        'p',
+        'lbl board-owner__detail-meta',
+        `📦 ${pr.repo} · review approved @ ${pr.sha.slice(0, 8)} · CI green at that head · mergeable · checked ${formatTs(pr.checkedAt)}`,
+      ),
+      el('p', 'lbl board-owner__detail-notice', 'Opening the PR never merges it — the merge stays your call on GitHub.'),
+    );
+    node.append(detail);
     return node;
   }
 
   // ------------------------------------------------------------------
-  // Status chip rail (v6: the v4 health row, relocated + counts folded)
+  // Slim status strip (v7 compact density): one wrapping status row plus
+  // three stable count groups — same snapshot and derivations as the pill
+  // rail it replaces, so the strip can never disagree with the board.
   // ------------------------------------------------------------------
 
-  /** The global rail: seven chips — deploy → reviews → silas → alerts →
-   * verify → cure → trackers. Same snapshot as the rows below, so the
-   * rail can never disagree with the board. */
   private renderRail(snapshot: BoardSnapshot): void {
     this.chipRail.hidden = false;
-    this.renderTrackers(snapshot);
+    const chips = railChips(snapshot);
+    this.renderTrackerChips(snapshot);
     this.chipRail.replaceChildren();
-    for (const chip of railChips(snapshot)) {
-      this.chipRail.append(chip.id === 'trackers' ? this.trackersChipNode(chip) : this.railChipNode(chip));
+    const row = el('div', 'strip-status');
+    for (const chip of chips) {
+      if (chip.id !== 'trackers') row.append(this.statusPairNode(chip));
     }
-  }
-
-  private railChipNode(chip: RailChip): HTMLElement {
-    const node = el('span', `rail-chip rail-chip--${chip.tone}`);
-    node.dataset.chip = chip.id;
-    node.title = chip.titleAttr;
-    node.append(
-      el('span', 'rail-chip__label', chip.label),
-      el('span', 'rail-chip__value', chip.value),
+    row.append(this.decisionsChip, this.unackedChip, this.wakesChip);
+    this.chipRail.append(
+      row,
+      this.stripGroupsNode(chips.find((chip) => chip.id === 'trackers') ?? null),
     );
-    if (chip.flag !== null) {
-      node.append(el('span', 'pp-chip pp-chip--alert rail-chip__flag', chip.flag));
-    }
-    return node;
   }
 
-  /** TRACKERS: the folded KPI count strips plus the Jev + unacked chips the
-   * v4 tracker strip carried (their ids/behavior survive the move). v6.1:
-   * every count renders as a labeled field — no bare slash counters. */
-  private trackersChipNode(chip: RailChip): HTMLElement {
-    const node = el('span', `rail-chip rail-chip--trackers rail-chip--${chip.tone}`);
-    node.dataset.chip = 'trackers';
-    node.title = chip.titleAttr;
-    node.append(el('span', 'rail-chip__label', chip.label));
-    for (const group of chip.kpis ?? []) {
-      const groupNode = el('span', 'rail-kpi');
-      groupNode.title = group.title;
-      const label = el('b', 'rail-kpi__label', group.label);
+  /** One terse labeled pair; the tone dot is decoration — the label and
+   * value text carry the fact (never colour alone). */
+  private statusPairNode(chip: RailChip): HTMLElement {
+    const pair = el('span', `strip-pair strip-pair--${chip.tone}`);
+    pair.dataset.chip = chip.id;
+    pair.title = chip.titleAttr;
+    const dot = el('span', 'strip-dot');
+    dot.setAttribute('aria-hidden', 'true');
+    pair.append(dot, el('span', 'strip-key', chip.label), this.stripValueNode(chip));
+    if (chip.flag !== null) pair.append(this.stripFlagNode(chip));
+    return pair;
+  }
+
+  /** The value with its numeric part in a reserved tabular slot, fed by
+   * the same derivation that produced the plain string — never re-derived. */
+  private stripValueNode(chip: RailChip): HTMLElement {
+    const value = el('span', 'strip-value');
+    const split = chip.valueSplit;
+    if (split.lead !== '') value.append(el('span', 'strip-value__txt', `${split.lead} `));
+    if (split.num !== null) value.append(el('span', 'num strip-value__num', String(split.num)));
+    if (split.unit !== '') value.append(el('span', 'strip-value__txt', split.unit));
+    if (value.childElementCount === 0) value.append(el('span', 'strip-value__txt', chip.value));
+    return value;
+  }
+
+  /** Flags split their numeric part too ("3" + " FAILED"). */
+  private stripFlagNode(chip: RailChip): HTMLElement {
+    const flag = el('span', 'pp-chip pp-chip--alert strip-flag');
+    flag.title = chip.titleAttr;
+    const split = chip.flagSplit;
+    if (split !== null && split.num !== null) {
+      flag.append(el('span', 'num strip-flag__num', String(split.num)));
+      flag.append(el('span', 'strip-flag__txt', split.unit));
+    } else {
+      flag.append(el('span', 'strip-flag__txt', chip.flag ?? ''));
+    }
+    return flag;
+  }
+
+  /** Heists / PRs / Crew (plus CHILDREN when the server reported it):
+   * stable groups with a reserved total slot and one labeled pair per
+   * count. Every number keeps its `data-kpi` identity. */
+  private stripGroupsNode(trackers: RailChip | null): HTMLElement {
+    const groups = el('div', 'strip-groups');
+    if (trackers === null) return groups;
+    groups.dataset.chip = 'trackers';
+    // The chip's long-form explanation survives the re-face (preserved
+    // title text): hover/AT users keep the Heists/PRs/minions + Jev fact.
+    groups.title = trackers.titleAttr;
+    for (const group of trackers.kpis ?? []) {
+      const groupNode = el('section', `strip-group strip-group--${STRIP_GROUP_TONE[group.label] ?? 'park'}`);
+      groupNode.setAttribute('aria-label', group.title);
+      const head = el('h2', 'strip-group__head');
+      const mark = el('span', 'strip-group__mark');
+      mark.setAttribute('aria-hidden', 'true');
+      head.append(mark, el('span', 'strip-group__name', group.label));
       if (group.total !== undefined) {
-        const total = el('span', 'rail-kpi__total', String(group.total.value));
-        total.dataset.kpi = group.total.kpi;
-        total.title = group.total.title;
-        label.append(document.createTextNode(' '), total);
+        const total = el('span', 'strip-group__total');
+        const totalNum = el('span', 'num strip-group__total-num', String(group.total.value));
+        totalNum.dataset.kpi = group.total.kpi;
+        totalNum.title = group.total.title;
+        total.append(totalNum);
+        head.append(total, el('span', 'strip-group__unit', group.total.label));
       }
-      groupNode.append(label);
+      const pairs = el('p', 'strip-group__pairs');
+      pairs.title = group.title;
       for (const value of group.values) {
-        const field = el('span', 'rail-kpi__field');
-        const fieldLabel = el('span', 'rail-kpi__field-label', value.label);
-        fieldLabel.title = value.title;
-        const number = el('span', 'rail-kpi__num', String(value.value));
-        number.dataset.kpi = value.kpi;
-        number.title = value.title;
+        const item = el('span', 'strip-kpi');
+        const key = el('span', 'strip-kpi__k', value.label);
+        key.title = value.title;
+        const num = el('span', 'num strip-kpi__num', String(value.value));
+        num.dataset.kpi = value.kpi;
+        num.title = value.title;
         if (value.kpi === 'prs.conflicting' && value.value > 0) {
-          number.classList.add('rail-kpi__num--alert');
+          num.classList.add('strip-kpi__num--alert');
         }
-        field.append(fieldLabel, number);
-        groupNode.append(field);
+        item.append(key, num);
+        pairs.append(item);
       }
-      node.append(groupNode);
+      groupNode.append(head, pairs);
+      groups.append(groupNode);
     }
-    node.append(this.decisionsChip, this.unackedChip, this.wakesChip);
-    return node;
+    return groups;
   }
 
   // ------------------------------------------------------------------
-  // Trackers: decisions chip + NEEDS GRU queue + wake count
+  // Tracker chips: decisions + NEEDS GRU queue + wake count (the tracker
+  // GROUPS themselves render in stripGroupsNode from the same derivation).
   // ------------------------------------------------------------------
 
-  private renderTrackers(snapshot: BoardSnapshot): void {
+  private renderTrackerChips(snapshot: BoardSnapshot): void {
     const decisions = snapshot.decisions;
     this.decisionsChip.className = `pp-chip board-decisions ${decisionChipTone(decisions.status)}`;
     this.decisionsChip.dataset.state = decisions.status;
@@ -916,35 +1127,67 @@ export class BoardView {
     // NEEDS GRU is the LIVE machine queue: action-required rows awaiting a
     // machine disposition (terminal-bound rows are closed receipts below).
     // It never rings the owner bell — the FOR YOU band (bell + toasts) is
-    // the only human-facing surface.
+    // the only human-facing surface. The slim strip renders this fact ONCE
+    // (the ALERTS pair); this chip keeps its id/text/title logic but stays
+    // hidden, so the number is not duplicated.
     const needsGru = snapshot.unackedActionRequired;
-    this.unackedChip.hidden = needsGru === 0;
+    this.unackedChip.hidden = true;
     this.unackedChip.textContent = `🛠 ${needsGru} needs Gru`;
     this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
-    // Wake tracker: every autonomous wake is a durable `gru.wake` event;
-    // the count/last fire stamp makes the wake path visible on the board.
-    // Issue #219: deferred (avoided) wakes render here too — counts and
-    // reasons — so suppression is as visible as firing.
+    // Wake tracker: every autonomous wake is a durable `gru.wake` event.
+    // Count and last-wake time are INDEPENDENT facts derived ONLY from
+    // snapshot.wakes (never from Silas): only 0 + no/invalid stamp is the
+    // honest no-wakes state; a supplied valid stamp is never discarded, and
+    // a missing stamp with a count is "last wake unknown", never
+    // fabricated. Issue #219: deferred (avoided) wakes render beside the
+    // count — counts and reasons — so suppression is as visible as firing.
     const wakes = snapshot.wakes;
     const deferred = wakes.deferred;
     const deferredCount = deferred?.count ?? 0;
-    this.wakesChip.hidden = wakes.count === 0 && deferredCount === 0;
-    this.wakesChip.textContent =
-      `⚡ ${wakes.count} wake${wakes.count === 1 ? '' : 's'}` +
-      (deferredCount > 0 ? ` · ${deferredCount} deferred` : '') +
-      (deferred?.truncated === true ? '+' : '');
-    this.wakesChip.title =
-      wakes.count === 0 && deferredCount === 0
-        ? 'No autonomous Gru wakes yet.'
-        : `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last ${wakes.lastAt !== null ? formatTs(wakes.lastAt) : '—'}.` +
-          (deferredCount > 0
-            ? ` ${deferredCount}${deferred?.truncated === true ? '+' : ''} wake demand${deferredCount === 1 ? '' : 's'} deferred (avoided): ` +
-              Object.entries(deferred?.reasons ?? {})
-                .sort(([a], [b]) => b.localeCompare(a))
-                .map(([reason, n]) => `${n} ${reason}`)
-                .join(', ') +
-              (deferred?.truncated === true ? ' — tally truncated at the scan cap' : '')
-            : '');
+    const stamp = wakes.lastAt;
+    const parsed =
+      stamp !== null && stamp !== '' && !Number.isNaN(Date.parse(stamp)) ? stamp : null;
+    // 0 + no/invalid stamp is the honest no-wakes state even when avoidances
+    // are tallied alongside it: no wake ever fired, so the fire time is not
+    // "unknown" — the deferred demand is an additional, separate fact.
+    this.wakesChip.hidden = false;
+    this.wakesChip.replaceChildren();
+    if (wakes.count === 0 && parsed === null) {
+      this.wakesChip.append(
+        document.createTextNode('⚡ no wakes yet · '),
+        el('span', 'num board-wakes__count', '0'),
+      );
+      this.wakesChip.title = 'No autonomous Gru wakes yet.';
+    } else {
+      this.wakesChip.append(
+        document.createTextNode('⚡ '),
+        el('span', 'num board-wakes__count', String(wakes.count)),
+        document.createTextNode(` wake${wakes.count === 1 ? '' : 's'} · `),
+      );
+      if (parsed !== null) {
+        this.wakesChip.append(this.ageSplitNode('wake', parsed, ' ago'));
+        this.wakesChip.title = `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last ${formatTs(parsed)}.`;
+      } else {
+        this.wakesChip.append(el('span', 'board-wakes__unknown', 'last wake unknown'));
+        this.wakesChip.title = `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last wake time unknown.`;
+      }
+    }
+    if (deferredCount > 0) {
+      this.wakesChip.append(
+        document.createTextNode(' · '),
+        el('span', 'num board-wakes__deferred', String(deferredCount)),
+        document.createTextNode(` deferred${deferred?.truncated === true ? '+' : ''}`),
+      );
+      this.wakesChip.title +=
+        ` ${deferredCount}${deferred?.truncated === true ? '+' : ''} wake demand${deferredCount === 1 ? '' : 's'} deferred (avoided): ` +
+        (Object.entries(deferred?.reasons ?? {}).length === 0
+          ? 'reasons unavailable'
+          : Object.entries(deferred?.reasons ?? {})
+              .sort(([a], [b]) => b.localeCompare(a))
+              .map(([reason, n]) => `${n} ${reason}`)
+              .join(', ')) +
+        (deferred?.truncated === true ? ' — tally truncated at the scan cap' : '');
+    }
   }
 
   // ------------------------------------------------------------------
@@ -961,8 +1204,40 @@ export class BoardView {
     return node;
   }
 
+  /** Live age with its numeric part in a reserved tabular slot: lead word
+   * ("wake"), the digits, then the unit letter + tail ("m ago") — a refresh
+   * grows the digits inside the reserved box (9m → 10m moves nothing). */
+  private ageSplitNode(lead: string, since: string, tail: string): HTMLElement {
+    const node = el('span', 'board-age-split');
+    node.dataset.mode = 'split';
+    node.dataset.since = since;
+    node.dataset.tail = tail;
+    if (lead !== '') node.append(el('span', 'board-age-split__lead', `${lead} `));
+    node.append(el('span', 'num board-age-split__num'), el('span', 'board-age-split__unit'));
+    this.refreshAge(node);
+    this.ageNodes.add(node);
+    return node;
+  }
+
   private refreshAge(node: HTMLElement): void {
     const since = node.dataset.since !== undefined && node.dataset.since !== '' ? node.dataset.since : null;
+    if (node.dataset.mode === 'split') {
+      const num = node.querySelector<HTMLElement>('.board-age-split__num');
+      const unit = node.querySelector<HTMLElement>('.board-age-split__unit');
+      if (num === null || unit === null) return;
+      const age = formatAge(since);
+      const parts = /^(\d+)([smhd])$/.exec(age);
+      if (parts === null) {
+        // Honest em dash: no fabricated number, no reserved gap.
+        num.hidden = true;
+        unit.textContent = `${age}${node.dataset.tail ?? ''}`;
+      } else {
+        num.hidden = false;
+        num.textContent = parts[1]!;
+        unit.textContent = `${parts[2]!}${node.dataset.tail ?? ''}`;
+      }
+      return;
+    }
     node.textContent = `${node.dataset.prefix ?? ''}${formatAge(since)}${node.dataset.suffix ?? ''}`;
   }
 
@@ -998,7 +1273,9 @@ export class BoardView {
    * classification — stopped/live-worker truth included — so their counts
    * cannot drift apart between renders. */
   private sectionsFor(snapshot: BoardSnapshot): ReturnType<typeof boardSections> {
-    // The same snapshot-only derivation the TRACKERS chip counts from.
+    // The same snapshot-only derivation the TRACKERS chip counts from
+    // (main's helper derives the stopped/live-worker truth from the same
+    // snapshot, so the strip and the section bodies still cannot drift).
     this.currentSections ??= snapshotSections(snapshot, Date.now());
     return this.currentSections;
   }
@@ -2028,12 +2305,15 @@ export class BoardView {
       forYou.append(el('div', 'board-notification-section__empty lbl', 'nothing needs you'));
     } else {
       for (const row of ownerRowsForBell) {
+        // The bell keeps main's pointer for a pending lesson proposal: the
+        // band owns the decision, the panel must never imply one.
         forYou.append(
           row.kind === 'ack'
             ? this.notificationRow(row.notification)
             : row.kind === 'proposal'
               ? this.ownerProposalPointer(row)
-              : this.ownerPrRow(row),
+              : this.ownerPrRow(row, 'panel'),
+
         );
       }
     }

@@ -264,3 +264,182 @@ describe('board rail — chips (v6)', () => {
     expect(chips.find((chip) => chip.id === 'alerts')?.tone).toBe('ok');
   });
 });
+
+describe('board rail — numeric part splits for the slim strip', () => {
+  /** Complete SilasView (current protocol) so each branch reads a real
+   * field state, never an `undefined !== null` accident. */
+  const silasIdle = (
+    overrides: Partial<NonNullable<BoardSnapshot['silas']>> = {},
+  ): NonNullable<BoardSnapshot['silas']> => ({
+    lastWakeAt: null,
+    lastTickAt: null,
+    lastReconcileAt: null,
+    lastReconcileFailedAt: null,
+    reconcileFailedNewer: false,
+    lastUsefulActionAt: null,
+    nextAction: null,
+    openTurnSince: null,
+    reconciliationsToday: 0,
+    checkedAt: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  });
+
+  const base = (overrides: Partial<BoardSnapshot>): BoardSnapshot => ({
+    repos: [],
+    agents: [],
+    notifications: [],
+    decisions: {
+      enabled: false,
+      status: 'disabled',
+      reason: null,
+      model: 'm',
+      endpoint: 'https://example.invalid',
+      credentialPresent: false,
+      credentialSource: 'none',
+      checkedAt: null,
+      incarnation: 't',
+      generation: 0,
+    },
+    unackedActionRequired: 0,
+    unackedNeedsOwner: 0,
+    wakes: { count: 0, lastAt: null },
+    build: null,
+    silas: null,
+    verify: null,
+    selfHeal: null,
+    ...overrides,
+  });
+
+  it('splits card values and numeric flags into lead/num/unit from the same derivations', () => {
+    const chips = railChips(
+      base({
+        build: {
+          buildRev: 'a'.repeat(40),
+          buildCommittedAt: '2026-01-01T00:00:00.000Z',
+          originMainRev: 'b'.repeat(40),
+          originMainCommittedAt: '2026-01-01T00:00:00.000Z',
+          commitsBehind: 43,
+          checkedAt: '2026-01-01T00:00:00.000Z',
+          checkError: null,
+        },
+        verify: { lockInUse: true, activeRuns: 1, queuedRuns: 2, workerBudget: 8, workersPerRun: 4 },
+        selfHeal: { sessionsResumed: 5, sessionsOrphaned: 3, since: null },
+      }),
+    );
+    const deploy = chips.find((c) => c.id === 'deploy')!;
+    expect(deploy.value).toBe('43 behind');
+    expect(deploy.valueSplit).toEqual({ lead: '', num: 43, unit: ' behind' });
+    expect(deploy.flag).toBe('RESTART PENDING');
+    const verify = chips.find((c) => c.id === 'verify')!;
+    expect(verify.valueSplit).toEqual({ lead: '', num: null, unit: 'lock held' });
+    expect(verify.flagSplit).toEqual({ num: 2, unit: ' QUEUED' });
+    const cure = chips.find((c) => c.id === 'cure')!;
+    expect(cure.valueSplit).toEqual({ lead: '', num: 5, unit: ' resumed' });
+    expect(cure.flagSplit).toEqual({ num: 3, unit: ' ORPHANED' });
+    const alerts = chips.find((c) => c.id === 'alerts')!;
+    expect(alerts.valueSplit).toEqual({ lead: '', num: 0, unit: '' });
+    expect(alerts.flagSplit).toBeNull();
+
+    // Every chip's split must RECONSTRUCT its exact value: the strip renders
+    // the split, so a split that drifted from `value` would show a wrong
+    // number against a green suite.
+    for (const chip of chips) {
+      if (chip.id === 'trackers') continue;
+      expect(`${chip.valueSplit.lead}${chip.valueSplit.num ?? ''}${chip.valueSplit.unit}`, `${chip.id} split reconstructs value`).toBe(chip.value);
+    }
+
+    // The trackers chip is the ONE documented exception: the strip renders
+    // it through its groups (kpis), never through label/value/splits. Pin
+    // that exemption to exactly one chip — a second exempted chip, or a
+    // trackers chip that starts rendering a value, must fail here.
+    const unsplit = chips.filter((c) => c.id === 'trackers');
+    expect(unsplit.map((c) => c.id)).toEqual(['trackers']);
+    expect(unsplit[0]!.valueSplit).toEqual({ lead: '', num: null, unit: '' });
+    expect(unsplit[0]!.flagSplit).toBeNull();
+    expect(unsplit[0]!.value).toBe('');
+  });
+
+  it('splits the silas wake value; an unparseable stamp stays honest text', () => {
+    const chips = railChips(
+      base({ silas: silasIdle({ lastWakeAt: new Date(Date.now() - 10 * 60_000).toISOString() }) }),
+    );
+    const silas = chips.find((c) => c.id === 'silas')!;
+    expect(silas.valueSplit.lead).toBe('wake');
+    expect(silas.valueSplit.num).toBe(10);
+    expect(silas.valueSplit.unit).toBe('m ago');
+    const stale = railChips(base({ silas: silasIdle({ lastWakeAt: 'not-a-timestamp' }) }));
+    const staleChip = stale.find((c) => c.id === 'silas')!;
+    expect(staleChip.valueSplit.num).toBeNull();
+    expect(staleChip.valueSplit.unit).toBe('— ago');
+  });
+
+  it('splits main\'s #163 silas headline branches with the same reserved slots', () => {
+    const failed = railChips(
+      base({
+        silas: silasIdle({
+          reconcileFailedNewer: true,
+          lastReconcileFailedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+        }),
+      }),
+    ).find((c) => c.id === 'silas')!;
+    expect(failed.value.startsWith('pass failed')).toBe(true);
+    expect(failed.valueSplit.lead).toBe('pass failed');
+    expect(failed.valueSplit.num).toBe(5);
+    expect(failed.valueSplit.unit).toBe('m ago');
+    expect(failed.flag).toBe('FAILED');
+
+    const openTurn = railChips(
+      base({ silas: silasIdle({ openTurnSince: new Date(Date.now() - 3 * 60_000).toISOString() }) }),
+    ).find((c) => c.id === 'silas')!;
+    expect(openTurn.valueSplit).toEqual({ lead: 'turn open', num: 3, unit: 'm' });
+
+    const reconciled = railChips(
+      base({ silas: silasIdle({ lastReconcileAt: new Date(Date.now() - 8 * 60_000).toISOString() }) }),
+    ).find((c) => c.id === 'silas')!;
+    expect(reconciled.valueSplit).toEqual({ lead: 'reconciled', num: 8, unit: 'm ago' });
+
+    const none = railChips(base({ silas: silasIdle() })).find((c) => c.id === 'silas')!;
+    expect(none.value).toBe('no wakes yet');
+    expect(none.valueSplit).toEqual({ lead: '', num: null, unit: 'no wakes yet' });
+  });
+
+  it('carries a reserved-slot split contract on every chip: FAILED stays pure text, no split is left empty', () => {
+    const failed = railChips(
+      base({
+        silas: silasIdle({
+          reconcileFailedNewer: true,
+          lastReconcileFailedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+        }),
+      }),
+    ).find((c) => c.id === 'silas')!;
+    // A text-only flag (no numeric part) never fabricates a reserved slot.
+    expect(failed.flag).toBe('FAILED');
+    expect(failed.flagSplit).toBeNull();
+    // Every health card's presentation split is populated from its own
+    // derivation — a new card that forgot the split would be caught here
+    // before the DOM fallback could silently print a bare value.
+    const chips = railChips(
+      base({
+        build: {
+          buildRev: 'a'.repeat(40),
+          buildCommittedAt: '2026-01-01T00:00:00.000Z',
+          originMainRev: 'b'.repeat(40),
+          originMainCommittedAt: '2026-01-01T00:00:00.000Z',
+          commitsBehind: 0,
+          checkedAt: '2026-01-01T00:00:00.000Z',
+          checkError: null,
+        },
+        silas: silasIdle({ lastWakeAt: new Date(Date.now() - 60_000).toISOString() }),
+        verify: { lockInUse: false, activeRuns: 0, queuedRuns: 0, workerBudget: 8, workersPerRun: 4 },
+        selfHeal: { sessionsResumed: 0, sessionsOrphaned: 0, since: null },
+      }),
+    ).filter((chip) => chip.id !== 'trackers');
+    expect(chips).toHaveLength(6);
+    for (const chip of chips) {
+      expect(
+        chip.valueSplit.lead !== '' || chip.valueSplit.num !== null || chip.valueSplit.unit !== '',
+        `${chip.id} value split populated`,
+      ).toBe(true);
+    }
+  });
+});

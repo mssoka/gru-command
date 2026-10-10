@@ -63,7 +63,9 @@ export interface BoardClientOptions {
 const BACKOFF_MS = [800, 1_600, 3_200, 6_400, 12_000] as const;
 const DEFAULT_LIVENESS_WINDOW_MS = 75_000;
 const DEFAULT_LIVENESS_CHECK_MS = 5_000;
-/** R7-05: a snapshot request (fetch AND body) that outlives this is abandoned. */
+/** R7-05: the shared request deadline — a snapshot GET (fetch AND body)
+ * that outlives it is abandoned, and every POST (owner actions) rides the
+ * same bound so an action that outlives it is unconfirmed, never replayed. */
 const SNAPSHOT_DEADLINE_MS = 15_000;
 /** R7-04: trailing refetches run back to back this many times in a chain... */
 const TRAILING_BURST = 2;
@@ -105,6 +107,9 @@ export class BoardClient {
   private trailingGeneration = 0;
   /** In-flight snapshot requests, cancelled by stop() (R7-05). */
   private readonly snapshotRequests = new Set<AbortController>();
+  /** Every other request this client owns (bounded GETs and POSTs), so
+   * stop() cancels an owner action or drawer fetch mid-flight too. */
+  private readonly requestControllers = new Set<AbortController>();
 
   constructor(
     options: BoardClientOptions,
@@ -144,6 +149,8 @@ export class BoardClient {
     this.trailingRun = 0;
     for (const request of this.snapshotRequests) request.abort();
     this.snapshotRequests.clear();
+    for (const request of this.requestControllers) request.abort();
+    this.requestControllers.clear();
     this.stopLivenessWatch();
     const socket = this.socket;
     this.socket = null;
@@ -301,13 +308,48 @@ export class BoardClient {
   private async api<T>(path: string, signal?: AbortSignal): Promise<T> {
     // Relative paths: the API is served from the same origin as the UI in
     // production, and vite's dev proxy carries /api to the mock.
+    //
+    // Every GET is bounded: a caller that supplies its own signal (the
+    // snapshot, whose controller stop() aborts) keeps it; otherwise this
+    // client owns a deadline controller tracked with the POSTs, so no
+    // drawer/receipt/transcript fetch can hang forever and re-pairing
+    // cancels it.
     const doFetch = this.fetchImpl;
-    const res = await doFetch(path, {
-      headers: { authorization: `Bearer ${this.options.token}` },
-      ...(signal !== undefined ? { signal } : {}),
+    if (signal !== undefined) {
+      // The caller owns the bound (the snapshot's own deadline controller:
+      // stop() aborts it). Do not invent a second, unused timer here.
+      const res = await doFetch(path, { headers: { authorization: `Bearer ${this.options.token}` }, signal });
+      if (!res.ok) return this.refused(path, res);
+      return (await res.json()) as T;
+    }
+    // This client owns the request (drawer/receipt/transcript GETs): bound
+    // it and register it so stop() cancels it on a re-pair.
+    const controller = new AbortController();
+    this.requestControllers.add(controller);
+    const timer = setTimeout(() => controller.abort(), SNAPSHOT_DEADLINE_MS);
+    const expired = new Promise<never>((_, reject) => {
+      controller.signal.addEventListener(
+        'abort',
+        () => reject(new BoardApiError(path, 0, 'timeout', 'no answer before the deadline — outcome unconfirmed')),
+        { once: true },
+      );
     });
-    if (!res.ok) return this.refused(path, res);
-    return (await res.json()) as T;
+    try {
+      return await Promise.race([
+        (async () => {
+          const res = await doFetch(path, {
+            headers: { authorization: `Bearer ${this.options.token}` },
+            signal: controller.signal,
+          });
+          if (!res.ok) return this.refused(path, res);
+          return (await res.json()) as T;
+        })(),
+        expired,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      this.requestControllers.delete(controller);
+    }
   }
 
   /** A non-2xx answer as a BoardApiError with the server's reason. A
@@ -334,8 +376,10 @@ export class BoardClient {
     throw new BoardApiError(path, res.status, code, detail);
   }
 
+
   /** One-shot HTTP snapshot fetch (initial load + reconnect catch-up). */
   async refetchSnapshot(): Promise<void> {
+    if (this.stopped) return; // a stopped (re-paired) client never re-polls
     const request = ++this.fetchSeq;
     const epoch = this.snapshotEpoch;
     try {
@@ -495,22 +539,55 @@ export class BoardClient {
     await this.postApi(`/api/notifications/${encodeURIComponent(id)}/ack`, { by: 'web' });
   }
 
+  /** Every POST rides the same bounded deadline budget as the snapshot
+   * GET: an owner action that outlives it is unconfirmed — never
+   * auto-replayed; the authoritative snapshot reconciles. The deadline
+   * rides a controller this client owns (not `AbortSignal.timeout`), so
+   * stop()/tests share one mechanism, and the expiry surfaces as a
+   * BoardApiError (code `timeout`, status 0 = no HTTP answer) — callers
+   * can tell "the server said no" from "we don't know". */
   private async postApi(path: string, body: unknown): Promise<unknown> {
     return (await this.postApiWithStatus(path, body)).body;
   }
 
   private async postApiWithStatus(path: string, body: unknown): Promise<{ readonly status: number; readonly body: unknown }> {
     const doFetch = this.fetchImpl;
-    const res = await doFetch(path, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${this.options.token}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify(body),
+    const request = new AbortController();
+    this.requestControllers.add(request);
+    const expired = new Promise<never>((_, reject) => {
+      request.signal.addEventListener(
+        'abort',
+        () => reject(new BoardApiError(path, 0, 'timeout', 'no answer before the deadline — outcome unconfirmed')),
+        { once: true },
+      );
     });
-    if (!res.ok) return this.refused(path, res);
-    return { status: res.status, body: await res.json() };
+    const timer = setTimeout(() => request.abort(), SNAPSHOT_DEADLINE_MS);
+    try {
+      // The deadline covers the FETCH and the BODY: a reply whose headers
+      // arrive and whose body stalls is the same unconfirmed outcome as no
+      // reply at all, and surfaces the same typed timeout. The reply keeps
+      // main's {status, body} shape (the lesson-proposal decision path
+      // distinguishes 200 from 202 on the status).
+      return await Promise.race([
+        (async () => {
+          const res = await doFetch(path, {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${this.options.token}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify(body),
+            signal: request.signal,
+          });
+          if (!res.ok) return this.refused(path, res);
+          return { status: res.status, body: await res.json() };
+        })(),
+        expired,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      this.requestControllers.delete(request);
+    }
   }
 }
 

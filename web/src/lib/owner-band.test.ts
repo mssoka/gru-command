@@ -4,6 +4,7 @@ import {
   LESSONS_PROPOSAL_CONSEQUENCE,
   OWNER_WINDOW_SIZE,
   ackConsequence,
+  ackNextStep,
   ownerPendingCount,
   ownerRows,
   ownerWindow,
@@ -184,6 +185,41 @@ describe('ack consequence copy — honest scope per kind, never parsed prose', (
     expect(ackConsequence('gru.owner-escalation')).toContain('does not by itself prove');
     expect(ackConsequence('something.brand.new')).toContain('does not by itself prove');
   });
+
+  it('the collapsed Next step and the expanded consequence agree on every kind family (one family map, never drifted)', () => {
+    // The face shows ackNextStep; the expanded region shows
+    // ackConsequence. They must classify kinds into the SAME families: a
+    // family added to one and not the other would silently pass every
+    // other test while the two surfaces tell different stories.
+    const unknown = 'something.brand.new';
+    const genericNext = ackNextStep(unknown);
+    const genericConsequence = ackConsequence(unknown);
+    // Both surfaces now derive their family from ONE map, so this list only
+    // has to cover every family once: a new family added to the map without
+    // both surfaces (or a family returning the generic copy on one surface)
+    // fails here.
+    const kinds = [
+      'supervision.provider-wall.agent-1.quota_exceeded',
+      'supervision.breaker',
+      'decisions.degraded.timeout',
+      'worktree-sweep-paused',
+      'port-squat',
+      'roll-port-squat',
+      unknown,
+    ];
+    const families = new Set<string>();
+    for (const kind of kinds) {
+      const next = ackNextStep(kind);
+      const consequence = ackConsequence(kind);
+      const nextIsGeneric = next === genericNext;
+      const consequenceIsGeneric = consequence === genericConsequence;
+      expect(nextIsGeneric, `family drift for ${kind}`).toBe(consequenceIsGeneric);
+      families.add(consequence);
+    }
+    // Every family renders its OWN copy (no two families collapse to one
+    // string, which would hide a typo'd kind from both surfaces).
+    expect(families.size, 'distinct family copy').toBe(5);
+  });
 });
 
 describe('safePrUrl', () => {
@@ -194,5 +230,18 @@ describe('safePrUrl', () => {
     expect(safePrUrl('https://')).toBeNull(); // no host — never a real target
     expect(safePrUrl('')).toBeNull();
     expect(safePrUrl('github.com/x/y/pull/1')).toBeNull();
+  });
+});
+
+describe('ackNextStep (short typed face phrases)', () => {
+  it('stays static per kind family, short, and never echoes prose', () => {
+    expect(ackNextStep('supervision.provider-wall.a1.quota_exceeded')).toBe('Ack re-arms this worker.');
+    expect(ackNextStep('supervision.breaker')).toBe('Ack re-arms this worker.');
+    expect(ackNextStep('decisions.degraded.model')).toBe('Ack records that you saw this.');
+    expect(ackNextStep('worktree-sweep-paused')).toBe('Check the worktree, then ack.');
+    expect(ackNextStep('port-squat')).toBe('Stop the foreign process, then ack.');
+    expect(ackNextStep('roll-port-squat')).toBe('Stop the foreign process, then ack.');
+    // An ordinary unsupported free-form notice gets the neutral truthful step.
+    expect(ackNextStep('some.free-form.notice')).toBe('Ack clears this notice.');
   });
 });

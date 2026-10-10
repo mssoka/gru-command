@@ -86,6 +86,14 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
+      // The slim-strip synthetic proof suite: its own project so an
+      // unfiltered `--project=mock` run (crew-rail-captures and other
+      // scopes) keeps the base smoke/working-flavor roster unchanged.
+      name: 'strip',
+      testMatch: 'dashboard-strip.spec.ts',
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
       // Managed repository overview (owner-approved compact rows A):
       // synthetic WebSocket-seeded snapshots only (the dev mock's default
       // board is untouched); light/dark desktop+narrow geometry captures

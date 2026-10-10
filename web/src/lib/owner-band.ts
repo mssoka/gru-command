@@ -18,23 +18,48 @@
 
 import { LESSONS_PROPOSAL_KIND, type BoardSnapshot, type NotificationView, type OwnerPrView } from './board-protocol.js';
 
-/** Consequence copy explains WHAT an ack does and does NOT do. Static
- * per kind — never parsed out of notification prose (prose is display
- * data, not execution authority). */
+/** The single kind-family map for every ack surface: the family key is
+ * derived ONCE here, so the collapsed Next step and the expanded
+ * consequence can never disagree about which kinds are special. Static per
+ * family — never parsed out of notification prose (prose is display data,
+ * not execution authority). */
+type AckFamily = 'rearm' | 'sighting' | 'sweep' | 'squat' | 'generic';
+
+function ackFamily(kind: string): AckFamily {
+  if (kind.startsWith('supervision.provider-wall.') || kind === 'supervision.breaker') return 'rearm';
+  if (kind.startsWith('decisions.degraded.')) return 'sighting';
+  if (kind === 'worktree-sweep-paused') return 'sweep';
+  if (kind === 'port-squat' || kind === 'roll-port-squat') return 'squat';
+  return 'generic';
+}
+
+/** What an ack does and does NOT do — the expanded region's full copy. */
+const ACK_CONSEQUENCE: Readonly<Record<AckFamily, string>> = {
+  rearm: 'Ack re-arms this worker and resumes supervision — it does NOT clear code/test/review holds.',
+  sighting: 'Ack records that you saw this; the system stays degraded until the credential or provider is fixed.',
+  sweep: 'Ack confirms removal of the listed worktree — check nothing live is rooted there first.',
+  squat: 'Stop the foreign process yourself; ack only clears the notice.',
+  generic: 'Ack clears this notice from your queue; it does not by itself prove the underlying operation ran.',
+};
+
+/** SHORT typed next step for the collapsed For-you face (approved
+ * clarification: the face stays concise — the supplied title is the
+ * Problem and this is the whole Next step; the full consequence still
+ * travels with the Ack control in the expanded region). */
+const ACK_NEXT_STEP: Readonly<Record<AckFamily, string>> = {
+  rearm: 'Ack re-arms this worker.',
+  sighting: 'Ack records that you saw this.',
+  sweep: 'Check the worktree, then ack.',
+  squat: 'Stop the foreign process, then ack.',
+  generic: 'Ack clears this notice.',
+};
+
 export function ackConsequence(kind: string): string {
-  if (kind.startsWith('supervision.provider-wall.') || kind === 'supervision.breaker') {
-    return 'Ack re-arms this worker and resumes supervision — it does NOT clear code/test/review holds.';
-  }
-  if (kind.startsWith('decisions.degraded.')) {
-    return 'Ack records that you saw this; the system stays degraded until the credential or provider is fixed.';
-  }
-  if (kind === 'worktree-sweep-paused') {
-    return 'Ack confirms removal of the listed worktree — check nothing live is rooted there first.';
-  }
-  if (kind === 'port-squat' || kind === 'roll-port-squat') {
-    return 'Stop the foreign process yourself; ack only clears the notice.';
-  }
-  return 'Ack clears this notice from your queue; it does not by itself prove the underlying operation ran.';
+  return ACK_CONSEQUENCE[ackFamily(kind)];
+}
+
+export function ackNextStep(kind: string): string {
+  return ACK_NEXT_STEP[ackFamily(kind)];
 }
 
 export interface OwnerAckRow {

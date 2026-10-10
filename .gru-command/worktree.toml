@@ -11,6 +11,7 @@ command = "npm ci"
 
 [verify]
 full = "npm test"
+
 typecheck = "npm run typecheck"
 directive-recovery = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/directive-retirement.test.ts test/directive-markers.test.ts test/ledger-db.test.ts test/silas-driver.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-sensor.test.ts test/supervisor.test.ts test/board-engine.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/branch-idle-guard.test.ts"
 
@@ -642,6 +643,93 @@ binned-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm 
 # directory and ignored pointer file are preserved for inspection; nothing
 # is deleted or checked out and no branch/worktree holds the sha.
 binned-baseline = 'set -e; base=84aec28b04ddc406f26c458383452318f8cb7ed1; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-binned.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/board-engine.test.ts test/ledger-pipeline.test.ts test/job-amendments.test.ts test/directive-markers.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-sensor.test.ts test/phase-handoffs.test.ts test/awareness.test.ts test/github-poll.test.ts test/silas-driver.test.ts test/yield-report.test.ts test/child-workers.test.ts test/report-jobs-backfill.test.ts test/durable-reconcile.test.ts test/fixtures/live-receipt-classification.json web/src/lib/board-signals.test.ts web/src/lib/board-kpi.test.ts web/src/lib/board-rail.test.ts web/src/lib/board-bands.test.ts web/src/lib/board-sections.test.ts web/src/ui/board.test.ts; do mkdir -p "$d/$(dirname "$f")"; git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "binned-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/binned-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/backend-results.json" test/ledger-api.test.ts test/ledger-obligations.test.ts test/board-engine-v4.test.ts test/board-server.test.ts test/board-engine.test.ts test/ledger-pipeline.test.ts test/job-amendments.test.ts test/directive-markers.test.ts test/provider-recovery-resume.test.ts test/provider-recovery-sensor.test.ts test/phase-handoffs.test.ts test/awareness.test.ts test/github-poll.test.ts test/silas-driver.test.ts test/yield-report.test.ts test/child-workers.test.ts test/report-jobs-backfill.test.ts test/durable-reconcile.test.ts; a=$?; cd web; ../node_modules/.bin/vitest run --reporter=json --outputFile="$d/web-results.json" src/lib/board-signals.test.ts src/lib/board-kpi.test.ts src/lib/board-rail.test.ts src/lib/board-bands.test.ts src/lib/board-sections.test.ts src/ui/board.test.ts; b=$?; set -e; echo "binned-baseline vitest exits: backend=$a web=$b"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed unexpectedly"; exit 2; fi; node "$root/tools/assert-binned-baseline.mjs" "$d/backend-results.json" "$d/web-results.json"; echo "EXPECTED-NONZERO: both legs failed named behavioral assertions against the pre-change base"; exit 1'
+
+# Scheduler-only browser proof for the slim-strip synthetic suite (job
+# dashboard-slim-strip-current-main-20261007): the scheduler's cwd is the
+# LANE ROOT, where no Playwright config exists — the dedicated `strip`
+# project, its safe ports, and the vite preview that serves web/dist live
+# in web/playwright.config.ts (the shared `mock` roster stays at the base
+# smoke/working-flavor pair). Run the EXISTING web workspace e2e script from
+# web/: it builds the web artifacts and invokes Playwright with the web
+# config selected, filtered to ONLY the strip project's dashboard-strip spec
+# (scripted auth/board fixtures; the real service scope is untouched;
+# reuseExistingServer:false; workers 1 / retries 0 / default 30s). Union
+# scope — every scope above stays as-is.
+strip-browser = "(cd web && npm run e2e -- --project=strip e2e/dashboard-strip.spec.ts)"
+
+# Narrow diagnostic scope for the 1200x900 dark ambiguity (j-1483 follow-up):
+# runs ONLY the settled-vs-transient contrast measurement for the FOR YOU
+# essentials at 1200x900 dark under the same synthetic fixture. Settlement is
+# proven by awaiting real running animations (never a sleep); the settled
+# ratio must clear 4.5:1 and the pre-settlement frame must measure lower.
+strip-visual-diagnostic = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=strip e2e/dashboard-strip.spec.ts --grep 'FOR YOU essentials hold'"
+
+# Focused smoke migration proof (this lane edits web/e2e/smoke.spec.ts: the
+# rail assertions move to the slim-strip DOM, so the mock project's smoke
+# suite must be exercised at the final head). Same runner discipline as the
+# sibling focused browser scopes: web typecheck + production web build +
+# the existing mock project filtered to smoke.spec.ts only; serial/retry/
+# 30s settings unchanged; never the unfiltered mock roster (its unrelated
+# pre-existing working-flavor failures stay outside this diff).
+strip-smoke = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=mock smoke.spec.ts"
+
+# Deliberate theme-baseline regeneration (PR148 snapshot-repair precedent):
+# the approved slim strip changes the pixels above the chat pane, so the
+# four committed whole-page theme goldens (mock chat-light/dark + real
+# real-chat-light/dark) are regenerated DELIBERATELY, the new PNGs are
+# inspected and committed, and the un-updated `strip-themes` scope re-runs
+# as the acceptance check. Scheduler-only; never invoked after a freeze;
+# never cited as acceptance evidence by itself.
+strip-themes-update = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --update-snapshots=changed --grep 'dark toggle persists'"
+
+# Acceptance check for the regenerated theme goldens: the same two theme
+# tests (mock + hermetic real-service project) with NO update flag; both
+# must pass against the committed PNGs at the exact head.
+strip-themes = "cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --grep 'dark toggle persists'"
+
+# Focused iteration/debug subset for this lane's FINAL source: the four web
+# unit files that carry the slim-strip regressions (board.test.ts,
+# board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts), run
+# against the committed head in the lane's own web workspace with the same
+# vitest bin form as the baseline scope. The `full` scope still covers the
+# whole suite; this only narrows a scheduled debug/iteration run so failures
+# are diagnosed against complete, scheduler-captured output instead of an
+# ad-hoc rerun.
+dashboard-slim-strip-unit = "cd web && node ../node_modules/vitest/vitest.mjs run src/ui/board.test.ts src/lib/board-rail.test.ts src/lib/owner-band.test.ts src/ui/slim-strip.baseline.test.ts"
+
+# Baseline exit semantics (both slim-strip baselines), R3-05 resolution:
+# the classifier maps the producer outcome to 1 = BASELINE RED CLASSIFIED
+# (setup/collection clean; failures are AssertionErrors naming the missing
+# slim surfaces), 2 = FAILS-BEFORE CLAIM BROKEN (unexpected green), 3 =
+# BASELINE SETUP/COLLECTION FAILURE (unreadable report, zero tests, module
+# load errors — NEVER readable as behavioral evidence). The raw vitest exit
+# is echoed into the log before classification. The unit baseline overlays
+# the dedicated fail-before instrument (web/src/ui/slim-strip.baseline.test.ts
+# — imports ONLY base-existing symbols; asserts slim surfaces through the
+# rendered DOM after a setup proof) plus the two base-import-clean unit
+# files (board.test.ts, board-rail.test.ts) for breadth. owner-band.test.ts
+# is deliberately NOT overlaid: its ackNextStep import is a slim-added
+# module symbol absent at base — that import error is a setup failure, not
+# evidence; its head-side coverage runs in dashboard-slim-strip-unit.
+# Snapshot pointer: _bmad-output/gate-prep/dashboard-slim-strip-baseline.last-snapshot.txt.
+dashboard-slim-strip-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-dashboard-slim-strip-current-main.XXXXXX"); git archive "$base" | tar -x -C "$d" || { echo "baseline archive failed (base $base) — SETUP FAILURE, not behavioral evidence"; exit 3; }; for f in web/src/ui/slim-strip.baseline.test.ts web/src/ui/board.test.ts web/src/lib/board-rail.test.ts; do git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/dashboard-slim-strip-baseline.last-snapshot.txt"; cd "$d/web"; set +e; node ../node_modules/vitest/vitest.mjs run src/ui/slim-strip.baseline.test.ts src/ui/board.test.ts src/lib/board-rail.test.ts --reporter=default --reporter=json --outputFile="$d/vitest-report.json" 2> "$d/vitest-log.txt"; vcode=$?; set -e; echo "dashboard-slim-strip-baseline vitest exit=$vcode (raw producer exit, before classification)"; tail -c 2000 "$d/vitest-log.txt" || true; node "$root/tools/classify-baseline.mjs" "$d/vitest-report.json" --require-file slim-strip.baseline.test.ts --require-file-substr "slim strip labelled status pairs,reserved numeric slot for strip KPIs,reveal-only compact disclosure"; exit $?'
+
+# Dashboard slim-strip BROWSER baseline: the lane's final strip spec and
+# playwright config (git show from the exact head) over the same isolated
+# baseline snapshot of the recorded current-main base, with web+root deps
+# bound by symlink; builds the BASELINE web app (tsc + vite from the
+# archived tree) and runs ONLY the strip project's dashboard-strip spec with
+# the unchanged serial/retry/30s settings. Expected result is RED by
+# behavioral assertion: the spec's harness asserts the slim-strip DOM the
+# baseline app never renders. Exit status left intact for the scheduler's
+# real outcome.exitCode; never masked into PASS.
+# Browser baseline (same R3-05 semantics): the strip spec's imports are
+# base-safe (base protocol symbols only), so collection succeeds and the
+# failures are the spec's own slim-surface assertions (Playwright surfaces
+# a failed auto-waiting assertion as a timeout naming the selector — the
+# classifier requires at least one failure naming a slim surface).
+# Snapshot pointer: _bmad-output/gate-prep/strip-browser-baseline.last-snapshot.txt.
+strip-browser-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-dashboard-strip-browser-current-main.XXXXXX"); git archive "$base" | tar -x -C "$d" || { echo "baseline archive failed (base $base) — SETUP FAILURE, not behavioral evidence"; exit 3; }; git show "$headrev":web/e2e/dashboard-strip.spec.ts > "$d/web/e2e/dashboard-strip.spec.ts"; git show "$headrev":web/playwright.config.ts > "$d/web/playwright.config.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/strip-browser-baseline.last-snapshot.txt"; cd "$d/web"; set +e; node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json >> "$d/pw-log.txt" 2>&1; tcode=$?; if [ $tcode -ne 0 ]; then echo "strip-browser-baseline setup: web tsc failed exit=$tcode (SETUP FAILURE, not behavioral evidence)"; tail -c 2000 "$d/pw-log.txt"; exit 3; fi; node node_modules/vite/bin/vite.js build >> "$d/pw-log.txt" 2>&1; bcode=$?; if [ $bcode -ne 0 ]; then echo "strip-browser-baseline setup: vite build failed exit=$bcode (SETUP FAILURE, not behavioral evidence)"; tail -c 2000 "$d/pw-log.txt"; exit 3; fi; PLAYWRIGHT_JSON_OUTPUT_NAME="$d/pw-report.json" node ../node_modules/@playwright/test/cli.js test --project=strip e2e/dashboard-strip.spec.ts --reporter=list,json 2> "$d/pw-log.txt"; pcode=$?; set -e; echo "strip-browser-baseline e2e exit=$pcode (raw producer exit, before classification)"; tail -c 2000 "$d/pw-log.txt" || true; node "$root/tools/classify-baseline.mjs" "$d/pw-report.json" --playwright --require-substr "strip-status,strip-groups,slim strip,strip-kpi"; exit $?'
 
 # Managed repository overview (owner-approved compact rows A, job
 # managed-repo-overview-compact-rows-20261007; j-1251/j-1259): the registry/

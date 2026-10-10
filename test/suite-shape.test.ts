@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
  * Adding a test? Bump this pin — that is the point.
  */
 const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
+  'classify-baseline.test.ts': 16,
   'assert-repo-overview-baseline.test.ts': 4,
   'assert-verify-keepalive-baseline.test.ts': 7,
   'rate-limit-retry.test.ts': 6,

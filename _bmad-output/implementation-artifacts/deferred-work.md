@@ -135,6 +135,64 @@
 
 - verificationFailures digest rows with a null scope can never follow the `verification-failure:<scope>@<run_id>` fingerprint discipline: the retirement fingerprints are only built when scope is non-null, so a null-scope failure row can only retire via resubmission (impossible for null scope) or terminality. Pre-existing digest identity gap (unchanged by #117, which only names the pre-existing instruction as the `verification-repair` rule). Fix: give the null-scope row an actionable identity or withhold the rule offer.
 
+## Deferred from: bmad-build review of dashboard-slim-strip-current-main (2026-10-07)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The two fail-before baseline scopes guard an unexpected GREEN but cannot distinguish a behavioral feature-absence RED from a build/import/collection failure.
+  evidence: The scopes now terminate exit 2 on an unexpected pass (`FAILS-BEFORE CLAIM BROKEN`) and keep the real exit otherwise; adding the binned-baseline failure-kind assertion (`tools/assert-binned-baseline.mjs` pattern: per-leg JSON reporter + named-behavioral-failure check) needs a lane helper and a re-verified run. The recorded REDs (runs e7bf5e64/f5976535, 6bda4166/a0cf1b64) are behavioral today.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The wake-age and deferred-count digit-boundary legs (9→10, 99→100, 999→1000) run at 1440 only, while the acceptance names 1440/1200/768/360.
+  evidence: The familyA/B/C boundary loops cover all four viewports for the other slots and the reserved-slot CSS is shared, but the age/deferred slots cross their own boundaries at one width only; extend the two long tests with narrow-width legs at the next suite touch (the long-label test now has a 360 leg).
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The bell panel's ready-PR row keeps its prior content and explicit OPEN PR link but flows with a flex override instead of the base grid alignment; no test compares the panel layout to base.
+  evidence: Round-3 blind-hunter follow-up (panel variant added by the port commit, not the review delta). Content/regions/controls are preserved and asserted structurally; revisit only when the notification panel is next touched, with a panel-level visual or computed-style pin.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The optional CHILDREN group falls through the tone map to the neutral park marker; no tone is assigned or asserted.
+  evidence: Round-3 blind-hunter follow-up. The approved reference defines only HEISTS/PRS/CREW marker tones; decide a CHILDREN tone (or keep neutral) and pin it when the group is next touched.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Each `.strip-group` section's accessible name is the tooltip enumeration (`working / in-review / …`) rather than the visible heading (HEISTS/PRS/CREW/CHILDREN).
+  evidence: Round-3 blind-hunter follow-up. No test asserts the section name; switch to the visible name or `aria-labelledby` the head when the strip next receives an a11y pass.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: `geometry()` cannot measure wake states without a valid stamp (`no wakes yet` / `last wake unknown`), so those states have text assertions only.
+  evidence: Round-3 blind-hunter follow-up: `need(.board-age-split__num)` throws for unstamped states; add optional-slot handling when the geometry helper is next extended.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: `bindClient` (re-pair) does not clear the owner band's `expandedOwnerRows`/`ownerRegionIds`, so an actionId reused by the new connection can render pre-expanded with a recycled region id.
+  evidence: Round-6 edge-case follow-up; reachable only across re-pair with a server that reuses ids; harden at the next owner-band touch (clear the maps in `bindClient` and pin with a unit test).
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The capture suite overwrites fixed ignored screenshot paths without clearing or run-scoping, so a failed run can leave stale images that satisfy the manual inspection step.
+  evidence: Round-6 blind-hunter follow-up (F-7); clear or run-scope `web/e2e-artifacts/` before capturing at the next suite touch.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The `.strip-kpi + .strip-kpi::before` separator glyphs are CSS-generated content exposed to assistive technology.
+  evidence: Round-6 blind-hunter follow-up (F-6); replace with a real `aria-hidden` span or non-content separator at the next strip a11y pass.
+
+## v7 review rounds — assessed follow-ups (from the workflow reviewers; not fixed here)
+
+These are real observations that are either outside the approved SLIM
+acceptance, by-design decisions, or carry more risk than the finding
+warrants. They are recorded, not dropped:
+
+- A persistently malformed `200` snapshot joins the rate-bounded trailing
+  chain with no duration cap and no connection-state surface (repeat: round 2
+  and round 3).
+- The e2e fixture's module-global `spec` couples cases under `workers: 1`
+  (asked for twice).
+- The strip has no `aria-live`/`role="status"` region: counts/alerts change
+  silently for screen readers. New a11y feature work, beyond the approved
+  scope.
+- `#board-unacked` stays rendered but permanently hidden (it keeps the
+  id/text/title so the number is not duplicated); documented contract holder.
+- `stripFlagNode` styles every flag with the alert pill regardless of pair
+  tone (carried; pairs other than DEPLOY are unpinned).
+- Group `aria-label` is the tooltip enumeration and the `::before` separators
+  are AT-audible (carried).
+- The `dashboard-slim-strip-baseline` overlay's "base-import-clean" premise is
+  not mechanically guarded; a future slim-only import would turn behavioral
+  evidence into a classifier exit 3 (which fails loud, not silently).
+- `scrollFullyIntoView` in `pipeline-board.spec.ts` scrolls before the
+  reachability assert (the strict-oracle helper from the amendment-#2 repair;
+  changing it risks re-opening that strict-containment work).
+- The visual-capture e2e test always runs and writes fixed ignored paths
+  (that is its purpose: operator/vision evidence).
 ## Deferred from: BMAD review rounds 1-5 of PR #284 (2026-10-09)
 
 - [Review][Defer] Consumer-level keepalive reproduction — a client socket (or dispatcher) with a small body-idle deadline proving `TypeError('terminated')` without the heartbeat and clean EOF with it (the incident report's §8.6 sketch). Deferred: acceptance 1-3 are proven by real byte arrivals with a bounded idle gap on an isolated server at an injected cadence; this is a stronger end-to-end variant, not a missing requirement. Settled by: a `node:http` client test that destroys the socket after an idle deadline, run against a quiet producer.

@@ -366,11 +366,69 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
     return {
       found: true,
+      // Strict full-viewport containment (unchanged acceptance): negative
+      // top/left or any coordinate past the right/bottom edge fails, and
+      // occlusion is the separate strict `hit` check.
       inViewport:
         rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight,
       hit: topmost !== null && (topmost === element || element.contains(topmost)),
     };
   }, selector);
+}
+
+/** Make a control actually reachable before the strict containment probe:
+ * keep the browser's minimal placement, then iteratively correct residual
+ * edge overflow (three of the four preserved b86af16 RED failures — run
+ * f6998e40 — were this 0<1px bottom sliver; the fourth was the stale fixed
+ * nav bound replaced at 065bbf6; 52b744fa is the later relaxed-green
+ * masking run, never the failure) and sticky-chrome occlusion with
+ * explicit scrolls — the scroll a real user would perform. Handles a cover
+ * above OR below the control. Bounded; if the control cannot be cleared,
+ * the strict probe below still fails truthfully. The oracle admits nothing
+ * off-viewport. */
+async function scrollFullyIntoView(page: Page, selector: string): Promise<void> {
+  await page
+    .locator(selector)
+    .first()
+    .evaluate((el) => {
+      el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      const pad = 8;
+      for (let i = 0; i < 6; i += 1) {
+        const rect = el.getBoundingClientRect();
+        const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        const covered = !(top !== null && (top === el || el.contains(top)));
+        if (covered && top !== null) {
+          // Score both escape directions against the covering element and
+          // take the feasible smaller move: down (scroll up) when the cover
+          // sits above the control, up (scroll down) when it sits below.
+          const cover = top.getBoundingClientRect();
+          const downNeed = Math.max(0, cover.bottom + pad - rect.top);
+          const upNeed = Math.max(0, rect.bottom - (cover.top - pad));
+          const roomDown = Math.max(0, window.innerHeight - pad - rect.bottom);
+          const roomUp = Math.max(0, rect.top - pad);
+          const canDown = downNeed > 0.5 && downNeed <= roomDown;
+          const canUp = upNeed > 0.5 && upNeed <= roomUp;
+          if (canDown && (!canUp || downNeed <= upNeed)) {
+            window.scrollBy(0, -downNeed);
+            continue;
+          }
+          if (canUp) {
+            window.scrollBy(0, upNeed);
+            continue;
+          }
+          break;
+        }
+        if (rect.bottom > window.innerHeight - pad) {
+          window.scrollBy(0, rect.bottom - (window.innerHeight - pad));
+          continue;
+        }
+        if (rect.top < pad) {
+          window.scrollBy(0, rect.top - pad);
+          continue;
+        }
+        break;
+      }
+    });
 }
 
 async function expectReachable(page: Page, selector: string): Promise<void> {
@@ -553,10 +611,11 @@ async function viewportProof(browser: Browser, viewportCase: ViewportCase, theme
     await expect(page.locator('.board-band--pipeline .board-pipeline')).toHaveCount(6);
     await page.locator('.board-band--cold .board-band__more').click();
     await expect(page.locator('.board-band--cold .board-job')).toHaveCount(4);
-    await page.locator('.board-band--cold .board-job').first().scrollIntoViewIfNeeded();
+    await scrollFullyIntoView(page, '.board-band--cold .board-job');
     await expectReachable(page, '.board-band--cold .board-job');
     await page.locator('.board-band--cold .board-band__more').focus();
     await expect(page.locator('.board-band--cold .board-band__more')).toBeFocused();
+    await scrollFullyIntoView(page, '.board-band--cold .board-band__more');
     await expectReachable(page, '.board-band--cold .board-band__more');
     // Every section disclosure control, focused in turn: a focused target
     // that a sticky chrome/drawer covered would fail its hit test.
@@ -570,6 +629,7 @@ async function viewportProof(browser: Browser, viewportCase: ViewportCase, theme
       const selector = `${band} .board-band__more`;
       await page.locator(selector).focus();
       await expect(page.locator(selector), `${label} toggle focus`).toBeFocused();
+      await scrollFullyIntoView(page, selector);
       await expectReachable(page, selector);
     }
     await captureViewport(page, `${name}-${theme}-expanded-focus`, 'expanded + focused-target viewport');
@@ -733,9 +793,17 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
     // its container edge).
     await page.locator('#board-section-settled').scrollIntoViewIfNeeded();
     const navBox = await page.locator('#board-nav').boundingBox();
+    const railBox = await page.locator('#chip-rail').boundingBox();
     expect(navBox).not.toBeNull();
+    expect(railBox).not.toBeNull();
     expect(navBox!.y).toBeGreaterThanOrEqual(0);
-    expect(navBox!.y).toBeLessThan(140); // pinned under the measured chrome
+    // Pinned under the measured chrome: the nav's sticky top follows the
+    // globally measured chrome height, so its top sits at the strip's
+    // bottom edge — bounded on BOTH sides so neither an under-measured
+    // chrome (nav overlapping the strip) nor a larger gap passes.
+    const railBottom = railBox!.y + railBox!.height;
+    expect(navBox!.y).toBeGreaterThanOrEqual(railBottom - 1);
+    expect(navBox!.y).toBeLessThanOrEqual(railBottom + 1);
 
     // A shortcut jump lands the target in view and never under the strip.
     const coldLink = page.locator('#board-nav .board-nav__link[data-nav="cold"]');

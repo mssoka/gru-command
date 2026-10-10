@@ -97,12 +97,14 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   (`MODE` · `RADAR` · top review round), the notification bell, the
   owner-chime speaker, theme and
   settings — no lens toggle: chat is always docked on desktop and the FAB
-  owns mobile chat. Below it the sticky **status chip rail** relocates the
-  v4 health row globally (DEPLOY → REVIEWS → SILAS → ALERTS → VERIFY →
-  CURE → TRACKERS); the TRACKERS chip renders the KPI counts as labeled
-  fields (`HEISTS 17 · working 2 · in review 2 · …`, every number a
-  `data-kpi` span tied to the same `boardKpis` derivation the v4 strip
-  used). At ≥1100px it is three panes — chat (~30%, collapsible,
+  owns mobile chat. Below it the sticky **slim status strip** renders the
+  v4 health row as labelled status pairs (DEPLOY → REVIEWS → SILAS →
+  ALERTS → VERIFY → CURE) plus the Jev decisions / NEEDS GRU / wake facts
+  and the HEISTS / PRS / CREW count groups (`HEISTS 17 · working 2 · in
+  review 2 · …`, every number a `data-kpi` span tied to the same
+  `boardKpis` derivation the v4 strip used). Numeric slots are reserved
+  (`tabular-nums` + a floor), so a count crossing 9→10→100→1000 never
+  reflows its neighbours. At ≥1100px it is three panes — chat (~30%, collapsible,
   resizable) | board | crew rail — with 4px drag splitters (sizes persist
   per breakpoint; double-click resets). At 900–1099px the board + rail
   hold the page and chat overlays via the Gru FAB (right drawer, dimmed

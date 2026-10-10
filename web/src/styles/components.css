@@ -252,146 +252,270 @@ body {
   50% { opacity: 0.35; }
 }
 
-/* ── Status chip rail (v6): the v4 health row, relocated global ── */
+/* ── Slim status strip (v7 compact density, approved sample #spec2): one
+   wrapping status row + three stable count groups. Same derivations as
+   the pill rail it replaces; density comes from hierarchy/spacing only.
+   The rail is a size container: the group columns engage at its 640px
+   inline-size transition (the sample's), so 768px keeps tablet density
+   and 360px stacks naturally. Never nowrap, never overflow-masked. ── */
 
 .chip-rail {
   position: sticky;
   top: var(--command-bar-h, 56px);
   z-index: 29;
   display: flex;
-  align-items: stretch;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px 12px;
+  flex-direction: column;
+  container-type: inline-size;
+  padding: 6px 12px 8px;
   background: var(--paper);
-  border-bottom: 1.5px solid var(--line);
+  border-bottom: 2px solid var(--line);
 }
 
-/* Phone: one calm scrollable row instead of stacked chrome. */
-@media (max-width: 899px) {
-  .chip-rail {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .chip-rail::-webkit-scrollbar {
-    display: none;
-  }
+/* Reserved tabular numeric slot: the NUMBER part only. Digits grow inside
+   the reserved box (9→10→100→1000 move nothing); counts beyond four digits
+   grow honestly and wrap — never clip. SCOPED to the two approved slim
+   surfaces (status strip + For-you band): a `.num` element anywhere else
+   keeps the app default, so this utility can never repaint an unrelated
+   band/panel (acceptance D). The e2e probe test and geometry measurements
+   in web/e2e/dashboard-strip.spec.ts prove both, not this declaration. */
+#chip-rail .num,
+#board-owner .num {
+  font-variant-numeric: tabular-nums;
+  display: inline-block;
+  text-align: right;
 }
 
-.rail-chip {
+/* Four digits must fit INSIDE the floor in each surface's own font
+   metrics (measured r6): the mono strip slots overshoot 4ch by up to
+   1/64px of sub-pixel rounding, and the sans tabular band slot overshoots
+   by a full digit advance (tabular figures are wider than the '0' glyph
+   the ch unit is derived from). These floors keep 9/10, 99/100 and
+   999/1000 inside ONE box per surface; 5-digit values (10000) still
+   exceed the floor and grow honestly. Geometry proven by measurement in
+   web/e2e/dashboard-strip.spec.ts, not by this declaration. */
+#chip-rail .num { min-width: calc(4ch + 1px); }
+#board-owner .num { min-width: calc(4ch + 1em); }
+
+.strip-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 18px;
+  row-gap: 4px;
+  padding: 4px 0 8px;
+}
+
+.strip-pair {
   display: inline-flex;
-  align-items: center;
-  gap: 9px;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.strip-dot {
   flex: none;
-  min-height: 48px;
-  padding: 8px 14px;
-  border: var(--outline-thin);
-  border-radius: 999px;
-  background: var(--card);
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--park);
+  border: 1.5px solid var(--line);
+}
+
+/* ONE tone per pair: a token-coloured dot beside the label; the label and
+   value text carry the fact (never colour alone). */
+.strip-pair--ok .strip-dot { background: var(--done); }
+.strip-pair--warn .strip-dot { background: var(--work); }
+.strip-pair--alert .strip-dot { background: var(--alert); }
+.strip-pair--muted .strip-dot { background: var(--park); }
+
+.strip-key {
+  color: var(--muted);
   font-size: 12px;
   font-weight: 700;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
 }
 
-.rail-chip__label {
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.14em;
-  color: var(--faint);
-}
-
-.rail-chip__value {
-  font-size: 14px;
-  font-weight: 800;
+.strip-value,
+.strip-value__txt {
   color: var(--ink);
+  font-weight: 700;
 }
 
-/* ONE accent per chip state: a colored left edge, never a fill. */
-.rail-chip--ok { border-left: 5px solid var(--done); }
-.rail-chip--warn { border-left: 5px solid var(--work); }
-.rail-chip--alert { border-left: 5px solid var(--alert); }
-.rail-chip--muted { border-left: 5px solid var(--muted); }
-
-.rail-chip__flag {
+.strip-flag {
   font-size: 10px;
   padding: 2px 8px;
 }
 
-/* Folded KPI fields (TRACKERS): group label + total, then one labeled
-   field per count — every value carries its own visible label (v6.1). */
-.rail-kpi {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+/* Stable count groups: three columns from the 640px container transition,
+   hairline separators between neighbours, natural stacking below it. */
+.strip-groups {
+  display: grid;
+  gap: 0;
+  padding: 0;
 }
 
-.rail-kpi__label {
-  font-size: 11px;
+.strip-group {
+  min-width: 0;
+  padding: 8px 0 4px;
+}
+
+.strip-group + .strip-group {
+  border-top: 2px solid var(--line);
+}
+
+.strip-group__head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin: 0 0 5px;
+}
+
+.strip-group__mark {
+  flex: none;
+  align-self: center;
+  width: 14px;
+  height: 8px;
+  border-radius: 5px;
+  background: var(--gmark, var(--park));
+  border: 1.5px solid var(--line);
+}
+
+.strip-group--work { --gmark: var(--work); }
+.strip-group--rev { --gmark: var(--rev); }
+.strip-group--done { --gmark: var(--done); }
+
+.strip-group__name {
+  font-size: 13px;
   font-weight: 800;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.01em;
+}
+
+.strip-group__total {
+  color: var(--ink);
+  font-size: 16.5px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.strip-group__unit {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
   color: var(--faint);
 }
 
-.rail-kpi__total {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 14px;
-  font-weight: 800;
-  color: var(--ink);
-  font-variant-numeric: tabular-nums;
+.strip-group__pairs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 16px;
+  row-gap: 4px;
+  margin: 0;
+  font-size: 12.5px;
 }
 
-.rail-kpi__field {
+.strip-kpi {
   display: inline-flex;
   align-items: baseline;
-  gap: 3px;
-  padding-left: 6px;
-  border-left: 1.5px solid color-mix(in srgb, var(--line) 30%, transparent);
+  gap: 5px;
 }
 
-.rail-kpi__field-label {
-  font-size: 9.5px;
+.strip-kpi + .strip-kpi::before {
+  content: '·';
+  margin-right: 16px;
   font-weight: 800;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--muted);
+  color: var(--faint);
 }
 
-.rail-kpi__num {
+.strip-kpi__k {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.strip-kpi__num {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
   font-weight: 700;
   color: var(--ink);
-  font-variant-numeric: tabular-nums;
 }
 
-.rail-kpi__num--alert {
+.strip-kpi__num--alert {
   color: var(--band-needs-you-ink);
   font-weight: 800;
 }
 
-.rail-chip--trackers {
-  gap: 8px;
+/* Jev / needs-Gru / GRU-wake chips keep their pp-chip faces inside the
+   status row — but NOT its nowrap: chip facts wrap honestly like every
+   other label (no clipping, no overflow masking). */
+.strip-status .pp-chip {
+  white-space: normal;
 }
 
-/* Desktop: TRACKERS grows into the rail's remaining width and its
-   labeled fields flow there, instead of dead-ending in a pill wider than
-   the viewport. Below 900px the rail is a horizontal scroller and the
-   chip stays one nowrap pill like every other chip. */
-@media (min-width: 900px) {
-  .rail-chip--trackers {
-    flex: 1 1 560px;
-    min-width: 0;
-    flex-wrap: wrap;
-    row-gap: 4px;
+.strip-status .board-decisions,
+.strip-status .board-unacked,
+.strip-status .board-wakes {
+  font-size: 10.5px;
+  padding: 3px 10px;
+}
+
+/* The wakes chip carries its own ink (the chip's card fill flips
+   instantly on a theme change while an inherited body color would still
+   be animating — an inherited ink can never be the chip's contrast). */
+.strip-status .board-wakes {
+  color: var(--ink);
+}
+
+.board-wakes__count {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 800;
+}
+
+.board-wakes__unknown,
+.board-age-split__lead,
+.board-age-split__unit {
+  font-weight: 700;
+}
+
+@container (min-width: 640px) {
+  .strip-groups {
+    grid-template-columns: repeat(3, 1fr);
+    padding: 6px 0 2px;
   }
-}
 
-.rail-chip--trackers .board-decisions,
-.rail-chip--trackers .board-unacked {
-  margin-left: 2px;
+  .strip-group {
+    padding: 0 18px 4px;
+  }
+
+  .strip-group:first-child {
+    padding-left: 0;
+  }
+
+  .strip-group:last-child {
+    padding-right: 0;
+  }
+
+  .strip-group + .strip-group {
+    border-top: 0;
+    border-left: 2px solid var(--line);
+  }
+
+  /* Row-edge alignment for a 4th group (CHILDREN) wrapping to a second
+     grid row: the row's first item gets the row separator and no in-row
+     left padding (flush with the first column), the row's last item is
+     flush right — matching the 1-row layout's edges. */
+  .strip-group:nth-child(3n) {
+    padding-right: 0;
+  }
+
+  .strip-group:nth-child(3n + 1):not(:first-child) {
+    border-left: 0;
+    border-top: 2px solid var(--line);
+    padding-left: 0;
+  }
 }
 
 .app-main {
@@ -1743,10 +1867,14 @@ body {
   transition: background 0.15s ease, color 0.15s ease;
 }
 
-/* ── FOR YOU (owner approval 2026-09-28): the permanent owner-action
-   band above the machine bands. Same band skeleton, owner accent;
-   rows are dense two-liners with the control on the right, hairline
-   dividers like the job rows — never a card grid. ───────────────── */
+/* ── FOR YOU (owner approval 2026-09-28; compact slim-strip re-face):
+   permanent owner-action band above the machine bands. Rows are collapsed
+   summaries: the supplied title is the Problem, one short typed Next
+   step, and a reveal-only Review decision control beside the content when
+   wide (natural stacking when narrow). The expanded region carries the
+   authoritative metadata, the complete original detail, and each action's
+   full consequence directly beside that action's control — disclosure is
+   never an action alias. ──────────────────────────────────────────── */
 .board-band--owner {
   --band-accent: var(--rev);
 }
@@ -1760,10 +1888,9 @@ body {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas:
-    'title action'
-    'meta action'
-    'note action';
-  align-items: center;
+    'face action'
+    'detail detail';
+  align-items: start;
   column-gap: 12px;
   padding: 8px 6px 9px;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 22%, transparent);
@@ -1786,10 +1913,7 @@ body {
   background: var(--alert);
 }
 
-.board-owner__row--error {
-  padding-left: 12px;
-}
-
+.board-owner__row--error,
 .board-owner__row--pr {
   padding-left: 12px;
 }
@@ -1805,39 +1929,114 @@ body {
   background: var(--done);
 }
 
-.board-owner__title {
-  grid-area: title;
-  font-weight: 800;
-  font-size: 13px;
-  overflow-wrap: anywhere;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+.board-owner__face {
+  grid-area: face;
   min-width: 0;
 }
 
-.board-owner__ready {
-  flex: none;
-}
-
-.board-owner__meta {
-  grid-area: meta;
+.board-owner__title {
+  margin: 0;
+  font-weight: 800;
+  font-size: 13px;
   overflow-wrap: anywhere;
 }
 
-.board-owner__consequence {
-  grid-area: note;
+.board-owner__next {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 600;
   color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__next b {
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.board-owner__ready {
+  margin-top: 4px;
+}
+
+/* Control column: reveal-only disclosure (+ OPEN PR on PR rows), beside
+   the content until the single-column phone layout (max-width: 560px). */
+.board-owner__actions {
+  grid-area: action;
+  display: grid;
+  gap: 6px;
+  justify-items: end;
+}
+
+.board-owner__row > .board-owner__disclose {
+  /* The ack row's one control sits in the row's action cell — stated
+   * explicitly (it was previously auto-placed into the only free cell). */
+  grid-area: action;
+  justify-self: end;
+}
+
+.board-owner__disclose {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--ink);
+  background: var(--card);
+  border: 2px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.board-owner__disclose:hover {
+  background: var(--soft);
+}
+
+.board-owner__disclose[aria-expanded='true'] {
+  background: var(--accent-soft, var(--soft));
+}
+
+/* Themed focus ring for the band's controls (the UA default is not the
+   app's language; the disclosure is new, Ack/OPEN PR share the gap). */
+.board-owner__disclose:focus-visible,
+.board-owner__ack:focus-visible,
+.board-owner__open:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
+}
+
+/* Expanded region: metadata, verbatim detail, full consequence. All text
+   renders as text and wraps anywhere — never clipped, never truncated. */
+.board-owner__detail {
+  grid-area: detail;
+  margin-top: 8px;
+  background: var(--paper-soft);
+  border: 2px dashed var(--ink-soft);
+  border-radius: 12px;
+  padding: 9px 12px 10px;
+}
+
+.board-owner__detail[hidden] {
+  display: none;
+}
+
+.board-owner__detail-meta,
+.board-owner__detail-notice {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__detail-text {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  font-weight: 600;
+  color: var(--ink);
   overflow-wrap: anywhere;
 }
 
 .board-owner__ack,
 .board-owner__open {
-  grid-area: action;
-  justify-self: end;
-  align-self: center;
-  flex: none;
   font-size: 12px;
   font-weight: 800;
   padding: 5px 12px;
@@ -1848,7 +2047,7 @@ body {
 }
 
 .board-owner__ack {
-  margin-top: 0; /* reset the panel row's flow margin — this is a grid area */
+  margin-top: 8px;
   background: var(--accent-soft, var(--soft));
   color: var(--ink);
 }
@@ -1934,22 +2133,57 @@ body {
   filter: brightness(1.05);
 }
 
-.board-owner__nolink {
-  grid-area: action;
-  justify-self: end;
+/* Bell panel keeps its prior full presentation (not the compact face):
+   inline flow, evidence as text, OPEN PR on the right. */
+.board-owner__row--panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
 }
 
-/* Narrow viewports: the control drops under the text instead of
+.board-owner__row--panel .board-owner__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.board-owner__row--panel .board-owner__meta {
+  flex: 1 1 100%;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.board-owner__row--panel .board-owner__open {
+  margin-left: auto;
+}
+
+.board-owner__nolink {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* Narrow viewports: the controls drop under the text instead of
    squeezing it — no horizontal overflow, thumb-sized targets. */
 @media (max-width: 560px) {
   .board-owner__row {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
-      'title'
-      'meta'
-      'note'
-      'action';
+      'face'
+      'action'
+      'detail';
     row-gap: 6px;
+  }
+
+  .board-owner__actions {
+    justify-items: start;
+    grid-auto-flow: column;
+  }
+
+  .board-owner__row > .board-owner__disclose {
+    justify-self: start;
   }
 
   /* A proposal row keeps its review area in the single column — without
@@ -1969,6 +2203,14 @@ body {
   .board-owner__nolink {
     justify-self: start;
   }
+}
+
+/* The band head is a focus target of last resort (the empty/settled-row
+   fallback): focus that a keyboard operator cannot see is not focus. */
+.board-band__head:focus-visible {
+  outline: 3px solid var(--work);
+  outline-offset: 2px;
+  border-radius: 6px;
 }
 
 .board-band__more:hover {

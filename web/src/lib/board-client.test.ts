@@ -217,6 +217,124 @@ describe('board client', () => {
     await expect(client.recheckDecisions()).rejects.toThrow(/malformed status/);
   });
 
+  it('every POST rides a bounded deadline — an owner action that outlives it is abandoned and rejects, never replayed (R3-03)', async () => {
+    // Presence of a signal is not the contract: the deadline must actually
+    // abort a never-settling POST. A signal that never fires would leave the
+    // Ack control disabled in "acking…" forever, against a green suite.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let init: RequestInit | undefined;
+      const fetchImpl = vi.fn(
+        (_path: string, options?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init = options;
+            options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+            // never settles on its own — the deadline is the only way out
+          }),
+      ) as unknown as typeof fetch;
+      client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      const posting = client.ackNotification('n1');
+      const rejection = expect(posting).rejects.toThrow(/no answer before the deadline/u);
+      expect(init).toMatchObject({ method: 'POST' });
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      expect(init?.signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(init?.signal?.aborted, 'the POST deadline fired').toBe(true);
+      await rejection;
+      // No retry was issued: one POST, one request — the outcome is
+      // unconfirmed and the snapshot reconciles it, not a replay.
+      expect(vi.mocked(fetchImpl)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a POST whose HEADERS arrive but whose BODY never finishes is abandoned at the same deadline (R3-03)', async () => {
+    // The GET path pins this shape (hang()); the POST must not be weaker: a
+    // stalled body would otherwise leave the owner action pending forever.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const fetchImpl = vi.fn(
+        (_path: string, options?: RequestInit) =>
+          Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+              new Promise((_resolve, reject) => {
+                options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+              }),
+          } as unknown as Response),
+      ) as unknown as typeof fetch;
+      client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      const posting = client.ackNotification('n1');
+      const rejection = expect(posting).rejects.toThrow(/no answer before the deadline/u);
+      await vi.advanceTimersByTimeAsync(15_000);
+      await rejection;
+      expect(vi.mocked(fetchImpl)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a signal-less GET (transcript/receipt) is bounded by the deadline and cancelled by stop()', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let init: RequestInit | undefined;
+      const fetchImpl = vi.fn(
+        (_path: string, options?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init = options;
+            options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          }),
+      ) as unknown as typeof fetch;
+      const client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      // The drawer/receipt path: no caller signal, so the client owns the bound.
+      const fetching = client.fetchReceipts(0);
+      const rejection = expect(fetching).rejects.toThrow(/no answer before the deadline/u);
+      expect(init?.signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(init?.signal?.aborted, 'the owned GET deadline fired').toBe(true);
+      await rejection;
+      expect(vi.mocked(fetchImpl)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop() cancels an in-flight signal-less GET (a re-pair never lets a drawer fetch outlive the pairing)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let init: RequestInit | undefined;
+      const fetchImpl = vi.fn(
+        (_path: string, options?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init = options;
+            options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          }),
+      ) as unknown as typeof fetch;
+      const client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      const fetching = client.fetchReceipts(0);
+      const rejection = expect(fetching).rejects.toThrow();
+      client.stop();
+      await rejection;
+      expect(init?.signal?.aborted, 'stop() aborted the owned GET').toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stop() halts reconnects', async () => {
     client = make({});
     client.connect();
