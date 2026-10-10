@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, openSync,
-  readFileSync, realpathSync, unlinkSync, writeFileSync, type Stats,
+  readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync, type Stats,
 } from 'node:fs';
 import { devNull } from 'node:os';
-import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import type { WorktreeLane } from '../dispatch/worktree-port.js';
 
 /** A missing, unsafe or conflicting explicit GC artifact binding. */
@@ -135,9 +135,17 @@ function maybeStat(path: string): Stats | null {
   }
 }
 
+/** APFS/NTFS may resolve a different case/Unicode spelling to the same inode.
+ * realpath alone does not recover the stored spelling on all filesystems. */
+function exactEntry(path: string): void {
+  if (!readdirSync(dirname(path)).includes(basename(path))) {
+    throw new ArtifactContextError(`artifact path uses an aliased filesystem spelling; use the exact directory entry: ${path}`);
+  }
+}
+
 /** Check every component, including dangling links and pre-existing ancestors.
  * Never chmod a foreign path or silently canonicalize a symlink escape. */
-function directory(path: string, create: boolean, privateFrom?: string): void {
+function directory(path: string, create: boolean, privateFrom?: string, exactFrom = privateFrom ?? path): void {
   const root = parse(path).root;
   let cursor = root;
   for (const component of relative(root, path).split(sep).filter(Boolean)) {
@@ -155,18 +163,50 @@ function directory(path: string, create: boolean, privateFrom?: string): void {
     if (!info.isDirectory() || info.isSymbolicLink()) {
       throw new ArtifactContextError(`artifact directory must be a real directory without symlinks: ${cursor}`);
     }
+    // Symlink/kind checks cover every ancestor. Exact spelling checks cover
+    // the owned boundary and descendants, not unrelated large system folders.
+    if (inside(exactFrom, cursor)) exactEntry(cursor);
     if (privateFrom !== undefined && inside(privateFrom, cursor) && (info.mode & 0o077) !== 0) {
       throw new ArtifactContextError(`artifact directory must be private (0700); fix permissions explicitly: ${cursor}`);
     }
   }
 }
 
+/** Only our fully-written atomic publication links may temporarily share an
+ * inode. Foreign hardlinks (including links outside this directory) refuse. */
+function stagingLinks(path: string, info: Stats): readonly string[] {
+  return readdirSync(dirname(path))
+    .filter((name) => /^\.gc-artifact-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.tmp$/u.test(name))
+    .map((name) => join(dirname(path), name))
+    .filter((candidate) => {
+      const stat = maybeStat(candidate);
+      return stat !== null && stat.isFile() && stat.ino === info.ino && stat.dev === info.dev;
+    });
+}
+
+function unlinkStaging(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    // An identical concurrent publisher may finish our already-published link.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
 function readRegular(path: string, privateFile: boolean): Buffer | null {
   const info = maybeStat(path);
   if (info === null) return null;
+  exactEntry(path);
   const check = (stat: Stats): void => {
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new ArtifactContextError(`artifact must be a regular file, not a symlink or hardlink: ${path}`);
+    }
+    if (stat.nlink !== 1 && stat.nlink !== stagingLinks(path, stat).length + 1) {
+      // The winning publisher may have removed its staging name while we listed.
+      const current = lstatSync(path);
+      if (current.ino !== stat.ino || current.dev !== stat.dev || current.nlink !== 1) {
+        throw new ArtifactContextError(`artifact must not have foreign hardlinks: ${path}`);
+      }
     }
     if (privateFile && (stat.mode & 0o077) !== 0) {
       throw new ArtifactContextError(`artifact file must be private (0600); fix permissions explicitly: ${path}`);
@@ -195,14 +235,19 @@ function sameBytes(path: string, bytes: Buffer, privateFile: boolean): boolean {
 
 /** Exclusive atomic publish. A crash before receipt publication is completed by
  * an identical retry; a different revision needs a different relative path. */
-function publish(path: string, bytes: Buffer, privateFrom?: string): void {
-  directory(dirname(path), true, privateFrom);
-  if (sameBytes(path, bytes, privateFrom !== undefined)) return;
+function publish(path: string, bytes: Buffer, privateFrom?: string, exactFrom = privateFrom ?? dirname(path)): void {
+  directory(dirname(path), true, privateFrom, exactFrom);
+  if (sameBytes(path, bytes, privateFrom !== undefined)) {
+    // Finish only same-inode staging links of this exact verified publication,
+    // including a crash at link-before-unlink. This is not a directory sweep.
+    for (const staging of stagingLinks(path, lstatSync(path))) unlinkStaging(staging);
+    return;
+  }
   const temporary = join(dirname(path), `.gc-artifact-${randomUUID()}.tmp`);
   writeFileSync(temporary, bytes, { flag: 'wx', mode: privateFrom === undefined ? 0o644 : 0o600 });
   let raced = false;
   try {
-    directory(dirname(path), false, privateFrom);
+    directory(dirname(path), false, privateFrom, exactFrom);
     try {
       linkSync(temporary, path);
     } catch (error) {
@@ -210,11 +255,38 @@ function publish(path: string, bytes: Buffer, privateFrom?: string): void {
       raced = true;
     }
   } finally {
-    unlinkSync(temporary);
+    unlinkStaging(temporary);
   }
-  // Our temporary link is gone before the single-link check. Other publishers
-  // use the same immutable bytes/receipt contract, never rename over a winner.
+  // Concurrent identical publishers may observe an owned staging hardlink;
+  // the payload was fully written before that link became visible.
   if (raced) sameBytes(path, bytes, privateFrom !== undefined);
+}
+
+const gitEnv = (): NodeJS.ProcessEnv => ({
+  PATH: process.env.PATH, LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull,
+});
+
+/** Refuse private storage in ANY Git checkout, not just this job's project.
+ * This reads ancestor metadata only and never discovers authority from it. */
+function refuseCheckoutDataHome(path: string): void {
+  for (let cursor = path; ; cursor = dirname(cursor)) {
+    if (maybeStat(join(cursor, '.git')) !== null) {
+      throw new ArtifactContextError(`configured artifact data directory must be outside all Git checkouts: ${path}`);
+    }
+    if (dirname(cursor) === cursor) return;
+  }
+}
+
+function refuseIgnoredDocument(worktreePath: string, path: string): void {
+  const result = spawnSync('git', ['-C', worktreePath, 'check-ignore', '-q', '--', `gru-output/${path}`], {
+    encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv(),
+  });
+  if (result.status === 0) {
+    throw new ArtifactContextError(`approved document is Git-ignored; change the ignore rule explicitly before publication: gru-output/${path}`);
+  }
+  if (result.error !== undefined || result.status !== 1) {
+    throw new ArtifactContextError(`cannot verify approved document Git visibility: ${result.error?.message ?? result.stderr}`);
+  }
 }
 
 /** Local read-only git probes use no inherited repository-routing overrides,
@@ -224,7 +296,7 @@ function gitIdentity(path: string): { readonly top: string; readonly gitDir: str
     '-C', path, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir',
   ], {
     encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { PATH: process.env.PATH, LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull },
+    env: gitEnv(),
   }).trimEnd().split('\n');
   if (output.length !== 3 || output.some((value) => value === '')) {
     throw new ArtifactContextError(`cannot identify registered git worktree: ${path}`);
@@ -265,7 +337,8 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
     const registeredRepo = absolute(input.worktree.repoPath, 'registered repository path');
     const assignedWorktree = absolute(input.worktree.path, 'assigned worktree path');
     const jobId = input.worktree.id;
-    if (input.worktree.kind !== 'job' || input.worktree.jobId !== jobId || input.worktree.status === 'swept' ||
+    if (input.worktree.kind !== 'job' || input.worktree.jobId !== jobId ||
+        (input.worktree.status !== 'active' && input.worktree.status !== 'paused') ||
         !/^[a-z0-9][a-z0-9._-]{0,127}$/u.test(jobId)) {
       throw new ArtifactContextError('artifact context requires a live registered job lane with a safe lowercase owning job id');
     }
@@ -276,6 +349,8 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
     if (inside(repoPath, dataDir) || inside(worktreePath, dataDir)) {
       throw new ArtifactContextError('configured artifact data directory must be outside the registered repository and assigned worktree');
     }
+    directory(dataDir, false);
+    refuseCheckoutDataHome(dataDir);
     const projectKey = hash(repoPath);
     const projects = join(dataDir, 'projects');
     const jobDirectory = join(projects, projectKey, 'jobs', jobId);
@@ -294,9 +369,13 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
     // Refuse all existing wrong-kind paths/identity conflicts before initialization
     // publishes anything. Existing documents are not scanned, copied or rewritten.
     checkBoundaries(false);
-    sameBytes(bindingFile, bindingBytes, true);
-    checkBoundaries(true);
+    const hasBinding = sameBytes(bindingFile, bindingBytes, true);
+    if (!hasBinding && maybeStat(jobDirectory) !== null && readdirSync(jobDirectory).length !== 0) {
+      throw new ArtifactContextError(`artifact context binding is missing from an existing namespace; restore it explicitly: ${bindingFile}`);
+    }
+    directory(jobDirectory, true, projects);
     publish(bindingFile, bindingBytes, projects);
+    checkBoundaries(true);
 
     const checkContext = (): void => {
       verifyLane(repoPath, worktreePath);
@@ -325,11 +404,17 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
       const payload = payloadPath(scope, path);
       const receipt = receiptPath(scope, path);
       const privateFrom = scope === 'operational' ? projects : undefined;
-      directory(dirname(payload), false, privateFrom);
-      sameBytes(payload, bytes, scope === 'operational');
-      sameBytes(receipt, receiptBytes, true);
-      publish(payload, bytes, privateFrom);
+      directory(dirname(payload), false, privateFrom, scope === 'document' ? knowledgeDirectory : projects);
+      const hasPayload = sameBytes(payload, bytes, scope === 'operational');
+      const hasReceipt = sameBytes(receipt, receiptBytes, true);
+      if (hasPayload && !hasReceipt) {
+        throw new ArtifactContextError(`artifact receipt is missing for existing content; restore it explicitly: ${receipt}`);
+      }
+      if (scope === 'document') refuseIgnoredDocument(worktreePath, path);
+      // Bind exact provenance BEFORE payload publication. A crash can leave a
+      // receipt without content, never content whose provenance can be guessed.
       publish(receipt, receiptBytes, projects);
+      publish(payload, bytes, privateFrom, scope === 'document' ? knowledgeDirectory : projects);
       return reference;
     });
 
@@ -355,7 +440,8 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
           throw new ArtifactContextError(`artifact reference has different provenance or binding: ${receipt}`);
         }
         const payload = payloadPath(scope, path);
-        directory(dirname(payload), false, scope === 'operational' ? projects : undefined);
+        directory(dirname(payload), false, scope === 'operational' ? projects : undefined,
+          scope === 'document' ? knowledgeDirectory : projects);
         const content = readRegular(payload, scope === 'operational');
         if (content === null || hash(content) !== expected.sha256) {
           throw new ArtifactContextError(`artifact content does not match reference sha256: ${payload}`);

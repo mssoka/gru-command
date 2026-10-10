@@ -20,7 +20,8 @@ that integration lands.
 `data_dir` comes from GC configuration (default `~/.gru-command`). The helper
 requires the caller to pass the configured absolute path; it never guesses
 HOME, an installation path, or a BMAD output directory. This root must be
-outside the registered repository and assigned worktree.
+outside all Git checkouts, including the registered repository and assigned
+worktree; private job material must not appear in another project's checkout.
 
 The full SHA-256 of the **canonical registered repository path** is the
 project key. Repository names and temporary worktree basenames are not
@@ -78,7 +79,8 @@ the caller.
 The approved document's **one authoritative mutable copy** is the ordinary
 worktree file. Its private receipt is immutable metadata, not a competing
 editable contract. `gru-output/` is neither auto-ignored nor auto-committed;
-review/version its documents normally. They remain readable without GC or
+publication refuses a Git-ignored document path and never edits ignore rules.
+Review/version its documents normally. They remain readable without GC or
 BMAD. Editing a document changes its hash, so the old reference subsequently
 refuses verification; a new approved revision needs a new publication path.
 
@@ -93,18 +95,30 @@ refuses verification; a new approved revision needs a new publication path.
   initialization does not enumerate, rewrite or delete documents.
 - Job/worktree/workflow binding is immutable. Resuming the same registered job
   resolves its old namespace and checks the same binding. A changed workflow,
-  assigned worktree or corrupt binding fails with `ArtifactContextError`;
-  restore the recorded binding/material explicitly instead of silently
-  adopting today's workflow.
-- Publication is exclusive and atomic for each file. Identical retries are
-  idempotent; different bytes or provenance refuse without replacing the
-  winner. New revisions use new relative paths. If publication stopped after
-  payload but before receipt, an identical retry finishes the receipt. A
-  missing receipt is never treated as a verified reference.
+  assigned worktree or corrupt/missing binding in an existing nonempty
+  namespace fails with `ArtifactContextError`; restore recorded material
+  explicitly instead of silently adopting today's workflow. The registry
+  snapshot establishes admission; the caller must obtain a current snapshot
+  for a new lifecycle. Every operation re-verifies the actual linked checkout;
+  a normal manager sweep removes it before recording `swept` and thus refuses
+  further operations even through an existing context.
+- Publication is exclusive and atomic for each file. Exact provenance is
+  published **before** payload bytes. Identical retries are idempotent;
+  different bytes or provenance refuse without replacing the winner. New
+  revisions use new relative paths. A crash leaving a receipt without content
+  is finished by an identical retry; orphaned content without a receipt is
+  refused rather than assigned guessed provenance. A missing receipt/content
+  is never treated as a verified reference. A concurrent/crashed publisher's
+  fully-written internal staging hardlink is recognized by its exact reserved
+  UUID name and inode/link count. An identical publication finishes only those
+  links; external or other hardlinks still refuse. This narrow staging cleanup
+  is not a retention sweep.
 - Absolute output paths, traversal, empty components, backslashes, colon
   paths, control characters, wrong-kind entries, symlinks (including dangling
-  links and ancestor components), and file hardlinks are refused. Use
-  normalized absolute roots without symlink components; on systems with
+  links and ancestor components), and foreign file hardlinks are refused.
+  Filesystem-equivalent case/Unicode spellings are rejected using the exact
+  stored directory entry, so one document cannot acquire competing approvals.
+  Use normalized absolute roots without symlink components; on systems with
   `/tmp` or `/var` aliases, supply their canonical paths. Boundaries are
   checked again on every operation. Files are opened without following leaf
   symlinks and read through a checked descriptor. Do not permit an untrusted

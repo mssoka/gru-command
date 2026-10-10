@@ -370,18 +370,27 @@ describe('explicit GC artifact context (#293)', () => {
     expect(readFileSync(foreign, 'utf8')).toBe('keep');
   });
 
-  it('verifies reference bytes on resume and can finish an interrupted publication without rewriting payload', () => {
+  it('verifies reference bytes and resumes receipt-before-payload publication without changing provenance', () => {
     const f = fixture();
     const context = createArtifactContext(f.input);
     const artifact = { path: 'draft.md', contents: 'v1', sources };
     const reference = context.writeOperational(artifact);
     const references = join(context.jobDirectory, 'references');
     const receipt = join(references, readdirSync(references)[0]!);
-    rmSync(receipt);
-    expect(() => context.readReference('operational', 'draft.md')).toThrow(ArtifactContextError);
+    const receiptBytes = readFileSync(receipt);
+    const payload = join(context.operationalDirectory, artifact.path);
+    rmSync(payload);
+    expect(() => context.readReference('operational', artifact.path)).toThrow(ArtifactContextError);
+    expect(() => context.writeOperational({ ...artifact, sources: [{ ...sources[0]!, revision: 'different' }] })).toThrow(/different/u);
+    expect(existsSync(payload)).toBe(false);
     expect(context.writeOperational(artifact)).toEqual(reference);
-    writeFileSync(join(context.operationalDirectory, 'draft.md'), 'tampered');
-    expect(() => createArtifactContext(f.input).readReference('operational', 'draft.md')).toThrow(/sha256|content/u);
+    expect(readFileSync(receipt)).toEqual(receiptBytes);
+    rmSync(receipt);
+    expect(() => context.writeOperational(artifact)).toThrow(/receipt is missing/u);
+    expect(() => context.writeOperational({ ...artifact, sources: [] })).toThrow(/receipt is missing/u);
+    writeFileSync(receipt, receiptBytes, { mode: 0o600 });
+    writeFileSync(payload, 'tampered');
+    expect(() => createArtifactContext(f.input).readReference('operational', artifact.path)).toThrow(/sha256|content/u);
     expect(() => context.writeOperational(artifact)).toThrow(ArtifactContextError);
   });
 
@@ -406,6 +415,136 @@ describe('explicit GC artifact context (#293)', () => {
     expect(() => context.writeOperational(artifact)).toThrow(ArtifactContextError);
     expect(existsSync(join(context.operationalDirectory, artifact.path))).toBe(false);
     expect(readFileSync(foreign, 'utf8')).toBe('keep');
+  });
+
+  it('fails closed on missing job bindings instead of reassigning prior workflow identity', () => {
+    const f = fixture();
+    const context = createArtifactContext(f.input);
+    context.writeOperational({ path: 'prior.md', contents: 'prior contract', sources });
+    rmSync(join(context.jobDirectory, 'context.json'));
+    const before = snapshot(context.jobDirectory);
+    for (const selected of [workflow, { ...workflow, sha256: hash('new workflow') }]) {
+      expect(() => createArtifactContext({ ...f.input, workflow: selected })).toThrow(/binding is missing/u);
+      expect(snapshot(context.jobDirectory)).toBe(before);
+    }
+  });
+
+  it('refuses private data homes inside any other checkout and aliased worktree roots', () => {
+    const f = fixture();
+    const foreign = fixture();
+    expect(() => createArtifactContext({ ...f.input, dataDir: join(foreign.repoPath, 'private-data') })).toThrow(/outside all Git/u);
+    expect(existsSync(join(foreign.repoPath, 'private-data'))).toBe(false);
+    const aliasRoot = join(dirname(f.worktree.path), f.worktree.id.toUpperCase());
+    if (existsSync(aliasRoot)) {
+      expect(() => createArtifactContext({ ...f.input, dataDir: join(aliasRoot, 'private-data') })).toThrow(/aliased|outside all Git/u);
+      expect(existsSync(join(f.worktree.path, 'private-data'))).toBe(false);
+    }
+  });
+
+  it('rejects filesystem-equivalent document spellings instead of creating competing approvals', () => {
+    const f = fixture();
+    const context = createArtifactContext(f.input);
+    const document = { path: 'Specs/Report.md', contents: 'approved', sources, approvalId: 'owner-a' };
+    const reference = context.publishDocument(document);
+    expect(context.readReference('document', document.path)).toEqual(reference);
+    if (existsSync(join(context.knowledgeDirectory, 'Specs/report.md'))) {
+      expect(() => context.publishDocument({ ...document, path: 'Specs/report.md', approvalId: 'owner-b' })).toThrow(/aliased/u);
+      expect(() => context.publishDocument({ ...document, path: 'specs/Report.md', approvalId: 'owner-b' })).toThrow(/aliased/u);
+      expect(readdirSync(join(context.jobDirectory, 'references'))).toHaveLength(1);
+    } else {
+      const other = context.publishDocument({ ...document, path: 'Specs/report.md', approvalId: 'owner-b' });
+      expect(context.readReference('document', other.path)).toEqual(other);
+    }
+  });
+
+  it('verifies approved document hashes, approval receipts and explicit revisions after ordinary edits', () => {
+    const f = fixture();
+    const context = createArtifactContext(f.input);
+    const document = { path: 'spec.md', contents: 'approved v1', sources, approvalId: 'owner-1' };
+    const reference = context.publishDocument(document);
+    expect(context.readReference('document', reference.path)).toEqual(reference);
+    writeFileSync(join(context.knowledgeDirectory, document.path), 'unapproved edit');
+    expect(() => context.readReference('document', reference.path)).toThrow(/sha256/u);
+    expect(() => context.publishDocument({ ...document, contents: 'unapproved edit', approvalId: 'owner-2' })).toThrow(/different/u);
+    const updated = context.publishDocument({ ...document, path: 'spec-v2.md', contents: 'approved v2', approvalId: 'owner-2' });
+    expect(context.readReference('document', updated.path)).toEqual(updated);
+  });
+
+  it('refuses Git-ignored approved documents without changing ignore rules or publishing references', () => {
+    const f = fixture();
+    writeFileSync(join(f.worktree.path, '.gitignore'), 'gru-output/\n');
+    const context = createArtifactContext(f.input);
+    expect(() => context.publishDocument({ path: 'spec.md', contents: 'approved', sources, approvalId: 'owner' })).toThrow(/Git-ignored/u);
+    expect(tree(context.knowledgeDirectory)).toEqual([]);
+    expect(tree(join(context.jobDirectory, 'references'))).toEqual([]);
+    expect(readFileSync(join(f.worktree.path, '.gitignore'), 'utf8')).toBe('gru-output/\n');
+  });
+
+  it('an existing context refuses a legally swept and removed lane, even with its original registry snapshot', () => {
+    const f = fixture();
+    const context = createArtifactContext(f.input);
+    git(f.repoPath, ['worktree', 'remove', '--force', f.worktree.path]);
+    expect(() => context.writeOperational({ path: 'after-sweep.md', contents: 'x', sources })).toThrow(ArtifactContextError);
+    expect(() => context.publishDocument({ path: 'after-sweep.md', contents: 'x', sources, approvalId: 'owner' })).toThrow(ArtifactContextError);
+    expect(existsSync(join(context.operationalDirectory, 'after-sweep.md'))).toBe(false);
+    expect(existsSync(f.worktree.path)).toBe(false);
+  });
+
+  it('handles identical same-path concurrency and crash recovery at the actual publication hardlink window', async () => {
+    const f = fixture();
+    const context = createArtifactContext(f.input);
+    const modulePath = join(f.root, 'paused-artifacts.mjs');
+    const original = readFileSync(join(import.meta.dirname, '../src/artifacts/context.ts'), 'utf8');
+    const pauseAt = '    unlinkStaging(temporary);';
+    expect(original.split(pauseAt)).toHaveLength(2);
+    const instrumented = `import { readSync } from 'node:fs';\n` + original.replace(pauseAt, `
+    if (path.endsWith('/draft.md')) {
+      process.stdout.write('linked\\n');
+      readSync(0, Buffer.alloc(1), 0, 1, null);
+    }
+    unlinkStaging(temporary);`);
+    writeFileSync(modulePath, transpileModule(instrumented, {
+      compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2022 },
+    }).outputText);
+    const script = `
+      import { createArtifactContext } from ${JSON.stringify(pathToFileURL(modulePath).href)};
+      const { input, artifact } = JSON.parse(process.argv[1]);
+      createArtifactContext(input).writeOperational(artifact);
+    `;
+    for (const mode of ['concurrent', 'crash']) {
+      const artifact = { path: `${mode}/draft.md`, contents: 'v1', sources };
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script, JSON.stringify({ input: f.input, artifact })], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+      const ready = new Promise<void>((resolve, reject) => {
+        child.stdout.once('data', () => resolve());
+        child.once('error', reject);
+        child.once('close', () => reject(new Error(stderr || 'publisher stopped before the hardlink gate')));
+      });
+      const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', (code, signal) => resolve({ code, signal }));
+      });
+      try {
+        await ready;
+        if (mode === 'crash') {
+          child.kill('SIGKILL');
+          expect((await done).signal).toBe('SIGKILL');
+        }
+        const resumed = context.writeOperational(artifact);
+        expect(context.readReference('operational', artifact.path)).toEqual(resumed);
+        expect(tree(join(context.operationalDirectory, mode))).toEqual(['draft.md']);
+        if (mode === 'concurrent') {
+          child.stdin.end('x');
+          expect((await done).code, stderr).toBe(0);
+        }
+      } finally {
+        child.kill();
+        await done;
+      }
+    }
   });
 
   it('does not touch legacy BMAD state, captures or workflow package material', () => {

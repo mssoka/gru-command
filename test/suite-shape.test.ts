@@ -17,7 +17,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'prune-stale-dist.test.ts': 5,
   'unshare-review-hardlinks.test.ts': 5,
   'admission-retry-service.test.ts': 1,
-  'artifact-context.test.ts': 20,
+  'artifact-context.test.ts': 27,
   'attachments.test.ts': 28,
 
   'awareness.test.ts': 80,
