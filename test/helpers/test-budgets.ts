@@ -51,7 +51,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   },
   {
     file: 'bmad-onboarding.test.ts',
-    workload: 'BMAD project provisioning over many real git repository fixtures',
+    workload: 'compiled GC setup CLI over many real Git repositories, including unchanged independent BMAD state',
   },
   {
     file: 'bmad-runtime-packaged.test.ts',
@@ -73,6 +73,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'HTTP ops surface over real git fixture repositories',
   },
   { file: 'fix-directive.test.ts', workload: 'dispatch/fix flow over real git fixtures' },
+  { file: 'gc-bootstrap-retirement.test.ts', workload: 'runs owner retirement/restore shell and Python commands over Git worktrees and backup corruption fixtures' },
   {
     file: 'harness-diagnostics.test.ts',
     workload: 'spawns a real Vitest child over a temp fixture to prove the timeout/failure wiring',

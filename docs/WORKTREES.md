@@ -31,11 +31,17 @@ A missing manifest is a no-op; a malformed one fails loud and rolls the
 worktree back **all the way** (worktree AND the branch the failed call
 created — a leftover `gru/<job>` would wedge the job id forever).
 
-BMAD needs no manifest entry (issue #283): a lane receives the GC-managed
-BMAD runtime when its first minion spawns, and the project's BMAD settings
-travel with the tracked `_bmad/custom/` files. Do not `[[link]]` `_bmad`
-into a lane — rendered workflow snapshots must stay inside the worktree,
-and the runtime refuses a linked `_bmad` ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)).
+GC-owned workflows need no BMAD manifest entry or project/global installation.
+New lanes bind the owned workflow and explicit artifact context when the minion
+spawns; approved portable knowledge lives in `gru-output/`. Independent user BMAD
+and explicit project setup commands remain user-owned and are honored unchanged.
+
+GC-marked `GRU COMMAND BMAD BOOTSTRAP` blocks are retired: new bootstrap refuses
+them before executing any links, copies or commands. Use the precise, owner-run
+preview/backup/retirement procedure in [BMAD-RUNTIME.md](./BMAD-RUNTIME.md); edited
+or uncertain blocks require deliberate repair, never automatic cleanup. Existing
+jobs still resolve verification commands from their original manifests and keep
+their original runtime bindings and paths.
 
 ## 2. Registry (18b)
 
