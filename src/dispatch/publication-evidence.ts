@@ -26,7 +26,6 @@
  * `perkins.ts` may import these values without a runtime cycle.
  */
 
-import type { LedgerApi } from '../ledger/api.js';
 import type { CanonicalReviewVerdict } from './perkins-review/types.js';
 import type { PostedReviewReceipt, VerdictReviewEvent } from './perkins.js';
 
@@ -142,6 +141,12 @@ export function parsePublicationAbsentPayload(payload: unknown): PublicationAbse
   return { targetSha: value['targetSha'], publicationSha256: value['publicationSha256'], detail: value['detail'] };
 }
 
+/** The minimal ledger surface the guard reads: the full `LedgerApi` and the
+ * digest's narrower reader both satisfy it structurally. */
+export interface PublicationEvidenceReader {
+  latestRoundEvent(roundId: string, kind: string): { readonly seq: number; readonly payload: unknown } | null;
+}
+
 export interface PendingPublicationProblem {
   readonly kind: 'uncredited-receipt' | 'unresolved-attempt';
   readonly detail: string;
@@ -154,7 +159,7 @@ export interface PendingPublicationProblem {
  * a reconciled-but-uncertain attempt, or a bare intent - may describe a
  * provider write that is not yet resolved, so a new same-head publication
  * must not be re-armed. A malformed attempt payload fails closed too. */
-export function pendingPublicationAttempt(ledger: LedgerApi, roundId: string): PendingPublicationProblem | null {
+export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, roundId: string): PendingPublicationProblem | null {
   const attemptEvent = ledger.latestRoundEvent(roundId, PUBLICATION_ATTEMPT_EVENT);
   if (attemptEvent === null) return null;
   const attempt = parsePublicationAttemptPayload(attemptEvent.payload);
