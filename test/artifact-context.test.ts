@@ -604,6 +604,69 @@ describe('explicit GC artifact context (#293)', () => {
     }
   });
 
+  it('accepts identical concurrent publication when the winner cleans staging after another reader obtains its proof', async () => {
+    const f = fixture();
+    const context = createArtifactContext(f.input);
+    const original = readFileSync(join(import.meta.dirname, '../src/artifacts/context.ts'), 'utf8');
+    const cleanupMarker = '    unlinkStaging(temporary);';
+    const proofMarker = "    const raw = JSON.parse(bytes.toString('utf8')) as { readonly sha256: string };";
+    expect(original.split(cleanupMarker)).toHaveLength(2);
+    expect(original.split(proofMarker)).toHaveLength(2);
+    const gate = `if (path.endsWith('/race/draft.md')) {
+      process.stdout.write('gate\\n'); readSync(0, Buffer.alloc(1), 0, 1, null);
+    }\n`;
+    const modules = [cleanupMarker, proofMarker].map((marker, index) => {
+      const file = join(f.root, `gated-${index}.mjs`);
+      const source = "import { readSync } from 'node:fs';\n" + original.replace(marker, gate + marker);
+      writeFileSync(file, transpileModule(source, {
+        compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2022 },
+      }).outputText);
+      return file;
+    });
+    const artifact = { path: 'race/draft.md', contents: 'identical', sources };
+    const script = `
+      const { modulePath, input, artifact } = JSON.parse(process.argv[1]);
+      const { createArtifactContext } = await import(modulePath);
+      createArtifactContext(input).writeOperational(artifact);
+    `;
+    const children: Array<ReturnType<typeof launch>> = [];
+    function launch(modulePath: string) {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script,
+        JSON.stringify({ modulePath: pathToFileURL(modulePath).href, input: f.input, artifact })], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+      const ready = new Promise<void>((resolve, reject) => {
+        child.stdout.once('data', () => resolve());
+        child.once('error', reject);
+        child.once('close', () => reject(new Error(stderr || 'publisher closed before gate')));
+      });
+      const done = new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', (code) => resolve(code));
+      });
+      return { child, ready, done, stderr: () => stderr };
+    }
+    try {
+      const winner = launch(modules[0]!);
+      children.push(winner);
+      await winner.ready;
+      const reader = launch(modules[1]!);
+      children.push(reader);
+      await reader.ready;
+      winner.child.stdin.end('x');
+      expect(await winner.done, winner.stderr()).toBe(0);
+      reader.child.stdin.end('x');
+      expect(await reader.done, reader.stderr()).toBe(0);
+      expect(context.readReference('operational', artifact.path).sha256).toBe(hash(artifact.contents));
+      expect(tree(join(context.jobDirectory, 'publication-staging'))).toEqual([]);
+    } finally {
+      for (const { child } of children) child.kill();
+      await Promise.allSettled(children.map(({ done }) => done));
+    }
+  });
+
   it('does not touch legacy BMAD state, captures or workflow package material', () => {
     const f = fixture();
     for (const path of ['_bmad-output/old.md', '_bmad/custom/config.toml', '.agents/skills/unrelated/SKILL.md']) {

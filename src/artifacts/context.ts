@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, openSync,
-  readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync, type Stats,
+  readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync, type BigIntStats, type Stats,
 } from 'node:fs';
 import { devNull } from 'node:os';
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
@@ -137,10 +137,12 @@ function maybeStat(path: string): Stats | null {
 
 /** APFS/NTFS may resolve a different case/Unicode spelling to the same inode.
  * realpath alone does not recover the stored spelling on all filesystems. */
-function exactEntry(path: string): void {
+function exactEntry(path: string): boolean {
   if (!readdirSync(dirname(path)).includes(basename(path))) {
+    if (maybeStat(path) === null) return false; // a completed publisher removed its ephemeral proof
     throw new ArtifactContextError(`artifact path uses an aliased filesystem spelling; use the exact directory entry: ${path}`);
   }
+  return true;
 }
 
 /** Check every component, including dangling links and pre-existing ancestors.
@@ -165,7 +167,9 @@ function directory(path: string, create: boolean, privateFrom?: string, exactFro
     }
     // Symlink/kind checks cover every ancestor. Exact spelling checks cover
     // the owned boundary and descendants, not unrelated large system folders.
-    if (inside(exactFrom, cursor)) exactEntry(cursor);
+    if (inside(exactFrom, cursor) && !exactEntry(cursor)) {
+      throw new ArtifactContextError(`artifact directory disappeared during validation: ${cursor}`);
+    }
     if (privateFrom !== undefined && inside(privateFrom, cursor) && (info.mode & 0o077) !== 0) {
       throw new ArtifactContextError(`artifact directory must be private (0700); fix permissions explicitly: ${cursor}`);
     }
@@ -190,10 +194,24 @@ function stagingLinks(path: string, info: Stats, stagingRoot: string): readonly 
     const stat = maybeStat(temporary);
     if (stat === null || !stat.isFile() || stat.ino !== info.ino || stat.dev !== info.dev) continue;
     const record = join(stagingRoot, `${uuid}.json`);
-    const bytes = readRegular(record, true);
+    let bytes: Buffer | null;
+    try {
+      bytes = readRegular(record, true);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
     if (bytes === null) continue;
     const raw = JSON.parse(bytes.toString('utf8')) as { readonly sha256: string };
-    const identity = lstatSync(temporary, { bigint: true });
+    let identity: BigIntStats;
+    try {
+      identity = lstatSync(temporary, { bigint: true });
+    } catch (error) {
+      // The winner may finish cleanup after we read its proof. readRegular
+      // rechecks the target link count; foreign/live unproven links still fail.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
     const expected = {
       schemaVersion: 1, target: path, temporary: name, dev: identity.dev.toString(), ino: identity.ino.toString(),
       sha256: sha256(raw.sha256, 'publication staging sha256'),
@@ -218,7 +236,7 @@ function unlinkStaging(path: string): void {
 function readRegular(path: string, privateFile: boolean, stagingRoot?: string): Buffer | null {
   const info = maybeStat(path);
   if (info === null) return null;
-  exactEntry(path);
+  if (!exactEntry(path)) return null;
   const stagingHashes = new Set<string>();
   const check = (stat: Stats): void => {
     if (!stat.isFile() || stat.isSymbolicLink()) {
