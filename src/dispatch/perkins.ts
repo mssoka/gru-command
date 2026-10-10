@@ -53,9 +53,11 @@ import { renderEffectiveContract } from '../review-inputs/amendments.js';
 import {
   PUBLICATION_ABSENT_EVENT,
   PUBLICATION_ATTEMPT_EVENT,
+  PUBLICATION_IDENTITY_EVENT,
   PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
   parsePublicationAttemptPayload,
+  parsePublicationIdentityPayload,
   parsePublicationRebindUnresolvedPayload,
   parsePublicationReceiptEvidencePayload,
   type PublicationAttemptPayload,
@@ -513,6 +515,15 @@ export interface VerdictPosterInput {
    * probe that resolves after the abort refuses delivery instead of
    * approving an already-cancelled round. */
   readonly signal?: AbortSignal;
+  /** Invoked by the publisher with the authenticated posting account it has
+   * PREPARED to publish as, immediately before the irreversible write
+   * (after every identity/head probe and the cancellation check). The host
+   * journals it durably so a restart can prove identity continuity before
+   * certifying an absence; a throwing callback aborts the delivery before
+   * the write. Optional: a publisher that does not report its prepared
+   * identity leaves the delivery's posting identity unbound, and restart
+   * reconciliation then holds instead of ever certifying absence. */
+  readonly onPreparedIdentity?: (actor: string) => void;
 }
 
 /** Optional caller context for VerdictPoster.reconcile (bounded shared
@@ -561,6 +572,29 @@ const ORIGIN_REF_SPELLING = /^(?:(?:refs\/)?remotes\/origin\/|origin\/)/u;
 
 function receiptDigest(body: string): string {
   return createHash('sha256').update(body, 'utf8').digest('hex');
+}
+
+/** Whether a gh review-list entry carries the delivery predicates in
+ * provider types, so that a NON-match can contribute to proving absence
+ * (native R2 F3). An entry missing the author, state, commit binding or
+ * body — a successful `[{}]` reply, an array or primitive entry, a mistyped
+ * field — is undecidable: it can neither be credited nor counted as
+ * absence. A provider-documented `null` for those fields stays decidable. */
+function isDecidableGhReviewEntry(entry: unknown): boolean {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const record = entry as Record<string, unknown>;
+  if (!('user' in record)) return false;
+  const user = record['user'];
+  if (user !== null) {
+    if (typeof user !== 'object' || Array.isArray(user)) return false;
+    if (typeof (user as Record<string, unknown>)['login'] !== 'string') return false;
+  }
+  for (const field of ['state', 'commit_id', 'body'] as const) {
+    if (!(field in record)) return false;
+    const value = record[field];
+    if (!(value === null || typeof value === 'string')) return false;
+  }
+  return true;
 }
 
 /** Combine an operation's cancellation signal with its own timeout: the
@@ -760,6 +794,9 @@ export class GhPrPoster implements VerdictPoster {
     if (input.signal?.aborted) {
       throw new Error('review delivery cancelled before the irreversible POST — review not delivered');
     }
+    // Bind the prepared posting identity durably BEFORE the write so a
+    // restart can prove the reconciliation lookup ran as the same account.
+    input.onPreparedIdentity?.(authenticatedLogin);
     const result = spawnSync(
       this.binary,
       ['api', '--hostname', input.host, '--method', 'POST', `${apiPath}/reviews`, '--input', '-'],
@@ -827,6 +864,10 @@ export class GhPrPoster implements VerdictPoster {
     const { apiPath, observedHead, observedBase } = this.githubPrIdentity(input);
     const authenticatedLogin = this.resolveAuthenticatedLogin(input.host);
     const reviews: Array<{ id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown }> = [];
+    // Undecidable entries (missing or mistyped delivery predicates) poison
+    // the ABSENCE certificate only: a usable match is still credited, but a
+    // list that cannot be decided never resolves to null (native R2 F3).
+    let undecidableEvidence = false;
     for (let page = 1; page <= MAX_RECONCILE_PAGES; page += 1) {
       const listed = spawnSync(
         this.binary,
@@ -844,6 +885,7 @@ export class GhPrPoster implements VerdictPoster {
       } catch {
         throw new Error('gh api review reconciliation response was not a review list');
       }
+      if (pageReviews.some((entry) => !isDecidableGhReviewEntry(entry))) undecidableEvidence = true;
       reviews.push(...pageReviews);
       if (pageReviews.length < 100) break;
       if (page === MAX_RECONCILE_PAGES) {
@@ -858,7 +900,14 @@ export class GhPrPoster implements VerdictPoster {
         );
       }
     }
-    return this.boundMatchFrom(reviews, input, authenticatedLogin, observedHead, observedBase);
+    const matched = this.boundMatchFrom(reviews, input, authenticatedLogin, observedHead, observedBase);
+    if (matched !== null) return matched;
+    if (undecidableEvidence) {
+      throw new Error(
+        'gh api review reconciliation returned an undecidable review record (missing or mistyped delivery-predicate fields) — the lookup cannot certify absence; delivery stays unresolved, never assume absence',
+      );
+    }
+    return null;
   }
 
   /** The single GitHub bound-match selection shared by the ordinary exit
@@ -1078,6 +1127,7 @@ export class GitLabMrPoster implements VerdictPoster {
     if (input.signal?.aborted) {
       throw new Error('merge-request note delivery cancelled before the irreversible POST — note not delivered');
     }
+    input.onPreparedIdentity?.(author);
     let noteResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
     try {
       noteResponse = await this.fetchImpl(`${mrUrl}/notes`, {
@@ -2637,6 +2687,17 @@ export class WaveRunner {
       );
       return 'held';
     }
+    // The lookup may only search the bytes the intent recorded (native R2
+    // F1): a changed artifact would make the provider search body B while
+    // the committed body A is what the delivery actually published.
+    if (receiptDigest(publicationBody) !== attempt.publicationSha256) {
+      this.escalate(
+        `Perkins publication attempt for round ${round.id} cannot be reconciled safely`,
+        'the canonical publication artifact bytes no longer match the recorded intent digest, so the provider lookup cannot be trusted to search the committed body; the outcome stays unresolved and same-head re-publication stays closed for inspection',
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
     try {
       const found = await poster.reconcile({
         prUrl: attempt.url,
@@ -2648,6 +2709,38 @@ export class WaveRunner {
         reviewEvent: attempt.reviewEvent,
       });
       if (found === null) {
+        // An absence may only be certified when the lookup ran as the SAME
+        // account that prepared the write (native R2 F2): an account
+        // rotation between the prepared write and the restart can exclude a
+        // surviving review from a fresh lookup, which is not proof that the
+        // write failed.
+        const identityEvent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_IDENTITY_EVENT);
+        const boundIdentity = identityEvent !== null && identityEvent.seq > attemptEvent.seq
+          ? parsePublicationIdentityPayload(identityEvent.payload)
+          : null;
+        let identityContinuity: 'same' | 'different' | 'unknown' = 'unknown';
+        if (boundIdentity !== null) {
+          try {
+            const current = typeof poster.authenticatedActor === 'function' ? await poster.authenticatedActor(attempt.host) : '';
+            identityContinuity = typeof current === 'string' && current.trim() !== ''
+              ? (current.toLowerCase() === boundIdentity.actor.toLowerCase() ? 'same' : 'different')
+              : 'unknown';
+          } catch {
+            identityContinuity = 'unknown';
+          }
+        }
+        if (identityContinuity !== 'same') {
+          this.escalate(
+            `Perkins publication attempt for round ${round.id} cannot be certified absent`,
+            `the provider lookup found no matching publication, but ${boundIdentity === null
+              ? 'the attempt carries no durably bound posting identity, so the lookup cannot be proved to have searched as the account that prepared the write'
+              : identityContinuity === 'different'
+                ? `the prepared posting identity "${boundIdentity.actor}" is not the currently authenticated account, so a review by the original account may sit outside the lookup`
+                : `the prepared posting identity "${boundIdentity.actor}" cannot be re-evidenced as continuous right now`}; the frozen-commit outcome stays unresolved and same-head re-publication stays closed`,
+            { jobId: round.jobId, roundId: round.id },
+          );
+          return 'held';
+        }
         this.opts.ledger.appendCustomEvent({
           kind: PUBLICATION_ABSENT_EVENT,
           jobId: round.jobId,
@@ -5543,6 +5636,17 @@ export class WaveRunner {
         this.opts.ledger.appendCustomEvent({
           kind: PUBLICATION_ATTEMPT_EVENT, jobId: job.id, roundId: round.id, payload: attemptPayload,
         });
+        // The prepared posting identity is durably bound immediately before
+        // the write (native R2 F2): a restart can only certify an absence
+        // when the lookup ran as the same account. A failed bind write
+        // throws inside the publisher and aborts the delivery before the
+        // irreversible POST.
+        const bindPreparedIdentity = (actor: string): void => {
+          this.opts.ledger.appendCustomEvent({
+            kind: PUBLICATION_IDENTITY_EVENT, jobId: job.id, roundId: round.id,
+            payload: { actor, host: prUrl.host, targetSha: review.targetSha },
+          });
+        };
         const delivered = verifyPostedReceipt(
           await poster.post({
             prUrl: job.prUrl!,
@@ -5553,6 +5657,7 @@ export class WaveRunner {
             baseSha: frozenReview.manifest.baseRefSha,
             reviewEvent,
             signal,
+            onPreparedIdentity: bindPreparedIdentity,
           }),
           { targetSha: review.targetSha, bodySha256: publicationSha256, event: wantedEnacted },
         );

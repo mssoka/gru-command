@@ -749,6 +749,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     if (input.signal?.aborted) {
       throw new PerkinsAppError('review delivery cancelled before the irreversible POST — no review was created');
     }
+    // Bind the prepared App-bot identity durably BEFORE the write so a
+    // restart can prove the reconciliation lookup ran as the same account.
+    input.onPreparedIdentity?.(botLogin);
     let review: unknown;
     try {
       review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {

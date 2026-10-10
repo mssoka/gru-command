@@ -41,6 +41,12 @@ export const PUBLICATION_ABSENT_EVENT = 'round.publication-absent';
  * provider write exists and stays unresolved until reconciliation supports
  * the actual result, so no same-head re-arm may start a second publication. */
 export const PUBLICATION_REBIND_UNRESOLVED_EVENT = 'round.publication-rebind-unresolved';
+/** The posting identity the publisher PREPARED to publish as, journaled by
+ * the host immediately before the irreversible write (native R2 F2). A
+ * restart reconciliation may only certify an absence when the lookup ran as
+ * the SAME account: an account rotation between the prepared write and the
+ * restart can hide a surviving review from a fresh lookup. */
+export const PUBLICATION_IDENTITY_EVENT = 'round.publication-identity';
 
 export interface PublicationAttemptPayload {
   readonly verdict: 'approved' | 'changes-requested';
@@ -72,6 +78,12 @@ export interface PublicationRebindUnresolvedPayload {
   readonly targetSha: string | null;
   readonly reviewId: string | null;
   readonly detail: string;
+}
+
+export interface PublicationIdentityPayload {
+  readonly actor: string;
+  readonly host: string;
+  readonly targetSha: string;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -150,6 +162,16 @@ export function parsePublicationAbsentPayload(payload: unknown): PublicationAbse
   if (!boundedString(value['targetSha'], 200) || !boundedString(value['publicationSha256'], 128) ||
     !boundedString(value['detail'], 1_000)) return null;
   return { targetSha: value['targetSha'], publicationSha256: value['publicationSha256'], detail: value['detail'] };
+}
+
+/** Strict, THROW-FREE parse of a `round.publication-identity` payload.
+ * Malformed/absent identity evidence never certifies a restart absence: the
+ * recovery caller treats a null parse as "continuity unprovable" and holds. */
+export function parsePublicationIdentityPayload(payload: unknown): PublicationIdentityPayload | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const value = payload as Record<string, unknown>;
+  if (!boundedString(value['actor'], 200) || !boundedString(value['host'], 255) || !boundedString(value['targetSha'], 200)) return null;
+  return { actor: value['actor'], host: value['host'], targetSha: value['targetSha'] };
 }
 
 /** Strict, THROW-FREE parse of a `round.publication-rebind-unresolved`
