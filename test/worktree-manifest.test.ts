@@ -41,6 +41,40 @@ describe('worktree bootstrap manifest (E8, ruling 18a)', () => {
     expect(manifest.setup[0]?.command).toBe('npm install');
   });
 
+  it('retired GC bootstrap refuses before links/copies/setup, while historical verification remains readable', async () => {
+    const repo = makeFixtureRepo('fixture-retired-bootstrap');
+    try {
+      writeFileSync(join(repo.path, '.env.local'), 'private fixture\n');
+      const manifest = parseWorktreeManifest([
+        '[[copy]]', 'from = ".env.local"', 'to = ".env.local"',
+        '# BEGIN GRU COMMAND BMAD BOOTSTRAP', '[[setup]]',
+        'command = "node .gru-command/bmad-bootstrap.mjs"',
+        '# END GRU COMMAND BMAD BOOTSTRAP', '[verify]', 'full = "npm test"',
+      ].join('\n'));
+      expect(resolveVerifyCommand(manifest, 'full')).toBe('npm test');
+      const worktreePath = join(repo.path, '..', 'fixture-retired-bootstrap-wt');
+      repo.git(['worktree', 'add', '--detach', worktreePath, 'HEAD']);
+      await expect(applyWorktreeManifest(manifest, { sourceRoot: repo.path, worktreePath, setupTimeoutMs: 10_000 }))
+        .rejects.toThrow(/retired GC-managed BMAD bootstrap.*docs\/BMAD-RUNTIME.md/u);
+      expect(existsSync(join(worktreePath, '.env.local'))).toBe(false);
+      expect(existsSync(join(worktreePath, '_bmad'))).toBe(false);
+      repo.git(['worktree', 'remove', '--force', worktreePath]);
+    } finally { repo.cleanup(); }
+  });
+
+  it('incomplete and edited GC marker blocks remain creation guards, not silently skipped commands', () => {
+    for (const text of [
+      '# BEGIN GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "echo edited"',
+      '# END GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "echo user"',
+    ]) expect(parseWorktreeManifest(text).retiredGcBmadBootstrap).toBe(true);
+  });
+
+  it('foreign multiline setup strings may mention BMAD markers without becoming GC-owned blocks', () => {
+    const foreign = "[[setup]]\ncommand = '''\n# BEGIN GRU COMMAND BMAD BOOTSTRAP\necho independent-BMAD\n# END GRU COMMAND BMAD BOOTSTRAP\n'''\n";
+    expect(parseWorktreeManifest(foreign).retiredGcBmadBootstrap).toBeUndefined();
+    expect(parseWorktreeManifest(`${foreign}# BEGIN GRU COMMAND BMAD BOOTSTRAP\n`).retiredGcBmadBootstrap).toBe(true);
+  });
+
   it('rejects malformed manifests loudly', () => {
     expect(() => parseWorktreeManifest('not toml [')).toThrowError(/valid TOML/);
     expect(() => parseWorktreeManifest('[[link]]\nat = ""\nto = "x"')).toThrowError(/non-empty/);

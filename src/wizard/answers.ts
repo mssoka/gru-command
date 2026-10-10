@@ -13,13 +13,6 @@ import { DEFAULT_INSTANCE_PORT, expandTilde, ROLES, RUNTIME_IDS, type Role, type
  * nothing written.
  */
 
-/**
- * Per-repo BMAD choice (issue #283): `provision` creates the project-local
- * state the GC-managed BMAD runtime uses (idempotent; nothing existing is
- * modified); `skip` leaves the repo untouched.
- */
-export type BmadRepoAction = 'provision' | 'skip';
-
 export interface WizardAnswers {
   /** Raw workspace-root string as answered (`~`-form preserved in output). */
   readonly workspaceRoot: string;
@@ -38,8 +31,6 @@ export interface WizardAnswers {
   readonly token: string;
   readonly registerService: boolean;
   readonly smoke: boolean;
-  /** Per-selected-repo BMAD action; defaults to provision. */
-  readonly bmad: Readonly<Record<string, BmadRepoAction>>;
 }
 
 /** Error class for answers validation — message is the whole UX. */
@@ -62,7 +53,6 @@ const ANSWER_KEYS = [
   'token',
   'register_service',
   'smoke',
-  'bmad',
 ] as const;
 
 export const DEFAULT_WORKSPACE_ROOT = '~/code';
@@ -223,6 +213,13 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
   if (!isPlainObject(raw)) {
     throw new AnswersError('--answers must be a JSON object');
   }
+  if (Object.hasOwn(raw, 'bmad')) {
+    throw new AnswersError(
+      'answers.bmad is retired: GC setup no longer provisions or configures BMAD. ' +
+        'Remove the bmad key from --answers and re-run GC setup; independent BMAD installations stay untouched. ' +
+        'For old GC bootstrap references, see docs/BMAD-RUNTIME.md.',
+    );
+  }
   for (const key of Object.keys(raw)) {
     if (!(ANSWER_KEYS as readonly string[]).includes(key)) {
       throw new AnswersError(
@@ -331,32 +328,6 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     }
   }
 
-  const bmad: Record<string, BmadRepoAction> = {};
-  for (const repo of repos) bmad[repo] = 'provision';
-  if (raw['bmad'] !== undefined) {
-    if (!isPlainObject(raw['bmad'])) {
-      throw new AnswersError('answers.bmad must be an object of selected repo → provision | skip');
-    }
-    for (const [repo, action] of Object.entries(raw['bmad'])) {
-      if (!repos.includes(repo)) {
-        throw new AnswersError(`answers.bmad names unselected repo \`${repo}\``);
-      }
-      if (action === 'install' || action === 'reuse') {
-        throw new AnswersError(
-          `answers.bmad.${repo} = ${JSON.stringify(action)} was retired with the repo-local BMAD installer: ` +
-            'Gru Command now ships the BMAD runtime itself. Use "provision" (creates only missing project ' +
-            'state, never modifies an existing install) or "skip".',
-        );
-      }
-      if (action !== 'provision' && action !== 'skip') {
-        throw new AnswersError(
-          `answers.bmad.${repo} must be "provision" or "skip", got: ${JSON.stringify(action)}`,
-        );
-      }
-      bmad[repo] = action;
-    }
-  }
-
   return {
     workspaceRoot,
     repos,
@@ -369,6 +340,5 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     token,
     registerService: raw['register_service'] === true,
     smoke: raw['smoke'] !== false,
-    bmad,
   };
 }

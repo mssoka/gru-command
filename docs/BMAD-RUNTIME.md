@@ -1,16 +1,148 @@
-# GC-managed BMAD runtime (historical/transitional)
+# BMAD-agnostic setup and historical runtime
 
-For the new directly editable GC-owned resource package, explicit invocation
-context and local integrity maintenance, see [GC-WORKFLOWS.md](GC-WORKFLOWS.md).
-This document describes the retained #283 package, already-bound historical
-sessions and transitional setup (pending #295). Production new-job and fallback
-selection now use owned resources (#294); the historical ambient fallback described
-below is no longer the production route. This is not the maintenance procedure for
-new GC workflows, and nothing described here is automatically migrated or removed.
+## Current GC setup
 
-Gru Command (GC) ships the BMAD framework its build workflow uses. A managed
-repository does not need its own BMAD installation for GC builds: it keeps
-only its own settings, context and generated work. (Issue #283.)
+Interactive setup has no BMAD install/reuse/provision/skip step. Headless setup
+needs no `bmad` answers, `_bmad` files, global skills, Python or `uv`. It validates
+the selected Git roots and GC worktree manifests, then writes only the existing
+GC instance configuration (with its normal backup/first-boot smoke behavior).
+Runtime CLIs are probed; their absence remains a warning until agent spawn.
+
+GC does not read user BMAD settings as GC configuration, render BMAD skills,
+create output folders or skill bindings, repair an installation, or run project
+setup commands during the wizard. Healthy, incomplete, conflicting, malformed
+and linked BMAD state is left untouched. Explicit project `[[setup]]`, `[[link]]`
+and `[[copy]]` instructions remain authoritative when a fresh worktree is created,
+even when they mention BMAD. They are not filtered by name.
+
+**Obsolete headless answers:** any `bmad` key (including `{}`, `skip`, `provision`,
+`install` or `reuse`) fails before writes with `answers.bmad is retired`.
+Remove the entire key and re-run GC setup; do not replace it with an install.
+Unknown general answer/config fields still fail loudly, rather than being ignored.
+
+New GC jobs use the explicit owned workflow/artifact context: private material
+under the configured GC data home (normally `~/.gru-command`), and approved
+portable knowledge in the assigned worktree's `gru-output/`. These locations are
+initialized by the established job/artifact contracts, not by BMAD provisioning.
+Existing `gru-output/` documents, `_bmad-output`, installations, custom settings,
+unrelated skills, active-job paths and historical bindings are not migrated,
+rewritten or removed. See [GC-WORKFLOWS.md](GC-WORKFLOWS.md).
+
+## Retire only the GC bootstrap
+
+A marked `GRU COMMAND BMAD BOOTSTRAP` block is an obsolete GC instruction, not
+an independent user installation. Setup and new worktree bootstrap fail before
+executing it with a pointer here. Already-running jobs can still read their
+original verification commands and retain their original paths/bindings.
+GC never edits this block automatically. Unmarked user commands remain user-owned.
+
+The narrow owner-run procedure below disables **only** the exact supported GC
+manifest block. It does not move/delete `_bmad`, `_bmad-output`, skills, settings,
+`.gru-command/bmad-install.json`, `.gru-command/bmad-bootstrap.mjs`, Git-local
+source settings, or any existing worktree. Retain those inert files/settings for
+historical lanes; archive them manually only after no lane needs them. There is
+no transfer to GC configuration: independent BMAD settings stay independent.
+The older optional full retirement/answer-transfer procedure further below is
+for owners deliberately retiring a historical repo-local installation, not a
+prerequisite for GC setup.
+
+Choose one repository and a **new backup directory outside it**. Python 3.11+
+is needed only for this optional owner-run command, never for GC setup:
+
+```sh
+# gc-bootstrap-retire:vars
+REPO="$HOME/code/your-repo"
+BACKUP="$HOME/.gru-command/bootstrap-backups/$(basename "$REPO")-$(date +%Y%m%dT%H%M%S)"
+MODE=preview
+```
+
+Run this same block first with `MODE=preview` (repository read-only; saves exact
+before/after bytes outside it). Inspect the plan and backup, then explicitly set
+`MODE=retire` and run it again. `MODE=restore` restores the original bytes only
+if the manifest has not since been edited. Edited, foreign, duplicate or incomplete
+blocks stop without changing the repository: preserve them and remove only the
+confirmed obsolete command by hand after a backup. Never guess ownership from a
+BMAD name. The two supported generated block versions are checked byte-for-byte,
+apart from LF/CRLF line endings.
+
+```sh
+# gc-bootstrap-retire:run
+python3 -I - "$REPO" "$BACKUP" "${MODE:-preview}" <<'PY'
+import os, pathlib, subprocess, sys, tomllib
+repo, backup = (pathlib.Path(os.path.realpath(p)) for p in sys.argv[1:3])
+mode = sys.argv[3]
+if mode not in ("preview", "retire", "restore"):
+    sys.exit("STOP: MODE must be preview, retire or restore")
+if backup == repo or repo in backup.parents:
+    sys.exit("STOP: BACKUP must be outside the repository")
+env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+top = subprocess.run(["git", "-C", str(repo), "rev-parse", "--show-toplevel"], env=env, capture_output=True, text=True)
+if top.returncode or pathlib.Path(os.path.realpath(top.stdout.strip())) != repo:
+    sys.exit("STOP: REPO must be the root of a usable Git repository")
+manifest = repo / ".gru-command/worktree.toml"
+if (repo / ".gru-command").is_symlink() or manifest.is_symlink() or not manifest.is_file():
+    sys.exit("STOP: the GC manifest must be a regular repository-local file; preserve uncertain ownership")
+original, retired, identity = (backup / n for n in ("original-worktree.toml", "retired-worktree.toml", "repo.txt"))
+if mode == "preview":
+    data = manifest.read_bytes()
+    lines = data.decode("utf-8").splitlines(keepends=True)
+    begin, end = "# BEGIN GRU COMMAND BMAD BOOTSTRAP", "# END GRU COMMAND BMAD BOOTSTRAP"
+    starts = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == begin]
+    ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == end]
+    if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        sys.exit("STOP: missing, duplicate or incomplete GC block; back up and repair deliberately")
+    first, last = starts[0], ends[0]
+    block = [line.rstrip("\r\n") for line in lines[first:last + 1]]
+    supported = [
+        [begin, "[[setup]]", 'command = "node .gru-command/bmad-bootstrap.mjs"', end],
+        [begin, "[[setup]]", "# Fresh clones have no git-local BMAD source. Only onboarded repositories",
+         "# run the generated copier; a configured but invalid source still fails loud.",
+         'command = "if git config --local --get gru-command.bmad-source >/dev/null 2>&1; then node .gru-command/bmad-bootstrap.mjs; fi"', end],
+    ]
+    if block not in supported:
+        sys.exit("STOP: edited/foreign GC block; preserve its bytes and repair deliberately")
+    # Confirm these are comments, not marker-looking lines in a setup string.
+    text = data.decode("utf-8")
+    for index in (first, last):
+        if tomllib.loads("".join(lines[:index] + lines[index + 1:])) != tomllib.loads(text):
+            sys.exit("STOP: markers are user string data, not GC-owned comments")
+    clean = "".join(lines[:first] + lines[last + 1:]).encode("utf-8")
+    tomllib.loads(clean.decode("utf-8"))
+    backup.mkdir(parents=True, exist_ok=False)
+    original.write_bytes(data)
+    retired.write_bytes(clean)
+    identity.write_text(str(repo), encoding="utf-8")
+    print("PREVIEW: retire only the supported GC bootstrap block in", manifest)
+    print("Exact original and retired manifest bytes saved in", backup)
+    lanes = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"], env=env, capture_output=True, text=True, check=True)
+    print(lanes.stdout, end="")
+    print("Existing lanes, outputs, settings, records and skills remain untouched.")
+else:
+    if identity.read_text(encoding="utf-8") != str(repo):
+        sys.exit("STOP: BACKUP belongs to a different repository")
+    expected, replacement = (original, retired) if mode == "retire" else (retired, original)
+    if manifest.read_bytes() != expected.read_bytes():
+        sys.exit("STOP: manifest changed since preview/retirement; preserve it and preview again")
+    manifest.write_bytes(replacement.read_bytes())
+    print(mode + ": manifest only; all other files and existing lanes unchanged")
+PY
+```
+
+Review and commit the resulting `.gru-command/worktree.toml` change through the
+normal owner workflow. Until committed, a fresh checkout of old HEAD still has
+the obsolete block and fails with retirement guidance rather than reinstalling.
+Then create a disposable fresh worktree of the committed HEAD and run GC setup
+there to prove the next lane's manifest is current. Do not test by modifying a
+live job, and do not run arbitrary user setup commands unless you intend their
+declared effects. `test/gc-bootstrap-retirement.test.ts` executes this procedure against disposable
+repositories, including changed-block refusal and restoration; the historical full
+procedure is covered by `test/bmad-legacy-retirement.test.ts`.
+
+## Historical #283 package
+
+The remaining sections describe the retained pinned package and already-bound
+historical sessions, not new setup or current production workflow selection.
+No historical files/bindings are automatically migrated or removed.
 
 ## What is bundled
 
@@ -100,28 +232,10 @@ refuses to read or write project state through a symlink: `_bmad`,
 `_bmad/custom` and its settings files, and anything under
 `_bmad/render/<skill>`.
 
-**Provisioning.** The setup wizard's BMAD step (`provision`, the default for
-each selected repo; `skip` leaves a repo untouched) creates only what is
-missing: `_bmad/custom/` with its `.gitignore`, `_bmad/render/` with its
-`.gitignore`, and the configured output folders that resolve inside the repo.
-It never modifies an existing file or directory. It never touches a legacy
-install or unrelated skills, and never runs the upstream installer.
-
-Before creating anything, it checks the project the way the renderer will
-read it, so it never reports ready for a repo whose first build would stop:
-
-- every `_bmad/custom/*.toml` parses;
-- the settings the bundled skills read are strings;
-- no legacy installer answer differs from the effective value;
-- a kept `_bmad/render/.gitignore` still ignores snapshots;
-- no target is a symlink or the wrong kind of entry.
-
-Last, it runs every bundled skill's own launcher against the repo, exactly
-as a build would. A `HALT` is a deterministic refusal, and the entries this
-run created are removed again.
-
-The headless answers values `install` and `reuse` were retired with the
-repo-local installer and fail loud.
+**Historical provisioning is retired.** The wizard no longer creates or checks
+any of the paths above. Do not use BMAD runtime maintenance/renderer checks to
+decide whether a repository is ready for current GC setup. These contracts remain
+available only for retained historical sessions and deliberate owner maintenance.
 
 ## How a job binds to a runtime
 
@@ -213,6 +327,8 @@ moves goes to `$BACKUP`, so it can be restored. Nothing is deleted.
   matches the installer's own hash record (`_bmad/_config/files-manifest.csv`)
   move
 - user setup commands in `.gru-command/worktree.toml`
+- historical `.gru-command/bmad-install.json` and `bmad-bootstrap.mjs` files,
+  even when edited; their obsolete manifest reference is removed precisely
 - all other project files
 
 **1. Choose the repository** (edit the first two lines):
@@ -336,15 +452,29 @@ for root in (".agents/skills", ".claude/skills"):
     for name in sorted(os.listdir(os.path.join(repo, root))):
         if name in ids:
             (bindings if proven(f"{root}/{name}", name) else unproven).append(f"{root}/{name}")
-gc_files = [rel for rel in (".gru-command/bmad-install.json",) if gc_owned_json(rel)]
-boot = os.path.join(repo, ".gru-command", "bmad-bootstrap.mjs")
-if os.path.isfile(boot) and "// Managed by Gru Command BMAD bootstrap v1" in open(boot, encoding="utf-8").read():
-    gc_files.append(".gru-command/bmad-bootstrap.mjs")
+# A marker or managed_by field does not prove every byte is unedited.
+# Keep historical records/copiers in place; disabling their manifest reference
+# is enough. The owner may archive them separately after no lane needs them.
+gc_files = []
 def has_block(path, start, end):
     if not os.path.isfile(path):
         return False
     lines = open(path, encoding="utf-8").read().splitlines()
-    return start in lines and end in lines and lines.index(start) < lines.index(end)
+    if start not in lines and end not in lines:
+        return False
+    if lines.count(start) != 1 or lines.count(end) != 1 or lines.index(start) >= lines.index(end):
+        sys.exit(f"STOP: incomplete/duplicate owned block in {path}; preserve it and repair deliberately")
+    if start == "# BEGIN GRU COMMAND BMAD BOOTSTRAP":
+        block = lines[lines.index(start):lines.index(end) + 1]
+        supported = [
+            [start, "[[setup]]", 'command = "node .gru-command/bmad-bootstrap.mjs"', end],
+            [start, "[[setup]]", "# Fresh clones have no git-local BMAD source. Only onboarded repositories",
+             "# run the generated copier; a configured but invalid source still fails loud.",
+             'command = "if git config --local --get gru-command.bmad-source >/dev/null 2>&1; then node .gru-command/bmad-bootstrap.mjs; fi"', end],
+        ]
+        if block not in supported:
+            sys.exit(f"STOP: edited/foreign GC bootstrap block in {path}; preserve it and repair deliberately")
+    return True
 manifest_block = has_block(os.path.join(repo, ".gru-command", "worktree.toml"),
                            "# BEGIN GRU COMMAND BMAD BOOTSTRAP", "# END GRU COMMAND BMAD BOOTSTRAP")
 exclude = git("rev-parse", "--git-path", "info/exclude").stdout.strip()
@@ -393,6 +523,8 @@ for line in git("worktree", "list", "--porcelain").stdout.splitlines():
         lanes.append(line[9:])
 proofs = {f: sha(f) for f in installer_files}
 proofs.update({f: sha(f) for b in bindings for f in files_under(b)})
+if manifest_block:
+    proofs[".gru-command/worktree.toml"] = sha(".gru-command/worktree.toml")
 plan = {"repo": repo, "framework": framework, "bindings": bindings, "unproven_bindings": unproven, "proofs": proofs,
         "unrecognized": unrecognized, "leftovers": leftovers, "module_dirs": module_dirs,
         "gc_files": gc_files, "manifest_block": manifest_block,
@@ -405,6 +537,7 @@ print(f"Plan for {repo} (saved to {backup}/plan.json)")
 print("  move aside (framework):", ", ".join(whole) or "nothing",
       f"+ {len(installer_files)} installer-recorded files under _bmad/{{{','.join(module_dirs)}}}")
 print(f"  move aside (proven BMAD skill bindings): {len(bindings)}")
+print("  historical bootstrap records/copiers: preserved in place")
 print("  GC-owned bootstrap references:", ", ".join(gc_files + (["worktree.toml block"] if manifest_block else [])
       + (["local exclude block"] if exclude_block else []) + (["git config gru-command.bmad-source"] if source else [])) or "none")
 print("  re-home settings:", json.dumps(transfer, ensure_ascii=False) if any(transfer.values()) else "none pending")

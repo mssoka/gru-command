@@ -21,17 +21,6 @@ import {
 import type { GruCommandConfig } from '../src/config.js';
 
 /**
- * A `uv` on PATH that answers the prerequisite probe itself and hands
- * everything else (the provisioning render check runs `uv run …`) to the
- * real uv, which the BMAD runtime needs.
- */
-const REAL_UV = execFileSync('/bin/sh', ['-c', 'command -v uv'], { encoding: 'utf-8' }).trim();
-function uvStub(versionExit = 'exit 0'): string {
-  return `#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then ${versionExit}; fi\nexec ${JSON.stringify(REAL_UV)} "$@"\n`;
-}
-
-
-/**
  * Setup wizard units (E9): answers validation (fail-loud, nothing
  * written), schema-exact config generation (proven against the REAL
  * loader), backup-on-rerun, QR payload shape parity with the web pairing
@@ -77,7 +66,7 @@ describe('wizard answers', () => {
     expect(answers.token).not.toBe('');
     expect(answers.registerService).toBe(false);
     expect(answers.smoke).toBe(true);
-    expect(answers.bmad).toEqual({});
+    expect(answers).not.toHaveProperty('bmad');
   });
 
   it('invalid answers fail loud, naming the field — nothing written anywhere', () => {
@@ -126,15 +115,14 @@ describe('wizard answers', () => {
       JSON.stringify({ workspace_root: workspace, repos: ['repo-a', 'repo-b'] }),
     );
     expect(ok.repos).toEqual(['repo-a', 'repo-b']);
-    expect(ok.bmad).toEqual({ 'repo-a': 'provision', 'repo-b': 'provision' });
-    // A legacy repo-local install does not change the default (issue #283):
-    // provisioning never modifies it.
+    expect(ok).not.toHaveProperty('bmad');
+    // Independent BMAD is not GC setup configuration.
     mkdirSync(join(workspace, 'repo-b', '_bmad', '_config'), { recursive: true });
     writeFileSync(join(workspace, 'repo-b', '_bmad', '_config', 'manifest.yaml'), 'existing\n');
     const defaultsByState = parseAnswers(
       JSON.stringify({ workspace_root: workspace, repos: ['repo-a', 'repo-b'] }),
     );
-    expect(defaultsByState.bmad).toEqual({ 'repo-a': 'provision', 'repo-b': 'provision' });
+    expect(defaultsByState).not.toHaveProperty('bmad');
     expect(() =>
       parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['repo-a', 'repo-a'] })),
     ).toThrow(/duplicate repo names/);
@@ -384,118 +372,49 @@ describe('wizard CLI surface', () => {
     expect(err).toContain('--no-interact');
   });
 
-  it('noninteractive deterministic BMAD failure fails loud without offering retry; explicit skip completes (gh-32)', () => {
+  it('obsolete BMAD actions are rejected with an explicit GC setup repair, not a hidden install', () => {
+    for (const value of [{}, { 'repo-a': 'provision' }, { 'repo-a': 'skip' }, { 'repo-a': 'reuse' }]) {
+      expect(() => parseAnswers(JSON.stringify({ bmad: value }))).toThrow(/answers.bmad is retired.*Remove the bmad key/u);
+    }
+  });
+
+  it('headless setup accepts a wrong-kind user BMAD path without reading or changing it', () => {
     const repoRoot = join(import.meta.dirname, '..');
-    const workspace = tempDir('gru-command-wizard-det-ws-');
+    const workspace = tempDir('gru-command-wizard-independent-ws-');
     const repoA = join(workspace, 'repo-a');
-    mkdirSync(repoA, { recursive: true });
+    mkdirSync(repoA);
     execFileSync('git', ['init', '-q'], { cwd: repoA });
-    // A symlinked project-state path is unchanged on-disk state: the
-    // deterministic class (provisioning never writes through a link).
-    symlinkSync(tempDir('gru-command-wizard-det-elsewhere-'), join(repoA, '_bmad'));
-    const bin = tempDir('gru-command-wizard-det-bin-');
-    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
-    const baseEnv = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` };
-    // Explicit objects (no string surgery): each leg names its repo and
-    // action directly. Port 0 keeps the fixed-port pre-check out of the
-    // fixture; smoke is off because this leg is about the BMAD contract.
-    const answersFor = (repo: string, action: string) =>
-      JSON.stringify({ workspace_root: workspace, repos: [repo], bmad: { [repo]: action }, runtime: 'pi', port: 0, smoke: false });
-    const runWizard = (answersJson: string, home: string) => spawnSync(
-      process.execPath,
-      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
-      { env: { ...baseEnv, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 60_000 },
-    );
-    const instance = tempDir('gru-command-wizard-det-home-');
-    const failed = runWizard(answersFor('repo-a', 'provision'), instance);
-    expect(failed.status, failed.stderr).toBe(1);
-    expect(failed.stderr).toContain('deterministic failure — retrying cannot fix it');
-    expect(failed.stderr).toContain('refusing BMAD project path through symlink');
-    // The truthful contract names the deliberate fix and the explicit skip
-    // escape hatch — and never suggests the futile retry.
-    expect(failed.stderr).toContain('Replace the symlinked path with a real directory deliberately');
-    expect(failed.stderr).toContain('answers.bmad.repo-a="skip"');
-    expect(failed.stderr).not.toContain('Retry after fixing it');
-    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
-
-    // Explicit skip keeps the existing opt-out contract: headless completion.
-    const skipHome = tempDir('gru-command-wizard-det-skip-home-');
-    const skipped = runWizard(answersFor('repo-a', 'skip'), skipHome);
-    expect(skipped.status, skipped.stderr).toBe(0);
-    expect(skipped.stdout).toContain('BMAD not ready in repo-a: skipped by explicit per-repo choice');
-    expect(readFileSync(join(skipHome, 'config.toml'), 'utf-8')).toContain('port = 0');
-
-    // The retired installer actions fail before anything is written.
-    const retiredHome = tempDir('gru-command-wizard-det-retired-home-');
-    const retired = runWizard(answersFor('repo-a', 'reuse'), retiredHome);
-    expect(retired.status).not.toBe(0);
-    expect(retired.stderr).toContain('was retired with the repo-local BMAD installer');
-    expect(existsSync(join(retiredHome, 'config.toml'))).toBe(false);
-  }, 120_000);
-
-  it('noninteractive hint-less deterministic failures name the neutral deliberate repair (gh-32 final review)', () => {
-    const repoRoot = join(import.meta.dirname, '..');
-    const workspace = tempDir('gru-command-wizard-fallback-ws-');
-    const repoA = join(workspace, 'repo-a');
-    mkdirSync(repoA, { recursive: true });
-    execFileSync('git', ['init', '-q'], { cwd: repoA });
-    // `_bmad` as a regular file is deterministic with NO class hint, so the
-    // neutral deliberate-repair fallback renders.
     writeFileSync(join(repoA, '_bmad'), 'not a directory\n');
-    const bin = tempDir('gru-command-wizard-fallback-bin-');
-    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
-    const answersJson = JSON.stringify({
-      workspace_root: workspace,
-      repos: ['repo-a'],
-      bmad: { 'repo-a': 'provision' },
-      runtime: 'pi',
-      port: 0,
-      smoke: false,
-    });
-    const instance = tempDir('gru-command-wizard-fallback-home-');
-    const failed = spawnSync(
-      process.execPath,
-      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
-      { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, GRU_COMMAND_HOME: instance }, encoding: 'utf-8', timeout: 60_000 },
-    );
-    expect(failed.status, failed.stderr).toBe(1);
-    expect(failed.stderr).toContain('BMAD project path exists but is not a directory');
-    expect(failed.stderr).toContain('Repair the reported condition deliberately, then re-run the wizard');
-    expect(failed.stderr).not.toContain('Retry after fixing it');
-    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
-  }, 120_000);
+    const home = tempDir('gru-command-wizard-independent-home-');
+    const result = spawnSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--answers', JSON.stringify({
+      workspace_root: workspace, repos: ['repo-a'], port: 0, smoke: false,
+    })], { env: { ...process.env, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 30_000 });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('Repository ready in repo-a');
+    expect(readFileSync(join(repoA, '_bmad'), 'utf-8')).toBe('not a directory\n');
+    expect(existsSync(join(repoA, '_bmad-output'))).toBe(false);
+  });
 
-  it('noninteractive provisioning reports the runtime, keeps a legacy install untouched, and is idempotent', () => {
+  it('headless setup leaves legacy outputs untouched and repeated setup creates no BMAD state', () => {
     const repoRoot = join(import.meta.dirname, '..');
-    const workspace = tempDir('gru-command-wizard-provision-ws-');
+    const workspace = tempDir('gru-command-wizard-repeat-ws-');
     const repoA = join(workspace, 'repo-a');
-    mkdirSync(repoA, { recursive: true });
+    mkdirSync(repoA);
     execFileSync('git', ['init', '-q'], { cwd: repoA });
-    mkdirSync(join(repoA, '_bmad', '_config'), { recursive: true });
-    writeFileSync(join(repoA, '_bmad', '_config', 'manifest.yaml'), 'installation:\n  version: 6.12.0\n');
-    mkdirSync(join(repoA, '_bmad-output', 'specs'), { recursive: true });
-    writeFileSync(join(repoA, '_bmad-output', 'specs', 'brief.md'), '# brief\n');
-    const bin = tempDir('gru-command-wizard-provision-bin-');
-    writeFileSync(join(bin, 'uv'), uvStub(), { mode: 0o755 });
-    const answersJson = JSON.stringify({ workspace_root: workspace, repos: ['repo-a'], runtime: 'pi', port: 0, smoke: false });
-    const runWizard = (home: string) => spawnSync(
-      process.execPath,
-      [join(repoRoot, 'dist', 'wizard', 'main.js'), '--answers', answersJson],
-      { env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 60_000 },
-    );
-    const first = runWizard(tempDir('gru-command-wizard-provision-home-'));
-    expect(first.status, first.stderr + first.stdout).toBe(0);
-    expect(first.stdout).toContain('repo-a: provision');
-    expect(first.stdout).toMatch(/BMAD ready in repo-a: GC-managed BMAD runtime bmad-method@6\.12\.0\+gru-command-bmad\.1; created /u);
-    expect(first.stdout).toContain('legacy repo-local BMAD install left unchanged');
-    expect(first.stdout).toContain('Commit repo-a/_bmad/custom/');
-    expect(readFileSync(join(repoA, '_bmad', '_config', 'manifest.yaml'), 'utf-8')).toBe('installation:\n  version: 6.12.0\n');
-    expect(readFileSync(join(repoA, '_bmad-output', 'specs', 'brief.md'), 'utf-8')).toBe('# brief\n');
-    expect(existsSync(join(repoA, '.gru-command'))).toBe(false);
-    const second = runWizard(tempDir('gru-command-wizard-provision-again-home-'));
-    expect(second.status, second.stderr + second.stdout).toBe(0);
-    expect(second.stdout).toContain('created nothing');
-  }, 120_000);
+    mkdirSync(join(repoA, '_bmad-output'));
+    writeFileSync(join(repoA, '_bmad-output/brief.md'), '# brief\n');
+    const home = tempDir('gru-command-wizard-repeat-home-');
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = spawnSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--force', '--answers', JSON.stringify({
+        workspace_root: workspace, repos: ['repo-a'], port: 0, smoke: false,
+      })], { env: { ...process.env, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 30_000 });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('Selected managed repos: repo-a');
+      expect(readFileSync(join(repoA, '_bmad-output/brief.md'), 'utf-8')).toBe('# brief\n');
+      expect(existsSync(join(repoA, '_bmad'))).toBe(false);
+      expect(existsSync(join(repoA, '.agents'))).toBe(false);
+    }
+  });
 
   it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {
     for (const good of ['::', '::1', 'fe80::1', 'fe80::1%en0', '1:2:3:4:5:6:7:8', '::ffff:127.0.0.1']) {

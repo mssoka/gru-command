@@ -23,8 +23,10 @@ storage contract before creating any ledger or worktree state; historical IDs an
 bindings are not migrated.
 Project AGENTS.md, testing conventions and approved source documents still apply.
 No project/global skill or malformed `_bmad/custom`/legacy answer selects GC's
-workflow. Setup provisioning is still transitional until #295; independent BMAD
-installations, historical records and live sessions are not modified.
+workflow. Setup validates only Git/GC prerequisites and no longer provisions BMAD;
+independent installations, historical records and live sessions are not modified.
+Retire obsolete GC bootstrap references only through the owner-run procedure in
+[BMAD-RUNTIME.md](BMAD-RUNTIME.md).
 
 Production fallback review verifies the assigned owned package and uses its
 adversarial review helper. Reports stay under the same private job operational
@@ -151,8 +153,8 @@ bytes; corrupt retained bytes fail loudly, never silently switch the lane.
 and composes `createArtifactContext` with the verified renderer. It records raw
 caller context privately in `workflow-context.json` (usable by the skill launcher)
 and renders a separate immutable invocation receipt with package identity. The
-system prompt names exact skill/entrypoint/context/output paths. This does not
-change setup provisioning.
+system prompt names exact skill/entrypoint/context/output paths. Setup does not
+provision project BMAD state; operational paths are initialized at job binding.
 
 ## Editing and shipping (maintainers)
 
