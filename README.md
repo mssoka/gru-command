@@ -181,24 +181,24 @@ context and no project/global BMAD, Python/uv or external skill dependency.
 See [docs/GC-WORKFLOWS.md](docs/GC-WORKFLOWS.md) for invocation, local manifest
 refresh, packaging tests and retained lane bindings.
 
-This resource-package change (#292) does **not** switch production sessions,
-review fallback selection or setup; those cutovers belong to #294/#295.
-Independent project BMAD installations and historical outputs are untouched.
-The existing transitional session/setup path is documented below.
+New implementation jobs now receive this owned package and explicit registered
+project/job context on both Pi and Claude Code. Operational material is private
+under `<data_dir>/projects/<project-key>/jobs/<job-id>/operational/`; approved
+portable knowledge belongs in the assigned worktree's `gru-output/`. GC-invoked
+fallback review uses a verified owned helper, not a global `bmad-review` install.
+Fallback PASS clears review/fix routing only, never native Perkins READY.
+Independent BMAD installs and historical outputs/bindings remain untouched;
+resumes retain their original package or fail with exact restoration guidance.
+Setup provisioning remains transitional until #295; it is not required for new
+GC-owned execution.
 
 ### GC-managed BMAD runtime (transitional)
 
-Gru Command ships the BMAD framework its build workflow uses: a pinned
-`bmad-method@6.12.0` `bmad-build` skill, unchanged, plus a small GC
-customization layer. A managed repository needs no BMAD installation of
-its own. Every job lane binds to the runtime it started with, so a GC
-update never switches a running job's workflow instructions. The bundled
-review layers carry no finding quota: a clean change may get no
-actionable findings. The bmad-review fallback gate still uses an installed
-`bmad-review` skill: 0 blockers clear review/fix routing only (the PASS is
-not a Perkins READY), while blockers route back to the implementing minion
-as fix directives. Perkins (GitHub/GitLab) remains the stronger gate with
-exact-head verdicts, and the owner holds every merge.
+The pinned `bmad-method@6.12.0` build package remains available for already-bound
+historical lanes. New jobs select GC-owned delivery resources instead. An upgrade
+never switches a running lane's workflow; missing retained bytes require restoring
+that exact package, not recreating the worker/worktree/PR. Perkins (GitHub/GitLab)
+remains the exact-head native release gate, and the owner holds every merge.
 
 For each selected managed repo (not the workspace root, and never every
 discovered directory), the wizard offers to **provision** the project
@@ -214,9 +214,9 @@ a malformed settings file) offer skip-only with deliberate repair
 guidance. Prerequisite and I/O failures keep retry or explicit skip. No
 false-ready state.
 
-You need the selected runtime CLI (`pi` or `claude`) for agents and `uv`
-for BMAD workflows. Missing prerequisites are reported before a repo is
-marked BMAD-ready. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
+You need the selected runtime CLI (`pi` or `claude`) for agents. Only the
+historical BMAD/provisioning path uses `uv`; owned GC execution does not.
+Legacy setup prerequisites are reported before a repo is marked BMAD-ready. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
 
 - the bundled set
 - configuration precedence

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -8,6 +8,7 @@ import { SessionStore } from '../src/sessions/store.js';
 import { buildClaudeCodeAuthArgs, isGitLabRemote } from '../src/dispatch/review-path.js';
 import {
   boundedDiff,
+  fallbackReviewPolicy,
   parseFallbackFindingsReport,
   parseRepoRemote,
   preflightFailure,
@@ -285,6 +286,44 @@ describe('isGitLabRemote exact-match boundary (V2 revert-mutation pin)', () => {
     expect(isGitLabRemote('notgitlab.com')).toBe(false);
     expect(isGitLabRemote('gitlab.example.test')).toBe(true);
     expect(isGitLabRemote('gitlab.com')).toBe(true);
+  });
+});
+
+describe('host-bound fallback report capability', () => {
+  it('submits only validated findings to the fixed private report with idempotent exact retries', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fallback-report-tool-'));
+    try {
+      const skill = join(root, 'helper.md'); const report = join(root, 'report.json'); const victim = join(root, 'implementation.ts');
+      writeFileSync(skill, 'verified helper'); writeFileSync(victim, 'DO_NOT_TOUCH');
+      const policy = fallbackReviewPolicy(skill, report);
+      expect(policy.tools).toEqual(['read', 'grep', 'find', 'ls']);
+      expect(policy.systemPrompt).toContain('verified helper');
+      const tool = policy.nativeTools![0]!;
+      await expect(tool.execute({ findings: [], path: victim })).rejects.toThrow(/path cannot be supplied/u);
+      await expect(tool.execute({ findings: [{}] })).rejects.toThrow(/non-empty string/u);
+      await tool.execute({ findings: [] }); await tool.execute({ findings: [] });
+      expect(() => policy.assertReportValid()).not.toThrow();
+      expect(readFileSync(report, 'utf8').trim()).toBe('[]');
+      expect(statSync(report).mode & 0o777).toBe(0o600);
+      await expect(tool.execute({ findings: [finding('correctness')] })).rejects.toThrow();
+      expect(() => policy.assertReportValid()).toThrow(/conflicting findings submissions/u);
+      expect(readFileSync(victim, 'utf8')).toBe('DO_NOT_TOUCH');
+      expect(parseFallbackFindingsReport(report)).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('cannot follow a report symlink or publish after tool cancellation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fallback-report-links-'));
+    try {
+      const skill = join(root, 'helper.md'); const victim = join(root, 'victim'); const report = join(root, 'report.json');
+      writeFileSync(skill, 'helper'); writeFileSync(victim, 'DO_NOT_TOUCH'); symlinkSync(victim, report);
+      await expect(fallbackReviewPolicy(skill, report).nativeTools![0]!.execute({ findings: [] })).rejects.toThrow();
+      expect(() => parseFallbackFindingsReport(report)).toThrow(/regular file/u);
+      rmSync(report);
+      const cancelled = new AbortController(); cancelled.abort();
+      await expect(fallbackReviewPolicy(skill, report).nativeTools![0]!.execute({ findings: [] }, cancelled.signal)).rejects.toThrow(/aborted/u);
+      expect(readFileSync(victim, 'utf8')).toBe('DO_NOT_TOUCH');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

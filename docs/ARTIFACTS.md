@@ -4,9 +4,9 @@ Issue [#293](https://github.com/mssoka/gru-command/issues/293) provides explicit
 storage primitives in `src/artifacts/context.ts`. They separate private job
 material from portable, approved project knowledge. They do **not** change
 existing BMAD session bindings, provision projects, import issues, authorize
-execution, or migrate anything. Runtime integration is owned by #294; the
-existing managed BMAD runtime continues using its historical layout until
-that integration lands.
+execution, or migrate anything. Production new-job integration (#294) now composes
+these primitives with the owned workflow binder and renderer. Already-bound BMAD
+jobs retain their historical layout; no historical namespace is rewritten.
 
 ## Locations and authority
 

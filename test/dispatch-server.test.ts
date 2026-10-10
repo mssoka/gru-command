@@ -772,6 +772,21 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('rejects a ledger-safe uppercase job id before creating GC dispatch state or a lane', async () => {
+    const h = await boot();
+    try {
+      const response = await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'ABC-123', repo_path: '/fixture', title: 'uppercase', briefing: 'must reject before effects',
+      }, TOKEN);
+      expect(response.status).toBe(400);
+      expect(field<string>(response.json, 'detail')).toContain('safe lowercase job id');
+      expect(h.ledger.getJob('ABC-123')).toBeNull();
+      expect(h.ledger.listEvents().filter((event) => event.jobId === 'ABC-123')).toEqual([]);
+      expect(h.worktrees.listWorktrees()).toEqual([]);
+      expect(h.spawns).toEqual([]);
+    } finally { await h.close(); }
+  });
+
   it('validates request bodies loudly (400, never a silent lane)', async () => {
     const h = await boot();
     try {

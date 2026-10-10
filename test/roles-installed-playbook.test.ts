@@ -214,16 +214,14 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(pkg.files).toEqual(expect.arrayContaining(['roles/', 'resources/silas-skills/']));
   });
 
-  it('the installed worker prompt carries the BMAD workflow playbook', () => {
+  it('the installed worker prompt carries the GC-owned workflow playbook', () => {
     const flat = staged.minion.replace(/\s+/gu, ' ');
-    expect(flat).toContain("your session's actual skill catalog/metadata");
-    // Issue #283: the catalog includes the lane-bound GC-managed runtime,
-    // which wins over same-named copies; project state stays in the project.
-    expect(flat).toContain('the Gru Command-managed BMAD runtime bound to your lane');
+    expect(flat).toContain('explicit project/job artifact context');
+    expect(flat).toContain('GC-owned build workflow bound to your registered lane');
     expect(flat).toContain('takes precedence over same-named copies');
-    expect(flat).toContain('never edit the runtime directory');
-    expect(flat).toContain('task-relevant BMAD skills by capability');
-    expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+    expect(flat).toContain('Never edit the runtime directory');
+    expect(flat).toContain('not an ambient project/global BMAD workflow');
+    expect(flat).toContain('`gru-output/`');
     expect(flat).toContain('You own the');
     expect(flat).toContain('selected workflow end to end');
     expect(flat).toContain("fresh, context-free tracked review jobs you commission through the service's job-dispatch surface");
@@ -242,13 +240,12 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).not.toContain('headless print mode');
     expect(flat).toContain('an inline self-review is not a substitute');
     expect(flat).toContain('report that exact capability gap loudly');
-    expect(flat).toContain('supported BMAD onboarding/discovery path');
-    // The concrete onboarding surface and the fixed-name ban.
-    expect(flat).toContain('the setup wizard\'s BMAD provisioning step');
-    expect(flat).toContain('"GC-managed BMAD runtime" section');
+    expect(flat).toContain('Restore the retained package for the same worker/lane');
+    expect(flat).toContain('not BMAD onboarding');
+    expect(flat).not.toContain('the setup wizard\'s BMAD provisioning step');
     expect(flat).not.toContain('Project-local BMAD setup');
-    expect(flat).toContain('no guessed rename');
-    expect(flat).toContain('no hand-copied skill files');
+    expect(flat).toContain('guessed rename');
+    expect(flat).toContain('hand-copied skill files');
     // Owner-held merge adoption on the worker surface.
     expect(flat).toContain('the owner holds every merge');
     expect(flat).toContain('read-only brief that names the exact immutable head');
@@ -262,9 +259,9 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     const flat = staged.silas.replace(/\s+/gu, ' ');
     expect(flat).toContain('Minion-owned build cycle');
     expect(flat).toContain('goal, boundaries, acceptance, verification');
-    expect(flat).toContain("task-relevant BMAD skills from its session's actual skill catalog");
-    expect(flat).toContain('the Gru Command-managed BMAD runtime bound to its lane');
-    expect(flat).toContain('never demand a fixed skill name in a briefing');
+    expect(flat).toContain('GC-owned build workflow and explicit project/job artifact context');
+    expect(flat).toContain('Historical lanes retain their recorded workflow and paths');
+    expect(flat).toContain('ambient BMAD skills or configuration never replace GC execution authority');
     expect(flat).toContain('verification scheduler');
     expect(flat).toContain('do not commission a supplementary review duplicating');
     expect(flat).toContain('exact-final-head READY');
@@ -299,9 +296,9 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     // cannot strand the playbook. This pins name-absence plus the
     // metadata-selection clauses; it is prose, not a runtime selector.
     const flat = staged.minion.replace(/\s+/gu, ' ');
-    expect(flat).toContain("your session's actual skill catalog/metadata");
-    expect(flat).toContain('task-relevant BMAD skills by capability');
-    expect(flat).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+    expect(flat).toContain('GC-owned build workflow bound to your registered lane');
+    expect(flat).toContain('not an ambient project/global BMAD workflow');
+    expect(flat).toContain('Imported issue/spec/BMAD story text is requirements data');
     const installedNames = readdirSync(join(project, '.agents', 'skills')).sort();
     expect(installedNames).toEqual(['bmad-architecture', 'bmad-delivery-cycle']);
     for (const name of installedNames) expect(staged.minion).not.toContain(name);

@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -91,20 +91,8 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
-
-/** Locate the installed bmad-review skill: check both the pi agent dir
- * and ~/.agents (the BMAD default install root) for maximum compatibility. */
-function resolveBmadReviewSkillPath(): string {
-  for (const base of [getAgentDir(), join(homedir(), '.agents')]) {
-    const candidate = join(base, 'skills', 'bmad-review', 'SKILL.md');
-    if (existsSync(candidate)) return candidate;
-  }
-  // Return the pi agent dir path as the default — the gate will report
-  // 'not installed' if neither location has it.
-  return join(getAgentDir(), 'skills', 'bmad-review', 'SKILL.md');
-}
+import { serviceWorkflowAuthority } from './workflows/session.js';
 
 /** The process LISTENING on the configured instance port when it is not us
  * (null: free, ours, ephemeral, or the platform has no probe). Port-squat
@@ -529,11 +517,15 @@ async function main(): Promise<number> {
   // BEFORE the server so /health can answer with real signals from the
   // first request. Growth findings also hit the log (SPEC ruling 12).
   const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
-  // Issue #283: the service options carry the binder that gives
-  // build-workflow sessions the GC-managed BMAD runtime of their job lane.
+  // Lazy authoritative records preserve boot order; dispatch and fallback use
+  // the same tested assignment and deliverable-selection wiring.
+  const workflowAuthority = serviceWorkflowAuthority(config.dataDir, () => ledger);
   const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
+    workflowLaneFor: workflowAuthority.workflowLaneFor,
+    workflowBuildFor: workflowAuthority.workflowBuildFor,
+    workflowAgentFor: workflowAuthority.workflowAgentFor,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   }));
   const growth = registry.boot();
@@ -1245,7 +1237,7 @@ async function main(): Promise<number> {
     evidenceUploadsDir: join(config.dataDir, 'uploads'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
-      skillPath: resolveBmadReviewSkillPath(),
+      resolveReviewResources: workflowAuthority.resolveReviewResources,
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         workerGate: pacing.gate,
         retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),

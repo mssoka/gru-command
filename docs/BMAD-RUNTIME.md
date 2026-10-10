@@ -2,10 +2,11 @@
 
 For the new directly editable GC-owned resource package, explicit invocation
 context and local integrity maintenance, see [GC-WORKFLOWS.md](GC-WORKFLOWS.md).
-This document describes the retained #283 package and current session/setup
-consumers until the separate #294/#295 cutover. It is not the maintenance
-procedure for new GC workflows, and shipping those resources does not migrate
-or remove anything described here.
+This document describes the retained #283 package, already-bound historical
+sessions and transitional setup (pending #295). Production new-job and fallback
+selection now use owned resources (#294); the historical ambient fallback described
+below is no longer the production route. This is not the maintenance procedure for
+new GC workflows, and nothing described here is automatically migrated or removed.
 
 Gru Command (GC) ships the BMAD framework its build workflow uses. A managed
 repository does not need its own BMAD installation for GC builds: it keeps
@@ -148,9 +149,11 @@ repo-local installer and fail loud.
   skill as `gru-command-bmad:bmad-build`. The session's system prompt names
   the bound runtime id, its content hash and its location. Review sessions
   (Perkins) never get it.
-- The bmad-review fallback gate is unaffected. It reads an installed global
-  `bmad-review` skill, which was never repo-local. That skill falls back to
-  its own defaults when a repo has no `_bmad/scripts`.
+- The production fallback gate selects the verified GC-owned helper via the
+  registered job's workflow authority, including for historical build lanes.
+  It never reads an installed global/project `bmad-review` skill. Historical
+  build bindings and their private review-output contract remain unchanged;
+  see [GC-owned workflows](GC-WORKFLOWS.md).
 
 ## Upgrading the bundled runtime (maintainers)
 

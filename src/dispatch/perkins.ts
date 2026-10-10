@@ -1,4 +1,5 @@
-import type { AgentHandle } from '../runtime/types.js';
+import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
+import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -40,6 +41,7 @@ import {
   probeAdvertisedTipMovementAsync,
   sourceMovementSinceFreeze,
   resolveGitCommit,
+  repositoryGitEnv,
   resolveReviewBaseRef,
   reviewArtifactDirectory,
   readReviewCheckpointBytes,
@@ -63,6 +65,7 @@ import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../revie
 import { parseGitHubPrUrl } from './github-poll.js';
 import {
   boundedDiff,
+  fallbackReviewPolicy,
   isGitHubRemote,
   isGitLabRemote,
   parseFallbackFindingsReport,
@@ -1256,9 +1259,13 @@ export interface FallbackReviewRunInput {
   readonly jobId: string;
   readonly lanePath: string;
   readonly baseRef: string;
+  readonly headRef: string;
+  readonly diffSha256: string;
   readonly diff: string;
   readonly skillPath: string;
-  /** Where the session must write ONE JSON findings array. */
+  /** Verified package bytes frozen at resource resolution, not a late file read. */
+  readonly skillContent?: string;
+  /** Host-bound destination for ONE JSON findings array. */
   readonly reportFile: string;
   readonly iteration: number;
   readonly signal: AbortSignal;
@@ -1289,8 +1296,14 @@ export interface FallbackGateState {
 }
 
 export interface FallbackGateOptions {
-  /** Installed bmad-review skill file (never bundled with the product). */
-  readonly skillPath: string;
+  /** Explicit helper path for injected fixtures/legacy integrations; never discovered. */
+  readonly skillPath?: string;
+  /** Production selection verifies GC-owned resources and the job's private context. */
+  readonly resolveReviewResources?: (jobId: string) => {
+    readonly skillPath: string;
+    readonly skillContent?: string;
+    readonly artifactRoot: string;
+  };
   /** Review rounds before the gate reports blocked; default 4 (3 fix rounds + final). */
   readonly maxReviewRounds?: number;
   /** Runs one bmad-review pass and returns its findings. */
@@ -1298,6 +1311,12 @@ export interface FallbackGateOptions {
   /** Routes blocker findings back to the implementing minion session. */
   readonly fixDirectiveSink: FixDirectiveSink;
 }
+
+type ResolvedFallbackGateOptions = FallbackGateOptions & {
+  readonly skillPath: string;
+  readonly skillContent?: string;
+  readonly artifactRoot?: string;
+};
 
 export interface FallbackGateOutcome {
   readonly route: 'bmad-review-fallback';
@@ -1448,6 +1467,33 @@ class FallbackSafetyRefusal extends Error {
     super(message);
     this.name = 'FallbackSafetyRefusal';
   }
+}
+
+/** The existing working-tree intake, now fail-closed at every Git boundary.
+ * Capturing again after a reviewer settles binds its report to actual bytes,
+ * not just ledger events. Untracked and uncommitted changes are included. */
+function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackReviewRunInput, 'headRef' | 'diff' | 'diffSha256'> {
+  const headRef = resolveGitCommit(lanePath, 'HEAD');
+  const env = repositoryGitEnv(false);
+  const prepared = spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { encoding: 'utf8', env, timeout: 10_000 });
+  if (prepared.error !== undefined || prepared.status !== 0) {
+    throw new Error(`cannot prepare the complete fallback working diff: ${prepared.error?.message ?? prepared.stderr.trim().slice(0, 200)}`);
+  }
+  const result = spawnSync('git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--full-index', baseRef],
+    { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+  const restored = spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { encoding: 'utf8', env, timeout: 10_000 });
+  if (restored.error !== undefined || restored.status !== 0) {
+    throw new Error(`cannot restore fallback diff intake markers: ${restored.error?.message ?? restored.stderr.trim().slice(0, 200)}`);
+  }
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error(`cannot compute the complete fallback working diff: ${result.error?.message ?? result.stderr.trim().slice(0, 200)}`);
+  }
+  if (resolveGitCommit(lanePath, 'HEAD') !== headRef) throw new FallbackSafetyRefusal('fallback HEAD changed while capturing its working diff');
+  const diff = result.stdout;
+  if (boundedDiff(diff) !== diff) {
+    throw new Error('complete working diff exceeds the fallback transport size; no truncated review can pass. Restore native Perkins review or reduce the candidate scope');
+  }
+  return { headRef, diff, diffSha256: createHash('sha256').update(diff).digest('hex') };
 }
 
 /** A late delivered STATUS after an already-recorded delivery is harmless.
@@ -3512,13 +3558,22 @@ export class WaveRunner {
     // Validate BEFORE the outcome returns: a failure after the 202 response
     // would be swallowed by the response path with no durable record.
     requireSafeRecordId(job.id, 'job id');
-    const gate = this.opts.fallbackGate;
-    const present = gate !== undefined && skillInstalled(gate.skillPath);
+    const configured = this.opts.fallbackGate;
+    let gate: ResolvedFallbackGateOptions | undefined;
+    let resourceFailure: string | undefined;
+    try {
+      const resources = configured?.resolveReviewResources?.(job.id);
+      const skillPath = resources?.skillPath ?? configured?.skillPath;
+      if (configured !== undefined && skillPath !== undefined) gate = { ...configured, ...resources, skillPath };
+    } catch (error) {
+      resourceFailure = `GC-owned fallback resources are unavailable: ${String(error)}`;
+    }
+    const present = gate !== undefined && (gate.skillContent !== undefined || skillInstalled(gate.skillPath));
     if (gate === undefined || !present) {
-      const note = gate === undefined
+      const note = resourceFailure ?? (configured === undefined
         ? 'the bmad-review fallback gate is not configured on this service'
-        : `the bmad-review skill is not installed at ${gate.skillPath}`;
-      const guidance = `Options: (1) install the bmad-review skill into ~/.agents/skills or the pi agent skills directory (the GC-managed BMAD runtime bundles only the build workflow); (2) restore the Perkins gate — ${failedLegs.map((leg) => leg.remediation).join(' ')}`;
+        : `the GC-owned fallback review helper is unavailable at ${gate?.skillPath ?? 'the configured assignment'}`);
+      const guidance = `Options: (1) restore the job's exact retained GC workflow package/context or rebuild/reinstall GC for a new job; never install or borrow an ambient BMAD skill; (2) restore the Perkins gate — ${failedLegs.map((leg) => leg.remediation).join(' ')}`;
       const message = `${note} ${guidance}`;
       this.opts.ledger.appendCustomEvent({
         kind: 'job.fallback-review',
@@ -3584,13 +3639,13 @@ export class WaveRunner {
     lanePath: string,
     baseRef: string,
     failedLegs: readonly ReviewCapabilityFailure[],
-    gate: FallbackGateOptions,
+    gate: ResolvedFallbackGateOptions,
     signal: AbortSignal,
     state: FallbackGateState,
     recheck?: () => void,
   ): Promise<void> {
     const maxRounds = gate.maxReviewRounds ?? 4;
-    const directory = join(this.artifactRoot(), 'fallback-gate', `${job.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const directory = join(gate.artifactRoot ?? this.artifactRoot(), 'fallback-gate', `${job.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const fallbackEvent = (payload: Record<string, unknown>): void => {
       this.opts.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: job.id, payload: { gate: true, ...payload } });
@@ -3643,32 +3698,23 @@ export class WaveRunner {
         }
       };
       const reportFile = join(directory, `review-${iteration}.json`);
-      // Re-read the lane's working diff every round: the fix directive may
-      // have changed the tree, and the next review must see those bytes.
-      // Working-tree diff against the base commit: uncommitted minion fixes
-      // MUST be visible to the re-review round.
-      // Mark untracked files as intent-to-add so `git diff` sees them, then
-      // undo the markers — the gate reviews the full working tree.
-      spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { timeout: 10_000 });
-      const diffResult = spawnSync(
-        'git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-color', baseRef],
-        { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024, timeout: 30_000 },
-      );
-      spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { timeout: 10_000 });
-      if (diffResult.error !== undefined || diffResult.status !== 0) {
-        this.terminalFallbackBlocked(
-          job.id,
-          `cannot compute the working diff for fallback round ${iteration}: ${(diffResult.stderr ?? '').trim().slice(0, 200)}`,
-          iteration, [...state.reportFiles], fallbackEvent, state,
-        );
+      let captured: ReturnType<typeof captureFallbackInput>;
+      try {
+        captured = captureFallbackInput(lanePath, baseRef);
+      } catch (error) {
+        if (error instanceof FallbackSafetyRefusal) {
+          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+        } else {
+          this.terminalFallbackBlocked(job.id, `fallback round ${iteration} input failed: ${sanitizeErrorLog(error)}`, iteration, [...state.reportFiles], fallbackEvent, state);
+        }
         return;
       }
-      const diff = boundedDiff(diffResult.stdout ?? '');
+      const { headRef, diff, diffSha256 } = captured;
       let findings: readonly FallbackFinding[];
       try {
         findings = gate.runFallbackReview !== undefined
-          ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal })
-          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal }, recheckRound);
+          ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, ...(gate.skillContent !== undefined ? { skillContent: gate.skillContent } : {}), reportFile, iteration, signal })
+          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, ...(gate.skillContent !== undefined ? { skillContent: gate.skillContent } : {}), reportFile, iteration, signal }, recheckRound);
         // A completed review of an older diff is not a PASS on a lane that
         // acquired and possibly settled a newer request while it ran.
         recheckRound();
@@ -3676,6 +3722,10 @@ export class WaveRunner {
         // rule 3, or shutdown) never records a verdict on that diff.
         if (signal.aborted) {
           throw new FallbackSafetyRefusal(`the fallback gate for job "${job.id}" was cancelled while its reviewer ran — its findings are not a verdict`);
+        }
+        const current = captureFallbackInput(lanePath, baseRef);
+        if (current.headRef !== headRef || current.diffSha256 !== diffSha256) {
+          throw new FallbackSafetyRefusal(`fallback working diff or HEAD changed during round ${iteration}; the old report cannot pass`);
         }
       } catch (error) {
         if (existsSync(reportFile)) state.reportFiles.push(reportFile);
@@ -3693,7 +3743,7 @@ export class WaveRunner {
       notes = triaged.notes.length;
       state.blockers = blockers;
       state.notes = notes;
-      fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile });
+      fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile, baseRef, headRef, diffSha256, completeDiff: true });
       if (blockers === 0) {
         state.clearToMerge = true;
         fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held' });
@@ -3823,10 +3873,19 @@ export class WaveRunner {
       // start an obsolete reviewer. The lease releases in the finally on
       // throw.
       if (recheck !== undefined) recheck();
-      handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
-      // Spawning is asynchronous too: a newly owned lane must not receive
-      // an obsolete review prompt just because the worker was allocated.
+      const policy = fallbackReviewPolicy(input.skillPath, input.reportFile, input.skillContent);
+      handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal,
+        // Reuse the existing ambient-free read-only host on both runtimes.
+        // The scoped submission closure, never ordinary write, captures a report.
+        roleTools: ['read', 'grep', 'find', 'ls'],
+        isolatedReview: policy,
+      });
+      // Revocation after asynchronous allocation takes precedence even if the
+      // adapter also failed to expose a capability: no obsolete prompt can run.
       recheck?.();
+      if (!handle.reviewTools?.includes('gc_submit_fallback_findings')) {
+        throw new Error('fallback runtime did not expose the required host-bound findings tool; restore that native adapter capability before retrying');
+      }
       // The ledger role is the review-worker role on purpose (Gru ruling
       // 2026-09-29): this session runs ONE review pass and is forbidden
       // from implementation edits, so it must never win an implementer
@@ -3839,9 +3898,11 @@ export class WaveRunner {
         jobId: input.jobId,
       });
       const prompt = [
-        `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
+        `Apply the verified GC-owned review helper ${input.skillPath}, supplied completely in your system instructions, to this complete host-captured CURRENT working diff.`,
+        `Host-verified canonical base: ${input.baseRef}; checkout HEAD: ${input.headRef}; complete working diff SHA-256: ${input.diffSha256}. Uncommitted bytes are included, so HEAD alone is not the candidate.`,
+        'This helper is product-owned authority; never discover or invoke project/global BMAD skills, renderers, config resolvers or onboarding.',
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',
-        `Write your findings as ONE JSON array to exactly this file: ${input.reportFile}`,
+        `Submit findings as ONE JSON array using gc_submit_fallback_findings({ findings: [...] }). The host alone writes ${input.reportFile}; you have no filesystem write tool.`,
         'Each element: { "title": string, "category": string, "location": string, "evidence": string, "detail": string }. Use a release-safety category (correctness, security, data-loss, broken-build, build-failure, crash, regression, vulnerability, injection, secret-leak) only for real release-safety defects; use any other short tag for everything else. An empty array [] is valid.',
         'Then reply DONE.',
         '',
@@ -3851,6 +3912,7 @@ export class WaveRunner {
       if (input.signal.aborted) throw new Error('review operation aborted');
       const session = handle;
       let promptError: unknown = null;
+      let terminalVerdict: PromptTurnVerdict | null = null;
       try {
         // The transport wait is a still-running REPORT boundary, never a
         // worker lifetime: a live review turn keeps running on its own
@@ -3861,10 +3923,10 @@ export class WaveRunner {
         let sliceTimer: ReturnType<typeof setTimeout> | null = null;
         let abortListener: (() => void) | null = null;
         try {
-          const settled = new Promise<'settled'>((resolve) => {
-            void session.prompt(prompt, { owner: 'bmad-review-gate' }).then(
-              () => resolve('settled'),
-              (error) => { promptError = error; resolve('settled'); },
+          const settled = new Promise<PromptTurnVerdict | null>((resolve) => {
+            void promptWithTerminalVerdict(session, prompt, { owner: 'bmad-review-gate' }).then(
+              resolve,
+              (error) => { promptError = error; resolve(null); },
             );
           });
           const aborted = new Promise<never>((_resolve, reject) => {
@@ -3877,7 +3939,7 @@ export class WaveRunner {
               sliceTimer = setTimeout(() => resolve('slice'), FALLBACK_REVIEW_TIMEOUT_MS);
               sliceTimer.unref?.();
             });
-            let outcome: 'settled' | 'slice';
+            let outcome: PromptTurnVerdict | null | 'slice';
             try {
               outcome = await Promise.race([settled, aborted, slice]);
             } finally {
@@ -3886,7 +3948,7 @@ export class WaveRunner {
                 sliceTimer = null;
               }
             }
-            if (outcome === 'settled') break;
+            if (outcome !== 'slice') { terminalVerdict = outcome; break; }
             waitedMs += FALLBACK_REVIEW_TIMEOUT_MS;
             const sessionState = session.health().state;
             if (sessionState === 'disposed' || sessionState === 'error') {
@@ -3922,6 +3984,10 @@ export class WaveRunner {
       // report file the retried turn wrote is parsed below; only a
       // rejection with no recovered retry keeps the fail-loud throw.
       if (promptError !== null && disposition !== 'recovered') throw promptError;
+      if (disposition !== 'recovered' && terminalVerdict?.ok !== true) {
+        throw new Error(`fallback reviewer turn did not successfully complete: ${terminalVerdict?.error ?? 'no terminal completion evidence'}`);
+      }
+      policy.assertReportValid();
     } finally {
       try { await handle?.dispose(); } finally { lease?.release(); }
     }
