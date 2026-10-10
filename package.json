@@ -14,6 +14,7 @@
     "docs/GC-WORKFLOWS.md",
     "docs/BMAD-RUNTIME.md",
     "docs/WORKTREES.md",
+    "docs/INTAKE.md",
     "roles/",
     "tools/verify-perkins-resource.mjs",
     "tools/patch-vitest-rpc-timeout.mjs",

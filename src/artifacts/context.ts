@@ -531,3 +531,126 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
     });
   });
 }
+
+export interface PreviewArtifactContextInput {
+  readonly dataDir: string;
+  /** Caller must select this canonical path from its managed repository set. */
+  readonly repoPath: string;
+  readonly intakeId: string;
+  readonly workflow: ArtifactWorkflow;
+}
+
+export interface PreviewArtifactReference extends Omit<ArtifactReference, 'jobId' | 'scope' | 'approvalId'> {
+  readonly intakeId: string;
+  readonly scope: 'operational';
+  readonly approvalId: null;
+}
+
+export interface PreviewArtifactContext {
+  readonly projectKey: string;
+  readonly operationalDirectory: string;
+  readonly writeOperational: (input: OperationalArtifactInput) => PreviewArtifactReference;
+  readonly readOperational: (path: string) => string;
+  readonly hasOperational: (path: string) => boolean;
+}
+
+/** Operational-only intake namespace. No lane, job, binding migration or
+ * repository document is allocated. Workflow identities belong to revisions,
+ * allowing an intake to retain older previews after an owned package refresh.
+ * Opening in existing mode never initializes or repairs namespace state. */
+export function createPreviewArtifactContext(input: PreviewArtifactContextInput, mode: 'existing'): PreviewArtifactContext | null;
+export function createPreviewArtifactContext(input: PreviewArtifactContextInput, mode?: 'create'): PreviewArtifactContext;
+export function createPreviewArtifactContext(input: PreviewArtifactContextInput, mode: 'create' | 'existing' = 'create'): PreviewArtifactContext | null {
+  return guarded(() => {
+    const dataDir = absolute(input.dataDir, 'configured data directory');
+    const repoPath = absolute(input.repoPath, 'registered repository path');
+    requireArtifactJobId(input.intakeId);
+    directory(repoPath, false);
+    if (realpathSync(repoPath) !== repoPath || gitIdentity(repoPath).top !== repoPath) {
+      throw new ArtifactContextError('preview requires the canonical registered repository root');
+    }
+    directory(dataDir, false);
+    refuseCheckoutDataHome(dataDir);
+    const workflow = workflowIdentity(input.workflow);
+    const projectKey = hash(repoPath);
+    const projects = join(dataDir, 'projects');
+    const root = join(projects, projectKey, 'intakes', input.intakeId);
+    const operationalDirectory = join(root, 'operational');
+    const references = join(root, 'references');
+    const staging = join(root, 'publication-staging');
+    const binding = join(root, 'context.json');
+    const bindingBytes = Buffer.from(json({ schemaVersion: 1, kind: 'intake-preview', projectKey, repoPath, intakeId: input.intakeId }));
+    const check = (create: boolean): void => {
+      directory(dataDir, false);
+      refuseCheckoutDataHome(dataDir);
+      for (const path of [root, operationalDirectory, references, staging]) directory(path, create, projects);
+    };
+    check(false);
+    const bound = sameBytes(binding, bindingBytes, true, staging);
+    if (!bound && maybeStat(root) !== null && readdirSync(root).length !== 0) {
+      throw new ArtifactContextError(`preview context binding is missing; restore it explicitly: ${binding}`);
+    }
+    if (mode === 'existing') {
+      if (!bound) return null;
+      for (const path of [operationalDirectory, references, staging]) {
+        if (maybeStat(path) === null) throw new ArtifactContextError(`preview context directory is missing; restore it explicitly: ${path}`);
+      }
+    } else {
+      publish(binding, bindingBytes, staging, projects);
+      check(true);
+    }
+    const checkBinding = (): void => {
+      check(false);
+      if (!sameBytes(binding, bindingBytes, true, staging)) throw new ArtifactContextError('preview context binding is missing');
+    };
+    const locations = (value: string): { readonly path: string; readonly payload: string; readonly receipt: string } => {
+      const path = artifactPath(value);
+      return { path, payload: join(operationalDirectory, path), receipt: join(references, `${hash(path)}.json`) };
+    };
+    return Object.freeze({
+      projectKey, operationalDirectory,
+      writeOperational: (value: OperationalArtifactInput): PreviewArtifactReference => guarded(() => {
+        checkBinding();
+        const { path, payload, receipt } = locations(value.path);
+        if (typeof value.contents !== 'string') throw new ArtifactContextError('preview contents must be explicit text bytes');
+        const reference: PreviewArtifactReference = {
+          schemaVersion: 1, projectKey, intakeId: input.intakeId, scope: 'operational', path,
+          sha256: hash(value.contents), workflow, sources: sourceIdentities(value.sources), approvalId: null,
+        };
+        directory(dirname(payload), false, projects);
+        const existing = sameBytes(payload, Buffer.from(value.contents), true, staging);
+        const hasReceipt = sameBytes(receipt, Buffer.from(json(reference)), true, staging);
+        if (existing && !hasReceipt) throw new ArtifactContextError('preview receipt missing for existing content');
+        publish(receipt, Buffer.from(json(reference)), staging, projects);
+        publish(payload, Buffer.from(value.contents), staging, projects);
+        return reference;
+      }),
+      hasOperational: (value: string): boolean => guarded(() => {
+        checkBinding();
+        const { path, payload, receipt } = locations(value);
+        directory(dirname(payload), false, projects);
+        const hasReceipt = readRegular(receipt, true, staging) !== null;
+        const hasPayload = readRegular(payload, true, staging) !== null;
+        if (hasReceipt !== hasPayload) throw new ArtifactContextError(`preview artifact payload/receipt pair is incomplete; restore the exact missing record: ${path}`);
+        return hasReceipt;
+      }),
+      readOperational: (value: string): string => guarded(() => {
+        checkBinding();
+        const { path, payload, receipt } = locations(value);
+        const bytes = readRegular(receipt, true, staging);
+        if (bytes === null) throw new ArtifactContextError(`preview artifact is missing: ${path}`);
+        const raw = JSON.parse(bytes.toString('utf8')) as PreviewArtifactReference;
+        const expected: PreviewArtifactReference = {
+          schemaVersion: 1, projectKey, intakeId: input.intakeId, scope: 'operational', path,
+          sha256: sha256(raw.sha256, 'preview sha256'), workflow: workflowIdentity(raw.workflow),
+          sources: sourceIdentities(raw.sources), approvalId: null,
+        };
+        if (!bytes.equals(Buffer.from(json(expected)))) throw new ArtifactContextError('preview reference binding is invalid');
+        directory(dirname(payload), false, projects);
+        const content = readRegular(payload, true, staging);
+        if (content === null || hash(content) !== expected.sha256) throw new ArtifactContextError('preview content does not match its receipt');
+        return content.toString('utf8');
+      }),
+    });
+  });
+}

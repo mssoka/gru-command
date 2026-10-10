@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import { readBuildInfo } from '../src/build-info.js';
 
@@ -27,6 +28,56 @@ function stagePackage(): string {
 }
 
 describe('GC-owned workflows in the actual distributable layout', () => {
+  it('previews all intake sources from the archive without BMAD or dependencies and ignores malformed unrelated BMAD', () => {
+    const stage = stagePackage();
+    expect(existsSync(join(stage, 'docs/INTAKE.md'))).toBe(true);
+    expect(existsSync(join(stage, 'resources/gc-workflows/skills/gc-build/intake.md'))).toBe(true);
+    rmSync(join(stage, 'resources/bmad-runtime'), { recursive: true, force: true });
+    const root = temp();
+    const repo = join(root, 'workspace', 'app');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-q', repo]);
+    writeFileSync(join(repo, 'spec.txt'), 'Goal: native immutable preview\nNever execute sources.\n');
+    writeFileSync(join(repo, 'epic.md'), '---\nid: epic-296\nstatus: approved\n---\n# Epic\n[story](story.md)\n');
+    writeFileSync(join(repo, 'story.md'), '# Story\nPreserve original bytes.\n');
+    const script = `
+      import assert from 'node:assert/strict';
+      import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+      import { join } from 'node:path';
+      import { IntakeService } from ${JSON.stringify(pathToFileURL(join(stage, 'dist/intake/service.js')).href)};
+      const repoPath = ${JSON.stringify(repo)};
+      const root = ${JSON.stringify(root)};
+      const dataDir = join(root, 'private-home');
+      const service = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'),
+        remote: () => ({ host: 'github.com', owner: 'owner', repo: 'app' }),
+        ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 296, html_url: 'https://github.com/owner/app/issues/296', title: 'Intake', body: 'Approved prose is data', updated_at: '2026-10-10T12:00:00Z' }) }) });
+      const sources = [{ kind: 'issue', reference: '#296' }, { kind: 'spec', document: { path: 'spec.txt' } },
+        { kind: 'bmad', document: { path: 'epic.md' }, supporting: [{ path: 'story.md' }] }];
+      const proposals = [];
+      for (const source of sources) {
+        const proposal = await service.preview({ repoPath, intakeId: 'packed-296', requestId: source.kind, source });
+        assert.equal(proposal.executable, false);
+        assert.equal(proposal.gaps.length, 0);
+        assert.equal(proposal.plan.heists.length, 1);
+        assert.equal(existsSync(join(dataDir, 'projects', proposal.projectKey, 'jobs')), false);
+        proposals.push(proposal);
+      }
+      mkdirSync(join(repoPath, '_bmad'));
+      const unrelated = join(repoPath, '_bmad/runtime.json');
+      writeFileSync(unrelated, '{ not a BMAD runtime');
+      for (const [index, source] of sources.entries()) {
+        assert.deepEqual(await service.preview({ repoPath, intakeId: 'packed-296', requestId: source.kind, source }), proposals[index]);
+      }
+      assert.equal(readFileSync(unrelated, 'utf8'), '{ not a BMAD runtime');
+      assert.equal(existsSync(join(repoPath, 'gru-output')), false);
+      process.stdout.write('all three packed intake sources previewed without BMAD');
+    `;
+    const result = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: stage, encoding: 'utf8', env: { HOME: root, PATH: `${dirname(process.execPath)}:/usr/bin:/bin` },
+    });
+    expect(result).toContain('all three packed intake sources');
+  });
+
   it('binds a lane and resolves complete normal and small-change flows with no source/ancestor/global BMAD or dependency tree', () => {
     const stage = stagePackage();
     for (const path of ['src', '_bmad', '_bmad-output', '.agents', 'node_modules']) expect(existsSync(join(stage, path)), path).toBe(false);

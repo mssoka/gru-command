@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { TextDecoder } from 'node:util';
 import type { LogLevel } from '../logger.js';
 import type {
   EventRecord,
@@ -506,13 +507,39 @@ export type GhCommandRunner = (args: readonly string[]) => Promise<GhCommandResu
 const GH_COMMAND_TIMEOUT_MS = 30_000;
 const GH_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
-/** Spawn the real `gh` binary; output bounded, timeout kills loud. */
-export function defaultGhRunner(binary = 'gh'): GhCommandRunner {
+export interface GhRunnerLimits {
+  readonly maxOutputBytes?: number;
+  readonly maxStderrBytes?: number;
+  readonly timeoutMs?: number;
+  /** Intake requires exact UTF-8; ordinary shared callers retain replacement decoding. */
+  readonly strictUtf8?: boolean;
+}
+
+/** Spawn the real `gh` binary; byte-bounded output, timeout kills loud.
+ * Decode only complete byte buffers: OS chunks may split UTF-8 codepoints. */
+export function defaultGhRunner(binary = 'gh', limits: GhRunnerLimits = {}): GhCommandRunner {
+  const maxOutputBytes = limits.maxOutputBytes ?? GH_MAX_OUTPUT_BYTES;
+  const maxStderrBytes = limits.maxStderrBytes ?? GH_MAX_OUTPUT_BYTES;
+  const timeoutMs = limits.timeoutMs ?? GH_COMMAND_TIMEOUT_MS;
+  for (const value of [maxOutputBytes, maxStderrBytes, timeoutMs]) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('gh runner limits must be positive safe integers');
+  }
   return (args) =>
     new Promise<GhCommandResult>((resolve) => {
       let settled = false;
-      let stdout = '';
-      let stderr = '';
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const captured = (): { stdout: string; stderr: string; error?: string } => {
+        const bytes = Buffer.concat(stdout, stdoutBytes);
+        const errorText = Buffer.concat(stderr, stderrBytes).toString('utf8');
+        try {
+          return { stdout: limits.strictUtf8 === true ? new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) : bytes.toString('utf8'), stderr: errorText };
+        } catch {
+          return { stdout: '', stderr: errorText, error: 'gh api output is not valid UTF-8; no exact text snapshot can be captured' };
+        }
+      };
       const child = spawn(binary, [...args], { stdio: ['ignore', 'pipe', 'pipe'] });
       const finish = (result: GhCommandResult): void => {
         if (settled) return;
@@ -522,24 +549,38 @@ export function defaultGhRunner(binary = 'gh'): GhCommandRunner {
       };
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
-        finish({ status: -1, stdout, stderr, error: `gh api timed out after ${GH_COMMAND_TIMEOUT_MS} ms` });
-      }, GH_COMMAND_TIMEOUT_MS);
+        const output = captured();
+        finish({ status: -1, ...output, error: `gh api timed out after ${timeoutMs} ms${output.error === undefined ? '' : `; ${output.error}`}` });
+      }, timeoutMs);
       child.stdout.on('data', (chunk: Buffer) => {
-        if (stdout.length >= GH_MAX_OUTPUT_BYTES) {
+        if (settled) return;
+        if (stdoutBytes + chunk.length > maxOutputBytes) {
           child.kill('SIGKILL');
-          finish({ status: -1, stdout, stderr, error: `gh api output exceeds ${GH_MAX_OUTPUT_BYTES} bytes` });
+          // A truncated response is not an exact source snapshot.
+          finish({ status: -1, stdout: '', stderr: Buffer.concat(stderr, stderrBytes).toString('utf8'), error: `gh api output exceeds ${maxOutputBytes} bytes` });
           return;
         }
-        stdout += chunk.toString('utf-8');
+        stdout.push(chunk);
+        stdoutBytes += chunk.length;
       });
       child.stderr.on('data', (chunk: Buffer) => {
-        if (stderr.length < GH_MAX_OUTPUT_BYTES) stderr += chunk.toString('utf-8');
+        if (settled || stderrBytes >= maxStderrBytes) return;
+        const bounded = chunk.subarray(0, maxStderrBytes - stderrBytes);
+        stderr.push(Buffer.from(bounded));
+        stderrBytes += bounded.length;
       });
       child.on('error', (error) => {
         finish({ status: -1, stdout: '', stderr: '', error: String(error) });
       });
       child.on('close', (code) => {
-        finish({ status: code ?? -1, stdout, stderr });
+        if (!settled) {
+          const output = captured();
+          if (output.error !== undefined && code !== null && code !== 0) {
+            // Preserve failed-CLI stderr/rate-limit classification, but never
+            // return unrepresentable stdout as an exact source snapshot.
+            finish({ status: code, stdout: '', stderr: output.stderr });
+          } else finish({ status: output.error === undefined ? code ?? -1 : -1, ...output });
+        }
       });
     });
 }
