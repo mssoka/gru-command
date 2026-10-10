@@ -100,7 +100,7 @@ export async function routeFixDirectiveToMinion(
     /** Prompt owner tag (audit); defaults to the shared routing owner. */
     owner?: string;
     readonly directiveTurn?: PromptOptions['directive'];
-    readonly beforeTurnSideEffect?: () => void;
+    readonly beforeTurnSideEffect?: (handle?: AgentHandle) => void;
     readonly onPrepared?: (handle: AgentHandle) => void;
     readonly onCleanup?: (handle: AgentHandle) => void;
     readonly freshSession?: boolean;
@@ -130,6 +130,13 @@ export async function routeFixDirectiveToMinion(
    * single-writer guard on this evidence alone. */
   admission?: 'none' | 'unknown';
 }> {
+  const disposeAndRecord = async (handle: AgentHandle, viaRegistry = false): Promise<void> => {
+    const failures: unknown[] = [];
+    try { await (viaRegistry ? input.registry.disposeHandle(handle) : handle.dispose()); } catch (error) { failures.push(error); }
+    try { input.onCleanup?.(handle); } catch (error) { failures.push(error); }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, `directive cleanup failed: ${failures.map(String).join('; ')}`);
+  };
   const owner = input.owner ?? 'fix-directive';
   input.beforeTurnSideEffect?.();
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
@@ -153,7 +160,7 @@ export async function routeFixDirectiveToMinion(
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;
       input.beforeTurnSideEffect?.();
-      try { await input.registry.disposeHandle(prior); } finally { input.onCleanup?.(prior); }
+      await disposeAndRecord(prior, true);
       input.beforeTurnSideEffect?.();
       if (prior.cessationEvidence?.() !== 'ceased') throw new Error(`prior minion ${prior.id} retains unproven producer ownership — rebrief refused`);
     }
@@ -264,6 +271,8 @@ export async function routeFixDirectiveToMinion(
     });
   }
   let handle: AgentHandle | null = null;
+  let registrationFailed = false;
+  const route = async (): Promise<Awaited<ReturnType<typeof routeFixDirectiveToMinion>>> => {
   try {
     // Prefer the CURRENT failing logical session; only when the evicted
     // handle exposed none fall back to the newest session-bearing record —
@@ -305,13 +314,8 @@ export async function routeFixDirectiveToMinion(
       // alone (owner rule 4).
       prompt = freshPrompt(contract);
     }
-    try {
-      assertDirectiveJobActive(input.ledger, input.jobId);
-      input.beforeTurnSideEffect?.();
-    } catch (error) {
-      try { await input.registry.disposeHandle(handle); } finally { input.onCleanup?.(handle); }
-      throw error;
-    }
+    assertDirectiveJobActive(input.ledger, input.jobId);
+    input.beforeTurnSideEffect?.();
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     const spawnedHandle = handle;
@@ -326,20 +330,11 @@ export async function routeFixDirectiveToMinion(
         ...(input.ledger.getAgent(spawnedHandle.id) === null ? { parentage: 'top-level' as const } : {}),
       });
     } catch (error) {
-      // A registration failure leaves the spawned handle ownerless — an
-      // unbound live worker must never survive the failed directive
-      // setup. Dispose it loudly, preserving the actionable registration
-      // error (mirrors the re-brief setup path's failure ladder).
-      await input.registry.disposeHandle(spawnedHandle).catch((disposeError: unknown) => {
-        throw new Error(
-          `could not dispose the unregistered minion ${spawnedHandle.id} after a failed directive registration: ${String(disposeError)}`,
-          { cause: error },
-        );
-      });
-      throw error;
+      registrationFailed = true;
+      throw error; // the single cleanup owner below preserves registration AND cleanup failures
     }
     assertDirectiveJobActive(input.ledger, input.jobId);
-    input.beforeTurnSideEffect?.();
+    input.beforeTurnSideEffect?.(handle);
     input.onPrepared?.(handle);
     try {
       verdict = await racedPrompt(handle, prompt, input.signal, owner, input.directiveTurn);
@@ -374,12 +369,19 @@ export async function routeFixDirectiveToMinion(
         ? ({ ok: true, error: null } as const)
         : (verdict ?? promptVerdictFromHealth(handle));
     return { delivered: true, minionId: handle.id, ...verdictFields(evidence) };
-  } finally {
-    lease?.release();
-    if (handle !== null) {
-      try { await handle.dispose(); } finally { input.onCleanup?.(handle); }
-    }
+  } finally { lease?.release(); }
+  };
+  const failures: unknown[] = [];
+  let result: Awaited<ReturnType<typeof routeFixDirectiveToMinion>> | undefined;
+  try { result = await route(); } catch (error) { failures.push(error); }
+  const owned = handle as AgentHandle | null;
+  if (owned !== null) {
+    try { await disposeAndRecord(owned, registrationFailed); } catch (error) { failures.push(error); }
   }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, `directive routing/cleanup failed: ${failures.map(String).join('; ')}`);
+  if (result === undefined) throw new Error('directive routing settled without result or failure');
+  return result;
 }
 
 /** Race a prompt against cancellation so shutdown cannot stall on an

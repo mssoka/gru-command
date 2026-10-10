@@ -549,6 +549,7 @@ async function serve(
   const registry = new CapturingMinions(h.ledger);
   registry.register('minion-lane');
   h.ledger.registerAgent({ id: 'minion-lane', role: 'minion', sessionFile: registry.getHandle('minion-lane')!.sessionFile, jobId: h.jobId });
+  h.ledger.setAgentState('minion-lane', registry.getHandle('minion-lane')!.health().state); // native fixture initialization has settled
   const server = createDispatchServer({
     pendingProducerBlockers: () => [],
     config: loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester'),

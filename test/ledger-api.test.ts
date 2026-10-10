@@ -2018,3 +2018,57 @@ describe('administrative closeout of a parked PR-backed job', () => {
     }
   });
 });
+
+describe('directive producer evidence integrity — P18 current-behavior regressions', () => {
+  it('a pre-effect dispatch claim records a reservation fact and never manufactures native producer start', () => {
+    const db = new LedgerDb(tmpDir());
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    try {
+      ledger.addJob({ id: 'reservation-job', repo: 'fixture', title: 'reservation', briefing: 'original approved scope' });
+      ledger.setJobStatus('reservation-job', 'working');
+      const request = ledger.beginDirectiveIntent({ jobId: 'reservation-job', requestId: 'reservation-request',
+        directive: 'approved work not invoked by this claim', holder: 'gru' }).record;
+      const identity = ledger.directiveTurnIdentity(request.requestId);
+      expect(ledger.claimDirectiveDispatch(request.requestId)).toBe(true);
+      expect(ledger.getDirective(request.requestId)).toMatchObject({ nativeTarget: null, nativeBinding: null, admissionSeq: null });
+      expect(ledger.latestJobEvent(request.jobId, 'silas.directive-sent')).toBeNull();
+      expect(ledger.latestJobEvent(request.jobId, 'job.delivered')).toBeNull();
+      const evidence = ledger.listJobEventsByKinds(request.jobId,
+        ['silas.directive-producer-reserved', 'silas.directive-producer-started']);
+      expect(evidence, 'a committed pre-effect claim is only a reservation, not actual native producer execution').toMatchObject([
+        { kind: 'silas.directive-producer-reserved', payload: { fact: 'reservation', request_id: request.requestId, producer_identity: identity } },
+      ]);
+      expect(evidence).toHaveLength(1);
+    } finally { db.close(); }
+  });
+
+  it('a later same-logical-minion cessation receipt cannot erase an older unbound incarnation UNKNOWN', () => {
+    const db = new LedgerDb(tmpDir());
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    try {
+      ledger.addJob({ id: 'incarnation-job', repo: 'fixture', title: 'incarnations', briefing: 'original approved scope' });
+      ledger.setJobStatus('incarnation-job', 'working');
+      const request = ledger.beginDirectiveIntent({ jobId: 'incarnation-job', requestId: 'incarnation-request',
+        directive: 'preserve unproven original physical owner', holder: 'gru' }).record;
+      const identity = ledger.directiveTurnIdentity(request.requestId);
+      ledger.registerAgent({ id: 'same-logical-minion', role: 'minion', jobId: request.jobId, sessionFile: '/original-native.jsonl' });
+      ledger.setAgentState('same-logical-minion', 'idle');
+      ledger.prepareDirectiveTarget(request.requestId, { agentId: 'same-logical-minion', sessionFile: '/original-native.jsonl' });
+      // Explicit event-consumer fixture: an earlier protocol recorded UNKNOWN
+      // without a reservation token. The later observation names a DIFFERENT
+      // native file. It is not proof about the original physical incarnation.
+      const unknown = ledger.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: request.jobId,
+        payload: { request_id: request.requestId, agent_id: 'same-logical-minion', session_file: '/original-native.jsonl', producer_identity: identity } });
+      ledger.registerAgent({ id: 'same-logical-minion', role: 'minion', jobId: request.jobId, sessionFile: '/later-native.jsonl' });
+      const later = ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: request.jobId,
+        payload: { request_id: request.requestId, agent_id: 'same-logical-minion', session_file: '/later-native.jsonl', producer_identity: identity } });
+      expect(later.seq).toBeGreaterThan(unknown.seq);
+      expect(ledger.getEvent(unknown.seq)).toEqual(unknown);
+      expect(ledger.getDirective(request.requestId)?.nativeTarget).toEqual({ agentId: 'same-logical-minion', sessionFile: '/original-native.jsonl' });
+      expect(ledger.latestJobEvent(request.jobId, 'job.delivered')).toBeNull();
+      expect(ledger.directiveProgressBlockers(request.requestId, 'original-lane').join(';'),
+        'later logical-ID reuse must not consume an independently unresolved original UNKNOWN').toContain('unproven producer cleanup');
+      expect(() => ledger.claimDirectiveDispatch(request.requestId)).toThrow(/unproven/);
+    } finally { db.close(); }
+  });
+});

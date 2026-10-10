@@ -7915,7 +7915,7 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
    * shim's `remote-down` flag exists — git's own failure, so the refusal is
    * the transient check-failed kind that retries. With `remote-slow`
    * instead, the probe marks `slowStarted`, waits, then answers truthfully. */
-  async function transientFixture(name: string, opts: { readonly probeDelaySeconds?: number; readonly stuckFile?: string } = {}) {
+  async function transientFixture(name: string, opts: { readonly probeDelaySeconds?: number } = {}) {
     const repo = makeFixtureRepo(`perkins-retry-${name}`);
     repos.push(repo);
     const branch = `feature/retry-${name}`;
@@ -7944,10 +7944,7 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     const slowStarted = join(shimDir, 'slow-started');
     writeFileSync(flag, '');
     const delay = opts.probeDelaySeconds !== undefined ? `sleep ${opts.probeDelaySeconds}; ` : '';
-    // stuckFile: the remote step hangs, recording its process group.
-    const remoteDown = opts.stuckFile !== undefined
-      ? `ps -o pgid= -p $$ | tr -d ' ' >> "${opts.stuckFile}"; exec sleep 30`
-      : `${delay}echo "fatal: unable to access the remote" >&2; exit 128`;
+    const remoteDown = `${delay}echo "fatal: unable to access the remote" >&2; exit 128`;
     writeFileSync(join(shimDir, 'git'), [
       '#!/bin/sh',
       `if [ -e "${flag}" ]; then case " $* " in *" ls-remote "*) ${remoteDown};; esac; fi`,
@@ -8107,9 +8104,21 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
   it('a fresh request refused while a retry waits keeps it — same attempt and due time — so neither the retry nor the final escalation is lost (R7-11)', async () => {
     const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('takeover');
     const escalations: string[] = [];
-    const wave = new WaveRunner({
+    const dueDuringSetup: Promise<void>[] = [];
+    const wave: WaveRunner = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [0, 600],
+      reviewFreezeObserver: () => {
+        if (ledger.listRounds(jobId).length !== 3) return;
+        // Fire the exact waiting retry while this fresh setup owns admission,
+        // without relying on OS probe speed relative to a 600 ms timer.
+        const seam = wave as unknown as { admissionRetries: Map<string, { attempt: number; timer: NodeJS.Timeout | null }>;
+          fireAdmissionRetry(retry: unknown): Promise<void> };
+        const waiting = seam.admissionRetries.get(jobId)!;
+        expect(waiting.attempt).toBe(2);
+        if (waiting.timer !== null) clearTimeout(waiting.timer);
+        dueDuringSetup.push(seam.fireAdmissionRetry(waiting));
+      },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     try {
@@ -8120,6 +8129,8 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       expect(waiting.payload).toMatchObject({ attempt: 2 });
       // A fresh request refused meanwhile keeps THAT retry — attempt 2, same due time.
       await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 2 of 2 is scheduled/u);
+      await Promise.all(dueDuringSetup);
+      expect(dueDuringSetup).toHaveLength(1);
       const taken = kinds(ledger, jobId, 'round.admission-retry-scheduled')[2]!;
       expect(taken.roundId).toBe(ledger.listRounds(jobId)[2]!.id);
       expect(taken.payload).toMatchObject({ attempt: 2, dueAt: (waiting.payload as { dueAt: string }).dueAt });
@@ -8430,16 +8441,21 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
   });
 
   it('a git group that would not stop refuses its round, escalates ONCE naming the group, is never retried — and quarantines nothing (owner decision 2026-10-08, R8-25)', async () => {
-    const stuckFile = join(mkdtempSync(join(tmpdir(), 'perkins-retry-stuck-')), 'groups');
-    dirs.push(dirname(stuckFile));
-    const f = await transientFixture('stuck-git', { stuckFile });
+    const f = await transientFixture('stuck-git');
+    let stuckGroup: number | null = null;
     const escalations: string[] = [];
     const informs: string[] = [];
-    const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
+    const stuck = (pgid: number): boolean => pgid === stuckGroup;
     const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
     const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
     const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
-    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => {
+      // Fault exactly one real OWNED runner at the actual observation seam.
+      // A deadline may kill its git child before a shell marker ever runs;
+      // child startup/marker timing must not decide group cessation proof.
+      stuckGroup ??= pgid;
+      return stuck(pgid) || realAsync(pgid, budget);
+    });
     const wave = new WaveRunner({
       ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, bus: f.bus,
       prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0, 0],
@@ -8456,6 +8472,8 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       await new Promise((resolve) => setTimeout(resolve, 200));
       expect(escalations).toHaveLength(1);
       expect(escalations[0]).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+      expect(stuckGroup).toBeGreaterThan(0);
+      expect(escalations[0]).toContain(`process group ${stuckGroup} still running`);
       expect(informs).toEqual([]);
       expect(kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled')).toEqual([]); // never a retry
       // No quarantine: once the remote answers, the next request is admitted.
@@ -8474,16 +8492,21 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
 
   it('a git group that would not stop is escalated naming it even when the branch turned busy during the probe — a busy refusal never masks it (R9-6)', async () => {
     for (const route of ['request', 'forced'] as const) {
-      const stuckFile = join(mkdtempSync(join(tmpdir(), 'perkins-retry-stuck-')), 'groups');
-      dirs.push(dirname(stuckFile));
-      const f = await transientFixture(`stuck-busy-${route}`, { stuckFile });
+      const f = await transientFixture(`stuck-busy-${route}`);
+      let stuckGroup: number | null = null;
       const escalations: string[] = [];
       const informs: string[] = [];
-      const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
+      const stuck = (pgid: number): boolean => pgid === stuckGroup;
       const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
       const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
       const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
-      const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
+      const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => {
+        // Fault exactly one real OWNED runner at the actual observation seam.
+        // A deadline may kill its git child before a shell marker ever runs;
+        // child startup/marker timing must not decide group cessation proof.
+        stuckGroup ??= pgid;
+        return stuck(pgid) || realAsync(pgid, budget);
+      });
       let landed = false;
       const wave = new WaveRunner({
         ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
@@ -8522,6 +8545,8 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       expect(round.status, route).toBe('aborted');
       expect(escalations, route).toHaveLength(1);
       expect(escalations[0], route).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+      expect(stuckGroup, route).toBeGreaterThan(0);
+      expect(escalations[0], route).toContain(`process group ${stuckGroup} still running`);
       expect(informs, route).toEqual([]);
       expect(kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled'), route).toEqual([]);
       expect(payloads(f.ledger, f.jobId, 'round.admission-preflight').at(-1), route).toMatchObject({

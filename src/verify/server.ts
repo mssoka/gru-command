@@ -99,11 +99,20 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         runTimeoutMs: options.config.verify.runTimeoutMs,
       },
       record: (event) => {
+        if (event.kind === 'verification.no-start' && ledger.listJobEventsByKinds(event.jobId, ['verification.no-start'], { limit: 1000 })
+          .some((row) => (row.payload as { run_id?: unknown }).run_id === event.payload['run_id'])) return;
         ledger.appendCustomEvent({
           kind: event.kind,
           jobId: event.jobId,
           payload: event.payload,
         });
+        if (event.kind === 'verification.reconciled' && event.payload['state'] === 'completed') {
+          const status = scheduler.attemptStatus({ requestId: String(event.payload['request_id']) });
+          if (status.state !== 'completed' || status.outcome === undefined || status.runId === null) return;
+          const lane = worktrees.listWorktrees({ jobId: event.jobId }).find((row) => row.kind === 'job' && row.path === status.cwd && row.status !== 'swept');
+          if (lane !== undefined) ledger.reconcileVerificationProcesses({ jobId: event.jobId, runId: status.runId,
+            requestId: String(event.payload['request_id']), command: status.outcome.command, cwd: status.outcome.cwd, worktreeId: lane.id });
+        }
       },
       // Lane process tracking (owner incident 2026-09-23): a verification
       // run is the orchestrator's own spawned service. Its pid is recorded

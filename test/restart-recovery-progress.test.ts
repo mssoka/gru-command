@@ -1,5 +1,7 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -8,8 +10,8 @@ import { EventBus } from '../src/events/bus.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
-import { inspectDirectiveCheckpoint, prepareDirectiveBinding, readDirectiveBinding } from '../src/runtime/directive-checkpoint.js';
-import { DirectiveProgressService, executeAcceptedDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
+import { inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, readDirectiveBinding } from '../src/runtime/directive-checkpoint.js';
+import { DirectiveProgressService, executeAcceptedDirective, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
 import { reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
@@ -132,14 +134,125 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive') {
     ledger.prepareDirectiveTarget(intent.requestId, { agentId: 'logical-minion', sessionFile: file });
     prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file, text, authorityManifest: manifest });
     native.append({ role: 'user', content: [{ type: 'text', text }] });
+    recordDirectiveProducerCessation(prepareDirectiveProducer({ identity, agentId: 'logical-minion', sessionId: native.sessionId, sessionFile: file }));
     return identity;
   };
   cleanups.push(() => { db.close(); store.dispose(); repo.cleanup(); rmSync(dir, { recursive: true, force: true }); });
-  return { dir, repo, db, ledger, notifications, lane, worktrees, native, file, intent, identity, registry, spawns, stop, deps, seed,
+  return { dir, repo, db, ledger, bus, notifications, lane, worktrees, store, native, file, intent, identity, registry, spawns, stop, deps, seed,
     manifest: (value: string) => { manifest = value; }, spawnGate: (value: Promise<void> | null) => { spawnGate = value; }, supervised: (value: readonly string[]) => { supervised = value; } };
 }
 
 describe('restart-recovery-progress — exact native request matrix', () => {
+  it('actual admitted original host exit continues once on the same persisted native lane, including live and frozen-owner refusals', async () => {
+    const f = await fixture();
+    const root = process.cwd();
+    const code = `
+      import { readFileSync, appendFileSync, writeFileSync } from 'node:fs';
+      import { LedgerDb } from ${JSON.stringify(`${process.cwd()}/dist/ledger/db.js`)};
+      import { LedgerApi } from ${JSON.stringify(`${process.cwd()}/dist/ledger/api.js`)};
+      import { EventBus } from ${JSON.stringify(`${process.cwd()}/dist/events/bus.js`)};
+      import { SessionStore } from ${JSON.stringify(`${process.cwd()}/dist/sessions/store.js`)};
+      import { PiAgentHandle, PI_CAPABILITIES } from ${JSON.stringify(`${process.cwd()}/dist/runtime/pi-adapter.js`)};
+      import { executeAcceptedDirective } from ${JSON.stringify(`${process.cwd()}/dist/dispatch/directive-progress.js`)};
+      function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
+      const NativeFixture = ${NativeFixture.toString().replace(/__vite_ssr_import_\d+__\./g, '')};
+      const db = new LedgerDb(${JSON.stringify(f.dir)});
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+      const store = new SessionStore(${JSON.stringify(f.dir)});
+      const native = new NativeFixture(${JSON.stringify(f.file)}); native.autoFinish = false;
+      const manifest = ${JSON.stringify(JSON.stringify({ role: 'minion', cwd: f.lane.path, tools: ['read', 'bash'], model: 'fixture/model' }))};
+      const registry = {
+        getHandle: () => null,
+        spawn: async () => {
+          store.acquireLock(native.sessionFile);
+          const handle = new PiAgentHandle('minion', native, native.sessionFile, PI_CAPABILITIES, false, [], store, () => {}, () => {}, 60000, 'logical-minion', () => manifest);
+          handle.subscribe((event) => { if (event.type === 'state') ledger.setAgentState(handle.id, event.state); });
+          native.subscribe((event) => { if (event.type === 'agent_start') setImmediate(() => process.send({ admitted: ledger.getDirective('approved-request').state })); });
+          return handle;
+        },
+        disposeHandle: async (handle) => handle.dispose(),
+      };
+      await executeAcceptedDirective({ ledger, registry, worktrees: { listWorktrees: () => [${JSON.stringify(f.lane)}] },
+        notifications: { postIncident: () => {} }, signal: new AbortController().signal, pendingProducerBlockers: () => [] }, 'approved-request');
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', code], { cwd: root, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    let stderr = ''; child.stderr!.on('data', (chunk) => { stderr += String(chunk); });
+    const ready = await Promise.race([once(child, 'message'), once(child, 'exit').then(() => { throw new Error(`native fixture exited before admission: ${stderr}`); })]);
+    expect(ready[0]).toMatchObject({ admitted: 'admitted' });
+    const original = f.ledger.getDirective(f.intent.requestId)!;
+    const start = f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-started')!;
+    const nativePrefix = readFileSync(f.file, 'utf8');
+    let resumedHandle: AgentHandle | null = null;
+    const registry: DirectiveRegistry = {
+      getHandle: () => resumedHandle,
+      spawn: vi.fn(async (_role, options = {}) => {
+        if (options.directiveRecoveryProducer !== undefined) f.store.acquireLockAfterHostExit(f.file, options.directiveRecoveryProducer.pid);
+        resumedHandle = new PiAgentHandle('minion', f.native, f.file, PI_CAPABILITIES, false, [], f.store, () => {}, () => { resumedHandle = null; },
+          60_000, options.agentId, () => JSON.stringify({ role: 'minion', cwd: f.lane.path, tools: ['read', 'bash'], model: 'fixture/model' }));
+        return resumedHandle;
+      }),
+      disposeHandle: async (handle) => handle.dispose(),
+    };
+    let service = new DirectiveProgressService({ ...f.deps, registry });
+    try {
+      service.reconsider(); await service.settled();
+      expect(registry.spawn).not.toHaveBeenCalled(); expect(f.native.continuations).toBe(0);
+      child.kill('SIGSTOP'); // frozen-but-live is never dead by heartbeat age
+      service.reconsider(); await service.settled();
+      expect(registry.spawn).not.toHaveBeenCalled(); expect(readFileSync(f.file, 'utf8')).toBe(nativePrefix);
+      const exit = once(child, 'exit'); child.kill('SIGKILL'); await exit;
+      await service.dispose(); f.db.close();
+      const db = new LedgerDb(f.dir); cleanups.push(() => db.close());
+      const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+      service = new DirectiveProgressService({ ...f.deps, ledger, registry, notifications: new NotificationCenter({ ledger, bus }) });
+      service.reconsider(); await service.settled();
+      expect(ledger.getDirective(original.requestId)).toMatchObject({ state: 'settled', nativeTarget: original.nativeTarget,
+        nativeBinding: original.nativeBinding, workRevision: original.workRevision, authorityEpoch: original.authorityEpoch });
+      expect(f.native.prompts).toEqual([]); expect(f.native.continuations).toBe(1); expect(registry.spawn).toHaveBeenCalledTimes(1);
+      expect(ledger.getEvent(start.seq)).toEqual(start);
+      expect(ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-continuation-claimed'])).toHaveLength(1);
+      const delivery = ledger.latestJobEvent(f.intent.jobId, 'job.delivered'); expect(delivery?.payload).toMatchObject({ request_id: original.requestId, agentId: 'logical-minion' });
+      expect(ledger.getJob(f.intent.jobId)?.prUrl).toBe('https://example.test/pull/286');
+      expect(f.worktrees.listWorktrees({ jobId: f.intent.jobId })).toEqual([f.lane]);
+      await service.dispose();
+      service = new DirectiveProgressService({ ...f.deps, ledger, registry, notifications: new NotificationCenter({ ledger, bus }) });
+      service.reconsider(); await service.settled();
+      expect(ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toEqual([delivery]);
+      expect(f.native.continuations).toBe(1); expect(registry.spawn).toHaveBeenCalledTimes(1);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) { const exit = once(child, 'exit'); child.kill('SIGKILL'); await exit; }
+      await service.dispose();
+    }
+  });
+
+  it('a later ceased physical incarnation on the same native file cannot erase the original live owner', async () => {
+    const f = await fixture(); f.seed();
+    const original = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    const start = f.ledger.startDirectiveProducer(f.identity, original);
+    const later = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    recordDirectiveProducerCessation(later);
+    expect(original.incarnation).not.toBe(later.incarnation);
+    expect(inspectDirectiveProducers(f.file, f.identity)).toEqual(expect.arrayContaining([
+      { producer: original, evidence: 'unknown' }, { producer: later, evidence: 'ceased' },
+    ]));
+    expect(() => f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: f.intent.jobId, payload: {
+      request_id: f.intent.requestId, agent_id: 'logical-minion', session_file: f.file,
+      producer_start_seq: start, producer_identity: f.identity, native_producer: later,
+    } })).toThrow(/exact original start/);
+    const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); await service.dispose();
+    expect(f.native.continuations).toBe(0); expect(f.spawns).toEqual([]); expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+  });
+
+  it('a torn physical producer journal remains actionable UNKNOWN without rewriting evidence or spawning', async () => {
+    const f = await fixture(); f.seed();
+    appendFileSync(`${f.file}.producers.jsonl`, '{"state":"ceased"');
+    const bytes = readFileSync(`${f.file}.producers.jsonl`, 'utf8');
+    const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); await service.dispose();
+    expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0); expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+    expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(bytes);
+    expect(f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active')?.detail).toContain('partial write');
+  });
+
   it('restores actual admission lost before ledger binding without replay', async () => {
     const f = await fixture(); f.seed();
     f.native.append({ role: 'assistant', stopReason: 'stop', content: [] });
@@ -288,7 +401,9 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   });
 
   it('UNKNOWN disposal preserves producer ownership until real independent-bash cessation', async () => {
-    const f = await fixture(); f.seed(); f.native.isBashRunning = true;
+    const f = await fixture(); f.seed();
+    const dispose = f.registry.disposeHandle.bind(f.registry);
+    f.registry.disposeHandle = async (handle) => { f.native.isBashRunning = true; await dispose(handle); };
     const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
     expect(f.native.continuations).toBe(1); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
@@ -298,6 +413,394 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     f.native.isBashRunning = false; service.reconsider(); await service.settled();
     expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); expect(f.native.continuations).toBe(1);
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-ceased')).not.toBeNull();
+  });
+
+  async function assertCleanupPublicationRetry(kind: 'unknown' | 'ceased', afterDurability: boolean): Promise<void> {
+    const f = await fixture(); f.seed();
+    const dispose = f.registry.disposeHandle.bind(f.registry);
+    f.registry.disposeHandle = async (handle) => { f.native.isBashRunning = true; await dispose(handle); };
+    const service = new DirectiveProgressService(f.deps);
+    const eventKind = `silas.directive-producer-${kind}`;
+    const append = f.ledger.appendCustomEvent.bind(f.ledger);
+    let failed = false;
+    const fault = vi.spyOn(f.ledger, 'appendCustomEvent').mockImplementation((fields) => {
+      if (fields.kind !== eventKind || failed) return append(fields);
+      failed = true;
+      if (afterDurability) append(fields);
+      throw new Error(`${kind} cleanup publication failed`);
+    });
+    try {
+      service.reconsider(); await service.settled();
+      if (kind === 'unknown') {
+        expect(failed).toBe(true);
+        expect(f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active')?.detail)
+          .toContain('unknown cleanup publication failed');
+      }
+      expect(() => settleNativeDirective(f.deps, f.identity)).toThrow(/producer.*(fences|cessation)/u);
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+      service.reconsider(); await service.settled(); // publish/reconcile UNKNOWN without re-executing
+      const unknown = f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-unknown')!;
+      expect(unknown).not.toBeNull();
+      expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id).join(';')).toContain('unproven producer cleanup');
+      expect(f.spawns).toHaveLength(1); expect(f.native.continuations).toBe(1);
+      f.native.isBashRunning = false; // actual independent resource cessation, not disposal fulfillment
+      if (kind === 'ceased') {
+        expect(() => service.reconsider()).toThrow('ceased cleanup publication failed');
+        expect(failed).toBe(true);
+        expect(() => settleNativeDirective(f.deps, f.identity)).toThrow(/retained producer cleanup/u);
+        expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
+        expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+      }
+      service.reconsider(); await service.settled();
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+      const events = f.ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-producer-unknown', 'silas.directive-producer-ceased']);
+      expect(events.map((event) => event.kind)).toEqual(['silas.directive-producer-ceased', 'silas.directive-producer-unknown']);
+      expect(events[1]).toEqual(unknown);
+      const delivered = f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')!;
+      expect(delivered.seq).toBeGreaterThan(events[0]!.seq);
+      service.reconsider(); await service.settled();
+      expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-producer-unknown', 'silas.directive-producer-ceased'])).toEqual(events);
+      expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toEqual([delivered]);
+      expect(f.spawns).toHaveLength(1); expect(f.native.continuations).toBe(1); expect(f.native.prompts).toEqual([]);
+    } finally { fault.mockRestore(); await service.dispose(); }
+  }
+
+  it('retains UNKNOWN cleanup ownership when publication fails before durability', async () => {
+    await assertCleanupPublicationRetry('unknown', false);
+  });
+  it('reconciles committed UNKNOWN cleanup after publication fails without duplicate history', async () => {
+    await assertCleanupPublicationRetry('unknown', true);
+  });
+  it('retains genuinely ceased cleanup ownership until failed publication can commit', async () => {
+    await assertCleanupPublicationRetry('ceased', false);
+  });
+  it('reconciles committed genuine cessation after publication fails without losing the retry owner', async () => {
+    await assertCleanupPublicationRetry('ceased', true);
+  });
+
+  async function assertCleanupAcrossLedgerRestart(ceasedBeforeRestart: boolean, failedCessationPublication = false): Promise<void> {
+    const f = await fixture(); f.seed();
+    const dispose = f.registry.disposeHandle.bind(f.registry);
+    f.registry.disposeHandle = async (handle) => { f.native.isBashRunning = true; await dispose(handle); };
+    const originalHandles: AgentHandle[] = [];
+    const spawn = f.registry.spawn.bind(f.registry);
+    f.registry.spawn = async (role, options) => { const handle = await spawn(role, options); originalHandles.push(handle); return handle; };
+    const service = new DirectiveProgressService(f.deps);
+    const append = f.ledger.appendCustomEvent.bind(f.ledger);
+    let unknownAppends = 0;
+    const fault = vi.spyOn(f.ledger, 'appendCustomEvent').mockImplementation((fields) => {
+      if (fields.kind === 'silas.directive-producer-unknown') {
+        unknownAppends += 1;
+        throw new Error('UNKNOWN cleanup failed before durability at restart');
+      }
+      return append(fields);
+    });
+    try {
+      service.reconsider(); await service.settled();
+      expect(unknownAppends).toBe(1);
+      expect(f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active')?.detail)
+        .toContain('UNKNOWN cleanup failed before durability at restart');
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-unknown')).toBeNull();
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+      expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: true });
+      expect(originalHandles).toHaveLength(1);
+      expect(originalHandles[0]!.cessationEvidence!()).toBe('unknown');
+      expect(originalHandles[0]!.cessationEvidence!()).toBe('unknown'); // logical disposal is not physical cessation
+      expect(f.registry.getHandle('logical-minion')).toBe(originalHandles[0]);
+      fault.mockRestore();
+      if (ceasedBeforeRestart) {
+        // Actual independent-controller cessation, then crash between its
+        // committed receipt and delivery. The reopened API may settle this
+        // terminal without executing; unknown cleanup must not be bypassed.
+        f.native.isBashRunning = false;
+        if (failedCessationPublication) {
+          const missedCessation = vi.spyOn(f.ledger, 'appendCustomEvent').mockImplementation((fields) => {
+            if (fields.kind === 'silas.directive-producer-ceased') throw new Error('genuine cessation publication failed before durability');
+            return append(fields);
+          });
+          try { expect(() => service.reconsider()).toThrow('genuine cessation publication failed before durability'); }
+          finally { missedCessation.mockRestore(); }
+        } else {
+          const delivery = f.ledger.appendCustomEventIfCurrentDirective.bind(f.ledger);
+          const missedDelivery = vi.spyOn(f.ledger, 'appendCustomEventIfCurrentDirective').mockImplementation((fields, identity) => {
+            if (fields.kind === 'job.delivered') throw new Error('delivery failed before durability after real cessation');
+            return delivery(fields, identity);
+          });
+          try { service.reconsider(); await service.settled(); } finally { missedDelivery.mockRestore(); }
+        }
+        expect(originalHandles[0]!.cessationEvidence!()).toBe('ceased');
+        expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+        const history = f.ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-producer-unknown', 'silas.directive-producer-ceased']);
+        expect(history.map((event) => event.kind)).toEqual(failedCessationPublication ? ['silas.directive-producer-unknown'] :
+          ['silas.directive-producer-ceased', 'silas.directive-producer-unknown']);
+        for (const event of history) expect(event.payload).toMatchObject({ request_id: f.intent.requestId, agent_id: 'logical-minion',
+          producer_start_seq: f.ledger.directiveProducerStart(f.identity), producer_identity: f.identity, session_file: f.file });
+      }
+      const request = f.ledger.getDirective(f.intent.requestId)!;
+      const debt = f.ledger.listObligations({ jobId: f.intent.jobId }).find((row) => row.incidentKey === `directive-recovery:${f.intent.requestId}`)!;
+      expect(debt).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision' }, firingRule: 'restart-recovery-gru-decision' });
+      const nativeBytes = readFileSync(f.file, 'utf8');
+      const binding = readDirectiveBinding(f.file, f.intent.requestId);
+      const admission = f.ledger.getEvent(request.admissionSeq!);
+      const cleanupHistory = f.ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-producer-unknown', 'silas.directive-producer-ceased']);
+      await service.dispose();
+      f.db.close(); // Real persisted SQLite close/reopen, NOT another service on the same API.
+      const reopenedDb = new LedgerDb(f.dir);
+      cleanups.push(() => reopenedDb.close());
+      expect(reopenedDb.dbPath).toBe(f.db.dbPath);
+      const bus = new EventBus({});
+      const ledger = new LedgerApi(reopenedDb.handle, { bus });
+      expect(ledger).not.toBe(f.ledger);
+      const freshRegistry: DirectiveRegistry = {
+        getHandle: vi.fn(() => null),
+        spawn: vi.fn(async () => { throw new Error('restart must not spawn or replay a terminal with unproven cleanup'); }),
+        disposeHandle: vi.fn(async () => { throw new Error('fresh registry has no retained cleanup handle'); }),
+      };
+      const resumed = new DirectiveProgressService({ ...f.deps, ledger, registry: freshRegistry,
+        notifications: new NotificationCenter({ ledger, bus }) });
+      try {
+        resumed.reconsider(); await resumed.settled();
+        const landed = ledger.latestJobEvent(f.intent.jobId, 'job.delivered');
+        if (!ceasedBeforeRestart || failedCessationPublication) {
+          expect(landed, 'unpublished UNKNOWN cleanup must survive a fresh LedgerApi without a handle').toBeNull();
+          expect(ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
+          expect(originalHandles[0]!.cessationEvidence!()).toBe(ceasedBeforeRestart ? 'ceased' : 'unknown');
+          expect(ledger.getObligation(debt.id)).toMatchObject({ generation: debt.generation, state: 'open', nextAction: { kind: 'gru-decision' } });
+          expect(ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active')?.detail)
+            .toContain(`generation ${debt.generation}`);
+        } else {
+          expect(landed?.payload).toMatchObject({ request_id: f.intent.requestId, agentId: 'logical-minion', work_revision: f.identity.workRevision });
+          expect(landed!.seq).toBeGreaterThan(cleanupHistory[0]!.seq);
+          expect(ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+          expect(ledger.getObligation(debt.id)?.state).toBe('settled');
+          resumed.reconsider(); await resumed.settled();
+          expect(ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toEqual([landed]);
+        }
+        expect(ledger.getDirective(f.intent.requestId)).toMatchObject({ requestId: request.requestId, jobId: request.jobId,
+          payloadHash: request.payloadHash, workRevision: request.workRevision, authorityEpoch: request.authorityEpoch,
+          contractSha256: request.contractSha256, nativeTarget: request.nativeTarget, nativeBinding: request.nativeBinding,
+          admissionSeq: request.admissionSeq, recoveryCheckpoint: request.recoveryCheckpoint });
+        expect(ledger.getEvent(request.admissionSeq!)).toEqual(admission);
+        expect(ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-producer-unknown', 'silas.directive-producer-ceased'])).toEqual(cleanupHistory);
+        expect(readFileSync(f.file, 'utf8')).toBe(nativeBytes);
+        expect(readDirectiveBinding(f.file, f.intent.requestId)).toEqual(binding);
+        expect(freshRegistry.spawn).not.toHaveBeenCalled(); expect(freshRegistry.disposeHandle).not.toHaveBeenCalled();
+        expect(f.spawns).toHaveLength(1); expect(f.native.continuations).toBe(1); expect(f.native.prompts).toEqual([]);
+      } finally { await resumed.dispose(); }
+    } finally { fault.mockRestore(); await service.dispose(); f.native.isBashRunning = false; }
+  }
+
+  it('restart with a fresh persisted ledger preserves unpublished UNKNOWN cleanup without replay or delivery', async () => {
+    await assertCleanupAcrossLedgerRestart(false);
+  });
+  it('restart with a fresh persisted ledger settles terminal progress only after recorded genuine cleanup cessation', async () => {
+    await assertCleanupAcrossLedgerRestart(true);
+  });
+
+  async function assertProducerFenceWriteFailure(mode: 'dispatch' | 'checkpoint', afterDurability: boolean): Promise<void> {
+    const f = await fixture(); if (mode === 'checkpoint') f.seed();
+    const prefix = readFileSync(f.file, 'utf8');
+    const publish = f.bus.publish.bind(f.bus);
+    const fault = afterDurability ? vi.spyOn(f.bus, 'publish').mockImplementation((event) => {
+      publish(event);
+      if (event.kind === 'silas.directive-producer-started') throw new Error('producer start publication failed after commit');
+    }) : null;
+    if (!afterDurability) f.db.handle.exec(`CREATE TRIGGER refuse_producer_start BEFORE INSERT ON events
+      WHEN NEW.kind = 'silas.directive-producer-started' BEGIN SELECT RAISE(FAIL, 'producer start storage failed before commit'); END`);
+    const service = new DirectiveProgressService(f.deps);
+    try {
+      if (mode === 'dispatch') await executeAcceptedDirective(f.deps, f.intent.requestId);
+      else { service.reconsider(); await service.settled(); }
+      const start = f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-started');
+      expect(start === null).toBe(!afterDurability);
+      expect(f.ledger.getDirective(f.intent.requestId)?.dispatchStartedAt !== null).toBe(mode === 'dispatch');
+      expect(f.ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint !== null).toBe(mode === 'checkpoint');
+      if (start !== null) expect(start.payload).toMatchObject({ request_id: f.intent.requestId, producer_identity: f.identity });
+      expect(f.spawns).toHaveLength(1); expect(f.native.prompts).toEqual([]); expect(f.native.continuations).toBe(0);
+      expect(readFileSync(f.file, 'utf8')).toBe(prefix);
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+      const debt = f.ledger.listObligations({ jobId: f.intent.jobId }).find((row) => row.incidentKey === `directive-recovery:${f.intent.requestId}`)!;
+      expect(debt).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision' } });
+      expect(f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active')?.detail)
+        .toContain(afterDurability ? 'producer start publication failed after commit' : 'producer start storage failed before commit');
+      if (afterDurability) expect(f.ledger.getEvent(start!.seq)?.kind).toBe('silas.directive-producer-started');
+    } finally {
+      fault?.mockRestore();
+      if (!afterDurability) f.db.handle.exec('DROP TRIGGER refuse_producer_start');
+      await service.dispose();
+    }
+  }
+  it('common dispatch checks a live supervised producer before spawning or preparing a native target', async () => {
+    const f = await fixture();
+    const before = readFileSync(f.file, 'utf8');
+    const head = resolveGitCommit(f.lane.path, 'HEAD');
+    f.supervised(['a different supervised producer still owns the original job lane']);
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    expect(f.native.prompts).toEqual([]); expect(f.native.continuations).toBe(0);
+    expect(readFileSync(f.file, 'utf8')).toBe(before);
+    expect(resolveGitCommit(f.lane.path, 'HEAD')).toBe(head);
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+    expect(f.spawns, 'full producer fences must precede native owner spawn, not only beforeAdmission').toEqual([]);
+    expect(f.ledger.getDirective(f.intent.requestId)?.nativeTarget,
+      'a blocked producer must not mutate the accepted native target').toBeNull();
+  });
+
+  it('common dispatch rechecks a real review producer appearing during pacing before spawn or target mutation', async () => {
+    const f = await fixture();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
+    const holder = await gate.acquireWorkerTurn({ id: 'independent-pacing-holder', label: 'independent held pacing slot', signal: new AbortController().signal });
+    let holderReleased = false;
+    const before = readFileSync(f.file, 'utf8');
+    const head = resolveGitCommit(f.lane.path, 'HEAD');
+    const execution = executeAcceptedDirective({ ...f.deps, workerGate: gate }, f.intent.requestId);
+    try {
+      // The real gate registers its waiter before its returned Promise can
+      // resolve. No timer or test-only admission implementation is involved.
+      expect(gate.view().worker.queued).toHaveLength(1);
+      expect(f.spawns).toEqual([]);
+      expect(f.ledger.getDirective(f.intent.requestId)?.nativeTarget).toBeNull();
+      const round = f.ledger.addRound({ jobId: f.intent.jobId, lenses: ['blind'] });
+      holder.release(); holderReleased = true; await execution;
+      expect(f.ledger.getRound(round.id)?.status).toBe('pending');
+      expect(gate.view().worker.running).toBe(0);
+      expect(f.native.prompts).toEqual([]); expect(f.native.continuations).toBe(0);
+      expect(readFileSync(f.file, 'utf8')).toBe(before);
+      expect(resolveGitCommit(f.lane.path, 'HEAD')).toBe(head);
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+      expect(f.spawns, 'a producer appearing across the actual pacing await must block pre-spawn').toEqual([]);
+      expect(f.ledger.getDirective(f.intent.requestId)?.nativeTarget,
+        'post-await producer refusal must precede target preparation').toBeNull();
+    } finally {
+      if (!holderReleased) holder.release();
+      await execution;
+    }
+  });
+
+  it('dispatch start fence storage failure rolls back before any native producer effect', async () => {
+    await assertProducerFenceWriteFailure('dispatch', false);
+  });
+  it('dispatch start fence committed publication failure retains uncertainty without starting native work', async () => {
+    await assertProducerFenceWriteFailure('dispatch', true);
+  });
+  it('checkpoint start fence storage failure rolls back before spawn or continuation', async () => {
+    await assertProducerFenceWriteFailure('checkpoint', false);
+  });
+  it('checkpoint start fence committed publication failure retains uncertainty without continuing native work', async () => {
+    await assertProducerFenceWriteFailure('checkpoint', true);
+  });
+
+  it('actual accepted dispatch at a native user checkpoint stays UNKNOWN after fresh-ledger restart without original producer cessation', async () => {
+    const f = await fixture(); f.native.autoFinish = false;
+    const started = deferred<void>();
+    const unsubscribe = f.native.subscribe((event) => { if ((event as { type: string }).type === 'agent_start') started.resolve(); });
+    const original = executeAcceptedDirective(f.deps, f.intent.requestId).catch((error: unknown) => error);
+    let resumed: DirectiveProgressService | null = null;
+    try {
+      await started.promise;
+      // The actual protocol, not seed(), has consumed this accepted prompt.
+      expect(f.native.prompts).toHaveLength(1); expect(f.native.isIdle).toBe(false);
+      const native = inspectDirectiveCheckpoint(f.file, f.identity);
+      expect(native.state).toBe('resumable');
+      const request = f.ledger.getDirective(f.intent.requestId)!;
+      expect(request.state).toBe('admitted');
+      const producer = f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-started')!;
+      expect(producer.payload).toMatchObject({ request_id: request.requestId, producer_identity: f.identity });
+      const prefix = readFileSync(f.file, 'utf8');
+      f.db.close(); // Hard restart loses this API/registry, not the producer's effects.
+      const db = new LedgerDb(f.dir); cleanups.push(() => db.close());
+      const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+      const registry: DirectiveRegistry = { getHandle: () => null,
+        spawn: vi.fn(async () => { throw new Error('unproven original producer cannot be replaced'); }), disposeHandle: async () => {} };
+      resumed = new DirectiveProgressService({ ...f.deps, ledger, registry, notifications: new NotificationCenter({ ledger, bus }) });
+      resumed.reconsider(); await resumed.settled();
+      expect(ledger.getDirective(request.requestId)).toMatchObject({ state: 'admitted', nativeBinding: request.nativeBinding,
+        nativeTarget: request.nativeTarget, workRevision: request.workRevision, contractSha256: request.contractSha256,
+        authorityEpoch: request.authorityEpoch, recoveryCheckpoint: null });
+      expect(ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-started')).toEqual(producer);
+      expect(ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-ceased')).toBeNull();
+      expect(ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+      expect(registry.spawn).not.toHaveBeenCalled(); expect(f.native.continuations).toBe(0); expect(f.native.prompts).toHaveLength(1);
+      expect(readFileSync(f.file, 'utf8')).toBe(prefix);
+      const debt = ledger.listObligations({ jobId: request.jobId }).find((row) => row.incidentKey === `directive-recovery:${request.requestId}`)!;
+      expect(debt).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision' } });
+      expect(debt.description).toContain(`start ${producer.seq}`);
+      expect(debt.nextAction).toMatchObject({ decision: expect.stringContaining('exact original producer') });
+    } finally {
+      await resumed?.dispose(); unsubscribe();
+      // Release the controlled original test resource, preserving its abort
+      // evidence rather than rewriting the checkpoint used by assertions.
+      f.native.finish('aborted'); await original;
+    }
+  });
+
+  it('foreign or mismatched cessation receipts cannot consume the exact original producer start fence', async () => {
+    const f = await fixture(); f.seed();
+    expect(f.ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(true);
+    const producer = inspectDirectiveProducers(f.file, f.identity)[0]!.producer;
+    const start = f.ledger.startDirectiveProducer(f.identity, producer);
+    const before = f.ledger.latestEventSeq();
+    const payload = { request_id: f.intent.requestId, agent_id: 'logical-minion', session_file: f.file,
+      producer_start_seq: start, producer_identity: f.identity, native_producer: producer };
+    for (const mismatch of [{ request_id: 'foreign-request' }, { agent_id: 'foreign-minion' }, { session_file: `${f.file}.foreign` },
+      { producer_start_seq: start + 1 }, { producer_identity: { ...f.identity, payloadHash: 'f'.repeat(64) } },
+      { producer_identity: { ...f.identity, authorityEpoch: f.identity.authorityEpoch + 1 } }]) {
+      expect(() => f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: f.intent.jobId,
+        payload: { ...payload, ...mismatch } })).toThrow(/exact original start/);
+      expect(f.ledger.latestEventSeq()).toBe(before);
+    }
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-ceased')).toBeNull();
+    expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id).join(';')).toContain(`start ${start}`);
+    expect(f.native.continuations).toBe(0); expect(f.spawns).toEqual([]);
+  });
+
+  it('resident cleanup preserves the logical native session for the next directive and cannot reuse an old producer token', async () => {
+    const f = await fixture();
+    await f.registry.spawn('minion', { agentId: 'logical-minion', cwd: f.lane.path });
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    const first = f.ledger.getDirective(f.intent.requestId)!;
+    expect(first.state).toBe('settled'); expect(f.registry.getHandle('logical-minion')).toBeNull();
+    const originalStart = f.ledger.directiveProducerStart(f.identity);
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-ceased')?.payload)
+      .toMatchObject({ producer_start_seq: originalStart, producer_identity: f.identity, agent_id: 'logical-minion', session_file: f.file });
+    const second = f.ledger.beginDirectiveIntent({ jobId: f.intent.jobId, requestId: 'second-resident-directive', directive: 'inspect remaining approved progress', holder: 'gru' }).record;
+    await executeAcceptedDirective(f.deps, second.requestId);
+    const identity = f.ledger.directiveTurnIdentity(second.requestId);
+    const secondStart = f.ledger.directiveProducerStart(identity);
+    expect(() => f.ledger.directiveProgressBlockers(second.requestId, f.lane.id, undefined, originalStart)).toThrow(/token/);
+    expect(secondStart).toBeGreaterThan(originalStart);
+    expect(f.ledger.getDirective(second.requestId)).toMatchObject({ state: 'settled', nativeTarget: first.nativeTarget });
+    expect(f.ledger.getDirective(second.requestId)?.nativeBinding?.sessionId).toBe(first.nativeBinding?.sessionId);
+    expect(f.spawns).toHaveLength(2); expect(f.spawns[1]).toMatchObject({ agentId: 'logical-minion', resumeFile: f.file, cwd: f.lane.path });
+    expect(f.native.prompts).toHaveLength(2); expect(f.worktrees.listWorktrees({ jobId: f.intent.jobId })).toEqual([f.lane]);
+  });
+
+  it('prior rebrief handle cessation cannot consume the current dispatch producer start fence', async () => {
+    const f = await fixture('rebrief');
+    const prior = await f.registry.spawn('minion', { agentId: 'logical-minion', cwd: f.lane.path });
+    const prepared = deferred<void>(); const gate = deferred<void>(); f.native.preflight = gate.promise;
+    const spawn = f.registry.spawn.bind(f.registry);
+    f.registry.spawn = async (role, options) => { const handle = await spawn(role, options);
+      const prepare = handle.prepareDirectiveProducer!.bind(handle);
+      handle.prepareDirectiveProducer = (identity) => { const producer = prepare(identity); queueMicrotask(() => prepared.resolve()); return producer; };
+      return handle; };
+    const execution = executeAcceptedDirective(f.deps, f.intent.requestId);
+    try {
+      await Promise.race([prepared.promise, execution.then(() => { throw new Error(f.ledger.findNotificationByKind(`silas.directive-unreconciled.${f.intent.requestId}`, 'active')?.detail ?? 'execution completed without producer'); })]); await Promise.resolve();
+      expect(prior.cessationEvidence!()).toBe('ceased');
+      const start = f.ledger.directiveProducerStart(f.identity);
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-ceased')).toBeNull();
+      expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id).join(';')).toContain(`start ${start}`);
+      gate.resolve(); await execution;
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-ceased')?.payload)
+        .toMatchObject({ producer_start_seq: start, agent_id: f.ledger.getDirective(f.intent.requestId)?.admissionMinion });
+    } finally { gate.resolve(); await execution; }
+  });
+
+  it('restart preserves UNKNOWN when genuine original cessation publication failed before durability', async () => {
+    await assertCleanupAcrossLedgerRestart(true, true);
   });
 
   it('checkpoint continuation preserves primary and disposal failures while releasing pacing and retaining UNKNOWN ownership', async () => {
@@ -376,6 +879,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const request = f.ledger.beginDirectiveIntent({ jobId, requestId: 'other-request', directive: 'approved unrelated turn', holder: 'gru' }).record;
     const identity = f.ledger.directiveTurnIdentity(request.requestId); f.ledger.prepareDirectiveTarget(request.requestId, { agentId: 'other-minion', sessionFile: file });
     prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'other-minion', sessionId: native.sessionId, sessionFile: file, text: 'approved unrelated turn', authorityManifest: 'other authorized fixture' });
+    recordDirectiveProducerCessation(prepareDirectiveProducer({ identity, agentId: 'other-minion', sessionId: native.sessionId, sessionFile: file }));
     native.append({ role: 'user', content: [{ type: 'text', text: 'approved unrelated turn' }] }); native.append({ role: 'assistant', stopReason: 'stop', content: [] });
     const service = new DirectiveProgressService(f.deps); service.reconsider(1); await service.settled(); service.reconsider(1); await service.settled();
     expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted'); expect(f.ledger.getDirective(request.requestId)?.state).toBe('settled');

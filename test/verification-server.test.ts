@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -401,6 +403,41 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     expect(started).toHaveLength(1);
     expect(completed).toHaveLength(1);
     await harness.close();
+  });
+
+  it('same-ID terminal reconciliation closes only absent exact lane processes while retaining failure and partial capture truth', async () => {
+    const harness = await boot(); const requestId = 'terminal-process-restart';
+    const pending = call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+    let originalStarted = harness.ledger.latestJobEvent(harness.jobId, 'verification.started');
+    while (originalStarted === null) { await new Promise<void>((resolve) => setImmediate(resolve)); originalStarted = harness.ledger.latestJobEvent(harness.jobId, 'verification.started'); }
+    process.kill(-((originalStarted.payload as { pid: number }).pid), 'SIGTERM');
+    const first = await pending;
+    const outcome = outcomeOf(completedFrame(first.frames)); expect(outcome['ok']).toBe(false); expect(outcome['signal']).toBe('SIGTERM');
+    const lane = harness.worktrees.listWorktrees({ jobId: harness.jobId })[0]!;
+    harness.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: harness.repo.path, path: lane.path, branch: lane.branch, sha: harness.repo.head(), kind: 'job', jobId: harness.jobId });
+    const started = harness.ledger.latestJobEvent(harness.jobId, 'verification.started')!;
+    const payload = started.payload as { pid: number; command: string };
+    const live = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const capture = join(harness.config.dataDir, 'original-partial-capture.ndjson'); writeFileSync(capture, JSON.stringify({ type: 'started', runId: outcome['runId'] }) + '\n');
+    const bytes = readFileSync(capture, 'utf8'); const completed = harness.ledger.latestJobEvent(harness.jobId, 'verification.completed');
+    harness.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [
+      { pid: payload.pid, command: `/bin/sh -c ${payload.command}`, evidence: 'registry' },
+      { pid: live.pid!, command: `/bin/sh -c ${payload.command}`, evidence: 'registry' },
+    ] });
+    try {
+      const replay = await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+      expect(replay.frames[0]).toMatchObject({ type: 'completed', reconciled: true }); expect(outcomeOf(replay.frames[0]!)).toEqual(outcome);
+      expect(harness.ledger.listWorktreeProcesses(lane.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ pid: payload.pid, state: 'killed' }), expect.objectContaining({ pid: live.pid, state: 'live' }),
+      ]));
+      expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.completed')).toEqual(completed);
+      const audit = harness.ledger.latestJobEvent(harness.jobId, 'verification.process-reconciled');
+      expect(audit?.payload).toMatchObject({ request_id: requestId, run_id: outcome['runId'], pid: payload.pid });
+      await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
+      expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.process-reconciled'])).toEqual([audit]);
+      expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.started'])).toEqual([started]);
+      expect(readFileSync(capture, 'utf8')).toBe(bytes); expect(harness.ledger.hasUnsettledVerificationRun(harness.jobId)).toBe(false);
+    } finally { const exit = once(live, 'exit'); live.kill('SIGKILL'); await exit; await harness.close(); }
   });
 
   it('replays a completed request_id instead of rerunning, and reconciles unknown → running → completed', async () => {

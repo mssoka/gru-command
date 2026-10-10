@@ -3257,6 +3257,11 @@ export class WaveRunner {
       this.opts.inform?.(`Automatic review retry for job ${jobId} skipped`,
         `Retry ${retry.attempt} after refused round ${retry.roundId} did not run: ${reason}.`, context);
     };
+    // A new setup may still refuse and take this exact waiting retry over.
+    // Its provisional round/status are not a completed successor. Leave the
+    // original attempt/due time intact; setup's finally re-arms after rollback
+    // (or the usual successor proof then skips it after real admission).
+    if (this.roundAdmission.has(jobId)) return;
     const skipped = this.admissionRetrySkipReason(retry);
     if (skipped !== null) return skip(skipped);
     retry.running = true;

@@ -1,6 +1,6 @@
 import type { Role } from '../config.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
-import type { DirectiveCheckpoint, DirectiveNativeBinding, DirectiveTurnIdentity } from './directive-checkpoint.js';
+import type { DirectiveCheckpoint, DirectiveNativeBinding, DirectiveProducer, DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 /**
  * Runtime adapter interface (EPICS E2 story 1; SPEC ruling 4).
@@ -124,6 +124,9 @@ export interface SpawnOptions {
    * When omitted a fresh session is created.
    */
   readonly resumeFile?: string;
+  /** Exact physical predecessor, inspected by the checkpoint coordinator.
+   * Only original host absence permits reclaiming its native session lock. */
+  readonly directiveRecoveryProducer?: DirectiveProducer;
   /**
    * Working directory for the session (SPEC ruling 17): the dispatch
    * flow roots minions and reviewers in the PROJECT they serve. Must be
@@ -337,6 +340,7 @@ export interface AgentHandle {
    */
   promptWithVerdict?(text: string, options?: PromptOptions): Promise<PromptTurnVerdict>;
   /** Adapter-owned safe native continuation: never replays a user prompt. */
+  prepareDirectiveProducer?(identity: DirectiveTurnIdentity): DirectiveProducer;
   inspectDirective?(identity: DirectiveTurnIdentity): DirectiveCheckpoint;
   resumeDirective?(identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void): Promise<PromptTurnVerdict>;
   /**

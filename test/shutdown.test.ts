@@ -153,7 +153,23 @@ describe('graceful shutdown', () => {
       // size snapshot — the next boot's growth detection has a baseline.
       const snapshotFile = join(home, 'sessions', 'store-state.json');
       expect(existsSync(snapshotFile)).toBe(true);
-      expect(JSON.parse(readFileSync(snapshotFile, 'utf-8'))).toEqual({});
+      const snapshot = JSON.parse(readFileSync(snapshotFile, 'utf-8')) as Record<string, number>;
+      const files = Object.keys(snapshot);
+      expect(files).toHaveLength(1);
+      const file = files[0]!;
+      expect(file.startsWith(join(home, 'sessions', 'gru') + '/')).toBe(true);
+      const bytes = readFileSync(file);
+      expect(Number.isSafeInteger(snapshot[file])).toBe(true);
+      expect(snapshot[file]).toBe(bytes.length);
+      expect(snapshot[file]).toBeGreaterThan(0);
+      const entries = bytes.toString('utf8').trim().split('\n').map((line) => JSON.parse(line) as { type: string; id?: string });
+      expect(entries[0]).toMatchObject({ type: 'session', id: expect.any(String) });
+      // Durable native initialization/selection is not a user turn,
+      // request admission, assistant completion or fabricated empty store.
+      expect(entries.every((entry) => ['session', 'model_change', 'thinking_level_change'].includes(entry.type))).toBe(true);
+      const db = new LedgerDb(home);
+      try { expect(db.handle.prepare('SELECT COUNT(*) AS n FROM pending_directives').get()?.n).toBe(0); }
+      finally { db.close(); }
       // And the boot line reported the session store wiring:
       const storeLine = lines.find((line) => line.msg === 'session store ready');
       expect(storeLine).toBeDefined();

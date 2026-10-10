@@ -431,6 +431,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     }
 
     async disposeHandle(handle: AgentHandle): Promise<void> {
+      await handle.dispose();
       this.handles.delete(handle.id);
     }
 
@@ -444,6 +445,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
         id,
         sessionFile: native.file,
         capabilities: FAKE_CAPABILITIES,
+        prepareDirectiveProducer: native.prepare,
         inspectDirective: native.inspect,
         async prompt(text: string, options?: PromptOptions): Promise<void> {
           native.begin(text, options);
@@ -460,7 +462,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
         health(): { state: 'idle'; lastActivity: null; sessionFile: null } {
           return { state: 'idle', lastActivity: null, sessionFile: null };
         },
-        async dispose(): Promise<void> { disposed = true; },
+        async dispose(): Promise<void> { native.ceased(); disposed = true; },
         cessationEvidence: () => disposed ? 'ceased' : 'unknown',
       };
     }

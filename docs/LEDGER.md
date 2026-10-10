@@ -681,3 +681,25 @@ Migration 25 adds nullable native progress and latest recovery pointers without 
 Legacy receipt SHA is server-computed and compared inside judgment transactions; clocks/watermarks alone are not correlation. Missing historical HEAD/revision are never supplied from current state. `silas.rebrief-control-closed` is non-executing administrative closure of proven-completed control with absent delivery facts: full immutable evidence remains; a concrete current-inspection obligation owns the next fresh directive/verification action. No historical delivery/current revision/verification/READY is emitted by closure.
 
 `ruling.recorded` with permission `fresh-current-approved-recovery-successor` and separate `silas.recovery-owner-stop-confirmed` are explicit owner-attributed records bound to transfer/subject/target generation/plan/current scope/stop lineage. Shared bearer attribution is not independently verified identity. Confirmation legally resumes/settles only its exact suspended real owner target; neither writer changes job parking, notification Ack, other holds or execution. Nongenuine target closure/plan changes create new suspended Gru incarnations, not permission. Original-generation decision replay remains immutable after subsequent incarnations.
+
+### GH-286 physical restart and verification evidence
+
+`silas.directive-producer-reserved` is only a pre-effect dispatch reservation.
+`silas.directive-producer-started` binds a prepared physical native incarnation
+(UUID/host/PID/request/session plus accepted authority); neither proves prompt
+admission. The exact native user receipt owns `silas.directive-sent` admission.
+Cleanup receipts consume only their exact producer start, or an explicitly
+named original UNKNOWN receipt. Logical minion reuse cannot erase older debt.
+The adapter's append-only `.producers.jsonl` journal precedes native execution;
+legacy, torn, live, foreign-host and uncertain tool evidence stays unknown.
+Original host ESRCH plus a safe persisted checkpoint and independent producer
+fences permits bounded same-session continuation, never original prompt replay.
+
+`verification.no-start` durably settles only scheduler-owned queued/granted
+attempts that shutdown revoked before spawn. Original request/run IDs remain
+readable across restart; no completion/PASS is invented. Same-ID terminal
+readback may append `verification.process-reconciled` and close a matching
+registry PID row only when both original PID and detached process group are
+absent. Terminal failures/SIGTERM, partial output and native review provenance
+are unchanged. Unsupported historical evidence stays actionable UNKNOWN.
+These controls authorize no owner Ack, production restart/deploy or merge.

@@ -6,7 +6,7 @@ import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
-import { DirectiveCheckpointError, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -1234,17 +1234,43 @@ export class LedgerApi {
         `SELECT 1 AS unsettled FROM (
            SELECT json_extract(payload, '$.run_id') AS run_id,
                   MAX(CASE WHEN kind IN ('verification.requested', 'verification.started') THEN seq ELSE 0 END) AS open_seq,
-                  MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout') THEN seq ELSE 0 END) AS settled_seq
+                  MAX(CASE WHEN kind IN ('verification.completed', 'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start') THEN seq ELSE 0 END) AS settled_seq
            FROM events
            WHERE job_id = ? AND kind IN (
              'verification.requested', 'verification.started', 'verification.completed',
-             'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout'
+             'verification.stale-released', 'verification.reconciled', 'verification.lock-timeout', 'verification.no-start'
            )
            GROUP BY run_id
          ) WHERE open_seq > settled_seq LIMIT 1`,
       )
       .get(jobId) as Row | undefined;
     return row !== undefined;
+  }
+
+  /** Authoritative terminal readback may close only absent matching physical
+   * registry rows. Process-group absence prevents detached children being lost;
+   * live, EPERM, PID reuse and foreign commands remain untouched. */
+  reconcileVerificationProcesses(input: { readonly jobId: string; readonly runId: string; readonly requestId: string;
+    readonly command: string; readonly cwd: string; readonly worktreeId: string }): void {
+    const absent = (pid: number): boolean => {
+      try { process.kill(pid, 0); return false; }
+      catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+    };
+    this.transaction(() => {
+      const lane = this.getWorktree(input.worktreeId);
+      if (lane?.jobId !== input.jobId || lane.path !== input.cwd) return;
+      const terminal = this.db.prepare(`SELECT seq FROM events WHERE job_id = ? AND kind IN ('verification.completed', 'verification.reconciled')
+        AND json_extract(payload, '$.run_id') = ? ORDER BY seq DESC LIMIT 1`).get(input.jobId, input.runId) as Row | undefined;
+      if (terminal === undefined) return;
+      for (const row of this.listWorktreeProcesses(input.worktreeId)) {
+        if (row.state !== 'live' || row.evidence !== 'registry' || row.command !== `/bin/sh -c ${input.command}` || !absent(row.pid) || !absent(-row.pid)) continue;
+        this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
+        this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
+          request_id: input.requestId, run_id: input.runId, terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,
+          pid: row.pid, command: row.command, evidence: 'original-pid-and-process-group-absent',
+        } });
+      }
+    });
   }
 
   /** Latest durable event for one job/kind (ops follow-through checks). */
@@ -3460,16 +3486,19 @@ export class LedgerApi {
     lens?: string | null;
     payload?: unknown;
   }): BusEvent {
-    return this.transaction(() =>
-      this.appendEvent({
+    return this.transaction(() => {
+      if (fields.kind === 'silas.directive-producer-ceased' || fields.kind === 'silas.directive-producer-unknown') {
+        this.validateDirectiveProducerReceipt(fields.jobId ?? null, fields.payload);
+      }
+      return this.appendEvent({
         kind: fields.kind,
         agentId: fields.agentId ?? null,
         jobId: fields.jobId ?? null,
         roundId: fields.roundId ?? null,
         lens: fields.lens ?? null,
         payload: fields.payload,
-      }),
-    );
+      });
+    });
   }
 
   /** Delivery-only crash recovery: check the exact admitted markers and
@@ -7051,9 +7080,13 @@ export class LedgerApi {
 
   claimDirectiveDispatch(requestId: string): boolean {
     return this.transaction(() => {
-      this.assertDirectiveAuthority(this.directiveTurnIdentity(requestId));
+      const identity = this.directiveTurnIdentity(requestId);
+      const cleanupBlockers = this.directiveCleanupBlockers(identity.jobId);
+      if (cleanupBlockers.length > 0) throw new DirectiveCheckpointError(`original producer cessation unproven: ${cleanupBlockers.join('; ')}`);
+      this.assertDirectiveAuthority(identity);
       const row = this.getDirective(requestId)!;
       if (row.dispatchStartedAt !== null) return false;
+      this.appendEvent({ kind: 'silas.directive-producer-reserved', jobId: identity.jobId, payload: { fact: 'reservation', request_id: requestId, producer_identity: identity } });
       this.db.prepare('UPDATE pending_directives SET dispatch_started_at = ? WHERE request_id = ?').run(nowIso(), requestId);
       this.appendEvent({ kind: 'silas.directive-dispatch-started', jobId: row.jobId, payload: { request_id: requestId } });
       return true;
@@ -7110,23 +7143,76 @@ export class LedgerApi {
     return this.transaction(() => { this.assertDirectiveAuthority(identity); return this.appendEvent(fields); });
   }
 
-  private directiveCleanupBlockers(jobId: string): readonly string[] {
+  startDirectiveProducer(identity: DirectiveTurnIdentity, producer: DirectiveProducer): number {
+    return this.transaction(() => {
+      this.assertDirectiveAuthority(identity);
+      const target = this.getDirective(identity.requestId)!.nativeTarget;
+      if (!isDeepStrictEqual(producer.identity, identity) || producer.agentId !== target?.agentId || producer.sessionFile !== target.sessionFile ||
+          !producer.incarnation || !producer.sessionId || !producer.host || !Number.isSafeInteger(producer.pid) || producer.pid <= 0) {
+        throw new DirectiveCheckpointError('native producer start must bind the exact prepared physical request/session authority');
+      }
+      const blockers = this.directiveCleanupBlockers(identity.jobId);
+      if (blockers.length > 0) throw new DirectiveCheckpointError(`original producer cessation unproven: ${blockers.join('; ')}`);
+      this.appendEvent({ kind: 'silas.directive-producer-started', jobId: identity.jobId,
+        payload: { request_id: identity.requestId, producer_identity: identity, native_producer: producer } });
+      return this.directiveProducerStart(identity);
+    });
+  }
+
+  directiveProducerStart(identity: DirectiveTurnIdentity): number {
+    const event = this.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId);
+    const payload = event?.payload as { producer_identity?: unknown } | undefined;
+    if (event === null || !isDeepStrictEqual(payload?.producer_identity, identity)) throw new DirectiveCheckpointError('exact directive producer start receipt missing');
+    return event.seq;
+  }
+
+  private validateDirectiveProducerReceipt(jobId: string | null, raw: unknown): void {
+    const payload = raw as { producer_start_seq?: unknown; producer_identity?: DirectiveTurnIdentity; request_id?: unknown; agent_id?: unknown; session_file?: unknown } | undefined;
+    if (payload?.producer_start_seq === undefined) return; // legacy records cannot consume a new start fence
+    const start = typeof payload.producer_start_seq === 'number' ? this.getEvent(payload.producer_start_seq) : null;
+    const identity = payload.producer_identity;
+    const row = typeof payload.request_id === 'string' ? this.getDirective(payload.request_id) : null;
+    if (identity === undefined || row === null || start?.kind !== 'silas.directive-producer-started' || start.jobId !== jobId || row.jobId !== jobId ||
+        !isDeepStrictEqual((start.payload as { producer_identity?: unknown }).producer_identity, identity) ||
+        !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), identity) || identity.requestId !== payload.request_id ||
+        row.nativeTarget?.agentId !== payload.agent_id || row.nativeTarget?.sessionFile !== payload.session_file ||
+        !isDeepStrictEqual((start.payload as { native_producer?: unknown }).native_producer, (raw as { native_producer?: unknown }).native_producer)) {
+      throw new DirectiveCheckpointError('producer cleanup receipt does not bind the exact original start/request/minion/session authority');
+    }
+  }
+
+  private directiveCleanupBlockers(jobId: string, ownProducerStartSeq?: number): readonly string[] {
     const rows = this.db.prepare(`SELECT kind, payload FROM events e WHERE e.job_id = ?
       AND e.kind IN ('silas.directive-producer-unknown', 'silas.directive-producer-ceased')
       AND NOT EXISTS (SELECT 1 FROM events newer WHERE newer.job_id = e.job_id AND newer.seq > e.seq
         AND newer.kind IN ('silas.directive-producer-unknown', 'silas.directive-producer-ceased')
         AND json_extract(newer.payload, '$.request_id') = json_extract(e.payload, '$.request_id')
-        AND json_extract(newer.payload, '$.agent_id') = json_extract(e.payload, '$.agent_id'))`).all(jobId) as Row[];
-    return rows.filter((row) => row.kind === 'silas.directive-producer-unknown').map((row) => {
+        AND json_extract(newer.payload, '$.agent_id') = json_extract(e.payload, '$.agent_id')
+        AND json_extract(newer.payload, '$.session_file') IS json_extract(e.payload, '$.session_file')
+        AND ((json_extract(e.payload, '$.producer_start_seq') IS NOT NULL
+          AND json_extract(newer.payload, '$.producer_start_seq') = json_extract(e.payload, '$.producer_start_seq'))
+          OR json_extract(newer.payload, '$.producer_unknown_seq') = e.seq))`).all(jobId) as Row[];
+    const starts = this.db.prepare(`SELECT seq, payload FROM events e WHERE e.job_id = ? AND e.kind = 'silas.directive-producer-started'
+      AND NOT EXISTS (SELECT 1 FROM events ceased WHERE ceased.job_id = e.job_id AND ceased.seq > e.seq
+        AND ceased.kind = 'silas.directive-producer-ceased' AND json_extract(ceased.payload, '$.producer_start_seq') = e.seq
+        AND json_extract(ceased.payload, '$.producer_identity') = json_extract(e.payload, '$.producer_identity'))`).all(jobId) as Row[];
+    const pending = starts.filter((row) => Number(row.seq) !== ownProducerStartSeq).map((row) => {
+      const payload = JSON.parse(str(row.payload)) as { request_id: string };
+      return `unproven producer cleanup: request ${payload.request_id}, start ${Number(row.seq)} — original-owner cessation receipt required; inspect exact native/controller evidence before Gru judgment`;
+    });
+    return [...pending, ...rows.filter((row) => row.kind === 'silas.directive-producer-unknown').map((row) => {
       const payload = JSON.parse(str(row.payload)) as { request_id: string; agent_id: string };
       return `unproven producer cleanup: minion ${payload.agent_id}, request ${payload.request_id}`;
-    });
+    })];
   }
 
-  directiveProgressBlockers(requestId: string, laneId: string, ownSpawningAgentId?: string): readonly string[] {
+  directiveProgressBlockers(requestId: string, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number): readonly string[] {
     const row = this.getDirective(requestId);
     if (row === null) throw new RecordNotFound(`directive request "${requestId}" not found`);
-    return this.directiveRetirementBlockers(row, laneId, ownSpawningAgentId);
+    if (ownProducerStartSeq !== undefined && this.directiveProducerStart(this.directiveTurnIdentity(requestId)) !== ownProducerStartSeq) {
+      throw new DirectiveCheckpointError('current producer token does not match this exact request start');
+    }
+    return this.directiveRetirementBlockers(row, laneId, ownSpawningAgentId, ownProducerStartSeq);
   }
 
   claimDirectiveCheckpoint(identity: DirectiveTurnIdentity, checkpointId: string): void {
@@ -7392,7 +7478,9 @@ export class LedgerApi {
       logicalStep: 'operation', incidentKey: `directive-recovery:${requestId}`,
       category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: row.baselineSeq,
       description: `Request ${requestId}; hash ${row.payloadHash}; revision ${String(row.workRevision)}; epoch ${String(row.authorityEpoch)}; ${reason}`,
-      nextAction: { kind: 'gru-decision', decision: 'inspect exact native request evidence; choose a guarded fresh successor or name the reserved owner decision' } }));
+      nextAction: { kind: 'gru-decision', decision: this.directiveCleanupBlockers(row.jobId).length > 0
+        ? 'inspect the exact original producer start and native/controller evidence; obtain original producer cessation attestation before guarded retirement/successor; if inaccessible, report the missing restart capability — never replay or infer cessation'
+        : 'inspect exact native request evidence; choose a guarded fresh successor or name the reserved owner decision' } }));
   }
 
   settleDirectiveRecoveryDebt(requestId: string, eventSeq: number, eventKind: string): void {
@@ -7770,8 +7858,8 @@ export class LedgerApi {
    * read is durable state or the process-local admission registry (the
    * same boundary every producer must reserve before its first await), so
    * a synchronous check inside the state transaction is authoritative. */
-  private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string): readonly string[] {
-    const blockers: string[] = [...this.directiveCleanupBlockers(row.jobId)];
+  private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number): readonly string[] {
+    const blockers: string[] = [...this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq)];
     const openTurns = this.listAgents().filter(
       (agent) => agent.jobId === row.jobId && ((agent.state === 'spawning' && agent.id !== ownSpawningAgentId) || agent.state === 'streaming'),
     );

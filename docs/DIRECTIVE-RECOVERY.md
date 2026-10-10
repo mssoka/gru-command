@@ -224,6 +224,33 @@ results/effects, changed native authority and unsupported runtimes refuse
 loudly. Claude CLI currently cannot attest this exact checkpoint protocol;
 its capability refusal stays visible rather than inventing admission.
 
+Physical ownership is recorded separately in `<session.jsonl>.producers.jsonl`:
+request/hash/revision/epoch, logical minion, native session/file, physical UUID,
+host and PID. Dispatch reservation is not native admission or producer start.
+The physical receipt is flushed before native execution, and the real Pi tool
+hook flushes exact assistant tool intent before a tool can run. Native
+independent bash controllers leave durable uncertainty until genuine cleanup.
+Only exact-incarnation cleanup or an original same-host PID returning ESRCH
+can establish original host cessation; a live/frozen/reused PID, foreign host,
+EPERM, torn journal or legacy missing incarnation stays UNKNOWN. Host absence
+alone does not prove tool/child cessation. Automatic continuation additionally
+needs a safe native checkpoint and all independent lane/child/provider/review/
+verification fences. Its native lock reclaim names only that absent original
+PID; no heartbeat age or missing registry is permission. The ledger closes
+only that exact start token, never a later same-logical-minion incarnation.
+
+Verification recovery also preserves original identities. Same-request terminal
+replay may reconcile matching registry process rows only after both the exact
+PID and its detached process group are absent. It records
+`verification.process-reconciled`, preserving failed/SIGTERM outcomes and
+partial captures; it never reruns tests or supplies a missing capture EOF.
+Live/ambiguous/foreign process rows remain fenced. Scheduler shutdown records
+`verification.no-start` for queued/granted attempts that never spawned, with
+the original run/request identities. Readback remains `admission-failed`
+(`scheduler_disposed`) after restart; same-ID replay settles evidence, not a
+new producer. Historical requests without authoritative terminal/no-start
+proof remain UNKNOWN; an empty scheduler or a lost log cannot settle them.
+
 Authenticated request readback exposes `native_target`, `native_binding`,
 `recovery_checkpoint`, `recovery_decision`, `authority_epoch`,
 `current_authority_epoch` and `recovery_obligation` (including generation).

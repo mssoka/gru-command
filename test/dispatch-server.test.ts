@@ -162,7 +162,10 @@ async function boot(opts: {
     override set(id: string, handle: AgentHandle): this {
       const wrapped = withNativeDirectiveFixture(handle, join(dir, 'native-live', `${id}.jsonl`), (state) => { if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state); });
       const row = ledger.getAgent(id);
-      if (row !== null) ledger.registerAgent({ id, role: row.role, jobId: row.jobId, sessionFile: wrapped.sessionFile });
+      if (row !== null) {
+        ledger.registerAgent({ id, role: row.role, jobId: row.jobId, sessionFile: wrapped.sessionFile });
+        ledger.setAgentState(id, wrapped.health().state); // fixture's completed native initialization
+      }
       return super.set(id, wrapped);
     }
   }();

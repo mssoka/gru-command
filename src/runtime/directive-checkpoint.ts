@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, fsyncSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { dirname } from 'node:path';
@@ -150,4 +151,105 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
       error: ok ? null : String(lastMessage.errorMessage ?? `native stopReason: ${String(lastMessage.stopReason)}`) };
   }
   return { state: 'resumable', binding: admitted, checkpointId: parent };
+}
+
+/** Physical native host ownership; logical minion identity is not an incarnation. */
+export interface DirectiveProducer {
+  readonly incarnation: string;
+  readonly pid: number;
+  readonly host: string;
+  readonly identity: DirectiveTurnIdentity;
+  readonly agentId: string;
+  readonly sessionId: string;
+  readonly sessionFile: string;
+}
+interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent'; readonly producer: DirectiveProducer }
+function appendProducer(receipt: ProducerReceipt): void {
+  const fd = openSync(`${receipt.producer.sessionFile}.producers.jsonl`, 'a', 0o600);
+  try { writeFileSync(fd, `${JSON.stringify(receipt)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
+  syncFile(dirname(receipt.producer.sessionFile));
+}
+export function prepareDirectiveProducer(input: Omit<DirectiveProducer, 'incarnation' | 'pid' | 'host'>): DirectiveProducer {
+  validateDirectiveIdentity(input.identity);
+  const producer = { ...input, incarnation: randomUUID(), pid: process.pid, host: hostname() };
+  appendProducer({ state: 'started', producer });
+  return producer;
+}
+function producerReceipts(file: string): readonly ProducerReceipt[] {
+  let text: string;
+  try { text = readFileSync(`${file}.producers.jsonl`, 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  if (!text.endsWith('\n')) throw new DirectiveCheckpointError('native producer journal has a partial write');
+  const rows = text.trimEnd().split('\n').map((line) => JSON.parse(line) as ProducerReceipt);
+  const starts = new Map<string, DirectiveProducer>();
+  for (const { state, producer } of rows) {
+    validateDirectiveIdentity(producer.identity);
+    if (!['started', 'ceased', 'independent'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
+        !producer.host || !producer.agentId || !producer.sessionId || producer.sessionFile !== file) throw new DirectiveCheckpointError('malformed native producer journal');
+    const start = starts.get(producer.incarnation);
+    if (state === 'started') {
+      if (start !== undefined) throw new DirectiveCheckpointError('duplicate native producer incarnation');
+      starts.set(producer.incarnation, producer);
+    } else if (!isDeepStrictEqual(start, producer)) throw new DirectiveCheckpointError('native cessation does not bind its physical incarnation');
+  }
+  return rows;
+}
+export function recordDirectiveProducerCessation(producer: DirectiveProducer): void {
+  const rows = producerReceipts(producer.sessionFile);
+  if (!rows.some((row) => row.state === 'started' && isDeepStrictEqual(row.producer, producer))) throw new DirectiveCheckpointError('native producer start missing');
+  if (!rows.some((row) => row.state === 'ceased' && isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'ceased', producer });
+}
+/** ESRCH proves only host absence. Caller still needs a safe native checkpoint
+ * and every independent child/process/tool fence before executing or settling. */
+export function inspectDirectiveProducers(file: string, identity: DirectiveTurnIdentity): readonly {
+  readonly producer: DirectiveProducer; readonly evidence: 'ceased' | 'host-absent' | 'unknown';
+}[] {
+  const rows = producerReceipts(file).filter((row) => isDeepStrictEqual(row.producer.identity, identity));
+  return rows.filter((row) => row.state === 'started').map(({ producer }) => {
+    if (rows.some((row) => row.state === 'ceased' && isDeepStrictEqual(row.producer, producer))) return { producer, evidence: 'ceased' as const };
+    if (rows.some((row) => row.state === 'independent' && isDeepStrictEqual(row.producer, producer))) return { producer, evidence: 'unknown' as const };
+    let absent = false;
+    if (producer.host === hostname()) {
+      try { process.kill(producer.pid, 0); }
+      catch (error) { absent = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+    }
+    return { producer, evidence: absent ? 'host-absent' as const : 'unknown' as const };
+  });
+}
+
+export function recordDirectiveIndependentController(producer: DirectiveProducer): void { appendProducer({ state: 'independent', producer }); }
+/** Called by the real SDK beforeToolCall hook, after its awaited message
+ * persistence. No tool can execute unless its exact intent is durably on disk. */
+export function flushDirectiveToolIntent(file: string, assistantMessage: unknown, toolCall: {
+  readonly id: string; readonly name: string; readonly arguments: unknown;
+}): void {
+  const native = entries(file);
+  let index = native.length - 1;
+  // A sequential batch persists each result before preparing the next call.
+  // Only that invocation's contiguous, tree-linked results may follow it.
+  while (index >= 0 && native[index]?.type === 'message' && native[index]?.message?.role === 'toolResult') index -= 1;
+  const invocation = native[index];
+  const content = invocation?.message?.content;
+  const refuse = (): never => { throw new DirectiveCheckpointError('native tool intent is not persisted before execution or its invocation/results changed'); };
+  if (invocation?.type !== 'message' || !invocation.id || invocation.message?.role !== 'assistant' || invocation.message.stopReason !== 'toolUse' ||
+      !isDeepStrictEqual(invocation.message, JSON.parse(JSON.stringify(assistantMessage))) || !Array.isArray(content)) refuse();
+  const pending = new Map<string, Record<string, unknown>>();
+  for (const block of content as Record<string, unknown>[]) {
+    if (block.type !== 'toolCall') continue;
+    if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name ||
+        typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) refuse();
+    pending.set(block.id as string, block);
+  }
+  let parent = invocation!.id;
+  for (const result of native.slice(index + 1)) {
+    const message = result.message;
+    const id = message?.toolCallId;
+    if (!result.id || result.parentId !== parent || typeof id !== 'string' || pending.get(id)?.name !== message?.toolName ||
+        typeof message?.isError !== 'boolean' || !Array.isArray(message.content)) refuse();
+    pending.delete(id as string);
+    parent = result.id;
+  }
+  const requested = pending.get(toolCall.id);
+  if (requested?.name !== toolCall.name || !isDeepStrictEqual(requested.arguments, toolCall.arguments)) refuse();
+  syncFile(file);
 }

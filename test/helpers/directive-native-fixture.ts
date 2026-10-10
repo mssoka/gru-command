@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { inspectDirectiveCheckpoint, prepareDirectiveBinding, type DirectiveTurnIdentity } from '../../src/runtime/directive-checkpoint.js';
+import { inspectDirectiveCheckpoint, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, type DirectiveProducer, type DirectiveTurnIdentity } from '../../src/runtime/directive-checkpoint.js';
 import type { AgentHandle, PromptOptions, AgentState } from '../../src/runtime/types.js';
 
 /** HTTP/ledger doubles retain real persisted native evidence. Only adapter
@@ -11,6 +11,7 @@ export class DirectiveNativeFixture {
   readonly sessionId: string = randomUUID();
   private parentId: string | null = null;
   private current: DirectiveTurnIdentity | null = null;
+  private readonly producers = new Map<string, DirectiveProducer>();
   constructor(readonly file: string, private readonly agentId: string) {
     mkdirSync(dirname(file), { recursive: true });
     if (existsSync(file) && readFileSync(file, 'utf8').trim() !== '') {
@@ -18,11 +19,20 @@ export class DirectiveNativeFixture {
       this.sessionId = rows[0]!.id; this.parentId = rows.filter((row) => row.type !== 'session').at(-1)?.id ?? null;
     } else writeFileSync(file, `${JSON.stringify({ type: 'session', id: this.sessionId, version: 3 })}\n`);
   }
+  prepare = (identity: DirectiveTurnIdentity): DirectiveProducer => {
+    const existing = this.producers.get(identity.requestId);
+    if (existing !== undefined) return existing;
+    const producer = prepareDirectiveProducer({ identity, agentId: this.agentId, sessionId: this.sessionId, sessionFile: this.file });
+    this.producers.set(identity.requestId, producer);
+    return producer;
+  };
+  ceased(): void { for (const producer of this.producers.values()) recordDirectiveProducerCessation(producer); }
   inspect = (identity: DirectiveTurnIdentity) => inspectDirectiveCheckpoint(this.file, identity);
   begin(text: string, options?: PromptOptions): void {
     this.current = options?.directive?.identity ?? null;
     if (options?.directive !== undefined) {
       options.directive.beforeAdmission();
+      this.prepare(options.directive.identity);
       prepareDirectiveBinding({ identity: options.directive.identity, runtime: 'pi', agentId: this.agentId,
         sessionId: this.sessionId, sessionFile: this.file, text, authorityManifest: 'deterministic HTTP fixture' });
     }
@@ -51,13 +61,13 @@ export function withNativeDirectiveFixture(handle: AgentHandle, file: string, on
   const native = new DirectiveNativeFixture(file, handle.id);
   let disposed = false;
   return {
-    ...handle, sessionFile: file, inspectDirective: native.inspect,
+    ...handle, sessionFile: file, prepareDirectiveProducer: native.prepare, inspectDirective: native.inspect,
     async prompt(text: string, options?: PromptOptions) {
       onState('idle'); native.begin(text, options); onState('streaming');
       try { await handle.prompt(text, options); native.end(handle.health().state === 'idle'); onState(handle.health().state); }
       catch (error) { native.end(false); onState('error'); throw error; }
     },
-    async dispose() { await handle.dispose(); disposed = true; onState('disposed'); },
+    async dispose() { await handle.dispose(); native.ceased(); disposed = true; onState('disposed'); },
     cessationEvidence: () => disposed ? 'ceased' : 'unknown',
   };
 }

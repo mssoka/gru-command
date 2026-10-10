@@ -360,6 +360,7 @@ interface Attempt {
 
 /** Terminal request_id evidence kept (bounded) for reconnect reconciliation. */
 interface RequestHistoryEntry {
+  readonly runId: string;
   readonly state: 'completed' | 'admission-failed';
   readonly spec: VerificationRunSpec;
   readonly head: string | null;
@@ -640,6 +641,7 @@ export class VerificationScheduler {
   private sweepTimer: NodeJS.Timeout | null = null;
   private started = false;
   private disposed = false;
+  private readonly noStartSettled = new Set<string>();
 
   constructor(opts: VerificationSchedulerOptions) {
     this.opts = opts;
@@ -715,6 +717,7 @@ export class VerificationScheduler {
     const persisted = this.loadState();
     for (const attempt of persisted.attempts ?? []) {
       this.requestHistory.set(attempt.request_id, {
+        runId: attempt.run_id,
         state: attempt.state,
         spec: {
           jobId: attempt.job_id,
@@ -992,6 +995,13 @@ export class VerificationScheduler {
           });
           return history.outcome;
         }
+        if (history.error?.code === 'scheduler_disposed') {
+          this.safeRecord({ kind: 'verification.no-start', jobId: history.spec.jobId, payload: {
+            request_id: requestId, run_id: history.runId, scope: history.spec.scope, command: history.spec.command,
+            cwd: history.spec.cwd, head: history.head, started: false, reason: 'scheduler_disposed', reconciled: true,
+          } });
+          throw new VerificationDisposedError();
+        }
         // Admission failure with no started run: the retry is explicitly
         // allowed — drop the record and admit a fresh attempt.
         this.requestHistory.delete(requestId);
@@ -1093,7 +1103,7 @@ export class VerificationScheduler {
         return {
           state: history.state,
           requestId,
-          runId: history.outcome?.runId ?? null,
+          runId: history.runId,
           jobId: history.spec.jobId,
           scope: history.spec.scope,
           command: history.spec.command,
@@ -1211,6 +1221,9 @@ export class VerificationScheduler {
     if (this.sweepTimer !== null) {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
+    }
+    for (const attempt of this.attempts.values()) {
+      if (!attempt.started) this.settleNoStart(attempt);
     }
     for (const waiter of this.waiters.splice(0)) {
       waiter.settled = true;
@@ -1414,7 +1427,8 @@ export class VerificationScheduler {
       attempt.resolve(outcome);
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
-      this.rememberHistory(attempt, {
+      if (failure instanceof VerificationDisposedError && !attempt.started) this.settleNoStart(attempt);
+      else this.rememberHistory(attempt, {
         state: failure instanceof VerificationLockTimeoutError ? 'admission-failed' : null,
         outcome: null,
         error:
@@ -1430,6 +1444,17 @@ export class VerificationScheduler {
       for (const requestId of attempt.requestIds) this.attemptsByRequest.delete(requestId);
       if (attempt.lease !== null) this.release(attempt.lease);
     }
+  }
+
+  private settleNoStart(attempt: Attempt): void {
+    if (attempt.started || this.slots.get(attempt.runId)?.child != null || this.noStartSettled.has(attempt.runId)) return;
+    this.noStartSettled.add(attempt.runId);
+    const error = new VerificationDisposedError();
+    this.rememberHistory(attempt, { state: 'admission-failed', outcome: null, error: { code: error.code, detail: error.message } });
+    this.safeRecord({ kind: 'verification.no-start', jobId: attempt.spec.jobId, payload: {
+      run_id: attempt.runId, request_ids: [...attempt.requestIds], scope: attempt.spec.scope, command: attempt.spec.command,
+      cwd: attempt.spec.cwd, head: attempt.head, started: false, reason: 'scheduler_disposed',
+    } });
   }
 
   /** Record (or forget) every bound request identity for reconciliation. */
@@ -1449,6 +1474,7 @@ export class VerificationScheduler {
       }
       const completedAt = this.now();
       this.requestHistory.set(requestId, {
+        runId: attempt.runId,
         state: terminal.state,
         spec: attempt.spec,
         head: attempt.head,
@@ -1548,7 +1574,7 @@ export class VerificationScheduler {
   private persistedAttempts(): PersistedAttempt[] {
     return [...this.requestHistory.entries()].map(([requestId, entry]) => ({
       request_id: requestId,
-      run_id: entry.outcome?.runId ?? '',
+      run_id: entry.runId,
       job_id: entry.spec.jobId,
       scope: entry.spec.scope,
       command: entry.spec.command,
@@ -1612,7 +1638,7 @@ export class VerificationScheduler {
     const workers = this.workersPerRun;
     const git = readGitState(lease.cwd);
     const slot = this.slots.get(lease.runId);
-    if (slot === undefined) throw new VerificationDisposedError(); // disposed between grant and spawn
+    if (this.disposed || slot === undefined) throw new VerificationDisposedError(); // disposed between grant and spawn
     // Exact-head evidence: a queue wait can span a push. Running the new
     // head under the old submission would silently verify the wrong
     // revision, so fail honestly instead (no spawn, no false PASS).
@@ -1659,6 +1685,10 @@ export class VerificationScheduler {
     });
     slot.pid = child.pid ?? null;
     slot.child = child;
+    // Native child existence, not a client started-frame callback, fences
+    // reentrant shutdown from manufacturing a no-start receipt.
+    const attempt = [...this.attempts.values()].find((owner) => owner.runId === lease.runId);
+    if (attempt !== undefined) attempt.started = true;
     this.callbackSafe('onSpawn', () =>
       this.opts.onSpawn?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
     );
@@ -1675,6 +1705,7 @@ export class VerificationScheduler {
       jobId: lease.jobId,
       payload: {
         run_id: lease.runId,
+        pid: child.pid ?? null,
         scope: lease.scope,
         command: lease.command,
         cwd: lease.cwd,

@@ -199,6 +199,26 @@ export class SessionStore {
     this.heartbeats.set(sessionFile, heartbeat);
   }
 
+  /** Bounded checkpoint recovery: reclaim only the exact absent original
+   * PID's lock, never heartbeat expiry or logical-minion reuse. */
+  acquireLockAfterHostExit(sessionFile: string, expectedPid: number): void {
+    const lockFile = this.lockFileFor(sessionFile);
+    let holder: SessionLockInfo;
+    try { holder = JSON.parse(readFileSync(lockFile, 'utf8')) as SessionLockInfo; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { this.acquireLock(sessionFile); return; }
+      throw new LockUnreadableError(lockFile, String(error));
+    }
+    if (holder.pid !== expectedPid) throw new LockBusyError(lockFile, holder);
+    try { process.kill(expectedPid, 0); throw new LockBusyError(lockFile, holder); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    // Re-read exact content before unlink; synchronous local reclaim, with
+    // O_EXCL admission still deciding races against another new host.
+    if (JSON.stringify(JSON.parse(readFileSync(lockFile, 'utf8'))) !== JSON.stringify(holder)) throw new LockBusyError(lockFile, holder);
+    unlinkSync(lockFile);
+    this.acquireLock(sessionFile);
+  }
+
   private stealIfStale(lockFile: string): void {
     let holder: SessionLockInfo;
     try {

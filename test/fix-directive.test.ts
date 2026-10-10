@@ -876,3 +876,77 @@ describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {
     }
   });
 });
+
+describe('fix directive cleanup failure provenance — P18 current-behavior regressions', () => {
+  function failureMessages(error: unknown): string[] {
+    return [String(error),
+      ...(error instanceof AggregateError ? error.errors.flatMap((nested: unknown) => failureMessages(nested)) : []),
+      ...(error instanceof Error && error.cause !== undefined ? failureMessages(error.cause) : [])];
+  }
+
+  async function assertSimultaneousCleanupFailures(prior: boolean): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-fix-cleanup-errors-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'));
+    const promptFailure = new Error('original fresh native prompt failure');
+    const disposalFailure = new Error(prior ? 'original prior rebrief disposal failure' : 'original fresh disposal failure');
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 1 });
+    const target: AgentHandle = {
+      id: 'cleanup-minion', role: 'minion', sessionFile: '/controlled-cleanup-native.jsonl',
+      capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+      prompt: vi.fn(async () => { throw promptFailure; }),
+      async steer() {}, async followUp() {},
+      subscribe() { return () => {}; },
+      health() { return { state: 'idle', lastActivity: null, sessionFile: this.sessionFile }; },
+      // The controlled cleanup really rejects; it never reports disposal or
+      // cessation just because the prompt operation rejected/settled.
+      dispose: vi.fn(async () => { throw disposalFailure; }),
+      cessationEvidence: () => 'unknown',
+    };
+    const spawn = vi.fn(async () => target);
+    const onCleanup = vi.fn((handle: AgentHandle) => {
+      ledger.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: 'cleanup-job',
+        payload: { request_id: 'cleanup-request', agent_id: handle.id, session_file: handle.sessionFile } });
+    });
+    try {
+      ledger.addJob({ id: 'cleanup-job', repo: 'fixture', title: 'cleanup', briefing: 'original contract' });
+      ledger.setJobStatus('cleanup-job', 'working');
+      await worktrees.createJobWorktree({ repoPath: dir, jobId: 'cleanup-job' });
+      if (prior) {
+        ledger.registerAgent({ id: target.id, role: 'minion', jobId: 'cleanup-job', sessionFile: target.sessionFile });
+        ledger.setAgentState(target.id, 'idle');
+      }
+      db.handle.exec(`CREATE TRIGGER reject_cleanup_journal BEFORE INSERT ON events
+        WHEN NEW.kind = 'silas.directive-producer-unknown'
+        BEGIN SELECT RAISE(FAIL, 'original cleanup journal storage failure'); END`);
+      const error = await routeFixDirectiveToMinion({ ledger,
+        registry: { getHandle: (id) => prior && id === target.id ? target : null, spawn,
+          disposeHandle: async (handle) => { await handle.dispose(); } },
+        worktrees,
+        jobId: 'cleanup-job', directive: 'preserve all original failures', signal: new AbortController().signal,
+        freshSession: prior, workerGate: gate, onCleanup,
+      }).then(() => null, (failure: unknown) => failure);
+      expect(target.dispose).toHaveBeenCalledTimes(1); expect(onCleanup).toHaveBeenCalledTimes(1);
+      expect(target.cessationEvidence!()).toBe('unknown');
+      expect(gate.view().worker.running).toBe(0);
+      expect(ledger.latestJobEvent('cleanup-job', 'silas.directive-producer-ceased')).toBeNull();
+      expect(ledger.latestJobEvent('cleanup-job', 'job.delivered')).toBeNull();
+      if (prior) { expect(target.prompt).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled(); }
+      else { expect(target.prompt).toHaveBeenCalledTimes(1); expect(spawn).toHaveBeenCalledTimes(1); }
+      const messages = failureMessages(error);
+      expect(messages, 'cleanup journaling must not replace the original disposal failure').toContain(String(disposalFailure));
+      if (!prior) expect(messages, 'fresh finally must also retain the original prompt failure').toContain(String(promptFailure));
+      expect(messages.join(';')).toContain('original cleanup journal storage failure');
+    } finally { db.close(); }
+  }
+
+  it('fresh prompt disposal and real SQLite journal failures retain every original failure', async () => {
+    await assertSimultaneousCleanupFailures(false);
+  });
+
+  it('prior rebrief disposal and real SQLite journal failures preserve the original owner failure without spawning', async () => {
+    await assertSimultaneousCleanupFailures(true);
+  });
+});

@@ -1,4 +1,5 @@
 import {
+  AgentSession,
   createAgentSession,
   createReadOnlyTools,
   DefaultResourceLoader,
@@ -44,7 +45,7 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
-import { DirectiveCheckpointError, inspectDirectiveCheckpoint, prepareDirectiveBinding, readDirectiveBinding, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -741,7 +742,16 @@ export class PiRuntime implements AgentRuntime {
     // (Perkins r2 B4-race: the loser must never delete the winner's lock).
     let lockAcquired = false;
     if (resumeFile !== undefined && !this.store.isHeld(resumeFile)) {
-      this.store.acquireLock(resumeFile);
+      const predecessor = options.directiveRecoveryProducer;
+      if (predecessor === undefined) this.store.acquireLock(resumeFile);
+      else {
+        const proof = inspectDirectiveCheckpoint(resumeFile, predecessor.identity);
+        const ownership = inspectDirectiveProducers(resumeFile, predecessor.identity).find(({ producer }) => isDeepStrictEqual(producer, predecessor));
+        if (predecessor.sessionFile !== resumeFile || ownership?.evidence !== 'host-absent' || proof.state !== 'resumable') {
+          throw new DirectiveCheckpointError('exact absent predecessor/safe checkpoint required before native lock reclaim');
+        }
+        this.store.acquireLockAfterHostExit(resumeFile, predecessor.pid);
+      }
       lockAcquired = true;
     }
     try {
@@ -971,7 +981,13 @@ export class PiAgentHandle implements AgentHandle {
     readonly resolve: (event: Extract<RuntimeEvent, { type: 'compaction_end' }>) => void;
     settled: boolean;
   } | null = null;
+  private readonly directiveProducers = new Map<string, DirectiveProducer>();
   private disposed = false;
+  private disposalPending: Promise<void> | null = null;
+  private cleanupSucceeded = false;
+  private nativeQuiescent = false;
+  private ownershipReleased = false;
+  private compactionWork: Promise<unknown> | null = null;
 
   constructor(
     role: Role,
@@ -980,10 +996,9 @@ export class PiAgentHandle implements AgentHandle {
       steer(text: string, images?: unknown): Promise<void>;
       followUp(text: string, images?: unknown): Promise<void>;
       subscribe(listener: (event: unknown) => void): () => void;
-      /** SDK 0.85.1 AgentSession.dispose awaits session-level waitForIdle
-       * (run, retry/continuation, compaction, branch summary). The wrapper
-       * MUST await it — calling it synchronously discards that proof. */
+      /** Pinned SDK disposal is synchronous cleanup, NOT native idle proof. */
       dispose(): Promise<void> | void;
+      abort?(): Promise<void>;
       waitForIdle?(): Promise<void>;
       /** Real controller-set queries (executeBash controllers, removed in
        * executeBash's finally) — truthful, unlike the metadata heartbeat. */
@@ -1034,6 +1049,18 @@ export class PiAgentHandle implements AgentHandle {
     this.principal = `handle:${this.id}`;
     this.toolHeartbeat = new ToolHeartbeat((event) => this.emit(event), toolHeartbeatMs);
     session.subscribe((event) => this.onPiEvent(event));
+    if (session instanceof AgentSession) {
+      const before = session.agent.beforeToolCall;
+      session.agent.beforeToolCall = async (input, signal) => {
+        if (this.liveDirective !== undefined) flushDirectiveToolIntent(this.sessionFile, input.assistantMessage, input.toolCall);
+        return before?.(input, signal);
+      };
+      const executeBash = session.executeBash.bind(session);
+      session.executeBash = (...args) => {
+        for (const producer of this.directiveProducers.values()) recordDirectiveIndependentController(producer);
+        return executeBash(...args);
+      };
+    }
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -1090,6 +1117,18 @@ export class PiAgentHandle implements AgentHandle {
     return turn.verdict();
   }
 
+  prepareDirectiveProducer = (identity: DirectiveTurnIdentity): DirectiveProducer => {
+    this.assertLive();
+    const prior = this.directiveProducers.get(identity.requestId);
+    if (prior !== undefined) return prior;
+    if (this.liveTurn !== null || !this.session.isIdle || this.isCompacting() || this.session.isBashRunning === true || this.session.hasPendingBashMessages === true) {
+      throw new DirectiveCheckpointError('native producer preparation requires genuine idle without independent controllers');
+    }
+    const producer = prepareDirectiveProducer({ identity, agentId: this.id, sessionId: this.nativeSessionId, sessionFile: this.sessionFile });
+    this.directiveProducers.set(identity.requestId, producer);
+    return producer;
+  };
+
   inspectDirective = (identity: DirectiveTurnIdentity) => inspectDirectiveCheckpoint(this.sessionFile, identity);
 
   resumeDirective = async (identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void): Promise<PromptTurnVerdict> => {
@@ -1102,6 +1141,7 @@ export class PiAgentHandle implements AgentHandle {
       throw new DirectiveCheckpointError('native directive checkpoint changed or is not safely resumable');
     }
     beforeContinuation();
+    this.prepareDirectiveProducer(identity);
     const turn = this.runTurn('', `directive-recovery:${identity.requestId}`, undefined,
       { identity, beforeAdmission: beforeContinuation, onAdmitted: () => {} }, () => this.session.agent!.continue());
     await turn.done;
@@ -1214,12 +1254,15 @@ export class PiAgentHandle implements AgentHandle {
     this.compacting = true;
     let failed = false;
     let failure: unknown;
+    const work = Promise.resolve().then(() => this.session.compact());
+    this.compactionWork = work;
     try {
-      await this.session.compact();
+      await work;
     } catch (error) {
       failed = true;
       failure = error;
     } finally {
+      if (this.compactionWork === work) this.compactionWork = null;
       this.compacting = false;
       if (!this.disposed) {
         if (failed || this.pendingCompactionEnd === null) {
@@ -1258,8 +1301,15 @@ export class PiAgentHandle implements AgentHandle {
   };
 
   async dispose(): Promise<void> {
-    if (this.disposed) return;
-    this.disposed = true;
+    if (this.ownershipReleased) return;
+    if (this.disposalPending !== null) return this.disposalPending;
+    this.disposed = true; // revoke new turns immediately; failed cleanup still owns the writer
+    this.disposalPending = Promise.resolve().then(() => this.disposeOwned()).finally(() => { this.disposalPending = null; });
+    this.invalidateOwned(); // synchronous logical cancellation; reentrant callers join pending cleanup
+    return this.disposalPending;
+  }
+
+  private invalidateOwned(): void {
     this.toolHeartbeat.dispose();
     if (this.compactionEndTimer !== null) clearTimeout(this.compactionEndTimer);
     this.compactionEndTimer = null;
@@ -1287,18 +1337,44 @@ export class PiAgentHandle implements AgentHandle {
       if (item.timer !== null) clearTimeout(item.timer);
       item.reject(new Error('agent session disposed before queued message was delivered'));
     }
+  }
+
+  private async disposeOwned(): Promise<void> {
+    const turn = this.liveTurn;
+    const compaction = this.compactionWork;
+    const failures: unknown[] = [];
     try {
-      // AWAIT the SDK's dispose: AgentSession.dispose() itself awaits
-      // session-level waitForIdle (agent run + awaited listeners + retry
-      // gap + post-run continuations + compaction + branch summary).
-      // Calling it synchronously discards the only real completion proof.
-      await this.session.dispose();
-    } finally {
-      this.store.releaseLock(this.sessionFile);
-      this.setState('disposed');
-      this.onDispose();
-      this.settleCessationEvidence();
-    }
+      const sdk = this.session instanceof AgentSession;
+      if (sdk && (typeof this.session.abort !== 'function' || typeof this.session.waitForIdle !== 'function')) {
+        throw new Error('Pi SDK lacks abort/waitForIdle — native producer quiescence cannot be proven');
+      }
+      if (sdk && (typeof this.session.isBashRunning !== 'boolean' || typeof this.session.hasPendingBashMessages !== 'boolean')) {
+        throw new Error('Pi SDK lacks independent-controller probes — producer cessation cannot be proven');
+      }
+      if (typeof this.session.abort === 'function' && typeof this.session.waitForIdle === 'function') {
+        // Keep SDK listeners connected until genuine native settlement.
+        await this.session.abort();
+        await this.session.waitForIdle();
+        await turn?.catch(() => {}); // original verdict/error remains with its caller
+        await compaction?.catch(() => {});
+      }
+      if (!this.cleanupSucceeded) {
+        await this.session.dispose();
+        this.cleanupSucceeded = true;
+      }
+      // Controlled doubles dispose their deferred operations; still await
+      // every adapter owner and require their explicit truthful idle state.
+      await turn?.catch(() => {});
+      await compaction?.catch(() => {});
+      if (typeof this.session.waitForIdle === 'function') await this.session.waitForIdle();
+      this.nativeQuiescent = this.session.isIdle === true && !this.session.isStreaming && !this.session.isCompacting &&
+        this.liveTurn === null && this.compactionWork === null && !this.compacting && !this.nativeCompactionOpen &&
+        this.pendingCompactionEnd === null && this.explicitCompactionTerminal?.settled !== false && this.queue.length === 0;
+      if (!this.nativeQuiescent) throw new Error('Pi disposal lacks genuine native/adapter quiescence — writer ownership retained');
+    } catch (error) { failures.push(error); }
+    try { this.settleCessationEvidence(); } catch (error) { failures.push(error); }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, `Pi native disposal/ownership cleanup failed: ${failures.map(String).join('; ')}`);
   }
 
   /** Compute + emit the once-only cessation evidence transition. Called
@@ -1310,29 +1386,40 @@ export class PiAgentHandle implements AgentHandle {
     let evidence: 'ceased' | 'unknown';
     try {
       const bashActive = this.session.isBashRunning === true || this.session.hasPendingBashMessages === true;
-      // The session-level idle was awaited inside dispose (proof for runs,
-      // retries, continuations, compaction, summary). Independent executeBash
-      // controllers are NOT part of isIdle: if still active, evidence is
-      // UNKNOWN (observable later by re-query; no timer/watcher added).
-      evidence = bashActive ? 'unknown' : 'ceased';
+      const controllersProven = !(this.session instanceof AgentSession) ||
+        (typeof this.session.isBashRunning === 'boolean' && typeof this.session.hasPendingBashMessages === 'boolean');
+      // Independent executeBash is outside native idle. Both proof domains
+      // AND successful required cleanup must hold before releasing ownership.
+      evidence = this.cleanupSucceeded && this.nativeQuiescent && this.liveTurn === null && this.compactionWork === null &&
+        this.session.isIdle === true && !this.session.isStreaming && !this.session.isCompacting && !this.compacting &&
+        !this.nativeCompactionOpen && this.pendingCompactionEnd === null && this.explicitCompactionTerminal?.settled !== false &&
+        this.queue.length === 0 && controllersProven && !bashActive ? 'ceased' : 'unknown';
     } catch {
       evidence = 'unknown'; // throwing probes are unknown, never false
     }
-    this.cessationState = evidence;
-    this.emit({ type: 'cessation_evidence', evidence });
+    if (evidence === 'ceased' && !this.ownershipReleased) {
+      this.store.releaseLock(this.sessionFile);
+      this.setState('disposed');
+      this.onDispose();
+      for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
+      this.ownershipReleased = true;
+    }
+    if (this.cessationState !== evidence) {
+      this.cessationState = evidence;
+      this.emit({ type: 'cessation_evidence', evidence });
+    }
   }
 
   cessationEvidence(): 'ceased' | 'unknown' {
     if (this.cessationState === 'live') return 'unknown';
     if (this.cessationState === 'ceased') return 'ceased';
-    // UNKNOWN may have settled since: re-query the truthful controller
-    // sets (bounded, read-only; a throw stays unknown).
-    try {
-      if (this.session.isBashRunning !== true && this.session.hasPendingBashMessages !== true) {
-        this.cessationState = 'ceased';
-        this.emit({ type: 'cessation_evidence', evidence: 'ceased' });
-      }
-    } catch { /* stays unknown */ }
+    // A failed SDK cleanup requires a real retry, not absent-bash inference.
+    // Completed cleanup may be re-probed for late independent controllers.
+    this.settleCessationEvidence();
+    return this.readCessationEvidence();
+  }
+
+  private readCessationEvidence(): 'ceased' | 'unknown' {
     return this.cessationState === 'ceased' ? 'ceased' : 'unknown';
   }
 
@@ -1390,6 +1477,7 @@ export class PiAgentHandle implements AgentHandle {
   ): { readonly done: Promise<void>; readonly verdict: () => PromptTurnVerdict } {
     if (directive !== undefined && continuation === undefined) {
       directive.beforeAdmission();
+      this.prepareDirectiveProducer(directive.identity);
       prepareDirectiveBinding({ identity: directive.identity, runtime: 'pi', agentId: this.id, sessionId: this.nativeSessionId,
         sessionFile: this.sessionFile, text, authorityManifest: this.directiveAuthorityManifest?.(), ...(images !== undefined ? { images } : {}) });
     }

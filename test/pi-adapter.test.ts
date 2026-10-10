@@ -1667,17 +1667,48 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       const handle = await fx.runtime.spawn('gru');
       const events = collect(handle);
       const internal = handle as unknown as {
-        session: { isCompacting: boolean };
+        session: import('@earendil-works/pi-coding-agent').AgentSession;
+        readonly liveTurn: Promise<void> | null;
+        readonly compactionWork: Promise<void> | null;
+        readonly compacting: boolean;
+        readonly nativeCompactionOpen: boolean;
+        readonly pendingCompactionEnd: unknown | null;
+        readonly explicitCompactionTerminal: { readonly settled: boolean } | null;
+        readonly queue: readonly unknown[];
         onPiEvent(event: unknown): void;
       };
-      const nativeSession = internal.session;
+      const nativeSession = await actualDirectiveSdkSession(handle);
+      const nativeDisposal = vi.spyOn(nativeSession, 'dispose'); // actual pinned SDK call-through
+      let injectedGate = true;
+      let releaseCleanup!: () => void;
+      const cleanupAllowed = new Promise<void>((resolveGate) => { releaseCleanup = resolveGate; });
+      let cleanupStarted!: () => void;
+      const cleanupInvoked = new Promise<void>((resolveGate) => { cleanupStarted = resolveGate; });
+      const disposeNative = async (): Promise<void> => {
+        cleanupStarted();
+        await cleanupAllowed;
+        await nativeSession.dispose();
+        await nativeSession.agent.waitForIdle();
+        await nativeSession.waitForIdle();
+        if (!nativeSession.isIdle || nativeSession.isStreaming || nativeSession.isCompacting ||
+            nativeSession.isBashRunning || nativeSession.hasPendingBashMessages || nativeSession.pendingMessageCount !== 0 ||
+            nativeSession.agent.hasQueuedMessages() || internal.liveTurn !== null || internal.compactionWork !== null ||
+            internal.compacting || internal.nativeCompactionOpen || internal.pendingCompactionEnd !== null ||
+            internal.explicitCompactionTerminal?.settled === false || internal.queue.length !== 0) {
+          throw new Error('fixture cannot end its injected gate without actual SDK/adapter/controller quiescence');
+        }
+        // End ONLY the artificial post-terminal probe, after successful real
+        // required SDK cleanup AND observed native/adapter quiescence.
+        injectedGate = false;
+      };
       try {
         await handle.prompt('prime');
         // Pi dispatches compaction_end before the session clears isCompacting;
         // hold that gate closed to pin the adapter's bounded reconciliation.
         internal.session = new Proxy(nativeSession, {
           get(target, key) {
-            if (key === 'isCompacting') return true;
+            if (key === 'isCompacting' && injectedGate) return true;
+            if (key === 'dispose') return disposeNative;
             return Reflect.get(target, key, target);
           },
         });
@@ -1704,6 +1735,15 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
           expect(ends).toHaveLength(1);
           expect(ends[0]!.success).toBe(false);
           expect(ends[0]!.error).toBe('native compaction state did not settle after its terminal event');
+          await cleanupInvoked;
+          expect(injectedGate).toBe(true);
+          expect(nativeDisposal).not.toHaveBeenCalled();
+          expect(handle.cessationEvidence!()).toBe('unknown');
+          expect(handle.health().state).not.toBe('disposed');
+          expect(fx.store.isHeld(handle.sessionFile!)).toBe(true);
+          expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(true);
+          expect(events.filter((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toEqual([]);
+          releaseCleanup();
           // Drain any disposal timers while the fake clock is still installed.
           await vi.advanceTimersByTimeAsync(60_000);
         } finally {
@@ -1713,9 +1753,23 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
         await waitFor(() => handle.health().state === 'disposed', 'reconciled disposal');
         expect(handle.sessionFile).not.toBeNull();
         expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(false);
-      } finally {
-        internal.session = nativeSession;
+        expect(nativeDisposal).toHaveBeenCalledTimes(1);
+        expect(injectedGate).toBe(false);
+        expect(nativeSession.isIdle).toBe(true);
+        expect(nativeSession.isStreaming).toBe(false);
+        expect(nativeSession.isCompacting).toBe(false);
+        expect(nativeSession.isBashRunning).toBe(false);
+        expect(nativeSession.hasPendingBashMessages).toBe(false);
+        expect(events.filter((event) => event.type === 'compaction_end')).toHaveLength(1);
         await handle.dispose();
+        expect(nativeDisposal).toHaveBeenCalledTimes(1);
+      } finally {
+        releaseCleanup();
+        try { await handle.dispose(); }
+        finally {
+          if (!injectedGate) internal.session = nativeSession;
+          nativeDisposal.mockRestore();
+        }
       }
     });
 
@@ -3263,6 +3317,51 @@ describe('typed provider-response provenance (r1 #13) — pure parsers', () => {
   });
 });
 
+it('directive native multi-tool invocation persists each sequential result and rejects unpersisted, foreign or completed calls', async () => {
+  const f = await fixture([
+    { deltas: [], toolCalls: [
+      { id: 'native-batch-first', name: 'bash', args: { command: "printf 'first\\n' > native-batch.txt" } },
+      { id: 'native-batch-second', name: 'bash', args: { command: "printf 'second\\n' >> native-batch.txt" } },
+    ] },
+    { deltas: ['genuine multi-tool completion'] },
+  ]);
+  const handle = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: 'native-batch-minion' });
+  const session = await actualDirectiveSdkSession(handle);
+  session.agent.toolExecution = 'sequential';
+  const before = session.agent.beforeToolCall!;
+  const { flushDirectiveToolIntent, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  let checkedSecond = false;
+  session.agent.beforeToolCall = async (input, signal) => {
+    if (input.toolCall.id === 'native-batch-second') {
+      const bytes = readFileSync(handle.sessionFile!, 'utf8');
+      const tail = JSON.parse(bytes.trimEnd().split('\n').at(-1)!) as { message: { role: string; toolCallId: string } };
+      expect(tail.message).toMatchObject({ role: 'toolResult', toolCallId: 'native-batch-first' });
+      expect(() => flushDirectiveToolIntent(handle.sessionFile!, { ...input.assistantMessage, timestamp: input.assistantMessage.timestamp + 1 }, input.toolCall)).toThrow(/invocation/);
+      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, { ...input.toolCall, arguments: { command: 'unpersisted effect' } })).toThrow(/invocation/);
+      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, { ...input.toolCall, id: 'foreign-call' })).toThrow(/invocation/);
+      const completed = input.assistantMessage.content.find((block) => block.type === 'toolCall' && block.id === 'native-batch-first');
+      if (completed?.type !== 'toolCall') throw new Error('native first batch call missing');
+      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, completed)).toThrow(/invocation/);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).toBe(bytes);
+      checkedSecond = true;
+    }
+    return before(input, signal);
+  };
+  const identity = { requestId: 'native-batch-request', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
+    jobId: 'native-batch-job', workRevision: 0, authorityEpoch: 0 };
+  try {
+    const verdict = await handle.promptWithVerdict!('approved sequential native tool batch', {
+      directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} },
+    });
+    expect(verdict).toMatchObject({ ok: true }); expect(checkedSecond).toBe(true);
+    expect(readFileSync(join(f.workspace, 'native-batch.txt'), 'utf8')).toBe('first\nsecond\n');
+    expect(f.script.calls).toHaveLength(2);
+    expect(inspectDirectiveCheckpoint(handle.sessionFile!, identity)).toMatchObject({ state: 'terminal', ok: true });
+    const messages = readFileSync(handle.sessionFile!, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { message?: { role: string; isError?: boolean } });
+    expect(messages.filter((entry) => entry.message?.role === 'toolResult').map((entry) => entry.message?.isError)).toEqual([false, false]);
+  } finally { await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); }
+});
+
 it('restart recovery records actual admission while the native prompt remains pending', async () => {
   let release!: () => void;
   const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
@@ -3327,4 +3426,306 @@ it('restart recovery continues a durable SDK user checkpoint without replaying i
     expect(prompt).not.toHaveBeenCalled(); expect(f.script.calls).toHaveLength(1);
     expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true });
   } finally { await f.runtime.dispose(); f.store.dispose(); }
+});
+
+it('restart recovery retains UNKNOWN and its writer lock through pending or failed actual SDK disposal', async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
+  // A real SDK-owned provider run remains pending even after abort. Neither
+  // independent bash flag is mocked: this exercises native ownership alone.
+  const f = await fixture([{ deltas: ['still owned native run'], hold, honorAbort: false }]);
+  const handle = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: 'sdk-disposal-minion' });
+  const events = collect(handle);
+  const identity = { requestId: 'sdk-disposal-request', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64),
+    jobId: 'sdk-disposal-job', workRevision: 1, authorityEpoch: 0 };
+  const admissions: unknown[] = [];
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const session = (handle as unknown as { readonly session: {
+    readonly isIdle: boolean;
+    readonly isBashRunning: boolean;
+    readonly hasPendingBashMessages: boolean;
+    readonly _extensionRunner: { invalidate(message?: string): void };
+    dispose(): void | Promise<void>;
+    waitForIdle(): Promise<void>;
+  } }).session;
+  const file = handle.sessionFile!;
+  let turnSettled = false;
+  const turn = handle.prompt('approved held native work', { directive: { identity, beforeAdmission: () => {},
+    onAdmitted: (binding) => { admissions.push(binding); } } }).finally(() => { turnSettled = true; });
+  const disposal = vi.spyOn(session, 'dispose'); // call through the ACTUAL SDK method
+  const failure = new Error('actual SDK invalidation failed before native idle');
+  // Pinned SDK dispose invokes this real dependency after abort hooks, before
+  // disconnect/cleanup; it does not await session-level waitForIdle at all.
+  const invalidation = vi.spyOn(session._extensionRunner, 'invalidate').mockImplementation(() => { throw failure; });
+  try {
+    await waitFor(() => f.script.calls.length === 1, 'held native SDK run');
+    expect(admissions).toHaveLength(1);
+    expect(session.isIdle).toBe(false); expect(turnSettled).toBe(false);
+    expect(session.isBashRunning).toBe(false); expect(session.hasPendingBashMessages).toBe(false);
+    expect(inspectDirectiveCheckpoint(file, identity).state).toBe('resumable');
+    const nativeBytes = readFileSync(file, 'utf8');
+    // Idle-first cleanup may still be pending here; do not demand unsafe
+    // SDK-before-idle ordering just to observe the injected rejection.
+    const disposing = handle.dispose().then(() => null, (error: unknown) => error);
+    await new Promise<void>((resolveGate) => setImmediate(resolveGate));
+    expect(session.isIdle).toBe(false); expect(turnSettled).toBe(false);
+    expect(session.isBashRunning).toBe(false); expect(session.hasPendingBashMessages).toBe(false);
+    expect(handle.cessationEvidence!(), 'pending or rejected native disposal without full cleanup cannot attest cessation').toBe('unknown');
+    expect(events.filter((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toEqual([]);
+    expect(readFileSync(file, 'utf8')).toBe(nativeBytes);
+    expect(inspectDirectiveCheckpoint(file, identity).state).toBe('resumable');
+    expect(f.store.isHeld(file)).toBe(true); expect(existsSync(`${file}.lock`)).toBe(true);
+    const foreign = new SessionStore(f.store.dataDir);
+    try { expect(() => foreign.acquireLock(file)).toThrow(LockBusyError); } finally { foreign.dispose(); }
+    await expect(f.runtime.spawn('minion', { resumeFile: file })).rejects.toThrow(/already hosted by this process/);
+    expect(f.script.calls).toHaveLength(1); expect(admissions).toHaveLength(1);
+    release(); await turn; await session.waitForIdle();
+    expect(await disposing).toBe(failure);
+    expect(disposal).toHaveBeenCalledTimes(1); expect(invalidation).toHaveBeenCalledTimes(1);
+    expect(session.isIdle).toBe(true); expect(turnSettled).toBe(true);
+    expect(handle.cessationEvidence!(), 'native idle does not excuse failed required SDK cleanup').toBe('unknown');
+    expect(events.filter((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toEqual([]);
+    expect(f.store.isHeld(file)).toBe(true); expect(existsSync(`${file}.lock`)).toBe(true);
+    // Only a later successful full disposal may release this original owner.
+    invalidation.mockRestore();
+    await handle.dispose();
+    expect(disposal).toHaveBeenCalledTimes(2);
+    expect(handle.cessationEvidence!()).toBe('ceased'); expect(handle.cessationEvidence!()).toBe('ceased');
+    await handle.dispose();
+    expect(events.filter((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toHaveLength(1);
+    expect(f.store.isHeld(file)).toBe(false); expect(existsSync(`${file}.lock`)).toBe(false);
+    expect(admissions).toHaveLength(1); expect(f.script.calls).toHaveLength(1);
+  } finally {
+    invalidation.mockRestore(); release();
+    await turn.catch(() => {});
+    // Even an assertion-RED must release the REAL SDK resource; the old
+    // adapter's disposed flag would otherwise short-circuit that teardown.
+    await session.waitForIdle(); await session.dispose();
+    disposal.mockRestore(); await f.runtime.dispose(); f.store.dispose();
+  }
+});
+
+it('restart recovery rejects synchronous SDK disposal success as proof while the native run still owns work', async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
+  const f = await fixture([{ deltas: ['held actual native stream'], hold, honorAbort: false }]);
+  const handle = await f.runtime.spawn('minion', { cwd: f.workspace });
+  const events = collect(handle);
+  const session = (handle as unknown as { readonly session: {
+    readonly isIdle: boolean;
+    readonly isBashRunning: boolean;
+    readonly hasPendingBashMessages: boolean;
+    dispose(): void;
+    waitForIdle(): Promise<void>;
+  } }).session;
+  const file = handle.sessionFile!;
+  const turn = handle.prompt('actual synchronous disposal proof boundary');
+  try {
+    await waitFor(() => f.script.calls.length === 1, 'real native held provider');
+    // Actual pinned SDK succeeds synchronously BEFORE the held native run
+    // ends. No replacement session/dispose implementation or bash flag.
+    expect(session.dispose()).toBeUndefined();
+    expect(session.isIdle).toBe(false);
+    expect(session.isBashRunning).toBe(false); expect(session.hasPendingBashMessages).toBe(false);
+    let settled = false;
+    const disposing = handle.dispose().then(() => { settled = true; });
+    const concurrent = handle.dispose();
+    await new Promise<void>((resolveGate) => setImmediate(resolveGate));
+    expect(settled).toBe(false);
+    expect(handle.cessationEvidence!()).toBe('unknown');
+    expect(events.filter((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toEqual([]);
+    expect(existsSync(`${file}.lock`)).toBe(true); expect(f.store.isHeld(file)).toBe(true);
+    await expect(handle.prompt('forbidden work during disposal')).rejects.toThrow(/disposed/);
+    await expect(f.runtime.spawn('minion', { resumeFile: file })).rejects.toThrow(/already hosted by this process/);
+    expect(f.script.calls).toHaveLength(1);
+    release(); await turn; await session.waitForIdle();
+    await Promise.all([disposing, concurrent]);
+    expect(session.isIdle).toBe(true); expect(handle.cessationEvidence!()).toBe('ceased');
+    await handle.dispose();
+    expect(events.filter((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toHaveLength(1);
+    expect(existsSync(`${file}.lock`)).toBe(false); expect(f.script.calls).toHaveLength(1);
+  } finally {
+    release(); await turn.catch(() => {}); await session.waitForIdle(); await session.dispose();
+    await f.runtime.dispose(); f.store.dispose();
+  }
+});
+
+/** A real persisted ledger/lane for SDK ownership regressions, not a native
+ * handoff fixture. It supplies no positive original-producer proof. */
+async function directiveRecoveryLedgerFixture(label: string) {
+  const { LedgerDb } = await import('../src/ledger/db.js');
+  const { LedgerApi } = await import('../src/ledger/api.js');
+  const { EventBus } = await import('../src/events/bus.js');
+  const { NotificationCenter } = await import('../src/notifications/center.js');
+  const { InMemoryWorktreePort } = await import('./helpers/in-memory-worktrees.js');
+  const dir = mkdtempSync(join(tmpdir(), 'gru-sdk-recovery-ledger-')); cleanupDirs.push(dir);
+  const repo = makeFixtureRepo(label);
+  const db = new LedgerDb(dir); const bus = new EventBus({});
+  const ledger = new LedgerApi(db.handle, { bus });
+  const notifications = new NotificationCenter({ ledger, bus });
+  const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'));
+  ledger.addJob({ id: 'sdk-original-job', repo: 'fixture', title: label, briefing: 'immutable original approved contract' });
+  ledger.setJobStatus('sdk-original-job', 'working');
+  const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'sdk-original-job' });
+  const request = ledger.beginDirectiveIntent({ jobId: 'sdk-original-job', requestId: 'sdk-original-request',
+    directive: 'perform original approved work only once', holder: 'gru' }).record;
+  return { dir, repo, db, bus, ledger, notifications, worktrees, lane, request,
+    identity: ledger.directiveTurnIdentity(request.requestId) };
+}
+
+async function actualDirectiveSdkSession(handle: AgentHandle) {
+  const { AgentSession } = await import('@earendil-works/pi-coding-agent');
+  const exposed = (handle as unknown as { readonly session: unknown }).session;
+  if (!(exposed instanceof AgentSession)) throw new Error('ownership regression requires the actual pinned SDK AgentSession');
+  return exposed;
+}
+
+async function assertPreFenceSdkOwnerSurvivesRestart(terminal: boolean): Promise<void> {
+  const { LedgerDb } = await import('../src/ledger/db.js');
+  const { LedgerApi } = await import('../src/ledger/api.js');
+  const { EventBus } = await import('../src/events/bus.js');
+  const { NotificationCenter } = await import('../src/notifications/center.js');
+  const { DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const { inspectDirectiveCheckpoint, readDirectiveBinding } = await import('../src/runtime/directive-checkpoint.js');
+  let release!: () => void; const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
+  let reached!: () => void; const boundary = new Promise<void>((resolveGate) => { reached = resolveGate; });
+  const f = await fixture((_prompt, index) => {
+    if (index === 0) return { deltas: [], toolCall: { id: 'original-effect-call', name: 'bash',
+      args: { command: "printf 'original-effect\\n' >> legacy-effect.txt" } } };
+    if (!terminal) { reached(); return { deltas: [], hold, honorAbort: false }; }
+    return { deltas: ['genuine original terminal response'] };
+  });
+  const scene = await directiveRecoveryLedgerFixture(terminal ? 'legacy-terminal-owner' : 'legacy-resumable-owner');
+  const owner = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: 'sdk-original-minion' });
+  const session = await actualDirectiveSdkSession(owner);
+  const file = owner.sessionFile!;
+  // This public awaited observer really holds the terminal SDK run. It is
+  // NOT a stop hook, idle stub, transcript rewrite or graceful handoff.
+  const unsubscribe = terminal ? session.agent.subscribe(async (event) => {
+    if (event.type === 'agent_end') { reached(); await hold; }
+  }) : () => {};
+  let reopened: InstanceType<typeof LedgerDb> | null = null;
+  let service: InstanceType<typeof DirectiveProgressService> | null = null;
+  let settled = false;
+  scene.ledger.registerAgent({ id: owner.id, role: 'minion', jobId: scene.request.jobId, sessionFile: file, parentage: 'top-level' });
+  // Last persisted pre-turn observer state. No live state is rewritten to
+  // idle; this old snapshot is deliberately not a cessation attestation.
+  scene.ledger.setAgentState(owner.id, 'idle');
+  scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: owner.id, sessionFile: file });
+  // Explicit preceding-version fixture: its dispatch claim stored these
+  // facts before native admission, before the producer-reservation event
+  // existed. Do not call/delete a genuine current claim or backfill proof.
+  scene.db.handle.prepare('UPDATE pending_directives SET dispatch_started_at = ? WHERE request_id = ?')
+    .run(new Date().toISOString(), scene.request.requestId);
+  scene.ledger.appendCustomEvent({ kind: 'silas.directive-dispatch-started', jobId: scene.request.jobId,
+    payload: { request_id: scene.request.requestId } });
+  const turn = owner.prompt('perform original approved work only once', { directive: { identity: scene.identity,
+    beforeAdmission: () => { scene.ledger.assertDirectiveAuthority(scene.identity); },
+    onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); },
+  } }).finally(() => { settled = true; });
+  // Observe an early genuine failure instead of hanging in setup if the
+  // actual SDK never reaches the requested owned boundary.
+  const premature = turn.then(() => { throw new Error('original SDK settled before its held boundary'); });
+  try {
+    await Promise.race([boundary, premature]);
+    expect(settled).toBe(false); expect(session.isIdle).toBe(false);
+    expect(session.agent.state.isStreaming).toBe(true);
+    expect(session.isBashRunning).toBe(false); expect(session.hasPendingBashMessages).toBe(false);
+    expect(owner.cessationEvidence!()).toBe('unknown');
+    expect(f.store.isHeld(file)).toBe(true);
+    expect(readFileSync(join(scene.lane.path, 'legacy-effect.txt'), 'utf8')).toBe('original-effect\n');
+    const proof = inspectDirectiveCheckpoint(file, scene.identity);
+    if (terminal) expect(proof).toMatchObject({ state: 'terminal', ok: true });
+    else expect(proof.state).toBe('resumable');
+    const request = scene.ledger.getDirective(scene.request.requestId)!;
+    expect(request).toMatchObject({ state: 'admitted', recoveryCheckpoint: null });
+    expect(request.dispatchStartedAt).not.toBeNull();
+    const admission = scene.ledger.getEvent(request.admissionSeq!);
+    expect(admission?.kind).toBe('silas.directive-sent');
+    expect(scene.ledger.latestJobEvent(request.jobId, 'silas.directive-producer-started')).toBeNull();
+    expect(scene.ledger.latestJobEvent(request.jobId, 'silas.directive-producer-ceased')).toBeNull();
+    const prefix = readFileSync(file, 'utf8');
+    const binding = readDirectiveBinding(file, request.requestId);
+    scene.db.close();
+    reopened = new LedgerDb(scene.dir); expect(reopened.dbPath).toBe(scene.db.dbPath);
+    const bus = new EventBus({}); const ledger = new LedgerApi(reopened.handle, { bus });
+    const registry: import('../src/dispatch/fix-directive.js').DirectiveRegistry = { getHandle: () => null,
+      spawn: vi.fn(async () => { throw new Error('fresh empty registry cannot replace an unproven original SDK owner'); }),
+      disposeHandle: vi.fn(async () => { throw new Error('fresh empty registry does not own the original handle'); }) };
+    service = new DirectiveProgressService({ ledger, registry, worktrees: scene.worktrees,
+      notifications: new NotificationCenter({ ledger, bus }), signal: new AbortController().signal,
+      pendingProducerBlockers: () => [] });
+    service.reconsider(); await service.settled();
+    expect(settled).toBe(false); expect(session.isIdle).toBe(false);
+    expect(owner.cessationEvidence!()).toBe('unknown'); expect(f.store.isHeld(file)).toBe(true);
+    expect(f.script.calls).toHaveLength(2);
+    expect(readFileSync(join(scene.lane.path, 'legacy-effect.txt'), 'utf8')).toBe('original-effect\n');
+    expect(readFileSync(file, 'utf8')).toBe(prefix);
+    expect(readDirectiveBinding(file, request.requestId)).toEqual(binding);
+    expect(ledger.getEvent(request.admissionSeq!)).toEqual(admission);
+    expect(ledger.latestJobEvent(request.jobId, 'job.delivered'),
+      'pre-fence native terminal completeness cannot prove the still-held original SDK producer ceased').toBeNull();
+    expect(registry.spawn, 'pre-fence user/tool results and missing reservation cannot authorize a new producer').not.toHaveBeenCalled();
+    expect(registry.disposeHandle).not.toHaveBeenCalled();
+    expect(ledger.getDirective(request.requestId)).toMatchObject({ state: 'admitted', recoveryCheckpoint: null,
+      payloadHash: request.payloadHash, workRevision: request.workRevision, contractSha256: request.contractSha256,
+      authorityEpoch: request.authorityEpoch, nativeTarget: request.nativeTarget, nativeBinding: request.nativeBinding });
+    const debt = ledger.listObligations({ jobId: request.jobId }).find((row) => row.incidentKey === `directive-recovery:${request.requestId}`);
+    expect(debt).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision' } });
+  } finally {
+    // Preserve every inspected byte until assertions finish; then genuinely
+    // release the original provider/listener and dispose its actual owner.
+    release(); unsubscribe(); await turn.catch(() => {}); await premature.catch(() => {});
+    await service?.dispose(); await session.waitForIdle(); await owner.dispose();
+    await f.runtime.dispose(); f.store.dispose(); reopened?.close(); scene.db.close(); scene.repo.cleanup();
+  }
+}
+
+it('pre-fence persisted admitted tool results stay UNKNOWN with a genuinely held original SDK after ledger restart', async () => {
+  await assertPreFenceSdkOwnerSurvivesRestart(false);
+});
+
+it('pre-fence persisted admitted terminal stays UNKNOWN with a genuinely held original SDK listener after ledger restart', async () => {
+  await assertPreFenceSdkOwnerSurvivesRestart(true);
+});
+
+it('resident actual SDK disposal and pre-durability UNKNOWN journal failures retain both original failures', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const f = await fixture([{ deltas: ['genuine original terminal'] }]);
+  const scene = await directiveRecoveryLedgerFixture('resident-sdk-journal-failures');
+  const owner = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: 'resident-sdk-minion' });
+  const session = await actualDirectiveSdkSession(owner);
+  const dependency = session as unknown as { readonly _extensionRunner: { invalidate(message?: string): void } };
+  const original = new Error('original actual resident SDK invalidation failure');
+  const disposal = vi.spyOn(session, 'dispose'); // actual pinned dispose call-through
+  const invalidation = vi.spyOn(dependency._extensionRunner, 'invalidate').mockImplementation(() => { throw original; });
+  scene.ledger.registerAgent({ id: owner.id, role: 'minion', jobId: scene.request.jobId, sessionFile: owner.sessionFile, parentage: 'top-level' });
+  scene.ledger.setAgentState(owner.id, 'idle');
+  const registry: import('../src/dispatch/fix-directive.js').DirectiveRegistry = {
+    getHandle: (id) => id === owner.id ? owner : null,
+    spawn: vi.fn(async () => { throw new Error('resident must not acquire another native owner'); }),
+    disposeHandle: async (handle) => { await handle.dispose(); },
+  };
+  try {
+    scene.db.handle.exec(`CREATE TRIGGER reject_resident_unknown BEFORE INSERT ON events
+      WHEN NEW.kind = 'silas.directive-producer-unknown'
+      BEGIN SELECT RAISE(FAIL, 'original resident UNKNOWN journal storage failure'); END`);
+    await executeAcceptedDirective({ ledger: scene.ledger, registry, worktrees: scene.worktrees,
+      notifications: scene.notifications, signal: new AbortController().signal, pendingProducerBlockers: () => [] }, scene.request.requestId);
+    expect(disposal).toHaveBeenCalledTimes(1); expect(invalidation).toHaveBeenCalledTimes(1);
+    expect(session.isIdle).toBe(true); expect(owner.cessationEvidence!()).toBe('unknown');
+    expect(f.store.isHeld(owner.sessionFile!)).toBe(true); expect(registry.spawn).not.toHaveBeenCalled();
+    expect(f.script.calls).toHaveLength(1);
+    expect(scene.ledger.getDirective(scene.request.requestId)?.state).toBe('admitted');
+    expect(scene.ledger.latestJobEvent(scene.request.jobId, 'job.delivered')).toBeNull();
+    expect(scene.ledger.latestJobEvent(scene.request.jobId, 'silas.directive-producer-unknown')).toBeNull();
+    expect(scene.ledger.latestJobEvent(scene.request.jobId, 'silas.directive-producer-ceased')).toBeNull();
+    const card = scene.ledger.findNotificationByKind(`silas.directive-unreconciled.${scene.request.requestId}`, 'active');
+    expect(card?.detail, 'UNKNOWN journaling must not mask the real pinned SDK disposal failure').toContain(original.message);
+    expect(card?.detail).toContain('original resident UNKNOWN journal storage failure');
+  } finally {
+    scene.db.handle.exec('DROP TRIGGER IF EXISTS reject_resident_unknown');
+    invalidation.mockRestore(); await owner.dispose(); disposal.mockRestore();
+    await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup();
+  }
 });

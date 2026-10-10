@@ -243,6 +243,47 @@ describe('verification scheduler — global budget', () => {
     expect(scheduler.activeCount()).toBe(0);
   });
 
+  it('reentrant shutdown after native child spawn cannot mislabel a missing started frame as no-start', async () => {
+    const repo = makeRepo(); const records: VerificationRecord[] = [];
+    let disposal: Promise<void> | null = null;
+    const scheduler = new VerificationScheduler({ storageDir: join(tempDir(), 'verify'),
+      limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 5000 },
+      record: (record) => records.push(record),
+      onSpawn: () => { disposal = scheduler.dispose(); }, disposeGraceMs: 1000,
+    });
+    const outcome = await scheduler.submit(repoSpec(repo, 'spawned-job', { command: 'node -e "setTimeout(() => {}, 3000)"', requestId: 'spawned-before-shutdown' }));
+    await disposal;
+    expect(outcome.ok).toBe(false); expect(outcome.signal).toBe('SIGTERM');
+    expect(records.filter((record) => record.kind === 'verification.no-start')).toEqual([]);
+    expect(scheduler.attemptStatus({ requestId: 'spawned-before-shutdown' })).toMatchObject({ state: 'completed', started: true, runId: outcome.runId });
+  });
+
+  it('shutdown durably settles a queued original run as no-start across restart, without executing or losing its identity', async () => {
+    const { scheduler, records, storageDir } = makeScheduler(); scheduler.start();
+    const holder = await scheduler.acquire(spec('independent-holder'));
+    const requestId = 'shutdown-never-started-request';
+    const input = { ...spec('queued-job', 'node -e "process.exit(99)"'), requestId };
+    const frames: VerificationProgress[] = [];
+    let queued!: () => void; const queuedBoundary = new Promise<void>((resolve) => { queued = resolve; });
+    const pending = scheduler.submit(input, (frame) => { frames.push(frame); if (frame.type === 'queued') queued(); });
+    const rejected = expect(pending).rejects.toBeInstanceOf(VerificationDisposedError);
+    await queuedBoundary;
+    const requested = records.find((record) => record.kind === 'verification.requested')!;
+    expect(frames[0]?.type).toBe('queued');
+    await scheduler.dispose(); await rejected;
+    const noStart = records.filter((record) => record.kind === 'verification.no-start');
+    expect(noStart).toHaveLength(1); expect(noStart[0]?.payload).toMatchObject({ run_id: requested.payload['run_id'], request_ids: [requestId], started: false });
+    expect(frames.some((frame) => frame.type === 'started' || frame.type === 'completed')).toBe(false);
+    scheduler.release(holder);
+    const resumed = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 } });
+    resumed.start();
+    try {
+      expect(resumed.attemptStatus({ requestId })).toMatchObject({ state: 'admission-failed', runId: requested.payload['run_id'], started: false, error: { code: 'scheduler_disposed' } });
+      await expect(resumed.submit(input, (frame) => { frames.push(frame); })).rejects.toBeInstanceOf(VerificationDisposedError);
+      expect(resumed.inFlightCount()).toBe(0); expect(frames).toHaveLength(1);
+    } finally { await resumed.dispose(); }
+  });
+
   it('rejects a queued request parked on its queued frame when dispose runs', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });
     scheduler.start();

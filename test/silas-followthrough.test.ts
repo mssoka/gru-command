@@ -21,6 +21,7 @@ import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtim
 import type { Role } from '../src/config.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
+import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
   streaming: true,
@@ -226,9 +227,10 @@ async function bootFollowThrough(input: {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);
     if (role === 'silas') throw new Error('the integration fakes the silas slot, never spawns it');
-    return {
+    const id = options?.agentId ?? `agent-${spawns.length}`;
+    return withNativeDirectiveFixture({
       role,
-      id: `agent-${spawns.length}`,
+      id,
       sessionFile: null,
       capabilities: FAKE_CAPABILITIES,
       async prompt(text: string) {
@@ -264,7 +266,9 @@ async function bootFollowThrough(input: {
         return { state: 'idle' as const, lastActivity: null, sessionFile: null };
       },
       async dispose() {},
-    };
+    }, join(reviewSessions, `${id}.jsonl`), (state) => {
+      if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state);
+    });
   };
 
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
@@ -316,7 +320,7 @@ async function bootFollowThrough(input: {
       registry: {
         getHandle: () => null,
         spawn: (role, options) => spawner(role, options),
-        disposeHandle: async () => {},
+        disposeHandle: async (handle) => { await handle.dispose(); },
       },
       worktrees,
       notifications: new NotificationCenter({ ledger, bus }),
@@ -498,7 +502,12 @@ describe('silas follow-through (no human input)', () => {
       const deliveries = events.filter((event) => event.kind === 'job.delivered');
       expect(deliveries).toHaveLength(2);
       const followUp = deliveries[0];
-      expect(followUp?.payload).toMatchObject({ source: 'silas-directive' });
+      expect(followUp?.payload).toMatchObject({ source: 'silas-directive', request_id: h.directiveReceipts[0]!.requestId });
+      const admitted = h.ledger.getDirective(h.directiveReceipts[0]!.requestId)!;
+      expect(admitted.state).toBe('settled');
+      expect(admitted.nativeBinding?.userEntryId).toBeTruthy();
+      expect(admitted.admissionSeq).toBeTypeOf('number');
+      expect(admitted.deliverySeq).toBe(followUp?.seq);
       const followUpSha = (followUp?.payload as { sha?: string | null }).sha;
       expect(typeof followUpSha).toBe('string');
       // The freshness predicate's witness: the fix delivery moved the lane
