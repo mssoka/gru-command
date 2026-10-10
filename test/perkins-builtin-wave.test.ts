@@ -8807,7 +8807,9 @@ describe('formal GitHub verdict publication from native judgments', () => {
     fix.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     fix.repo.git(['push', '--quiet', 'origin', 'feature/formal-scenario']);
     const outcome = asWave(await runner(fix, poster, undefined, {
-      priorDisposition: () => [{ prior_index: 1, status: 'fixed', note: 'corrected in this delta' }],
+      // Every revisited prior (the round-2 blocker AND its carried round-1
+      // warning, both cited on the corrected file) is dispositioned fixed.
+      priorDisposition: (priors) => priors.map((_entry, index) => ({ prior_index: index, status: 'fixed' as const, note: 'corrected in this delta' })),
     }, escalations).runRound({ jobId: 'job-formal-lifecycle' }));
     const rounds = fix.ledger.listRounds('job-formal-lifecycle');
     expect(rounds, escalations.join('\n')).toHaveLength(4);
