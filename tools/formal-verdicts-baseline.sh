@@ -32,7 +32,12 @@ d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-formal-verdicts.XXXXXX")
 git archive "$base" -o "$d/base.tar"
 tar -xf "$d/base.tar" -C "$d"
 rm -f "$d/base.tar"
-for f in test/perkins-github-app.test.ts test/perkins-builtin-wave.test.ts test/suite-shape.test.ts; do
+# The new standalone evidence module is added to the overlay because the
+# FINAL test files import it. It is purely additive: the base implementation
+# never references it, its only imports are type-only (erased at runtime),
+# and it changes nothing about the old publisher behavior the regressions
+# measure. The remaining overlay is the FINAL test suites only.
+for f in test/perkins-github-app.test.ts test/perkins-builtin-wave.test.ts test/suite-shape.test.ts src/dispatch/publication-evidence.ts; do
   mkdir -p "$d/$(dirname "$f")"
   git show "$headrev:$f" > "$d/$f"
 done
