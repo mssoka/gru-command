@@ -2525,6 +2525,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "diff/libesm/util/string.js",
   "dijkstrajs/dijkstra.js",
   "dijkstrajs/test/dijkstra.test.js",
+  "dist/artifacts/context.js",
   "dist/attachments/resolver.js",
   "dist/attachments/server.js",
   "dist/auth.js",
