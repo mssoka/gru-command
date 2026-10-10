@@ -1,18 +1,21 @@
 #!/usr/bin/env node
-/** Baseline classifier for the R4 repair of job
- * perkins-integration-review-coverage-20261009 (fresh-worker re-brief).
+/** Baseline classifier for the R4/R7 repairs of job
+ * perkins-integration-review-coverage-20261009.
  *
  * The fail-before evidence is discriminating only when the NAMED regression
- * fails by ASSERTION against the pre-fix base e9772afc69fface847eba5a35b5d52f7959ae052:
- * a nonzero exit from import, collection, setup or an unrelated test is NOT
- * RED. Two legs:
+ * fails by ASSERTION against the named uncorrected lineage: a nonzero exit
+ * from import, collection, setup or an unrelated test is NOT RED. Three legs:
  *
- *   fast  — the consumed-byte mutation refusal: the pre-fix base accepts the
- *           replaced record, so `rejects` reports "promise resolved ...
- *           instead of rejecting".
- *   heavy — both verdict-to-annotation crash windows: the pre-fix base
- *           skips the annotation-less predecessor and integrates from the
- *           OLDER whole round, so the covered-head equality assertion fails.
+ *   fast  — the consumed-byte mutation refusal at e9772af: the pre-fix base
+ *           accepts the replaced record, so `rejects` reports "promise
+ *           resolved ... instead of rejecting".
+ *   heavy — both verdict-to-annotation crash windows plus the production
+ *           pin pass-through at e9772af: the pre-fix base skips the
+ *           annotation-less predecessor and consumes the mutated record, so
+ *           the covered-head equality and refusal assertions fail.
+ *   r7    — the historical-fallback authentication at fd8f2a6: the
+ *           uncorrected reader credits the stripped delta record as debt-free
+ *           whole, so the restored-debt assertion fails.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -114,7 +117,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   try {
     const [leg, path] = process.argv.slice(2);
     if (leg === undefined || path === undefined) {
-      throw new Error('usage: assert-perkins-integration-review-baseline.mjs <fast|heavy> REPORT_JSON');
+      throw new Error('usage: assert-perkins-integration-review-baseline.mjs <fast|heavy|r7> REPORT_JSON');
     }
     const titles = assertPerkinsIntegrationBaseline(leg, JSON.parse(readFileSync(path, 'utf8')));
     process.stdout.write(

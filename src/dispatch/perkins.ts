@@ -692,20 +692,31 @@ function parsePostedReviewState(value: unknown): PostedReviewStateParse {
   };
 }
 
+/** The host-owned appendix heading: the publication body is the
+ * lead-authored report CONCATENATED with the host appendix, so structural
+ * scope markers are read only from the appendix region (after the LAST
+ * occurrence of this heading). Untrusted prose can never shadow or invalidate
+ * them. */
+const HOST_APPENDIX_HEADING = '## Execution and findings (host-recorded facts)';
+
 /** What a DIGEST-VERIFIED publication body discloses about its round's review
  * scope: the immutable native scope evidence for a round whose posted event
- * predates the persisted `review` block. `legacy` is a body written before
- * scope disclosure existed (a genuine pre-Stage-5 whole review); `scoped`
- * names the disclosed scope plus whether the body also discloses an owed
- * final whole-change pass; null is a missing or unrecognized body, which can
- * never corroborate retention (refuse, never guess). */
+ * predates the persisted `review` block. `legacy` is a body with no host
+ * appendix or no scope disclosure in it (a genuine pre-Stage-5 whole
+ * review); `scoped` names the disclosed scope plus whether the appendix
+ * still discloses an owed final whole-change pass; null is a missing body or
+ * an unrecognized disclosure, which can never corroborate retention (refuse,
+ * never guess). */
 type PublishedScopeDisclosure =
   | { readonly kind: 'legacy' }
   | { readonly kind: 'scoped'; readonly reviewScope: 'whole' | 'delta' | 'integration'; readonly finalPassRequired: boolean };
 
 function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure | null {
   if (text === null) return null;
-  const line = text.split('\n').find((entry) => entry.startsWith('- Review scope: '));
+  const hostStart = text.lastIndexOf(HOST_APPENDIX_HEADING);
+  if (hostStart === -1) return { kind: 'legacy' };
+  const host = text.slice(hostStart);
+  const line = host.split('\n').find((entry) => entry.startsWith('- Review scope: '));
   if (line === undefined) return { kind: 'legacy' };
   const disclosed = line.slice('- Review scope: '.length);
   const reviewScope = disclosed.startsWith('whole change')
@@ -719,7 +730,7 @@ function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure
   return {
     kind: 'scoped',
     reviewScope,
-    finalPassRequired: text.includes('- Final whole-change pass: STILL OWED'),
+    finalPassRequired: host.includes('- Final whole-change pass: STILL OWED'),
   };
 }
 
@@ -6192,6 +6203,17 @@ export class WaveRunner {
       });
       if (!linkage.ok) return null;
       const scope = convergence.reviewScope as 'whole' | 'delta' | 'integration';
+      // A digest-verified disclosure must not CONTRADICT the record: the same
+      // clearance class as the absent-block case. A body that names a
+      // different scope, or that still owes the final pass while the record's
+      // effective debt says none is owed, is damaged state — refuse.
+      const disclosure = publishedScopeDisclosure(posted.publicationText);
+      if (disclosure !== null && disclosure.kind === 'scoped') {
+        const effectiveDebt = scope === 'delta' ||
+          (scope === 'integration' && convergence.coverageComplete !== true) ||
+          convergence.finalPassRequired === true;
+        if (disclosure.reviewScope !== scope || (disclosure.finalPassRequired && !effectiveDebt)) return null;
+      }
       return {
         reviewScope: scope,
         coverageComplete: convergence.coverageComplete === true || scope === 'whole',

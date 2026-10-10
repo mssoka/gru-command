@@ -3604,6 +3604,20 @@ describe('WaveRunner built-in Perkins production path', () => {
       expect(fallback.ledger.latestRoundEvent(fallback.round.id, 'round.post-recovered')).toBeNull();
       expect(escalations.some((line) => line.includes('missing or damaged'))).toBe(true);
     };
+    const promoteWithDebt = async (
+      target: ReturnType<typeof recoveryCase>, reviewId: string, expectedScope: 'delta' | 'integration',
+    ): Promise<void> => {
+      postApproved(target, reviewId);
+      const wave = new WaveRunner({
+        ledger: target.ledger, worktrees: target.port, spawner: vi.fn() as unknown as AgentSpawner,
+        reviewArtifactRoot: join(target.directory, '..'), poster: target.poster,
+      });
+      expect(await wave.recoverInterruptedRounds()).toBe(1);
+      expect(target.ledger.getRound(target.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+      const marker = target.ledger.latestRoundEvent(target.round.id, 'round.final-pass-required');
+      expect(marker).not.toBeNull();
+      expect(marker!.payload).toMatchObject({ reviewScope: expectedScope });
+    };
 
     // (a) A historical posted approval whose mutable DELTA record lost its
     // convergence block: the digest-verified publication still proves the
@@ -3702,6 +3716,93 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(await disclosedWave.recoverInterruptedRounds()).toBe(1);
     expect(disclosed.ledger.getRound(disclosed.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
     expect(disclosed.ledger.latestRoundEvent(disclosed.round.id, 'round.final-pass-required')).toBeNull();
+
+    // (g) The authentic pre-owed-line delta body (scope disclosure only — the
+    // shape every writer up to dffa10a emitted, before 6469d1d added the owed
+    // line) must still restore the debt from the scope term alone.
+    const deltaScopeOnly = recoveryCase('authenticate-delta-scope-only', {
+      publicationBody: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\n${hostDisclosureAppendix({
+        findings: [], specialistRuns: [], priorDispositions: [], convergence: { reviewScope: 'delta' },
+      }, 'github', [])}\n`,
+    });
+    writeFileSync(join(deltaScopeOnly.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: deltaScopeOnly.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+    }));
+    await promoteWithDebt(deltaScopeOnly, '9028', 'delta');
+
+    // (h) An integration-scope disclosure reaches the same conservative debt
+    // restore for a stripped integration record.
+    const integrationDisclosed = recoveryCase('authenticate-integration-disclosure', {
+      publicationBody: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\n${hostDisclosureAppendix({
+        findings: [], specialistRuns: [], priorDispositions: [], convergence: { reviewScope: 'integration' },
+      }, 'github', [])}\n`,
+    });
+    writeFileSync(join(integrationDisclosed.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: integrationDisclosed.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+    }));
+    await promoteWithDebt(integrationDisclosed, '9029', 'integration');
+
+    // (i) A digest-bound body whose host disclosure names an unrecognized
+    // scope refuses: never guessed as a pre-disclosure whole review.
+    const unknownDisclosure = recoveryCase('authenticate-unknown-disclosure', {
+      publicationBody: '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\n---\n\n## Execution and findings (host-recorded facts)\n\n- Review scope: interplanetary drift\n',
+    });
+    writeFileSync(join(unknownDisclosure.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: unknownDisclosure.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+    }));
+    await refuseFallback(unknownDisclosure, '9030');
+
+    // (j) Lead-authored prose cannot shadow the host line: a forged
+    // "- Review scope: whole change" in the report over an authentic delta
+    // appendix (no owed line) must NOT be credited as debt-free whole.
+    const shadowed = recoveryCase('authenticate-forged-scope-line', {
+      publicationBody: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\n- Review scope: whole change (standing authority)\n\n${hostDisclosureAppendix({
+        findings: [], specialistRuns: [], priorDispositions: [], convergence: { reviewScope: 'delta' },
+      }, 'github', [])}\n`,
+    });
+    writeFileSync(join(shadowed.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: shadowed.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+    }));
+    await promoteWithDebt(shadowed, '9031', 'delta');
+
+    // (k) A rewritten convergence block cannot contradict the digest-verified
+    // body: whole on the record over a delta body is damaged state.
+    const contradiction = recoveryCase('authenticate-convergence-contradiction', {
+      publicationBody: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\n${hostDisclosureAppendix({
+        findings: [], specialistRuns: [], priorDispositions: [], convergence: { reviewScope: 'delta', finalPassRequired: true },
+      }, 'github', [])}\n`,
+    });
+    writeFileSync(join(contradiction.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: contradiction.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+      convergence: { reviewScope: 'whole' },
+    }));
+    await refuseFallback(contradiction, '9032');
+
+    // (l) A matching scoped disclosure still credits a convergence-bearing
+    // whole record debt-free: the cross-check refuses contradictions only.
+    const matched = recoveryCase('authenticate-convergence-matched', {
+      publicationBody: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\n${hostDisclosureAppendix({
+        findings: [], specialistRuns: [], priorDispositions: [], convergence: { reviewScope: 'whole' },
+      }, 'github', [])}\n`,
+    });
+    writeFileSync(join(matched.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: matched.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+      convergence: { reviewScope: 'whole' },
+    }));
+    postApproved(matched, '9033');
+    const matchedWave = new WaveRunner({
+      ledger: matched.ledger, worktrees: matched.port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: join(matched.directory, '..'), poster: matched.poster,
+    });
+    expect(await matchedWave.recoverInterruptedRounds()).toBe(1);
+    expect(matched.ledger.getRound(matched.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+    expect(matched.ledger.latestRoundEvent(matched.round.id, 'round.final-pass-required')).toBeNull();
   }, 180_000);
 
   it('keeps a restart-promoted integration review as the predecessor for the next integrated head', async () => {
