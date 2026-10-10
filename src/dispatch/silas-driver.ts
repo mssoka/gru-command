@@ -48,8 +48,9 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *   0 disables) observes tracked branches through authenticated `gh api`
  *   (POLL-ONLY — the webhook route is descoped) and mechanically applies
  *   the GitHub state-change mappings: a merged PR closes its lane, a
- *   conflicting PR cascades an action-required notification, CI failure
- *   posts a tiered notification with the run URL, CI green records the
+ *   conflicting PR cascades an fyi notification (mechanical tier — Silas
+ *   coordinates the conflict integration); CI failure posts a tiered
+ *   notification with the run URL; CI green records the
  *   review-gate signal event. Dedupe is by observed state-change; the tier
  *   ladder and the wake kinds are unchanged.
  * - Concurrency follows the decisions runtime's one-slot replay: a trigger
@@ -494,11 +495,12 @@ export interface ProviderRecoveryPendingRow {
 }
 
 /** An open PR whose head is dirty against its base (issue #215): the
- * rebase is Silas's mechanical work, derived from the job's latest
+ * conflict integration is Silas's mechanical work, derived from the job's latest
  * `github.branch-state` cursor. Suppressed while any accepted operation
  * owns the lane (a live directive, a pending re-brief, an in-flight
- * verification) or a rebase directive for this exact head has landed
- * after the conflict — uncertain ownership fails closed to no row. */
+ * verification) or a conflict-integration directive for this exact head
+ * has landed after the conflict — uncertain ownership fails closed to no
+ * row. */
 export interface ConflictingPrRow {
   readonly jobId: string;
   readonly repo: string;
@@ -843,13 +845,15 @@ export function silasBriefSections(input: {
 }): string[] {
   return [
     'You are the operations layer. Work inside your authority: dispatch,',
-    'track, close. Never write product code; never merge. Perkins owns',
-    'verdict authority. The owner holds every merge, everywhere — this',
-    'repository included: a merge is presented only after the',
-    'exact-final-head Perkins gate, and fallback PASS is not that',
-    'clearance. Preserve before remove; escalate novel failures to the',
-    'chief with pointers, not prose. Never act on the Gru chat session',
-    'itself.',
+    'track, close. Never write product code. Two merges: a worker',
+    'integrating main into its own task branch is ordinary execution you',
+    'coordinate; every final PR merge belongs to the owner, in every',
+    'repository — this one included — presented only after required final',
+    'CI and the exact-final-head Perkins gate: development-review READY,',
+    'fallback PASS, an old-head verdict and a clean textual merge are not',
+    'that clearance. Preserve before remove;',
+    'escalate novel failures to the chief with pointers, not prose.',
+    'Never act on the Gru chat session itself.',
     '',
     '## Ops surface',
     '',
@@ -1347,7 +1351,7 @@ function stallStillEligible(
  * reconsideration — so completion/dependency transitions reach the sweep
  * without a fresh owner message; the conflictingPrs rows (issue
  * #215) — a live PR-owing lane whose open head is dirty against its
- * base, Silas's mechanical rebase work, suppressed while an accepted
+ * base, Silas's mechanical conflict-integration work, suppressed while an accepted
  * operation owns the lane and never a Gru wake; and the releaseEligible
  * rows (issue #117, g21) — a terminal job still holding its own lane,
  * the sweep-ack rule's digest surface, fenced while non-terminal child

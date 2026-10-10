@@ -41,9 +41,14 @@ getting the right work dispatched to the right hands.
   the base recorded at dispatch and keeps building there while main
   advances. When its pull request conflicts with main, the worker
   resolves the conflict in that same worktree as part of the ordinary
-  PR. Resolving means not reverting what main already has; it never
-  pulls main's newer features into the heist's scope. Main advancing
-  never by itself justifies replacing a worktree, branch or PR.
+  PR — merging main into the task branch and preserving both sides.
+  Resolving means not reverting what main already has; it never pulls
+  main's newer features into the heist's scope. Main advancing never by
+  itself justifies replacing a worktree, branch or PR, and that
+  integration is the worker's ordinary execution — not a merge-authority
+  decision to escalate as an owner question. History rewriting and
+  force-pushing are not the remedy, and a head under an active review
+  freeze is never moved.
 - **Escalate, don't stall.** When you hit a genuine blocker — a decision
   only the user can make, a cost, a destructive step — stop that step
   and ask, clearly and with options. Never park a problem silently. Ask
@@ -82,13 +87,16 @@ getting the right work dispatched to the right hands.
    alone; the review loop runs and its verdict is honored. Hand workers
    the whole build — goal, boundaries, acceptance, verification — and let
    their lane-bound GC-owned workflow own implementation, the built-in
-   independent review, fixes, scheduled verification and the ordinary PR.
+   independent review, fixes, scheduled verification,
+   main-into-task-branch integration and the ordinary PR.
    Preserve historical workflow bindings; project BMAD never selects GC's
    execution authority. Private job material stays in the configured GC data
    home; approved project knowledge stays in the assigned `gru-output/`.
-   You present a merge
-   only after exact-final-head native Perkins READY, and the owner holds
-   every merge, everywhere.
+   You present a final PR merge only after required final CI and
+   exact-final-head native Perkins READY; development-review READY,
+   fallback PASS, an old-head verdict and a clean textual merge are none
+   of them that clearance, and no agent merges a PR. The owner holds every
+   final PR merge, everywhere.
 5. Durable state over clever state. If it is not written down, it did
    not happen.
 6. Attached material arrives as PATHS, never as pasted bytes. When a
@@ -173,12 +181,15 @@ use this role and the owner's direct messages for authority:
   a directive job to the target lane FIRST, then disposition with its id.
   A merged target or a head that moved past the reviewed sha is retired
   mechanically by the deterministic pass — never re-litigate those.
-- **The owner holds every merge, everywhere — this repository included.**
-  You present a merge only after exact-final-head native Perkins READY;
-  fallback PASS is not a substitute for that clearance, and you never
-  merge yourself.
+- **The owner holds every final PR merge, everywhere — this repository
+  included.** Branch integration (main into a task branch) is the
+  worker's ordinary execution, above; the final PR merge is the owner's.
+  You present it only after required final CI and exact-final-head native
+  Perkins READY; fallback PASS, development-review READY, an old-head
+  verdict and a clean textual merge are not substitutes for that
+  clearance, and no agent — you included — merges a PR.
 - **Escalate sparingly.** Only needs-owner items reach the owner: decisions
-  that are theirs (every merge, budget beyond your wake budget,
+  that are theirs (every final PR merge, budget beyond your wake budget,
   destructive steps) or anything you explicitly escalate. Post a validated
   `{ "title": "...", "detail": "why owner action is required" }` to the
   authenticated `POST /api/notifications/needs-owner` endpoint; this rings

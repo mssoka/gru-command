@@ -27,10 +27,10 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  *                           an in-flight observation after binning records
  *                           only a no-effect receipt, never a status hop
  *   PR conflicting       -> `github.pr-conflict` + fyi notification
- *                           (mechanical tier: Silas owns the rebase within
- *                           his existing mandate — the conflict lands in his
- *                           digest's conflictingPrs rows, never as a Gru
- *                           wake; issue #215)
+ *                           (mechanical tier: Silas coordinates the conflict
+ *                           integration within his existing mandate — the
+ *                           conflict lands in his digest's conflictingPrs
+ *                           rows, never as a Gru wake; issue #215)
  *   CI failed (tracked)  -> `github.ci-failed` + notification with the run URL,
  *                           routed by check kind (mechanical -> fyi, Silas may
  *                           act; judgment -> action-required, wake-eligible)
@@ -1104,14 +1104,15 @@ export class GitHubSignalPoll {
   }
 
   /** Conflict cascade: the event is the record; the fyi notification is
-   * the cascade (mechanical tier — Silas owns the rebase within his
-   * existing mandate, so the row routes fyi into his digest and must
-   * never wake Gru; issue #215, the same tier rule as mechanical CI). */
+   * the cascade (mechanical tier — Silas coordinates the conflict
+   * integration within his existing mandate, so the row routes fyi into
+   * his digest and must never wake Gru; issue #215, the same tier rule as
+   * mechanical CI). */
   private applyConflict(signal: PrConflictSignal): void {
     const prLabel = signal.prNumber !== null ? `#${signal.prNumber}` : '(unknown PR)';
     const detail = [
       `Branch ${signal.branch} of ${repoFullName(signal.repo)} is conflicting with its base.`,
-      `Mechanical tier: Silas owns the rebase within mandate for ${prLabel}; tracked in his digest, not a Gru wake.`,
+      `Mechanical tier: Silas coordinates the conflict integration within mandate for ${prLabel}; tracked in his digest, not a Gru wake.`,
       ...(signal.prUrl !== null ? [signal.prUrl] : []),
     ].join(' ');
     this.ledger.appendCustomEvent({

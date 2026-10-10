@@ -90,9 +90,9 @@ the same way. The guard compares a lane's RECORDED branch (or the
 checks out its own branch but pushes a FOREIGN PR branch (a rebase/
 salvage lane) is invisible to that comparison — no lane declares a push
 target yet (issue #121 records the evidence and the declared-push-target
-extension). Silas's standing freeze-r1 rule — never arm while a known
-rebase/force-push lane is active on the target — is the control for that
-class. The same recheck runs after a failed pre-flight and before
+extension). Silas's standing freeze-r1 rule — never arm while any known
+lane is actively moving/pushing the target (rebase/force-push or
+integration) — is the control for that class. The same recheck runs after a failed pre-flight and before
 the bmad-review fallback gate admits — a re-brief or lane re-open landing
 during the awaited pre-flight refuses the fallback arm (409, or a queued
 replay re-queue) instead of starting a fallback reviewer; the fallback
@@ -290,9 +290,10 @@ fallback session is a bounded minion report task with read tools and one JSON
 report write, without build-workflow injection, implementation edit or shell tools.
 It reads the owned helper and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
-never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge, and the owner holds every
-merge, everywhere — this repository included. A failed pre-flight is never a silent downgrade — the failed
+never records a Perkins verdict and never moves merge authority: only
+required final CI plus an exact-head Perkins READY can authorize a final
+PR merge, and the owner performs every final PR merge, everywhere — this
+repository included. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (restore the exact retained
 owned package/context or repair a new GC install / restore Perkins) are escalated
 and recorded on the job as
@@ -557,7 +558,7 @@ resolution, verification, the authorized ordinary non-draft PR); Silas
 gives goal/boundaries/acceptance, coordinates capacity and expensive
 verification through the existing scheduler, and arms native Perkins on
 the exact final settled PR head. NEEDS CHANGES returns to the same
-implementing worker; the owner holds every merge.
+implementing worker; the owner performs every final PR merge.
 
 **Policy vs implemented.** These obligations ship in the installed
 playbook, and the deliverable kind is implemented: reviewer, artifact and
@@ -663,8 +664,8 @@ the judgment; the dispatch surface is the mechanical hand.
   applies exactly once: PR merged → `in-review → merged` transition plus
   a `github.pr-merged` event; PR conflicting (`mergeable_state: dirty`) →
   `github.pr-conflict` plus an fyi notification (mechanical tier — Silas
-  owns the rebase within mandate; the conflict lands in his digest's
-  `conflictingPrs` rows and never wakes Gru, issue #215); CI
+  coordinates the conflict integration within mandate; the conflict lands
+  in his digest's `conflictingPrs` rows and never wakes Gru, issue #215); CI
   failed → `github.ci-failed` plus a notification carrying the run URL,
   routed by check kind (mechanical → fyi, judgment → wake-eligible
   action-required); CI green → `github.ci-green` review-gate signal.
@@ -705,7 +706,7 @@ the judgment; the dispatch surface is the mechanical hand.
   `blocked`/`aborted` answer nothing, so the same abort reappears for the
   next sweep. Conflicting PR heads (issue #215) are digest rows too: a
   live PR-owing lane whose open head is dirty against its base is Silas's
-  mechanical rebase work — suppressed while a directive, re-brief or
+  mechanical conflict-integration work — suppressed while a directive, re-brief or
   verification owns the lane, and never a Gru wake. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
@@ -772,8 +773,8 @@ the judgment; the dispatch surface is the mechanical hand.
   counts `examined` in markers but `completed`/`redispatched`/`retired`
   in jobs, so one retired pair reads `examined: 2 … retired: 1` by design.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
-  track, close; never product code; never merge; preserve before remove;
-  escalate with pointers. Silas acts only through the authenticated ops
+  track, close; never product code; never merge a PR (the owner performs
+  every final PR merge); preserve before remove; escalate with pointers. Silas acts only through the authenticated ops
   surface — the pairing token is read from the instance config at call
   time, never echoed.
 - **Skills** — `ops-dispatch` and `ledger-closeout` ship in-repo under
@@ -853,8 +854,9 @@ IDs remain pending for rate-limited retry.
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
 on in-turn: Gru diagnoses the incident and takes one substantive step per
 incident (a fix lane, a re-arm, a disposition) within budget, staging the
-rest; novel failures and judgment calls stay with Gru. Gru holds merge
-authority for this repository; the owner retains it elsewhere. The owner
+rest; novel failures and judgment calls stay with Gru. Every final PR merge is
+the owner's, in this repository and everywhere else; no agent merges a
+PR. The owner
 is reached only through `needs-owner` — and sparingly; an empty FOR YOU
 band is the healthy state.
 
@@ -865,7 +867,7 @@ next user-directed context block:
 | routing | meaning | surface |
 |---|---|---|
 | `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue (live rows only; terminal-job rows are closed receipts under FEED); wakes Gru; never rings the owner bell |
-| `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
+| `needs-owner` | owner-only decisions (every final PR merge, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
 **Unresolved follow-up.** A successful prompt is delivery, not resolution.
@@ -900,10 +902,12 @@ actual resolutions and job events must be counted separately.
 **Silas mandate split** (same lane). Mechanical reactions move to Silas's
 ops driver — re-arm review rounds after clean aborts, pattern respins for
 known failure classes, sweep acks under recorded rules. Gru keeps the
-judgments: rulings, merges, and novel failures. One standing rule from the
-2026-09-23 freeze: never auto-arm a review round on a branch while a
-rebase/force-push lane is active on the same target (the round races the
-push and dies obsolete); arm only after the lane genuinely settles — the
+judgments: rulings, merge presentations, and novel failures. One standing
+rule from the
+2026-09-23 freeze: never auto-arm a review round on a branch while any
+lane is actively moving/pushing the target (rebase/force-push or an
+ordinary integration push; the round races the push and dies obsolete);
+arm only after the lane genuinely settles — the
 attempt delivered AND no unresolved re-brief request standing (marker/
 control settlement, not delivery alone; see the branch-idle guard
 section). Service restarts remain manual until self-roll-34 lands.

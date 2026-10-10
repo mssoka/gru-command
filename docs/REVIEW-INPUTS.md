@@ -346,5 +346,5 @@ or amendments to an existing PR:
 3. For PR165-style renamed-skill corrections, append the approved amendment
    with its real provenance reference, then freeze a new round.
 4. Existing pending source/control records are never replaced; re-arm only
-   through the supported endpoints above. Merges, restarts and deployments
-   stay owner-held.
+   through the supported endpoints above. Final PR merges, restarts and
+   deployments stay owner-held.

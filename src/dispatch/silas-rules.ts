@@ -95,7 +95,7 @@ export const SILAS_RULES: readonly SilasRuleSpec[] = [
     firesOn: 'conflictingPrs row (open PR head dirty against its base, no operation owns the lane)',
     receipt: ['silas.directive-sent'],
     summary:
-      'ONE rebase directive with blocker_fingerprint pr-conflict:<head_sha>; the receipt carries rule_id.',
+      'ONE conflict-integration directive with blocker_fingerprint pr-conflict:<head_sha>; the receipt carries rule_id.',
   },
   {
     id: 'revision-continuation',
