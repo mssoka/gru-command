@@ -46,10 +46,7 @@ import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { BRANCH_STATE_EVENT } from '../src/dispatch/github-poll.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
-import {
-  PUBLICATION_ATTEMPT_EVENT,
-  PUBLICATION_REBIND_UNRESOLVED_EVENT,
-} from '../src/dispatch/publication-evidence.js';
+import { PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
 import type { AgentCapabilities, AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
 import type { EventRecord, JobDeliverable, JobRecord, RoundRecord } from '../src/ledger/api.js';
@@ -1239,13 +1236,18 @@ describe('silas digest (the four actionable states)', () => {
       expect((await digestOf()).prWithoutReview).toMatchObject([
         { jobId: 'clean-held', cleanAbort: { roundId: round.id, ruleId: 'clean-abort-service-restart' } },
       ]);
-      // A durable intent plus an unresolved rebind marker holds it closed.
-      h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId: 'clean-held', roundId: round.id, payload: {
+      // The pre-upgrade failure shape: a recorded delivery with NO durable
+      // publication intent whose re-binding failed at restart.
+      h.ledger.appendCustomEvent({ kind: 'round.posted', jobId: 'clean-held', roundId: round.id, payload: {
         verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
         url: 'https://git.example.invalid/pull/held', host: 'git.example.invalid',
         targetSha: 'sha-held', baseSha: 'b'.repeat(40),
         publicationFile: '/tmp/held/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
-        reviewEvent: 'APPROVE',
+        receipt: {
+          reviewId: '9001', actor: 'gru-bot', event: 'APPROVED', commitId: 'sha-held',
+          headSha: 'sha-held', baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64),
+        },
+        reconciled: false,
       } });
       h.ledger.appendCustomEvent({ kind: PUBLICATION_REBIND_UNRESOLVED_EVENT, jobId: 'clean-held', roundId: round.id,
         payload: { targetSha: 'sha-held', reviewId: '9001', detail: 'recorded delivery could not be re-bound' } });

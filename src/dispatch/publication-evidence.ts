@@ -187,22 +187,25 @@ export interface PendingPublicationProblem {
  * provider write that is not yet resolved, so a new same-head publication
  * must not be re-armed. A malformed attempt payload fails closed too. */
 export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, roundId: string): PendingPublicationProblem | null {
+  const posted = ledger.latestRoundEvent(roundId, 'round.posted');
+  // A recorded delivery whose re-binding stayed unresolved is NOT a
+  // conclusion: the provider write exists and must be reconciled before any
+  // same-head publication is re-armed. This holds for ANY recorded delivery,
+  // including pre-upgrade rounds that carry no durable publication intent
+  // (their posted event is the only evidence), so the marker check must
+  // precede the attempt early-return.
+  const rebindEvent = ledger.latestRoundEvent(roundId, PUBLICATION_REBIND_UNRESOLVED_EVENT);
+  if (rebindEvent !== null && (posted === null || rebindEvent.seq > posted.seq)) {
+    const rebind = parsePublicationRebindUnresolvedPayload(rebindEvent.payload);
+    return {
+      kind: 'unresolved-rebinding',
+      detail: `a recorded provider delivery${rebind?.reviewId === null || rebind?.reviewId === undefined ? '' : ` (review ${rebind.reviewId})`} on frozen head ${rebind?.targetSha ?? 'unknown'} could not be re-bound/credited at restart, so whether it is the final delivery stays unresolved - reconcile it before re-arming`,
+    };
+  }
   const attemptEvent = ledger.latestRoundEvent(roundId, PUBLICATION_ATTEMPT_EVENT);
   if (attemptEvent === null) return null;
   const attempt = parsePublicationAttemptPayload(attemptEvent.payload);
   const head = attempt?.targetSha ?? 'unknown';
-  const posted = ledger.latestRoundEvent(roundId, 'round.posted');
-  // A recorded delivery whose re-binding stayed unresolved is NOT a
-  // conclusion: the provider write exists and must be reconciled before any
-  // same-head publication is re-armed.
-  const rebindEvent = ledger.latestRoundEvent(roundId, PUBLICATION_REBIND_UNRESOLVED_EVENT);
-  if (rebindEvent !== null && rebindEvent.seq > attemptEvent.seq && (posted === null || rebindEvent.seq > posted.seq)) {
-    const rebind = parsePublicationRebindUnresolvedPayload(rebindEvent.payload);
-    return {
-      kind: 'unresolved-rebinding',
-      detail: `a recorded provider delivery${rebind?.reviewId === null || rebind?.reviewId === undefined ? '' : ` (review ${rebind.reviewId})`} on frozen head ${rebind?.targetSha ?? head} could not be re-bound/credited at restart, so whether it is the final delivery stays unresolved - reconcile it before re-arming`,
-    };
-  }
   if (posted !== null && posted.seq > attemptEvent.seq) return null;
   const absent = ledger.latestRoundEvent(roundId, PUBLICATION_ABSENT_EVENT);
   if (absent !== null && absent.seq > attemptEvent.seq && parsePublicationAbsentPayload(absent.payload) !== null) return null;

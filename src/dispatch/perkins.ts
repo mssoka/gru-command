@@ -2565,14 +2565,14 @@ export class WaveRunner {
    * 'clear' when the attempt already has a conclusive outcome, and 'held' when
    * a provider write exists or its state stays unresolved. */
   private async reconcileInterruptedPublication(round: RoundRecord): Promise<'none' | 'clear' | 'held'> {
-    const attemptEvent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ATTEMPT_EVENT);
-    if (attemptEvent === null) return 'none';
-    const credited = this.opts.ledger.latestRoundEvent(round.id, 'round.posted');
     // A recorded delivery whose re-binding stayed unresolved is NOT a
     // conclusion: recovery keeps it held instead of treating the posted
-    // event as a cleared publication.
+    // event as a cleared publication. The marker is consulted BEFORE the
+    // attempt early-return because a pre-upgrade round carries only its
+    // recorded round.posted (no durable publication intent).
+    const credited = this.opts.ledger.latestRoundEvent(round.id, 'round.posted');
     const rebindEvent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_REBIND_UNRESOLVED_EVENT);
-    if (rebindEvent !== null && rebindEvent.seq > attemptEvent.seq && (credited === null || rebindEvent.seq > credited.seq)) {
+    if (rebindEvent !== null && (credited === null || rebindEvent.seq > credited.seq)) {
       const rebind = parsePublicationRebindUnresolvedPayload(rebindEvent.payload);
       this.escalate(
         `Perkins publication for round ${round.id} could not be re-bound at restart and stays held`,
@@ -2581,6 +2581,8 @@ export class WaveRunner {
       );
       return 'held';
     }
+    const attemptEvent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ATTEMPT_EVENT);
+    if (attemptEvent === null) return 'none';
     if (credited !== null && credited.seq > attemptEvent.seq) return 'clear';
     const absent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT);
     if (absent !== null && absent.seq > attemptEvent.seq) return 'clear';
@@ -2699,27 +2701,20 @@ export class WaveRunner {
   private recordUnboundPublicationRebind(round: RoundRecord): void {
     const posted = this.opts.ledger.latestRoundEvent(round.id, 'round.posted')?.payload;
     const parsed = posted === undefined ? null : parsePostedEventPayload(posted);
-    try {
-      this.opts.ledger.appendCustomEvent({
-        kind: PUBLICATION_REBIND_UNRESOLVED_EVENT,
-        jobId: round.jobId,
-        roundId: round.id,
-        payload: {
-          targetSha: parsed?.targetSha ?? round.targetRef,
-          reviewId: parsed?.receipt.reviewId ?? null,
-          detail: 'a recorded round.posted delivery could not be re-bound/credited at restart; the provider write stays unresolved until reconciliation supports the actual result',
-        },
-      });
-    } catch (error) {
-      this.log('error', 'could not record the unresolved publication rebind', {
-        round: round.id, error: String(error),
-      });
-      this.escalate(
-        `Perkins publication rebind for round ${round.id} could not be recorded durably`,
-        `the recorded delivery stays unresolved, but the durable rebind marker could not be written (${String(error).slice(0, 200)}); a same-head re-arm must be refused manually`,
-        { jobId: round.jobId, roundId: round.id },
-      );
-    }
+    // A failed hold write MUST NOT leave the round aborted-but-ungated:
+    // letting it propagate leaves the round live, so the automatic re-arm
+    // (which requires an aborted round) cannot start a second publication;
+    // the per-round recovery catch escalates and retries next restart.
+    this.opts.ledger.appendCustomEvent({
+      kind: PUBLICATION_REBIND_UNRESOLVED_EVENT,
+      jobId: round.jobId,
+      roundId: round.id,
+      payload: {
+        targetSha: parsed?.targetSha ?? round.targetRef,
+        reviewId: parsed?.receipt.reviewId ?? null,
+        detail: 'a recorded round.posted delivery could not be re-bound/credited at restart; the provider write stays unresolved until reconciliation supports the actual result',
+      },
+    });
   }
 
   /** Mark crash-interrupted proof INCOMPLETE and release every owned lane. */

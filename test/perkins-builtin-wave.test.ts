@@ -9168,6 +9168,7 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     jobId: string,
     roundId: string,
     target: string,
+    appendIntent = true,
   ) {
     const roundDir = join(fix.artifacts, roundId);
     mkdirSync(roundDir, { recursive: true });
@@ -9182,7 +9183,9 @@ describe('formal GitHub publication durability and restart reconciliation', () =
       targetSha: target, baseSha: 'b'.repeat(40),
       publicationFile, publicationSha256, reviewEvent: 'APPROVE',
     };
-    fix.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId, payload: attemptPayload });
+    if (appendIntent) {
+      fix.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId, payload: attemptPayload });
+    }
     return { attemptPayload, publicationSha256 };
   }
 
@@ -9283,14 +9286,14 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     // delivery was credited durably, and the process died before the round
     // finalized. At restart promotion re-proves the posting actor; a
     // transient probe failure leaves the recorded delivery unbound.
-    async function crashedRound(name: string, actorProbe: () => Promise<string>) {
+    async function crashedRound(name: string, actorProbe: () => Promise<string>, options: { readonly withoutAttempt?: boolean } = {}) {
       const fix = durabilityFixture(name);
       const jobId = `job-rebind-${name}`;
       fix.ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
       fix.ledger.setJobStatus(jobId, 'working');
       const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
       fix.ledger.setRoundStatus(round.id, 'live');
-      const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target);
+      const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target, options.withoutAttempt !== true);
       fix.ledger.setJobPr(jobId, attemptPayload.url);
       fix.ledger.appendCustomEvent({
         kind: 'round.posted', jobId, roundId: round.id,
@@ -9334,6 +9337,17 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     expect(bindable.post).not.toHaveBeenCalled();
     expect(bindable.fix.ledger.latestRoundEvent(bindable.round.id, PUBLICATION_REBIND_UNRESOLVED_EVENT)).toBeNull();
     expect(bindable.fix.ledger.getRound(bindable.round.id)?.status).toBe('verdict-posted');
+
+    // The pre-upgrade shape: a recorded delivery with NO durable intent
+    // (only its round.posted) whose re-binding fails at restart. The hold
+    // must still apply — the marker check precedes the attempt early-return.
+    const markerOnly = await crashedRound('rebind-marker-only', async () => { throw new Error('actor probe unavailable'); }, { withoutAttempt: true });
+    await markerOnly.wave.recoverInterruptedRounds();
+    expect(markerOnly.post).not.toHaveBeenCalled();
+    expect(markerOnly.fix.ledger.latestRoundEvent(markerOnly.round.id, PUBLICATION_REBIND_UNRESOLVED_EVENT)).not.toBeNull();
+    expect(pendingPublicationAttempt(markerOnly.fix.ledger, markerOnly.round.id)?.kind).toBe('unresolved-rebinding');
+    expect(markerOnly.fix.ledger.getRound(markerOnly.round.id)?.status).toBe('aborted');
+    expect(markerOnly.escalations.join('\n')).toMatch(/could not be re-bound/u);
   }, 180_000);
 
   it('reconciles an unresolved publication attempt on restart without a second POST and holds the proven receipt uncredited (formal GitHub)', async () => {

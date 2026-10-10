@@ -17,10 +17,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
-import {
-  PUBLICATION_ATTEMPT_EVENT,
-  PUBLICATION_REBIND_UNRESOLVED_EVENT,
-} from '../src/dispatch/publication-evidence.js';
+import { PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
@@ -1122,13 +1119,19 @@ describe('dispatch server (E8)', () => {
         job_id: 'clean-abort-held', by: 'silas',
         rule_id: 'clean-abort-service-restart', source_round_id: roundId,
       };
+      // The pre-upgrade failure shape: a recorded delivery with NO durable
+      // publication intent whose re-binding failed at restart.
       h.ledger.appendCustomEvent({
-        kind: PUBLICATION_ATTEMPT_EVENT, jobId: 'clean-abort-held', roundId,
+        kind: 'round.posted', jobId: 'clean-abort-held', roundId,
         payload: {
-          verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
-          url: PR_URL, host: new URL(PR_URL).host, targetSha: sha, baseSha: 'b'.repeat(40),
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
+          targetSha: sha, baseSha: 'b'.repeat(40),
           publicationFile: '/tmp/held/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
-          reviewEvent: 'APPROVE',
+          receipt: {
+            reviewId: '9001', actor: 'gru-bot', event: 'APPROVED', commitId: sha,
+            headSha: sha, baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64),
+          },
+          reconciled: false,
         },
       });
       h.ledger.appendCustomEvent({

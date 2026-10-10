@@ -66,6 +66,27 @@ describe('publication re-arm guard', () => {
     ]), 'r1')).toBeNull();
   });
 
+  it('holds a marker-only recorded delivery (no durable intent) as unresolved rebinding', () => {
+    // The pre-upgrade shape: only the recorded round.posted and the failed
+    // rebind marker exist. The marker check must precede the attempt
+    // early-return so this state is held, never cleared.
+    const problem = pendingPublicationAttempt(ledgerWith([
+      { kind: 'round.posted', seq: 1, payload: { verdict: 'approved' } },
+      { kind: PUBLICATION_REBIND_UNRESOLVED_EVENT, seq: 2, payload: { targetSha: TARGET, reviewId: '9001', detail: 'unbound at restart' } },
+    ]), 'r1');
+    expect(problem?.kind).toBe('unresolved-rebinding');
+    expect(problem?.detail).toContain('9001');
+    expect(problem?.detail).toContain(TARGET);
+  });
+
+  it('respects event order: a marker older than the recorded delivery does not hold it', () => {
+    expect(pendingPublicationAttempt(ledgerWith([
+      { kind: PUBLICATION_REBIND_UNRESOLVED_EVENT, seq: 1, payload: { targetSha: TARGET, reviewId: '9001', detail: 'old rebind failure' } },
+      { kind: 'round.posted', seq: 2, payload: { verdict: 'approved' } },
+      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 3, payload: attempt },
+    ]), 'r1')).toBeNull();
+  });
+
   it('fails closed on a malformed attempt or absence payload', () => {
     expect(pendingPublicationAttempt(ledgerWith([
       { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: { verdict: 'approved' } },
