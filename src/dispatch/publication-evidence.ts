@@ -36,6 +36,11 @@ export const PUBLICATION_ATTEMPT_EVENT = 'round.publication-attempt';
 export const PUBLICATION_RECEIPT_EVENT = 'round.publication-receipt';
 /** A bounded reconciliation proved the attempt did not land. */
 export const PUBLICATION_ABSENT_EVENT = 'round.publication-absent';
+/** A recorded `round.posted` delivery could not be RE-BOUND/credited at
+ * restart (for example a transient actor-evidence probe failure): the
+ * provider write exists and stays unresolved until reconciliation supports
+ * the actual result, so no same-head re-arm may start a second publication. */
+export const PUBLICATION_REBIND_UNRESOLVED_EVENT = 'round.publication-rebind-unresolved';
 
 export interface PublicationAttemptPayload {
   readonly verdict: 'approved' | 'changes-requested';
@@ -60,6 +65,12 @@ export interface PublicationReceiptEvidencePayload extends PublicationAttemptPay
 export interface PublicationAbsentPayload {
   readonly targetSha: string;
   readonly publicationSha256: string;
+  readonly detail: string;
+}
+
+export interface PublicationRebindUnresolvedPayload {
+  readonly targetSha: string | null;
+  readonly reviewId: string | null;
   readonly detail: string;
 }
 
@@ -141,6 +152,22 @@ export function parsePublicationAbsentPayload(payload: unknown): PublicationAbse
   return { targetSha: value['targetSha'], publicationSha256: value['publicationSha256'], detail: value['detail'] };
 }
 
+/** Strict, THROW-FREE parse of a `round.publication-rebind-unresolved`
+ * payload. A malformed marker still holds (the caller fails closed on the
+ * event's presence); the parser only decides whether its detail is usable. */
+export function parsePublicationRebindUnresolvedPayload(payload: unknown): PublicationRebindUnresolvedPayload | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const value = payload as Record<string, unknown>;
+  if (!boundedString(value['detail'], 1_000)) return null;
+  const targetSha = value['targetSha'];
+  const reviewId = value['reviewId'];
+  return {
+    targetSha: typeof targetSha === 'string' && targetSha.trim() !== '' ? targetSha : null,
+    reviewId: typeof reviewId === 'string' && reviewId.trim() !== '' ? reviewId : null,
+    detail: value['detail'],
+  };
+}
+
 /** The minimal ledger surface the guard reads: the full `LedgerApi` and the
  * digest's narrower reader both satisfy it structurally. */
 export interface PublicationEvidenceReader {
@@ -148,7 +175,7 @@ export interface PublicationEvidenceReader {
 }
 
 export interface PendingPublicationProblem {
-  readonly kind: 'uncredited-receipt' | 'unresolved-attempt';
+  readonly kind: 'uncredited-receipt' | 'unresolved-attempt' | 'unresolved-rebinding';
   readonly detail: string;
 }
 
@@ -165,6 +192,17 @@ export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, rou
   const attempt = parsePublicationAttemptPayload(attemptEvent.payload);
   const head = attempt?.targetSha ?? 'unknown';
   const posted = ledger.latestRoundEvent(roundId, 'round.posted');
+  // A recorded delivery whose re-binding stayed unresolved is NOT a
+  // conclusion: the provider write exists and must be reconciled before any
+  // same-head publication is re-armed.
+  const rebindEvent = ledger.latestRoundEvent(roundId, PUBLICATION_REBIND_UNRESOLVED_EVENT);
+  if (rebindEvent !== null && rebindEvent.seq > attemptEvent.seq && (posted === null || rebindEvent.seq > posted.seq)) {
+    const rebind = parsePublicationRebindUnresolvedPayload(rebindEvent.payload);
+    return {
+      kind: 'unresolved-rebinding',
+      detail: `a recorded provider delivery${rebind?.reviewId === null || rebind?.reviewId === undefined ? '' : ` (review ${rebind.reviewId})`} on frozen head ${rebind?.targetSha ?? head} could not be re-bound/credited at restart, so whether it is the final delivery stays unresolved - reconcile it before re-arming`,
+    };
+  }
   if (posted !== null && posted.seq > attemptEvent.seq) return null;
   const absent = ledger.latestRoundEvent(roundId, PUBLICATION_ABSENT_EVENT);
   if (absent !== null && absent.seq > attemptEvent.seq && parsePublicationAbsentPayload(absent.payload) !== null) return null;

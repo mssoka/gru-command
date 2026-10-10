@@ -53,8 +53,10 @@ import { renderEffectiveContract } from '../review-inputs/amendments.js';
 import {
   PUBLICATION_ABSENT_EVENT,
   PUBLICATION_ATTEMPT_EVENT,
+  PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
   parsePublicationAttemptPayload,
+  parsePublicationRebindUnresolvedPayload,
   parsePublicationReceiptEvidencePayload,
   type PublicationAttemptPayload,
   type PublicationReceiptEvidencePayload,
@@ -2566,6 +2568,19 @@ export class WaveRunner {
     const attemptEvent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ATTEMPT_EVENT);
     if (attemptEvent === null) return 'none';
     const credited = this.opts.ledger.latestRoundEvent(round.id, 'round.posted');
+    // A recorded delivery whose re-binding stayed unresolved is NOT a
+    // conclusion: recovery keeps it held instead of treating the posted
+    // event as a cleared publication.
+    const rebindEvent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_REBIND_UNRESOLVED_EVENT);
+    if (rebindEvent !== null && rebindEvent.seq > attemptEvent.seq && (credited === null || rebindEvent.seq > credited.seq)) {
+      const rebind = parsePublicationRebindUnresolvedPayload(rebindEvent.payload);
+      this.escalate(
+        `Perkins publication for round ${round.id} could not be re-bound at restart and stays held`,
+        `a recorded delivery${rebind?.reviewId === null || rebind?.reviewId === undefined ? '' : ` (review ${rebind.reviewId})`} on frozen head ${rebind?.targetSha ?? 'unknown'} is not yet credited (${rebind?.detail ?? 'no detail'}); the round terminalizes as interrupted and same-head re-publication stays closed until reconciliation establishes the actual result`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
     if (credited !== null && credited.seq > attemptEvent.seq) return 'clear';
     const absent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT);
     if (absent !== null && absent.seq > attemptEvent.seq) return 'clear';
@@ -2677,6 +2692,36 @@ export class WaveRunner {
     }
   }
 
+  /** A recorded `round.posted` delivery whose promotion was classified
+   * `unbound` at restart: the provider write exists and its credit stays
+   * unresolved. Journal that durably so the shared re-arm guard refuses a
+   * same-head publication until reconciliation supports the actual result. */
+  private recordUnboundPublicationRebind(round: RoundRecord): void {
+    const posted = this.opts.ledger.latestRoundEvent(round.id, 'round.posted')?.payload;
+    const parsed = posted === undefined ? null : parsePostedEventPayload(posted);
+    try {
+      this.opts.ledger.appendCustomEvent({
+        kind: PUBLICATION_REBIND_UNRESOLVED_EVENT,
+        jobId: round.jobId,
+        roundId: round.id,
+        payload: {
+          targetSha: parsed?.targetSha ?? round.targetRef,
+          reviewId: parsed?.receipt.reviewId ?? null,
+          detail: 'a recorded round.posted delivery could not be re-bound/credited at restart; the provider write stays unresolved until reconciliation supports the actual result',
+        },
+      });
+    } catch (error) {
+      this.log('error', 'could not record the unresolved publication rebind', {
+        round: round.id, error: String(error),
+      });
+      this.escalate(
+        `Perkins publication rebind for round ${round.id} could not be recorded durably`,
+        `the recorded delivery stays unresolved, but the durable rebind marker could not be written (${String(error).slice(0, 200)}); a same-head re-arm must be refused manually`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+    }
+  }
+
   /** Mark crash-interrupted proof INCOMPLETE and release every owned lane. */
   async recoverInterruptedRounds(): Promise<number> {
     let recovered = 0;
@@ -2705,6 +2750,7 @@ export class WaveRunner {
         recovered += 1;
         continue;
       }
+      if (promotion === 'unbound') this.recordUnboundPublicationRebind(round);
       // A durable publication attempt that never reached a credited
       // round.posted is reconciled against the provider before the round
       // terminalizes: a proven receipt is retained (uncredited) and the
@@ -2761,6 +2807,7 @@ export class WaveRunner {
           recovered += 1;
           continue;
         }
+        if (promotion === 'unbound') this.recordUnboundPublicationRebind(round);
         await this.reconcileInterruptedPublication(round);
         const note = 'review interrupted before its detached worktree was durably registered; required proof is incomplete';
         const preAbortFacts = this.interruptedExecutionFacts(round, round.lenses.map((chip) => chip.lens as PerkinsLens));
