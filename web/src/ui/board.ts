@@ -108,6 +108,7 @@ import { BoardApiError, type BoardClient } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
+import { RepoOverviewPanel } from './repo-overview.js';
 
 const ROLE_EMOJI: Readonly<Record<string, string>> = {
   gru: '🧠',
@@ -143,6 +144,9 @@ export class BoardView {
   private readonly boardNav: HTMLElement;
   private readonly chipRail: HTMLElement;
   private readonly agentsCount: HTMLElement;
+  /** Managed repository overview (compact rows A) — rendered below the
+   * crew list inside the same rail panel. */
+  private readonly repoOverview: RepoOverviewPanel;
   private readonly notificationBell: HTMLButtonElement;
   private readonly notificationBadge: HTMLElement;
   private readonly notificationPanel: HTMLElement;
@@ -255,6 +259,9 @@ export class BoardView {
     }
     this.chipRail = mustGet('chip-rail');
     this.agentsCount = mustGet('rail-agents-count');
+    this.repoOverview = new RepoOverviewPanel(mustGet('board-repos'), {
+      ageNode: (className, since, prefix, suffix) => this.ageNode(className, since, prefix, suffix),
+    });
     this.notificationBell = mustGet<HTMLButtonElement>('notification-bell');
     this.notificationBadge = mustGet('notification-badge');
     this.notificationPanel = mustGet('notification-panel');
@@ -324,6 +331,7 @@ export class BoardView {
     this.renderJobs(snapshot);
     this.restoreFocusKey(focusKey);
     this.renderAgents(snapshot.agents);
+    this.repoOverview.render(snapshot.repoOverview);
     this.renderNotifications(snapshot);
     restoreOwnerFocusKey(ownerFocus);
     this.surfaceNewNotifications(previous, snapshot.notifications);
