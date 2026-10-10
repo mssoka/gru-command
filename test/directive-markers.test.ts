@@ -20,7 +20,7 @@ import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import type { DispatchService } from '../src/dispatch/service.js';
 import type { WaveRunner } from '../src/dispatch/perkins.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
-import { DirectiveNativeFixture } from './helpers/directive-native-fixture.js';
+import { DirectiveNativeFixture, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import type { Role } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, PromptOptions, SpawnOptions } from '../src/runtime/types.js';
 
@@ -55,6 +55,7 @@ function tmpDir(): string {
 /** Drive one directive request to `settled` with real correlated events. */
 function settleDirective(api: LedgerApi, jobId: string, requestId: string, minionId: string): void {
   api.beginDirectiveIntent({ jobId, directive: `settled ${requestId}`, holder: 'silas-ops', requestId });
+  markHistoricalDirectiveFixture(api, requestId);
   const sent = api.appendCustomEvent({
     kind: 'silas.directive-sent',
     jobId,
@@ -186,6 +187,7 @@ describe('directive requests — durable ledger contract', () => {
     api.addJob({ id: 'job-d3x', repo: 'r', title: 'Job D3x' });
     api.setJobStatus('job-d3', 'working');
     api.beginDirectiveIntent({ jobId: 'job-d3', directive: 'run', holder: 'silas-ops', requestId: 'req-d3' });
+    markHistoricalDirectiveFixture(api, 'req-d3'); // legacy event-validation contract
     // Fabricated sequence.
     expect(() => api.recordDirectiveAdmission({ requestId: 'req-d3', minionId: 'm1', eventSeq: 987_654 })).toThrow(
       /does not exist/u,
@@ -262,6 +264,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
       ledger.addJob({ id: 'job-r1', repo: 'r', title: 'Job R1' });
       ledger.setJobStatus('job-r1', 'working');
       ledger.beginDirectiveIntent({ jobId: 'job-r1', directive: 'run', holder: 'silas-ops', requestId: 'req-r1' });
+      markHistoricalDirectiveFixture(ledger, 'req-r1'); // historical event-only crash window
       // The turn DID admit and deliver; the crash hit between the event
       // append and the request-record update.
       const sent = ledger.appendCustomEvent({
@@ -317,6 +320,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
       ledger.addJob({ id: 'job-r3', repo: 'r', title: 'Job R3' });
       ledger.setJobStatus('job-r3', 'working');
       ledger.beginDirectiveIntent({ jobId: 'job-r3', directive: 'run', holder: 'silas-ops', requestId: 'req-r3' });
+      markHistoricalDirectiveFixture(ledger, 'req-r3');
       const sent = ledger.appendCustomEvent({
         kind: 'silas.directive-sent',
         jobId: 'job-r3',
@@ -388,6 +392,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
       ledger.addJob({ id: 'job-w1', repo: 'r', title: 'Job W1' });
       ledger.setJobStatus('job-w1', 'working');
       ledger.beginDirectiveIntent({ jobId: 'job-w1', directive: 'run', holder: 'silas-ops', requestId: 'req-w1' });
+      markHistoricalDirectiveFixture(ledger, 'req-w1');
       // Admission evidence exists; the terminal receipt does not. Boot
       // recovery records the admission from the event, so the card must
       // describe the request as ADMITTED — never as admission-unknown.

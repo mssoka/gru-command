@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
+import type { LedgerApi } from '../../src/ledger/api.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { inspectDirectiveCheckpoint, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, type DirectiveProducer, type DirectiveTurnIdentity } from '../../src/runtime/directive-checkpoint.js';
@@ -56,6 +58,24 @@ export class DirectiveNativeFixture {
   }
 }
 
+
+/** Explicit pre-native-protocol persisted row for historical event decoders.
+ * New-protocol tests must use actual native admission, never this seeding seam. */
+export function markHistoricalDirectiveFixture(ledger: LedgerApi, requestId: string): void {
+  const { db } = ledger as unknown as { readonly db: DatabaseSync };
+  db.prepare('UPDATE pending_directives SET request_kind = NULL, authority_epoch = NULL, contract_snapshot = NULL, contract_sha256 = NULL WHERE request_id = ?').run(requestId);
+}
+
+/** Persist genuine current-protocol admission for non-runtime ledger consumers. */
+export function admitNativeDirectiveFixture(ledger: LedgerApi, requestId: string, minionId: string, file: string): number {
+  const row = ledger.getDirective(requestId)!;
+  ledger.registerAgent({ id: minionId, role: 'minion', jobId: row.jobId, sessionFile: file, parentage: 'top-level' });
+  ledger.setAgentState(minionId, 'idle');
+  ledger.prepareDirectiveTarget(requestId, { agentId: minionId, sessionFile: file });
+  const native = new DirectiveNativeFixture(file, minionId);
+  native.begin('exact approved fixture request', { directive: { identity: ledger.directiveTurnIdentity(requestId), beforeAdmission: () => {}, onAdmitted: (binding) => ledger.bindDirectiveNativeAdmission(binding) } });
+  return ledger.getDirective(requestId)!.admissionSeq!;
+}
 
 export function withNativeDirectiveFixture(handle: AgentHandle, file: string, onState: (state: AgentState) => void = () => {}): AgentHandle {
   const native = new DirectiveNativeFixture(file, handle.id);

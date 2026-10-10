@@ -206,7 +206,7 @@ New directive **and rebrief** acceptance uses `pending_directives`, with
 no longer create new legacy marker pairs. Accepted is not admitted: the
 Pi adapter durably associates the exact request/hash/logical minion/native
 session and native user entry before calling the admission observer.
-Queued prompts retain these options but produce no admission receipt.
+Queued prompts retain these options but produce no admission receipt. A positively observed routing-guard refusal before any native operation records `silas.directive-dispatch-deferred` against the exact dispatch reservation. Bounded reconsideration can retry only that unconsumed original request under unchanged current authority after its fences settle. Missing targets/receipts, expired claims, attempted spawns or uncertain cleanup never supply this proof.
 Spawn/init/turn-start cannot establish acceptance. The native association
 journal is `<session.jsonl>.directives.jsonl`; native receipt identity and
 its role/cwd/tool/model authority manifest are validated on readback.
@@ -381,6 +381,6 @@ Permission recording is an explicitly attributed authenticated call, never invok
 
 The server constructs an immutable narrow `ruling.recorded` permission and validates exact subject/transfer/target/lineage/current scope. It does **not** release a stop, unpark, Ack, execute work or assert cessation/effects/completion. Shared bearer authentication plus `by: owner` is attribution, **not independently verified owner identity**.
 
-A separate explicitly owner-attributed `POST .../owner-resolution/confirm-stop` uses fresh expectations plus `expected_resolution_fingerprint` from the real recorded ruling. It affirms the exact still-current target/ruling and atomically performs the legal resume-then-settle of **only that suspended target** with a genuine confirmation receipt. Parking, other holds, cards and work execution remain unchanged. Stable identity replay returns immutable original receipts; conflicting intent refuses. Missing/foreign/stale resolution, plan/scope/epoch changes and unrelated stop lineage do not grant permission.
+A separate explicitly owner-attributed `POST .../owner-resolution/confirm-stop` uses fresh expectations plus `expected_resolution_fingerprint` from the real recorded ruling. It affirms the exact still-current target/ruling and atomically settles **only that governing open, waiting or suspended target** with a genuine confirmation receipt. A suspended target alone requires the legal resume-before-settle transition; an open or waiting target requires no artificial suspension. Parking, other holds, cards and work execution remain unchanged. Stable identity replay returns immutable original receipts; conflicting intent refuses. Missing/foreign/stale resolution, plan/scope/epoch changes and unrelated stop lineage do not grant permission.
 
 Then, only if intended, explicitly unpark via the existing board action and explicitly Ack any real owner notification separately. A fresh Gru recovery generation/judgment—not the owner recording/confirmation—may accept a distinct currently authorized successor after actual cessation. No automatic owner action, role substitution, original-work replay, additional scope or READY claim is permitted.

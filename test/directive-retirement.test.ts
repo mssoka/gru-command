@@ -17,7 +17,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
-import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { reconcilePendingDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
@@ -360,6 +360,7 @@ describe('directive retirement — evidence-fenced control closure', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-b', 'req-b');
+    markHistoricalDirectiveFixture(h.ledger, 'req-b');
     const sent = h.ledger.appendCustomEvent({
       kind: 'silas.directive-sent',
       jobId: 'job-b',
@@ -390,6 +391,7 @@ describe('directive retirement — evidence-fenced control closure', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-c', 'req-c');
+    markHistoricalDirectiveFixture(h.ledger, 'req-c');
     // The crash window: the admission EVENT landed, the row was never bound.
     const sent = h.ledger.appendCustomEvent({
       kind: 'silas.directive-sent',
@@ -412,6 +414,7 @@ describe('directive retirement — evidence-fenced control closure', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-d', 'req-d');
+    markHistoricalDirectiveFixture(h.ledger, 'req-d');
     const sent = h.ledger.appendCustomEvent({
       kind: 'silas.directive-sent',
       jobId: 'job-d',
@@ -1132,12 +1135,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     // ordinary offer returns — the fence was the closed control decision,
     // not a permanent lane freeze.
     h.ledger.beginDirectiveIntent({ jobId: 'job-z', directive: 'fresh repair', holder: 'silas-ops', requestId: 'req-z-next' });
-    const sent = h.ledger.appendCustomEvent({
-      kind: 'silas.directive-sent',
-      jobId: 'job-z',
-      payload: { request_id: 'req-z-next', minion_id: 'minion-z' },
-    });
-    h.ledger.recordDirectiveAdmission({ requestId: 'req-z-next', minionId: 'minion-z', eventSeq: sent.seq });
+    admitNativeDirectiveFixture(h.ledger, 'req-z-next', 'minion-z', join(h.dir, 'minion-z.jsonl'));
     const delivered = h.ledger.appendCustomEvent({
       kind: 'job.delivered',
       jobId: 'job-z',
@@ -1470,6 +1468,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-admission-mismatch', 'req-admission-mismatch');
+    markHistoricalDirectiveFixture(h.ledger, 'req-admission-mismatch');
     const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-admission-mismatch',
       payload: { request_id: 'req-admission-mismatch', minion_id: 'actual-minion' } });
     const accepted = h.ledger.getDirective('req-admission-mismatch');
@@ -1654,9 +1653,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => {
       expect((await retire(h, 'req-settled-owner-race', laneHead(lane))).status).toBe(200);
       h.ledger.beginDirectiveIntent({ jobId: 'job-settled-owner-race', directive: 'fresh repair', holder: 'silas-ops', requestId: 'req-settled-owner-next' });
-      const sent = h.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'job-settled-owner-race',
-        payload: { request_id: 'req-settled-owner-next', minion_id: 'fresh-settled-minion' } });
-      h.ledger.recordDirectiveAdmission({ requestId: 'req-settled-owner-next', minionId: 'fresh-settled-minion', eventSeq: sent.seq });
+      admitNativeDirectiveFixture(h.ledger, 'req-settled-owner-next', 'fresh-settled-minion', join(h.dir, 'fresh-settled-minion.jsonl'));
       const delivered = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-settled-owner-race',
         payload: { request_id: 'req-settled-owner-next', minion_id: 'fresh-settled-minion', sha: laneHead(lane) } });
       h.ledger.recordDirectiveDelivery({ requestId: 'req-settled-owner-next', eventSeq: delivered.seq });
@@ -1934,6 +1931,21 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
     expect(h.ledger.getDirective(f.original.requestId)).toMatchObject({ workRevision: f.original.workRevision,
       authorityEpoch: f.original.authorityEpoch, contractSha256: f.original.contractSha256, contractSnapshot: f.original.contractSnapshot });
   }
+
+  async function assertLiveOwnerConfirmation(state: 'open' | 'waiting') {
+    const f = await ownerFixture('directives'); const { h } = f;
+    h.ledger.resumeObligation(f.target.id, 'explicit fixture owner resumed this exact stop');
+    if (state === 'waiting') h.ledger.armReceiptExpectation({ obligationId: f.target.id, receiptKind: 'owner.confirmed', deadlineAt: new Date(Date.now() + 60000).toISOString() });
+    const permission = await call(h.port, 'POST', `${f.route}/owner-resolution`, await f.actionBody(), TOKEN); expect(permission.status).toBe(200);
+    const ruling = field<{ payload: { fingerprint: string } }>(permission.json, 'receipt');
+    const before = h.ledger.latestEventSeq();
+    const confirmed = await call(h.port, 'POST', `${f.route}/owner-resolution/confirm-stop`, { ...await f.actionBody(), expected_resolution_fingerprint: ruling.payload.fingerprint }, TOKEN);
+    expect(confirmed.status, JSON.stringify(confirmed.json)).toBe(200); expect(h.ledger.getObligation(f.target.id)?.state).toBe('settled');
+    expect(h.ledger.listJobEventsByKinds(f.jobId, ['job.obligation-state']).filter((event) => event.seq > before)).toEqual([]);
+    expect(h.ledger.getJob(f.jobId)?.status).toBe('parked'); expect(h.ledger.getNotification(f.ownerStop.id)?.ackedAt).toBeNull(); expect(h.spawns).toEqual([]);
+  }
+  it('explicit confirmation settles the exact open owner target without an artificial resume', () => assertLiveOwnerConfirmation('open'));
+  it('explicit confirmation settles the exact waiting owner target without an artificial resume', () => assertLiveOwnerConfirmation('waiting'));
 
   it('native suspended owner transfer records permission, confirms only its stop, then separately accepts one fresh-generation successor', async () => {
     await assertOwnerLifecycle('directives');

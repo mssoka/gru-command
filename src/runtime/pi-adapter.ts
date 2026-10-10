@@ -1061,8 +1061,17 @@ export class PiAgentHandle implements AgentHandle {
     if (session instanceof AgentSession) {
       const before = session.agent.beforeToolCall;
       session.agent.beforeToolCall = async (input, signal) => {
-        if (this.liveDirective !== undefined) flushDirectiveToolIntent(this.sessionFile, input.assistantMessage, input.toolCall);
-        return before?.(input, signal);
+        const directive = this.liveDirective;
+        const check = (): void => {
+          if (directive === undefined) return;
+          if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
+          directive.beforeAdmission();
+          flushDirectiveToolIntent(this.sessionFile, input.assistantMessage, input.toolCall);
+        };
+        check();
+        const result = await before?.(input, signal);
+        check(); // prior extensions may await or change permission/native intent
+        return result;
       };
       const executeBash = session.executeBash.bind(session);
       session.executeBash = (...args) => {
@@ -1407,10 +1416,12 @@ export class PiAgentHandle implements AgentHandle {
       evidence = 'unknown'; // throwing probes are unknown, never false
     }
     if (evidence === 'ceased' && !this.ownershipReleased) {
+      // Fallible physical receipts precede release of either native lock or
+      // runtime owner. A failed/committed-then-thrown append is retryable.
+      for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
       this.store.releaseLock(this.sessionFile);
       this.setState('disposed');
       this.onDispose();
-      for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
       this.ownershipReleased = true;
     }
     if (this.cessationState !== evidence) {

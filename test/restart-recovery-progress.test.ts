@@ -143,6 +143,117 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive') {
 }
 
 describe('restart-recovery-progress — exact native request matrix', () => {
+  async function assertStaleTerminalTail(tail: 'user' | 'branch' | 'assistant' | 'partial') {
+    const f = await fixture(); f.seed(); f.native.finish();
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toMatchObject({ state: 'terminal', ok: true });
+    if (tail === 'user') f.native.append({ role: 'user', content: [{ type: 'text', text: 'foreign turn' }] });
+    if (tail === 'assistant') f.native.append({ role: 'assistant', stopReason: 'stop', content: [] });
+    if (tail === 'branch') appendFileSync(f.file, `${JSON.stringify({ type: 'branch', id: 'foreign-control' })}\n`);
+    if (tail === 'partial') appendFileSync(f.file, `${JSON.stringify({ type: 'message', id: 'partial', message: { role: 'assistant' } })}\n`);
+    const bytes = readFileSync(f.file, 'utf8');
+    expect(inspectDirectiveCheckpoint(f.file, f.identity).state).toBe('unknown');
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(false);
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+    expect(readFileSync(f.file, 'utf8')).toBe(bytes);
+  }
+  it('rejects a stale terminal before a later user tail', () => assertStaleTerminalTail('user'));
+  it('rejects a stale terminal before a later branch tail', () => assertStaleTerminalTail('branch'));
+  it('rejects a stale terminal before a later assistant tail', () => assertStaleTerminalTail('assistant'));
+  it('rejects a stale terminal before a later partial tail', () => assertStaleTerminalTail('partial'));
+
+  async function assertForeignAssociation(damage: 'malformed' | 'conflicting' | 'receipt-rebound') {
+    const f = await fixture(); f.seed();
+    const binding = readDirectiveBinding(f.file, f.identity.requestId)!;
+    const foreign = { ...binding, identity: { ...binding.identity, requestId: 'foreign-request' } };
+    const records = damage === 'malformed' ? [{ ...foreign, runtime: 'unknown-runtime' }]
+      : damage === 'conflicting' ? [foreign, { ...foreign, promptHash: 'b'.repeat(64) }]
+      : [{ ...foreign, userEntryId: 'original-native-user' }, { ...foreign, userEntryId: 'changed-native-user' }];
+    appendFileSync(`${f.file}.directives.jsonl`, records.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const bytes = readFileSync(`${f.file}.directives.jsonl`, 'utf8');
+    expect(() => readDirectiveBinding(f.file, f.identity.requestId)).toThrow(/association/);
+    expect(readFileSync(`${f.file}.directives.jsonl`, 'utf8')).toBe(bytes);
+  }
+  it('rejects malformed foreign association journal records without changing bytes', () => assertForeignAssociation('malformed'));
+  it('rejects conflicting foreign association journal records without changing bytes', () => assertForeignAssociation('conflicting'));
+  it('rejects receipt-rebound foreign association journal records without changing bytes', () => assertForeignAssociation('receipt-rebound'));
+
+  async function assertPreNativeDeferral(boundary: 'first-fence' | 'post-pacing') {
+    const f = await fixture(); const gate = deferred<void>(); let waiting = false;
+    const deps = { ...f.deps, ...(boundary === 'post-pacing' ? { workerGate: { acquireWorkerTurn: async () => { waiting = true; await gate.promise; return { release: () => {} }; } } as unknown as PacingGate } : {}) };
+    if (boundary === 'first-fence') f.supervised(['transient producer']);
+    const attempt = executeAcceptedDirective(deps, f.intent.requestId);
+    if (boundary === 'post-pacing') { while (!waiting) await new Promise<void>((resolve) => setImmediate(resolve)); f.supervised(['transient producer']); gate.resolve(); }
+    await attempt;
+    expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+    expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-dispatch-deferred', f.intent.requestId)?.payload).toMatchObject({ native_effects: 'none', identity: f.identity });
+    const original = f.ledger.getDirective(f.intent.requestId)!;
+    f.db.close(); const db = new LedgerDb(f.dir); cleanups.push(() => db.close());
+    const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus }); f.supervised([]);
+    const registry: DirectiveRegistry = { getHandle: () => null, spawn: async (_role, options = {}) => {
+      f.spawns.push(options);
+      const handle = new PiAgentHandle('minion', f.native, f.file, PI_CAPABILITIES, false, [], f.store, () => {}, () => {}, 60000,
+        options.agentId ?? 'logical-minion', () => 'preserved authority');
+      handle.subscribe((event) => { if (event.type === 'state') ledger.setAgentState(handle.id, event.state); });
+      return handle;
+    }, disposeHandle: async (handle) => handle.dispose() };
+    const service = new DirectiveProgressService({ ...f.deps, ledger, registry, notifications: new NotificationCenter({ ledger, bus }) });
+    try {
+      service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+      expect(ledger.getDirective(original.requestId)).toMatchObject({ state: 'settled', payloadHash: original.payloadHash, workRevision: original.workRevision, authorityEpoch: original.authorityEpoch });
+      expect(f.spawns).toHaveLength(1); expect(f.native.prompts).toHaveLength(1);
+      expect(ledger.listJobEventsByKinds(original.jobId, ['silas.directive-sent'])).toHaveLength(1);
+      expect(ledger.hasDirectiveDispatchDeferral(original.requestId)).toBe(false);
+    } finally { await service.dispose(); }
+  }
+  it('positive first-fence deferral resumes the unconsumed original request once after persisted restart', () => assertPreNativeDeferral('first-fence'));
+  it('positive post-pacing deferral resumes the unconsumed original request once after persisted restart', () => assertPreNativeDeferral('post-pacing'));
+
+  async function assertDeferralPublication(fault: 'pre-commit' | 'post-commit') {
+    const f = await fixture(); f.supervised(['temporary fence']);
+    const record = f.ledger.recordDirectiveDispatchDeferral.bind(f.ledger);
+    const failure = vi.spyOn(f.ledger, 'recordDirectiveDispatchDeferral').mockImplementation((...args) => {
+      if (fault === 'post-commit') record(...args);
+      throw new Error('deferral publication failed');
+    });
+    await executeAcceptedDirective(f.deps, f.intent.requestId); failure.mockRestore(); f.supervised([]);
+    const service = new DirectiveProgressService(f.deps);
+    try {
+      service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+      expect(f.native.prompts).toHaveLength(fault === 'post-commit' ? 1 : 0);
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe(fault === 'post-commit' ? 'settled' : 'dispatching');
+    } finally { await service.dispose(); }
+  }
+  it('pre-native deferral publication pre-commit never invents a retry receipt', () => assertDeferralPublication('pre-commit'));
+  it('pre-native deferral publication post-commit never invents a retry receipt', () => assertDeferralPublication('post-commit'));
+
+  it('an attempted spawn without onPrepared remains UNKNOWN and is never a no-native deferral', async () => {
+    const f = await fixture(); const spawn = vi.spyOn(f.registry, 'spawn').mockRejectedValue(new Error('spawn outcome unknown'));
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    expect(f.ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-dispatch-deferred', f.intent.requestId)).toBeNull();
+    const service = new DirectiveProgressService(f.deps);
+    try { service.reconsider(); await service.settled(); expect(spawn).toHaveBeenCalledTimes(1); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('dispatching'); }
+    finally { await service.dispose(); }
+  });
+
+  it('positive no-effect closes only the attached awaiting phase without completion', async () => {
+    const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture replaced before dispatch' });
+    const row = f.ledger.beginDirectiveIntent({ jobId: f.intent.jobId, requestId: 'phase-no-effect', directive: 'approved', holder: 'gru', handoff: { kind: 'gru-decision', decision: 'inspect phase' } }).record;
+    const phase = f.ledger.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId })!;
+    await executeAcceptedDirective({ ...f.deps, registry: { ...f.registry, getHandle: () => null }, worktrees: { ...f.worktrees, listWorktrees: () => [] } as unknown as typeof f.worktrees }, row.requestId);
+    expect(f.ledger.getDirective(row.requestId)?.state).toBe('failed');
+    expect(f.ledger.getPhaseHandoff(phase.phaseId)).toMatchObject({ state: 'closed', completionSeq: null });
+    expect(f.ledger.latestJobEvent(row.jobId, 'job.delivered')).toBeNull();
+  });
+
+  it('current-protocol event-only sent and delivery cannot bind admission or settle through durable reconciliation', async () => {
+    const f = await fixture();
+    const sent = f.ledger.appendCustomEvent({ jobId: f.intent.jobId, kind: 'silas.directive-sent', payload: { request_id: f.intent.requestId, minion_id: 'logical-minion' } });
+    f.ledger.appendCustomEvent({ jobId: f.intent.jobId, kind: 'job.delivered', payload: { request_id: f.intent.requestId } });
+    expect(() => f.ledger.recordDirectiveAdmission({ requestId: f.intent.requestId, minionId: 'logical-minion', eventSeq: sent.seq })).toThrow(/native admission/);
+    const { reconcilePendingDirectives } = await import('../src/dispatch/rebrief-recovery.js');
+    reconcilePendingDirectives(f.deps);
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'dispatching', nativeBinding: null, admissionSeq: null, deliverySeq: null });
+  });
   it('actual admitted original host exit continues once on the same persisted native lane, including live and frozen-owner refusals', async () => {
     const f = await fixture();
     const root = process.cwd();
@@ -733,6 +844,66 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       // evidence rather than rewriting the checkpoint used by assertions.
       f.native.finish('aborted'); await original;
     }
+  });
+
+  it('active streaming exemption requires the exact physical request, session and current start token, never a generic agent id', async () => {
+    const f = await fixture(); f.seed();
+    const proof = inspectDirectiveCheckpoint(f.file, f.identity); if (proof.state === 'unknown') throw new Error(proof.reason);
+    f.ledger.bindDirectiveNativeAdmission(proof.binding);
+    const old = inspectDirectiveProducers(f.file, f.identity)[0]!.producer;
+    const oldStart = f.ledger.startDirectiveProducer(f.identity, old);
+    f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: f.intent.jobId, payload: {
+      request_id: f.intent.requestId, agent_id: old.agentId, session_file: f.file, producer_start_seq: oldStart, producer_identity: f.identity, native_producer: old,
+    } });
+    const current = prepareDirectiveProducer({ identity: f.identity, agentId: old.agentId, sessionId: old.sessionId, sessionFile: f.file });
+    const start = f.ledger.startDirectiveProducer(f.identity, current);
+    f.ledger.setAgentState(current.agentId, 'streaming');
+    expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start, current)).toEqual([]);
+    expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, current.agentId, start).join(';')).toContain(`${current.agentId} (streaming)`);
+    const watermark = f.ledger.latestEventSeq(); const bytes = readFileSync(`${f.file}.producers.jsonl`, 'utf8');
+    for (const mismatch of [{ incarnation: 'foreign-incarnation' }, { agentId: 'reused-logical-minion' }, { sessionId: 'foreign-session' },
+      { sessionFile: `${f.file}.foreign` }, { identity: { ...f.identity, payloadHash: 'f'.repeat(64) } },
+      { identity: { ...f.identity, authorityEpoch: f.identity.authorityEpoch + 1 } }]) {
+      expect(() => f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start, { ...current, ...mismatch })).toThrow(/exact current physical/);
+    }
+    expect(() => f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start + 1, current)).toThrow(/token/);
+    expect(() => f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, oldStart, old)).toThrow(/token/);
+    expect(() => f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start, old)).toThrow(/exact current physical/);
+    expect(f.ledger.latestEventSeq()).toBe(watermark); expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(bytes);
+    expect(() => f.ledger.retireInterruptedDirective({ requestId: f.intent.requestId, expectedJobId: f.intent.jobId, expectedState: 'admitted', expectedPayloadHash: f.intent.payloadHash,
+      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), lane: { id: f.lane.id, resolvedHead: resolveGitCommit(f.lane.path, 'HEAD') }, reason: 'must not exempt an executing native owner', by: 'gru' })).toThrow(/live ownership/);
+    expect(f.ledger.latestEventSeq()).toBe(watermark);
+  });
+
+  it('an exact current streaming producer cannot hide an older UNKNOWN physical incarnation on the same native session', async () => {
+    const f = await fixture(); f.seed();
+    const proof = inspectDirectiveCheckpoint(f.file, f.identity); if (proof.state === 'unknown') throw new Error(proof.reason);
+    f.ledger.bindDirectiveNativeAdmission(proof.binding);
+    const old = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    const oldStart = f.ledger.startDirectiveProducer(f.identity, old);
+    f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: f.intent.jobId, payload: {
+      request_id: f.intent.requestId, agent_id: old.agentId, session_file: f.file, producer_start_seq: oldStart, producer_identity: f.identity, native_producer: old,
+    } });
+    const current = prepareDirectiveProducer({ identity: f.identity, agentId: old.agentId, sessionId: old.sessionId, sessionFile: f.file });
+    // Explicit historical/corrupt dual-owner fixture: the current guarded
+    // start API correctly cannot construct this state while old UNKNOWN owns it.
+    const start = f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-started', jobId: f.intent.jobId,
+      payload: { request_id: f.intent.requestId, producer_identity: f.identity, native_producer: current } }).seq;
+    f.ledger.setAgentState(current.agentId, 'streaming');
+    const watermark = f.ledger.latestEventSeq(); const bytes = readFileSync(`${f.file}.producers.jsonl`, 'utf8');
+    expect(() => f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start, current)).toThrow(/another physical incarnation remains UNKNOWN/);
+    expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start).join(';')).toContain(`start ${oldStart}`);
+    expect(f.ledger.latestEventSeq()).toBe(watermark); expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(bytes);
+  });
+
+  it('a ceased physical producer never grants an active streaming exemption even with the matching latest start token', async () => {
+    const f = await fixture(); f.seed();
+    const proof = inspectDirectiveCheckpoint(f.file, f.identity); if (proof.state === 'unknown') throw new Error(proof.reason);
+    f.ledger.bindDirectiveNativeAdmission(proof.binding);
+    const ceased = inspectDirectiveProducers(f.file, f.identity)[0]!.producer;
+    const start = f.ledger.startDirectiveProducer(f.identity, ceased);
+    f.ledger.setAgentState(ceased.agentId, 'streaming');
+    expect(() => f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id, undefined, start, ceased)).toThrow(/ceased\/unbound/);
   });
 
   it('foreign or mismatched cessation receipts cannot consume the exact original producer start fence', async () => {

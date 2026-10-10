@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
+import { admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { parseCompletionHandoffIntent } from '../src/ledger/obligations.js';
@@ -292,12 +293,7 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     expect(h.ledger.getPhaseHandoff(phase!.phaseId)?.state).toBe('awaiting');
     // The correlated native admission lands, then the boot backstop
     // completes the phase from the already-committed delivery.
-    const sent = h.ledger.appendCustomEvent({
-      kind: 'silas.directive-sent',
-      jobId: 'job-ph-dir',
-      payload: { request_id: 'req-ph-dir', minion_id: 'minion-d' },
-    });
-    h.ledger.recordDirectiveAdmission({ requestId: 'req-ph-dir', minionId: 'minion-d', eventSeq: sent.seq });
+    admitNativeDirectiveFixture(h.ledger, 'req-ph-dir', 'minion-d', join(tmpDir(), 'minion-d.jsonl'));
     const report = reconcilePhaseHandoffs({ ledger: h.ledger, notifications: h.notifications });
     expect(report.completed).toBe(1);
     expect(report.published).toBe(1);

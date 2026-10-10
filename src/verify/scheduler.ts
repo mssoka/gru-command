@@ -1,6 +1,6 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -337,6 +337,8 @@ interface TerminalIdentity {
   readonly head: string | null;
   readonly started: boolean;
   readonly completed_at: number;
+  readonly reason?: 'scheduler_disposed';
+  readonly request_ids?: readonly string[];
 }
 
 /** One in-flight single-flight attempt: the shared producer plus every attached sink. */
@@ -501,6 +503,9 @@ function parseTerminalIdentity(value: unknown): TerminalIdentity | null {
     head,
     started,
     completed_at: completedAt,
+    ...(record['reason'] === 'scheduler_disposed' && state === 'admission-failed' && !started ? { reason: 'scheduler_disposed' as const,
+      ...(Array.isArray(record['request_ids']) && record['request_ids'].every((id) => typeof id === 'string' && VERIFICATION_REQUEST_ID_PATTERN.test(id)) && record['request_ids'].includes(requestId)
+        ? { request_ids: record['request_ids'] as string[] } : {}) } : {}),
   };
 }
 /** Cap on one streamed output frame (bytes of text). */
@@ -642,6 +647,7 @@ export class VerificationScheduler {
   private started = false;
   private disposed = false;
   private readonly noStartSettled = new Set<string>();
+  private readonly pendingNoStart = new Map<string, VerificationRecord>();
 
   constructor(opts: VerificationSchedulerOptions) {
     this.opts = opts;
@@ -733,6 +739,25 @@ export class VerificationScheduler {
         error: attempt.error,
       });
     }
+    // The append-only identity index survives a failed scheduler-state write.
+    // Only explicit current no-start provenance can recover this refusal.
+    for (const identity of this.requestIndex.values()) {
+      if (identity.reason !== 'scheduler_disposed') continue;
+      this.pendingNoStart.set(identity.run_id, { kind: 'verification.no-start', jobId: identity.job_id, payload: {
+        run_id: identity.run_id, request_ids: identity.request_ids ?? [...this.requestIndex.values()].filter((row) => row.run_id === identity.run_id && row.reason === 'scheduler_disposed').map((row) => row.request_id),
+        scope: identity.scope, command: identity.command, cwd: identity.cwd, head: identity.head, started: false, reason: identity.reason,
+      } });
+    }
+    // Older supported state files have the full refusal even before the
+    // append-only format gained its explicit reason field.
+    for (const history of this.requestHistory.values()) {
+      if (history.error?.code !== 'scheduler_disposed' || history.started || this.pendingNoStart.has(history.runId)) continue;
+      this.pendingNoStart.set(history.runId, { kind: 'verification.no-start', jobId: history.spec.jobId, payload: {
+        run_id: history.runId, request_ids: [...this.requestHistory].filter(([, row]) => row.runId === history.runId && !row.started && row.error?.code === 'scheduler_disposed').map(([id]) => id), scope: history.spec.scope, command: history.spec.command,
+        cwd: history.spec.cwd, head: history.head, started: false, reason: 'scheduler_disposed',
+      } });
+    }
+    this.retryNoStart();
     for (const slot of persisted.slots) {
       // A persisted slot never has an in-process child (this is a fresh
       // scheduler): it is an orphan candidate until proven dead or aged out.
@@ -758,6 +783,7 @@ export class VerificationScheduler {
     this.sweepTimer = setInterval(() => {
       try {
         this.reconcileStale();
+        this.retryNoStart();
       } catch (error) {
         this.log('error', 'verification stale sweep failed', { error: String(error) });
       }
@@ -996,10 +1022,7 @@ export class VerificationScheduler {
           return history.outcome;
         }
         if (history.error?.code === 'scheduler_disposed') {
-          this.safeRecord({ kind: 'verification.no-start', jobId: history.spec.jobId, payload: {
-            request_id: requestId, run_id: history.runId, scope: history.spec.scope, command: history.spec.command,
-            cwd: history.spec.cwd, head: history.head, started: false, reason: 'scheduler_disposed', reconciled: true,
-          } });
+          this.retryNoStart();
           throw new VerificationDisposedError();
         }
         // Admission failure with no started run: the retry is explicitly
@@ -1028,6 +1051,7 @@ export class VerificationScheduler {
       // ledger holds the record; the caller mints a new identity.
       const known = this.requestIndex.get(requestId);
       if (known !== undefined) {
+        if (known.reason === 'scheduler_disposed') { this.retryNoStart(); throw new VerificationDisposedError(); }
         if (known.state === 'admission-failed') {
           this.requestIndex.delete(requestId);
         } else {
@@ -1148,6 +1172,7 @@ export class VerificationScheduler {
           head: known.head,
           trackedDirty: null,
           started: known.started,
+          ...(known.reason === 'scheduler_disposed' ? { error: { code: 'scheduler_disposed', detail: new VerificationDisposedError().message } } : {}),
         };
       }
       // An explicit unknown request identity never borrows another
@@ -1216,7 +1241,7 @@ export class VerificationScheduler {
 
   /** Terminate active runs and refuse new work (service shutdown). */
   async dispose(): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed) { this.retryNoStart(); return; }
     this.disposed = true;
     if (this.sweepTimer !== null) {
       clearInterval(this.sweepTimer);
@@ -1448,13 +1473,39 @@ export class VerificationScheduler {
 
   private settleNoStart(attempt: Attempt): void {
     if (attempt.started || this.slots.get(attempt.runId)?.child != null || this.noStartSettled.has(attempt.runId)) return;
-    this.noStartSettled.add(attempt.runId);
-    const error = new VerificationDisposedError();
-    this.rememberHistory(attempt, { state: 'admission-failed', outcome: null, error: { code: error.code, detail: error.message } });
-    this.safeRecord({ kind: 'verification.no-start', jobId: attempt.spec.jobId, payload: {
+    this.pendingNoStart.set(attempt.runId, { kind: 'verification.no-start', jobId: attempt.spec.jobId, payload: {
       run_id: attempt.runId, request_ids: [...attempt.requestIds], scope: attempt.spec.scope, command: attempt.spec.command,
       cwd: attempt.spec.cwd, head: attempt.head, started: false, reason: 'scheduler_disposed',
     } });
+    this.retryNoStart();
+  }
+
+  private retryNoStart(): void {
+    for (const [runId, record] of this.pendingNoStart) {
+      try {
+        const error = new VerificationDisposedError();
+        for (const requestId of record.payload['request_ids'] as string[]) {
+          const history: RequestHistoryEntry = { runId, state: 'admission-failed', started: false, outcome: null,
+            completedAt: this.now(), head: record.payload['head'] as string | null,
+            spec: { jobId: record.jobId, scope: String(record.payload['scope']), command: String(record.payload['command']), cwd: String(record.payload['cwd']) },
+            error: { code: error.code, detail: error.message } };
+          // Memory refusal is not a durable receipt. Persist exact provenance
+          // first, retain it on failure, then acknowledge ledger publication.
+          this.requestHistory.set(requestId, history);
+          if (this.requestIndex.get(requestId)?.reason !== 'scheduler_disposed') {
+            this.appendTerminalIdentity({ request_id: requestId, run_id: runId, state: 'admission-failed', job_id: record.jobId,
+              scope: history.spec.scope, command: history.spec.command, cwd: history.spec.cwd, head: history.head,
+              started: false, completed_at: history.completedAt, reason: 'scheduler_disposed', request_ids: record.payload['request_ids'] as string[] }, true);
+          }
+        }
+        this.persistBestEffort();
+        this.recordEvent(record);
+        this.noStartSettled.add(runId);
+        this.pendingNoStart.delete(runId);
+      } catch (error) {
+        this.log('error', 'verification no-start persistence/publication failed; original identity retained for retry', { run: runId, error: String(error) });
+      }
+    }
   }
 
   /** Record (or forget) every bound request identity for reconciliation. */
@@ -1536,11 +1587,19 @@ export class VerificationScheduler {
   }
 
   /** Append one terminal identity (append-only; the log is never rewritten). */
-  private appendTerminalIdentity(record: TerminalIdentity): void {
-    this.requestIndex.set(record.request_id, record);
+  private appendTerminalIdentity(record: TerminalIdentity, durable = false): void {
     try {
       appendFileSync(this.requestLogFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+      if (durable) {
+        const fd = openSync(this.requestLogFile, 'r');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        const dir = openSync(this.opts.storageDir, 'r');
+        try { fsyncSync(dir); } finally { closeSync(dir); }
+      }
+      this.requestIndex.set(record.request_id, record);
     } catch (error) {
+      if (durable) throw error;
+      this.requestIndex.set(record.request_id, record); // retain original in-process terminal refusal, never replay on a write error
       this.log('error', 'verification request identity append failed', {
         path: this.requestLogFile,
         request: record.request_id,

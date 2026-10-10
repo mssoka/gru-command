@@ -762,6 +762,9 @@ function listAllLiveDirectives(ledger: LedgerApi): readonly DirectiveRequestReco
  * returns null: unknown stays unknown. */
 function completeDirectiveFromEvidence(ledger: LedgerApi, row: DirectiveRequestRecord): DirectiveRequestRecord | null {
   let current = row;
+  // Event-only decoding belongs solely to rows accepted by the historical
+  // protocol. Current requests require the adapter-owned native binding.
+  if (current.requestKind !== null && current.nativeBinding === null) return null;
   if (current.state === 'dispatching') {
     const sent = findCorrelatedEvent(ledger, current.jobId, current.requestId, 'silas.directive-sent', (event) => event.seq > current.baselineSeq);
     if (sent === null) return null;

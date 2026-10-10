@@ -74,7 +74,9 @@ interface Harness {
   readonly lanePath: string;
   readonly jobId: string;
   readonly server: VerificationServer;
+  readonly db: LedgerDb;
   readonly close: () => Promise<void>;
+  readonly restart: () => Promise<Harness>;
 }
 
 async function boot(opts: {
@@ -103,9 +105,8 @@ async function boot(opts: {
   writeFileSync(join(dir, 'config.toml'), configLines, 'utf-8');
   mkdirSync(join(dir, 'wtroot'));
   const config = loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester');
-  const db = new LedgerDb(dir);
-  const bus = new EventBus({});
-  const ledger = new LedgerApi(db.handle, { bus });
+  let db = new LedgerDb(dir);
+  let ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
   const repo = makeFixtureRepo('verify-app');
   repos.push(repo);
@@ -118,7 +119,7 @@ async function boot(opts: {
   ledger.addJob({ id: jobId, repo: 'verify-app', title: 'verify the lane', baseBranch: 'main', briefing: 'verify' });
   ledger.setJobStatus(jobId, 'working');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId });
-  const server = createVerificationServer({
+  let server = createVerificationServer({
     config,
     ledger,
     worktrees,
@@ -140,7 +141,14 @@ async function boot(opts: {
     repo,
     lanePath: lane.path,
     jobId,
-    server,
+    get server() { return server; },
+    get db() { return db; },
+    restart: async () => {
+      await server.dispose(); db.close();
+      db = new LedgerDb(dir); ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+      server = createVerificationServer({ config, ledger, worktrees });
+      return { ...harness, ledger, server };
+    },
     close: async () => {
       if (closed) return;
       closed = true;
@@ -419,7 +427,7 @@ describe('verification single-flight + reconcile (issue #159)', () => {
   });
 
   it('same-ID terminal reconciliation closes only absent exact lane processes while retaining failure and partial capture truth', async () => {
-    const harness = await boot(); const requestId = 'terminal-process-restart';
+    let harness = await boot(); const requestId = 'terminal-process-restart';
     const pending = call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
     let originalStarted = harness.ledger.latestJobEvent(harness.jobId, 'verification.started');
     while (originalStarted === null) { await new Promise<void>((resolve) => setImmediate(resolve)); originalStarted = harness.ledger.latestJobEvent(harness.jobId, 'verification.started'); }
@@ -431,26 +439,83 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     const started = harness.ledger.latestJobEvent(harness.jobId, 'verification.started')!;
     const payload = started.payload as { pid: number; command: string };
     const live = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const foreign = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' }); const foreignPid = foreign.pid!; await once(foreign, 'exit');
     const capture = join(harness.config.dataDir, 'original-partial-capture.ndjson'); writeFileSync(capture, JSON.stringify({ type: 'started', runId: outcome['runId'] }) + '\n');
     const bytes = readFileSync(capture, 'utf8'); const completed = harness.ledger.latestJobEvent(harness.jobId, 'verification.completed');
     harness.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [
       { pid: payload.pid, command: `/bin/sh -c ${payload.command}`, evidence: 'registry' },
       { pid: live.pid!, command: `/bin/sh -c ${payload.command}`, evidence: 'registry' },
+      { pid: foreignPid, command: `/bin/sh -c ${payload.command}`, evidence: 'registry' },
     ] });
+    harness = await harness.restart();
     try {
       const replay = await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
       expect(replay.frames[0]).toMatchObject({ type: 'completed', reconciled: true }); expect(outcomeOf(replay.frames[0]!)).toEqual(outcome);
       expect(harness.ledger.listWorktreeProcesses(lane.id)).toEqual(expect.arrayContaining([
         expect.objectContaining({ pid: payload.pid, state: 'killed' }), expect.objectContaining({ pid: live.pid, state: 'live' }),
+        expect.objectContaining({ pid: foreignPid, state: 'live' }),
       ]));
       expect(harness.ledger.latestJobEvent(harness.jobId, 'verification.completed')).toEqual(completed);
       const audit = harness.ledger.latestJobEvent(harness.jobId, 'verification.process-reconciled');
       expect(audit?.payload).toMatchObject({ request_id: requestId, run_id: outcome['runId'], pid: payload.pid });
+      harness = await harness.restart();
       await call(harness.port, { job_id: harness.jobId, scope: 'slow', request_id: requestId });
       expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.process-reconciled'])).toEqual([audit]);
       expect(harness.ledger.listJobEventsByKinds(harness.jobId, ['verification.started'])).toEqual([started]);
       expect(readFileSync(capture, 'utf8')).toBe(bytes); expect(harness.ledger.hasUnsettledVerificationRun(harness.jobId)).toBe(false);
     } finally { const exit = once(live, 'exit'); live.kill('SIGKILL'); await exit; await harness.close(); }
+  });
+
+  async function assertProcessIdentityRefusal(fault: 'unbound' | 'conflicting-start' | 'unbound-reused-pid' | 'reused-pid' | 'foreign-command' | 'foreign-terminal' | 'EPERM' | 'live-original') {
+    const h = await boot(); const requestId = `process-negative-${fault}`;
+    const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+    const outcome = outcomeOf(completedFrame(result.frames)); const runId = String(outcome['runId']);
+    const started = h.ledger.latestJobEvent(h.jobId, 'verification.started')!;
+    const facts = started.payload as { pid: number; command: string; cwd: string };
+    const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch, sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${facts.command}`, evidence: 'registry' }] });
+    if (fault === 'unbound') h.db.handle.prepare('DELETE FROM events WHERE seq = ?').run(started.seq);
+    if (fault === 'conflicting-start') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.started', payload: { ...facts, run_id: runId, pid: facts.pid + 1 } });
+    if (fault === 'reused-pid') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.started', payload: { ...facts, run_id: 'different-run' } });
+    if (fault === 'unbound-reused-pid') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.started', payload: facts });
+    if (fault === 'foreign-terminal') h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.completed', payload: { run_id: runId, command: 'foreign command', cwd: facts.cwd } });
+    const before = h.ledger.listWorktreeProcesses(lane.id); const kill = process.kill.bind(process);
+    const probe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (pid === facts.pid && signal === 0 && (fault === 'EPERM' || fault === 'live-original')) {
+        if (fault === 'live-original') return true;
+        throw Object.assign(new Error('ambiguous permission'), { code: 'EPERM' });
+      }
+      return kill(pid, signal);
+    });
+    try {
+      h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId, requestId, command: fault === 'foreign-command' ? 'other command' : facts.command, cwd: facts.cwd, worktreeId: lane.id });
+      expect(h.ledger.listWorktreeProcesses(lane.id)).toEqual(before); expect(h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled')).toBeNull();
+    } finally { probe.mockRestore(); }
+  }
+  it('process reconciliation refuses unbound original identity evidence', () => assertProcessIdentityRefusal('unbound'));
+  it('process reconciliation refuses conflicting-start original identity evidence', () => assertProcessIdentityRefusal('conflicting-start'));
+  it('process reconciliation refuses reused-pid original identity evidence', () => assertProcessIdentityRefusal('reused-pid'));
+  it('process reconciliation refuses unbound-reused-pid original identity evidence', () => assertProcessIdentityRefusal('unbound-reused-pid'));
+  it('process reconciliation refuses foreign-command original identity evidence', () => assertProcessIdentityRefusal('foreign-command'));
+  it('process reconciliation refuses foreign-terminal original identity evidence', () => assertProcessIdentityRefusal('foreign-terminal'));
+  it('process reconciliation refuses EPERM original identity evidence', () => assertProcessIdentityRefusal('EPERM'));
+  it('process reconciliation refuses live-original original identity evidence', () => assertProcessIdentityRefusal('live-original'));
+
+  it('original no-start deduplication survives more than 1000 newer receipts and a real server restart', async () => {
+    let h = await boot();
+    const holder = call(h.port, { job_id: h.jobId, scope: 'slow', request_id: 'dedup-holder' });
+    while (h.ledger.latestJobEvent(h.jobId, 'verification.started') === null) await new Promise<void>((resolve) => setImmediate(resolve));
+    const queued = call(h.port, { job_id: h.jobId, scope: 'full', request_id: 'old-no-start' });
+    while (h.ledger.listJobEventsByKinds(h.jobId, ['verification.requested']).length < 2) await new Promise<void>((resolve) => setImmediate(resolve));
+    await h.server.dispose(); await Promise.all([holder, queued]);
+    const original = h.ledger.latestJobEvent(h.jobId, 'verification.no-start')!; expect(original).not.toBeNull();
+    for (let n = 0; n < 1001; n += 1) h.ledger.appendCustomEvent({ jobId: h.jobId, kind: 'verification.no-start', payload: { run_id: `other-run-${n}` } });
+    h = await h.restart();
+    await call(h.port, { job_id: h.jobId, scope: 'full', request_id: 'old-no-start' });
+    const rows = h.ledger.listJobEventsByKinds(h.jobId, ['verification.no-start'], { limit: 2000 }).filter((row) => (row.payload as { run_id?: unknown }).run_id === (original.payload as { run_id: string }).run_id);
+    expect(rows).toEqual([original]);
+    expect(h.ledger.listJobEventsByKinds(h.jobId, ['verification.started'])).toHaveLength(1);
   });
 
   it('replays a completed request_id instead of rerunning, and reconciles unknown → running → completed', async () => {

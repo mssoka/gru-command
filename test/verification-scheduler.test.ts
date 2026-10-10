@@ -16,6 +16,10 @@ import {
   type VerificationRecord,
 } from '../src/verify/scheduler.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { EventBus } from '../src/events/bus.js';
+import { laneIsBusy } from '../src/dispatch/branch-idle.js';
 
 /**
  * The verification scheduler (contention fix, 2026-09-22): one global test
@@ -283,6 +287,49 @@ describe('verification scheduler — global budget', () => {
       expect(resumed.inFlightCount()).toBe(0); expect(frames).toHaveLength(1);
     } finally { await resumed.dispose(); }
   });
+
+  async function assertNoStartRecovery(fault: 'pre-commit' | 'post-commit' | 'state-storage' | 'identity-storage') {
+    const dir = tempDir(); const db = new LedgerDb(dir); const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+    ledger.addJob({ id: 'queued-job', repo: 'fixture', title: 'queued' }); ledger.setJobStatus('queued-job', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'queued-job', payload: { work_revision: 0 } });
+    const repo = makeRepo(); const storageDir = join(dir, 'verify');
+    let fail = true; let spawns = 0; const errors: string[] = [];
+    const record = (event: VerificationRecord) => {
+      if (event.kind === 'verification.no-start' && fail && fault === 'pre-commit') throw new Error('no-start publication refused');
+      if (!ledger.hasJobEventWithPayloadValues(event.jobId, [event.kind], [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) ledger.appendCustomEvent(event);
+      if (event.kind === 'verification.no-start' && fail && fault === 'post-commit') throw new Error('no-start committed then observer failed');
+    };
+    const opts = { storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 }, record, onSpawn: () => { spawns += 1; }, log: (_level: unknown, message: string) => { errors.push(message); } };
+    const scheduler = new VerificationScheduler(opts); scheduler.start();
+    const held = await scheduler.acquire(spec('holder'));
+    let queued!: () => void; const boundary = new Promise<void>((resolve) => { queued = resolve; });
+    const input = repoSpec(repo, 'queued-job', { requestId: 'original-no-start' });
+    const pending = scheduler.submit(input, (frame) => { if (frame.type === 'queued') queued(); });
+    const rejected = expect(pending).rejects.toBeInstanceOf(VerificationDisposedError); await boundary;
+    const original = ledger.latestJobEvent('queued-job', 'verification.requested')!;
+    expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true); expect(laneIsBusy(ledger, ledger.getJob('queued-job')!)).toBe(true);
+    if (fault === 'state-storage') { rmSync(join(storageDir, 'scheduler.json')); mkdirSync(join(storageDir, 'scheduler.json')); }
+    if (fault === 'identity-storage') mkdirSync(join(storageDir, 'requests.ndjson'));
+    await scheduler.dispose(); await rejected; scheduler.release(held);
+    if (fault === 'pre-commit' || fault === 'identity-storage') expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true);
+    if (fault === 'state-storage') rmSync(join(storageDir, 'scheduler.json'), { recursive: true });
+    if (fault === 'identity-storage') rmSync(join(storageDir, 'requests.ndjson'), { recursive: true });
+    fail = false;
+    const resumed = new VerificationScheduler(opts); resumed.start();
+    try {
+      expect(resumed.attemptStatus({ requestId: 'original-no-start' })).toMatchObject({ state: 'admission-failed', runId: (original.payload as { run_id: string }).run_id, started: false, error: { code: 'scheduler_disposed' } });
+      expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(false); expect(laneIsBusy(ledger, ledger.getJob('queued-job')!)).toBe(false);
+      await expect(resumed.submit(input)).rejects.toBeInstanceOf(VerificationDisposedError);
+      expect(spawns).toBe(0); expect(ledger.listJobEventsByKinds('queued-job', ['verification.no-start'])).toHaveLength(1);
+      ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'queued-job', payload: { run_id: 'unrelated-open' } });
+      expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true); expect(laneIsBusy(ledger, ledger.getJob('queued-job')!)).toBe(true);
+      expect(errors.length).toBeGreaterThan(0);
+    } finally { await resumed.dispose(); db.close(); }
+  }
+  it('retries original no-start pre-commit failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('pre-commit'));
+  it('retries original no-start post-commit failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('post-commit'));
+  it('retries original no-start state-storage failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('state-storage'));
+  it('retries original no-start identity-storage failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('identity-storage'));
 
   it('rejects a queued request parked on its queued frame when dispose runs', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });

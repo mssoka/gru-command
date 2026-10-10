@@ -3534,6 +3534,61 @@ it('directive native multi-tool invocation persists each sequential result and r
   } finally { await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); }
 });
 
+async function assertSdkToolAuthority(boundary: 'model-await' | 'prior-hook-await') {
+  let release!: () => void; const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
+  const f = await fixture([{ deltas: [], ...(boundary === 'model-await' ? { hold } : {}), toolCalls: [
+    { id: 'allowed-first', name: 'bash', args: { command: 'echo allowed > authority-effects.txt' } },
+    { id: 'revoked-second', name: 'bash', args: { command: 'echo forbidden >> authority-effects.txt' } },
+  ] }, { deltas: ['done'] }]);
+  const original = await f.runtime.spawn('minion', { cwd: f.workspace });
+  const session = await actualDirectiveSdkSession(original); session.agent.toolExecution = 'sequential';
+  let allowed = true; let checks = 0;
+  const previous = session.agent.beforeToolCall;
+  session.agent.beforeToolCall = async (input, signal) => {
+    if (input.toolCall.id === 'revoked-second') {
+      if (boundary === 'prior-hook-await') await Promise.resolve();
+      allowed = false;
+    }
+    return previous?.(input, signal);
+  };
+  const { PiAgentHandle, PI_CAPABILITIES } = await import('../src/runtime/pi-adapter.js');
+  const handle = new PiAgentHandle('minion', session, original.sessionFile!, PI_CAPABILITIES, false, [], f.store, () => {}, () => {}, 60000, original.id, () => 'exact test authority');
+  const identity = { requestId: 'tool-revocation', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'tool-job', workRevision: 0, authorityEpoch: 0 };
+  try {
+    const turn = handle.promptWithVerdict!('approved tools', { directive: { identity, beforeAdmission: () => { checks += 1; if (!allowed) throw new Error('exact authority revoked'); }, onAdmitted: () => {} } });
+    if (boundary === 'model-await') { await waitFor(() => f.script.calls.length === 1, 'awaited native model'); allowed = false; release(); }
+    await turn;
+    if (boundary === 'model-await') expect(existsSync(join(f.workspace, 'authority-effects.txt'))).toBe(false);
+    else expect(readFileSync(join(f.workspace, 'authority-effects.txt'), 'utf8')).toBe('allowed\n');
+    expect(checks).toBeGreaterThan(2);
+    const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+    expect(inspectDirectiveCheckpoint(handle.sessionFile!, identity).state).toBe('unknown');
+  } finally { release(); await handle.dispose(); await original.dispose(); await f.runtime.dispose(); f.store.dispose(); }
+}
+it('real sequential SDK tools recheck revoked directive authority after model-await', () => assertSdkToolAuthority('model-await'));
+it('real sequential SDK tools recheck revoked directive authority after prior-hook-await', () => assertSdkToolAuthority('prior-hook-await'));
+
+it('cessation journal failure retains native lock and physical owner until an exact receipt retry succeeds', async () => {
+  const f = await fixture([{ deltas: ['done'] }]);
+  const handle = await f.runtime.spawn('minion', { cwd: f.workspace });
+  const identity = { requestId: 'ceased-journal', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'ceased-job', workRevision: 0, authorityEpoch: 0 };
+  handle.prepareDirectiveProducer!(identity);
+  const path = `${handle.sessionFile!}.producers.jsonl`; const bytes = readFileSync(path, 'utf8');
+  writeFileSync(path, `${bytes}{partial`);
+  try {
+    await expect(handle.dispose()).rejects.toThrow(/partial/);
+    expect(f.store.isHeld(handle.sessionFile!)).toBe(true);
+    expect(existsSync(`${handle.sessionFile!}.lock`)).toBe(true);
+    expect(handle.health().state).not.toBe('disposed');
+    await expect(f.runtime.spawn('minion', { resumeFile: handle.sessionFile! })).rejects.toThrow(/already hosted/);
+    writeFileSync(path, bytes);
+    await handle.dispose(); await handle.dispose();
+    expect(handle.cessationEvidence!()).toBe('ceased'); expect(f.store.isHeld(handle.sessionFile!)).toBe(false);
+    const rows = readFileSync(path, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { state: string });
+    expect(rows.filter((row) => row.state === 'ceased')).toHaveLength(1);
+  } finally { writeFileSync(path, readFileSync(path, 'utf8').replace('{partial', '')); await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); }
+});
+
 it('restart recovery records actual admission while the native prompt remains pending', async () => {
   let release!: () => void;
   const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
@@ -3744,6 +3799,187 @@ async function directiveRecoveryLedgerFixture(label: string) {
   return { dir, repo, db, bus, ledger, notifications, worktrees, lane, request,
     identity: ledger.directiveTurnIdentity(request.requestId) };
 }
+
+async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void) {
+  const fx = await fixture(turns);
+  const scene = await directiveRecoveryLedgerFixture('guarded-sdk-tools');
+  const { AgentSession } = await import('@earendil-works/pi-coding-agent');
+  const registry = new RuntimeRegistry({ config: fx.config, store: fx.store,
+    pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime } });
+  const states: string[] = []; const toolStates: string[] = [];
+  const sessions: InstanceType<typeof AgentSession>[] = [];
+  registry.onAgentEvent((envelope) => {
+    if (envelope.phase === 'spawned') {
+      const handle = registry.getHandle(envelope.agentId)!;
+      scene.ledger.registerAgent({ id: handle.id, role: handle.role, jobId: scene.request.jobId, sessionFile: handle.sessionFile, parentage: 'top-level' });
+      // Record genuine initial adapter state, then relay every native state
+      // through the real registry tap. Never replace streaming with idle.
+      scene.ledger.setAgentState(handle.id, handle.health().state);
+      const session = (handle as unknown as { readonly session: unknown }).session;
+      if (!(session instanceof AgentSession)) throw new Error('guard regression requires the actual pinned SDK');
+      sessions.push(session); session.agent.toolExecution = 'sequential';
+      vi.spyOn(session, 'prompt'); vi.spyOn(session.agent, 'continue');
+      const before = session.agent.beforeToolCall!;
+      session.agent.beforeToolCall = async (input, signal) => {
+        toolStates.push(scene.ledger.getAgent(handle.id)!.state);
+        expect(handle.health().state).toBe('streaming');
+        expect(scene.ledger.getAgent(handle.id)!.state).toBe('streaming');
+        return before(input, signal);
+      };
+      configureSession?.(session, handle);
+    }
+    if (envelope.phase === 'event' && envelope.event?.type === 'state') {
+      states.push(envelope.event.state);
+      scene.ledger.setAgentState(envelope.agentId, envelope.event.state);
+    }
+  });
+  const deps = { ledger: scene.ledger, registry, worktrees: scene.worktrees, notifications: scene.notifications,
+    signal: new AbortController().signal, pendingProducerBlockers: () => [] };
+  const cleanup = async () => { await registry.dispose(); await fx.runtime.dispose(); fx.store.dispose(); scene.db.close(); scene.repo.cleanup(); };
+  return { fx, scene, registry, sessions, states, toolStates, deps, cleanup };
+}
+
+const guardedSdkTools: readonly StubTurn[] = [
+  { deltas: [], toolCalls: [
+    { id: 'guarded-first', name: 'bash', args: { command: "printf 'first\\n' > guarded-effects.txt" } },
+    { id: 'guarded-second', name: 'bash', args: { command: "printf 'second\\n' >> guarded-effects.txt" } },
+  ] },
+  { deltas: ['genuine guarded correlated delivery'] },
+];
+
+async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveExecutionFixture>>) {
+  const { prepareDirectiveBinding, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const original = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'guarded-original-minion' });
+  const session = await actualDirectiveSdkSession(original);
+  const identity = f.scene.identity;
+  f.scene.ledger.claimDirectiveDispatch(identity.requestId);
+  f.scene.ledger.prepareDirectiveTarget(identity.requestId, { agentId: original.id, sessionFile: original.sessionFile! });
+  const producer = original.prepareDirectiveProducer!(identity);
+  const start = f.scene.ledger.startDirectiveProducer(identity, producer);
+  const authority = (original as unknown as { directiveAuthorityManifest(): string }).directiveAuthorityManifest();
+  const text = 'original approved native user checkpoint';
+  prepareDirectiveBinding({ identity, runtime: 'pi', agentId: original.id, sessionId: session.sessionId,
+    sessionFile: original.sessionFile!, text, authorityManifest: authority });
+  // Accountable checkpoint fixture: the SDK's public persistence primitive
+  // writes the original user receipt. No model, effects or terminal is forged.
+  session.sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text }], timestamp: Date.now() });
+  const proof = inspectDirectiveCheckpoint(original.sessionFile!, identity);
+  if (proof.state !== 'resumable') throw new Error('SDK user fixture did not produce a resumable checkpoint');
+  f.scene.ledger.bindDirectiveNativeAdmission(proof.binding);
+  await f.registry.disposeHandle(original); // genuine original native cessation
+  f.scene.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: identity.jobId, payload: {
+    request_id: identity.requestId, producer_start_seq: start, producer_identity: identity, native_producer: producer,
+    agent_id: original.id, session_file: original.sessionFile,
+  } });
+  return { original, proof, prefix: readFileSync(original.sessionFile!, 'utf8') };
+}
+
+async function assertGuardedSdkDelivery(resume: boolean) {
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture(guardedSdkTools);
+  let service: InstanceType<typeof DirectiveProgressService> | null = null;
+  try {
+    const seeded = resume ? await seedSdkUserCheckpoint(f) : null;
+    const spawn = vi.spyOn(f.registry, 'spawn');
+    if (resume) { service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); }
+    else await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const entries = readFileSync(row.nativeTarget!.sessionFile, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { message?: { role: string; toolCallId?: string; isError?: boolean } });
+    const results = entries.filter((entry) => entry.message?.role === 'toolResult');
+    expect(row.state, `Native SDK tool evidence: ${JSON.stringify(results)}`).toBe('settled');
+    expect(readFileSync(join(f.scene.lane.path, 'guarded-effects.txt'), 'utf8')).toBe('first\nsecond\n');
+    expect(f.toolStates).toEqual(['streaming', 'streaming']); expect(f.states).toContain('streaming');
+    expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)?.payload).toMatchObject({ request_id: row.requestId, agentId: row.nativeTarget!.agentId });
+    expect(f.fx.script.calls).toHaveLength(2); expect(spawn).toHaveBeenCalledTimes(1);
+    expect(f.sessions.at(-1)!.prompt).toHaveBeenCalledTimes(resume ? 0 : 1);
+    expect(f.sessions.at(-1)!.agent.continue).toHaveBeenCalledTimes(resume ? 1 : 0);
+    expect(results.map((entry) => [entry.message!.toolCallId, entry.message!.isError])).toEqual([['guarded-first', false], ['guarded-second', false]]);
+    if (seeded !== null) {
+      expect(spawn.mock.calls[0]![1]).toMatchObject({ resumeFile: seeded.original.sessionFile, agentId: seeded.original.id, cwd: f.scene.lane.path });
+      expect(row.nativeBinding).toEqual(seeded.proof.binding);
+      expect(readFileSync(row.nativeTarget!.sessionFile, 'utf8').startsWith(seeded.prefix)).toBe(true);
+      expect(entries.filter((entry) => entry.message?.role === 'user')).toHaveLength(1);
+      service!.reconsider(); await service!.settled(); expect(spawn).toHaveBeenCalledTimes(1);
+    }
+    expect(f.scene.worktrees.listWorktrees({ jobId: row.jobId })).toEqual([f.scene.lane]);
+  } finally { await service?.dispose(); await f.cleanup(); }
+}
+it('production shared executor permits only its exact streaming SDK producer to run two native tools and deliver', () => assertGuardedSdkDelivery(false));
+it('production checkpoint callback permits its exact streaming SDK producer to run two native tools without prompt replay', () => assertGuardedSdkDelivery(true));
+
+async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'foreign-streaming') {
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  let release!: () => void; const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
+  let reached!: () => void; const boundary = new Promise<void>((resolveGate) => { reached = resolveGate; });
+  const first = guardedSdkTools[0]!;
+  const f = await sdkDirectiveExecutionFixture([
+    { ...first, ...(fault !== 'prior-hook-await' ? { hold, honorAbort: true } : {}) }, guardedSdkTools[1]!,
+  ], (session) => {
+    if (fault !== 'prior-hook-await') return;
+    // Actual awaited SDK extension hook: the adapter must recheck AFTER it.
+    const runner = (session as unknown as { readonly _extensionRunner: {
+      hasHandlers(type: string): boolean; emitToolCall(input: { toolCallId: string }): Promise<undefined>;
+    } })._extensionRunner;
+    const has = runner.hasHandlers.bind(runner);
+    vi.spyOn(runner, 'hasHandlers').mockImplementation((type) => type === 'tool_call' || has(type));
+    vi.spyOn(runner, 'emitToolCall').mockImplementation(async (input) => {
+      if (input.toolCallId === 'guarded-second') { reached(); await hold; }
+      return undefined;
+    });
+  });
+  let service: InstanceType<typeof DirectiveProgressService> | null = null;
+  let run: Promise<void> | null = null;
+  let foreignRegistry: RuntimeRegistry | null = null;
+  let foreignTurn: Promise<void> | null = null;
+  let foreignRelease = () => {};
+  try {
+    if (resume) await seedSdkUserCheckpoint(f);
+    if (resume) { service = new DirectiveProgressService(f.deps); service.reconsider(); run = service.settled(); }
+    else run = executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    if (fault === 'prior-hook-await') await Promise.race([boundary, run.then(() => { throw new Error('SDK settled before genuine prior-hook await'); })]);
+    else await waitFor(() => f.fx.script.calls.length === 1, 'genuine guarded model await');
+    const active = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(f.scene.ledger.getAgent(active.nativeTarget!.agentId)?.state).toBe('streaming');
+    if (fault === 'foreign-streaming') {
+      const foreignHold = new Promise<void>((resolveGate) => { foreignRelease = resolveGate; });
+      const script = new StubScript([{ deltas: [], hold: foreignHold, honorAbort: true }]);
+      const registry = new RuntimeRegistry({ config: f.fx.config, store: f.fx.store,
+        pi: { agentDir: f.fx.agentDir, modelRuntime: await makeStubModelRuntime(script) } });
+      foreignRegistry = registry;
+      registry.onAgentEvent((envelope) => {
+        if (envelope.phase === 'spawned') {
+          const handle = registry.getHandle(envelope.agentId)!;
+          f.scene.ledger.registerAgent({ id: handle.id, role: handle.role, jobId: active.jobId, sessionFile: handle.sessionFile, parentage: 'top-level' });
+          f.scene.ledger.setAgentState(handle.id, handle.health().state);
+        }
+        if (envelope.phase === 'event' && envelope.event?.type === 'state') f.scene.ledger.setAgentState(envelope.agentId, envelope.event.state);
+      });
+      const foreign = await registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'foreign-streaming-producer' });
+      foreignTurn = foreign.prompt('independent foreign native turn held open');
+      await waitFor(() => script.calls.length === 1 && f.scene.ledger.getAgent(foreign.id)?.state === 'streaming', 'truthful foreign SDK streaming producer');
+      expect(foreign.health().state).toBe('streaming');
+    } else f.scene.ledger.setJobStatus(active.jobId, 'parked');
+    release(); await run;
+    const path = join(f.scene.lane.path, 'guarded-effects.txt');
+    if (fault === 'prior-hook-await') expect(readFileSync(path, 'utf8')).toBe('first\n');
+    else expect(existsSync(path)).toBe(false);
+    expect(f.scene.ledger.getDirective(active.requestId)?.state).toBe('admitted');
+    expect(f.scene.ledger.latestJobEventByRequestId(active.jobId, 'job.delivered', active.requestId)).toBeNull();
+    if (fault === 'foreign-streaming') {
+      expect(readFileSync(active.nativeTarget!.sessionFile, 'utf8')).toContain('foreign-streaming-producer (streaming)');
+      expect(f.scene.ledger.getAgent('foreign-streaming-producer')?.state).toBe('streaming');
+    }
+  } finally {
+    release(); foreignRelease(); await run?.catch(() => {}); await service?.dispose();
+    await foreignRegistry?.dispose(); await foreignTurn?.catch(() => {}); await f.cleanup();
+  }
+}
+it('production shared SDK tool guard refuses authority revoked during its model await', () => assertProductionSdkFence(false, 'model-await'));
+it('production checkpoint SDK tool guard refuses authority revoked during its model await', () => assertProductionSdkFence(true, 'model-await'));
+it('production shared SDK tool guard rechecks authority after its awaited native prior hook', () => assertProductionSdkFence(false, 'prior-hook-await'));
+it('production checkpoint SDK tool guard rechecks authority after its awaited native prior hook', () => assertProductionSdkFence(true, 'prior-hook-await'));
+it('production shared SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(false, 'foreign-streaming'));
+it('production checkpoint SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(true, 'foreign-streaming'));
 
 async function actualDirectiveSdkSession(handle: AgentHandle) {
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');

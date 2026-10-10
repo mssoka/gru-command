@@ -192,8 +192,8 @@ export function createVerificationServer(options: VerificationServerOptions): Ve
         runTimeoutMs: options.config.verify.runTimeoutMs,
       },
       record: (event) => {
-        if (event.kind === 'verification.no-start' && ledger.listJobEventsByKinds(event.jobId, ['verification.no-start'], { limit: 1000 })
-          .some((row) => (row.payload as { run_id?: unknown }).run_id === event.payload['run_id'])) return;
+        if (event.kind === 'verification.no-start' && ledger.hasJobEventWithPayloadValues(event.jobId, ['verification.no-start'],
+          [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) return;
         ledger.appendCustomEvent({
           kind: event.kind,
           jobId: event.jobId,

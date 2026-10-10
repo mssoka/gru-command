@@ -90,6 +90,12 @@ function assertDirectiveJobActive(ledger: Pick<LedgerApi, 'getJob'>, jobId: stri
   }
 }
 
+/** Positive routing proof: this invocation stopped at a guard before any
+ * native spawn, preparation, prompt or cleanup operation was attempted. */
+export class DirectiveDispatchDeferredError extends Error {
+  constructor(readonly original: unknown) { super(`pre-native directive deferred: ${String(original)}`); this.name = 'DirectiveDispatchDeferredError'; }
+}
+
 /** Route a directive to the implementing minion: the live job minion
  * first; otherwise a fresh minion on the job lane. */
 export async function routeFixDirectiveToMinion(
@@ -138,7 +144,15 @@ export async function routeFixDirectiveToMinion(
     if (failures.length > 1) throw new AggregateError(failures, `directive cleanup failed: ${failures.map(String).join('; ')}`);
   };
   const owner = input.owner ?? 'fix-directive';
-  input.beforeTurnSideEffect?.();
+  let nativeAttempted = false;
+  const guard = (handle?: AgentHandle): void => {
+    try { input.beforeTurnSideEffect?.(handle); }
+    catch (error) {
+      if (input.directiveTurn !== undefined && !nativeAttempted) throw new DirectiveDispatchDeferredError(error);
+      throw error;
+    }
+  };
+  guard();
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
@@ -159,9 +173,10 @@ export async function routeFixDirectiveToMinion(
     for (const minion of minions) {
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;
-      input.beforeTurnSideEffect?.();
+      guard();
+      nativeAttempted = true;
       await disposeAndRecord(prior, true);
-      input.beforeTurnSideEffect?.();
+      guard();
       if (prior.cessationEvidence?.() !== 'ceased') throw new Error(`prior minion ${prior.id} retains unproven producer ownership — rebrief refused`);
     }
     minions = [];
@@ -177,7 +192,7 @@ export async function routeFixDirectiveToMinion(
       // the other turn's outcome. Await before taking the worker slot — the
       // retry re-acquires its own slot and must not be blocked by ours.
       const pending = await settleRetries(input.retrySettlement, handle.id, input.signal);
-      input.beforeTurnSideEffect?.();
+      guard();
       if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'none' };
       let lease: PacingLease | null = null;
       if (input.workerGate !== undefined) {
@@ -195,7 +210,8 @@ export async function routeFixDirectiveToMinion(
         // prompt error eligible for retry recovery. It must still release
         // the pacing lease acquired after the asynchronous wait above.
         assertDirectiveJobActive(input.ledger, input.jobId);
-        input.beforeTurnSideEffect?.();
+        guard();
+        nativeAttempted = true;
         input.onPrepared?.(handle);
         try {
           verdict = await racedPrompt(handle, directive, input.signal, owner, input.directiveTurn);
@@ -293,7 +309,8 @@ export async function routeFixDirectiveToMinion(
     let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
     try {
       assertDirectiveJobActive(input.ledger, input.jobId);
-      input.beforeTurnSideEffect?.();
+      guard();
+      nativeAttempted = true; // a rejected spawn is still uncertain, never a deferral
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
@@ -307,7 +324,8 @@ export async function routeFixDirectiveToMinion(
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
       assertDirectiveJobActive(input.ledger, input.jobId);
-      input.beforeTurnSideEffect?.();
+      guard();
+      nativeAttempted = true;
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       // A fresh session has no memory of accepted amendments: brief it with
       // the EFFECTIVE contract (original + amendments), never the original
@@ -315,7 +333,7 @@ export async function routeFixDirectiveToMinion(
       prompt = freshPrompt(contract);
     }
     assertDirectiveJobActive(input.ledger, input.jobId);
-    input.beforeTurnSideEffect?.();
+    guard();
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     const spawnedHandle = handle;
@@ -334,7 +352,8 @@ export async function routeFixDirectiveToMinion(
       throw error; // the single cleanup owner below preserves registration AND cleanup failures
     }
     assertDirectiveJobActive(input.ledger, input.jobId);
-    input.beforeTurnSideEffect?.(handle);
+    guard(handle);
+    nativeAttempted = true;
     input.onPrepared?.(handle);
     try {
       verdict = await racedPrompt(handle, prompt, input.signal, owner, input.directiveTurn);

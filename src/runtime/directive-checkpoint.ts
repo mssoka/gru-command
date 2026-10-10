@@ -80,19 +80,26 @@ export function readDirectiveBinding(file: string, requestId: string): Directive
   try { raw = readFileSync(proofPath(file), 'utf8'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   if (!raw.endsWith('\n')) throw new DirectiveCheckpointError('directive native association has a partial write');
-  const rows = raw.trimEnd().split('\n').map((line) => JSON.parse(line) as DirectiveNativeBinding)
-    .filter((row) => row.identity.requestId === requestId);
+  const rows = raw.trimEnd().split('\n').map((line) => JSON.parse(line) as DirectiveNativeBinding);
+  const latest = new Map<string, DirectiveNativeBinding>();
   for (const row of rows) {
+    if (typeof row !== 'object' || row === null) throw new DirectiveCheckpointError('directive native association is malformed');
     validateDirectiveIdentity(row.identity);
-    if (row.sessionFile !== file || !row.agentId || !row.sessionId || !row.authorityManifest || !/^[a-f0-9]{64}$/.test(row.promptHash)) {
+    if (row.sessionFile !== file || !['pi', 'claude-code'].includes(row.runtime) ||
+        [row.agentId, row.sessionId, row.authorityManifest].some((value) => typeof value !== 'string' || value.trim() === '') ||
+        typeof row.promptHash !== 'string' || !/^[a-f0-9]{64}$/.test(row.promptHash) ||
+        !(row.baseline === null || typeof row.baseline === 'string' && row.baseline !== '') ||
+        !(row.userEntryId === null || typeof row.userEntryId === 'string' && row.userEntryId !== '')) {
       throw new DirectiveCheckpointError('directive native association is malformed');
     }
-    const first = rows[0]!;
-    if (!isDeepStrictEqual({ ...first, userEntryId: null }, { ...row, userEntryId: null })) {
+    const prior = latest.get(row.identity.requestId);
+    if (prior !== undefined && (!isDeepStrictEqual({ ...prior, userEntryId: null }, { ...row, userEntryId: null }) ||
+        prior.userEntryId !== null && prior.userEntryId !== row.userEntryId)) {
       throw new DirectiveCheckpointError('conflicting native request associations');
     }
+    latest.set(row.identity.requestId, row);
   }
-  return rows.at(-1) ?? null;
+  return latest.get(requestId) ?? null;
 }
 /** Native transcript readback owns proof. Pi entries are tree-linked: only
  * the exact direct user child of the prepared baseline is admitted. A
@@ -119,7 +126,9 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   let parent = user.id;
   const pending = new Map<string, string>();
   let lastMessage = user.message;
+  let terminal = false;
   for (const entry of native.slice(start + 1)) {
+    if (terminal) return unknown('native entries follow the correlated terminal checkpoint');
     if (entry.type !== 'message' || entry.parentId !== parent || !entry.id || entry.message === undefined) return unknown('native branch/control/partial checkpoint');
     parent = entry.id;
     const message = entry.message;
@@ -132,9 +141,8 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
         pending.set(block.id, block.name);
       }
       if (pending.size === 0) {
-        const ok = message.stopReason === 'stop';
-        return { state: 'terminal', binding: admitted, checkpointId: parent, ok,
-          error: ok ? null : String(message.errorMessage ?? `native stopReason: ${String(message.stopReason)}`) };
+        if (!['stop', 'error', 'aborted', 'length'].includes(String(message.stopReason))) return unknown('malformed native assistant terminal');
+        terminal = true;
       }
     } else if (message.role === 'toolResult') {
       if (typeof message.toolCallId !== 'string' || !pending.has(message.toolCallId) || pending.get(message.toolCallId) !== message.toolName || typeof message.isError !== 'boolean') return unknown('unmatched/malformed native tool result');
@@ -198,6 +206,7 @@ export function recordDirectiveProducerCessation(producer: DirectiveProducer): v
   const rows = producerReceipts(producer.sessionFile);
   if (!rows.some((row) => row.state === 'started' && isDeepStrictEqual(row.producer, producer))) throw new DirectiveCheckpointError('native producer start missing');
   if (!rows.some((row) => row.state === 'ceased' && isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'ceased', producer });
+  else { syncFile(`${producer.sessionFile}.producers.jsonl`); syncFile(dirname(producer.sessionFile)); }
 }
 /** ESRCH proves only host absence. Caller still needs a safe native checkpoint
  * and every independent child/process/tool fence before executing or settling. */
