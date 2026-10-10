@@ -4427,14 +4427,22 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     expect(postedBody).not.toContain('UNAVAILABLE');
     expect(postedBody).toContain('- Specialist attempts started: 5 journaled (2 valid, 3 failed) across 3 of 9 available lenses');
     expect(postedBody).toContain('- Lenses not used this round:');
-    expect(postedBody).toContain('authenticated COMMENT review on the reviewed commit');
-    // R16: the persisted round.posted receipt pins the actual actor/event —
-    // removing them from the ledger writer would fail this test.
+    // The confirmed blocker set publishes a FORMAL change request: the
+    // footer names the wanted event without claiming provider proof — the
+    // receipt is the record of what the provider actually enacted.
+    expect(postedBody).toContain('formal GitHub change request — review event REQUEST_CHANGES submitted on the reviewed commit');
+    expect(postedBody).not.toContain('formal GitHub approval');
+    expect(postedBody).not.toContain('authenticated COMMENT review on the reviewed commit');
+    // R16: the persisted round.posted receipt pins the actual actor/event
+    // and the carried intent — removing any of them from the ledger writer
+    // would fail this test.
     const postedEvent = ledger.latestRoundEvent(outcome.round.id, 'round.posted')?.payload as {
       receipt?: { actor?: string; event?: string; reviewId?: string };
+      reviewEvent?: string;
     };
+    expect(postedEvent.reviewEvent).toBe('REQUEST_CHANGES');
     expect(postedEvent.receipt?.actor).toBe('gru-bot');
-    expect(postedEvent.receipt?.event).toBe('COMMENTED');
+    expect(postedEvent.receipt?.event).toBe('CHANGES_REQUESTED');
     expect(postedEvent.receipt?.reviewId).toBe('9001');
     // T12: a lens that failed once then succeeded keeps its earlier failure
     // visible in the persisted lens note (security malformed once).
@@ -4652,7 +4660,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const repoPath = join(ghRoot, 'repo');
     execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
     execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://github.com/acme/fixture.git']);
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(ghLog)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  writeFileSync(${JSON.stringify(ghStore)}, JSON.stringify({ id: 9100, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));\n  process.exit(1);\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify(existsSync(${JSON.stringify(ghStore)}) ? [JSON.parse(readFileSync(${JSON.stringify(ghStore)}, 'utf8'))] : []));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${target}\t${'2'.repeat(40)}\n`)});\n}\n`, 'utf8');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(ghLog)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) {\n  const body = JSON.parse(input);\n  const enacted = body.event === 'APPROVE' ? 'APPROVED' : body.event === 'REQUEST_CHANGES' ? 'CHANGES_REQUESTED' : 'COMMENTED';\n  writeFileSync(${JSON.stringify(ghStore)}, JSON.stringify({ id: 9100, user: { login: 'gru-bot' }, state: enacted, commit_id: body.commit_id, body: body.body }));\n  process.exit(1);\n} else if (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify(existsSync(${JSON.stringify(ghStore)}) ? [JSON.parse(readFileSync(${JSON.stringify(ghStore)}, 'utf8'))] : []));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${target}\t${'2'.repeat(40)}\n`)});\n}\n`, 'utf8');
     chmodSync(binary, 0o755);
     // PRODUCTION adapter with the real GitHub poster; the GitLeg provider
     // fails loud if the adapter ever selects it for a github.com URL.
@@ -7451,10 +7459,13 @@ describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
     const postedEvent = ledger.latestRoundEvent(roundId, 'round.posted')?.payload as {
       receipt?: { reviewId?: string; actor?: string; event?: string; commitId?: string };
       publicationFile?: string; publicationSha256?: string;
+      reviewEvent?: string;
     };
-    // R16: the persisted writer receipt carries the actual actor/event.
+    // R16: the persisted writer receipt carries the actual actor/event, and
+    // the carried intent matches the whole-change READY the child submitted.
     expect(postedEvent.receipt?.actor).toBe('gru-bot');
-    expect(postedEvent.receipt?.event).toBe('COMMENTED');
+    expect(postedEvent.reviewEvent).toBe('APPROVE');
+    expect(postedEvent.receipt?.event).toBe('APPROVED');
     expect(postedEvent.receipt?.commitId).toBe(target);
     // Recovery completes the round from the persisted event WITHOUT
     // republishing and sweeps the crashed lane.
@@ -7473,9 +7484,10 @@ describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
     const recoveredEvent = ledger.latestRoundEvent(roundId, 'round.post-recovered')?.payload as {
       receipt?: { reviewId?: string; actor?: string; event?: string };
     };
+    // The recovered receipt still proves the FORMAL approval it enacted.
+    expect(recoveredEvent?.receipt?.event).toBe('APPROVED');
     expect(recoveredEvent?.receipt?.reviewId).toBe('9001');
     expect(recoveredEvent?.receipt?.actor).toBe('gru-bot');
-    expect(recoveredEvent?.receipt?.event).toBe('COMMENTED');
     expect(port.getWorktree(roundId)?.status).toBe('swept');
   }, 300_000);
 
@@ -8693,4 +8705,152 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       expect(reconciled, during).toEqual(during === 'resolution' ? [] : ['']);
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// Formal GitHub verdict publication from native judgments (j-1615)
+// ---------------------------------------------------------------------------
+
+describe('formal GitHub verdict publication from native judgments', () => {
+  /** The publisher fixtures enact the intent the host hands them, so every
+   * recorded receipt proves the state the round actually asked for. */
+  const intentPoster = () => ({
+    post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+      reviewId: '9100', actor: 'gru-bot',
+      event: enactedFor(call.reviewEvent), commitId: call.targetSha,
+      headSha: call.targetSha, baseSha: 'b'.repeat(40),
+      bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+    })),
+  });
+
+  /** The wanted formal event each round recorded, with its enacted receipt. */
+  function postedIntent(ledger: LedgerApi, roundId: string): { reviewEvent?: string; enacted?: string; reconciled?: boolean } {
+    const payload = ledger.latestRoundEvent(roundId, 'round.posted')?.payload as {
+      reviewEvent?: string; receipt?: { event?: string }; reconciled?: boolean;
+    } | undefined;
+    return { reviewEvent: payload?.reviewEvent, enacted: payload?.receipt?.event, reconciled: payload?.reconciled };
+  }
+
+  function scenario(name: string) {
+    const repo = makeFixtureRepo(`formal-verdict-${name}`);
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/formal-scenario']);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), `formal-${name}-port-`));
+    const artifacts = mkdtempSync(join(tmpdir(), `formal-${name}-artifacts-`));
+    const sessions = mkdtempSync(join(tmpdir(), `formal-${name}-sessions-`));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), `formal-${name}-db-`)));
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/formal-scenario', repo.head());
+    return { repo, root, artifacts, sessions, ledger, port };
+  }
+
+  let formalRunnerSeq = 0;
+  function runner(fix: ReturnType<typeof scenario>, poster: unknown, finding?: ReturnType<typeof groundedFinding>, overrides: Record<string, unknown> = {}) {
+    formalRunnerSeq += 1;
+    return new WaveRunner({
+      ledger: fix.ledger, worktrees: fix.port, poster,
+      reviewArtifactRoot: fix.artifacts, prHeadProbe: localHeadProbe('feature/formal-scenario'),
+      reviewPreflight: async () => ({
+        ok: true as const, failures: [],
+        reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+      }),
+      reviewRuntimeIdentity: () => ({ id: 'pi', version: 'test-runtime-v1' }),
+      reconcileReviewAgent: async () => true,
+      spawner: fakeWholeSpawner(mkdtempSync(join(fix.sessions, `spawner-${formalRunnerSeq}`)), {
+        childAnswer: () => '[]', specialists: [],
+        ...(finding !== undefined ? { leadFinding: finding } : {}),
+        ...overrides,
+      }).spawner,
+      ...extra,
+    });
+  }
+
+  it('publishes a real approval, a real change request, keeps a final-pass-debt READY a comment, and clears the change request with a later eligible READY (formal GitHub)', async () => {
+    const fix = scenario('lifecycle');
+    fix.ledger.addJob({ id: 'job-formal-lifecycle', repo: 'fixture', title: 'formal lifecycle', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus('job-formal-lifecycle', 'working');
+    settleLane(fix.ledger, 'job-formal-lifecycle');
+    fix.ledger.setJobPr('job-formal-lifecycle', 'https://github.com/acme/fixture/pull/61');
+    attachOrigin(fix.repo, 'feature/formal-scenario', fix.root);
+    const poster = intentPoster();
+
+    // Round 1 — whole change, READY: the eligible final judgment enacts a
+    // REAL approval bound to the frozen head.
+    const first = asWave(await runner(fix, poster, groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' })).runRound({ jobId: 'job-formal-lifecycle' }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+    expect(postedIntent(fix.ledger, first.round.id)).toEqual({ reviewEvent: 'APPROVE', enacted: 'APPROVED', reconciled: false });
+
+    // Round 2 — a confirmed blocker inside the delta: a REAL change request.
+    fix.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    fix.repo.git(['push', '--quiet', 'origin', 'feature/formal-scenario']);
+    const second = asWave(await runner(fix, poster, groundedFinding('lead', 'blocker', { location: 'src/main.ts:2', title: 'delta blocker' })).runRound({ jobId: 'job-formal-lifecycle' }));
+    expect(second.canonicalVerdict).toBe('NEEDS CHANGES');
+    expect(postedIntent(fix.ledger, second.round.id)).toEqual({ reviewEvent: 'REQUEST_CHANGES', enacted: 'CHANGES_REQUESTED', reconciled: false });
+
+    // Round 3 — the blocker is corrected in the delta and the lead confirms
+    // it fixed: a delta READY that still owes its final whole-change pass.
+    // The delivery stays a comment — never a premature formal approval — and
+    // the wave chains the final whole pass itself.
+    fix.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    fix.repo.git(['push', '--quiet', 'origin', 'feature/formal-scenario']);
+    const outcome = asWave(await runner(fix, poster, undefined, {
+      priorDisposition: () => [{ prior_index: 0, status: 'fixed', note: 'corrected in this delta' }],
+    }).runRound({ jobId: 'job-formal-lifecycle' }));
+    const rounds = fix.ledger.listRounds('job-formal-lifecycle');
+    expect(rounds).toHaveLength(4);
+    expect(outcome.round.seq).toBe(4);
+    const deltaRound = rounds.find((round) => round.seq === 3)!;
+    expect(fix.ledger.latestRoundEvent(deltaRound.id, 'round.perkins-review')?.payload)
+      .toMatchObject({ canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true });
+    expect(postedIntent(fix.ledger, deltaRound.id)).toEqual({ reviewEvent: 'COMMENT', enacted: 'COMMENTED', reconciled: false });
+
+    // Round 4 — the eligible final whole-change READY publishes a real
+    // approval, clearing the bot's earlier change-request state on the
+    // provider while both rounds keep their truthful review history.
+    expect(outcome.canonicalVerdict).toBe('READY TO MERGE');
+    expect(postedIntent(fix.ledger, outcome.round.id)).toEqual({ reviewEvent: 'APPROVE', enacted: 'APPROVED', reconciled: false });
+    // No round ever recorded a formal event its receipt did not prove.
+    for (const round of rounds) {
+      const recorded = postedIntent(fix.ledger, round.id);
+      expect(recorded.enacted).toBe(enactedFor(recorded.reviewEvent));
+    }
+  }, 240_000);
+
+  it('refuses a publisher receipt that did not enact the intended formal state, and never retries it (formal GitHub)', async () => {
+    const fix = scenario('wrong-state');
+    fix.ledger.addJob({ id: 'job-formal-wrong-state', repo: 'fixture', title: 'formal wrong state', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus('job-formal-wrong-state', 'working');
+    settleLane(fix.ledger, 'job-formal-wrong-state');
+    fix.ledger.setJobPr('job-formal-wrong-state', 'https://github.com/acme/fixture/pull/62');
+    attachOrigin(fix.repo, 'feature/formal-scenario', fix.root);
+    const escalations: string[] = [];
+    // The provider ignored the requested APPROVE event and enacted a plain
+    // comment: this delivery is NOT an approval, no matter what the body says.
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9400', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: fix.port, poster,
+      reviewArtifactRoot: fix.artifacts, prHeadProbe: localHeadProbe('feature/formal-scenario'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      spawner: fakeWholeSpawner(mkdtempSync(join(fix.sessions, 'wrong-state-spawner')), {
+        childAnswer: () => '[]', specialists: [],
+        leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+      }).spawner,
+    });
+    const outcome = asWave(await wave.runRound({ jobId: 'job-formal-wrong-state' }));
+    expect(outcome.canonicalVerdict).toBe('READY TO MERGE');
+    expect(outcome.verdict).toBeNull();
+    expect(outcome.posted).toBe(false);
+    expect(outcome.round.status).toBe('aborted');
+    expect(poster.post).toHaveBeenCalledTimes(1);
+    expect(fix.ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    expect(escalations.join('\n')).toContain('COMMENTED instead of the required APPROVED');
+  }, 120_000);
 });

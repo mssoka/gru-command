@@ -3357,3 +3357,101 @@ describe('startup wiring pin (src/main.ts)', () => {
     expect(main).not.toMatch(/poster:\s*new GhPrPoster\(/u);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Formal GitHub verdict publication (owner ruling j-1615)
+// ---------------------------------------------------------------------------
+
+describe('formal GitHub verdict publication', () => {
+  /** A provider review object the App bot enacted for `state`. */
+  const botReview = (state: string) => ({
+    id: 987654,
+    user: { login: 'perkins-review[bot]', type: 'Bot', id: 308038895 },
+    commit_id: HEAD,
+    state,
+    body: 'review body\n',
+  });
+
+  it('delivers a formal APPROVE bound to the frozen head and proves the APPROVED state (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('APPROVED') }) },
+    ]);
+    const receipt = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' });
+    expect(receipt).toEqual({ ...RECEIPT, event: 'APPROVED' });
+    const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
+    expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'APPROVE', commit_id: HEAD });
+  });
+
+  it('delivers a formal REQUEST_CHANGES bound to the frozen head and proves the CHANGES_REQUESTED state (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('CHANGES_REQUESTED') }) },
+    ]);
+    const receipt = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' });
+    expect(receipt).toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' });
+    const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
+    expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'REQUEST_CHANGES', commit_id: HEAD });
+  });
+
+  it('never credits a COMMENTED review beside an approval intent and never re-posts (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const { poster, calls } = posterWith(fixture, [
+      // The provider ignored the requested event and enacted a plain comment.
+      { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('COMMENTED') }) },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED')] }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' }))
+      .rejects.toThrow(/COMMENTED instead of the required APPROVED/u);
+    // One POST, one bounded lookup — the ambiguous outcome is never retried,
+    // and a comment review is never promoted into the intended approval.
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(1);
+  });
+
+  it('reconciles an approval against provider proof of the APPROVED state only (formal GitHub)', async () => {
+    const approvedFixture = bundleFixture();
+    const approved = posterWith(approvedFixture, [
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED'), botReview('APPROVED')] }) },
+    ]);
+    await expect(approved.poster.reconcile({ ...PR_INPUT, repoPath: repoPathOf(approvedFixture), reviewEvent: 'APPROVE' }))
+      .resolves.toEqual({ ...RECEIPT, event: 'APPROVED' });
+
+    // A covered list with only a comment review is an explicit UNRESOLVED,
+    // never a null absence certificate for an intended approval.
+    const commentedFixture = bundleFixture();
+    const commented = posterWith(commentedFixture, [
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED')] }) },
+    ]);
+    await expect(commented.poster.reconcile({ ...PR_INPUT, repoPath: repoPathOf(commentedFixture), reviewEvent: 'APPROVE' }))
+      .rejects.toThrow(/no provider-proved matching App review|unresolved/u);
+  });
+
+  it('keeps the GitLab note contract and refuses a formal intent a note cannot enact (formal GitHub)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'perkins-gl-formal-'));
+    try {
+      const repoPath = join(root, 'repo');
+      execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+      execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://gitlab.example.test/acme/widget.git']);
+      const calls: Array<{ url: string; method?: string }> = [];
+      const poster = new GitLabMrPoster({
+        token: 'glpat-token',
+        fetchImpl: async (url: string, init?: { method?: string }) => {
+          calls.push({ url, method: init?.method });
+          if (init?.method === 'POST' && url.includes('/notes')) {
+            return { ok: true, status: 201, text: async () => JSON.stringify({ id: 71, body: 'review body\n', author: { username: 'gru-bot' } }) };
+          }
+          if (url.endsWith('/user')) return { ok: true, status: 200, text: async () => JSON.stringify({ username: 'gru-bot' }) };
+          return { ok: true, status: 200, text: async () => JSON.stringify({ sha: HEAD, diff_refs: { base_sha: BASE } }) };
+        },
+      });
+      await expect(poster.post({
+        prUrl: 'https://gitlab.example.test/acme/widget/-/merge_requests/7', host: 'gitlab.example.test', repoPath,
+        body: 'review body\n', targetSha: HEAD, baseSha: BASE, reviewEvent: 'APPROVE',
+      })).rejects.toThrow(/cannot enact review event APPROVE/u);
+      expect(calls.filter((call) => call.method === 'POST')).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

@@ -298,7 +298,16 @@ delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
 than gating, since a pinned base is expected to trail a moving main), and
 the GitLab probe and poster resolve their token
-identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). GitHub
+identically (`GITLAB_TOKEN`, falling back to `GL_TOKEN`). On GitHub the
+delivery carries the eligible native judgment as its WANTED event: a
+completed whole-change READY that owes no final whole-change pass is
+published as a formal approval (`APPROVE`), a confirmed blocker set as a
+formal change request (`REQUEST_CHANGES`), and every other conclusive
+judgment — notably a delta READY still owing its final pass — as a
+commit-bound comment. The delivery receipt must prove the state the
+provider ACTUALLY enacted on the frozen head, so a wrong-state receipt
+never records a formal decision; GitLab notes stay non-formal by
+contract. GitHub
 **publication** authenticates through the `gh` CLI when no Perkins App
 bundle is installed; with a bundle, github.com publication is App-authored
 while the review preflight still probes remotes through `gh` (see
