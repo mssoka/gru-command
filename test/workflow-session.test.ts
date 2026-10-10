@@ -1,15 +1,21 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { createBmadRuntimeBinder, readBmadRuntimeBinding } from '../src/bmad/runtime.js';
 import { loadConfig } from '../src/config.js';
+import { DispatchService } from '../src/dispatch/service.js';
+import { WaveRunner } from '../src/dispatch/perkins.js';
+import { preflightFailure } from '../src/dispatch/review-path.js';
+import { UnavailableWorktreePort } from '../src/dispatch/worktree-port.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerDb } from '../src/ledger/db.js';
 import type { Role, RuntimeId } from '../src/config.js';
 import { managedSkillsPromptNote, preferManagedSkills } from '../src/runtime/managed-skills.js';
 import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
 import type { AgentHandle, AgentRuntime, SpawnOptions } from '../src/runtime/types.js';
 import { SessionStore } from '../src/sessions/store.js';
-import { createWorkflowSessionBinder, ownedFallbackReviewResources, registeredWorkflowLane } from '../src/workflows/session.js';
+import { createWorkflowSessionBinder, ownedFallbackReviewResources, registeredWorkflowLane, serviceWorkflowAuthority } from '../src/workflows/session.js';
 import { loadBundledWorkflowRuntime, renderWorkflow, writeWorkflowManifest } from '../src/workflows/runtime.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
 
@@ -19,14 +25,14 @@ afterAll(() => { for (const root of roots) rmSync(root, { recursive: true, force
 function fixture() { const f = makeWorkflowLane(); roots.push(f.root); return f; }
 const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
 
-function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>) {
+function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>, authority?: Pick<ReturnType<typeof serviceWorkflowAuthority>, 'workflowLaneFor' | 'workflowBuildFor'>) {
   const config = loadConfig({ GRU_COMMAND_HOME: f.dataDir });
   const seen: SpawnOptions[] = [];
   const adapter: AgentRuntime = {
     id: runtimeId, capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {},
     spawn: async (role: Role, opts: SpawnOptions = {}): Promise<AgentHandle> => {
       seen.push(opts);
-      return { id: opts.agentId ?? 'original-worker', role, sessionFile: join(f.dataDir, 'worker.jsonl'), capabilities: caps,
+      return { id: opts.agentId ?? `worker-${seen.length}`, role, sessionFile: join(f.dataDir, 'worker.jsonl'), capabilities: caps,
         health: () => ({ state: 'idle', lastActivity: null, sessionFile: join(f.dataDir, 'worker.jsonl') }),
         subscribe: () => () => {}, prompt: async () => {}, steer: async () => {}, followUp: async () => {},
         hasLiveProcess: () => false, isCompacting: () => false, dispose: async () => {},
@@ -37,7 +43,7 @@ function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>) {
     override runtimeIdFor(): RuntimeId { return runtimeId; }
     override runtimeFor(): AgentRuntime { return adapter; }
   }
-  const registry = new HostRegistry(serviceRegistryOptions({ config, store: new SessionStore(f.dataDir), workflowLaneFor: () => f.lane }));
+  const registry = new HostRegistry(serviceRegistryOptions({ config, store: new SessionStore(f.dataDir), ...(authority ?? { workflowLaneFor: () => f.lane }) }));
   return { seen, registry };
 }
 
@@ -65,7 +71,10 @@ describe('production owned workflow session binding', () => {
         skillsDir: managed.skillsDir, skills: managed.skills }, workflow.context, route);
       expect(existsSync(rendered.entrypoint)).toBe(true);
       const review = readFileSync(join(rendered.snapshotDir, 'skills/gc-build/review.md'), 'utf8');
-      expect(review).toContain('tracked child runs');
+      expect(review).toContain('service-tracked');
+      expect(review).toContain('POST /api/dispatch');
+      expect(review).toContain(`parent_job_id: "${f.lane.id}"`);
+      expect(review).toContain('recorded findings');
       expect(review).toContain('Fix all actionable in-scope defects');
       expect(readFileSync(join(rendered.snapshotDir, 'skills/gc-build/present.md'), 'utf8')).toContain('verification');
     }
@@ -81,6 +90,90 @@ describe('production owned workflow session binding', () => {
 
   it('Pi registry spawn carries exact identity/context and resumes the same cwd/worker', async () => assertHost('pi'));
   it('Claude registry spawn carries exact identity/context and resumes the same cwd/worker', async () => assertHost('claude-code'));
+
+  it('production dispatch/registry selects PR builds but excludes new review/artifact workflows', async () => {
+    const a = makeWorkflowLane('j-pr'); const b = makeWorkflowLane('j-review'); const c = makeWorkflowLane('j-artifact');
+    roots.push(a.root, b.root, c.root);
+    const db = new LedgerDb(a.dataDir);
+    const ledger = new LedgerApi(db.handle);
+    class Port extends UnavailableWorktreePort {
+      override async createJobWorktree(input?: { jobId: string }) {
+        if (input === undefined) throw new Error('fixture dispatch requires a job identity');
+        const f = [a, b, c].find((item) => item.lane.id === input.jobId)!;
+        return ledger.registerWorktree(f.lane);
+      }
+      override getWorktree(id: string) { return ledger.getWorktree(id); }
+      override listWorktrees(options?: { jobId?: string }) { return ledger.listWorktrees(options); }
+    }
+    const h = host('pi', a, serviceWorkflowAuthority(a.dataDir, () => ledger));
+    const dispatch = new DispatchService({ ledger, worktrees: new Port(), spawner: (role, options) => h.registry.spawn(role, options) });
+    try {
+      for (const [f, deliverable] of [[a, 'pr'], [b, 'review'], [c, 'artifact']] as const) {
+        const outcome = await dispatch.dispatch({ jobId: f.lane.id, repoPath: f.lane.repoPath,
+          title: deliverable, briefing: `bounded ${deliverable}`, deliverable,
+          ...(deliverable === 'review' ? { targetRef: 'https://git.example.invalid/a/b/pull/1', targetSha: f.lane.sha } : {}),
+        });
+        expect(await outcome.settled).toEqual({ ok: true });
+      }
+      expect(h.seen[0]!.managedSkills!.workflow!.context.jobId).toBe(a.lane.id);
+      expect(h.seen[1]!.managedSkills).toBeUndefined();
+      expect(h.seen[2]!.managedSkills).toBeUndefined();
+      expect(h.seen.map((opts) => opts.cwd)).toEqual([a.lane.path, b.lane.path, c.lane.path]);
+      expect(readBmadRuntimeBinding(b.lane.path, join(a.dataDir, 'bmad-runtime'))).toBeNull();
+      expect(readBmadRuntimeBinding(c.lane.path, join(a.dataDir, 'bmad-runtime'))).toBeNull();
+    } finally { await h.registry.dispose(); db.close(); }
+  });
+
+  it('production fallback gates select each registered job retained package and private report root', async () => {
+    const a = makeWorkflowLane('j-gate-a'); const b = makeWorkflowLane('j-gate-b'); roots.push(a.root, b.root);
+    const db = new LedgerDb(a.dataDir);
+    const ledger = new LedgerApi(db.handle);
+    for (const f of [a, b]) {
+      ledger.addJob({ id: f.lane.id, repo: 'app', title: 'review', baseBranch: 'main' });
+      ledger.registerWorktree(f.lane);
+      ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.lane.id, payload: {} });
+    }
+    const first = serviceWorkflowAuthority(a.dataDir, () => ledger).resolveReviewResources(a.lane.id);
+    const pkg = join(b.root, 'package-b');
+    cpSync(join(repoRoot, 'resources/gc-workflows'), join(pkg, 'resources/gc-workflows'), { recursive: true });
+    writeWorkflowManifest(pkg, 2);
+    const authority = serviceWorkflowAuthority(a.dataDir, () => ledger, pkg);
+    const second = authority.resolveReviewResources(b.lane.id);
+    const seen: SpawnOptions[] = [];
+    class Port extends UnavailableWorktreePort {
+      override getWorktree(id: string) { return ledger.getWorktree(id); }
+      override listWorktrees() { return ledger.listWorktrees(); }
+    }
+    const wave = new WaveRunner({ ledger, worktrees: new Port(),
+      reviewPreflight: async () => ({ ok: false, failures: [preflightFailure('review-policy', 'fixture disabled')] }),
+      fallbackGate: { resolveReviewResources: authority.resolveReviewResources, fixDirectiveSink: async () => ({ delivered: false }) },
+      spawner: async (role, opts = {}) => {
+        seen.push(opts);
+        return { id: `fallback-${seen.length}`, role, sessionFile: null, capabilities: caps,
+          reviewTools: opts.isolatedReview?.nativeTools?.map((tool) => tool.name),
+          prompt: async () => { await opts.isolatedReview!.nativeTools![0]!.execute({ findings: [] }); },
+          subscribe: () => () => {}, steer: async () => {}, followUp: async () => {}, dispose: async () => {},
+          health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
+        };
+      },
+    });
+    try {
+      for (const [f, resources] of [[a, first], [b, second]] as const) {
+        const outcome = await wave.runRound({ jobId: f.lane.id });
+        if (!('route' in outcome)) throw new Error('expected fallback');
+        expect(outcome.clearToMerge).toBe(true);
+        expect(outcome.reportFiles[0]).toContain(join(resources.artifactRoot, 'fallback-gate'));
+        expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
+      }
+      expect(first.artifactRoot).not.toBe(second.artifactRoot);
+      expect(seen[0]!.isolatedReview!.systemPrompt).toContain(first.skillPath);
+      expect(seen[1]!.isolatedReview!.systemPrompt).toContain(second.skillPath);
+      expect(readBmadRuntimeBinding(a.lane.path, join(a.dataDir, 'bmad-runtime'))!.id).toBe(loadBundledWorkflowRuntime().id);
+      expect(readBmadRuntimeBinding(b.lane.path, join(a.dataDir, 'bmad-runtime'))!.id).toBe(loadBundledWorkflowRuntime(pkg).id);
+      expect(authority.resolveReviewResources(a.lane.id)).toEqual(first);
+      expect(() => authority.resolveReviewResources('j-missing')).toThrow(/live registered job worktree/u);
+    } finally { await wave.shutdown(); db.close(); }
+  });
 
   it('ambient name collisions/malformed BMAD answers cannot replace authority or write paths', () => {
     const f = fixture();
@@ -129,6 +222,27 @@ describe('production owned workflow session binding', () => {
     expect(() => bind({ cwd: f.lane.path })).toThrow(/restore that exact retained package/u);
   });
 
+  it('retains historical report/artifact bindings even when the new build predicate excludes them', () => {
+    const f = fixture();
+    const old = createBmadRuntimeBinder(join(f.dataDir, 'bmad-runtime'))(f.lane.path);
+    const bind = createWorkflowSessionBinder(f.dataDir, () => f.lane, undefined, () => false);
+    expect(bind({ resumeFile: '/historical-report.jsonl' })).toEqual({ cwd: f.lane.path, managedSkills: old });
+    rmSync(old.root, { recursive: true });
+    expect(() => bind({ resumeFile: '/historical-report.jsonl' })).toThrow(/restore that exact retained package/u);
+  });
+
+  it('rejects invalid artifact paths before publishing a new lane workflow binding', () => {
+    const f = fixture();
+    symlinkSync(f.dataDir, join(f.lane.path, 'gru-output'));
+    expect(() => createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path })).toThrow(/symlink/u);
+    expect(readBmadRuntimeBinding(f.lane.path, join(f.dataDir, 'bmad-runtime'))).toBeNull();
+    rmSync(join(f.lane.path, 'gru-output'));
+    const pkg = join(f.root, 'package-b');
+    cpSync(join(repoRoot, 'resources/gc-workflows'), join(pkg, 'resources/gc-workflows'), { recursive: true });
+    writeWorkflowManifest(pkg, 2);
+    expect(createWorkflowSessionBinder(f.dataDir, () => f.lane, pkg)({ cwd: f.lane.path }).managedSkills!.runtimeId).toBe(loadBundledWorkflowRuntime(pkg).id);
+  });
+
   it('isolates projects/jobs, rejects missing/unsafe context and preserves bounded child/report tasks', () => {
     const a = fixture(); const b = fixture();
     const aa = createWorkflowSessionBinder(a.dataDir, () => a.lane)({ cwd: a.lane.path }).managedSkills!;
@@ -152,6 +266,9 @@ describe('production owned workflow session binding', () => {
     expect(resolve({ resumeFile: records[0]!.sessionFile })).toEqual(f.lane);
     expect(resolve({ cwd: f.lane.path })).toEqual(f.lane);
     expect(() => resolve({ agentId: 'worker', cwd: '/foreign' })).toThrow(/conflicts/u);
+    expect(() => resolve({ resumeFile: '/private/unowned.jsonl', cwd: f.lane.path })).toThrow(/registered session owner/u);
+    expect(() => resolve({ resumeFile: '/private/unowned.jsonl', agentId: 'worker' })).toThrow(/registered session owner/u);
+    expect(() => resolve({ resumeFile: records[0]!.sessionFile, agentId: 'unknown' })).toThrow(/identity conflicts/u);
     records.push({ id: 'other', jobId: 'j-other', sessionFile: records[0]!.sessionFile });
     expect(() => resolve({ resumeFile: records[0]!.sessionFile })).toThrow(/ambiguous/u);
     expect(resolve({ cwd: join(f.lane.path, '..', 'guessed-job') })).toBeNull();

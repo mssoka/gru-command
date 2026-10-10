@@ -8,9 +8,19 @@ new files. Review actual code and executed evidence, not the implementer's repor
 
 ## Required reviewers
 
-Launch fresh, context-free reviewers as actual tracked child runs or independent
-terminal sessions. The normal route uses all three lenses in parallel when the
-runtime supports it:
+For a GC-assigned job, launch fresh, context-free reviewers as service-tracked
+commissioned review jobs (megaminions), never generic child workers or untracked
+terminal agents. Use `POST /api/dispatch` with `deliverable: "review"`,
+`parent_job_id: "{{context.jobId}}"`, `target_ref` naming this job's ordinary PR and
+`target_sha` naming the exact committed candidate head. If needed, commit the
+verified candidate and publish its reviewable ordinary PR before commissioning;
+never merge it. Retain each reviewer job identity and its recorded findings
+handback/disposition using the shipped minion playbook.
+
+Independent terminal sessions are permitted only for explicit owner-directed
+external development outside a GC job, with durable session/pane receipts; a GC
+minion must not use this exception. The normal route uses all three lenses in
+parallel when the runtime supports it:
 
 - [[gc-resource:skills/gc-build/review-prompts/adversarial.md]] — diff and repository,
   without the author's explanation or self-review.

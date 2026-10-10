@@ -1,6 +1,6 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -8,6 +8,7 @@ import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
 import { RuntimeRegistry, applyThinkingFallback, serviceRegistryOptions } from '../src/runtime/registry.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
+import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
@@ -3295,6 +3296,32 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
     await expect(
       fx.runtime.spawn('minion', { cwd: project, roleTools: ['read', 'undeclared-tool'] }),
     ).rejects.toThrowError(/role tool override names "undeclared-tool"/);
+  });
+
+  it('default fallback reaches the real Pi SDK with read-only tools and host-captured findings', async () => {
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'fallback-submit', name: 'gc_submit_fallback_findings', args: { findings: [] } } },
+      { deltas: ['DONE'] },
+    ]);
+    const dataDir = realpathSync(fx.home);
+    const h = makeFallbackRuntimeHarness((role, opts) => registry.spawn(role, opts), dataDir);
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+      workflowLaneFor: h.authority.workflowLaneFor, workflowBuildFor: h.authority.workflowBuildFor }),
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback');
+      expect(outcome.clearToMerge).toBe(true);
+      const options = twinGate.lastOptions as { tools: string[]; customTools: { name: string }[]; noTools: string };
+      expect(options.noTools).toBe('all');
+      expect(options.tools).toEqual(['review_read', 'review_grep', 'review_find', 'review_ls', 'gc_submit_fallback_findings']);
+      expect(options.customTools.map((tool) => tool.name)).toEqual(options.tools);
+      expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
+      expect(outcome.reportFiles[0]).toContain(join(dataDir, 'projects'));
+      expect(readFileSync(join(h.lane.path, 'candidate.ts'), 'utf8')).toBe('export const candidate = 1;\n');
+      expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    } finally { await h.wave.shutdown(); await registry.dispose(); await fx.runtime.dispose(); h.close(); }
   });
 
   it('fails loud on a relative or nonexistent cwd (never a silent fallback)', async () => {

@@ -22,15 +22,22 @@ adversarial review helper. Reports stay under the same private job operational
 root. Historical build lanes retain their original bindings and use an owned
 fallback helper without reinterpreting their historical build/output contract;
 their existing private review store remains addressable. The fallback runtime
-runs one bounded report task, not build onboarding or another review orchestrator.
-Missing owned resources record an actionable blocked result, never borrow an
+runs one ambient-free read-only report task using the existing isolated review
+host on both adapters. Its only write capability is `gc_submit_fallback_findings`,
+a host-bound private report submission; ordinary shell/Edit/Write tools are absent.
+The host supplies the verified helper and canonical base/HEAD/complete working-diff
+hash. Oversize input blocks before spawning, never passes a truncated diff.
+Missing owned resources or the required report-tool capability record an actionable
+blocked result, never borrow an
 ambient skill. Stable `bmad-review-fallback` API/event identifiers are retained;
 this is routing compatibility, not an external BMAD dependency.
 
 ## Supported delivery paths
 
 - `gc-build`: normal route — investigate/plan, implement, independent tracked
-  three-lens review, reasoned fixes, verification and ordinary PR handoff.
+  three-lens review via commissioned service review jobs, reasoned fixes,
+  verification and ordinary PR handoff. Generic child workers/untracked terminals
+  do not replace a GC job's commissioned review handback/disposition.
 - Small-change route — reduced planning plus at least one fresh independent
   adversarial reviewer, reasoned fixes, verification and ordinary PR handoff.
 - Planning and review helper entrypoints are also independently resolvable.

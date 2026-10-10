@@ -92,7 +92,7 @@ import {
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
 import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
-import { createWorkflowSessionBinder, ownedFallbackReviewResources, registeredWorkflowLane } from './workflows/session.js';
+import { serviceWorkflowAuthority } from './workflows/session.js';
 
 /** The process LISTENING on the configured instance port when it is not us
  * (null: free, ours, ephemeral, or the platform has no probe). Port-squat
@@ -517,17 +517,14 @@ async function main(): Promise<number> {
   // BEFORE the server so /health can answer with real signals from the
   // first request. Growth findings also hit the log (SPEC ruling 12).
   const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
-  // GC-owned execution; the ledger-backed callback is invoked only on spawn,
-  // after the ledger has opened. Existing historical lane bindings win unchanged.
+  // Lazy authoritative records preserve boot order; dispatch and fallback use
+  // the same tested assignment and deliverable-selection wiring.
+  const workflowAuthority = serviceWorkflowAuthority(config.dataDir, () => ledger);
   const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
-    workflowLaneFor: (options) => registeredWorkflowLane(options, ledger, ledger),
-    workflowBuildFor: (lane) => {
-      const job = ledger.getJob(lane.id);
-      if (job === null) throw new Error(`GC workflow requires the registered job record for ${lane.id}`);
-      return job.deliverable === null || job.deliverable === 'pr';
-    },
+    workflowLaneFor: workflowAuthority.workflowLaneFor,
+    workflowBuildFor: workflowAuthority.workflowBuildFor,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   }));
   const growth = registry.boot();
@@ -1222,8 +1219,6 @@ async function main(): Promise<number> {
       requeued: pipelineRecovery.requeued,
     });
   }
-  const bindFallbackWorkflow = createWorkflowSessionBinder(config.dataDir,
-    (options) => registeredWorkflowLane(options, ledger, ledger));
   const wave = createServiceReviewWave({ registry, options: {
     ledger,
     worktrees: worktreeManager,
@@ -1241,11 +1236,7 @@ async function main(): Promise<number> {
     evidenceUploadsDir: join(config.dataDir, 'uploads'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
-      resolveReviewResources: (jobId) => {
-        const lane = worktreeManager.getWorktree(jobId);
-        if (lane === null) throw new Error(`GC fallback review requires the registered job worktree for ${jobId}`);
-        return ownedFallbackReviewResources(bindFallbackWorkflow({ cwd: lane.path }), config.dataDir);
-      },
+      resolveReviewResources: workflowAuthority.resolveReviewResources,
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         workerGate: pacing.gate,
         retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),

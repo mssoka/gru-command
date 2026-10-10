@@ -6033,6 +6033,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Make the fallback turn reject after writing its report (a transport
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
+    missingReportTool?: boolean;
     /** Hold every fallback minion turn open until the test releases it, so a
      * transport wait slice can expire while the review is genuinely live. */
     promptHold?: { readonly release: Promise<void> };
@@ -6082,14 +6083,12 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         id: `prod-minion-${spawnCwds.length}`,
         sessionFile: file,
         capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
-        reviewIsolation: undefined,
+        reviewIsolation: true,
+        reviewTools: options.missingReportTool === true ? [] : spawnOptions.isolatedReview?.nativeTools?.map((tool) => tool.name),
         async prompt(text: string) {
           prompts.push(text);
-          // The minion writes the findings JSON to the requested report file
-          const reportMatch = /Write your findings as ONE JSON array to exactly this file: (.+)$/mu.exec(text);
-          if (reportMatch !== null) {
-            writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
-          }
+          // Exercise the host closure, never grant the fake model file writes.
+          await spawnOptions.isolatedReview!.nativeTools![0]!.execute({ findings: options.findingToWrite });
           if (options.promptHold !== undefined) await options.promptHold.release;
           if (options.failPrompt === true) throw new Error('429 too many requests');
         },
@@ -6153,6 +6152,28 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     expect(h.prompts).toEqual([]);
     expect(h.ledger.listRounds(h.job.id)).toEqual([]);
     expect(h.ledger.listEvents().some((event) => event.kind === 'job.fallback-review' && event.jobId === h.job.id)).toBe(true);
+  });
+
+  it('blocks oversized complete diffs before spawning rather than passing a truncated prefix', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    h.repo.commitFile('large.md', `start\n${'x'.repeat(600 * 1024)}\ntail-defect\n`);
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('no truncated review can pass');
+    expect(h.spawnCwds).toEqual([]);
+    expect(h.prompts).toEqual([]);
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+  });
+
+  it('blocks a fallback runtime that did not actually expose its scoped report tool', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], missingReportTool: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('required host-bound findings tool');
+    expect(h.prompts).toEqual([]);
+    expect(h.disposed).toHaveLength(1);
   });
 
   it('spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean', async () => {
@@ -6296,11 +6317,12 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: async (role) => {
+      spawner: async (role, options = {}) => {
         const file = join(sessions, 'prod-nres.jsonl');
         writeFileSync(file, '', 'utf8');
         return {
           role, id: 'prod-nres', sessionFile: file,
+          reviewTools: options.isolatedReview?.nativeTools?.map((tool) => tool.name),
           capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
           async prompt(text: string) { promptText = text; /* deliberately does NOT write the report */ },
           async steer() {}, async followUp() {},

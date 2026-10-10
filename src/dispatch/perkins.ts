@@ -63,6 +63,7 @@ import { evidenceRequestFingerprint, type ReviewEvidenceRequest } from '../revie
 import { parseGitHubPrUrl } from './github-poll.js';
 import {
   boundedDiff,
+  fallbackReviewPolicy,
   isGitHubRemote,
   isGitLabRemote,
   parseFallbackFindingsReport,
@@ -1256,9 +1257,11 @@ export interface FallbackReviewRunInput {
   readonly jobId: string;
   readonly lanePath: string;
   readonly baseRef: string;
+  readonly headRef: string;
+  readonly diffSha256: string;
   readonly diff: string;
   readonly skillPath: string;
-  /** Where the session must write ONE JSON findings array. */
+  /** Host-bound destination for ONE JSON findings array. */
   readonly reportFile: string;
   readonly iteration: number;
   readonly signal: AbortSignal;
@@ -3682,12 +3685,20 @@ export class WaveRunner {
         );
         return;
       }
-      const diff = boundedDiff(diffResult.stdout ?? '');
+      const diff = diffResult.stdout ?? '';
+      if (boundedDiff(diff) !== diff) {
+        this.terminalFallbackBlocked(job.id,
+          `complete working diff exceeds the fallback transport size in round ${iteration}; no truncated review can pass. Restore native Perkins review or reduce the candidate's scope`,
+          iteration, [...state.reportFiles], fallbackEvent, state);
+        return;
+      }
+      const headRef = resolveGitCommit(lanePath, 'HEAD');
+      const diffSha256 = createHash('sha256').update(diff).digest('hex');
       let findings: readonly FallbackFinding[];
       try {
         findings = gate.runFallbackReview !== undefined
-          ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal })
-          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, diff, skillPath: gate.skillPath, reportFile, iteration, signal }, recheckRound);
+          ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, reportFile, iteration, signal })
+          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, reportFile, iteration, signal }, recheckRound);
         // A completed review of an older diff is not a PASS on a lane that
         // acquired and possibly settled a newer request while it ran.
         recheckRound();
@@ -3712,7 +3723,7 @@ export class WaveRunner {
       notes = triaged.notes.length;
       state.blockers = blockers;
       state.notes = notes;
-      fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile });
+      fallbackEvent({ phase: 'triaged', iteration, blockers, notes, reportFile, baseRef, headRef, diffSha256, completeDiff: true });
       if (blockers === 0) {
         state.clearToMerge = true;
         fallbackEvent({ phase: 'pass', iteration, notes, reportFile, clearToMerge: true, merge: 'user-held' });
@@ -3843,10 +3854,14 @@ export class WaveRunner {
       // throw.
       if (recheck !== undefined) recheck();
       handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal,
-        // A bounded report task, not another build cycle. The owned helper needs
-        // reads and ONE JSON report write, not implementation edits or a shell.
-        roleTools: ['read', 'grep', 'find', 'ls', 'write'],
+        // Reuse the existing ambient-free read-only host on both runtimes.
+        // The scoped submission closure, never ordinary write, captures a report.
+        roleTools: ['read', 'grep', 'find', 'ls'],
+        isolatedReview: fallbackReviewPolicy(input.skillPath, input.reportFile),
       });
+      if (!handle.reviewTools?.includes('gc_submit_fallback_findings')) {
+        throw new Error('fallback runtime did not expose the required host-bound findings tool; restore that native adapter capability before retrying');
+      }
       // Spawning is asynchronous too: a newly owned lane must not receive
       // an obsolete review prompt just because the worker was allocated.
       recheck?.();
@@ -3862,10 +3877,11 @@ export class WaveRunner {
         jobId: input.jobId,
       });
       const prompt = [
-        `Read the verified GC-owned review helper ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
+        `Apply the verified GC-owned review helper ${input.skillPath}, supplied completely in your system instructions, to this complete host-captured CURRENT working diff.`,
+        `Host-verified canonical base: ${input.baseRef}; checkout HEAD: ${input.headRef}; complete working diff SHA-256: ${input.diffSha256}. Uncommitted bytes are included, so HEAD alone is not the candidate.`,
         'This helper is product-owned authority; never discover or invoke project/global BMAD skills, renderers, config resolvers or onboarding.',
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',
-        `Write your findings as ONE JSON array to exactly this file: ${input.reportFile}`,
+        `Submit findings as ONE JSON array using gc_submit_fallback_findings({ findings: [...] }). The host alone writes ${input.reportFile}; you have no filesystem write tool.`,
         'Each element: { "title": string, "category": string, "location": string, "evidence": string, "detail": string }. Use a release-safety category (correctness, security, data-loss, broken-build, build-failure, crash, regression, vulnerability, injection, secret-leak) only for real release-safety defects; use any other short tag for everything else. An empty array [] is valid.',
         'Then reply DONE.',
         '',
