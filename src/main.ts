@@ -1,10 +1,10 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
-import { RuntimeRegistry } from './runtime/registry.js';
+import { RuntimeRegistry, serviceRegistryOptions } from './runtime/registry.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
 import { SessionStore } from './sessions/store.js';
 import { LedgerDb } from './ledger/db.js';
@@ -37,6 +37,7 @@ import {
 } from './provider-recovery/composition.js';
 import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js';
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
+import { GhRepoOverviewApi, ManagedRepoOverviewTracker } from './repos/overview.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
@@ -91,20 +92,8 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
-
-/** Locate the installed bmad-review skill: check both the pi agent dir
- * and ~/.agents (the BMAD default install root) for maximum compatibility. */
-function resolveBmadReviewSkillPath(): string {
-  for (const base of [getAgentDir(), join(homedir(), '.agents')]) {
-    const candidate = join(base, 'skills', 'bmad-review', 'SKILL.md');
-    if (existsSync(candidate)) return candidate;
-  }
-  // Return the pi agent dir path as the default — the gate will report
-  // 'not installed' if neither location has it.
-  return join(getAgentDir(), 'skills', 'bmad-review', 'SKILL.md');
-}
+import { serviceWorkflowAuthority } from './workflows/session.js';
 
 /** The process LISTENING on the configured instance port when it is not us
  * (null: free, ours, ephemeral, or the platform has no probe). Port-squat
@@ -358,6 +347,7 @@ async function main(): Promise<number> {
     pipeline?: PipelineService;
     deployDrift?: DeployDriftTracker;
     directiveProgress?: DirectiveProgressService;
+    repoOverview?: ManagedRepoOverviewTracker;
   } = {};
   let shuttingDown = false;
   /** Service-stopping signal (pacing): aborts QUEUED admission waits and
@@ -481,6 +471,7 @@ async function main(): Promise<number> {
           }
         }
         state.deployDrift?.stop();
+        state.repoOverview?.stop();
         if (state.registry !== undefined) {
           try {
             await state.registry.dispose();
@@ -529,11 +520,17 @@ async function main(): Promise<number> {
   // BEFORE the server so /health can answer with real signals from the
   // first request. Growth findings also hit the log (SPEC ruling 12).
   const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
-  const registry = new RuntimeRegistry({
+  // Lazy authoritative records preserve boot order; dispatch and fallback use
+  // the same tested assignment and deliverable-selection wiring.
+  const workflowAuthority = serviceWorkflowAuthority(config.dataDir, () => ledger);
+  const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
+    workflowLaneFor: workflowAuthority.workflowLaneFor,
+    workflowBuildFor: workflowAuthority.workflowBuildFor,
+    workflowAgentFor: workflowAuthority.workflowAgentFor,
     log: (level, msg, fields) => logger.log(level, msg, fields),
-  });
+  }));
   const growth = registry.boot();
   state.store = store;
   state.registry = registry;
@@ -604,6 +601,16 @@ async function main(): Promise<number> {
     build: readBuildInfo(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Managed repository overview (owner-approved compact rows A): the
+  // read-only GitHub projection of the configured managed-repo registry.
+  // Own bounded cadence (never per-render, never per-tab), coalesced,
+  // server-side through the existing gh auth seam; the snapshot carries
+  // the cached view. Rows are absent (null) until the first pass runs.
+  const repoOverview = new ManagedRepoOverviewTracker({
+    workspaceRoot: config.workspaceRoot,
+    api: new GhRepoOverviewApi(),
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
   // Late-bound (the verification server lands below) — same pattern as
   // supervisionFor / decisionsStatus above.
   let verificationView: () => VerificationQueueView | null = () => null;
@@ -653,6 +660,7 @@ async function main(): Promise<number> {
       generation: 0,
     },
     buildDrift: () => deployDrift.view(),
+    repoOverview: () => repoOverview.view(),
     verifyQueue: () => verificationView(),
     pipeline: () => pipelineView(),
     log: (level, msg, fields) => logger.log(level, msg, fields),
@@ -663,6 +671,8 @@ async function main(): Promise<number> {
   });
   deployDrift.start();
   state.deployDrift = deployDrift;
+  repoOverview.start();
+  state.repoOverview = repoOverview;
 
   // Chat (E4): the single Gru session behind /ws. The durable frame log
   // loads and boot-settles BEFORE the HTTP server accepts anything (r1
@@ -1230,7 +1240,7 @@ async function main(): Promise<number> {
     evidenceUploadsDir: join(config.dataDir, 'uploads'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
-      skillPath: resolveBmadReviewSkillPath(),
+      resolveReviewResources: workflowAuthority.resolveReviewResources,
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         workerGate: pacing.gate,
         retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),

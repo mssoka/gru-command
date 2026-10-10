@@ -375,6 +375,83 @@ export interface PipelineView {
   readonly pending: number;
 }
 
+/** Managed repository overview (owner-approved compact rows A): one
+ * row per configured managed repository. Server-computed and additive —
+ * absent/null on pre-upgrade servers and until the tracker's first
+ * refresh pass, in which case the board hides the section entirely.
+ * Counts are repo-wide exact totals (issues excluding PRs); the run is
+ * the newest Actions run on the repository's discovered default branch,
+ * never deployment health. */
+export const REPO_OVERVIEW_RUN_STATES = [
+  'passed',
+  'failed',
+  'timed-out',
+  'startup-failure',
+  'action-required',
+  'cancelled',
+  'skipped',
+  'neutral',
+  'stale-run',
+  'running',
+  'queued',
+  'no-workflow',
+  'never-run',
+  'no-branch',
+  'unavailable',
+  'unknown',
+] as const;
+
+export type RepoOverviewRunState = (typeof REPO_OVERVIEW_RUN_STATES)[number];
+
+export const REPO_OVERVIEW_FRESHNESS = ['unchecked', 'fresh', 'stale', 'unavailable'] as const;
+
+export type RepoOverviewFreshness = (typeof REPO_OVERVIEW_FRESHNESS)[number];
+
+/** One observed run. `status`/`conclusion` are raw provider strings
+ * (untrusted display text); `url` is https on the repository host only. */
+export interface RepoOverviewRunView {
+  readonly state: RepoOverviewRunState;
+  readonly status: string | null;
+  readonly conclusion: string | null;
+  readonly workflow: string | null;
+  readonly branch: string | null;
+  readonly runNumber: number | null;
+  readonly url: string | null;
+  /** Actual provider creation time (the newest-run selection key). */
+  readonly runCreatedAt: string | null;
+  /** Actual attempt start; null while queued. Distinct from creation. */
+  readonly runStartedAt: string | null;
+  readonly runUpdatedAt: string | null;
+}
+
+export interface RepoOverviewRowView {
+  /** Stable registry identity (repository directory name). */
+  readonly key: string;
+  readonly displayName: string;
+  readonly linked: boolean;
+  /** The GitHub host the identity was read from (null when not linked). */
+  readonly host: string | null;
+  readonly link: string | null;
+  readonly linkReason: string | null;
+  readonly fullName: string | null;
+  /** Exact repo-wide open pull-request count (null = not proven). */
+  readonly openPrs: number | null;
+  /** Exact open-issue count EXCLUDING pull requests (null = not proven). */
+  readonly openIssues: number | null;
+  readonly run: RepoOverviewRunView | null;
+  readonly freshness: RepoOverviewFreshness;
+  /** Last successful complete observation (ISO); null = none yet. */
+  readonly checkedAt: string | null;
+  /** Last observation attempt (ISO); null = never attempted. */
+  readonly lastAttemptAt: string | null;
+  /** Last failed attempt detail; null = clean. */
+  readonly error: string | null;
+}
+
+export interface RepoOverviewView {
+  readonly rows: readonly RepoOverviewRowView[];
+}
+
 export interface BoardSnapshot {
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
@@ -416,6 +493,11 @@ export interface BoardSnapshot {
   /** FOR YOU PR rows (owner approval 2026-09-28); absent on pre-upgrade
   * servers (validator tolerates; the band renders ack rows only). */
   readonly ownerPrs?: readonly OwnerPrView[] | null;
+  /** Managed repository overview (owner-approved compact rows A); absent
+  * on pre-upgrade servers and null until the tracker's first refresh
+  * pass (the board then hides the section rather than claiming an empty
+  * registry). A present block is validated strictly below. */
+  readonly repoOverview?: RepoOverviewView | null;
   /** Issue #161: tracker-wide child counters; absent on pre-upgrade
   * servers (the strip then renders no child numbers). */
   readonly children?: ChildWorkerCounts | null;
@@ -865,6 +947,157 @@ function isOwnerPrView(value: unknown): value is OwnerPrView {
   }
 }
 
+/** Managed repository overview: known run states and freshness classes —
+ * an unknown string is a server bug, never a silently tolerated value. */
+function isRepoOverviewRunState(value: unknown): value is RepoOverviewRunState {
+  return typeof value === 'string' && (REPO_OVERVIEW_RUN_STATES as readonly string[]).includes(value);
+}
+
+function isRepoOverviewFreshness(value: unknown): value is RepoOverviewFreshness {
+  return typeof value === 'string' && (REPO_OVERVIEW_FRESHNESS as readonly string[]).includes(value);
+}
+
+function isNullableIso(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && Number.isFinite(Date.parse(value)));
+}
+
+function isSafeCountOrNull(value: unknown): value is number | null {
+  return value === null || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0);
+}
+
+/** hrefs are https-or-nothing (the same fail-closed rule as ownerPrs). */
+function isHttpsUrlOrNull(value: unknown): value is string | null {
+  if (value === null) return true;
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    // Credentials and alternate ports never validate (fail closed).
+    return url.protocol === 'https:' && url.username === '' && url.password === '' && url.port === '';
+  } catch {
+    return false;
+  }
+}
+
+function isNonEmptyOrNull(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && value !== '');
+}
+
+function isRepoOverviewRunView(value: unknown): value is RepoOverviewRunView {
+  return (
+    isRecord(value) &&
+    isRepoOverviewRunState(value.state) &&
+    isNonEmptyOrNull(value.status) &&
+    isNonEmptyOrNull(value.conclusion) &&
+    isNonEmptyOrNull(value.workflow) &&
+    isNonEmptyOrNull(value.branch) &&
+    (value.runNumber === null ||
+      (typeof value.runNumber === 'number' && Number.isSafeInteger(value.runNumber) && value.runNumber >= 0)) &&
+    isHttpsUrlOrNull(value.url) &&
+    isNullableIso(value.runCreatedAt) &&
+    isNullableIso(value.runStartedAt) &&
+    isNullableIso(value.runUpdatedAt)
+  );
+}
+
+function isSafeHost(value: unknown): value is string {
+  return typeof value === 'string' && value !== '' && /^[A-Za-z0-9.-]+$/u.test(value);
+}
+
+function isRepoOverviewRowView(value: unknown): value is RepoOverviewRowView {
+  if (
+    !isRecord(value) ||
+    typeof value.key !== 'string' ||
+    value.key === '' ||
+    typeof value.displayName !== 'string' ||
+    !hasVisibleCharacters(value.displayName) ||
+    typeof value.linked !== 'boolean' ||
+    !(value.host === null || isSafeHost(value.host)) ||
+    !isHttpsUrlOrNull(value.link) ||
+    (value.linkReason !== null && typeof value.linkReason !== 'string') ||
+    (value.fullName !== null && typeof value.fullName !== 'string') ||
+    !isSafeCountOrNull(value.openPrs) ||
+    !isSafeCountOrNull(value.openIssues) ||
+    (value.run !== null && !isRepoOverviewRunView(value.run)) ||
+    !isRepoOverviewFreshness(value.freshness) ||
+    !isNullableIso(value.checkedAt) ||
+    !isNullableIso(value.lastAttemptAt) ||
+    (value.error !== null && typeof value.error !== 'string')
+  ) {
+    return false;
+  }
+  // Empty strings on the disclosure fields would render dangling
+  // punctuation; the server normalizes them to null.
+  if (typeof value.linkReason === 'string' && value.linkReason === '') return false;
+  if (typeof value.error === 'string' && value.error === '') return false;
+  // Freshness coherence mirrors the server's one-atomic-observation rule:
+  // fresh/stale REQUIRE a successful observation (checkedAt, a run and
+  // exact counts, and a clean error for fresh); the pre-success classes
+  // never carry observed data, and unavailable MUST name its failure.
+  const observed = value.freshness === 'fresh' || value.freshness === 'stale';
+  if (observed && value.checkedAt === null) return false;
+  // A completed observation always carries its attempt stamp; so does
+  // `unavailable` (the failed attempt is what makes it unavailable).
+  if (observed && value.lastAttemptAt === null) return false;
+  if (value.freshness === 'unavailable' && value.lastAttemptAt === null) return false;
+  if (observed && (value.openPrs === null || value.openIssues === null)) return false;
+  if (observed && value.run === null) return false;
+  if (value.freshness === 'fresh' && value.error !== null) return false;
+  if (value.freshness === 'unchecked') {
+    if (value.checkedAt !== null || value.lastAttemptAt !== null) return false;
+    if (value.openPrs !== null || value.openIssues !== null || value.run !== null || value.error !== null) return false;
+  }
+  if (value.freshness === 'unavailable') {
+    if (value.checkedAt !== null) return false;
+    if (value.openPrs !== null || value.openIssues !== null || value.run !== null) return false;
+    if (value.error === null) return false;
+  }
+  // Coherence: a linked row has a link and no reason; an unlinked row has
+  // a reason and no link. A linked row must also carry a safe full name
+  // that the link path actually addresses — a row can never validate as a
+  // guessed or mismatched identity.
+  if (!value.linked) {
+    return (
+      value.link === null &&
+      value.linkReason !== null &&
+      value.host === null &&
+      value.openPrs === null &&
+      value.openIssues === null &&
+      value.run === null &&
+      // The server always emits an unlinked row as never-observed.
+      value.freshness === 'unchecked'
+    );
+  }
+  if (value.link === null || value.linkReason !== null || value.host === null) return false;
+  if (typeof value.fullName !== 'string' || value.fullName === '') return false;
+  const segments = value.fullName.split('/');
+  if (
+    segments.length < 2 ||
+    segments.some(
+      (segment) =>
+        segment === '' || segment === '.' || segment === '..' || !/^[A-Za-z0-9_.-]+$/u.test(segment),
+    )
+  ) {
+    return false;
+  }
+  try {
+    const link = new URL(value.link);
+    if (link.pathname !== `/${value.fullName}`) return false;
+    // The link and any run link must live on the host the identity was
+    // read from — an off-host URL can never present as this repository.
+    if (link.hostname.toLowerCase() !== value.host.toLowerCase()) return false;
+    if (value.run !== null && value.run.url !== null) {
+      if (new URL(value.run.url).hostname.toLowerCase() !== value.host.toLowerCase()) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isRepoOverviewView(value: unknown): value is RepoOverviewView {
+  return isRecord(value) && Array.isArray(value.rows) && value.rows.every(isRepoOverviewRowView);
+}
+
 function isWakesView(value: unknown): boolean {
   if (
     !(
@@ -927,6 +1160,12 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   // present block must match its shape — readiness is server authority.
   if (value.ownerPrs !== undefined && value.ownerPrs !== null && !Array.isArray(value.ownerPrs)) return false;
   if (Array.isArray(value.ownerPrs) && !value.ownerPrs.every(isOwnerPrView)) return false;
+  // Managed repository overview: optional (pre-upgrade/not-yet-refreshed)
+  // but strictly typed when present — a malformed row must never render a
+  // guessed identity, count or link.
+  if (value.repoOverview !== undefined && value.repoOverview !== null && !isRepoOverviewView(value.repoOverview)) {
+    return false;
+  }
   // Issue #161: the tracker-wide child counters are optional (pre-upgrade
   // servers) but strictly typed when present.
   if (value.children !== undefined && value.children !== null && !isChildCounts(value.children)) return false;

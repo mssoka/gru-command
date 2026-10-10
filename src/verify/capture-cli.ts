@@ -385,6 +385,7 @@ async function commandRun(
     outcome,
     reconciled: parsed.reconciled,
     frames: parsed.frames,
+    pings: parsed.pings,
     capture_bytes: digest.bytes,
     capture_sha256: digest.sha256,
     run_id: fields?.runId ?? null,

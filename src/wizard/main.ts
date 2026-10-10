@@ -46,7 +46,7 @@ import {
   seedAnswersFromConfig,
   writeConfigText,
 } from './steps.js';
-import { onboardBmadRepo, REUSE_REPAIR_HINT } from './bmad-onboarding.js';
+import { onboardBmadRepo } from './bmad-onboarding.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -215,31 +215,26 @@ async function interactiveAnswers(
     );
   }
 
-  const bmad: Record<string, 'install' | 'reuse' | 'skip'> = {};
+  const bmad: Record<string, 'provision' | 'skip'> = {};
   for (const repo of repos) {
-    const hasBmad = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'));
+    const hasLegacy = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'));
     for (;;) {
       const answer = (
         await ask(
           rl,
-          hasBmad
-            ? `BMAD in ${repo}: existing install found; reuse unchanged or skip? [reuse]: `
-            : `BMAD in ${repo}: install official bmm,cis,tea,gds (core implicit)? [Y/n]: `,
+          `BMAD in ${repo}: provision project state for the GC-managed BMAD runtime` +
+            `${hasLegacy ? ' (the existing repo-local install stays untouched)' : ''}? [Y/n]: `,
         )
       ).toLowerCase();
-      if (hasBmad && ['', 'reuse'].includes(answer)) {
-        bmad[repo] = 'reuse';
-        break;
-      }
-      if (!hasBmad && ['', 'y', 'yes'].includes(answer)) {
-        bmad[repo] = 'install';
+      if (['', 'y', 'yes', 'provision'].includes(answer)) {
+        bmad[repo] = 'provision';
         break;
       }
       if (['skip', 'n', 'no'].includes(answer)) {
         bmad[repo] = 'skip';
         break;
       }
-      out.write(`  ✗ enter ${hasBmad ? 'reuse or skip' : 'yes or no'}\n`);
+      out.write('  ✗ enter yes or no\n');
     }
   }
 
@@ -665,8 +660,8 @@ async function main(argv: readonly string[]): Promise<number> {
       if (result.ready) {
         stdout.write(`BMAD ready in ${repo}: ${result.message}\n`);
         stdout.write(
-          `  Commit ${repo}/.gru-command/{worktree.toml,bmad-bootstrap.mjs,bmad-install.json} ` +
-            'so fresh worktrees receive the project-local binding.\n',
+          `  Commit ${repo}/_bmad/custom/ (team settings, its .gitignore) when fresh worktrees should share ` +
+            'them; generated output and personal *.user.toml settings stay local.\n',
         );
         break;
       }
@@ -678,26 +673,19 @@ async function main(argv: readonly string[]): Promise<number> {
         // Deterministic state failure (gh-32): the check ran against
         // unchanged on-disk state, so another identical retry can never
         // succeed. Offer skip-only plus the class-appropriate deliberate
-        // repair path — install-repair classes keep the official-installer
-        // hint, other classes fall back to neutral wording. The wizard
-        // never repairs or overwrites an existing install itself.
+        // repair path; other classes fall back to neutral wording. The
+        // wizard never repairs or overwrites existing repo state itself.
         const repairHint = result.repairHint ??
           'Repair the reported condition deliberately, then re-run the wizard';
         if (terminal === null) {
-          // Headless guidance names the JSON values this mode actually
-          // offers: a reuse-class refusal is unblocked by asking for reuse
-          // again, not by an interactive prompt the mode does not have.
-          const headlessEscape = result.repairHint === REUSE_REPAIR_HINT
-            ? ` Headless: set answers.bmad.${repo}="reuse" to preserve it, or "skip" to leave the repo managed.`
-            : `, or explicitly set answers.bmad.${repo}="skip".`;
           fail(
             `BMAD setup for ${repo} is not ready (deterministic failure — retrying cannot fix it): ${result.message}\n` +
-              `${repairHint}${headlessEscape}`,
+              `${repairHint}, or explicitly set answers.bmad.${repo}="skip".`,
           );
         }
         terminal.output.write(
           `BMAD setup for ${repo} failed (deterministic — retrying cannot fix it): ${result.message}\n` +
-            `  ${repairHint}; Gru never repairs an existing install automatically.\n`,
+            `  ${repairHint}; Gru never repairs existing repo state automatically.\n`,
         );
         for (;;) {
           const skipRl = createInterface({ input: terminal.input, output: terminal.output });

@@ -170,7 +170,7 @@
       <aside id="agents-rail" class="board-side agents-rail">
         <div class="agents-rail__tabs" role="tablist" aria-label="Crew and transcripts">
           <button id="rail-tab-agents" class="agents-rail__tab agents-rail__tab--active" type="button"
-                  role="tab" aria-selected="true" aria-controls="board-agents" data-rail-tab="agents">
+                  role="tab" aria-selected="true" aria-controls="board-agents board-repos" data-rail-tab="agents">
             CREW (<span class="agents-rail__count" id="rail-agents-count">0</span>)
           </button>
           <button id="rail-tab-transcripts" class="agents-rail__tab" type="button"
@@ -179,6 +179,10 @@
           </button>
         </div>
         <div id="board-agents" class="board-agents rail-panel" role="tabpanel" aria-labelledby="rail-tab-agents" data-rail-panel="agents"></div>
+        <!-- Managed repository overview (owner-approved compact rows A):
+             read-only GitHub state below the crew list; toggled with the
+             CREW tab like the crew panel itself. -->
+        <section id="board-repos" class="repo-overview rail-panel" data-rail-panel="agents" role="tabpanel" aria-labelledby="rail-tab-agents" aria-label="Managed repositories"></section>
         <div id="board-transcripts" class="board-agents rail-panel" role="tabpanel" aria-labelledby="rail-tab-transcripts" data-rail-panel="transcripts" hidden></div>
       </aside>
     </div>

@@ -147,6 +147,7 @@ function mountBoardDom(): void {
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
     <div id="board-agents"></div>
+    <section id="board-repos" data-rail-panel="agents"></section>
     <span id="rail-agents-count">0</span>
     <button id="notification-bell"><span id="notification-badge">0</span></button>
     <div id="notification-panel"><div id="notification-list"></div></div>

@@ -16,8 +16,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * Schema (all arrays optional, all entries validated fail-loud):
  *
  *   [[link]]                 # symlink created IN the worktree
- *   at   = "_bmad"           #   path inside the fresh worktree (relative, no ..)
- *   to   = "_bmad"           #   target: repo-root-relative (.. allowed) or absolute
+ *   at   = "fixtures/large"  #   path inside the fresh worktree (relative, no ..)
+ *   to   = "fixtures/large"  #   target: repo-root-relative (.. allowed) or absolute
  *
  *   [[copy]]                 # file copied FROM the source checkout
  *   from = ".env.local"      #   repo-root-relative (no ..)

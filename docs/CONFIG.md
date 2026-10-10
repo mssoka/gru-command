@@ -18,7 +18,8 @@ The config file is always `<instance dir>/config.toml`.
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
 the supported installation path. It reads prompts from `/dev/tty`, so a
 `curl | bash` install remains one invocation, probes runtime CLIs, asks
-for managed repos, offers per-repo BMAD onboarding, and writes the same
+for managed repos, offers per-repo BMAD provisioning for the GC-managed
+runtime ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same
 **complete teaching config** as the generator below. Every concrete
 default is active; optional role/runtime overrides are shown commented
 because activating a placeholder would change precedence.

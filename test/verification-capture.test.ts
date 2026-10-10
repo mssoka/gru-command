@@ -13,6 +13,7 @@ import {
   openExclusiveCaptureSink,
   parseCapturedNdjson,
   readCaptureOwner,
+  readCaptureReceipt,
   withdrawCaptureOwner,
   writeCaptureOwner,
   type CaptureOwnerRecord,
@@ -121,6 +122,7 @@ describe('capture receipts', () => {
       outcome: 'completed',
       reconciled: false,
       frames: 4,
+      pings: 0,
       capture_bytes: 512,
       capture_sha256: 'c'.repeat(64),
       run_id: 'run-1',
@@ -188,6 +190,32 @@ describe('capture receipts', () => {
     );
     expect(parsed.outcome).toBeNull();
     expect(parsed.malformed).toBe(1);
+  });
+
+  it('normalizes a pre-keepalive receipt that has no pings field', () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'legacy.ndjson');
+    // A receipt written before the keepalive shipped carries no `pings`; it
+    // truthfully held zero transport frames and must read back as 0, not
+    // undefined.
+    const legacy = { ...receipt(), sink: sinkPath } as Record<string, unknown>;
+    delete legacy['pings'];
+    writeFileSync(captureReceiptPath(sinkPath), `${JSON.stringify(legacy)}\n`);
+    const read = readCaptureReceipt(captureReceiptPath(sinkPath));
+    expect(read).not.toBeNull();
+    expect(read!.pings).toBe(0);
+  });
+
+  it('refuses a present-but-corrupt pings field instead of reporting zero', () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'corrupt.ndjson');
+    for (const corrupt of ['3', null, -1, 1.5, Number.NaN]) {
+      writeFileSync(
+        captureReceiptPath(sinkPath),
+        `${JSON.stringify({ ...receipt(), sink: sinkPath, pings: corrupt })}\n`,
+      );
+      expect(readCaptureReceipt(captureReceiptPath(sinkPath))).toBeNull();
+    }
   });
 });
 
@@ -584,5 +612,185 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     expect(code).toBe(CAPTURE_EXIT.ok);
     expect(signals).toEqual(['SIGTERM']);
     expect(existsSync(ownerPath)).toBe(false);
+  });
+});
+
+describe('keepalive pings in the capture stream (incident 2026-10-09)', () => {
+  const PING_LINE = `${JSON.stringify({ type: 'ping' })}\n`;
+
+  function completedWithPings(outcome: Record<string, unknown> = COMPLETED_OUTCOME): string {
+    return (
+      `${JSON.stringify({ type: 'queued', runId: outcome['runId'], position: 0, active: 0, limit: 1 })}\n` +
+      PING_LINE +
+      `${JSON.stringify({ type: 'started', runId: outcome['runId'], workers: 2, sha: outcome['sha'], queuedMs: 3 })}\n` +
+      PING_LINE +
+      `${JSON.stringify({ type: 'output', runId: outcome['runId'], stream: 'stdout', text: 'ok\n' })}\n` +
+      PING_LINE +
+      `${JSON.stringify({ type: 'completed', runId: outcome['runId'], outcome })}\n`
+    );
+  }
+
+  function cliDeps(fetchImpl: CaptureCliDeps['fetchImpl']): CaptureCliDeps {
+    return {
+      probe: () => liveProbe,
+      cwd: () => '/tmp/lane',
+      argv: ['capture-cli', 'run'],
+      now: () => 1_700_000_000_000,
+      fetchImpl,
+      stdout: () => {},
+      stderr: () => {},
+    };
+  }
+
+  it('accepts interleaved pings and still rejects a frame after the terminal', () => {
+    const parsed = parseCapturedNdjson(completedWithPings());
+    // Pings are counted apart from the producer frames and are never
+    // malformed, and the one terminal completion binds the run/head/output
+    // as before.
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.frames).toBe(4);
+    expect(parsed.pings).toBe(3);
+    expect(parsed.started).toBe(true);
+    expect(parsed.outcome?.['runId']).toBe('run-capture-1');
+
+    // A ping AFTER the terminal frame is still a concatenated/foreign stream:
+    // the keepalive must never loosen the post-terminal rejection.
+    const postTerminal = parseCapturedNdjson(`${completedNdjson()}${PING_LINE}`);
+    expect(postTerminal.malformed).toBe(1);
+
+    // A LEADING ping (legal: the body's first frame) still binds the run and
+    // parses cleanly.
+    const leading = parseCapturedNdjson(
+      PING_LINE +
+        `${JSON.stringify({ type: 'queued', runId: 'run-capture-1', position: 0, active: 0, limit: 1 })}\n` +
+        `${JSON.stringify({ type: 'started', runId: 'run-capture-1', workers: 2, sha: 'a'.repeat(40), queuedMs: 1 })}\n` +
+        `${JSON.stringify({ type: 'completed', runId: 'run-capture-1', outcome: COMPLETED_OUTCOME })}\n`,
+    );
+    expect(leading.malformed).toBe(0);
+    expect(leading.frames).toBe(3);
+    expect(leading.pings).toBe(1);
+    expect(leading.started).toBe(true);
+    expect(leading.outcome?.['runId']).toBe('run-capture-1');
+
+    // An IDENTITY-BEARING ping may not bypass the single-run check: a ping
+    // for another run makes the stream malformed and it is never promoted.
+    const foreignPing = parseCapturedNdjson(
+      `${JSON.stringify({ type: 'queued', runId: 'run-capture-1', position: 0, active: 0, limit: 1 })}\n` +
+        `${JSON.stringify({ type: 'ping', runId: 'run-foreign' })}\n` +
+        `${JSON.stringify({ type: 'completed', runId: 'run-capture-1', outcome: COMPLETED_OUTCOME })}\n`,
+    );
+    expect(foreignPing.malformed).toBeGreaterThan(0);
+
+    // A LEADING foreign ping cannot silently establish someone else's run.
+    const leadingForeign = parseCapturedNdjson(
+      `${JSON.stringify({ type: 'ping', runId: 'run-foreign' })}\n` +
+        `${JSON.stringify({ type: 'queued', runId: 'run-capture-1', position: 0, active: 0, limit: 1 })}\n` +
+        `${JSON.stringify({ type: 'started', runId: 'run-capture-1', workers: 2, sha: 'a'.repeat(40), queuedMs: 1 })}\n` +
+        `${JSON.stringify({ type: 'completed', runId: 'run-capture-1', outcome: COMPLETED_OUTCOME })}\n`,
+    );
+    expect(leadingForeign.malformed).toBeGreaterThan(0);
+    expect(leadingForeign.outcome).toBeNull();
+
+    // Identity-free pings and a matching identity-bearing ping stay clean.
+    const matchedPing = parseCapturedNdjson(
+      `${JSON.stringify({ type: 'ping' })}\n` +
+        `${JSON.stringify({ type: 'ping', runId: 'run-capture-1' })}\n` +
+        `${JSON.stringify({ type: 'completed', runId: 'run-capture-1', outcome: COMPLETED_OUTCOME })}\n`,
+    );
+    expect(matchedPing.malformed).toBe(0);
+    expect(matchedPing.pings).toBe(2);
+    expect(matchedPing.outcome?.['runId']).toBe('run-capture-1');
+  });
+
+  it('a completed capture whose body carried pings stays promotable through real EOF', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'pings-ok.ndjson');
+    const body = completedWithPings();
+    const code = await runCaptureCli(
+      ['run', '--job', 'job-capture', '--scope', 'full', '--sink', sinkPath, '--request-id', 'req-cli-pings', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      cliDeps(
+        async () =>
+          new Response(body, { status: 200, headers: { 'content-type': 'application/x-ndjson' } }),
+      ),
+    );
+    expect(code).toBe(CAPTURE_EXIT.ok);
+    const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+    expect(receipt.outcome).toBe('completed');
+    expect(captureReceiptSucceeded(receipt)).toBe(true);
+    expect(receipt.run_id).toBe('run-capture-1');
+    expect(receipt.head).toBe('a'.repeat(40));
+    // Producer frames and transport pings are recorded separately.
+    expect(receipt.frames).toBe(4);
+    expect(receipt.pings).toBe(3);
+    // Every real body byte to EOF is preserved, pings included.
+    expect(readFileSync(sinkPath, 'utf-8')).toBe(body);
+  });
+
+  it('a stream severed after keepalive pings stays UNKNOWN, never success', async () => {
+    const dir = tempDir();
+    const sinkPath = join(dir, 'pings-severed.ndjson');
+    let step = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (step === 0) {
+          step += 1;
+          controller.enqueue(
+            new TextEncoder().encode(
+              `${JSON.stringify({ type: 'queued', runId: 'run-capture-1', position: 0, active: 0, limit: 1 })}\n` +
+                PING_LINE +
+                PING_LINE +
+                `${JSON.stringify({ type: 'started', runId: 'run-capture-1', workers: 2, sha: 'a'.repeat(40), queuedMs: 1 })}\n`,
+            ),
+          );
+          return;
+        }
+        controller.error(new Error('socket reset before EOF'));
+      },
+    });
+    const code = await runCaptureCli(
+      ['run', '--job', 'job-capture', '--scope', 'full', '--sink', sinkPath, '--request-id', 'req-cli-pings-lost', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      cliDeps(async () => new Response(stream, { status: 200 })),
+    );
+    expect(code).toBe(CAPTURE_EXIT.unknown);
+    const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+    expect(receipt.outcome).toBe('unknown');
+    expect(receipt.started).toBe(true);
+    expect(receipt.error).toContain('socket reset');
+    // The keepalive pings were honestly recorded as liveness, not producer
+    // frames, and never fabricate output or a terminal.
+    expect(receipt.pings).toBe(2);
+    expect(receipt.frames).toBe(2);
+    expect(receipt.output_bytes).toBeNull();
+    expect(captureReceiptSucceeded(receipt)).toBe(false);
+  });
+
+  it('refuses a capture whose pings carry a foreign run identity', async () => {
+    const dir = tempDir();
+    const producerFrames =
+      `${JSON.stringify({ type: 'queued', runId: 'run-capture-1', position: 0, active: 0, limit: 1 })}\n` +
+      `${JSON.stringify({ type: 'started', runId: 'run-capture-1', workers: 2, sha: 'a'.repeat(40), queuedMs: 3 })}\n` +
+      `${JSON.stringify({ type: 'output', runId: 'run-capture-1', stream: 'stdout', text: 'ok\\n' })}\n` +
+      `${JSON.stringify({ type: 'completed', runId: 'run-capture-1', outcome: COMPLETED_OUTCOME })}\n`;
+    const foreignPing = `${JSON.stringify({ type: 'ping', runId: 'run-foreign' })}\n`;
+    const queuedLine = `${JSON.stringify({ type: 'queued', runId: 'run-capture-1', position: 0, active: 0, limit: 1 })}\n`;
+    // After admission, and as a leading frame before any producer frame.
+    const afterAdmission = queuedLine + foreignPing + producerFrames.replace(queuedLine, '');
+    const leading = foreignPing + producerFrames;
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ['after-admission', afterAdmission],
+      ['leading', leading],
+    ];
+    for (const [label, body] of cases) {
+      const sinkPath = join(dir, `${label}.ndjson`);
+      const exitCode = await runCaptureCli(
+        ['run', '--job', 'job-capture', '--scope', 'full', '--sink', sinkPath, '--request-id', `req-foreign-ping-${label}`, '--url', 'http://127.0.0.1:9', '--token', 't'],
+        cliDeps(async () => new Response(body, { status: 200 })),
+      );
+      expect(exitCode, `${label}: a foreign identity-bearing ping must not be promoted`).toBe(CAPTURE_EXIT.unknown);
+      const receipt = JSON.parse(readFileSync(captureReceiptPath(sinkPath), 'utf-8')) as CaptureReceipt;
+      expect(receipt.outcome).toBe('unknown');
+      expect(receipt.error).toContain('malformed');
+      expect(captureReceiptSucceeded(receipt)).toBe(false);
+    }
   });
 });

@@ -170,40 +170,60 @@ npm run config:generate                 # refuses an existing file
 npm run config:generate -- --force      # timestamped 0600 backup first
 ```
 
-### Project-local BMAD setup
+### GC-owned delivery resources
 
-For each selected managed repo—not the workspace root and never every
-discovered directory—the wizard offers official BMAD setup, default on
-for fresh repos. This release pins `bmad-method@6.12.0` and installs all
-four approved defaults: `bmm,cis,tea,gds` (core is implicit), with
-external pins `cis=v0.3.2`, `tea=v1.27.2`, `gds=v0.7.2`. Runtime bindings
-follow the selected `pi`/Claude tools. Existing/customized installs
-default to **reuse unchanged**; per-repo skip is always available.
-The pinned set carries `bmad-review` out of the box, and it is a gate:
-0 blockers clear review/fix routing only — the PASS is not a Perkins
-READY — while blockers route back to the implementing minion as fix
-directives, never inform-only. Perkins (GitHub/GitLab) remains the
-stronger gate with exact-head verdicts; the owner holds every merge.
+GC ships directly editable build/planning/review resources with their own
+identity and content integrity in `resources/gc-workflows/`. Both normal and
+small-change paths retain independent tracked review, reasoned fixes,
+verification and ordinary PR handoff, without finding or tool-call quotas.
+The new package resolves with explicit project/job/worktree/artifact/knowledge
+context and no project/global BMAD, Python/uv or external skill dependency.
+See [docs/GC-WORKFLOWS.md](docs/GC-WORKFLOWS.md) for invocation, local manifest
+refresh, packaging tests and retained lane bindings.
 
-Successful setup records exact versions in
-`.gru-command/bmad-install.json`, adds an idempotent owned bootstrap
-block to `.gru-command/worktree.toml`, and uses narrow Git-local excludes
-for generated paths. It does not blanket-ignore `.agents/`, `.claude/`,
-or `_bmad-output/`, and never untracks files. Commit the three
-`.gru-command/` bootstrap files so newly-created worktrees can copy an
-isolated project-local BMAD install and discover the build-workflow
-skill this pinned release provides; generated skills/output remain
-local. Network and prerequisite failures name the
-repo and keep retry or explicit skip; deterministic state failures—a
-broken or partial install, a missing/unsafe module directory, a missing
-runtime binding—offer skip-only with deliberate repair guidance
-(install-repair classes additionally name the official repair path
-`npx bmad-method install` in that repository), never an automatic
-overwrite. No false-ready state.
+New implementation jobs now receive this owned package and explicit registered
+project/job context on both Pi and Claude Code. Operational material is private
+under `<data_dir>/projects/<project-key>/jobs/<job-id>/operational/`; approved
+portable knowledge belongs in the assigned worktree's `gru-output/`. GC-invoked
+fallback review uses a verified owned helper, not a global `bmad-review` install.
+Fallback PASS clears review/fix routing only, never native Perkins READY.
+Independent BMAD installs and historical outputs/bindings remain untouched;
+resumes retain their original package or fail with exact restoration guidance.
+Setup provisioning remains transitional until #295; it is not required for new
+GC-owned execution.
 
-You need the selected runtime CLI (`pi` or `claude`) for agents and `uv`
-for BMAD workflows. Missing prerequisites are reported before a repo is
-marked BMAD-ready.
+### GC-managed BMAD runtime (transitional)
+
+The pinned `bmad-method@6.12.0` build package remains available for already-bound
+historical lanes. New jobs select GC-owned delivery resources instead. An upgrade
+never switches a running lane's workflow; missing retained bytes require restoring
+that exact package, not recreating the worker/worktree/PR. Perkins (GitHub/GitLab)
+remains the exact-head native release gate, and the owner holds every merge.
+
+For each selected managed repo (not the workspace root, and never every
+discovered directory), the wizard offers to **provision** the project
+state the runtime uses. It is on by default, and per-repo skip is always
+available. Provisioning creates only what is missing: `_bmad/custom/`
+(project settings: `config.toml` for the team, `*.user.toml` for you,
+ignored), a self-ignoring `_bmad/render/`, and the configured output
+folders under `_bmad-output/`. It never modifies existing files, an
+existing repo-local BMAD install, or unrelated skills. Commit
+`_bmad/custom/` when fresh worktrees should share team settings.
+Deterministic state failures (a symlinked or wrongly typed project path,
+a malformed settings file) offer skip-only with deliberate repair
+guidance. Prerequisite and I/O failures keep retry or explicit skip. No
+false-ready state.
+
+You need the selected runtime CLI (`pi` or `claude`) for agents. Only the
+historical BMAD/provisioning path uses `uv`; owned GC execution does not.
+Legacy setup prerequisites are reported before a repo is marked BMAD-ready. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
+
+- the bundled set
+- configuration precedence
+- job binding
+- the deliberate upstream-upgrade procedure
+- license notices
+- the tested commands for retiring an old repo-local `_bmad` install by hand
 
 ## Run
 

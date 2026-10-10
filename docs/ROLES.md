@@ -10,7 +10,7 @@ fail-loud at boot); this page is the map.
 |------|-------------|-----------|--------|-------|
 | Gru | `roles/gru.md` | workspace root | chat only | judgment: consult, plan-before-heist, dispatch, verify |
 | Silas | `roles/silas.md` | workspace root | ledger/ops | operations: briefings are contracts, lanes, sweeps, close-outs; hosted as the `silas-ops` slot with follow-through + recurrence duties (`docs/FLOW.md`) |
-| minion | `roles/minion.md` | **spawn-provided** (the job worktree) | code | one briefing per lane, verified work, honest commits; selects the project's installed BMAD build-workflow skill by capability and owns the review/fix/verify/PR cycle ([FLOW.md §4f](./FLOW.md)) |
+| minion | `roles/minion.md` | **spawn-provided** (the job worktree) | code | one briefing per lane, verified work, honest commits; selects the BMAD build-workflow skill by capability from its session catalog (the lane-bound GC-managed BMAD runtime plus the project's own skills) and owns the review/fix/verify/PR cycle ([FLOW.md §4f](./FLOW.md)) |
 | Perkins | `roles/perkins.md` | **spawn-provided** (frozen detached review tree) | review artifacts only | one whole-PR lead reviews the complete change, may run tracked whole-change specialists, verifies, revisits priors, and reports through narrow host tools |
 | Bob | `roles/bob.md` | workspace root | memory files | periodic consolidation with provenance |
 
@@ -19,8 +19,11 @@ fail-loud at boot); this page is the map.
 - The chat Gru, ops (Silas), and memory (Bob) host at the **workspace
   root** — they operate across repos.
 - Minions host at the **project root they serve** and discover that
-  project's own `.agents/skills` and `_bmad` through the fresh worktree
-  bootstrap manifest (`.gru-command/worktree.toml`).
+  project's own `.agents/skills` (through the fresh worktree bootstrap
+  manifest, `.gru-command/worktree.toml`, when they are not tracked) and
+  its BMAD project state in `_bmad/custom/`. Each minion session also
+  receives the GC-managed BMAD runtime bound to its job lane
+  ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)); the binding survives GC updates.
 - Perkins leads and non-blind specialists are rooted in the frozen detached
   review tree; blind specialists are rooted outside it. Review sessions
   disable all project/global skills, context files, extensions, prompts,

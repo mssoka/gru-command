@@ -1,6 +1,7 @@
 import type { Role } from '../config.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import type { DirectiveCheckpoint, DirectiveNativeBinding, DirectiveProducer, DirectiveTurnIdentity } from './directive-checkpoint.js';
+import type { WorkflowContext, WorkflowInvocation } from '../workflows/runtime.js';
 
 /**
  * Runtime adapter interface (EPICS E2 story 1; SPEC ruling 4).
@@ -115,6 +116,40 @@ export interface IsolatedReviewPolicy {
   readonly nativeTools?: readonly NativeAgentTool[];
 }
 
+/**
+ * Skills Gru Command supplies to a session from a bound, read-only runtime
+ * directory (GC-owned resources or a retained historical BMAD runtime). The session keeps its
+ * project cwd; these skills are added beside the project's own and win a
+ * name collision, so the job runs exactly the runtime it is bound to.
+ */
+export interface ManagedSkillSet {
+  /** Provenance label; Claude Code namespaces the skills under it. */
+  readonly source: string;
+  readonly runtimeId: string;
+  readonly contentSha256: string;
+  /** Runtime root (Claude Code loads it as a plugin directory). */
+  readonly root: string;
+  /** `<root>/skills` — one directory per skill. */
+  readonly skillsDir: string;
+  readonly skills: readonly string[];
+  /** True when the binding is recorded for the job lane (survives GC updates). */
+  readonly laneBound: boolean;
+  /** Present only for GC-owned jobs; historical workflows keep their old contract. */
+  readonly workflow?: {
+    readonly context: WorkflowContext;
+    readonly invocation: WorkflowInvocation;
+    /** Raw caller context for the skill launcher (not the augmented snapshot receipt). */
+    readonly contextFile: string;
+  };
+}
+
+export interface ManagedWorkflowSession {
+  readonly cwd: string;
+  /** Recorded logical owner, including resumes that supplied only a file. */
+  readonly agentId?: string;
+  readonly managedSkills?: ManagedSkillSet;
+}
+
 /** Options for spawn(). */
 export interface SpawnOptions {
   /** Cancel a queued resident admission without starting an adapter spawn. */
@@ -188,6 +223,14 @@ export interface SpawnOptions {
   readonly reviewLead?: IsolatedReviewPolicy & {
     readonly nativeTools: readonly NativeAgentTool[];
   };
+  /**
+   * Skills the product supplies from a bound, read-only runtime directory
+   * (GC-owned workflow of the job lane, or its retained historical runtime).
+   * The registry fills this for build-workflow roles; adapters add the
+   * skills beside the project's own (winning a name collision) and name
+   * the binding in the system prompt. Never applied to review sessions.
+   */
+  readonly managedSkills?: ManagedSkillSet;
 }
 
 /**

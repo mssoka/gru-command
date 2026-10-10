@@ -46,8 +46,20 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'spawns and reaps a real child process and streams large real files',
   },
   {
+    file: 'bmad-legacy-retirement.test.ts',
+    workload: 'runs the documented retirement commands (python, git worktrees, uv renders) against a disposable repo',
+  },
+  {
     file: 'bmad-onboarding.test.ts',
-    workload: 'real uv/BMAD bootstrap installs plus PTY interaction',
+    workload: 'BMAD project provisioning over many real git repository fixtures',
+  },
+  {
+    file: 'bmad-runtime-packaged.test.ts',
+    workload: 'npm pack staging plus compiled-product uv renders over git worktrees',
+  },
+  {
+    file: 'bmad-runtime.test.ts',
+    workload: 'real uv renders of the bundled BMAD runtime over git repositories and worktrees',
   },
   { file: 'branch-idle-guard.test.ts', workload: 'real service and git lane lifecycle' },
   { file: 'claude-adapter.test.ts', workload: 'real CLI child processes over stdio per test' },
@@ -102,6 +114,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'uploads-dir.test.ts', workload: 'real service boot against real filesystem state' },
   { file: 'verification-server.test.ts', workload: 'verification runner spawning real declared commands' },
   { file: 'wake-e2e.test.ts', workload: 'real service wake-on-alert flow' },
+  { file: 'workflow-runtime-packaged.test.ts', workload: 'extracts the actual npm archive and drives compiled workflow CLIs over a real git lane' },
   { file: 'wizard-interactive.test.ts', workload: 'PTY wizard session against the built CLI' },
   { file: 'wizard-register.test.ts', workload: 'install.sh service registration subprocess' },
   { file: 'wizard.test.ts', workload: 'built wizard CLI subprocesses' },

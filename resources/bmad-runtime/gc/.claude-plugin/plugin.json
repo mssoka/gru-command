@@ -1,0 +1,5 @@
+{
+  "name": "gru-command-bmad",
+  "description": "Gru Command-managed BMAD runtime: the pinned bmad-method build workflow with the Gru Command customization layer.",
+  "license": "MIT"
+}

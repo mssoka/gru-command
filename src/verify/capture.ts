@@ -34,6 +34,14 @@ import { isValidVerificationRequestId } from './scheduler.js';
  */
 
 export const CAPTURE_OWNER_VERSION = 1;
+/**
+ * The capture receipt schema version. Additive fields keep version 1; the
+ * current example is `pings`, added after v1 receipts already existed and
+ * normalized by {@link readCaptureReceipt} to its pre-change value (`0`)
+ * when absent. A future additive field must be normalized the same way
+ * (absent → pre-change default) so old receipts stay readable; a breaking
+ * change (renamed/removed/retyped field) would need a new version.
+ */
 export const CAPTURE_RECEIPT_VERSION = 1;
 
 // ------------------------------------------------------------------
@@ -341,7 +349,11 @@ export interface CaptureReceipt {
   /** True when the terminal frame was a recorded-outcome replay: the run's
    * outcome is known, but this sink is NOT the original full capture. */
   readonly reconciled: boolean;
+  /** Producer frames (queued/attached/started/output/one terminal). */
   readonly frames: number;
+  /** Transport liveness frames (`ping`) — kept out of `frames` so the
+   * producer-frame count stays the diagnostic it always was. */
+  readonly pings: number;
   readonly capture_bytes: number;
   readonly capture_sha256: string;
   readonly run_id: string | null;
@@ -375,9 +387,24 @@ export function readCaptureReceipt(path: string): CaptureReceipt | null {
   }
   try {
     const parsed = JSON.parse(text) as CaptureReceipt;
-    return parsed !== null && typeof parsed === 'object' && parsed.version === CAPTURE_RECEIPT_VERSION
-      ? parsed
-      : null;
+    if (parsed === null || typeof parsed !== 'object' || parsed.version !== CAPTURE_RECEIPT_VERSION) {
+      return null;
+    }
+    // `pings` shipped after receipts already existed: a pre-keepalive receipt
+    // truthfully carried zero transport frames, so an ABSENT `pings` field
+    // normalizes to 0. A present-but-corrupt `pings` value is refused loudly
+    // (null = unreadable) rather than silently reported as "no transport
+    // frames". (Validation of the other, pre-existing receipt fields is
+    // deliberately unchanged by this fix.)
+    if (parsed.pings === undefined) return { ...parsed, pings: 0 };
+    if (
+      typeof parsed.pings !== 'number' ||
+      !Number.isInteger(parsed.pings) ||
+      parsed.pings < 0
+    ) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -411,7 +438,10 @@ export function captureReceiptSucceeded(receipt: CaptureReceipt): boolean {
 // ------------------------------------------------------------------
 
 export interface CapturedNdjson {
+  /** Producer frames (queued/attached/started/output/one terminal). */
   readonly frames: number;
+  /** Transport liveness frames (`ping`); never producer frames. */
+  readonly pings: number;
   readonly malformed: number;
   /** The terminal `completed` frame's outcome payload, if a valid one arrived. */
   readonly outcome: Record<string, unknown> | null;
@@ -431,11 +461,14 @@ const MAX_PARTIAL_LINE_BYTES = 1024 * 1024;
  * terminal frame at the END of the stream, and counts torn/foreign records
  * instead of silently accepting them. A capture with malformed records, a
  * second run's frames, or frames after the terminal frame is not a clean
- * single-run stream and must never be promoted to success.
+ * single-run stream and must never be promoted to success. Transport
+ * keepalive `ping` frames are counted separately (`pings`), never as
+ * producer frames.
  */
 export class NdjsonCaptureReader {
   private buffer = '';
   private frames = 0;
+  private pings = 0;
   private malformed = 0;
   private outcome: Record<string, unknown> | null = null;
   private reconciled = false;
@@ -466,6 +499,7 @@ export class NdjsonCaptureReader {
     }
     return {
       frames: this.frames,
+      pings: this.pings,
       malformed: this.malformed,
       outcome: this.outcome,
       reconciled: this.reconciled,
@@ -493,13 +527,31 @@ export class NdjsonCaptureReader {
 
   private acceptFrame(frame: Record<string, unknown>): void {
     if (this.terminalSeen) {
-      // Frames after the terminal frame are a concatenated/foreign stream.
+      // Frames after the terminal frame are a concatenated/foreign stream
+      // (a keepalive ping included — the terminal is the last body frame).
       this.malformed += 1;
       return;
     }
-    this.frames += 1;
     const frameRunId =
       typeof frame['runId'] === 'string' && frame['runId'] !== '' ? frame['runId'] : null;
+    if (frame['type'] === 'ping') {
+      // Transport liveness, not producer output: counted apart so the
+      // receipt's producer-frame count keeps its diagnostic meaning. An
+      // IDENTITY-BEARING ping still participates in the single-run check —
+      // a foreign (or leading-foreign) run id is malformed and can never be
+      // promoted. Identity-free pings (the server's shape) are unaffected.
+      if (frameRunId !== null) {
+        if (this.runId === null) {
+          this.runId = frameRunId;
+        } else if (this.runId !== frameRunId) {
+          this.malformed += 1;
+          return;
+        }
+      }
+      this.pings += 1;
+      return;
+    }
+    this.frames += 1;
     if (frameRunId !== null) {
       if (this.runId === null) {
         this.runId = frameRunId;

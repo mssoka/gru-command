@@ -383,6 +383,177 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot({ ...snapshot(), ownerPrs: { not: 'an array' } } as unknown)).toBe(false);
   });
 
+  it('managed repo overview: absent/null tolerated, well-formed accepted, malformed rejected', () => {
+    expect(isValidSnapshot(snapshot())).toBe(true);
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: null } as unknown)).toBe(true);
+
+    const run = {
+      state: 'passed',
+      status: 'completed',
+      conclusion: 'success',
+      workflow: 'CI',
+      branch: 'main',
+      runNumber: 12,
+      url: 'https://github.com/example/demo/actions/runs/42',
+      runCreatedAt: '2026-01-01T00:00:00.000Z',
+      runStartedAt: '2026-01-01T00:01:00.000Z',
+      runUpdatedAt: '2026-01-01T00:05:00.000Z',
+    };
+    const row = {
+      key: 'demo',
+      displayName: 'demo',
+      linked: true,
+      host: 'github.com',
+      link: 'https://github.com/example/demo',
+      linkReason: null,
+      fullName: 'example/demo',
+      openPrs: 0,
+      openIssues: 3,
+      run,
+      freshness: 'fresh',
+      checkedAt: '2026-01-01T00:06:00.000Z',
+      lastAttemptAt: '2026-01-01T00:06:00.000Z',
+      error: null,
+    };
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [row] } } as unknown)).toBe(true);
+    // The exact server-emitted absence shapes (no provider strings) pass.
+    const absence = { ...run, status: null, conclusion: null, workflow: null, runNumber: null, runCreatedAt: null, runStartedAt: null, runUpdatedAt: null };
+    for (const absent of [
+      { ...row, run: { ...absence, state: 'never-run' } },
+      { ...row, run: { ...absence, state: 'no-workflow' } },
+      { ...row, run: { ...absence, state: 'no-branch', branch: null } },
+      { ...row, run: { ...absence, state: 'unavailable' } },
+    ]) {
+      expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [absent] } } as unknown), JSON.stringify(absent)).toBe(true);
+    }
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [] } } as unknown)).toBe(true);
+
+    const unlinked = {
+      ...row,
+      linked: false,
+      host: null,
+      link: null,
+      linkReason: 'non-GitHub remote',
+      fullName: null,
+      openPrs: null,
+      openIssues: null,
+      run: null,
+      freshness: 'unchecked',
+      checkedAt: null,
+      lastAttemptAt: null,
+    };
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [unlinked] } } as unknown)).toBe(true);
+    // Positive shapes the server emits that a fixture-light suite can
+    // miss: a linked but never-observed row (first pass / rotation
+    // window) and an aged stale row with no failure marker.
+    expect(
+      isValidSnapshot({
+        ...snapshot(),
+        repoOverview: {
+          rows: [
+            {
+              ...row,
+              freshness: 'unchecked',
+              checkedAt: null,
+              lastAttemptAt: null,
+              openPrs: null,
+              openIssues: null,
+              run: null,
+              error: null,
+            },
+          ],
+        },
+      } as unknown),
+    ).toBe(true);
+    expect(
+      isValidSnapshot({
+        ...snapshot(),
+        repoOverview: {
+          rows: [
+            {
+              ...row,
+              freshness: 'stale',
+              checkedAt: '2026-01-01T00:05:00.000Z',
+              lastAttemptAt: '2026-01-01T00:05:00.000Z',
+              error: null,
+            },
+          ],
+        },
+      } as unknown),
+    ).toBe(true);
+
+    // Strictness: an unknown state/freshness, a negative or fractional count,
+    // a non-https or malformed URL, inconsistent link coherence or an
+    // unparseable timestamp must never render.
+    for (const broken of [
+      { ...row, run: { ...run, state: 'vibes' } },
+      { ...row, run: { ...run, url: 'javascript:alert(1)' } },
+      { ...row, freshness: 'maybe' },
+      { ...row, openPrs: -1 },
+      { ...row, openIssues: 1.5 },
+      { ...row, link: 'https://evil.example/demo' , linkReason: 'why' },
+      { ...row, linked: false },
+      { ...unlinked, link: 'https://github.com/example/demo' },
+      { ...row, checkedAt: 'not-a-date' },
+      { ...row, key: '' },
+      { ...row, run: { ...run, runNumber: -2 } },
+      { ...row, fullName: '' },
+      { ...row, fullName: '../evil' },
+      { ...row, link: 'https://github.com/other/repo' },
+      { ...row, link: 'https://github.com/example/demo/extra' },
+      // r2 hardening: off-host links/run URLs, empty provider strings,
+      // invisible names and incoherent freshness claims never validate.
+      { ...row, host: 'evil.example' },
+      { ...row, run: { ...run, url: 'https://evil.example/actions/runs/42' } },
+      // Credentials and alternate ports never validate (fail closed).
+      { ...row, run: { ...run, url: 'https://user:secret@github.com/actions/runs/42' } },
+      { ...row, run: { ...run, url: 'https://github.com:8443/actions/runs/42' } },
+      { ...row, link: 'https://user:secret@github.com/example/demo' },
+      // The round-1 creation stamp is required and discriminated: a
+      // missing or malformed runCreatedAt rejects the run (and the row).
+      { ...row, run: { ...run, runCreatedAt: undefined } },
+      { ...row, run: { ...run, runCreatedAt: 'not-a-date' } },
+      { ...row, run: { ...run, status: '' } },
+      { ...row, run: { ...run, workflow: '' } },
+      { ...row, run: { ...run, branch: '' } },
+      { ...row, displayName: '\u200b' },
+      { ...row, freshness: 'fresh', checkedAt: null },
+      { ...row, freshness: 'unchecked' },
+      { ...row, freshness: 'fresh', run: null },
+      { ...row, freshness: 'fresh', openPrs: null },
+      { ...row, freshness: 'fresh', error: 'HTTP 500' },
+      { ...row, freshness: 'stale', checkedAt: null },
+      { ...row, freshness: 'unavailable', checkedAt: '2026-01-01T00:06:00.000Z', run: null },
+      { ...row, freshness: 'unavailable', checkedAt: null, run: null },
+      { ...row, freshness: 'unavailable', checkedAt: null, error: null },
+      // Each round-4 guard is discriminated alone: only the counts, run,
+      // attempt-stamp or unchecked-data condition rejects these.
+      { ...row, freshness: 'unavailable', checkedAt: null, run: null, error: 'HTTP 500' },
+      { ...row, freshness: 'unavailable', checkedAt: null, openPrs: null, openIssues: null, run, error: 'HTTP 500' },
+      { ...row, freshness: 'fresh', lastAttemptAt: null },
+      { ...row, freshness: 'stale', lastAttemptAt: null },
+      { ...row, freshness: 'unavailable', checkedAt: null, run: null, error: 'HTTP 500', lastAttemptAt: null },
+      // Only the attempt-stamp guard rejects this one (counts/run/error
+      // are all coherent).
+      { ...row, freshness: 'unavailable', checkedAt: null, openPrs: null, openIssues: null, run: null, error: 'HTTP 500', lastAttemptAt: null },
+      { ...row, linkReason: '' },
+      { ...row, error: '' },
+      { ...unlinked, openPrs: 2 },
+      { ...unlinked, run },
+      // unchecked must not carry observed data (only the data guard rejects).
+      { ...row, freshness: 'unchecked', checkedAt: null, lastAttemptAt: null, run: null, error: null, openPrs: 2 },
+      // An unlinked row is always never-observed.
+      { ...unlinked, freshness: 'unavailable', error: 'HTTP 500', lastAttemptAt: '2026-01-01T00:06:00.000Z' },
+    ]) {
+      expect(
+        isValidSnapshot({ ...snapshot(), repoOverview: { rows: [broken] } } as unknown),
+        JSON.stringify(broken),
+      ).toBe(false);
+    }
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: 'nope' } } as unknown)).toBe(false);
+    expect(isValidSnapshot({ ...snapshot(), repoOverview: { rows: [null] } } as unknown)).toBe(false);
+  });
+
   it('activeDecisions (issue #218): absent/null tolerated, well-formed accepted, malformed rejected', () => {
     expect(isValidSnapshot(snapshot())).toBe(true);
     const nullDecisions = { ...snapshot(), activeDecisions: null, activeDecisionCount: null } as unknown;

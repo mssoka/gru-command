@@ -13,7 +13,12 @@ import { DEFAULT_INSTANCE_PORT, expandTilde, ROLES, RUNTIME_IDS, type Role, type
  * nothing written.
  */
 
-export type BmadRepoAction = 'install' | 'reuse' | 'skip';
+/**
+ * Per-repo BMAD choice (issue #283): `provision` creates the project-local
+ * state the GC-managed BMAD runtime uses (idempotent; nothing existing is
+ * modified); `skip` leaves the repo untouched.
+ */
+export type BmadRepoAction = 'provision' | 'skip';
 
 export interface WizardAnswers {
   /** Raw workspace-root string as answered (`~`-form preserved in output). */
@@ -33,7 +38,7 @@ export interface WizardAnswers {
   readonly token: string;
   readonly registerService: boolean;
   readonly smoke: boolean;
-  /** Per-selected-repo BMAD action. Fresh defaults to install; existing to reuse. */
+  /** Per-selected-repo BMAD action; defaults to provision. */
   readonly bmad: Readonly<Record<string, BmadRepoAction>>;
 }
 
@@ -327,26 +332,28 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
   }
 
   const bmad: Record<string, BmadRepoAction> = {};
-  const workspaceAbs = expandTilde(workspaceRoot, home);
-  for (const repo of repos) {
-    bmad[repo] = existsSync(join(workspaceAbs, repo, '_bmad', '_config', 'manifest.yaml'))
-      ? 'reuse'
-      : 'install';
-  }
+  for (const repo of repos) bmad[repo] = 'provision';
   if (raw['bmad'] !== undefined) {
     if (!isPlainObject(raw['bmad'])) {
-      throw new AnswersError('answers.bmad must be an object of selected repo → install | reuse | skip');
+      throw new AnswersError('answers.bmad must be an object of selected repo → provision | skip');
     }
     for (const [repo, action] of Object.entries(raw['bmad'])) {
       if (!repos.includes(repo)) {
         throw new AnswersError(`answers.bmad names unselected repo \`${repo}\``);
       }
-      if (!['install', 'reuse', 'skip'].includes(String(action))) {
+      if (action === 'install' || action === 'reuse') {
         throw new AnswersError(
-          `answers.bmad.${repo} must be "install", "reuse", or "skip", got: ${JSON.stringify(action)}`,
+          `answers.bmad.${repo} = ${JSON.stringify(action)} was retired with the repo-local BMAD installer: ` +
+            'Gru Command now ships the BMAD runtime itself. Use "provision" (creates only missing project ' +
+            'state, never modifies an existing install) or "skip".',
         );
       }
-      bmad[repo] = action as BmadRepoAction;
+      if (action !== 'provision' && action !== 'skip') {
+        throw new AnswersError(
+          `answers.bmad.${repo} must be "provision" or "skip", got: ${JSON.stringify(action)}`,
+        );
+      }
+      bmad[repo] = action;
     }
   }
 

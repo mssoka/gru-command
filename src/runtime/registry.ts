@@ -2,11 +2,14 @@ import { RUNTIME_IDS, resolveSpawnPolicy, type Role, type RuntimeId } from '../c
 import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { PiRuntime } from './pi-adapter.js';
+import { PiRuntime, normalizeSessionPath } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
-import type { AgentHandle, AgentRuntime, RuntimeEvent, SpawnOptions } from './types.js';
+import type { AgentHandle, AgentRuntime, ManagedSkillSet, ManagedWorkflowSession, RuntimeEvent, SpawnOptions } from './types.js';
+import { ROLE_DEFINITIONS } from '../roles.js';
+import { createWorkflowSessionBinder } from '../workflows/session.js';
+import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
@@ -92,6 +95,29 @@ export interface RuntimeRegistryOptions {
     readonly attempt: number;
     readonly error: string;
   }) => void;
+  /**
+   * Issue #283: bind a session cwd (the job lane) to the GC-managed BMAD
+   * runtime. Called for every non-review spawn of a role that runs BMAD
+   * build workflows; a failure fails the spawn loudly. The host wires the
+   * real binder; omitted = no managed runtime (unit tests).
+   */
+  readonly bmadRuntime?: (cwd: string) => ManagedSkillSet;
+  /** Production GC-owned selection with an explicit registered assignment. */
+  readonly workflowRuntime?: (options: SpawnOptions) => ManagedWorkflowSession;
+}
+
+/** New jobs use GC-owned resources; retained historical bindings keep their bytes.
+ * The caller supplies ledger/registry authority, never a directory-name guess. */
+export function serviceRegistryOptions(
+  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & {
+    readonly config: { readonly dataDir: string };
+    readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
+    readonly workflowBuildFor?: (lane: WorktreeLane) => boolean;
+    readonly workflowAgentFor?: (options: SpawnOptions) => string | undefined;
+  },
+): RuntimeRegistryOptions {
+  const { workflowLaneFor, workflowBuildFor, workflowAgentFor, ...options } = base;
+  return { ...options, workflowRuntime: createWorkflowSessionBinder(base.config.dataDir, workflowLaneFor, undefined, workflowBuildFor, workflowAgentFor) };
 }
 
 /**
@@ -559,6 +585,32 @@ export class RuntimeRegistry {
     };
   }
 
+  /** Issue #283: the lane-bound BMAD runtime for a build-workflow role. */
+  private managedSkillsFor(role: Role, options: SpawnOptions): ManagedSkillSet | undefined {
+    if (options.managedSkills !== undefined) return options.managedSkills;
+    if (!ROLE_DEFINITIONS[role].managedBmadRuntime || this.opts.bmadRuntime === undefined) return undefined;
+    if ((options.reviewLead ?? options.isolatedReview) !== undefined) return undefined;
+    if (options.cwd === undefined || options.cwd === '') {
+      // No project cwd (for example a crash restart whose job lane is gone):
+      // there is no lane to bind. Keep the spawn working, visibly without
+      // the managed runtime.
+      this.log('warn', 'bmad runtime not bound: spawn has no project cwd', {
+        role,
+        resume_file: options.resumeFile ?? null,
+      });
+      return undefined;
+    }
+    const managed = this.opts.bmadRuntime(options.cwd);
+    this.log('info', 'bmad runtime bound', {
+      role,
+      cwd: options.cwd,
+      runtime: managed.runtimeId,
+      content_sha256: managed.contentSha256,
+      lane_bound: managed.laneBound,
+    });
+    return managed;
+  }
+
   private async spawnReserved(role: Role, options: SpawnOptions, release: (() => void) | null): Promise<AgentHandle> {
     if (options.signal?.aborted) throw new Error('resident admission cancelled before spawn');
     if (options.reviewOwnerGeneration !== undefined &&
@@ -585,14 +637,28 @@ export class RuntimeRegistry {
         : {},
     );
     const thinkingLevel = applyThinkingFallback(adapter, policy.thinkingLevel, this.log);
+    // Assignment lookup must see the same canonical URI/tilde path that both
+    // adapters lock/open, otherwise a legitimate recorded resume looks unowned.
+    const workflowOptions = options.resumeFile === undefined ? options
+      : { ...options, resumeFile: normalizeSessionPath(options.resumeFile) };
+    const workflowSession = this.opts.workflowRuntime !== undefined && ROLE_DEFINITIONS[role].managedBmadRuntime &&
+      (options.reviewLead ?? options.isolatedReview) === undefined
+      ? this.opts.workflowRuntime(workflowOptions) : undefined;
+    const managedSkills = workflowSession !== undefined ? workflowSession.managedSkills : this.managedSkillsFor(role, options);
+    const cwd = workflowSession?.cwd ?? options.cwd;
+    if (managedSkills !== undefined) this.log('info', 'managed workflow bound', {
+      role, cwd, runtime: managedSkills.runtimeId, content_sha256: managedSkills.contentSha256,
+      artifact_root: managedSkills.workflow?.context.artifactRoot ?? null,
+    });
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
-      ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
-      ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...((workflowSession?.agentId ?? options.agentId) !== undefined ? { agentId: workflowSession?.agentId ?? options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
       ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),
+      ...(managedSkills !== undefined ? { managedSkills } : {}),
       model: options.reviewModel !== undefined && this.runtimeIdFor(role) === 'pi'
         ? options.reviewModel.modelRef : policy.model,
       thinkingLevel,
