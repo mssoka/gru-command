@@ -733,13 +733,18 @@ function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure
     return text.includes(REDACTION_PLACEHOLDER) ? null : { kind: 'legacy' };
   }
   const host = text.slice(heading.index);
+  // A region carrying a redaction placeholder can never be trusted for scope
+  // credit: a forged heading and scope line planted in the lead-authored
+  // report ahead of a span that erased the genuine appendix would otherwise
+  // decode as a genuine disclosure. Redactions confined to the report (before
+  // the heading) leave the region clean, so the legacy/scoped paths below
+  // stay intact for them.
+  if (host.includes(REDACTION_PLACEHOLDER)) return null;
   const scopeLines = host.split('\n').filter((entry) => entry.startsWith('- Review scope: '));
   if (scopeLines.length === 0) {
-    // A missing disclosure is either the genuine pre-Stage-5 whole review (no
-    // scope lines were ever emitted) or scope evidence erased by a redaction
-    // span, whose placeholder remains in the region. An erased region can
-    // never be told from the absent era, so refuse rather than credit whole.
-    return host.includes(REDACTION_PLACEHOLDER) ? null : { kind: 'legacy' };
+    // No scope disclosure was ever emitted in this placeholder-free region: a
+    // genuine pre-Stage-5 whole review.
+    return { kind: 'legacy' };
   }
   // The host appendix emits exactly ONE scope line: two or more is ambiguous
   // scope evidence and refuses rather than picking one.
