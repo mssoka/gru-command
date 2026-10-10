@@ -4,6 +4,7 @@ import {
   PUBLICATION_ATTEMPT_EVENT,
   PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
+  parsePublicationIdentityPayload,
   pendingPublicationAttempt,
   type PublicationEvidenceReader,
 } from '../src/dispatch/publication-evidence.js';
@@ -103,6 +104,16 @@ describe('publication re-arm guard', () => {
     expect(problem?.kind).toBe('unresolved-rebinding');
     expect(problem?.detail).toContain('9001');
     expect(problem?.detail).toContain(TARGET);
+  });
+
+  it('parses a well-formed prepared posting identity and rejects malformed evidence', () => {
+    expect(parsePublicationIdentityPayload({ actor: 'gru-bot', host: 'github.com', targetSha: TARGET }))
+      .toEqual({ actor: 'gru-bot', host: 'github.com', targetSha: TARGET });
+    // Malformed/absent identity evidence never certifies a restart absence.
+    expect(parsePublicationIdentityPayload({ actor: 'gru-bot', host: 'github.com' })).toBeNull();
+    expect(parsePublicationIdentityPayload({ actor: '', host: 'github.com', targetSha: TARGET })).toBeNull();
+    expect(parsePublicationIdentityPayload({ actor: 7, host: 'github.com', targetSha: TARGET })).toBeNull();
+    expect(parsePublicationIdentityPayload(null)).toBeNull();
   });
 
   it('fails closed on a malformed attempt or absence payload', () => {

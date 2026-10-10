@@ -224,6 +224,8 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Perkins publication attempt for round ${round.id} could not be reconciled after restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} cannot be certified absent`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} did not land`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication for round ${round.id} was found at the provider after restart and is retained UNCREDITED`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} stays unresolved after restart`', '{ jobId: round.jobId, roundId: round.id }'],
@@ -262,10 +264,10 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    // 35 pre-existing wave call sites + the 10 durable-publication-recovery
+    // 35 pre-existing wave call sites + the 12 durable-publication-recovery
     // escalations added by the PR #289 native correction cycle, its
-    // amendment #1 rebind hold and the lane-less recovery resilience.
-    expect(sites).toHaveLength(45);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(42);
+    // amendments and the native R2 byte/identity fences.
+    expect(sites).toHaveLength(47);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(44);
   });
 });

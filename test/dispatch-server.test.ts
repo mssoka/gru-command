@@ -17,7 +17,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
-import { PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
+import { PUBLICATION_ATTEMPT_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
@@ -1177,6 +1177,34 @@ describe('dispatch server (E8)', () => {
       });
       expect(h.ledger.latestJobEvent('clean-abort-historical', 'silas.review-triggered')).toBeNull();
       expect(h.ledger.listRounds('clean-abort-historical')).toHaveLength(1);
+    } finally { await h.close(); }
+  }, 90_000);
+
+  it('refuses a clean-abort re-arm while a durable publication attempt has no conclusive outcome (native R2)', async () => {
+    // Shared consequence of the native R2 false-absence findings: a held
+    // recovery leaves the attempt unresolved, and the mechanical admission
+    // must refuse rather than start a second same-head publication.
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-r2-attempt');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const { sha, roundId } = await prepareCleanAbort(h, repo, 'clean-abort-r2-attempt');
+      h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId: 'clean-abort-r2-attempt', roundId, payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
+        targetSha: sha, baseSha: 'b'.repeat(40),
+        publicationFile: '/tmp/r2/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+        reviewEvent: 'APPROVE',
+      } });
+      const refused = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'clean-abort-r2-attempt', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      }, TOKEN);
+      expect(refused).toMatchObject({
+        status: 400,
+        json: { error: 'bad_request', detail: expect.stringMatching(/reconcile it before re-arming|publication attempt/u) },
+      });
+      expect(h.ledger.latestJobEvent('clean-abort-r2-attempt', 'silas.review-triggered')).toBeNull();
+      expect(h.ledger.listRounds('clean-abort-r2-attempt')).toHaveLength(1);
     } finally { await h.close(); }
   }, 90_000);
 

@@ -553,21 +553,60 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     const valid = make(goodBody, []);
     input.repoPath = join(dirname(valid.log), 'repo');
     await expect(valid.poster.post(input)).resolves.toMatchObject({ reviewId: '7', commitId: head, headSha: head });
-    // Reconciliation: a body-matching review with no usable commit binding
-    // is NOT a match — honestly unresolved, never a bound receipt.
+    // Reconciliation: a body-matching review with a provider-documented
+    // null/empty commit binding is a DECIDABLE non-match — honestly null,
+    // never a bound receipt.
     const unboundList = make(goodBody, [
-      { id: 8, user: { login: 'gru-bot' }, state: 'COMMENTED', body: 'review body\n' },
       { id: 9, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: null, body: 'review body\n' },
       { id: 10, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: '', body: 'review body\n' },
     ]);
     input.repoPath = join(dirname(unboundList.log), 'repo');
     await expect(unboundList.poster.reconcile!(input)).resolves.toBeNull();
+    // An entry MISSING a delivery predicate is undecidable evidence: it can
+    // neither be credited nor certify absence (native R2 F3).
+    const undecidableList = make(goodBody, [
+      { id: 8, user: { login: 'gru-bot' }, state: 'COMMENTED', body: 'review body\n' },
+    ]);
+    input.repoPath = join(dirname(undecidableList.log), 'repo');
+    await expect(undecidableList.poster.reconcile!(input)).rejects.toThrow(/undecidable|unresolved/u);
     const boundList = make(goodBody, [
       { id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: head, body: 'unrelated' },
       { id: 11, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' },
     ]);
     input.repoPath = join(dirname(boundList.log), 'repo');
     await expect(boundList.poster.reconcile!(input)).resolves.toMatchObject({ reviewId: '11', commitId: head, headSha: head });
+  });
+
+  it('refuses an undecidable gh review list instead of reporting absence (native R2 F3)', async () => {
+    const head = '1'.repeat(40);
+    const base = '2'.repeat(40);
+    const make = (reviews: unknown): { poster: GhPrPoster; repoPath: string } => {
+      const root = mkdtempSync(join(tmpdir(), 'perkins-gh-r2f3-'));
+      const log = join(root, 'calls.jsonl');
+      const binary = join(root, 'gh-double.mjs');
+      const repoPath = join(root, 'repo');
+      execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+      execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
+      writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(JSON.stringify(reviews))});\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+      chmodSync(binary, 0o755);
+      return { poster: new GhPrPoster(binary), repoPath };
+    };
+    const input = (repoPath: string) => ({
+      prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
+      body: 'review body\n', targetSha: head, baseSha: base, reviewEvent: 'COMMENT' as const,
+    });
+    // A successful `[{}]` reply is not a decidable list: no absence.
+    const undecidable = make([{}]);
+    await expect(undecidable.poster.reconcile!(input(undecidable.repoPath))).rejects.toThrow(/undecidable|unresolved/u);
+    // A genuinely empty list still proves absence.
+    const empty = make([]);
+    await expect(empty.poster.reconcile!(input(empty.repoPath))).resolves.toBeNull();
+    // A complete, valid, non-matching entry still proves absence.
+    const nonmatching = make([{ id: 8000, user: { login: 'someone' }, state: 'COMMENTED', commit_id: 'f'.repeat(40), body: 'unrelated' }]);
+    await expect(nonmatching.poster.reconcile!(input(nonmatching.repoPath))).resolves.toBeNull();
+    // A complete, valid match is still credited.
+    const matching = make([{ id: 8001, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' }]);
+    await expect(matching.poster.reconcile!(input(matching.repoPath))).resolves.toMatchObject({ reviewId: '8001', commitId: head, headSha: head });
   });
 
   it('never certifies absence when the frozen head carries a body-identical review in the wrong state (formal GitHub)', async () => {
@@ -9510,5 +9549,104 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     expect(stuckFix.ledger.latestRoundEvent(stuckRound.id, PUBLICATION_RECEIPT_EVENT)).toBeNull();
     expect(pendingPublicationAttempt(stuckFix.ledger, stuckRound.id)?.kind).toBe('unresolved-attempt');
     expect(stuckEscalations.join('\n')).toContain('unresolved');
+  }, 120_000);
+
+  it('never certifies absence when the canonical publication bytes changed after the intent (native R2 F1)', async () => {
+    const fix = durabilityFixture('r2-changed-bytes');
+    const jobId = 'job-r2-changed-bytes';
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: 'r2 changed bytes', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+    fix.ledger.setRoundStatus(round.id, 'live');
+    const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target);
+    fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'gru-bot', host: 'github.com', targetSha: fix.target } });
+    // The readable canonical artifact now carries DIFFERENT bytes than the
+    // durable intent digest: the lookup must never search them and then
+    // certify absence of the committed body.
+    writeFileSync(attemptPayload.publicationFile, '# DIFFERENT BYTES\n', 'utf8');
+    const reconcile = vi.fn(async () => null);
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      poster: { post: vi.fn(), reconcile, authenticatedActor: async () => 'gru-bot' },
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    await wave.recoverInterruptedRounds();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(fix.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
+    expect(pendingPublicationAttempt(fix.ledger, round.id)?.kind).toBe('unresolved-attempt');
+    expect(fix.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(escalations.join('\n')).toMatch(/digest|bytes/u);
+  }, 120_000);
+
+  it('requires provable posting-identity continuity before certifying absence (native R2 F2)', async () => {
+    async function identityScenario(name: string, prepared: string | null, current: string) {
+      const fix = durabilityFixture(name);
+      const jobId = `job-r2-identity-${name}`;
+      fix.ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+      fix.ledger.setJobStatus(jobId, 'working');
+      const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+      fix.ledger.setRoundStatus(round.id, 'live');
+      seedAttempt(fix, jobId, round.id, fix.target);
+      if (prepared !== null) {
+        fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: prepared, host: 'github.com', targetSha: fix.target } });
+      }
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger: fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: fix.artifacts,
+        spawner: vi.fn() as unknown as AgentSpawner,
+        poster: { post: vi.fn(), reconcile: vi.fn(async () => null), authenticatedActor: async () => current },
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      await wave.recoverInterruptedRounds();
+      return { fix, round, escalations };
+    }
+
+    // Rotated account: the fresh lookup cannot speak for the prepared one.
+    const rotated = await identityScenario('r2-identity-rotated', 'account-a', 'account-b');
+    expect(rotated.fix.ledger.latestRoundEvent(rotated.round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
+    expect(pendingPublicationAttempt(rotated.fix.ledger, rotated.round.id)?.kind).toBe('unresolved-attempt');
+    expect(rotated.escalations.join('\n')).toMatch(/identity|account/u);
+    // No durable identity at all: continuity is unprovable, never assumed.
+    const unbound = await identityScenario('r2-identity-unbound', null, 'account-a');
+    expect(unbound.fix.ledger.latestRoundEvent(unbound.round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
+    expect(pendingPublicationAttempt(unbound.fix.ledger, unbound.round.id)?.kind).toBe('unresolved-attempt');
+    // The SAME account: the bounded absence is credible and clears the attempt.
+    const same = await identityScenario('r2-identity-same', 'account-a', 'account-a');
+    expect(same.fix.ledger.latestRoundEvent(same.round.id, PUBLICATION_ABSENT_EVENT)).not.toBeNull();
+    expect(pendingPublicationAttempt(same.fix.ledger, same.round.id)).toBeNull();
+  }, 180_000);
+
+  it('holds a restart whose gh lookup met an undecidable review list (native R2 F3)', async () => {
+    const fix = durabilityFixture('r2-undecidable');
+    const jobId = 'job-r2-undecidable';
+    try { fix.repo.git(['remote', 'add', 'origin', 'https://github.com/acme/fixture.git']); }
+    catch { fix.repo.git(['remote', 'set-url', 'origin', 'https://github.com/acme/fixture.git']); }
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: 'r2 undecidable', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/77');
+    const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+    fix.ledger.setRoundStatus(round.id, 'live');
+    seedAttempt(fix, jobId, round.id, fix.target);
+    fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'gru-bot', host: 'github.com', targetSha: fix.target } });
+    // The real gh reconciliation meets a successful `[{}]` reply: usable
+    // evidence it is not, so the restart may not certify absence.
+    const ghRoot = mkdtempSync(join(tmpdir(), 'perkins-gh-r2f3-recovery-'));
+    dirs.push(ghRoot);
+    const binary = join(ghRoot, 'gh-double.mjs');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{}]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${fix.target}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
+    chmodSync(binary, 0o755);
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      poster: new GhPrPoster(binary),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    await wave.recoverInterruptedRounds();
+    expect(fix.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
+    expect(pendingPublicationAttempt(fix.ledger, round.id)?.kind).toBe('unresolved-attempt');
+    expect(escalations.join('\n')).toMatch(/stays unresolved|undecidable/u);
   }, 120_000);
 });

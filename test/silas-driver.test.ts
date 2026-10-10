@@ -46,7 +46,17 @@ import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { BRANCH_STATE_EVENT } from '../src/dispatch/github-poll.js';
 import { DEFAULT_SILAS_CONFIG } from '../src/config.js';
-import { PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
+import {
+  PUBLICATION_ABSENT_EVENT,
+  PUBLICATION_ATTEMPT_EVENT,
+  PUBLICATION_IDENTITY_EVENT,
+  PUBLICATION_REBIND_UNRESOLVED_EVENT,
+} from '../src/dispatch/publication-evidence.js';
+import { WaveRunner } from '../src/dispatch/perkins.js';
+import type { WorktreePort } from '../src/dispatch/worktree-port.js';
+import type { AgentSpawner } from '../src/dispatch/service.js';
+import { createHash } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import type { AgentCapabilities, AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
 import type { EventRecord, JobDeliverable, JobRecord, RoundRecord } from '../src/ledger/api.js';
@@ -1294,6 +1304,74 @@ describe('silas digest (the four actionable states)', () => {
       expect((await digestOf()).prWithoutReview).toEqual([]);
     } finally { h.cleanup(); }
   });
+
+  it('does not offer a clean-abort re-arm after a held recovery whose absence certificate would have been false (native R2 F1/F2)', async () => {
+    // The shared consequence of the native R2 findings: when restart
+    // reconciliation cannot honestly certify absence, the attempt stays
+    // unresolved and the automatic same-head re-arm must not be offered.
+    const h = makeLedger();
+    const artifacts = mkdtempSync(join(tmpdir(), 'gru-command-silas-r2-artifacts-'));
+    const repo = mkdtempSync(join(tmpdir(), 'gru-command-silas-r2-repo-'));
+    try {
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      const seed = (jobId: string, sha: string, mode: 'changed-bytes' | 'rotated-identity' | 'same-identity') => {
+        addJobWithDelivery(h.ledger, jobId, { prUrl: `https://git.example.invalid/pull/${jobId}` });
+        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha } });
+        const round = h.ledger.addRound({ jobId, targetRef: sha });
+        h.ledger.setRoundStatus(round.id, 'live');
+        h.ledger.setJobStatus(jobId, 'in-review');
+        const roundDir = join(artifacts, round.id);
+        mkdirSync(roundDir, { recursive: true });
+        const body = '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
+        const publicationFile = join(roundDir, 'perkins-report.publication.md');
+        writeFileSync(publicationFile, body, 'utf8');
+        writeFileSync(join(roundDir, 'manifest.json'), JSON.stringify({ repoPath: repo }), 'utf8');
+        h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId: round.id, payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
+          url: `https://git.example.invalid/pull/${jobId}`, host: 'git.example.invalid',
+          targetSha: sha, baseSha: 'b'.repeat(40),
+          publicationFile, publicationSha256: createHash('sha256').update(body).digest('hex'), reviewEvent: 'APPROVE',
+        } });
+        h.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'account-a', host: 'git.example.invalid', targetSha: sha } });
+        if (mode === 'changed-bytes') writeFileSync(publicationFile, '# DIFFERENT BYTES\n', 'utf8');
+        const wave = new WaveRunner({
+          ledger: h.ledger, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
+          reviewArtifactRoot: artifacts, spawner: vi.fn() as unknown as AgentSpawner,
+          poster: {
+            post: vi.fn(), reconcile: vi.fn(async () => null),
+            authenticatedActor: async () => (mode === 'rotated-identity' ? 'account-b' : 'account-a'),
+          },
+        });
+        return { round, wave };
+      };
+
+      // F1 (changed bytes) and F2 (rotated identity) both hold: no absence
+      // event, no clean-abort offer for either job.
+      for (const mode of ['changed-bytes', 'rotated-identity'] as const) {
+        const jobId = `clean-r2-${mode}`;
+        const { round, wave } = seed(jobId, `sha-${mode}`, mode);
+        await wave.recoverInterruptedRounds();
+        expect(h.ledger.getRound(round.id)?.status, mode).toBe('aborted');
+        expect(h.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT), mode).toBeNull();
+        expect((await digestOf()).prWithoutReview.filter((row) => row.jobId === jobId), mode).toEqual([]);
+      }
+
+      // The credible-absence positive: the same posting identity is proved
+      // continuous, the absence is recorded and the row returns.
+      const same = seed('clean-r2-same', 'sha-same', 'same-identity');
+      await same.wave.recoverInterruptedRounds();
+      expect(h.ledger.latestRoundEvent(same.round.id, PUBLICATION_ABSENT_EVENT)).not.toBeNull();
+      expect((await digestOf()).prWithoutReview).toMatchObject([
+        { jobId: 'clean-r2-same', cleanAbort: { roundId: same.round.id, ruleId: 'clean-abort-service-restart' } },
+      ]);
+    } finally {
+      rmSync(artifacts, { recursive: true, force: true });
+      rmSync(repo, { recursive: true, force: true });
+      h.cleanup();
+    }
+  }, 120_000);
 
   it('retires a clean-abort re-arm on the state it was answered by, keeping failed and deferred attempts eligible', async () => {
     const h = makeLedger();
