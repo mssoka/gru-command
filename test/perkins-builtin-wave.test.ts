@@ -8731,7 +8731,7 @@ describe('formal GitHub verdict publication from native judgments', () => {
     return { reviewEvent: payload?.reviewEvent, enacted: payload?.receipt?.event, reconciled: payload?.reconciled };
   }
 
-  function scenario(name: string) {
+  async function scenario(name: string, jobId: string) {
     const repo = makeFixtureRepo(`formal-verdict-${name}`);
     repos.push(repo);
     repo.git(['checkout', '-b', 'feature/formal-scenario']);
@@ -8743,6 +8743,7 @@ describe('formal GitHub verdict publication from native judgments', () => {
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), `formal-${name}-db-`)));
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
     const port = new GitReviewPort(root, 'feature/formal-scenario', repo.head());
+    await port.createJobWorktree({ repoPath: repo.path, jobId });
     return { repo, root, artifacts, sessions, ledger, port };
   }
 
@@ -8763,12 +8764,11 @@ describe('formal GitHub verdict publication from native judgments', () => {
         ...(finding !== undefined ? { leadFinding: finding } : {}),
         ...overrides,
       }).spawner,
-      ...extra,
     });
   }
 
   it('publishes a real approval, a real change request, keeps a final-pass-debt READY a comment, and clears the change request with a later eligible READY (formal GitHub)', async () => {
-    const fix = scenario('lifecycle');
+    const fix = await scenario('lifecycle', 'job-formal-lifecycle');
     fix.ledger.addJob({ id: 'job-formal-lifecycle', repo: 'fixture', title: 'formal lifecycle', baseBranch: 'main', briefing: 'review' });
     fix.ledger.setJobStatus('job-formal-lifecycle', 'working');
     settleLane(fix.ledger, 'job-formal-lifecycle');
@@ -8819,7 +8819,7 @@ describe('formal GitHub verdict publication from native judgments', () => {
   }, 240_000);
 
   it('refuses a publisher receipt that did not enact the intended formal state, and never retries it (formal GitHub)', async () => {
-    const fix = scenario('wrong-state');
+    const fix = await scenario('wrong-state', 'job-formal-wrong-state');
     fix.ledger.addJob({ id: 'job-formal-wrong-state', repo: 'fixture', title: 'formal wrong state', baseBranch: 'main', briefing: 'review' });
     fix.ledger.setJobStatus('job-formal-wrong-state', 'working');
     settleLane(fix.ledger, 'job-formal-wrong-state');
