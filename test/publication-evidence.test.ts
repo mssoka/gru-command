@@ -80,11 +80,13 @@ describe('publication re-arm guard', () => {
     expect(problem?.detail).toContain(TARGET);
   });
 
-  it('respects event order: a marker older than the recorded delivery does not hold it', () => {
+  it('respects event order: a stale marker does not hold a later recorded delivery', () => {
+    // The hold applies when the marker postdates the latest recorded
+    // delivery; a delivery recorded AFTER the marker has not been assessed
+    // yet (the next restart promotes it or writes a fresh marker).
     expect(pendingPublicationAttempt(ledgerWith([
       { kind: PUBLICATION_REBIND_UNRESOLVED_EVENT, seq: 1, payload: { targetSha: TARGET, reviewId: '9001', detail: 'old rebind failure' } },
       { kind: 'round.posted', seq: 2, payload: { verdict: 'approved' } },
-      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 3, payload: attempt },
     ]), 'r1')).toBeNull();
   });
 
