@@ -693,10 +693,11 @@ function parsePostedReviewState(value: unknown): PostedReviewStateParse {
 }
 
 /** The host-owned appendix heading: the publication body is the
- * lead-authored report CONCATENATED with the host appendix, so structural
- * scope markers are read only from the appendix region (after the LAST
- * occurrence of this heading). Untrusted prose can never shadow or invalidate
- * them. */
+ * lead-authored report CONCATENATED with the host appendix. Structural scope
+ * markers are recognized only inside a region opened by a LINE-ANCHORED
+ * occurrence of this heading (exactly one anchored occurrence; none = a
+ * pre-disclosure legacy body; more than one = ambiguous and refused), so
+ * untrusted prose can never shadow or invalidate them. */
 const HOST_APPENDIX_HEADING = '## Execution and findings (host-recorded facts)';
 
 /** What a DIGEST-VERIFIED publication body discloses about its round's review
