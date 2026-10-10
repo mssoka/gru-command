@@ -6,12 +6,18 @@
  * The pre-change base d0e6389 is a COMMENT-only publisher: it sends
  * `event: "COMMENT"`, enforces `COMMENTED`, records no wanted formal event,
  * and cannot refuse a wrong-state receipt. Every named formal-event
- * regression below must therefore fail AS A BEHAVIORAL ASSERTION against
- * that base — a leg that passes, a collection/setup/import failure, or a
- * named regression that failed for a non-assertion reason breaks the
- * fails-before claim instead of proving it. The exact named titles are
- * pinned here so the claim cannot drift to unrelated failures; missing
- * titles and every observed failed title are printed on failure.
+ * regression below must therefore fail BEHAVIORALLY — for a formal-event
+ * reason, not because the overlay could not be imported or collected.
+ *
+ * What counts as behavioral RED: a failed named assertion whose message
+ * carries a Vitest/Chai assertion frame (`AssertionError` / `_Assertion`),
+ * Vitest's resolved-instead-of-rejected matcher phrase, or the state-mismatch
+ * refusal the base poster itself raises. Import/collection/setup signatures
+ * (`Cannot find module`, missing exports, syntax/reference errors, unloadable
+ * urls, empty suites) are never accepted, and the named titles are pinned so
+ * the claim cannot drift to unrelated failures. A leg that passes, an
+ * unparseable report, or a named regression that failed for a non-behavioral
+ * reason breaks the fails-before claim (exit 2) instead of proving it.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -33,8 +39,29 @@ export const EXPECTED_FORMAL_EVENT_ASSERTIONS = Object.freeze({
   ]),
 });
 
+/** Import/collection/setup signatures an overlay failure must never carry. */
+export const NON_BEHAVIORAL_FAILURE_SIGNATURES = Object.freeze([
+  /Cannot find module/u,
+  /Cannot find package/u,
+  /does not provide an export named/u,
+  /Failed to load url/u,
+  /\bSyntaxError\b/u,
+  /\bReferenceError: .* is not defined/u,
+  /No test suite found/u,
+  /ERR_MODULE_NOT_FOUND/u,
+]);
+
+/** Behavioral markers: a real assertion frame, Vitest's rejection matcher,
+ * or the formal-state mismatch the COMMENT-only base itself enforces. */
+export const BEHAVIORAL_FAILURE_MARKERS = Object.freeze([
+  /AssertionError/u,
+  /_Assertion/u,
+  /instead of rejecting|instead of resolving/u,
+  /state mismatch|enacted (?:APPROVED|CHANGES_REQUESTED|COMMENTED) instead of/u,
+]);
+
 /** Verify one leg: parseable report, no collection/setup failures, and every
- * required formal-event assertion failed AS an assertion. Returns the proof
+ * required formal-event assertion failed behaviorally. Returns the proof
  * line; throws with the observed failed titles when the claim is broken. */
 export function assertFormalVerdictsBaselineLeg(label, report, requiredTitles) {
   if (report === null || typeof report !== 'object' || report.numFailedTests < 1 || !Array.isArray(report.testResults)) {
@@ -58,8 +85,17 @@ export function assertFormalVerdictsBaselineLeg(label, report, requiredTitles) {
       continue;
     }
     if (!Array.isArray(assertion.failureMessages) || assertion.failureMessages.length === 0 ||
-      assertion.failureMessages.some((message) => typeof message !== 'string' || !message.startsWith('AssertionError:'))) {
-      missing.push(`${title} (did not fail as an AssertionError)`);
+      assertion.failureMessages.some((message) => typeof message !== 'string')) {
+      missing.push(`${title} (no usable failure message)`);
+      continue;
+    }
+    const message = assertion.failureMessages.join('\n');
+    if (NON_BEHAVIORAL_FAILURE_SIGNATURES.some((pattern) => pattern.test(message))) {
+      missing.push(`${title} (failed for an import/setup reason, not behaviorally)`);
+      continue;
+    }
+    if (!BEHAVIORAL_FAILURE_MARKERS.some((pattern) => pattern.test(message))) {
+      missing.push(`${title} (failure carries no formal-event behavioral marker)`);
     }
   }
   if (missing.length > 0) {
@@ -76,7 +112,7 @@ export function assertFormalVerdictsBaselineLeg(label, report, requiredTitles) {
   const excluded = results.filter(
     (result) => result.status === 'failed' && !required.has(nameOf(result)),
   ).length;
-  return `${label}: formal-event absence proven — ${requiredTitles.length} named assertion(s) RED; ${excluded} unrelated failure(s) excluded from the claim`;
+  return `${label}: formal-event absence proven — ${requiredTitles.length} named assertion(s) RED behaviorally; ${excluded} unrelated failure(s) excluded from the claim`;
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {

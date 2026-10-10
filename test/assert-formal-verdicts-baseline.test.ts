@@ -35,12 +35,15 @@ describe('formal GitHub verdicts fail-before classifier', () => {
       .toThrow(/did not fail against the base/);
   });
 
-  it('rejects a named regression that failed for a non-assertion reason', () => {
+  it('rejects a named regression that failed for a non-behavioral reason', () => {
     const titles = EXPECTED_FORMAL_EVENT_ASSERTIONS.wave;
-    const failures = titles.map((title, index) =>
+    const noMarker = titles.map((title, index) =>
       assertion(title, 'failed', [index === 0 ? 'TypeError: cannot read properties of undefined' : 'AssertionError: nope']));
-    expect(() => assertFormalVerdictsBaselineLeg('wave', report(...failures), titles))
-      .toThrow(/did not fail as an AssertionError/);
+    expect(() => assertFormalVerdictsBaselineLeg('wave', report(...noMarker), titles))
+      .toThrow(/no formal-event behavioral marker/);
+    const imported = titles.map((title) => assertion(title, 'failed', ['Error: Cannot find module ../src/missing.js']));
+    expect(() => assertFormalVerdictsBaselineLeg('wave', report(...imported), titles))
+      .toThrow(/import\/setup reason/);
   });
 
   it('rejects collection/setup/import failures and unparseable reports', () => {
