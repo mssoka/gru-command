@@ -32,7 +32,7 @@ import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/t
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
-import { nextReviewScope, readPriorConvergenceMeta } from './perkins-review/convergence.js';
+import { planPerkinsReviewScope, validateRetainedReviewLinkage, type PriorAcceptanceBinding, type PriorNativeReceipt } from './perkins-review/convergence.js';
 import {
   freezeReviewInputs,
   compatibleReviewIdentity,
@@ -104,10 +104,14 @@ export function lensAgentLabel(lens: string, attempt: number): string {
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
+const REDACTION_PLACEHOLDER = '[REDACTED]';
+
 function redaction(_value: string): string {
   // A fixed placeholder: any digest of the redacted bytes would publish an
-  // offline brute-force oracle for low-entropy secrets.
-  return '[REDACTED]';
+  // offline brute-force oracle for low-entropy secrets. The scope-disclosure
+  // decoder uses the same literal to distinguish evidence erased by a
+  // redaction span from an authentic pre-disclosure absence.
+  return REDACTION_PLACEHOLDER;
 }
 
 /** Keep verification evidence private when it resembles a credential. The
@@ -265,12 +269,20 @@ export function hostDisclosureAppendix(
     readonly specialistRuns: ReadonlyArray<{ readonly lens: string; readonly status: string; readonly findingsDelivered?: boolean; readonly recoveredForLead?: true; readonly cleanupRecordingError?: string; readonly evidenceRecordingError?: string; readonly progressError?: string }>;
     readonly priorDispositions: ReadonlyArray<{ readonly status: string }>;
     readonly budgetRefusals?: ReadonlyArray<RoundBudgetRefusal>;
+    readonly targetSha?: string;
     readonly convergence?: {
-      readonly reviewScope: 'whole' | 'delta';
+      readonly reviewScope: 'whole' | 'delta' | 'integration';
+      readonly scopeReason?: string;
       readonly deltaUnavailable?: string;
+      readonly deltaFromSha?: string;
+      readonly integrationFromSha?: string;
+      readonly integrationBaseSha?: string;
+      readonly integrationPriorDiffBase?: string;
+      readonly integrationDeltaSha256?: string;
       readonly carriedPriors?: readonly number[];
       readonly deferredFollowups?: readonly { readonly title: string; readonly location: string; readonly severity: string }[];
       readonly verdictRecomputed?: { readonly from: string; readonly to: string };
+      readonly finalPassRequired?: true;
     };
   },
   provider: PublicationProviderKind,
@@ -362,12 +374,23 @@ export function hostDisclosureAppendix(
     ...(notUsed.length > 0 ? [`- Lenses not used this round: ${notUsed.join(', ')}`]: []),
     ...(prior.length > 0 ? [`- Prior findings revisited: ${prior.length} (${priorFixed} fixed, ${priorStill} still present)`] : []),
     ...(review.convergence === undefined ? [] : [
-      `- Review scope: ${review.convergence.reviewScope === 'delta' ? `delta since the last reviewed SHA${review.convergence.deltaUnavailable !== undefined ? ` (delta UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}` : 'whole change (standing authority)'}`,
+      `- Review scope: ${review.convergence.reviewScope === 'integration'
+        ? `integration review — prior coverage retained for the unchanged feature work; the review unit is the new integration/conflict-resolution work${review.convergence.integrationFromSha !== undefined ? ` since ${review.convergence.integrationFromSha}` : ''} integrated with base ${review.convergence.integrationBaseSha ?? 'n/a'}`
+        : review.convergence.reviewScope === 'delta'
+          ? `delta since the last reviewed SHA${review.convergence.deltaUnavailable !== undefined ? ` (delta UNAVAILABLE — disclosed whole-change re-verification: ${review.convergence.deltaUnavailable})` : ''}`
+          : 'whole change (standing authority)'}`,
+      ...(review.convergence.scopeReason !== undefined ? [`- Review scope reason: ${review.convergence.scopeReason}`] : []),
+      ...(review.convergence.finalPassRequired === true
+        ? ['- Final whole-change pass: STILL OWED — this round did not cover the whole candidate, so a later whole-scope pass must close at this target before the change is merge-ready']
+        : []),
+      ...(review.convergence.integrationFromSha !== undefined
+        ? [`- Integration provenance: prior covered head ${review.convergence.integrationFromSha} -> incoming base ${review.convergence.integrationBaseSha ?? 'n/a'} -> verdict head ${review.targetSha}${review.convergence.integrationDeltaSha256 !== undefined ? ` (integration unit sha256 ${review.convergence.integrationDeltaSha256})` : ''}`]
+        : []),
       ...(review.convergence.carriedPriors !== undefined && review.convergence.carriedPriors.length > 0
         ? [`- Prior findings carried forward without re-verification: ${review.convergence.carriedPriors.length} (quoted evidence unchanged, cited file untouched)`]
         : []),
       ...(review.convergence.deferredFollowups !== undefined && review.convergence.deferredFollowups.length > 0
-        ? [`- Follow-ups deferred by the convergence rule: ${review.convergence.deferredFollowups.length} — new finding(s) outside this round's delta hunks, filed as follow-ups; they are recorded in full and cannot hold the PR (${review.convergence.deferredFollowups.map((followUp) => `${followUp.severity}: "${followUp.title}" at ${followUp.location}`).join('; ')})`]
+        ? [`- Follow-ups deferred by the convergence rule: ${review.convergence.deferredFollowups.length} — new finding(s) outside this round's delta hunks, filed as follow-ups; they are recorded in full and cannot hold the PR (${review.convergence.deferredFollowups.map((followUp) => `${followUp.severity}: "${renderUntrustedInline(followUp.title)}" at ${renderUntrustedInline(followUp.location, 500)}`).join('; ')})`]
         : []),
       ...(review.convergence.verdictRecomputed !== undefined
         ? [`- Canonical verdict RECOMPUTED by the host convergence rule: the lead submitted "${review.convergence.verdictRecomputed.from}", the converged blocker set determines "${review.convergence.verdictRecomputed.to}"`]
@@ -521,6 +544,31 @@ export interface PostedEventPayload {
   readonly publicationSha256: string;
   readonly receipt: PostedReviewReceipt;
   readonly reconciled: boolean;
+  /** The round's authenticated review scope/coverage/debt, persisted with the
+   * posted event so restart recovery never has to infer debt from an absent
+   * or damaged consolidated record. Absent on historical rounds. */
+  readonly review?: PostedReviewState;
+}
+
+/** The durable posted review state: scope, whole-candidate coverage and the
+ * final-pass obligation, plus the integration linkage when applicable. */
+export interface PostedReviewState {
+  readonly reviewScope: 'whole' | 'delta' | 'integration';
+  readonly coverageComplete: boolean;
+  readonly finalPassRequired: boolean;
+  /** The round's own frozen diff base (persisted so promoted rounds can be
+   * authenticated as predecessors without trusting the mutable file). */
+  readonly diffBaseSha?: string;
+  /** Retained finding identity, persisted BEFORE delivery so a
+   * restart-promoted round can still authenticate its contents. */
+  readonly blockers?: number;
+  readonly retainedFindings?: number;
+  readonly retainedFindingsSha256?: string;
+  /** The round's full immutable integration linkage (all three together for
+   * an integration claim, none otherwise). */
+  readonly integrationFromSha?: string;
+  readonly integrationBaseSha?: string;
+  readonly integrationPriorDiffBase?: string;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -566,6 +614,11 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
   ) return null;
   const commitId = receipt['commitId'];
   if (commitId !== null && !nonEmptyString(commitId)) return null;
+  const parsedReview = parsePostedReviewState(value['review']);
+  // A PRESENT-but-damaged review block is not an absent historical one: the
+  // whole event refuses to parse (it can never be promoted or trusted), while
+  // an absent block keeps its documented fallback to the preserved record.
+  if (parsedReview.kind === 'damaged') return null;
   return {
     verdict,
     canonicalVerdict: canonicalVerdict as CanonicalReviewVerdict,
@@ -576,12 +629,164 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
     publicationFile,
     publicationSha256,
     reconciled,
+    ...(parsedReview.kind === 'valid' ? { review: parsedReview.state } : {}),
     receipt: {
       reviewId: receipt['reviewId'], actor: receipt['actor'], event: receipt['event'],
       commitId: commitId as string | null, headSha: receipt['headSha'], baseSha: receipt['baseSha'],
       bodySha256: receipt['bodySha256'],
     },
   };
+}
+
+/** The tri-state verdict on the OPTIONAL posted `review` block: absent (a
+ * historical round without one — recovery may fall back to the preserved
+ * consolidated record), damaged (the block EXISTS but is not a coherent,
+ * fully-linked state — the event is refused), or valid. */
+type PostedReviewStateParse =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'damaged' }
+  | { readonly kind: 'valid'; readonly state: PostedReviewState };
+
+/** Strict, throw-free parse of the optional posted `review` block. A present
+ * block must be complete and self-consistent: scope, coverage/debt booleans,
+ * the frozen diff base, the retained-finding identity AND — for an
+ * integration claim — the FULL immutable linkage validated by the SAME
+ * shared validator the scope planner and recovery readers use. A block
+ * failing any of that is DAMAGED, never silently treated as absent. */
+function parsePostedReviewState(value: unknown): PostedReviewStateParse {
+  if (value === undefined) return { kind: 'absent' };
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { kind: 'damaged' };
+  const review = value as Record<string, unknown>;
+  const scope = review['reviewScope'];
+  if (scope !== 'whole' && scope !== 'delta' && scope !== 'integration') return { kind: 'damaged' };
+  if (typeof review['coverageComplete'] !== 'boolean' || typeof review['finalPassRequired'] !== 'boolean') return { kind: 'damaged' };
+  const diffBaseSha = review['diffBaseSha'];
+  if (typeof diffBaseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(diffBaseSha)) return { kind: 'damaged' };
+  const blockers = review['blockers'];
+  const retainedFindings = review['retainedFindings'];
+  const retainedFindingsSha256 = review['retainedFindingsSha256'];
+  if (!Number.isSafeInteger(blockers) || (blockers as number) < 0) return { kind: 'damaged' };
+  if (!Number.isSafeInteger(retainedFindings) || (retainedFindings as number) < 0) return { kind: 'damaged' };
+  if (typeof retainedFindingsSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(retainedFindingsSha256)) return { kind: 'damaged' };
+  const from = review['integrationFromSha'];
+  const base = review['integrationBaseSha'];
+  const priorDiffBase = review['integrationPriorDiffBase'];
+  // ONE shared full-linkage verdict: an integration claim must carry all
+  // three linkage fields with its incoming base equal to its own frozen diff
+  // base; a whole/delta claim must carry none.
+  const linkage = validateRetainedReviewLinkage({
+    reviewScope: scope,
+    diffBaseSha,
+    integrationFromSha: from,
+    integrationBaseSha: base,
+    integrationPriorDiffBase: priorDiffBase,
+  });
+  if (!linkage.ok) return { kind: 'damaged' };
+  return {
+    kind: 'valid',
+    state: {
+      reviewScope: scope,
+      coverageComplete: review['coverageComplete'],
+      finalPassRequired: review['finalPassRequired'],
+      diffBaseSha,
+      blockers: blockers as number,
+      retainedFindings: retainedFindings as number,
+      retainedFindingsSha256,
+      ...(typeof from === 'string' ? { integrationFromSha: from } : {}),
+      ...(typeof base === 'string' ? { integrationBaseSha: base } : {}),
+      ...(typeof priorDiffBase === 'string' ? { integrationPriorDiffBase: priorDiffBase } : {}),
+    },
+  };
+}
+
+/** The host-owned appendix heading: the publication body is the
+ * lead-authored report CONCATENATED with the host appendix. Structural scope
+ * markers are recognized only inside a region opened by a LINE-ANCHORED
+ * occurrence of this heading (exactly one anchored occurrence; none = a
+ * pre-disclosure legacy body; more than one = ambiguous and refused), so
+ * untrusted prose can never shadow or invalidate them. */
+const HOST_APPENDIX_HEADING = '## Execution and findings (host-recorded facts)';
+
+/** What a DIGEST-VERIFIED publication body discloses about its round's review
+ * scope: the immutable native scope evidence for a round whose posted event
+ * predates the persisted `review` block. `legacy` is a body with no host
+ * appendix scope disclosure AND no trace of publication-redaction erasure (a
+ * genuine pre-Stage-5 whole review); `scoped` names the disclosed scope plus
+ * whether the appendix still discloses an owed final whole-change pass; null
+ * is a missing body, an unrecognized disclosure, or missing evidence whose
+ * absence is consistent with a redaction span — none of which can corroborate
+ * retention (refuse, never guess). */
+type PublishedScopeDisclosure =
+  | { readonly kind: 'legacy' }
+  | { readonly kind: 'scoped'; readonly reviewScope: 'whole' | 'delta' | 'integration'; readonly finalPassRequired: boolean };
+
+function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure | null {
+  if (text === null) return null;
+  // Structural recognition: only a LINE-ANCHORED heading marks the host
+  // appendix region. A finding or deferred-follow-up title embedding the
+  // heading inside a longer line can never move the boundary, and more than
+  // one anchored heading is ambiguous scope evidence and refuses.
+  const heading = lineAnchoredPosition(text, HOST_APPENDIX_HEADING);
+  if (heading.count > 1) return null;
+  if (heading.count === 0) {
+    // No host heading: either a genuine pre-heading-era whole record or
+    // evidence erased by a publication redaction span — which always leaves
+    // its placeholder. With a placeholder present the absence is ambiguous:
+    // refuse rather than credit whole clearance.
+    return text.includes(REDACTION_PLACEHOLDER) ? null : { kind: 'legacy' };
+  }
+  const host = text.slice(heading.index);
+  // A region carrying a redaction placeholder can never be trusted for scope
+  // credit: a forged heading and scope line planted in the lead-authored
+  // report ahead of a span that erased the genuine appendix would otherwise
+  // decode as a genuine disclosure. Redactions confined to the report (before
+  // the heading) leave the region clean, so the legacy/scoped paths below
+  // stay intact for them.
+  if (host.includes(REDACTION_PLACEHOLDER)) return null;
+  const scopeLines = host.split('\n').filter((entry) => entry.startsWith('- Review scope: '));
+  if (scopeLines.length === 0) {
+    // No scope disclosure was ever emitted in this placeholder-free region: a
+    // genuine pre-Stage-5 whole review.
+    return { kind: 'legacy' };
+  }
+  // The host appendix emits exactly ONE scope line: two or more is ambiguous
+  // scope evidence and refuses rather than picking one.
+  if (scopeLines.length > 1) return null;
+  const disclosed = scopeLines[0]!.slice('- Review scope: '.length);
+  const reviewScope = disclosed.startsWith('whole change')
+    ? 'whole' as const
+    : disclosed.startsWith('delta since')
+      ? 'delta' as const
+      : disclosed.startsWith('integration review')
+        ? 'integration' as const
+        : null;
+  if (reviewScope === null) return null;
+  return {
+    kind: 'scoped',
+    reviewScope,
+    finalPassRequired: host.includes('- Final whole-change pass: STILL OWED'),
+  };
+}
+
+/** The number of LINE-ANCHORED occurrences of `line` in `text` plus the
+ * position of the first: an occurrence is anchored when it starts at the
+ * text start or right after a newline AND ends at the text end or right
+ * before one. A dynamic field embedding the marker inside a longer line can
+ * never qualify. */
+function lineAnchoredPosition(text: string, line: string): { readonly count: number; readonly index: number } {
+  let count = 0;
+  let index = -1;
+  let cursor = text.indexOf(line);
+  while (cursor !== -1) {
+    const before = cursor === 0 || text[cursor - 1] === '\n';
+    const after = cursor + line.length === text.length || text[cursor + line.length] === '\n';
+    if (before && after) {
+      count += 1;
+      if (index === -1) index = cursor;
+    }
+    cursor = text.indexOf(line, cursor + 1);
+  }
+  return { count, index };
 }
 
 /** Host-side binding of a provider receipt before anything is recorded as
@@ -2378,6 +2583,7 @@ export class WaveRunner {
     // publication file still exists as a regular non-symlink file and
     // carries exactly the digested bytes (T3/R21).
     let bound = false;
+    let publicationText: string | null = null;
     if (event !== null && bindingProblem === null && actorProblem === null) {
       bound = true;
       try {
@@ -2386,14 +2592,57 @@ export class WaveRunner {
         if (!info.isFile() || info.isSymbolicLink()) {
           bound = false;
         } else {
-          const digest = createHash('sha256').update(readFileSync(canonical, 'utf8')).digest('hex');
+          const bytes = readFileSync(canonical);
+          const digest = createHash('sha256').update(bytes).digest('hex');
           bound = digest === event.publicationSha256 && digest === event.receipt.bodySha256;
+          // Keep the VERIFIED bytes: the scope fallback corroborates a
+          // historical round's scope from this exact body, never from a
+          // second (mutable) read.
+          if (bound) publicationText = bytes.toString('utf8');
         }
       } catch {
         bound = false;
       }
     }
     if (bound && event !== null) {
+      // Restore a partial-coverage round's final-pass debt BEFORE approval is
+      // committed: a crash between the posted event and the pre-commit marker
+      // must not promote a partial approval into owner-readiness. The state is
+      // the writer-persisted posted `review` block when present, else the
+      // preserved consolidated record, authenticated to the posted head.
+      // Absent/damaged evidence is NEVER treated as "no debt": the promotion
+      // is refused and the round stays interrupted for inspection.
+      if (postedVerdict === 'approved') {
+        const postedReview = event.review ?? this.readPostedReviewState(round.id, event.receipt.headSha, {
+          canonicalVerdict: event.canonicalVerdict,
+          publicationText,
+        });
+        if (postedReview === null) {
+          this.escalate(
+            `Review round ${round.id} cannot be promoted: its review coverage state is missing or damaged`,
+            'restart recovery refuses to promote an approval whose authenticated scope/coverage/debt cannot be established from the posted receipt or the preserved consolidated record; the round stays interrupted for inspection',
+            { jobId: round.jobId, roundId: round.id },
+          );
+          return 'unbound';
+        }
+        // Every partial scope owes the final whole-change pass: a delta
+        // approval always owed it, and an integration approval owed it unless
+        // the retained coverage was whole-complete. A whole-scope approval
+        // owes nothing unless its own record explicitly says otherwise.
+        const owesFinalPass = postedReview.finalPassRequired ||
+          (postedReview.reviewScope === 'integration' && !postedReview.coverageComplete) ||
+          postedReview.reviewScope === 'delta';
+        if (owesFinalPass && this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') === null) {
+          try {
+            this.opts.ledger.appendCustomEvent({
+              kind: 'round.final-pass-required', jobId: round.jobId, roundId: round.id,
+              payload: { targetSha: event.receipt.headSha, reviewScope: postedReview.reviewScope },
+            });
+          } catch (markerError) {
+            throw new Error(`restart recovery could not restore the required final whole-change pass before promoting round ${round.id}: ${String(markerError)}`);
+          }
+        }
+      }
       // R6-1: reconstruct the DEFERRED lens outcomes from durable evidence
       // before promotion — the crash may have landed between the real post
       // and finalization, leaving never-started lenses pending. The
@@ -4847,15 +5096,21 @@ export class WaveRunner {
 
     let review: PerkinsWholeResult;
     try {
-      // The NEWEST completed predecessor is the required prior record: a
-      // missing or corrupt consolidated file for it fails loudly instead of
-      // silently presenting an older past as the whole history.
+      // The NEWEST conclusive predecessor, selected INDEPENDENTLY of its
+      // annotations: normal finalization commits `verdict-posted` before
+      // `round.perkins-review`, and restart promotion commits it before
+      // `round.post-recovered`, so a crash in either window leaves a
+      // delivered, terminal round carrying neither marker. Its posted receipt
+      // (persisted BEFORE delivery) authenticates it below; when that evidence
+      // is unusable the plan reviews whole with a durable reason rather than
+      // jumping to older coverage. A missing or corrupt consolidated file for
+      // the selected round fails loudly instead of silently presenting an
+      // older past as the whole history.
       let priorConsolidatedFile: string | undefined;
       const newestPredecessor = this.opts.ledger
         .listRounds(job.id)
         .filter((candidate) =>
-          candidate.seq < round.seq && candidate.status === 'verdict-posted' && candidate.verdict !== null &&
-          this.opts.ledger.latestRoundEvent(candidate.id, 'round.perkins-review') !== null,
+          candidate.seq < round.seq && candidate.status === 'verdict-posted' && candidate.verdict !== null,
         )
         .sort((left, right) => right.seq - left.seq)[0];
       if (newestPredecessor !== undefined) {
@@ -4985,6 +5240,29 @@ export class WaveRunner {
             ...(sha256 !== undefined ? { sha256 } : {}) };
         });
       }
+      // Stage-5 convergence (issue #225) + integration coverage: the scope is
+      // planned from the prior round's durable convergence record and the
+      // repo's own ancestry, never from wall-clock heuristics. Retained
+      // coverage is credited only when the prior record's scope/coverage and
+      // acceptance are AUTHENTICATED against the prior round's native ledger
+      // receipts (freeze binding + review/verdict/debt events) — a stripped,
+      // forged or contradicted record reviews whole with a durable reason.
+      const priorEvidence = newestPredecessor === undefined ? null : this.priorNativeEvidence(newestPredecessor);
+      const scopePlan = planPerkinsReviewScope({
+        ...(priorConsolidatedFile !== undefined && newestPredecessor !== undefined
+          ? { priorConsolidatedFile, priorSeq: newestPredecessor.seq }
+          : {}),
+        repoPath: frozenReview.manifest.repoPath,
+        currentTargetSha: frozenReview.manifest.targetSha,
+        currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
+        currentAcceptance: frozenReview.manifest.acceptance,
+        ...(priorEvidence !== null ? { nativeReceipt: priorEvidence.receipt, acceptanceReceipt: priorEvidence.acceptance } : {}),
+        rules: {
+          deltaRoundsFrom: policy.portableContract.rules.convergence.deltaRoundsFrom,
+          finalWholePassAtReady: policy.portableContract.rules.convergence.finalWholePassAtReady,
+          integrationCoverage: policy.portableContract.rules.convergence.integrationCoverage,
+        },
+      });
       review = await workflow.run({
         roundId: round.id,
         ...(recoveryDirectory !== undefined ? { recoveryDirectory, recoveryStarts, recoverySources } : {}),
@@ -4995,19 +5273,10 @@ export class WaveRunner {
         signal,
         ...(recoveredBaseTips.length > 0 && candidates.length > 0 ? { recoveredBaseTips } : {}),
         ...(priorConsolidatedFile !== undefined ? { priorConsolidatedFile } : {}),
-        // Stage-5 convergence (issue #225): every round after a prior is a
-        // delta round, except the final whole-change pass at a READY
-        // candidate. The scope is planned from the prior round's durable
-        // convergence record, never from wall-clock heuristics.
-        reviewScope: nextReviewScope({
-          prior: priorConsolidatedFile !== undefined && newestPredecessor !== undefined
-            ? readPriorConvergenceMeta(priorConsolidatedFile, newestPredecessor.seq)
-            : null,
-          currentTargetSha: frozenReview.manifest.targetSha,
-          currentDiffBaseSha: frozenReview.manifest.diffBaseSha,
-          deltaRoundsFrom: policy.portableContract.rules.convergence.deltaRoundsFrom,
-          finalWholePassAtReady: policy.portableContract.rules.convergence.finalWholePassAtReady,
-        }),
+        ...(scopePlan.priorConsolidatedSha256 !== undefined ? { priorConsolidatedSha256: scopePlan.priorConsolidatedSha256 } : {}),
+        reviewScope: scopePlan.scope,
+        reviewScopeReason: scopePlan.reason,
+        priorCoverageComplete: scopePlan.priorCoverageComplete,
         ...(claimedFixedPriors !== undefined ? { claimedFixedPriors } : {}),
       });
     } catch (error) {
@@ -5198,6 +5467,24 @@ export class WaveRunner {
               commitId: delivered.commitId, headSha: delivered.headSha, baseSha: delivered.baseSha, bodySha256: delivered.bodySha256,
             },
             reconciled,
+            // Persist the authenticated review scope/coverage/debt AND the
+            // retained finding identity WITH the posted event, BEFORE it
+            // becomes promotable, so restart recovery and promoted-round
+            // predecessor selection never have to trust mutable state.
+            ...(review.convergence !== undefined ? {
+              review: {
+                reviewScope: review.convergence.reviewScope,
+                coverageComplete: review.convergence.coverageComplete === true || review.convergence.reviewScope === 'whole',
+                finalPassRequired: review.convergence.finalPassRequired === true,
+                diffBaseSha: review.diffBaseSha,
+                blockers: review.findings.filter((finding) => finding.severity === 'blocker' && finding.deferredFollowup !== true).length,
+                retainedFindings: review.findings.length,
+                retainedFindingsSha256: createHash('sha256').update(JSON.stringify(review.findings)).digest('hex'),
+                ...(review.convergence.integrationFromSha !== undefined ? { integrationFromSha: review.convergence.integrationFromSha } : {}),
+                ...(review.convergence.integrationBaseSha !== undefined ? { integrationBaseSha: review.convergence.integrationBaseSha } : {}),
+                ...(review.convergence.integrationPriorDiffBase !== undefined ? { integrationPriorDiffBase: review.convergence.integrationPriorDiffBase } : {}),
+              },
+            } : {}),
         };
         // R34 writer/reader symmetry invariant: the event about to be
         // persisted MUST parse through the SAME shared contract restart
@@ -5205,6 +5492,21 @@ export class WaveRunner {
         // refused here instead of becoming a round that can never recover.
         if (parsePostedEventPayload(postedPayload) === null) {
           throw new Error('internal: refusing to persist a round.posted payload that restart recovery cannot parse');
+        }
+        // The final-pass obligation is durable BEFORE the posted event becomes
+        // promotable: a crash between `round.posted` and a later marker write
+        // must never let restart recovery (or the board's owner-ready gate)
+        // promote a partial-coverage approval without its debt.
+        if (verdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved &&
+          this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') === null) {
+          try {
+            this.opts.ledger.appendCustomEvent({
+              kind: 'round.final-pass-required', jobId: job.id, roundId: round.id,
+              payload: { targetSha: review.targetSha, reviewScope: review.convergence.reviewScope },
+            });
+          } catch (markerError) {
+            throw new Error(`could not record the required final whole-change pass before the posted event: ${String(markerError)}`);
+          }
         }
         this.opts.ledger.appendCustomEvent({
           kind: 'round.posted',
@@ -5394,11 +5696,12 @@ export class WaveRunner {
     }
     if (recordedVerdict !== null) {
       // Stage-5: the final-pass obligation is durable BEFORE the verdict
-      // commits. A crash between the two must never leave an approved
-      // delta round without its marker (the board's owner-ready gate reads
-      // this event); a failed marker write therefore fails the round
-      // closed instead of approving.
-      if (recordedVerdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved) {
+      // commits. It is normally already written by recordDelivery BEFORE the
+      // posted event; this is the idempotent fallback for any delivery path
+      // that did not. A failed marker write fails the round closed instead of
+      // approving.
+      if (recordedVerdict === 'approved' && review.convergence?.finalPassRequired === true && !headMoved &&
+        this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') === null) {
         try {
           this.opts.ledger.appendCustomEvent({
             kind: 'round.final-pass-required', jobId: job.id, roundId: round.id,
@@ -5431,6 +5734,11 @@ export class WaveRunner {
           // digest renders it as "verdict with N blocker(s)"). Deferred
           // follow-ups cannot hold the PR, so they are not blockers here.
           blockers: review.findings.filter((finding) => finding.severity === 'blocker' && finding.deferredFollowup !== true).length,
+          // Bind the retained finding CONTENTS to the native submission: a
+          // record whose findings are later swapped/emptied can never be
+          // credited whole-complete coverage over unresolved priors.
+          retainedFindings: review.findings.length,
+          retainedFindingsSha256: createHash('sha256').update(JSON.stringify(review.findings)).digest('hex'),
           targetSha: review.targetSha,
           baseRefSha: frozenReview.manifest.baseRefSha,
           diffBaseSha: review.diffBaseSha,
@@ -5440,6 +5748,12 @@ export class WaveRunner {
           complete: canonical !== 'INCOMPLETE' && !headMoved,
           ...(review.convergence !== undefined ? {
             reviewScope: review.convergence.reviewScope,
+            ...(review.convergence.scopeReason !== undefined ? { scopeReason: review.convergence.scopeReason } : {}),
+            ...(review.convergence.integrationFromSha !== undefined ? { integrationFromSha: review.convergence.integrationFromSha } : {}),
+            ...(review.convergence.integrationBaseSha !== undefined ? { integrationBaseSha: review.convergence.integrationBaseSha } : {}),
+            ...(review.convergence.integrationPriorDiffBase !== undefined ? { integrationPriorDiffBase: review.convergence.integrationPriorDiffBase } : {}),
+            ...(review.convergence.coverageComplete === true ? { coverageComplete: true } : {}),
+            ...(review.convergence.integrationDeltaSha256 !== undefined ? { integrationDeltaSha256: review.convergence.integrationDeltaSha256 } : {}),
             ...(review.convergence.carriedPriors !== undefined ? { carriedPriors: review.convergence.carriedPriors.length } : {}),
             ...(review.convergence.carriedLenses !== undefined ? { carriedLenses: review.convergence.carriedLenses } : {}),
             ...(review.convergence.deferredFollowups !== undefined ? { deferredFollowups: review.convergence.deferredFollowups.length } : {}),
@@ -5935,6 +6249,163 @@ export class WaveRunner {
     } catch {
       return false;
     }
+  }
+
+  /** Read the review scope/coverage/debt from a round's preserved consolidated
+   * record when the posted event carries no persisted `review` block,
+   * authenticated to the posted head AND to the round's immutable native
+   * evidence. Returns null when the record is absent, unreadable, malformed,
+   * bound to a different head, not a conclusive unchanged-head completion, or
+   * its verdict disagrees with the posted event — recovery then refuses to
+   * promote rather than assume no debt. Absent convergence is NOT itself
+   * whole-review proof: the DIGEST-VERIFIED publication body must corroborate
+   * whole scope (a pre-disclosure body IS the genuine historical whole
+   * review); a body that discloses a delta/integration/owed-pass scope keeps
+   * its debt instead of promoting debt-free. A recognized scope whose full
+   * linkage is missing or inconsistent (the SAME shared validator the planner
+   * and posted parser use) is DAMAGED state, never a debt-free promotion. */
+  private readPostedReviewState(
+    roundId: string,
+    headSha: string,
+    posted: { readonly canonicalVerdict: string; readonly publicationText: string | null },
+  ): PostedReviewState | null {
+    const consolidated = join(reviewArtifactDirectory(this.artifactRoot(), roundId), 'consolidated.json');
+    try {
+      const info = lstatSync(consolidated);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > 8 * 1024 * 1024) return null;
+      const parsed = JSON.parse(readFileSync(consolidated, 'utf8')) as {
+        architecture?: unknown;
+        schemaVersion?: unknown;
+        complete?: unknown;
+        headMoved?: unknown;
+        canonicalVerdict?: unknown;
+        frozen?: { targetSha?: unknown; diffBaseSha?: unknown };
+        findings?: unknown;
+        convergence?: { reviewScope?: unknown; coverageComplete?: unknown; finalPassRequired?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
+      };
+      if (parsed.architecture !== 'perkins-whole-pr' || parsed.schemaVersion !== 3 || parsed.frozen?.targetSha !== headSha) return null;
+      // A recovery fallback may credit only a CONCLUSIVE, unchanged-head
+      // completion whose verdict agrees with the posted event: an incomplete,
+      // moved-head or verdict-inconsistent record must never promote.
+      if (parsed.complete !== true || parsed.headMoved !== false) return null;
+      if (typeof parsed.canonicalVerdict !== 'string' || parsed.canonicalVerdict !== posted.canonicalVerdict) return null;
+      if (parsed.convergence === undefined) {
+        // Absent convergence is authenticated against the round's immutable
+        // scope evidence or refused: never treated as whole clearance on the
+        // mutable file's word alone.
+        const disclosure = publishedScopeDisclosure(posted.publicationText);
+        if (disclosure === null) return null;
+        if (disclosure.kind === 'scoped' && (disclosure.reviewScope !== 'whole' || disclosure.finalPassRequired)) {
+          return { reviewScope: disclosure.reviewScope, coverageComplete: false, finalPassRequired: true };
+        }
+        return { reviewScope: 'whole', coverageComplete: true, finalPassRequired: false };
+      }
+      const convergence = parsed.convergence;
+      // A present-but-mistyped coverage/debt field is damaged state, never a
+      // coerced 'no debt': the writer emits booleans or nothing.
+      if (convergence.coverageComplete !== undefined && typeof convergence.coverageComplete !== 'boolean') return null;
+      if (convergence.finalPassRequired !== undefined && typeof convergence.finalPassRequired !== 'boolean') return null;
+      const from = convergence.integrationFromSha;
+      const base = convergence.integrationBaseSha;
+      const priorDiffBase = convergence.integrationPriorDiffBase;
+      // ONE shared full-linkage verdict: a recognized integration claim must
+      // carry all three linkage fields with its incoming base equal to its
+      // own frozen diff base; whole/delta claims must carry none; an empty or
+      // unrecognized scope is never debt-free 'unknown'.
+      const linkage = validateRetainedReviewLinkage({
+        reviewScope: convergence.reviewScope,
+        diffBaseSha: parsed.frozen.diffBaseSha,
+        integrationFromSha: from,
+        integrationBaseSha: base,
+        integrationPriorDiffBase: priorDiffBase,
+      });
+      if (!linkage.ok) return null;
+      const scope = convergence.reviewScope as 'whole' | 'delta' | 'integration';
+      // A digest-verified disclosure must not CONTRADICT the record: the same
+      // clearance class as the absent-block case. A body that names a
+      // different scope, or that still owes the final pass while the record's
+      // effective debt says none is owed, is damaged state — refuse.
+      const disclosure = publishedScopeDisclosure(posted.publicationText);
+      // Unusable publication scope is NEVER authenticated by the mutable
+      // record: a missing or unrecognized disclosure refuses in BOTH fallback
+      // branches (the absent-convergence branch refuses it too).
+      if (disclosure === null) return null;
+      if (disclosure.kind === 'scoped') {
+        const effectiveDebt = scope === 'delta' ||
+          (scope === 'integration' && convergence.coverageComplete !== true) ||
+          convergence.finalPassRequired === true;
+        if (disclosure.reviewScope !== scope || (disclosure.finalPassRequired && !effectiveDebt)) return null;
+      }
+      return {
+        reviewScope: scope,
+        coverageComplete: convergence.coverageComplete === true || scope === 'whole',
+        finalPassRequired: convergence.finalPassRequired === true,
+        ...(typeof parsed.frozen.diffBaseSha === 'string' ? { diffBaseSha: parsed.frozen.diffBaseSha } : {}),
+        ...(typeof from === 'string' ? { integrationFromSha: from } : {}),
+        ...(typeof base === 'string' ? { integrationBaseSha: base } : {}),
+        ...(typeof priorDiffBase === 'string' ? { integrationPriorDiffBase: priorDiffBase } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** The prior round's NATIVE ledger receipts: the durable
+   * `round.perkins-review` fields (identity + scope/coverage/debt) plus the
+   * pre-commit `round.final-pass-required` marker presence, and the accepted
+   * contract binding recorded on the round's own freeze event. These
+   * authenticate a consolidated file's retained-coverage claims. */
+  private priorNativeEvidence(round: RoundRecord): { receipt: PriorNativeReceipt; acceptance: PriorAcceptanceBinding | null } {
+    const reviewEvent = this.opts.ledger.latestRoundEvent(round.id, 'round.perkins-review');
+    const payload = typeof reviewEvent?.payload === 'object' && reviewEvent.payload !== null
+      ? reviewEvent.payload as Record<string, unknown>
+      : {};
+    // A restart-PROMOTED round has no round.perkins-review event; its
+    // scope/coverage/debt and retained-finding identity were persisted with
+    // the posted event BEFORE delivery and are the authoritative receipt.
+    // The posted evidence is used only when it is bound to THIS round's own
+    // frozen target; anything else is an unusable receipt (the caller then
+    // reviews whole, never inherits from it).
+    const postedEvent = this.opts.ledger.latestRoundEvent(round.id, 'round.posted');
+    const posted = postedEvent === null ? null : parsePostedEventPayload(postedEvent.payload);
+    const postedReview = posted !== null && posted.targetSha === round.targetRef ? posted.review : undefined;
+    const debtMarker = this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') !== null;
+    const frozenEvent = this.opts.ledger.latestRoundEvent(round.id, 'round.review-inputs-frozen');
+    const frozenPayload = typeof frozenEvent?.payload === 'object' && frozenEvent.payload !== null
+      ? frozenEvent.payload as { acceptance?: unknown }
+      : {};
+    const rawAcceptance = frozenPayload.acceptance;
+    const acceptance = typeof rawAcceptance === 'object' && rawAcceptance !== null &&
+      typeof (rawAcceptance as { version?: unknown }).version === 'number' &&
+      Number.isSafeInteger((rawAcceptance as { version?: number }).version) &&
+      typeof (rawAcceptance as { baseSha256?: unknown }).baseSha256 === 'string' &&
+      typeof (rawAcceptance as { contractSha256?: unknown }).contractSha256 === 'string' &&
+      /^[a-f0-9]{64}$/u.test((rawAcceptance as { contractSha256: string }).contractSha256) &&
+      Array.isArray((rawAcceptance as { amendmentIds?: unknown }).amendmentIds) &&
+      ((rawAcceptance as { amendmentIds: unknown[] }).amendmentIds).every((id) => typeof id === 'string')
+      ? {
+          version: (rawAcceptance as { version: number }).version,
+          baseSha256: (rawAcceptance as { baseSha256: string }).baseSha256,
+          contractSha256: (rawAcceptance as { contractSha256: string }).contractSha256,
+          amendmentIds: [...(rawAcceptance as { amendmentIds: string[] }).amendmentIds],
+        }
+      : null;
+    return {
+      receipt: {
+        targetSha: payload['targetSha'] ?? posted?.targetSha,
+        diffBaseSha: payload['diffBaseSha'] ?? postedReview?.diffBaseSha,
+        reviewScope: payload['reviewScope'] ?? postedReview?.reviewScope,
+        coverageComplete: payload['coverageComplete'] ?? postedReview?.coverageComplete,
+        finalPassRequired: payload['finalPassRequired'] === true || debtMarker || postedReview?.finalPassRequired === true,
+        blockers: payload['blockers'] ?? postedReview?.blockers,
+        retainedFindings: payload['retainedFindings'] ?? postedReview?.retainedFindings,
+        retainedFindingsSha256: payload['retainedFindingsSha256'] ?? postedReview?.retainedFindingsSha256,
+        integrationFromSha: payload['integrationFromSha'] ?? postedReview?.integrationFromSha,
+        integrationBaseSha: payload['integrationBaseSha'] ?? postedReview?.integrationBaseSha,
+        integrationPriorDiffBase: payload['integrationPriorDiffBase'] ?? postedReview?.integrationPriorDiffBase,
+      },
+      acceptance,
+    };
   }
 
   private async sweepReviewWorktree(worktreeId: string): Promise<void> {

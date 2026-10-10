@@ -7,7 +7,7 @@ import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
 import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
-import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, type DeltaSince, type PriorCarryClassification } from './convergence.js';
+import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, integrationSince, parsePriorConvergenceMeta, probeIntegrationLineage, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -162,6 +162,11 @@ export interface RunWholeReviewInput {
   readonly movementRef: string;
   readonly noSpec: boolean;
   readonly priorConsolidatedFile?: string;
+  /** sha256 of the exact prior-record bytes the production scope planner
+   * authenticated. When present, the engine consumes ONLY bytes that hash to
+   * this pin: a file changed between planning and consumption refuses before
+   * any coverage credit instead of silently substituting prior coverage. */
+  readonly priorConsolidatedSha256?: string;
   /** Authenticated predecessor base tips when a compatible base-only fast-forward
    * occurred. The fresh lead must judge the current base, not inherited work. */
   readonly recoveredBaseTips?: readonly string[];
@@ -177,10 +182,20 @@ export interface RunWholeReviewInput {
     readonly manifestSha256: string; readonly sha256?: string;
   }[];
   /** Stage-5 review scope: 'delta' reviews the change since the last
-   * reviewed SHA with host carry-forward of untouched priors; 'whole' is
-   * the standing whole-change authority (a job's first review and the
-   * final pass at a READY candidate). Default 'whole'. */
-  readonly reviewScope?: 'whole' | 'delta';
+   * reviewed SHA with host carry-forward of untouched priors; 'integration'
+   * reviews the new integration/conflict-resolution work of a candidate that
+   * integrated the reviewed feature head with an advanced base, retaining
+   * the prior coverage; 'whole' is the standing whole-change authority (a
+   * job's first review and the final pass at a READY candidate). Default
+   * 'whole'. */
+  readonly reviewScope?: 'whole' | 'delta' | 'integration';
+  /** Deterministic host reason for the planned scope (disclosed durably). */
+  readonly reviewScopeReason?: string;
+  /** The authenticated whole-candidate coverage of the prior round, as the
+   * production planner authenticated it against the prior round's native
+   * ledger receipt. Absent = fall back to the record's own (unauthenticated)
+   * bit (tests and direct callers). */
+  readonly priorCoverageComplete?: boolean;
   /** Prior indexes the implementing minion claimed fixed (fix-directive
    * receipt); claimed priors are always re-verified by the lead. */
   readonly claimedFixedPriors?: readonly number[];
@@ -224,11 +239,26 @@ export interface RoundBudgetRefusal {
  * whenever a prior round existed). Disclosed in consolidated.json and the
  * publication appendix; every field is deterministic host output. */
 export interface ReviewConvergence {
-  readonly reviewScope: 'whole' | 'delta';
-  /** Set when the delta could not be read and the round fell back to the
-   * whole-change authority — disclosed, never silent. */
+  readonly reviewScope: 'whole' | 'delta' | 'integration';
+  /** Deterministic host reason for the scope decision (covers integration
+   * retention and disclosed whole-change fallbacks). */
+  readonly scopeReason?: string;
+  /** Set when a delta/integration unit could not be prepared and the round
+   * fell back to the whole-change authority — disclosed, never silent. */
   readonly deltaUnavailable?: string;
   readonly deltaFromSha?: string;
+  /** Integration scope only: the prior covered feature head H0. */
+  readonly integrationFromSha?: string;
+  /** Integration scope only: the advanced incoming base B1. */
+  readonly integrationBaseSha?: string;
+  /** Integration scope only: the prior round's own pinned base B0. */
+  readonly integrationPriorDiffBase?: string;
+  /** sha256 of the persisted `integration-delta.patch` review unit. */
+  readonly integrationDeltaSha256?: string;
+  /** Integration scope only: prior feature changes the integration discarded
+   * (the candidate now matches its base), so the whole-candidate authority is
+   * still owed and the review cannot certify the integration. */
+  readonly integrationDroppedPaths?: readonly string[];
   /** Prior indexes carried forward without lead re-verification. */
   readonly carriedPriors?: readonly number[];
   /** Prior indexes the lead had to disposition. */
@@ -246,6 +276,12 @@ export interface ReviewConvergence {
   /** Set only when the host recomputed the canonical verdict because a
    * deferred blocker changed the converged blocker set. */
   readonly verdictRecomputed?: { readonly from: CanonicalReviewVerdict; readonly to: CanonicalReviewVerdict };
+  /** Set only when this round's scope + retained coverage covers the WHOLE
+   * current candidate (a whole round, or an integration round whose prior
+   * was itself whole-complete). Persisted so the NEXT round reads a durable
+   * bit instead of inferring coverage from a scope label — a partial-coverage
+   * integration round records NO such bit and can never launder into one. */
+  readonly coverageComplete?: true;
   /** A delta round that posted READY still owes the final whole-change
    * pass: approval must never be credited before that pass runs. */
   readonly finalPassRequired?: true;
@@ -720,23 +756,53 @@ interface PriorReview {
   /** Valid lens results of the prior round ([] for legacy records without
    * a specialistRuns field). */
   readonly validLenses: readonly PerkinsLens[];
+  /** The prior round's own review scope ('unknown' for legacy records). */
+  readonly reviewScope: 'whole' | 'delta' | 'integration' | 'unknown';
+  /** Durable whole-candidate coverage bit: true only when the prior round's
+   * scope + retained coverage covered the whole candidate. A legacy `whole`
+   * record without the bit is whole-complete by construction; a `delta` or a
+   * partial `integration` record is not. */
+  readonly coverageComplete: boolean;
 }
 
 /** Load the prior round's consolidated record. schemaVersion 2 is the retired
  * chunk-protocol shape (read-only compatibility; its `chunks` field is
- * tolerated and ignored); schemaVersion 3 is the whole-PR shape. */
-function loadPriorReview(file: string | undefined): PriorReview {
-  if (file === undefined) return { findings: [], targetSha: null, diffBaseSha: null, validLenses: [] };
+ * tolerated and ignored); schemaVersion 3 is the whole-PR shape. When the
+ * production planner pinned the record's exact bytes, ONLY bytes matching
+ * that pin are consumed: a changed file refuses BEFORE any coverage credit
+ * (the authenticated scope can never be silently replaced by different
+ * findings), and the meta used for coverage is parsed from those same bytes
+ * rather than re-read from the mutable path. */
+function loadPriorReview(file: string | undefined, expectedSha256: string | undefined): PriorReview {
+  if (file === undefined) {
+    if (expectedSha256 !== undefined) {
+      throw new Error('internal: a pinned prior review was requested without a prior record path');
+    }
+    return { findings: [], targetSha: null, diffBaseSha: null, validLenses: [], reviewScope: 'unknown', coverageComplete: false };
+  }
   const size = statSync(file).size;
   if (size > 8 * 1024 * 1024) throw new Error('prior consolidated review exceeds 8 MiB');
   const bytes = readFileSync(file);
   if (bytes.byteLength !== size || bytes.byteLength > 8 * 1024 * 1024) {
     throw new Error('prior consolidated review changed while bounded bytes were read');
   }
+  if (expectedSha256 !== undefined) {
+    if (!/^[a-f0-9]{64}$/u.test(expectedSha256)) {
+      throw new Error('internal: the authenticated prior review pin is malformed');
+    }
+    const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(
+        `the authenticated prior review record changed between scope planning and engine consumption ` +
+        `(pinned sha256 ${expectedSha256}, found ${actualSha256}) — refusing to credit retained coverage`,
+      );
+    }
+  }
   const parsed = JSON.parse(bytes.toString('utf8')) as {
     schemaVersion?: unknown; findings?: unknown;
     frozen?: { targetSha?: unknown; diffBaseSha?: unknown };
     specialistRuns?: unknown;
+    convergence?: { reviewScope?: unknown; coverageComplete?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
   };
   if (
     (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3) ||
@@ -791,11 +857,17 @@ function loadPriorReview(file: string | undefined): PriorReview {
       }
     }
   }
+  const priorMeta = parsePriorConvergenceMeta(bytes, 0);
   return {
     findings,
     targetSha: parsed.frozen.targetSha,
     diffBaseSha: typeof parsed.frozen.diffBaseSha === 'string' ? parsed.frozen.diffBaseSha : null,
     validLenses,
+    // One shared reader owns the linkage/coverage rules for both the scope
+    // planner and the engine, so they can never diverge — and it parses the
+    // SAME pinned bytes the digest above verified.
+    reviewScope: priorMeta?.reviewScope ?? 'unknown',
+    coverageComplete: priorMeta?.coverageComplete ?? false,
   };
 }
 
@@ -1088,7 +1160,7 @@ export class PerkinsWholeReview {
     const catalog = input.noSpec
       ? this.policy.portableContract.rules.noSpecLenses
       : this.policy.portableContract.rules.fullLenses;
-    const priorReview = loadPriorReview(input.priorConsolidatedFile);
+    const priorReview = loadPriorReview(input.priorConsolidatedFile, input.priorConsolidatedSha256);
     const prior = priorReview.findings;
     // Stage-5 convergence plan (issue #225): the round's review scope and,
     // for a delta round, the deterministic carry-forward classification of
@@ -1097,26 +1169,98 @@ export class PerkinsWholeReview {
     // READY candidate). An unreadable delta degrades DISCLOSED to whole
     // authority (every prior re-verified) — never silently.
     const convergenceRules = this.policy.portableContract.rules.convergence;
-    // A delta round requires a prior target to delta FROM; the caller's
-    // scope decision (nextReviewScope) owns the round-number policy.
-    const reviewScope = input.reviewScope === 'delta' && priorReview.targetSha !== null
-      ? 'delta' as const
-      : 'whole' as const;
+    // A delta/integration round requires a prior target to delta FROM; the
+    // caller's scope decision (planReviewScope) owns the round-number policy.
+    let reviewScope: 'whole' | 'delta' | 'integration' =
+      input.reviewScope === 'delta' && priorReview.targetSha !== null
+        ? 'delta'
+        : input.reviewScope === 'integration' && priorReview.targetSha !== null && priorReview.diffBaseSha !== null
+          ? 'integration'
+          : 'whole';
+    let scopeReason = input.reviewScopeReason ?? null;
+    if (input.reviewScope === 'integration' && reviewScope !== 'integration') {
+      scopeReason = 'integration scope requested without a conclusive prior target/base — whole-change re-verification';
+    }
+    if (input.reviewScope === 'delta' && reviewScope !== 'delta') {
+      scopeReason = 'delta scope requested without a conclusive prior target/base — whole-change re-verification';
+    }
     let delta: DeltaSince | null = null;
     let deltaUnavailable: string | null = null;
+    let integrationLinkage: { readonly priorTargetSha: string; readonly priorDiffBaseSha: string; readonly incomingBaseSha: string; readonly sha256: string } | null = null;
+    let integrationCarryPaths: ReadonlySet<string> | null = null;
+    let integrationDroppedPaths: readonly string[] = [];
     if (reviewScope === 'delta') {
       try {
         delta = deltaSince(review.manifest.repoPath, priorReview.targetSha!, review.manifest.targetSha);
       } catch (error) {
         deltaUnavailable = sanitizeError(error);
+        scopeReason = `delta scope planned but the delta since the prior reviewed head could not be prepared (${deltaUnavailable}) — whole-change re-verification`;
+      }
+    } else if (reviewScope === 'integration') {
+      try {
+        // Re-prove the lineage inside the engine before reading the unit: a
+        // direct caller cannot produce a durable integration record whose
+        // provenance the host never checked.
+        const lineage = probeIntegrationLineage(review.manifest.repoPath, {
+          priorDiffBaseSha: priorReview.diffBaseSha!,
+          priorTargetSha: priorReview.targetSha!,
+          currentDiffBaseSha: review.manifest.diffBaseSha,
+          currentTargetSha: review.manifest.targetSha,
+        });
+        if (lineage === null ||
+          !((lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned) ||
+            lineage.sameHeadAdoptedBase)) {
+          throw new Error('integration lineage could not be re-proven for this prior target/base');
+        }
+        const integration = integrationSince(
+          review.manifest.repoPath, priorReview.targetSha!, priorReview.diffBaseSha!,
+          review.manifest.diffBaseSha, review.manifest.targetSha,
+        );
+        delta = integration;
+        integrationCarryPaths = integration.carryPaths;
+        integrationDroppedPaths = integration.droppedFeaturePaths;
+        const deltaSha256 = createHash('sha256').update(integration.diff, 'utf8').digest('hex');
+        // Persist the exact reviewed unit so a stranger can distinguish the
+        // newly reviewed integration work from retained coverage.
+        writeReviewArtifact(review, 'integration-delta.patch', integration.diff);
+        integrationLinkage = {
+          priorTargetSha: integration.priorTargetSha,
+          priorDiffBaseSha: integration.priorDiffBaseSha,
+          incomingBaseSha: integration.incomingBaseSha,
+          sha256: deltaSha256,
+        };
+      } catch (error) {
+        // A damaged/unreadable integration unit is a coverage gap: fall back
+        // to the whole-change authority with the reason disclosed, never a
+        // silent restart and never inherited coverage. ALL derived state is
+        // reset — a stale unit would otherwise render a mislabeled delta
+        // block in the whole-change prompt.
+        deltaUnavailable = sanitizeError(error);
+        scopeReason = `integration scope planned but the integration unit could not be prepared (${deltaUnavailable}) — whole-change re-verification`;
+        reviewScope = 'whole';
+        delta = null;
+        integrationCarryPaths = null;
+        integrationDroppedPaths = [];
+        integrationLinkage = null;
       }
     }
-    const classifications: readonly PriorCarryClassification[] = reviewScope === 'delta'
+    const carriesForward = reviewScope === 'delta' || reviewScope === 'integration';
+    // Coverage completeness is the PRIOR record's durable bit, never a scope
+    // label: an integration round whose own prior was partial carries no bit
+    // and can never launder partial coverage into a later integration READY.
+    const priorCoveredWhole = input.priorCoverageComplete ?? priorReview.coverageComplete;
+    const classifications: readonly PriorCarryClassification[] = carriesForward
       ? delta === null || convergenceRules.carryForwardUntouchedPriors !== true
-        ? prior.map((_finding, priorIndex) => ({ priorIndex, status: 'reverify' as const, reason: deltaUnavailable !== null ? `delta since the last reviewed SHA unavailable (${deltaUnavailable}) — whole-change re-verification` : 'carry-forward disabled by policy' }))
+        ? prior.map((_finding, priorIndex) => ({ priorIndex, status: 'reverify' as const, reason: deltaUnavailable !== null
+          ? `delta since the last reviewed SHA unavailable (${deltaUnavailable}) — whole-change re-verification`
+          : 'carry-forward disabled by policy' }))
         : classifyPriorFindings({
           prior,
-          touchedPaths: delta.touchedPaths,
+          // For integration, "changed since the prior review" is every path
+          // whose content changed H0..H1 (including incoming-base-only
+          // files), not merely the unit — a prior on a base-changed file is
+          // re-verified against its new content.
+          touchedPaths: integrationCarryPaths ?? delta.touchedPaths,
           ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
           frozenBlobContains: (path, evidence) => frozenBlobContains(review, path, evidence),
         })
@@ -1135,7 +1279,7 @@ export class PerkinsWholeReview {
         if (source !== 'lead') priorFindingLenses.add(source);
       }
     }
-    const carriedLensCandidates = reviewScope === 'delta'
+    const carriedLensCandidates = carriesForward
       ? catalog.filter((lens) => priorReview.validLenses.includes(lens) && !priorFindingLenses.has(lens))
       : [];
     const attempts = new Map<string, number>();
@@ -2305,7 +2449,7 @@ export class PerkinsWholeReview {
           for (const result of results.values()) {
             if (result.status === 'valid') ranValidThisRound.add(result.lens);
           }
-          const carriedLenses: PerkinsLens[] = reviewScope === 'delta'
+          const carriedLenses: PerkinsLens[] = carriesForward
             ? catalog.filter((lens) => priorReview.validLenses.includes(lens) && !ranValidThisRound.has(lens) &&
               !findings.some((finding) => finding.sources.includes(lens)))
             : [];
@@ -2324,12 +2468,28 @@ export class PerkinsWholeReview {
               canonicalVerdict = expected;
             }
           }
+          // Whole-candidate coverage of THIS round: a whole round always
+          // covers the candidate; an integration round covers it only when
+          // the retained prior coverage was itself whole-complete (read from
+          // the prior record's durable bit, never a scope label). A delta
+          // round never does. A round that ended INCOMPLETE or on a moved
+          // head certifies nothing.
+          const coversWhole = reviewScope === 'whole' ||
+            (reviewScope === 'integration' && priorCoveredWhole && integrationDroppedPaths.length === 0);
           const convergence: ReviewConvergence = {
             reviewScope,
+            ...(scopeReason !== null ? { scopeReason } : {}),
             ...(deltaUnavailable !== null ? { deltaUnavailable } : {}),
-            ...(delta !== null ? { deltaFromSha: delta.fromSha } : {}),
+            ...(reviewScope === 'delta' && delta !== null ? { deltaFromSha: delta.fromSha } : {}),
+            ...(reviewScope === 'integration' && integrationLinkage !== null ? {
+              integrationFromSha: integrationLinkage.priorTargetSha,
+              integrationBaseSha: integrationLinkage.incomingBaseSha,
+              integrationPriorDiffBase: integrationLinkage.priorDiffBaseSha,
+              integrationDeltaSha256: integrationLinkage.sha256,
+              ...(integrationDroppedPaths.length > 0 ? { integrationDroppedPaths } : {}),
+            } : {}),
             ...(carriedPriors.length > 0 ? { carriedPriors: carriedPriors.map((classification) => classification.priorIndex).sort((left, right) => left - right) } : {}),
-            ...(reviewScope === 'delta' ? { reverifyPriors: reverifyPriors.map((classification) => classification.priorIndex).sort((left, right) => left - right) } : {}),
+            ...(carriesForward ? { reverifyPriors: reverifyPriors.map((classification) => classification.priorIndex).sort((left, right) => left - right) } : {}),
             ...(carriedLenses.length > 0 ? { carriedLenses } : {}),
             ...(deferredLead.length > 0 ? {
               deferredFollowups: deferredLead.map(({ finding, reason }) => ({
@@ -2338,11 +2498,16 @@ export class PerkinsWholeReview {
               })),
             } : {}),
             ...(verdictRecomputed !== undefined ? { verdictRecomputed } : {}),
-            // A delta READY still owes the final whole-change pass: approval
-            // must never be credited before that pass runs (see perkins.ts,
-            // which chains it immediately, and the board's owner-ready gate,
-            // which refuses a round still carrying this flag after a crash).
-            ...(reviewScope === 'delta' && canonicalVerdict === 'READY TO MERGE' && headMovedAtSubmit === null
+            // Durable whole-candidate coverage for the NEXT round's decision.
+            ...(coversWhole && canonicalVerdict !== 'INCOMPLETE' && headMovedAtSubmit === null
+              ? { coverageComplete: true as const }
+              : {}),
+            // A READY round that does NOT cover the whole candidate still owes
+            // the final whole-change pass: approval must never be credited
+            // before that pass runs (see perkins.ts, which chains it
+            // immediately, and the board's owner-ready gate, which refuses a
+            // round still carrying this flag after a crash).
+            ...(!coversWhole && canonicalVerdict === 'READY TO MERGE' && headMovedAtSubmit === null
               ? { finalPassRequired: true as const }
               : {}),
           };
@@ -2454,18 +2619,33 @@ export class PerkinsWholeReview {
       `--- CHARGED SPECIALIST BUDGET ---\n${specialistsStarted}/${MAX_SPECIALISTS_PER_ROUND} round runs spent; ` +
       catalog.map((lens) => `${lens}: ${attempts.get(lens) ?? 0}/2 attempts`).join(', ') +
       '. These ledger starts remain spent even when their output cannot be authenticated. No previous verdict or clearance is inherited.';
-    const deltaPromptSection = delta === null ? '' : [
-      '--- DELTA SINCE LAST REVIEWED SHA (this round\'s review unit) ---',
-      `From: ${delta.fromSha}`,
-      `To: ${delta.toSha}`,
-      `Touched paths (${delta.touchedPaths.size}): ${[...delta.touchedPaths].sort().join(', ')}`,
-      'Everything below is part of the complete frozen diff; this is the subset this delta round reviews first.',
-      delta.diff,
-    ].join('\n');
+    const deltaPromptSection = delta === null ? '' : reviewScope === 'integration'
+      ? [
+        '--- INTEGRATION UNIT (new integration/conflict-resolution work) ---',
+        `Prior covered feature head: ${priorReview.targetSha}`,
+        `Incoming base: ${review.manifest.diffBaseSha}`,
+        `Touched paths (${delta.touchedPaths.size}): ${[...delta.touchedPaths].sort().join(', ')}`,
+        'Everything below is part of the complete frozen diff; this is the subset this integration round reviews first. Unchanged incoming base code is baseline context, not new PR work; the delta convergence rule does not apply.',
+        delta.diff === '' ? (integrationDroppedPaths.length > 0
+          ? '(the integration unit is empty, but a resolution discarded prior reviewed feature work; the whole-change pass is still owed)'
+          : '(the integration unit is empty: no candidate change differs from the prior frozen diff)') : delta.diff,
+      ].join('\n')
+      : [
+        '--- DELTA SINCE LAST REVIEWED SHA (this round\'s review unit) ---',
+        `From: ${delta.fromSha}`,
+        `To: ${delta.toSha}`,
+        `Touched paths (${delta.touchedPaths.size}): ${[...delta.touchedPaths].sort().join(', ')}`,
+        'Everything below is part of the complete frozen diff; this is the subset this delta round reviews first.',
+        delta.diff,
+      ].join('\n');
     const initialPrompt = [this.leadPrompt(review, prior, priorReview.targetSha, {
       reviewScope,
       delta,
       deltaUnavailable,
+      integrationBaseSha: review.manifest.diffBaseSha,
+      integrationPriorBaseSha: integrationLinkage?.priorDiffBaseSha ?? null,
+      priorCoverageComplete: priorCoveredWhole,
+      integrationDroppedPaths,
       carriedPriors,
       reverifyPriors,
       carriedLenses: carriedLensCandidates,
@@ -2850,9 +3030,13 @@ export class PerkinsWholeReview {
     prior: readonly VerifiedFinding[],
     priorTargetSha: string | null,
     plan: {
-      readonly reviewScope: 'whole' | 'delta';
+      readonly reviewScope: 'whole' | 'delta' | 'integration';
       readonly delta: DeltaSince | null;
       readonly deltaUnavailable: string | null;
+      readonly integrationBaseSha?: string | null;
+      readonly integrationPriorBaseSha?: string | null;
+      readonly priorCoverageComplete?: boolean;
+      readonly integrationDroppedPaths?: readonly string[];
       readonly carriedPriors: readonly PriorCarryClassification[];
       readonly reverifyPriors: readonly PriorCarryClassification[];
       readonly carriedLenses: readonly PerkinsLens[];
@@ -2862,11 +3046,20 @@ export class PerkinsWholeReview {
   ): string {
     const evidenceSection = renderEvidencePromptSection(review.evidence.attachments, review.manifest.targetSha);
     const deltaRound = plan.reviewScope === 'delta' && priorTargetSha !== null;
-    // A delta round lists only the priors the lead must disposition; host-
-    // carried priors are listed separately (accounting, never disposition).
-    const revisitIndexes = deltaRound ? plan.reverifyPriors.map((classification) => classification.priorIndex) : prior.map((_finding, index) => index);
+    const integrationRound = plan.reviewScope === 'integration' && priorTargetSha !== null;
+    // The EFFECTIVE whole-candidate coverage of this integration round: the
+    // retained bit must hold AND no resolution may have discarded reviewed
+    // feature work (the same condition the engine's coversWhole uses). The
+    // prompt must never claim READY binds the head while a whole pass is owed.
+    const droppedPaths = plan.integrationDroppedPaths ?? [];
+    const effectiveCoverage = plan.priorCoverageComplete === true && droppedPaths.length === 0;
+    // An incremental (delta OR integration) round lists only the priors the
+    // lead must disposition; host-carried priors are listed separately
+    // (accounting, never disposition).
+    const incrementalRound = deltaRound || integrationRound;
+    const revisitIndexes = incrementalRound ? plan.reverifyPriors.map((classification) => classification.priorIndex) : prior.map((_finding, index) => index);
     const revisit = JSON.stringify(revisitIndexes.map((prior_index) => ({ prior_index, ...prior[prior_index]! })), null, 2);
-    const carriedList = deltaRound && plan.carriedPriors.length > 0
+    const carriedList = incrementalRound && plan.carriedPriors.length > 0
       ? [
         '--- PRIOR FINDINGS CARRIED FORWARD (host-verified; do NOT disposition) ---',
         JSON.stringify(plan.carriedPriors.map((classification) => ({
@@ -2876,19 +3069,37 @@ export class PerkinsWholeReview {
           severity: prior[classification.priorIndex]!.severity,
           reason: classification.reason,
         })), null, 2),
-        'The host re-verified each carried finding deterministically: its quoted evidence is unchanged in the frozen tree and its cited file untouched by this round\'s delta. They remain retained findings — account for every carried title in your report — but they need no disposition from you.',
+        'The host re-verified each carried finding deterministically: its quoted evidence is unchanged in the frozen tree and its cited file untouched by this round\'s review unit. They remain retained findings — account for every carried title in your report — but they need no disposition from you.',
         '',
       ].join('\n')
       : '';
-    const scopeHeader = deltaRound
-      ? `REVIEW SCOPE: DELTA ROUND — the review unit is the delta since the last reviewed SHA (${priorTargetSha}..${review.manifest.targetSha}). Prior lens results stand for lenses with no open findings and no relevance to this delta; run a lens only where the delta or an open finding needs its fresh view.`
-      : priorTargetSha !== null
-        ? 'REVIEW SCOPE: WHOLE CHANGE — this is the standing whole-change authority pass (the delta convergence rule does not apply here).'
-        : 'REVIEW SCOPE: WHOLE CHANGE.';
-    const carriedLensSection = deltaRound && plan.carriedLenses.length > 0
+    const scopeHeader = integrationRound
+      ? `REVIEW SCOPE: INTEGRATION ROUND — the reviewed feature head ${priorTargetSha} was integrated with an advanced base (new frozen diff base ${review.manifest.diffBaseSha}); the host retains the prior review of the unchanged feature work where its evidence still holds. The review unit is the new integration/conflict-resolution work since the prior covered candidate (below); unchanged incoming base code is baseline context, NOT new PR work. The complete frozen diff above stays your review context — judge the interactions across this boundary. The delta convergence rule does NOT apply in an integration round: a finding the integration introduced holds the PR wherever its evidence lies. ${effectiveCoverage ? 'The retained coverage is whole-complete: a READY here binds the current head.' : droppedPaths.length > 0 ? `The retained coverage cannot certify the whole candidate: ${droppedPaths.length} previously reviewed feature change(s) no longer differ from the incoming base, so a READY here still owes the final whole-change pass.` : 'The retained coverage is only partial: a READY here still owes the final whole-change pass.'}`
+      : deltaRound
+        ? `REVIEW SCOPE: DELTA ROUND — the review unit is the delta since the last reviewed SHA (${priorTargetSha}..${review.manifest.targetSha}). Prior lens results stand for lenses with no open findings and no relevance to this delta; run a lens only where the delta or an open finding needs its fresh view.`
+        : priorTargetSha !== null
+          ? 'REVIEW SCOPE: WHOLE CHANGE — this is the standing whole-change authority pass (the delta convergence rule does not apply here).'
+          : 'REVIEW SCOPE: WHOLE CHANGE.';
+    const carriedLensSection = incrementalRound && plan.carriedLenses.length > 0
       ? [
-        `PRIOR LENS RESULTS CARRIED (${plan.carriedLenses.join(', ')}): these lenses completed a valid, DELIVERED prior run and have no prior finding at all, so the host records their last result as coverage for this round. The host does not claim delta irrelevance — re-run any lens whose view this delta could change.`,
+        `PRIOR LENS RESULTS CARRIED (${plan.carriedLenses.join(', ')}): these lenses completed a valid, DELIVERED prior run and have no prior finding at all, so the host records their last result as coverage for this round. The host does not claim the review unit leaves them irrelevant — re-run any lens whose view it could change.`,
         '',
+      ].join('\n')
+      : '';
+    const integrationSection = integrationRound && plan.delta !== null
+      ? [
+        '--- INTEGRATION UNIT (new integration/conflict-resolution work) ---',
+        `Prior covered feature head: ${priorTargetSha}`,
+        `Prior pinned base: ${plan.integrationPriorBaseSha ?? 'n/a'}`,
+        `Incoming base (this round's frozen diff base): ${plan.integrationBaseSha ?? review.manifest.diffBaseSha}`,
+        `Unit paths (${plan.delta.touchedPaths.size}): ${[...plan.delta.touchedPaths].sort().join(', ') || 'none'}`,
+        'This unit is exactly the part of the new whole diff (`base..target`) whose per-path content differs from the prior covered round: unchanged feature work (identical per-path diff) and incoming-base-only files (absent from the new whole diff) are NOT in it, while manual conflict resolutions, new feature edits and files BOTH sides changed ARE. The complete frozen diff above is still your review context; use it to judge the integration boundary. The delta convergence rule does NOT apply — any finding you ground can hold the PR wherever its evidence lies.',
+        ...(droppedPaths.length > 0
+          ? [`Discarded reviewed feature change(s) (${droppedPaths.length}): ${droppedPaths.join(', ')} — the resolution no longer carries these prior reviewed changes, so the whole-change pass is still owed and a READY here cannot bind the head.`]
+          : []),
+        plan.delta.diff === '' ? ((plan.integrationDroppedPaths?.length ?? 0) > 0
+          ? `(the integration unit is empty, but ${plan.integrationDroppedPaths!.length} prior feature change(s) no longer differ from the incoming base — a resolution discarded reviewed work, so the whole-change pass is still owed)`
+          : '(the integration unit is empty: no candidate change differs from the prior frozen diff, so the retained coverage stands)') : plan.delta.diff,
       ].join('\n')
       : '';
     const deltaSection = plan.delta === null
@@ -2903,6 +3114,7 @@ export class PerkinsWholeReview {
         'Everything below is part of the complete frozen diff; this is the subset this delta round reviews first.',
         plan.delta.diff,
       ].join('\n');
+    const incrementalSection = integrationRound ? integrationSection : deltaSection;
     const convergenceRule = deltaRound && plan.roundNumber >= plan.fromRound
       ? `CONVERGENCE RULE (round ${plan.roundNumber}): from this round, only a blocker whose location intersects this round's delta hunks can hold the PR. The host defers findings outside the delta (new or carried) as follow-ups — recorded and disclosed, never dropped — and a deferred blocker cannot hold THIS round; the final whole-change pass is where an untouched blocker holds again. Submit the verdict the CONVERGED blocker set implies.`
       : '';
@@ -2926,7 +3138,7 @@ export class PerkinsWholeReview {
       '',
       '--- COMPLETE FROZEN DIFF (the whole change under review) ---',
       review.diff,
-      ...(deltaSection === '' ? [] : ['', deltaSection]),
+      ...(incrementalSection === '' ? [] : ['', incrementalSection]),
       '',
       ...(carriedList === '' ? [] : [carriedList]),
       ...(carriedLensSection === '' ? [] : [carriedLensSection]),

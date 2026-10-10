@@ -147,3 +147,29 @@
 - [Review][Defer] Receipt validation is asymmetric — `readCaptureReceipt` validates only the `pings` field this change added; a v1 receipt with a missing/wrongly-typed `frames`/`capture_bytes`/`started` still reads back as a `CaptureReceipt`. Pre-existing; a full receipt validator is a separate change.
 - [Review][Defer] Ping wire literal duplicated — `PingFrame` is exported but the reader compares a bare `frame['type'] === 'ping'`; a rename on either side compiles clean and silently reclassifies the keepalive as a producer frame. Settled by: a shared `PING_FRAME_TYPE` constant (or type guard) owned by the verify wire vocabulary.
 - [Review][Defer] Synchronous write-failure branch has no test double — the `stopHeartbeat()` in `writeFrame`'s catch (ERR_STREAM_*/serialization) is defensive and unreachable by the current socket tests. Settled by: a fake `res` whose `write` throws, asserting the interval is cleared.
+
+## Deferred from: native R4 repair of job perkins-integration-review-coverage-20261009 (2026-10-10)
+
+- source_spec: `spec-perkins-integration-review-coverage.md`
+  summary: Ordinary delta planning treats a baseline whole record with nonempty findings but no findings digest as unusable, so a same-base fix round restarts whole review instead of delta convergence.
+  evidence: The R4 warning at `src/dispatch/perkins-review/convergence.ts:1014-1021` is a real behavior observation. Separating "ordinary delta predecessor usability" from "integration whole-complete credit" would reintroduce unauthenticated finding contents into carry-forward, which prior-finding 0 deliberately made fail closed; the change is safety-sensitive and outside the approved R4 repair scope. Settled by: a design that authenticates delta carry through a per-finding binding (digest or frozen-evidence re-proof) without trusting count-only receipts, reviewed as its own change.
+
+## Deferred from: native R7 whole-change review of job perkins-integration-review-coverage-20261009 (2026-10-10)
+
+- source_spec: `spec-perkins-integration-review-coverage.md`
+  summary: A baseline whole receipt with `blockers: 0` and no total finding count or digest cannot authenticate an empty finding set, so erased warnings/notes can be credited as whole-complete coverage.
+  evidence: R7 warning at `src/dispatch/perkins-review/convergence.ts:1073-1076`. The erasure can only lose warning/note entries (a blocker-bearing record fails the count comparison at `:1054-1055`), and requiring an authoritative zero total for every legacy empty receipt would reclassify genuine pre-digest empties as unauthenticated. Settled by: a design binding emptiness to digest/publication evidence without resetting genuinely empty legacy predecessors.
+- source_spec: `spec-perkins-integration-review-coverage.md`
+  summary: A transient post-commit annotation failure retries with `blockers: 0`, so a genuine blocker-bearing predecessor fails authentication and the next integration unnecessarily restarts whole review.
+  evidence: R7 warning at the committed-verdict retry annotation (`src/dispatch/perkins.ts:5867`, the `round.perkins-review` retry event's `blockers: 0`). The behavior fails closed (whole re-review, never unsafe approval). Settled by: rebuilding the retry annotation from the validated posted review state, with its own annotation-crash-window regression.
+
+## Deferred from: native R8 repair + dispatched R8-repair review round (2026-10-10)
+
+- source_spec: `spec-perkins-integration-review-coverage.md`
+  summary: The redaction pass over the assembled publication body can, combined with a stripped consolidated record, swallow the host appendix heading/scope lines inside the digest-bound redacted body and defeat the recovery scope corroboration.
+  evidence: R8-repair edge review finding at `src/dispatch/perkins.ts:721-725`, source-traced (redaction patterns can match across newlines from lead-authored text into the host appendix). Remedy: redact the lead report and each dynamic appendix field before joining so redaction spans cannot cross host lines — a publication-assembly/digest pipeline change outside the two mandatory R8 in-scope blockers. Settled by: that delivery-path hardening with a digest-consistent regression.
+- source_spec: `spec-perkins-integration-review-coverage.md`
+  summary: `PriorReview.reviewScope` parsed in `whole.ts` is dead state — it is populated but no consumer reads it.
+  evidence: R8-repair blind review follow-up at `src/dispatch/perkins-review/whole.ts:760` (populated at `:869`); the file was untouched by the R8 repair. Settled by: removing it or wiring it into a real cross-check.
+
+- source_spec: `spec-perkins-integration-review-coverage.md` — RESOLVED by contract revision 2 / amendment #2 (j-1762): the redaction-span follow-up recorded above is repaired reader-side. The scope-disclosure decoder now refuses evidence whose absence is consistent with a publication-redaction span (no anchored heading with a redaction placeholder present, or an in-region placeholder with no scope line), while genuine pre-disclosure legacy records (no placeholder) keep whole-complete credit. Regression: `redaction-erased disclosure cannot grant historical whole clearance` (real assembler/redactor + recovery/readiness assertions, fail-before at b930417 via `perkins-int-r9-baseline-heavy`).

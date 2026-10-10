@@ -715,3 +715,89 @@ repo-overview-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && no
 # file are preserved for inspection; nothing is deleted or checked out and
 # no branch/worktree holds the sha.
 repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-repo-overview.XXXXXX"); git archive "$base" | tar -x -C "$d"; for f in test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts web/src/lib/board-protocol.test.ts web/src/ui/board.test.ts web/src/ui/board-merged-attention.test.ts web/src/ui/owner-chime.test.ts; do mkdir -p "$d/$(dirname "$f")"; git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "%s base=%s head=%s\n" "$d" "$base" "$headrev" > "$prep/repo-overview-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/backend-results.json" test/board-engine.test.ts test/board-engine-v4.test.ts test/board-server.test.ts; a=$?; cd web; ../node_modules/.bin/vitest run --reporter=json --outputFile="$d/web-results.json" src/lib/board-protocol.test.ts src/ui/board.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts; b=$?; set -e; echo "repo-overview-baseline vitest exits: backend=$a web=$b"; if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: a baseline leg passed unexpectedly"; exit 2; fi; node "$root/tools/assert-repo-overview-baseline.mjs" "$d/backend-results.json" "$d/web-results.json" || exit 2; echo "EXPECTED-NONZERO: baseline legs failed named behavioral assertions against the pre-change base"; exit 1'
+
+# Native integration review with retained prior coverage — R4 repair
+# (fresh-worker re-brief 2026-10-10, PR #285): the consumed predecessor
+# bytes stay bound to their authenticated plan (digest pin), verdict-
+# committed rounds survive both annotation-crash windows, and one shared
+# full-linkage validator governs planning, posted-state parsing and
+# recovery. Focused = touched fast suites + the classified heavy wave and
+# whole-review files (heavy config); exits never masked, approved RPC
+# patch prerequisite first.
+perkins-integration-r4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-integration-review.test.ts test/perkins-review-convergence.test.ts test/assert-perkins-integration-review-baseline.test.ts test/board-engine.test.ts test/escalation-identity.test.ts test/verify-perkins-resource.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts"
+
+# Static product checks for the same change: lint, compiler, build
+# (including the pinned Perkins resource verifier), approved RPC patch
+# first, unchanged budgets/thresholds.
+perkins-integration-r4-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build"
+
+# Fails-before evidence, FAST leg: the FINAL mutation-refusal test bytes are
+# overlaid onto an isolated git-archive snapshot of the pre-fix base
+# e9772afc (no download/install, no branch mutation; node_modules linked by
+# symlink; approved RPC patch prerequisite; unchanged configs/budgets). The
+# base has no consumed-bytes pin, so the rejected-promise assertion REDs
+# ("instead of rejecting") when the mutated record is accepted — classified
+# by tools/assert-perkins-integration-review-baseline.mjs, which exits 2 on
+# a collection/setup/import failure, a named-green test, or an unlisted
+# failure. The vitest exit is echoed intact and never masked; the snapshot
+# directory and ignored pointer file are preserved.
+perkins-integration-r4-baseline = 'set -e; base=e9772afc69fface847eba5a35b5d52f7959ae052; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-int-r4.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-integration-review.test.ts > "$d/test/perkins-integration-review.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-integration-r4-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-integration-r4-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/perkins-integration-review.test.ts -t "mutated between the authenticated scope plan"; a=$?; set -e; echo "perkins-integration-r4-baseline vitest exit=$a EXPECTED-NONZERO: pre-fix base accepts the mutated predecessor bytes"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-perkins-integration-review-baseline.mjs" fast "$d/results.json" || exit 2; echo "EXPECTED-NONZERO: the mutation refusal REDs by assertion against the pre-fix base"; exit 1'
+
+# Fails-before evidence, HEAVY leg: the FINAL crash-window and production
+# pin-pass-through test bytes are overlaid on the same isolated pre-fix base
+# snapshot and run under the unchanged heavy config. The base selects the
+# OLDER whole round as predecessor (the crashed round carries neither
+# annotation) and passes no byte pin into the engine, so both covered-head
+# equality assertions and the mutated-predecessor refusal RED; classified by
+# the same tool (heavy leg). The vitest exit is echoed intact and never
+# masked; the snapshot directory and ignored pointer file are preserved.
+perkins-int-r4-baseline-heavy = 'set -e; base=e9772afc69fface847eba5a35b5d52f7959ae052; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-int-r4-heavy.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-int-r4-baseline-heavy base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-int-r4-baseline-heavy.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "verdict-committed round as predecessor|mutated between the authenticated plan"; a=$?; set -e; echo "perkins-int-r4-baseline-heavy vitest exit=$a EXPECTED-NONZERO: pre-fix base skips the annotation-less verdict-committed predecessor"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-perkins-integration-review-baseline.mjs" heavy "$d/results.json" || exit 2; echo "EXPECTED-NONZERO: the two crash-window predecessors and the production pin pass-through RED by assertion against the pre-fix base"; exit 1'
+
+# Fails-before evidence for the R7 repair (native R7 NEEDS CHANGES at fd8f2a6,
+# blocker: authenticate the historical fallback before treating absent
+# convergence as whole clearance). The FINAL historical-fallback test bytes
+# are overlaid on an isolated git-archive snapshot of the UNCORRECTED lineage
+# fd8f2a6 and run under the unchanged heavy config: there the stripped-delta
+# record promotes debt-free (no round.final-pass-required), so the debt
+# assertion REDs. Classified by tools/assert-perkins-integration-review-baseline.mjs
+# (r7 leg), which exits 2 on a collection/setup/import failure, a named-green
+# test, or an unlisted failure. The vitest exit is echoed intact and never
+# masked; the snapshot directory and ignored pointer file are preserved.
+perkins-int-r7-baseline-heavy = 'set -e; base=fd8f2a6f41f1d0b102e2148f69c2aa6ce2d49f30; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-int-r7.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-int-r7-baseline-heavy base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-int-r7-baseline-heavy.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "authenticates the historical fallback"; a=$?; set -e; echo "perkins-int-r7-baseline-heavy vitest exit=$a EXPECTED-NONZERO: uncorrected fallback credits the stripped record as debt-free whole"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-perkins-integration-review-baseline.mjs" r7 "$d/results.json" || exit 2; echo "EXPECTED-NONZERO: the historical-fallback authentication REDs by assertion at the uncorrected lineage"; exit 1'
+
+# Fails-before evidence for the R8 repair (native R8 NEEDS CHANGES at 43d5349,
+# blockers: deferred-field heading shadowing and the present-convergence
+# bypass of the unusable-disclosure refusal). The FINAL regression test bytes
+# are overlaid on an isolated git-archive snapshot of the UNCORRECTED lineage
+# 43d5349 and run under the unchanged heavy config: there the embedded-heading
+# body loses its debt (no round.final-pass-required) and the unusable
+# present-convergence record still promotes, so both assertions RED.
+# Classified by tools/assert-perkins-integration-review-baseline.mjs (r8 leg),
+# which exits 2 on a collection/setup/import failure, a named-green test, or
+# an unlisted failure. The vitest exit is echoed intact and never masked; the
+# snapshot directory and ignored pointer file are preserved.
+perkins-int-r8-baseline-heavy = 'set -e; base=43d5349f3cf8064bd559ad72ca67808b475a1304; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-int-r8.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-int-r8-baseline-heavy base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-int-r8-baseline-heavy.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "dynamic appendix fields embed|unusable publication disclosure"; a=$?; set -e; echo "perkins-int-r8-baseline-heavy vitest exit=$a EXPECTED-NONZERO: uncorrected decoder shadows the heading and skips the unusable-scope refusal"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-perkins-integration-review-baseline.mjs" r8 "$d/results.json" || exit 2; echo "EXPECTED-NONZERO: both R8 decoder regressions RED by assertion at the uncorrected lineage"; exit 1'
+
+# Fails-before evidence for the contract-revision-2 repair (amendment #2:
+# redaction-erased disclosure is not whole-clearance evidence; native R8
+# follow-up source-traced at 78d8eab, head b930417). The FINAL
+# redaction-erasure regression bytes are overlaid on an isolated git-archive
+# snapshot of the UNCORRECTED lineage b930417 and run under the unchanged
+# heavy config: there the erased bodies are credited as legacy whole
+# clearance, so the refusal assertions RED. Classified by
+# tools/assert-perkins-integration-review-baseline.mjs (r9 leg), which exits 2
+# on a collection/setup/import failure, a named-green test, or an unlisted
+# failure. The vitest exit is echoed intact and never masked; the snapshot
+# directory and ignored pointer file are preserved.
+perkins-int-r9-baseline-heavy = 'set -e; base=b93041775d842d0757868c5a258de1b8f1a609bd; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-int-r9.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-int-r9-baseline-heavy base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-int-r9-baseline-heavy.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "redaction-erased disclosure"; a=$?; set -e; echo "perkins-int-r9-baseline-heavy vitest exit=$a EXPECTED-NONZERO: uncorrected decoder credits redaction-erased disclosure as whole clearance"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-perkins-integration-review-baseline.mjs" r9 "$d/results.json" || exit 2; echo "EXPECTED-NONZERO: the redaction-erasure refusal REDs by assertion at the uncorrected lineage"; exit 1'
+
+# Fails-before evidence for the rev2-review-round completion: the incomplete
+# first AC2 fix at d856531 refused missing-disclosure erasure but still
+# credited a forged anchored heading/scope line planted ahead of the span.
+# The FINAL regression bytes are overlaid on an isolated git-archive snapshot
+# of d856531 and run under the unchanged heavy config: there the forged-anchor
+# body promotes as whole clearance, so the refusal assertion REDs. Classified
+# by tools/assert-perkins-integration-review-baseline.mjs (r9 leg), exits 2 on
+# collection/setup/import failure, named-green or unlisted failures; the vitest
+# exit is echoed intact and never masked.
+perkins-int-r9b-baseline-heavy = 'set -e; base=d85653138c675a24310455f33feb467c24182736; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-int-r9b.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-int-r9b-baseline-heavy base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-int-r9b-baseline-heavy.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "redaction-erased disclosure"; a=$?; set -e; echo "perkins-int-r9b-baseline-heavy vitest exit=$a EXPECTED-NONZERO: incomplete fix still credits the forged-anchor erasure"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-perkins-integration-review-baseline.mjs" r9 "$d/results.json" || exit 2; echo "EXPECTED-NONZERO: the forged-anchor refusal REDs by assertion at d856531"; exit 1'

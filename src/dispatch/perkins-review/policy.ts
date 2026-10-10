@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PERKINS_POLICY_ID = 'perkins-code-review';
 export const PERKINS_CANONICAL_SOURCE_SHA256 = 'f38c28ffb10b4e44fa1f87f260a08507bb0a5c8872de2cf47e05a985c5eb92e7';
-export const PERKINS_POLICY_SHA256 = '68a39c61d4f27666eb652ff8f61c4957561373639b9cf031cee0be49debfe1de';
+export const PERKINS_POLICY_SHA256 = '097be56ca2f6ecb6e1c75e1b320c6d3b50e481cc39a439ccd80134ea665d040d';
 
 export const PERKINS_LENSES = [
   'blind',
@@ -36,6 +36,10 @@ export interface PerkinsConvergenceRules {
   readonly finalWholePassAtReady: boolean;
   /** Untouched, unclaimed priors carry forward without re-verification. */
   readonly carryForwardUntouchedPriors: boolean;
+  /** A prior native-reviewed feature head integrated with an advanced base
+   * (a forward merge) retains its coverage: the next round reviews the new
+   * integration/conflict-resolution work instead of a whole-PR restart. */
+  readonly integrationCoverage: boolean;
 }
 
 export interface PerkinsPolicy {
@@ -134,11 +138,12 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
   const convergenceKeys = convergence === undefined ? [] : Object.keys(convergence).sort();
   if (
     convergence === undefined ||
-    convergenceKeys.join('\0') !== ['carryForwardUntouchedPriors', 'convergenceRuleFromRound', 'deltaRoundsFrom', 'finalWholePassAtReady'].join('\0') ||
+    convergenceKeys.join('\0') !== ['carryForwardUntouchedPriors', 'convergenceRuleFromRound', 'deltaRoundsFrom', 'finalWholePassAtReady', 'integrationCoverage'].join('\0') ||
     !Number.isSafeInteger(convergence.deltaRoundsFrom) || convergence.deltaRoundsFrom < 2 ||
     !Number.isSafeInteger(convergence.convergenceRuleFromRound) || convergence.convergenceRuleFromRound < convergence.deltaRoundsFrom ||
     convergence.finalWholePassAtReady !== true ||
-    convergence.carryForwardUntouchedPriors !== true
+    convergence.carryForwardUntouchedPriors !== true ||
+    convergence.integrationCoverage !== true
   ) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} resource failed its convergence-rule contract`);
   }
@@ -188,7 +193,8 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
   // resource that silently drops it can never ship under the pin.
   if (!policy.portableContract.leadWorkflow.includes('DELTA ROUND') ||
     !policy.portableContract.leadWorkflow.includes('CARRIED FORWARD') ||
-    !policy.portableContract.leadWorkflow.includes('convergence rule')) {
+    !policy.portableContract.leadWorkflow.includes('convergence rule') ||
+    !policy.portableContract.leadWorkflow.includes('INTEGRATION ROUND')) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} lead workflow is missing the convergence guidance`);
   }
   return policy;
