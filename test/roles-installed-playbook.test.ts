@@ -37,6 +37,12 @@ interface StagedPrompt {
   readonly minion: string;
   readonly silas: string;
   readonly gru: string;
+  /** The packaged ops-dispatch skill body, loaded through the shipped
+   *  loader (null only if the staged install genuinely lacks it). */
+  readonly opsSkill: string | null;
+  /** The assembled Silas operating brief (brief + skills) from the staged
+   *  install — the composition a real session receives. */
+  readonly silasBrief: string;
   readonly loadError?: undefined;
 }
 interface StagedFailure {
@@ -137,10 +143,15 @@ function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
     [
       'try {',
       '  const { ROLE_DEFINITIONS } = await import("./dist/roles.js");',
+      '  const { loadSilasSkills, silasBriefSections } = await import("./dist/dispatch/silas-driver.js");',
+      '  const skills = loadSilasSkills();',
+      '  const opsSkill = skills.find((skill) => skill.name === "ops-dispatch");',
       '  process.stdout.write(JSON.stringify({',
       '    minion: ROLE_DEFINITIONS.minion.systemPrompt,',
       '    silas: ROLE_DEFINITIONS.silas.systemPrompt,',
       '    gru: ROLE_DEFINITIONS.gru.systemPrompt,',
+      '    opsSkill: opsSkill === undefined ? null : opsSkill.body,',
+      '    silasBrief: silasBriefSections({ skills, ops: { baseUrl: "http://127.0.0.1:1", configPath: "/tmp/merge-authority-probe-config" } }).join("\\n"),',
       '  }));',
       '} catch (error) {',
       '  process.stdout.write(JSON.stringify({ loadError: String(error && error.message ? error.message : error) }));',
@@ -160,7 +171,8 @@ function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
   });
   const parsed = JSON.parse(stdout) as StagedPrompt | StagedFailure;
   if (parsed.loadError !== undefined) return parsed;
-  if (typeof parsed.minion !== 'string' || typeof parsed.silas !== 'string' || typeof parsed.gru !== 'string') {
+  if (typeof parsed.minion !== 'string' || typeof parsed.silas !== 'string' || typeof parsed.gru !== 'string' ||
+    typeof parsed.silasBrief !== 'string' || (parsed.opsSkill !== null && typeof parsed.opsSkill !== 'string')) {
     throw new Error(`unexpected probe output: ${stdout.slice(0, 200)}`);
   }
   return parsed;
@@ -249,8 +261,12 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).not.toContain('Project-local BMAD setup');
     expect(flat).toContain('no guessed rename');
     expect(flat).toContain('no hand-copied skill files');
-    // Owner-held merge adoption on the worker surface.
-    expect(flat).toContain('the owner holds every merge');
+    // Merge boundary on the worker surface (owner ruling 2026-10-10):
+    // same-branch integration is ordinary worker execution; the final PR
+    // merge is the owner's.
+    expect(flat).toContain('merge main into your task branch');
+    expect(flat).toContain('the owner performs every final PR merge');
+    expect(flat).toContain('never moves a branch under an active review freeze');
     expect(flat).toContain('read-only brief that names the exact immutable head');
     expect(flat).toContain('never echo or copy');
     // Owner clarification j-761: never a fixed skill-name dependency —
@@ -269,11 +285,29 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('do not commission a supplementary review duplicating');
     expect(flat).toContain('exact-final-head READY');
     expect(flat).toContain('NEEDS CHANGES returns to the same implementing worker');
+    // Merge boundary on the installed ops prompt.
+    expect(flat).toContain('The owner performs every final PR merge, in every repository');
+    expect(flat).toContain('integrates main into the existing task branch');
     expect(flat).not.toContain('bmad-build');
     // Fixed build-skill names must not return on the ops surface either,
     // while the legitimate review tokens stay allowed.
     const opsTokens = [...flat.matchAll(/bmad-[a-z][a-z-]*/gu)].map((match) => match[0]);
     expect(opsTokens.every((token) => token === 'bmad-review' || token === 'bmad-review-fallback')).toBe(true);
+  });
+
+  it('the installed ops skill and assembled brief carry the worker/owner merge boundary', () => {
+    expect(staged.opsSkill).not.toBeNull();
+    const ops = (staged.opsSkill ?? '').replace(/\s+/gu, ' ');
+    expect(ops).toContain('The owner performs every final PR merge, in every repository');
+    expect(ops).toContain('merge the PR base into your task branch');
+    expect(ops).toContain('never rebase, reset or force-push');
+    expect(ops).toContain('`pr-conflict-rebase`');
+    expect(ops).not.toContain('The chief holds merge authority');
+    expect(ops).not.toContain('"directive":"rebase');
+    const brief = staged.silasBrief.replace(/\s+/gu, ' ');
+    expect(brief).toContain('every final PR merge');
+    expect(brief).toContain('integrating main into its own task branch');
+    expect(brief).toContain('fallback PASS are not that clearance');
   });
 
   it('a renamed/replacement project catalog still satisfies the worker contract (no fixed skill name)', () => {

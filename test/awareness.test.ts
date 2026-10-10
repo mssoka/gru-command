@@ -319,7 +319,7 @@ describe('gru awareness — wake policy', () => {
       routing: 'fyi',
       severity: 'error',
       title: 'PR #11 conflicts with its base (acme/app)',
-      detail: 'Mechanical tier: Silas owns the rebase within mandate for #11; tracked in his digest, not a Gru wake.',
+      detail: 'Mechanical tier: Silas coordinates the conflict integration within mandate for #11; tracked in his digest, not a Gru wake.',
     });
     // The mechanical conflict is Silas's digest work: under the default
     // action-required wake policy it is a passive ℹ row, never a wake —

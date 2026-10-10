@@ -288,8 +288,8 @@ fallback session is a full-capability minion by design — it must load the
 ambient BMAD skill — and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
 never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge, and the owner holds every
-merge, everywhere — this repository included. A failed pre-flight is never a silent downgrade — the failed
+exact-head Perkins READY can authorize a merge, and the owner performs
+every final PR merge, everywhere — this repository included. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install the global
 bmad-review skill, which the GC-managed BMAD runtime does not bundle /
 restore Perkins) are escalated and recorded on the job as
@@ -554,7 +554,7 @@ resolution, verification, the authorized ordinary non-draft PR); Silas
 gives goal/boundaries/acceptance, coordinates capacity and expensive
 verification through the existing scheduler, and arms native Perkins on
 the exact final settled PR head. NEEDS CHANGES returns to the same
-implementing worker; the owner holds every merge.
+implementing worker; the owner performs every final PR merge.
 
 **Policy vs implemented.** These obligations ship in the installed
 playbook, and the deliverable kind is implemented: reviewer, artifact and
@@ -660,8 +660,8 @@ the judgment; the dispatch surface is the mechanical hand.
   applies exactly once: PR merged → `in-review → merged` transition plus
   a `github.pr-merged` event; PR conflicting (`mergeable_state: dirty`) →
   `github.pr-conflict` plus an fyi notification (mechanical tier — Silas
-  owns the rebase within mandate; the conflict lands in his digest's
-  `conflictingPrs` rows and never wakes Gru, issue #215); CI
+  coordinates the conflict integration within mandate; the conflict lands
+  in his digest's `conflictingPrs` rows and never wakes Gru, issue #215); CI
   failed → `github.ci-failed` plus a notification carrying the run URL,
   routed by check kind (mechanical → fyi, judgment → wake-eligible
   action-required); CI green → `github.ci-green` review-gate signal.
@@ -702,7 +702,7 @@ the judgment; the dispatch surface is the mechanical hand.
   `blocked`/`aborted` answer nothing, so the same abort reappears for the
   next sweep. Conflicting PR heads (issue #215) are digest rows too: a
   live PR-owing lane whose open head is dirty against its base is Silas's
-  mechanical rebase work — suppressed while a directive, re-brief or
+  mechanical conflict-integration work — suppressed while a directive, re-brief or
   verification owns the lane, and never a Gru wake. NEEDS CHANGES
   verdicts awaiting follow-through, with per-blocker recurrence analysis;
   working lanes whose minion has been silent past `stall_threshold_ms`;
@@ -769,8 +769,8 @@ the judgment; the dispatch surface is the mechanical hand.
   counts `examined` in markers but `completed`/`redispatched`/`retired`
   in jobs, so one retired pair reads `examined: 2 … retired: 1` by design.
 - **Authority boundaries are unchanged** (`roles/silas.md`): dispatch,
-  track, close; never product code; never merge; preserve before remove;
-  escalate with pointers. Silas acts only through the authenticated ops
+  track, close; never product code; never merge a PR (the owner performs
+  every final PR merge); preserve before remove; escalate with pointers. Silas acts only through the authenticated ops
   surface — the pairing token is read from the instance config at call
   time, never echoed.
 - **Skills** — `ops-dispatch` and `ledger-closeout` ship in-repo under

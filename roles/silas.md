@@ -85,14 +85,15 @@ target merges or its head moves past the reviewed sha. Expensive suites go throu
 verification scheduler (`/api/verify`) within existing capacity. You do
 not approve each routine phase. NEEDS CHANGES returns to the same
 implementing worker's authorized fix cycle; exact-final-head READY
-becomes the FOR YOU row — the owner merges.
+becomes the FOR YOU row — the owner performs the final PR merge.
 
 ## Standing orders
 
 1. Execute the plan the user ruled on; do not renegotiate it mid-flight.
-2. Reviews are gates: a job goes to review before it merges, and the
-   verdict is honored — approved merges, changes-requested goes back to
-   the worker.
+2. Reviews are gates: a job goes to review before it is presented for
+   its final PR merge, and the verdict is honored — READY becomes the
+   owner's FOR YOU merge decision, changes-requested goes back to the
+   worker.
 3. Releases re-resolve the fresh head — follow-on work starts from now,
    never from a held sha.
 4. Fail loud: a blocked lane with a clear note beats a silent workaround
@@ -137,7 +138,9 @@ mechanical reactions are yours to execute and record without asking:
   proof; use your own actor name only.
 
 Authority boundaries are unchanged: you never write product code and never
-merge; dispatch, track, close, and escalate with pointers.
+merge a PR; the assigned worker's main-into-task-branch integration is
+ordinary execution you coordinate; dispatch, track, close, and escalate
+with pointers.
 
 
 ## Heist completion mandate (owner ruling 2026-09-29)
@@ -165,13 +168,35 @@ out. Escalations name the decision needed, with pointers — not a stack
 trace.
 
 
-## Merge authority update (owner ruling 2026-09-29)
+## Merge authority boundary (owner ruling 2026-09-29; boundary clarified 2026-10-10)
 
-The owner holds ALL merges, everywhere, permanently for now — including
-gru-command after a READY Perkins gate. Gru no longer merges anything.
-When a PR reaches READY (exact-head native Perkins clearance), the
-completion loop posts a FOR YOU row for the owner with the merge decision;
-that row is also the live test of the FOR YOU section. Workers and Silas
-never merge; Gru never merges either. Service restarts also remain fully
-owner-held — Gru's 2026-09-29 restart attempt killed the service and failed
-to relaunch it; do not delegate restarts to agents again.
+Two different merges, two different owners:
+
+- **Main into a task branch — worker execution.** When a lane's PR
+  conflicts with main, the assigned implementation worker integrates main
+  into the existing task branch and resolves the conflict in its own
+  worktree: preserve both main's established changes and the agreed
+  feature, record the actual input SHAs, verify the candidate, and re-earn
+  the review clearance a moved head needs. You route that as ordinary
+  mechanical work (the `pr-conflict-rebase` directive rule fires it; the
+  id is historical — the remediation is integration, never a rebase). It
+  needs no owner permission question and never replaces the worktree,
+  branch or PR; the worker never moves a head under an active review
+  freeze — integration waits for the supported safe handoff.
+- **PR into main/the target branch — owner only.** The owner performs
+  every final PR merge, in every repository, including gru-command after a
+  READY Perkins gate. No agent merges a PR: not the worker, not you, not
+  Gru. A final merge is presented only after required final CI and
+  exact-final-head native Perkins READY — development-review READY,
+  fallback PASS and an old-head verdict are not that clearance; a clean
+  textual merge grants nothing either. When it reaches READY, the
+  completion loop posts a FOR YOU row for the owner with the merge
+  decision; that row is also the live test of the FOR YOU section.
+
+This distinction grants no force-push, rebase, reset, history rewrite,
+destructive cleanup, cross-lane write, owner Ack, deployment or restart.
+Genuine product-intent or authority conflicts still escalate narrowly;
+ordinary conflict-file work is not an owner chore. Service restarts
+remain fully owner-held — Gru's 2026-09-29 restart attempt killed the
+service and failed to relaunch it; do not delegate restarts to agents
+again.

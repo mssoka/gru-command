@@ -2902,7 +2902,7 @@ describe('silas skills and wake prompt', () => {
     expect(() => loadSilasSkills(['nope'])).toThrow(/unreadable/);
   });
 
-  it('assembles shipped skills with one scoped merge authority and exact clean-abort rule', () => {
+  it('assembles shipped skills with the worker/owner merge boundary and the exact clean-abort rule', () => {
     const prompt = buildWakePrompt({ digest: { computedAt: '2026-09-24T00:00:00Z', trigger: 'sweep',
       deliveredWithoutPr: [], prWithoutReview: [{ jobId: 'clean', repo: 'gru-command', prUrl: 'https://example.invalid/1',
         priorRounds: 1, cleanAbort: { roundId: 'clean-r1', ruleId: 'clean-abort-service-restart' } }],
@@ -2910,9 +2910,11 @@ describe('silas skills and wake prompt', () => {
       verificationFailures: [], verificationWaits: [], providerRecoveryPending: [], conflictingPrs: [], releaseEligible: [], revisionContinuations: [], verificationsOwed: [] },
       trigger: { kind: 'sweep' }, skills: loadSilasSkills(), ops: { baseUrl: 'http://127.0.0.1:1', configPath: '/tmp/test-config' } });
     expect(prompt).toContain('You NEVER merge a pull request');
-    expect(prompt).toContain('The owner holds every merge');
+    expect(prompt).toContain('every final PR merge');
+    expect(prompt).toContain('integrating main into its own task branch');
+    expect(prompt).not.toContain('The chief holds merge authority');
     expect(prompt).not.toContain('Gru may merge gru-command only');
-    expect(prompt).toContain('fallback PASS is not that clearance');
+    expect(prompt).toContain('fallback PASS are not that clearance');
     expect(prompt).not.toContain('owner holds merges elsewhere');
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');

@@ -182,7 +182,7 @@ actionable findings. The bmad-review fallback gate still uses an installed
 `bmad-review` skill: 0 blockers clear review/fix routing only (the PASS is
 not a Perkins READY), while blockers route back to the implementing minion
 as fix directives. Perkins (GitHub/GitLab) remains the stronger gate with
-exact-head verdicts, and the owner holds every merge.
+exact-head verdicts, and the owner performs every final PR merge.
 
 For each selected managed repo (not the workspace root, and never every
 discovered directory), the wizard offers to **provision** the project
