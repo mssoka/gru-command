@@ -99,6 +99,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'fetch/freeze resolution over real git remotes',
   },
   {
+    file: 'perkins-integration-recovery.test.ts',
+    workload: 'reviewer restart recovery over real git repositories, worktrees and durable sqlite state',
+  },
+  {
     file: 'perkins-whole-review.test.ts',
     workload: 'whole-review engine over real worktrees and git',
   },
