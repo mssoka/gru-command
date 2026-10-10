@@ -1,9 +1,21 @@
-import { describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { execFileSync, spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
+import { captureSources, INTAKE_MAX_SOURCE_BYTES } from '../src/intake/sources.js';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: vi.fn(() => { throw new Error('test refuses unmocked child spawn; no live gh calls'); }) };
+});
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { IntakeService } from '../src/intake/service.js';
+import { digest } from '../src/intake/types.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   BRANCH_STATE_EVENT,
+  defaultGhRunner,
   GhApiError,
   GhCliApi,
   GhRateLimitedError,
@@ -1116,4 +1128,153 @@ describe('github signal poll tick', () => {
       h.cleanup();
     }
   });
+});
+
+describe('byte-correct bounded gh command transport', () => {
+  afterEach(() => { vi.useRealTimers(); vi.mocked(spawn).mockClear(); });
+  function childFixture() {
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(() => true),
+    });
+    vi.mocked(spawn).mockReturnValueOnce(child as never);
+    return child;
+  }
+
+  it('preserves split UTF-8 codepoints, BOM bytes and the exact intake response byte hash', async () => {
+    const child = childFixture();
+    const bytes = Buffer.from('\uFEFF' + JSON.stringify({ number: 296, html_url: 'https://github.com/owner/demo/issues/296', title: '雪🙂', body: 'café', updated_at: '2026-10-10T12:00:00Z' }) + '\n');
+    const captured = captureSources('/explicit-repo', { kind: 'issue', reference: '#296' }, {
+      uploadsDir: '/explicit-uploads', remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
+    });
+    // Every byte is a distinct OS chunk: deterministic splits inside both
+    // three- and four-byte codepoints, not timing-dependent child writes.
+    for (const byte of bytes) child.stdout.emit('data', Buffer.from([byte]));
+    child.emit('close', 0);
+    const capture = await captured;
+    expect(capture.gaps).toEqual([]);
+    expect(capture.snapshots[0]?.raw).toBe(bytes.toString('utf8'));
+    expect(capture.snapshots[0]?.sha256).toBe(createHash('sha256').update(bytes).digest('hex'));
+    expect(capture.snapshots[0]?.text).toBe('雪🙂\n\ncafé');
+    expect(spawn).toHaveBeenCalledWith('gh', ['api', '--hostname', 'github.com', 'repos/owner/demo/issues/296'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  });
+
+  it('kills intake transport immediately at 256 KiB and bounds stderr without preserving a truncated snapshot', async () => {
+    const child = childFixture();
+    const captured = captureSources('/explicit-repo', { kind: 'issue', reference: '#296' }, {
+      uploadsDir: '/explicit-uploads', remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
+    });
+    child.stderr.emit('data', Buffer.alloc(8192, 'e'));
+    child.stdout.emit('data', Buffer.alloc(INTAKE_MAX_SOURCE_BYTES, 'a'));
+    expect(child.kill).not.toHaveBeenCalled();
+    child.stdout.emit('data', Buffer.from('é'));
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    // More bytes and close cannot change the already-settled refusal.
+    child.stdout.emit('data', Buffer.alloc(INTAKE_MAX_SOURCE_BYTES, 'b'));
+    child.emit('close', 0);
+    const capture = await captured;
+    expect(capture.snapshots).toEqual([]);
+    expect(capture.gaps[0]).toMatchObject({ code: 'GhApiError' });
+    expect(capture.gaps[0]?.question).toContain('exceeds 262144 bytes');
+    const bounded = childFixture();
+    const result = defaultGhRunner('gh', { maxOutputBytes: 8, maxStderrBytes: 4 })([]);
+    bounded.stderr.emit('data', Buffer.from('abcdef'));
+    bounded.emit('close', 1);
+    expect((await result).stderr).toBe('abcd');
+  });
+
+  it('retains the shared 16 MiB output and 30-second timeout defaults with optional narrower timeout', async () => {
+    vi.useFakeTimers();
+    const shared = childFixture();
+    const result = defaultGhRunner()([]);
+    shared.stdout.emit('data', Buffer.alloc(INTAKE_MAX_SOURCE_BYTES + 1, 'a'));
+    expect(shared.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(29999);
+    expect(shared.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(shared.kill).toHaveBeenCalledWith('SIGKILL');
+    expect((await result).error).toContain('30000 ms');
+    const narrow = childFixture();
+    const limited = defaultGhRunner('gh', { timeoutMs: 25 })([]);
+    await vi.advanceTimersByTimeAsync(25);
+    expect(narrow.kill).toHaveBeenCalledWith('SIGKILL');
+    expect((await limited).error).toContain('25 ms');
+    const full = childFixture();
+    const fullResult = defaultGhRunner()([]);
+    full.stdout.emit('data', Buffer.alloc(16 * 1024 * 1024, 'a'));
+    expect(full.kill).not.toHaveBeenCalled();
+    full.stdout.emit('data', Buffer.from('b'));
+    expect(full.kill).toHaveBeenCalledWith('SIGKILL');
+    expect((await fullResult).error).toContain('16777216 bytes');
+  });
+
+  it('refuses invalid intake UTF-8 byte chunks while retaining the request and inventing no snapshot or requirements', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gc-intake-invalid-utf8-')));
+    try {
+      const repoPath = join(root, 'workspace', 'demo');
+      mkdirSync(repoPath, { recursive: true });
+      execFileSync('git', ['init', '-q', repoPath]);
+      const dataDir = join(root, 'private-home');
+      const service = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }) });
+      const request = { repoPath, intakeId: 'intake-296', requestId: 'r1', source: { kind: 'issue' as const, reference: '#296' } };
+      const child = childFixture();
+      const pending = service.preview(request);
+      const bytes = Buffer.concat([Buffer.from('{"number":296,"html_url":"https://github.com/owner/demo/issues/296","title":"Issue","body":"'), Buffer.from([0xc3, 0x28]), Buffer.from('","updated_at":"2026-10-10T12:00:00Z"}')]);
+      for (const byte of bytes) child.stdout.emit('data', Buffer.from([byte]));
+      child.emit('close', 0);
+      const proposal = await pending;
+      expect(proposal.gaps[0]).toMatchObject({ code: 'GhApiError', question: expect.stringContaining('not valid UTF-8') });
+      expect(proposal.snapshots).toEqual([]);
+      expect(proposal.requirements).toEqual([]);
+      expect(proposal.plan.heists).toEqual([]);
+      expect(proposal.executable).toBe(false);
+      const prefix = join(dataDir, 'projects', digest(repoPath), 'intakes', request.intakeId, 'operational', 'requests/r1');
+      expect(JSON.parse(readFileSync(join(prefix, 'input.json'), 'utf8')).source).toEqual({ ...request.source, commentIds: [] });
+      expect(JSON.parse(readFileSync(join(prefix, 'capture.json'), 'utf8')).snapshots).toEqual([]);
+      const limited = childFixture();
+      const retry = service.preview({ ...request, requestId: 'r2', source: { ...request.source, commentIds: [91] } });
+      limited.stdout.emit('data', bytes);
+      limited.stderr.emit('data', Buffer.from('API rate limit exceeded'));
+      limited.emit('close', 1);
+      const stopped = await retry;
+      expect(stopped.snapshots).toEqual([]);
+      expect(stopped.requirements).toEqual([]);
+      expect(stopped.gaps.map((gap) => gap.code)).toEqual(['GhRateLimitedError', 'intake_supporting_source_unattempted']);
+      expect(stopped.gaps[0]?.question).toContain('rate limit');
+      expect(spawn).toHaveBeenCalledTimes(2); // never attempts the selected comment
+      expect(existsSync(join(dataDir, 'jobs'))).toBe(false);
+      expect(execFileSync('git', ['-C', repoPath, 'worktree', 'list', '--porcelain'], { encoding: 'utf8' }).match(/^worktree /gmu)).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('leaves ordinary shared replacement decoding unchanged while offering strict intake-only decoding', async () => {
+    const shared = childFixture();
+    const ordinary = defaultGhRunner()([]);
+    shared.stdout.emit('data', Buffer.from([0xc3, 0x28]));
+    shared.emit('close', 0);
+    expect(await ordinary).toEqual({ status: 0, stdout: '\uFFFD(', stderr: '' });
+    const strict = childFixture();
+    const exact = defaultGhRunner('gh', { strictUtf8: true })([]);
+    strict.stdout.emit('data', Buffer.from([0xc3]));
+    strict.stdout.emit('data', Buffer.from([0x28]));
+    strict.emit('close', 0);
+    expect(await exact).toMatchObject({ status: -1, stdout: '', error: expect.stringContaining('not valid UTF-8') });
+  });
+
+  it('retains exact valid timeout-prefix evidence without any complete-source identity or planning text', async () => {
+    vi.useFakeTimers();
+    const child = childFixture();
+    const raw = '\uFEFF{"number":296,"title":"雪🙂"';
+    const captured = captureSources('/explicit-repo', { kind: 'issue', reference: '#296' }, {
+      uploadsDir: '/explicit-uploads', remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
+    });
+    for (const byte of Buffer.from(raw)) child.stdout.emit('data', Buffer.from([byte]));
+    await vi.advanceTimersByTimeAsync(30_000);
+    const capture = await captured;
+    expect(capture.gaps[0]).toMatchObject({ code: 'GhApiError', question: expect.stringContaining('30000 ms') });
+    expect(capture.snapshots).toHaveLength(1);
+    expect(capture.snapshots[0]).toMatchObject({ raw, sha256: digest(Buffer.from(raw)), revision: `sha256:${digest(Buffer.from(raw))}`, text: '', identifiers: {} });
+    expect(capture.requirements).toEqual([]);
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+  });
+
 });

@@ -21,6 +21,9 @@ export const REQUIRED_WORKFLOW_FILES: readonly string[] = [
   'skills/gc-build/references/claims-check.md', 'skills/gc-build/references/deletion-check.md',
 ];
 
+/** Current intake needs this helper; historical lane manifests remain valid. */
+export const REQUIRED_INTAKE_WORKFLOW_FILE = 'skills/gc-build/intake.md';
+
 export class WorkflowResourceError extends Error {
   constructor(message: string) {
     super(message);

@@ -117,9 +117,9 @@ export function parseRepoRemote(url: string): RepoRemote | null {
   return null;
 }
 
-export function repoRemote(repoPath: string, gitBinary = 'git'): RepoRemote | null {
+export function repoRemote(repoPath: string, gitBinary = 'git', env?: NodeJS.ProcessEnv): RepoRemote | null {
   const origin = spawnSync(gitBinary, ['-C', repoPath, 'remote', 'get-url', 'origin'], {
-    encoding: 'utf-8', timeout: 10_000,
+    encoding: 'utf-8', timeout: 10_000, ...(env === undefined ? {} : { env }),
   });
   if (origin.error !== undefined || origin.status !== 0) return null;
   return parseRepoRemote((origin.stdout ?? '').trim());
