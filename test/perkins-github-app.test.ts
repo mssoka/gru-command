@@ -202,6 +202,9 @@ const PR_INPUT = {
   body: 'review body\n',
   targetSha: HEAD,
   baseSha: BASE,
+  // The non-formal COMMENT intent: the delivery-contract cases below prove
+  // identity/binding/receipt discipline, not the eligible-judgment mapping.
+  reviewEvent: 'COMMENT',
 } as const;
 
 function repoPathOf(fixture: BundleFixture): string {
@@ -588,6 +591,7 @@ describe('startup poster selection (the seam main wires)', () => {
       body: 'x',
       targetSha: HEAD,
       baseSha: BASE,
+      reviewEvent: 'COMMENT',
     });
     expect(gitlabCalls).toEqual(['https://gitlab.example.test/acme/widget/-/merge_requests/7']);
   });

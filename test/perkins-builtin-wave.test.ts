@@ -320,6 +320,14 @@ afterEach(() => {
   }
 });
 
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
+
 describe('GitHub SHA-bound Perkins delivery', () => {
   it('delivers on head equality even when the recorded base is stale, and refuses a moved head', async () => {
     const root = mkdtempSync(join(tmpdir(), 'perkins-gh-poster-'));
@@ -343,7 +351,7 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     // must NOT refuse a commit-bound review.
     await expect(poster.post({
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
-      body: 'review body\n', targetSha: head, baseSha: '3'.repeat(40),
+      body: 'review body\n', targetSha: head, baseSha: '3'.repeat(40), reviewEvent: 'COMMENT',
     })).resolves.toEqual({
       reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: head,
       headSha: head, baseSha: base,
@@ -362,18 +370,18 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     // review is posted.
     await expect(poster.post({
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
-      body: 'x', targetSha: '4'.repeat(40), baseSha: base,
+      body: 'x', targetSha: '4'.repeat(40), baseSha: base, reviewEvent: 'COMMENT',
     })).rejects.toThrow(/identity moved/);
     const callsAfterRefusal = readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[]; input: string });
     expect(callsAfterRefusal.filter((call) => call.argv.includes('--method'))).toHaveLength(1);
     await expect(poster.post({
       prUrl: 'https://evil.example/acme/widget/pull/42', host: 'git.example.test', repoPath,
-      body: 'x', targetSha: head, baseSha: base,
+      body: 'x', targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
     })).rejects.toThrow(/host-mismatched/);
     execFileSync('git', ['-C', repoPath, 'remote', 'set-url', 'origin', 'https://git.example.test/acme/other.git']);
     await expect(poster.post({
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
-      body: 'x', targetSha: head, baseSha: base,
+      body: 'x', targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
     })).rejects.toThrow(/reviewed repository origin/);
     rmSync(root, { recursive: true, force: true });
   });
@@ -394,9 +402,9 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     };
     const head = '1'.repeat(40);
     const base = '2'.repeat(40);
-    const input: { prUrl: string; host: string; repoPath: string; body: string; targetSha: string; baseSha: string } = {
+    const input: { prUrl: string; host: string; repoPath: string; body: string; targetSha: string; baseSha: string; reviewEvent: 'COMMENT' } = {
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath: '',
-      body: 'review body\n', targetSha: head, baseSha: base,
+      body: 'review body\n', targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
     };
     // Empty provider output on a zero exit is NOT a receipt.
     const empty = makePoster('empty', []);
@@ -437,8 +445,8 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     };
     const input = {
       prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test',
-      body: 'review body\n', targetSha: head, baseSha: base,
-    } as { prUrl: string; host: string; repoPath: string; body: string; targetSha: string; baseSha: string };
+      body: 'review body\n', targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
+    } as { prUrl: string; host: string; repoPath: string; body: string; targetSha: string; baseSha: string; reviewEvent: 'COMMENT' };
     const goodBody = JSON.stringify({ id: 7, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: head, body: 'review body\n' });
     // Creation: a provider response without a usable commit_id is refused
     // — missing, null and empty each fail loud, mismatched is bound-refused.
@@ -944,8 +952,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     attachOrigin(repo, 'feature/finalization-explode', root);
     const fake = fakeWholeSpawner(sessions, { specialists: ['security'], childAnswer: () => '[]' });
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1041,8 +1049,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/48');
     attachOrigin(repo, 'feature/unsettled-lens', root);
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1165,8 +1173,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     attachOrigin(repo, 'feature/oversized-bound-run', root);
     const fake = fakeWholeSpawner(sessions, { childAnswer: () => '[]' });
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1414,8 +1422,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/54');
     attachOrigin(repo, 'feature/posted-missing-ci', root);
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1571,8 +1579,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     const escalations: string[] = [];
     const fake = fakeWholeSpawner(sessions, { specialists: ['security'], childAnswer: () => '[]' });
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -1755,8 +1763,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://github.com/acme/fixture/pull/61');
     attachOrigin(repo, 'feature/two-charged', root);
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -2387,8 +2395,8 @@ describe('WaveRunner built-in Perkins production path', () => {
       ledger, worktrees: port, reviewArtifactRoot: artifacts,
       reviewPreflight: async () => ({ ok: true, failures: [], reviewModel }),
       poster: {
-        post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-          reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+          reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
           headSha: call.targetSha, baseSha: 'b'.repeat(40),
           bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
         })),
@@ -2465,8 +2473,8 @@ describe('WaveRunner built-in Perkins production path', () => {
       }).spawner,
       reviewArtifactRoot: artifacts,
       poster: {
-        post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-          reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+          reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
           headSha: call.targetSha, baseSha: 'b'.repeat(40),
           bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
         })),
@@ -2518,8 +2526,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/37');
     attachOrigin(repo, 'feature/prior-continuity', root);
     const receiptPoster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -2628,8 +2636,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
     attachOrigin(repo, 'feature/final-refused', root);
     const receiptPoster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9002', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -2743,8 +2751,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/38');
     attachOrigin(repo, 'feature/final-pass', root);
     const receiptPoster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9002', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -3643,10 +3651,10 @@ describe('WaveRunner built-in Perkins production path', () => {
     // past the round's frozen base: the delivery record must refresh to the
     // delivered identity, never echo the frozen base.
     const deliveredBase = '9'.repeat(40);
-    const poster = { post: vi.fn(async (input: { readonly prUrl: string; readonly body: string; readonly targetSha: string }) => {
+    const poster = { post: vi.fn(async (input: { readonly prUrl: string; readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
       expect(ledger.listRounds(job.id).at(-1)).toMatchObject({ status: 'live', verdict: null });
       return {
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha,
         headSha: input.targetSha, baseSha: deliveredBase,
         bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
       };
@@ -3836,8 +3844,8 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
 
   function receiptPoster(overrides: ReceiptOverrides = {}) {
     return {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
         ...overrides,
@@ -3908,8 +3916,8 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/32');
     attachOrigin(repo, 'feature/reconcile', root);
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: simulated timeout after commit'); });
-    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-      reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+      reviewId: '9002', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
       headSha: call.targetSha, baseSha: 'b'.repeat(40),
       bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
     }));
@@ -3991,8 +3999,8 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // An otherwise valid receipt whose base is the shape the shared restart
     // reader rejects: the writer must refuse it, never persist an event
     // recovery cannot parse.
-    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-      reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+      reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
       headSha: call.targetSha, baseSha: '',
       bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
     }));
@@ -4097,7 +4105,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
    * its identity probe, not a subsequent advance during delivery. */
   function liveBaseReceipt(reviewId: string, call: { readonly body: string; readonly targetSha: string }, liveBase: string) {
     return {
-      reviewId, actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      reviewId, actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
       headSha: call.targetSha, baseSha: liveBase,
       bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
     };
@@ -4177,7 +4185,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const fixture = await baseAdvanceFixture('perkins-base-advance-post', 'feature/base-advance-post', 36);
     let advancedDuringLead = false;
     let observedBase = '';
-    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
       observedBase = fixture.repo.git(['rev-parse', 'main']);
       advanceMain(fixture.repo);
       return liveBaseReceipt('9300', call, observedBase);
@@ -4205,7 +4213,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const fixture = await baseAdvanceFixture('perkins-base-advance-reconcile', 'feature/base-advance-reconcile', 37);
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: simulated timeout after commit'); });
     let observedBase = '';
-    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
       observedBase = fixture.repo.git(['rev-parse', 'main']);
       advanceMain(fixture.repo);
       return liveBaseReceipt('9301', call, observedBase);
@@ -4239,7 +4247,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // (a) POST returns a valid receipt, but the target moved while it was
     // outstanding: the post-delivery guard refuses the recording.
     const inPost = await baseAdvanceFixture('perkins-target-push-post', 'feature/target-push-post', 38);
-    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+    const post = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
       pushMovedTarget(inPost, 'feature/target-push-post');
       return liveBaseReceipt('9302', call, inPost.base);
     });
@@ -4262,7 +4270,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // outstanding: the found receipt is kept unrecorded with the exact reason.
     const inReconcile = await baseAdvanceFixture('perkins-target-push-reconcile', 'feature/target-push-reconcile', 39);
     const failingPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: simulated timeout after commit'); });
-    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
       pushMovedTarget(inReconcile, 'feature/target-push-reconcile');
       return liveBaseReceipt('9303', call, inReconcile.base);
     });
@@ -4939,7 +4947,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // outstanding: the receipt is preserved, never recorded as delivery.
     const moved = await t4Timed('moved', 'fixture-prep', () => prepare('perkins-t4-moved', 'feature/t4-moved', 'moved'));
     const post = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
-    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
       return t4Timed('moved', 'reconcile-lookup', async () => {
         // The base is rewritten (orphan) while the lookup is outstanding:
         // commit-tree without -p, so the new `main` no longer descends from
@@ -4956,7 +4964,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
         moved.repo.git(['branch', '-f', 'main', newMain]);
         t4Mark('moved', 'git-ops', 'end', 'completed', performance.now() - gitStarted);
         return {
-          reviewId: '9200', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          reviewId: '9200', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
           headSha: call.targetSha, baseSha: 'b'.repeat(40),
           bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
         };
@@ -5115,11 +5123,11 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // (b) The run's abort signal fires while the lookup is outstanding.
     const aborted = await t4Timed('aborted', 'fixture-prep', () => prepare('perkins-t4-aborted', 'feature/t4-aborted', 'aborted'));
     const abortPost = vi.fn(async () => { throw new Error('gh api review delivery exited 1: timeout'); });
-    const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+    const abortReconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
       return t4Timed('aborted', 'reconcile-lookup', async () => {
         for (const controller of (abortedWave as unknown as { activeControllers: Set<AbortController> }).activeControllers) controller.abort();
         return {
-          reviewId: '9201', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+          reviewId: '9201', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
           headSha: call.targetSha, baseSha: 'b'.repeat(40),
           bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
         };
@@ -5461,7 +5469,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
           mr(),
         ], calls),
       });
-      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'review body\n', targetSha: head, baseSha: base }))
+      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'review body\n', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .resolves.toEqual({
           reviewId: '55', actor: 'gru-bot', event: 'note', commitId: null,
           headSha: head, baseSha: recordedBase,
@@ -5483,7 +5491,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
         token: 'glpat-token',
         fetchImpl: fetchSequence([mr(), { status: 201, body: JSON.stringify({ id: 56, body: 'something else', author: { username: 'gru-bot' } }) }], echoCalls),
       });
-      await expect(echoed.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'review body\n', targetSha: head, baseSha: base }))
+      await expect(echoed.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'review body\n', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .rejects.toThrow(/receipt body does not match/);
     } finally {
       cleanup();
@@ -5507,12 +5515,12 @@ describe('GitLab SHA-bound merge-request delivery', () => {
         return { ok: true, status: 200, text: async () => JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) };
       };
       const poster = new GitLabMrPoster({ tokenResolver: () => token, fetchImpl });
-      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'rotated body\n', targetSha: head, baseSha: base }))
+      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'rotated body\n', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .resolves.toMatchObject({ actor: 'user-a' });
       // The token rotates under the long-lived poster: the next post must
       // compare against the NEW account, never a host-keyed stale cache.
       token = 'glpat-b';
-      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'rotated body\n', targetSha: head, baseSha: base }))
+      await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'rotated body\n', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .resolves.toMatchObject({ actor: 'user-b' });
       expect(userTokens).toEqual(['glpat-a', 'glpat-b']);
     } finally {
@@ -5537,7 +5545,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
         token: 'glpat-token',
         fetchImpl: fetchDouble({ status: 200, body: JSON.stringify({ sha: 'd'.repeat(40), diff_refs: { base_sha: base } }) }, movedCalls),
       });
-      await expect(moved.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base }))
+      await expect(moved.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .rejects.toThrow(/identity moved/u);
       expect(movedCalls).toHaveLength(1);
 
@@ -5550,13 +5558,13 @@ describe('GitLab SHA-bound merge-request delivery', () => {
           { status: 200, body: JSON.stringify({ sha: 'e'.repeat(40), diff_refs: { base_sha: 'f'.repeat(40) } }) },
         ], racedCalls),
       });
-      await expect(raced.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base }))
+      await expect(raced.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .rejects.toThrow(/identity moved/u);
       // identity, authenticated-account probe, note POST, moved confirm
       expect(racedCalls).toHaveLength(4);
 
       const noToken = new GitLabMrPoster({ fetchImpl: fetchDouble({ status: 200, body: '{}' }, []) });
-      await expect(noToken.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base }))
+      await expect(noToken.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .rejects.toThrow(/GITLAB_TOKEN/u);
 
       const poster = new GitLabMrPoster({
@@ -5576,14 +5584,14 @@ describe('GitLab SHA-bound merge-request delivery', () => {
         const other = join(wrongRepo, 'repo');
         execFileSync('git', ['init', other], { stdio: 'ignore' });
         execFileSync('git', ['-C', other, 'remote', 'add', 'origin', 'https://gitlab.example.test/acme/other.git']);
-        await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath: other, body: 'x', targetSha: head, baseSha: base }))
+        await expect(poster.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath: other, body: 'x', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
           .rejects.toThrow(/does not match the reviewed repository origin/u);
       } finally {
         rmSync(wrongRepo, { recursive: true, force: true });
       }
 
       const failing = new GitLabMrPoster({ token: 't', fetchImpl: fetchDouble({ status: 500, body: 'boom' }, []) });
-      await expect(failing.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base }))
+      await expect(failing.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .rejects.toThrow(/HTTP 500/u);
     } finally {
       cleanup();
@@ -5594,7 +5602,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
     const github = { post: vi.fn(async () => ({ headSha: 'github-head', baseSha: 'github-base' })) } as unknown as VerdictPoster;
     const gitlab = { post: vi.fn(async () => ({ headSha: 'gitlab-head', baseSha: 'gitlab-base' })) } as unknown as VerdictPoster;
     const poster = new AutoVerdictPoster(github, gitlab);
-    const base = { prUrl: 'https://x', host: 'x', repoPath: '/r', body: 'b', targetSha: 'h', baseSha: 'b' };
+    const base = { prUrl: 'https://x', host: 'x', repoPath: '/r', body: 'b', targetSha: 'h', baseSha: 'b', reviewEvent: 'COMMENT' as const };
     await expect(poster.post({ ...base, prUrl: 'https://github.com/acme/widget/pull/1', host: 'github.com' }))
       .resolves.toEqual({ headSha: 'github-head', baseSha: 'github-base' });
     expect(github.post).toHaveBeenCalledTimes(1);
@@ -5708,11 +5716,11 @@ describe('poster transport negatives and fallback-gate terminals', () => {
   it('rejects unparseable URLs, missing gh binaries, and failed probes', async () => {
     const poster = new GhPrPoster('/nonexistent/gh-binary');
     await expect(poster.post({
-      prUrl: 'not a url', host: 'x', repoPath: '/r', body: 'b', targetSha: 'h', baseSha: 'b',
+      prUrl: 'not a url', host: 'x', repoPath: '/r', body: 'b', targetSha: 'h', baseSha: 'b', reviewEvent: 'COMMENT',
     })).rejects.toThrow(/cannot parse pull request URL/u);
     await expect(poster.post({
       prUrl: 'https://github.com/acme/widget/pull/1', host: 'github.com', repoPath: '/r',
-      body: 'b', targetSha: 'h', baseSha: 'b',
+      body: 'b', targetSha: 'h', baseSha: 'b', reviewEvent: 'COMMENT',
     })).rejects.toThrow(/unavailable|origin/u);
   });
 
@@ -5741,14 +5749,14 @@ describe('poster transport negatives and fallback-gate terminals', () => {
       const primary = new GitLabMrPoster({ fetchImpl });
       await primary.post({
         prUrl: 'https://gitlab.example.test/acme/widget/-/merge_requests/7',
-        host: 'gitlab.example.test', repoPath, body: 'x', targetSha: 'h', baseSha: 'b',
+        host: 'gitlab.example.test', repoPath, body: 'x', targetSha: 'h', baseSha: 'b', reviewEvent: 'COMMENT',
       });
       expect(seen[0]).toBe('primary-token');
       delete process.env['GITLAB_TOKEN'];
       const fallback = new GitLabMrPoster({ fetchImpl });
       await fallback.post({
         prUrl: 'https://gitlab.example.test/acme/widget/-/merge_requests/7',
-        host: 'gitlab.example.test', repoPath, body: 'x', targetSha: 'h', baseSha: 'b',
+        host: 'gitlab.example.test', repoPath, body: 'x', targetSha: 'h', baseSha: 'b', reviewEvent: 'COMMENT',
       });
       expect(seen.at(-1)).toBe('fallback-token');
     } finally {
@@ -6173,6 +6181,7 @@ describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R
   const input = (repoPath: string) => ({
     prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
     body, targetSha: head, baseSha: base,
+    reviewEvent: 'COMMENT' as const,
   });
 
   it('refuses a null provider review id instead of stringifying it (R13)', async () => {
@@ -6309,7 +6318,7 @@ describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R
       execFileSync('git', ['-C', repoDir, 'remote', 'add', 'origin', `https://${host}/${owner}/widget.git`]);
       await expect(poster.post({
         prUrl: `https://${host}/${owner}/widget/pull/7`, host, repoPath: repoDir,
-        body: 'multi-host body\n', targetSha: head, baseSha: base,
+        body: 'multi-host body\n', targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
       })).resolves.toMatchObject({ actor: host === 'git.example.test' ? 'gru-bot' : 'enterprise-bot', event: 'COMMENTED' });
     }
   });
@@ -6350,7 +6359,7 @@ describe('repair pass 3: provider forms and posting-account discipline', () => {
     const poster = new GitLabMrPoster({ token: 'glpat-token', fetchImpl: fetchImpl as never });
     await expect(poster.post({
       prUrl: 'https://gitlab.example.test/acme/widget/-/merge_requests/7', host: 'gitlab.example.test', repoPath,
-      body: 'note body\n', targetSha: head, baseSha: 'b'.repeat(40),
+      body: 'note body\n', targetSha: head, baseSha: 'b'.repeat(40), reviewEvent: 'COMMENT',
     })).rejects.toThrow(/not the authenticated posting account/);
   });
 });
@@ -6404,6 +6413,7 @@ describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () =>
   }
   const input = (repoPath: string) => ({
     prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body, targetSha: head, baseSha: base,
+    reviewEvent: 'COMMENT' as const,
   });
 
   it('throws unresolved on ANY body-matching authored note: the creation head cannot be proved (R3)', async () => {
@@ -7099,8 +7109,8 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/77');
     attachOrigin(repo, 'feature/p3-overflow', root);
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -7202,8 +7212,8 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
       })),
     );
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -7251,7 +7261,7 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     attachOrigin(repo, 'feature/p3-gitlab-note', root);
     const postedBodies: string[] = [];
     const poster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
         postedBodies.push(call.body);
         return {
           reviewId: '7701', actor: 'fixture-bot', event: 'note', commitId: null,
@@ -7341,8 +7351,8 @@ describe('repair pass 3: publication completeness, GitLab wording, and v2 integr
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: fake.spawner,
       poster: {
-        post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-          reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+          reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
           headSha: call.targetSha, baseSha: 'b'.repeat(40),
           bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
         })),
@@ -7538,8 +7548,8 @@ describe('repair pass 3: real child-process crash recovery (R19/R16)', () => {
       reviewPreflight: async () => ({ ok: true as const, failures: [],
         reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: "fixture-safe-route" } }),
       prHeadProbe: localHeadProbe('feature/selective-crash'),
-      poster: { post: vi.fn(async (call: { body: string; targetSha: string }) => ({
-        reviewId: 'new', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      poster: { post: vi.fn(async (call: { body: string; targetSha: string; reviewEvent?: string }) => ({
+        reviewId: 'new', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body).digest('hex'),
       })) },
@@ -7862,8 +7872,8 @@ describe('provider pacing through WaveRunner', () => {
     ledger.setJobStatus('pacing-wave', 'working'); settleLane(ledger, 'pacing-wave');
     ledger.setJobPr('pacing-wave', 'https://git.example.invalid/acme/fixture/pull/11');
     attachOrigin(repo, 'feature/pacing-wave', root);
-    const poster = { post: vi.fn(async (input: { readonly prUrl: string; readonly body: string; readonly targetSha: string }) => ({
-      reviewId: '9101', actor: 'gru-bot', event: 'COMMENTED', commitId: input.targetSha,
+    const poster = { post: vi.fn(async (input: { readonly prUrl: string; readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+      reviewId: '9101', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha,
       headSha: input.targetSha, baseSha: input.targetSha,
       bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex'),
     })) };

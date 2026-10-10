@@ -29,6 +29,14 @@ import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resu
 import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
+
 /**
  * Guarded interrupted-directive recovery (owner approval j-1348).
  *
@@ -135,11 +143,11 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
     spawner,
     bus,
     poster: {
-      async post(input: { readonly targetSha: string; readonly body: string }) {
+      async post(input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) {
         return {
           reviewId: '9001',
           actor: 'gru-bot',
-          event: 'COMMENTED',
+          event: enactedFor(input.reviewEvent),
           commitId: input.targetSha,
           headSha: input.targetSha,
           baseSha: 'stub-base',
