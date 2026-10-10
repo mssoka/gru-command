@@ -51,6 +51,15 @@ import {
 } from './perkins-review/artifacts.js';
 import { renderEffectiveContract } from '../review-inputs/amendments.js';
 import {
+  PUBLICATION_ABSENT_EVENT,
+  PUBLICATION_ATTEMPT_EVENT,
+  PUBLICATION_RECEIPT_EVENT,
+  parsePublicationAttemptPayload,
+  parsePublicationReceiptEvidencePayload,
+  type PublicationAttemptPayload,
+  type PublicationReceiptEvidencePayload,
+} from './publication-evidence.js';
+import {
   appendCiEvidence,
   renderRecordedCiEvidence,
   CI_BRANCH_STATE_EVENT,
@@ -496,6 +505,12 @@ export interface VerdictPosterInput {
    * or the non-formal `COMMENT` intent. Never optional: every publisher
    * must enact and verify this exact state or fail by name. */
   readonly reviewEvent: VerdictReviewEvent;
+  /** The round's cancellation signal. A cancelling/superseding round must
+   * never start the irreversible provider write: publishers check this
+   * immediately before the POST (and combine it with their timeouts), so a
+   * probe that resolves after the abort refuses delivery instead of
+   * approving an already-cancelled round. */
+  readonly signal?: AbortSignal;
 }
 
 /** Optional caller context for VerdictPoster.reconcile (bounded shared
@@ -544,6 +559,13 @@ const ORIGIN_REF_SPELLING = /^(?:(?:refs\/)?remotes\/origin\/|origin\/)/u;
 
 function receiptDigest(body: string): string {
   return createHash('sha256').update(body, 'utf8').digest('hex');
+}
+
+/** Combine an operation's cancellation signal with its own timeout: the
+ * request aborts on EITHER the round's cancellation or the deadline, so a
+ * cancelled round can never leave a probe hanging past its abort. */
+export function cancelAwareSignal(cancel: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  return cancel === undefined ? AbortSignal.timeout(timeoutMs) : AbortSignal.any([cancel, AbortSignal.timeout(timeoutMs)]);
 }
 
 /** The exact `round.posted` payload the production writer appends (see
@@ -730,6 +752,12 @@ export class GhPrPoster implements VerdictPoster {
     // set enacts REQUEST_CHANGES, everything else stays a COMMENT. The
     // provider's enacted state is verified below against exactly this.
     const wantedEvent = enactedStateFor(input.reviewEvent);
+    // The round may have been cancelled/superseded while the identity and
+    // credential probes were outstanding: never start the irreversible POST
+    // for an already-cancelled round.
+    if (input.signal?.aborted) {
+      throw new Error('review delivery cancelled before the irreversible POST — review not delivered');
+    }
     const result = spawnSync(
       this.binary,
       ['api', '--hostname', input.host, '--method', 'POST', `${apiPath}/reviews`, '--input', '-'],
@@ -1042,13 +1070,19 @@ export class GitLabMrPoster implements VerdictPoster {
     // note's echoed author must match it, and an unnamed account refuses
     // delivery before a note exists.
     const author = await this.resolveAuthenticatedUser(input.host, headers);
+    // The round may have been cancelled/superseded while the identity probe
+    // was outstanding: never start the irreversible note POST for an
+    // already-cancelled round.
+    if (input.signal?.aborted) {
+      throw new Error('merge-request note delivery cancelled before the irreversible POST — note not delivered');
+    }
     let noteResponse: Awaited<ReturnType<typeof this.fetchImpl>>;
     try {
       noteResponse = await this.fetchImpl(`${mrUrl}/notes`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ body: input.body }),
-        signal: AbortSignal.timeout(30_000),
+        signal: cancelAwareSignal(input.signal, 30_000),
       });
     } catch (error) {
       throw new Error(`GitLab note delivery failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -2494,6 +2528,151 @@ export class WaveRunner {
     return 'unbound';
   }
 
+  /** The frozen manifest's repository path for a round, from its own artifact
+   * directory. Null when unreadable or malformed: recovery then fails closed
+   * rather than probing a guessed path. */
+  private publicationRecoveryRepoPath(round: RoundRecord): string | null {
+    try {
+      const bytes = readReviewCheckpointBytes(
+        reviewArtifactDirectory(this.artifactRoot(), round.id),
+        'manifest.json',
+        FROZEN_MANIFEST_MAX_BYTES,
+      );
+      const parsed = JSON.parse(bytes.toString('utf8')) as { repoPath?: unknown };
+      return typeof parsed.repoPath === 'string' && parsed.repoPath.trim() !== '' ? parsed.repoPath : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Restart-time reconciliation of a durable publication attempt that never
+   * reached a credited `round.posted` (native blockers 2/3 on PR #289).
+   *
+   * The attempt intent is journaled before the irreversible POST, so a crash
+   * leaves this method a concrete question: did the frozen-commit write land?
+   * It answers with provider evidence only:
+   *
+   * - a bounded reconcile `null` records `round.publication-absent` — the
+   *   ONLY outcome that clears the attempt for a later same-head re-arm;
+   * - a proven match is retained as UNCREDITED `round.publication-receipt`
+   *   evidence (never credited to a moved head, never re-posted);
+   * - an unreadable artifact, a missing poster, or a failed lookup leaves the
+   *   attempt unresolved and the shared re-arm guard closed.
+   *
+   * Nothing here ever POSTs. Returns 'none' when the round carries no attempt,
+   * 'clear' when the attempt already has a conclusive outcome, and 'held' when
+   * a provider write exists or its state stays unresolved. */
+  private async reconcileInterruptedPublication(round: RoundRecord): Promise<'none' | 'clear' | 'held'> {
+    const attemptEvent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ATTEMPT_EVENT);
+    if (attemptEvent === null) return 'none';
+    const credited = this.opts.ledger.latestRoundEvent(round.id, 'round.posted');
+    if (credited !== null && credited.seq > attemptEvent.seq) return 'clear';
+    const absent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT);
+    if (absent !== null && absent.seq > attemptEvent.seq) return 'clear';
+    const attempt = parsePublicationAttemptPayload(attemptEvent.payload);
+    if (attempt === null) {
+      this.escalate(
+        `Perkins publication attempt for round ${round.id} is malformed`,
+        'the durable publication intent cannot be parsed, so its provider outcome stays unresolved and same-head re-publication stays closed for inspection',
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
+    const existingReceipt = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_RECEIPT_EVENT);
+    if (existingReceipt !== null && existingReceipt.seq > attemptEvent.seq) {
+      const evidence = parsePublicationReceiptEvidencePayload(existingReceipt.payload);
+      this.escalate(
+        `Perkins publication for round ${round.id} was proven at the provider but never credited`,
+        `an uncredited receipt (review ${evidence?.receipt.reviewId ?? 'unknown'}) exists for frozen head ${attempt.targetSha}: the round terminalizes as interrupted and same-head re-publication stays closed until the delivery is reconciled; the frozen-commit receipt is retained as truthful evidence`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
+    const poster = this.opts.poster;
+    if (poster === undefined || typeof poster.reconcile !== 'function') {
+      this.escalate(
+        `Perkins publication attempt for round ${round.id} could not be reconciled after restart`,
+        `no reconciling poster is configured, so whether the frozen-commit publication for ${attempt.targetSha} landed stays unresolved; same-head re-publication stays closed`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
+    const repoPath = this.publicationRecoveryRepoPath(round);
+    const canonical = resolve(join(reviewArtifactDirectory(this.artifactRoot(), round.id), 'perkins-report.publication.md'));
+    if (repoPath === null || resolve(attempt.publicationFile) !== canonical) {
+      this.escalate(
+        `Perkins publication attempt for round ${round.id} cannot be reconciled safely`,
+        'the frozen repository path or the canonical publication artifact could not be verified, so the provider outcome stays unresolved and same-head re-publication stays closed for inspection',
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
+    let publicationBody: string;
+    try {
+      const info = lstatSync(attempt.publicationFile);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > PUBLICATION_BODY_MAX_BYTES) throw new Error('publication artifact is not a bounded regular file');
+      publicationBody = readFileSync(attempt.publicationFile, 'utf8');
+    } catch (error) {
+      this.escalate(
+        `Perkins publication attempt for round ${round.id} cannot be reconciled safely`,
+        `the canonical publication artifact could not be read (${String(error).slice(0, 200)}), so the provider outcome stays unresolved and same-head re-publication stays closed for inspection`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
+    try {
+      const found = await poster.reconcile({
+        prUrl: attempt.url,
+        host: attempt.host,
+        repoPath,
+        body: publicationBody,
+        targetSha: attempt.targetSha,
+        baseSha: attempt.baseSha,
+        reviewEvent: attempt.reviewEvent,
+      });
+      if (found === null) {
+        this.opts.ledger.appendCustomEvent({
+          kind: PUBLICATION_ABSENT_EVENT,
+          jobId: round.jobId,
+          roundId: round.id,
+          payload: {
+            targetSha: attempt.targetSha,
+            publicationSha256: attempt.publicationSha256,
+            detail: 'bounded provider reconciliation proved the recorded publication attempt did not land',
+          },
+        });
+        this.escalate(
+          `Perkins publication attempt for round ${round.id} did not land`,
+          `bounded provider reconciliation proved no matching publication on frozen head ${attempt.targetSha}; the attempt is recorded as absent and a fresh publication on the same head is safe`,
+          { jobId: round.jobId, roundId: round.id },
+        );
+        return 'clear';
+      }
+      const receiptEvidence: PublicationReceiptEvidencePayload = {
+        ...attempt, receipt: found, credited: false, reason: 'recovered-uncredited-after-restart',
+      };
+      this.opts.ledger.appendCustomEvent({
+        kind: PUBLICATION_RECEIPT_EVENT,
+        jobId: round.jobId,
+        roundId: round.id,
+        payload: receiptEvidence,
+      });
+      this.escalate(
+        `Perkins publication for round ${round.id} was found at the provider after restart and is retained UNCREDITED`,
+        `provider reconciliation proved review ${found.reviewId} (${found.event}) on frozen head ${attempt.targetSha}; it is retained as uncredited frozen-commit evidence, is never credited to a newer head, and no duplicate POST is attempted — reconcile the delivery manually before re-arming a publication on this head`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    } catch (error) {
+      this.escalate(
+        `Perkins publication attempt for round ${round.id} stays unresolved after restart`,
+        `provider reconciliation failed (${String(error).slice(0, 200)}): the provider may hold an unreported publication for frozen head ${attempt.targetSha}; the frozen-commit outcome stays unresolved and same-head re-publication stays closed`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
+  }
+
   /** Mark crash-interrupted proof INCOMPLETE and release every owned lane. */
   async recoverInterruptedRounds(): Promise<number> {
     let recovered = 0;
@@ -2522,6 +2701,12 @@ export class WaveRunner {
         recovered += 1;
         continue;
       }
+      // A durable publication attempt that never reached a credited
+      // round.posted is reconciled against the provider before the round
+      // terminalizes: a proven receipt is retained (uncredited) and the
+      // shared re-arm guard keeps same-head re-publication closed. Never
+      // POSTs, never credits a moved head.
+      await this.reconcileInterruptedPublication(round);
       const note = 'review interrupted by service restart; selected lens/verification proof is incomplete';
       // Pre-abort classification: a live chip is a started child even when
       // its journal write was lost to the crash (P5).
@@ -2572,6 +2757,7 @@ export class WaveRunner {
           recovered += 1;
           continue;
         }
+        await this.reconcileInterruptedPublication(round);
         const note = 'review interrupted before its detached worktree was durably registered; required proof is incomplete';
         const preAbortFacts = this.interruptedExecutionFacts(round, round.lenses.map((chip) => chip.lens as PerkinsLens));
         this.abortRound(round, note);
@@ -5281,6 +5467,18 @@ export class WaveRunner {
         const { prUrl, publicationBody } = deliveryInput();
         const publicationFile = writeReviewArtifact(frozenReview, 'perkins-report.publication.md', publicationBody);
         const publicationSha256 = createHash('sha256').update(publicationBody).digest('hex');
+        // The immutable intent is durable BEFORE the irreversible POST: a
+        // crash after this point can never look like "no publication was
+        // attempted", and a failed intent write aborts with no POST at all.
+        if (verdict === null) throw new Error('internal: publication attempt without a conclusive verdict');
+        const attemptPayload: PublicationAttemptPayload = {
+          verdict, canonicalVerdict: canonical, url: job.prUrl!, host: prUrl.host,
+          targetSha: review.targetSha, baseSha: frozenReview.manifest.baseRefSha,
+          publicationFile, publicationSha256, reviewEvent,
+        };
+        this.opts.ledger.appendCustomEvent({
+          kind: PUBLICATION_ATTEMPT_EVENT, jobId: job.id, roundId: round.id, payload: attemptPayload,
+        });
         const delivered = verifyPostedReceipt(
           await poster.post({
             prUrl: job.prUrl!,
@@ -5290,9 +5488,19 @@ export class WaveRunner {
             targetSha: review.targetSha,
             baseSha: frozenReview.manifest.baseRefSha,
             reviewEvent,
+            signal,
           }),
           { targetSha: review.targetSha, bodySha256: publicationSha256, event: wantedEnacted },
         );
+        // The proven receipt is retained IMMEDIATELY, before the finality
+        // checks: movement or cancellation must never discard the only
+        // durable proof that the frozen-commit provider write exists.
+        const receiptEvidence: PublicationReceiptEvidencePayload = {
+          ...attemptPayload, receipt: delivered, credited: false, reason: 'pending-finality-checks',
+        };
+        this.opts.ledger.appendCustomEvent({
+          kind: PUBLICATION_RECEIPT_EVENT, jobId: job.id, roundId: round.id, payload: receiptEvidence,
+        });
         if (signal.aborted) throw new Error('review operation aborted while the report was being delivered');
         const duringDelivery = sourceMovementSinceFreeze(frozenReview);
         if (duringDelivery !== null) throw new Error(`source changed while the report was being delivered (${duringDelivery.cause}: ${duringDelivery.detail})`);
@@ -5331,11 +5539,25 @@ export class WaveRunner {
               targetSha: review.targetSha,
               baseSha: frozenReview.manifest.baseRefSha,
               reviewEvent,
+              signal,
             }, { reason: 'post-failure' });
             reconciledDelivery = found === null
               ? null
               : verifyPostedReceipt(found, { targetSha: review.targetSha, bodySha256: publicationSha256, event: wantedEnacted });
             if (reconciledDelivery !== null) {
+              // Retain the proven receipt IMMEDIATELY, before the finality
+              // checks below: a movement/abort refusal keeps it as truthful
+              // uncredited evidence instead of discarding it.
+              if (verdict === null) throw new Error('internal: reconciled publication without a conclusive verdict');
+              const receiptEvidence: PublicationReceiptEvidencePayload = {
+                verdict, canonicalVerdict: canonical, url: job.prUrl!, host: prUrl.host,
+                targetSha: review.targetSha, baseSha: frozenReview.manifest.baseRefSha,
+                publicationFile, publicationSha256, reviewEvent,
+                receipt: reconciledDelivery, credited: false, reason: 'reconciled-after-ambiguous-post',
+              };
+              this.opts.ledger.appendCustomEvent({
+                kind: PUBLICATION_RECEIPT_EVENT, jobId: job.id, roundId: round.id, payload: receiptEvidence,
+              });
               // The SAME stale-head/cancellation safeguards as a normal
               // POST apply AFTER the lookup, before anything is recorded
               // (T4): a receipt discovered while the ref moved (or the
