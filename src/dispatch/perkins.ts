@@ -383,7 +383,7 @@ export function hostDisclosureAppendix(
         ? [`- Prior findings carried forward without re-verification: ${review.convergence.carriedPriors.length} (quoted evidence unchanged, cited file untouched)`]
         : []),
       ...(review.convergence.deferredFollowups !== undefined && review.convergence.deferredFollowups.length > 0
-        ? [`- Follow-ups deferred by the convergence rule: ${review.convergence.deferredFollowups.length} — new finding(s) outside this round's delta hunks, filed as follow-ups; they are recorded in full and cannot hold the PR (${review.convergence.deferredFollowups.map((followUp) => `${followUp.severity}: "${followUp.title}" at ${followUp.location}`).join('; ')})`]
+        ? [`- Follow-ups deferred by the convergence rule: ${review.convergence.deferredFollowups.length} — new finding(s) outside this round's delta hunks, filed as follow-ups; they are recorded in full and cannot hold the PR (${review.convergence.deferredFollowups.map((followUp) => `${followUp.severity}: "${renderUntrustedInline(followUp.title)}" at ${renderUntrustedInline(followUp.location, 500)}`).join('; ')})`]
         : []),
       ...(review.convergence.verdictRecomputed !== undefined
         ? [`- Canonical verdict RECOMPUTED by the host convergence rule: the lead submitted "${review.convergence.verdictRecomputed.from}", the converged blocker set determines "${review.convergence.verdictRecomputed.to}"`]
@@ -713,12 +713,20 @@ type PublishedScopeDisclosure =
 
 function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure | null {
   if (text === null) return null;
-  const hostStart = text.lastIndexOf(HOST_APPENDIX_HEADING);
-  if (hostStart === -1) return { kind: 'legacy' };
-  const host = text.slice(hostStart);
-  const line = host.split('\n').find((entry) => entry.startsWith('- Review scope: '));
-  if (line === undefined) return { kind: 'legacy' };
-  const disclosed = line.slice('- Review scope: '.length);
+  // Structural recognition: only a LINE-ANCHORED heading marks the host
+  // appendix region. A finding or deferred-follow-up title embedding the
+  // heading inside a longer line can never move the boundary, and more than
+  // one anchored heading is ambiguous scope evidence and refuses.
+  const heading = lineAnchoredPosition(text, HOST_APPENDIX_HEADING);
+  if (heading.count === 0) return { kind: 'legacy' };
+  if (heading.count > 1) return null;
+  const host = text.slice(heading.index);
+  const scopeLines = host.split('\n').filter((entry) => entry.startsWith('- Review scope: '));
+  if (scopeLines.length === 0) return { kind: 'legacy' };
+  // The host appendix emits exactly ONE scope line: two or more is ambiguous
+  // scope evidence and refuses rather than picking one.
+  if (scopeLines.length > 1) return null;
+  const disclosed = scopeLines[0]!.slice('- Review scope: '.length);
   const reviewScope = disclosed.startsWith('whole change')
     ? 'whole' as const
     : disclosed.startsWith('delta since')
@@ -732,6 +740,27 @@ function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure
     reviewScope,
     finalPassRequired: host.includes('- Final whole-change pass: STILL OWED'),
   };
+}
+
+/** The number of LINE-ANCHORED occurrences of `line` in `text` plus the
+ * position of the first: an occurrence is anchored when it starts at the
+ * text start or right after a newline AND ends at the text end or right
+ * before one. A dynamic field embedding the marker inside a longer line can
+ * never qualify. */
+function lineAnchoredPosition(text: string, line: string): { readonly count: number; readonly index: number } {
+  let count = 0;
+  let index = -1;
+  let cursor = text.indexOf(line);
+  while (cursor !== -1) {
+    const before = cursor === 0 || text[cursor - 1] === '\n';
+    const after = cursor + line.length === text.length || text[cursor + line.length] === '\n';
+    if (before && after) {
+      count += 1;
+      if (index === -1) index = cursor;
+    }
+    cursor = text.indexOf(line, cursor + 1);
+  }
+  return { count, index };
 }
 
 /** Host-side binding of a provider receipt before anything is recorded as
@@ -6208,7 +6237,11 @@ export class WaveRunner {
       // different scope, or that still owes the final pass while the record's
       // effective debt says none is owed, is damaged state — refuse.
       const disclosure = publishedScopeDisclosure(posted.publicationText);
-      if (disclosure !== null && disclosure.kind === 'scoped') {
+      // Unusable publication scope is NEVER authenticated by the mutable
+      // record: a missing or unrecognized disclosure refuses in BOTH fallback
+      // branches (the absent-convergence branch refuses it too).
+      if (disclosure === null) return null;
+      if (disclosure.kind === 'scoped') {
         const effectiveDebt = scope === 'delta' ||
           (scope === 'integration' && convergence.coverageComplete !== true) ||
           convergence.finalPassRequired === true;
