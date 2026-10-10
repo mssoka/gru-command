@@ -21,6 +21,11 @@ function report(...assertions: readonly Record<string, unknown>[]) {
 describe('verification-history fail-before classifier', () => {
   it('accepts the named 208-run regression failing with the recorded window reason', () => {
     expect(assertVerificationHistoryBaseline(report(red()))).toBe(TITLE);
+    // The REAL Vitest JSON shape: the top message is the promise-rejection
+    // assertion with the reason truncated by an ellipsis.
+    expect(assertVerificationHistoryBaseline(report(red([
+      'Error: promise rejected "Error: verification history window exceed…" instead of resolving',
+    ])))).toBe(TITLE);
   });
 
   it('refuses an unexpected GREEN baseline', () => {

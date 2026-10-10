@@ -11,8 +11,15 @@ import { pathToFileURL } from 'node:url';
 /** The single discriminating case the baseline overlay must RED. */
 export const EXPECTED_BASELINE_TITLE =
   'reviews a job with 208 completed verification runs: the newest binding run freezes without a lifetime-window exception (j-1594)';
-/** The recorded reason the pre-fix base refuses the history for. */
-export const EXPECTED_BASELINE_REASON = 'verification history window exceeded';
+/** The recorded reason the pre-fix base refuses the history for. The Vitest
+ * JSON top-level message truncates the throw with an ellipsis, so the
+ * discriminator is the stable prefix, not the full sentence. */
+export const EXPECTED_BASELINE_REASON = 'verification history window exceed';
+
+/** A promise-resolution assertion (the wave case) or a plain assertion. */
+function isBehavioralAssertion(message) {
+  return message.includes('AssertionError:') || message.includes('instead of resolving');
+}
 
 /**
  * Classify a Vitest JSON report from the pre-fix verification-history
@@ -64,7 +71,7 @@ export function assertVerificationHistoryBaseline(report) {
   }
   const messages = Array.isArray(match.failureMessages) ? match.failureMessages : [];
   const joined = messages.filter((message) => typeof message === 'string').join('\n');
-  if (!joined.startsWith('AssertionError:') && !joined.includes('AssertionError:')) {
+  if (!isBehavioralAssertion(joined)) {
     throw new Error('the named regression failed before its assertion; setup/import failure is not RED evidence');
   }
   if (!joined.includes(EXPECTED_BASELINE_REASON)) {
