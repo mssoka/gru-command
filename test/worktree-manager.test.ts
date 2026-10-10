@@ -179,16 +179,27 @@ describe('worktree manager: creation (ruling 18a/b/d/e)', () => {
     const h = harness();
     const repo = h.make('fixture-retired-fetched-head');
     const retired = '# BEGIN GRU COMMAND BMAD BOOTSTRAP\n[[setup]]\ncommand = "node .gru-command/bmad-bootstrap.mjs"\n# END GRU COMMAND BMAD BOOTSTRAP\n';
-    repo.commitFile('.gru-command/worktree.toml', retired);
-    attachBareOrigin(repo);
+    const remoteHead = repo.commitFile('.gru-command/worktree.toml', retired);
+    const origin = attachBareOrigin(repo);
+    repo.git(['push', '--quiet', 'origin', 'main']);
+    repo.git(['symbolic-ref', 'HEAD', 'refs/heads/main'], origin);
     const clean = '[[setup]]\ncommand = "echo user-setup > .boot-marker"\n';
-    writeFileSync(join(repo.path, '.gru-command/worktree.toml'), clean);
+    const localHead = repo.commitFile('.gru-command/worktree.toml', clean);
+    expect(localHead).not.toBe(remoteHead);
+    expect(repo.git(['status', '--porcelain'])).toBe('');
+    expect(repo.git(['ls-remote', '--symref', 'origin', 'HEAD'])).toContain(`${remoteHead}\tHEAD`);
+    // A populated remote-tracking ref after refusal must come from the
+    // manager's fetch, not from push or the local checkout's clean HEAD.
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/main']);
     ledgerJob(h, 'job-retired-head', repo);
     await expect(h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-retired-head' }))
       .rejects.toThrow(/retired GC-managed BMAD bootstrap/u);
     expect(h.ledger.getWorktree('job-retired-head')).toBeNull();
     expect(repo.git(['worktree', 'list'])).not.toContain('job-retired-head');
     expect(repo.git(['branch', '--list', 'gru/job-retired-head'])).toBe('');
+    expect(repo.git(['rev-parse', 'refs/remotes/origin/main'])).toBe(remoteHead);
+    expect(repo.head()).toBe(localHead);
+    expect(h.baseFallbacks).toEqual([]);
     expect(readFileSync(join(repo.path, '.gru-command/worktree.toml'), 'utf-8')).toBe(clean);
   });
 
