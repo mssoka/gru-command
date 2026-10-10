@@ -390,6 +390,10 @@ verification budget.
   frozen review target SHA (clean tracked tree), the host freezes a
   clearly-delimited evidence block into the review spec context, so the
   tests lens weighs ledger-backed evidence instead of a pasted report.
+  The job's COMPLETE `verification.completed` history is read in bounded
+  keyset pages with no finite lifetime window: the newest run binding the
+  frozen target governs, a long history never refuses a review, and the
+  explicit absence section appears only after the whole history is read.
 - **Progress streams** back as NDJSON: `queued` → `started` → `output…`
   → `completed` (or `error`), with transport `ping` frames interleaved
   into any silence. A duplicate submission to an in-flight run instead

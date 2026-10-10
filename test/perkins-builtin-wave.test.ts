@@ -50,6 +50,86 @@ function settleLane(ledger: LedgerApi, jobId: string): void {
   ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'fixture-settled' } });
 }
 
+/** A syntactically complete `verification.completed` payload carrying every
+ * receipt binding `renderRecordedVerification` requires. */
+function completedRunPayload(
+  sha: string,
+  runId: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    sha,
+    scope: 'full',
+    command: 'npm test',
+    ok: true,
+    exit_code: 0,
+    duration_ms: 1000,
+    workers: 2,
+    run_id: runId,
+    output_bytes: 4096,
+    output_sha256: createHash('sha256').update(runId).digest('hex'),
+    ...overrides,
+  };
+}
+
+/** Complete persisted `verification.completed` rows for the named jobs — the
+ * read-only before/after proof that host selection neither adds, deletes,
+ * reorders nor rewrites historical verification records (j-1594 acceptance 4).
+ * Read through a kind-scoped list (never the iterator under test) with a
+ * limit above any fixture history, so truncation cannot fake equality. */
+function persistedVerificationRows(ledger: LedgerApi, jobIds: readonly string[]): Record<string, unknown> {
+  const rows: Record<string, unknown> = {};
+  for (const jobId of jobIds) {
+    rows[jobId] = ledger.listJobEventsByKinds(jobId, ['verification.completed'], { limit: 1000 });
+  }
+  return rows;
+}
+
+/** A delivered job lane whose target is a fresh commit on its own branch —
+ * the fixture shape the recorded-verification wave pins use. The caller
+ * appends the synthetic verification history through the returned ledger. */
+async function verificationHistoryLane(id: string, prefix: string, prNumber: number): Promise<{
+  readonly ledger: LedgerApi;
+  readonly job: ReturnType<LedgerApi['addJob']>;
+  readonly target: string;
+  readonly branch: string;
+  readonly artifacts: string;
+  readonly sessions: string;
+  readonly port: GitReviewPort;
+}> {
+  const repo = makeFixtureRepo(`${prefix}-repo`);
+  repos.push(repo);
+  const branch = `feature/${prefix}`;
+  repo.git(['checkout', '-b', branch]);
+  const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+  const root = mkdtempSync(join(tmpdir(), `${prefix}-port-`));
+  const artifacts = mkdtempSync(join(tmpdir(), `${prefix}-artifacts-`));
+  const sessions = mkdtempSync(join(tmpdir(), `${prefix}-sessions-`));
+  dirs.push(root, artifacts, sessions);
+  const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${prefix}-db-`)));
+  dbs.push(db);
+  const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+  const port = new GitReviewPort(root, branch, target);
+  await port.createJobWorktree({ repoPath: repo.path, jobId: id });
+  const job = ledger.addJob({ id, repo: 'fixture', title: prefix, baseBranch: 'main', briefing: 'review' });
+  ledger.setJobStatus(job.id, 'working');
+  settleLane(ledger, job.id);
+  ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${prNumber}`);
+  attachOrigin(repo, branch, root);
+  return { ledger, job, target, branch, artifacts, sessions, port };
+}
+
+function waveFor(lane: Awaited<ReturnType<typeof verificationHistoryLane>>): WaveRunner {
+  const underlying = makeSpawner(lane.sessions, []);
+  return new WaveRunner({
+    ledger: lane.ledger,
+    worktrees: lane.port,
+    spawner: (role, options) => underlying(role, options),
+    reviewArtifactRoot: lane.artifacts,
+    prHeadProbe: localHeadProbe(lane.branch),
+  });
+}
+
 
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { WorktreeBaseSource } from '../src/ledger/api.js';
@@ -1825,6 +1905,157 @@ describe('WaveRunner built-in Perkins production path', () => {
     const frozenSpec = readFileSync(join(artifacts, round.id, 'spec-context.md'), 'utf8');
     expect(frozenSpec).toContain('result: PASS (exit 0)');
     expect(frozenSpec).toContain('run_id: run-bvw-1');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+  });
+
+  it('reviews a job with 208 completed verification runs: the newest binding run freezes without a lifetime-window exception (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-208', 'perkins-long-history-208', 70);
+    const { ledger, job, target } = lane;
+    // 207 completed runs for OTHER shas, then the binding run as the NEWEST.
+    // The old lifetime ceiling threw on the total before any search happened.
+    for (let index = 0; index < 207; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('f'.repeat(40), `run-noise-${index}`),
+      });
+    }
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-newest'),
+    });
+    // Another job's completed history is kind/job-scoped noise here.
+    for (let index = 0; index < 210; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: 'job-other',
+        payload: completedRunPayload(target, `run-other-${index}`),
+      });
+    }
+    expect(ledger.listJobEventsByKinds(job.id, ['verification.completed'], { limit: 1000 })).toHaveLength(208);
+    // BEFORE: every persisted verification row of BOTH jobs (the reviewed
+    // lane and the other job's unrelated history).
+    const verificationBefore = persistedVerificationRows(ledger, [job.id, 'job-other']);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // AFTER: host selection is read-only — the complete persisted history of
+    // both jobs is identical row-for-row (same seqs, order, payloads and
+    // outcomes). An added, deleted or rewritten receipt (including an OLDER
+    // one) fails here, while ordinary round/status bookkeeping — different
+    // event kinds — cannot mask it.
+    expect(persistedVerificationRows(ledger, [job.id, 'job-other'])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('result: PASS (exit 0)');
+    expect(frozenSpec).toContain('run_id: run-binding-newest');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+    // Exactly ONE verification section, and the round really bound the
+    // target — not a vacuous "the exception text is absent" check.
+    expect(frozenSpec.match(/--- HOST-RECORDED VERIFICATION \(ledger-backed/gu)).toHaveLength(1);
+    expect(round.targetRef).toBe(target);
+  });
+
+  it('finds a binding run behind more than 200 newer nonqualifying completed runs (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-old', 'perkins-long-history-old', 71);
+    const { ledger, job, target } = lane;
+    // The binding run is the OLDEST; the newest-first scan must page past the
+    // first page (200 rows) of newer other-sha runs to reach it.
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-old'),
+    });
+    for (let index = 0; index < 205; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('e'.repeat(40), `run-newer-${index}`),
+      });
+    }
+    const verificationBefore = persistedVerificationRows(ledger, [job.id]);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // Paging past two pages to the oldest row rewrote nothing.
+    expect(persistedVerificationRows(ledger, [job.id])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('run_id: run-binding-old');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+  });
+
+  it('renders the explicit UNAVAILABLE section only after a complete long-history selection finds no binding run (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-none', 'perkins-long-history-none', 72);
+    const { ledger, job } = lane;
+    for (let index = 0; index < 205; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('d'.repeat(40), `run-absent-${index}`),
+      });
+    }
+    // A second job's unrelated completed history must survive an exhausted
+    // absence proof untouched, too.
+    for (let index = 0; index < 3; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: 'job-other-absent',
+        payload: completedRunPayload('c'.repeat(40), `run-absent-other-${index}`),
+      });
+    }
+    const verificationBefore = persistedVerificationRows(ledger, [job.id, 'job-other-absent']);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // Exhausted absence is still read-only: no record was added to fill the
+    // gap, none deleted to shorten the search, none rewritten to look absent.
+    expect(persistedVerificationRows(ledger, [job.id, 'job-other-absent'])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('state: UNAVAILABLE — NO BOUND VERIFICATION RUN');
+    expect(frozenSpec).not.toContain('result: PASS');
+  });
+
+  it('a verification-history read failure during iteration aborts the freeze loudly and never fabricates absence or a pass (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-fail', 'perkins-long-history-fail', 73);
+    const { ledger, job, target } = lane;
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-ok'),
+    });
+    // The real read is a generator: it cannot fail at the call expression —
+    // a storage failure surfaces while the selector iterates. Yield one
+    // non-binding run, then fail on the next pull.
+    const noise = ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload('f'.repeat(40), 'run-noise-before-failure'),
+    });
+    vi.spyOn(ledger, 'iterateJobVerificationCompleted').mockImplementation(function* failingRead() {
+      yield noise;
+      throw new Error('simulated mid-iteration verification-history read failure');
+    });
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/simulated mid-iteration verification-history read failure/u);
+    const round = ledger.listRounds(job.id)[0]!;
+    expect(round.status).toBe('aborted');
+    // Round-scoped receipt read — never a global newest-N window.
+    expect(ledger.latestRoundEvent(round.id, 'round.review-no-spawn')).not.toBeNull();
+    expect(ledger.listAgents().filter((agent) => agent.roundId === round.id)).toEqual([]);
+    expect(ledger.latestJobEvent(job.id, 'round.verdict')).toBeNull();
+  });
+
+  it('freezes a baseline-red binding run as its honest recorded FAIL with its scope, never relabeled PASS (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-red', 'perkins-long-history-red', 74);
+    const { ledger, job, target } = lane;
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-red', { ok: false, exit_code: 1, scope: 'fast' }),
+    });
+    for (let index = 0; index < 203; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('c'.repeat(40), `run-red-noise-${index}`),
+      });
+    }
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('run_id: run-red');
+    expect(frozenSpec).toContain('result: FAIL (exit 1)');
+    expect(frozenSpec).toContain('scope: fast');
     expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
   });
 
