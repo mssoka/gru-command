@@ -17,7 +17,9 @@ import {
   parseFindingLocation,
   parseDeltaStructure,
   applyConvergenceDeferral,
+  readPriorConvergenceFile,
   readPriorConvergenceMeta,
+  validateRetainedReviewLinkage,
 } from '../src/dispatch/perkins-review/convergence.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/perkins-review/whole.js';
@@ -481,7 +483,7 @@ describe('integration scope: same-head adopted base and identical base adoption'
     const plan = planReviewScope({
       prior: {
         seq: 1, reviewScope: 'whole', canonicalVerdict: 'READY TO MERGE', targetSha: h0, diffBaseSha: b0,
-        acceptance: null, coverageComplete: true, legacyWhole: false, findings: null,
+        acceptance: null, coverageComplete: true, legacyWhole: false, findings: null, integration: null,
       },
       currentTargetSha: h0, currentDiffBaseSha: currentBase,
       deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true,
@@ -710,6 +712,34 @@ describe('production scope planning wiring (planPerkinsReviewScope)', () => {
     expect(call(baselineNeedsChanges, {
       nativeReceipt: { ...baselineReceipt, retainedFindings: 1, retainedFindingsSha256: createHash('sha256').update(JSON.stringify(genuineFindings)).digest('hex') },
     }).scope).toBe('integration');
+
+    // (integration receipt without its full linkage) An integration record's
+    // own linkage must be corroborated field-for-field by its native receipt;
+    // a linkage-free or mismatched receipt reviews whole with no coverage.
+    const integrationRecord = writePrior('prior-integration.json', {
+      ...wholePrior,
+      convergence: {
+        reviewScope: 'integration', coverageComplete: true,
+        integrationFromSha: h0, integrationBaseSha: b0, integrationPriorDiffBase: b0,
+      },
+    });
+    const missingReceiptLinkage = call(integrationRecord, {
+      nativeReceipt: { targetSha: h0, diffBaseSha: b0, reviewScope: 'integration', coverageComplete: true },
+    });
+    expect(missingReceiptLinkage.scope).toBe('whole');
+    expect(missingReceiptLinkage.reason).toContain('could not be authenticated');
+    expect(missingReceiptLinkage.priorCoverageComplete).toBe(false);
+    // Even when authentication fails, the plan still pins the exact bytes it
+    // read so the engine can never substitute a different record.
+    expect(missingReceiptLinkage.priorConsolidatedSha256).toMatch(/^[a-f0-9]{64}$/u);
+    const mismatchedReceiptLinkage = call(integrationRecord, {
+      nativeReceipt: {
+        targetSha: h0, diffBaseSha: b0, reviewScope: 'integration', coverageComplete: true,
+        integrationFromSha: h0, integrationBaseSha: b0, integrationPriorDiffBase: 'f'.repeat(40),
+      },
+    });
+    expect(mismatchedReceiptLinkage.scope).toBe('whole');
+    expect(mismatchedReceiptLinkage.priorCoverageComplete).toBe(false);
   });
 });
 
@@ -828,6 +858,7 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
     coverageComplete: false,
     legacyWhole: false,
     findings: null,
+    integration: null,
     ...overrides,
   });
   const scope = (prior: ReturnType<typeof meta> | null, overrides: Partial<{ currentTargetSha: string; currentDiffBaseSha: string; finalWholePassAtReady: boolean; integrationLineage: { baseAdvanced: boolean; featureIntegrated: boolean; commonBasePinned: boolean; sameHeadAdoptedBase: boolean } | null; integrationCoverage: boolean; acceptanceCompatible: boolean }> = {}) => planReviewScope({
@@ -936,7 +967,7 @@ describe('prior convergence meta read (tolerant)', () => {
     };
     writeFileSync(file, JSON.stringify(modern));
     expect(readPriorConvergenceMeta(file, 4)).toEqual({
-      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null, coverageComplete: false, legacyWhole: false, findings: null,
+      seq: 4, reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE', targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40), acceptance: null, coverageComplete: false, legacyWhole: false, findings: null, integration: null,
     });
     writeFileSync(file, JSON.stringify({ ...modern, convergence: undefined }));
     expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('unknown');
@@ -967,11 +998,76 @@ describe('prior convergence meta read (tolerant)', () => {
     // A non-hex linkage field is damaged.
     writeFileSync(file, JSON.stringify({ ...integrated, convergence: { ...integrated.convergence, integrationPriorDiffBase: 'nope' } }));
     expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    // An incoming base differing from the record's own frozen diff base is
+    // the SAME shared-validator failure the posted parser and recovery
+    // reader must reject.
+    writeFileSync(file, JSON.stringify({ ...integrated, convergence: { ...integrated.convergence, integrationBaseSha: 'e'.repeat(40) } }));
+    expect(readPriorConvergenceMeta(file, 4)).toBeNull();
+    // A whole/delta record carrying stray integration linkage is damaged too.
+    writeFileSync(file, JSON.stringify({ ...integrated, convergence: { reviewScope: 'whole', coverageComplete: true, integrationFromSha: 'a'.repeat(40) } }));
+    expect(readPriorConvergenceMeta(file, 4)).toBeNull();
     // A valid same-head adoption linkage (the round integrated from the very
     // head it reviewed) is NOT damaged: the frozen target and the integration
     // source legitimately coincide, and the engine persists exactly that.
     writeFileSync(file, JSON.stringify({ ...integrated, convergence: { ...integrated.convergence, integrationFromSha: 'b'.repeat(40) } }));
     expect(readPriorConvergenceMeta(file, 4)?.reviewScope).toBe('integration');
+  });
+
+  it('pins the exact prior bytes it parsed and fails closed when the read is not exact', () => {
+    const root = temp('perkins-meta-pin-');
+    const file = join(root, 'consolidated.json');
+    const record = {
+      schemaVersion: 3,
+      architecture: 'perkins-whole-pr',
+      canonicalVerdict: 'READY TO MERGE',
+      complete: true,
+      headMoved: false,
+      frozen: { targetSha: 'b'.repeat(40), diffBaseSha: 'd'.repeat(40) },
+      convergence: { reviewScope: 'whole', coverageComplete: true },
+      findings: [],
+    };
+    writeFileSync(file, JSON.stringify(record));
+    const read = readPriorConvergenceFile(file, 4);
+    expect(read.meta?.reviewScope).toBe('whole');
+    expect(read.sha256).toBe(createHash('sha256').update(readFileSync(file)).digest('hex'));
+    // A same-shape rewrite is a DIFFERENT record: the digest changes, so an
+    // engine that pinned the old bytes refuses the replacement.
+    const rewritten = JSON.stringify({ ...record, findings: [{ title: 'replacement' }] });
+    writeFileSync(file, rewritten);
+    const after = readPriorConvergenceFile(file, 4);
+    expect(after.sha256).toBe(createHash('sha256').update(rewritten).digest('hex'));
+    expect(after.sha256).not.toBe(read.sha256);
+    // Missing/unreadable records return no bytes and no digest.
+    expect(readPriorConvergenceFile(join(root, 'missing.json'), 4)).toEqual({ meta: null, sha256: null });
+  });
+
+  it('validates integration linkage with ONE rule across the planner, posted parser and recovery', () => {
+    const from = 'a'.repeat(40);
+    const base = 'b'.repeat(40);
+    const prior = 'c'.repeat(40);
+    expect(validateRetainedReviewLinkage({
+      reviewScope: 'integration', diffBaseSha: base,
+      integrationFromSha: from, integrationBaseSha: base, integrationPriorDiffBase: prior,
+    }).ok).toBe(true);
+    // Every required linkage field must be present and a full SHA.
+    for (const missing of ['integrationFromSha', 'integrationBaseSha', 'integrationPriorDiffBase'] as const) {
+      const input: Parameters<typeof validateRetainedReviewLinkage>[0] = {
+        reviewScope: 'integration', diffBaseSha: base,
+        integrationFromSha: from, integrationBaseSha: base, integrationPriorDiffBase: prior,
+        [missing]: undefined,
+      };
+      expect(validateRetainedReviewLinkage(input).ok, missing).toBe(false);
+      expect(validateRetainedReviewLinkage({ ...input, [missing]: 'not-a-sha' }).ok, `${missing} non-SHA`).toBe(false);
+    }
+    // The recorded incoming base must be the record's own frozen diff base.
+    expect(validateRetainedReviewLinkage({
+      reviewScope: 'integration', diffBaseSha: base,
+      integrationFromSha: from, integrationBaseSha: 'e'.repeat(40), integrationPriorDiffBase: prior,
+    }).ok).toBe(false);
+    // Whole/delta claims must not carry linkage, and unsupported scopes never pass.
+    expect(validateRetainedReviewLinkage({ reviewScope: 'whole', diffBaseSha: base, integrationFromSha: from }).ok).toBe(false);
+    expect(validateRetainedReviewLinkage({ reviewScope: 'delta', diffBaseSha: base }).ok).toBe(true);
+    expect(validateRetainedReviewLinkage({ reviewScope: undefined, diffBaseSha: base }).ok).toBe(false);
   });
 
   it('fails closed on a present-but-malformed acceptance binding', () => {

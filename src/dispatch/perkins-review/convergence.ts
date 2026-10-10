@@ -676,6 +676,14 @@ export interface ReviewScopePlan {
   readonly priorCoverageComplete: boolean;
 }
 
+/** The production scope plan: the shared decision plus the PIN of the exact
+ * prior-record bytes it was derived from. The engine must consume only bytes
+ * that still hash to this digest — a changed file refuses rather than
+ * silently substituting retained coverage. */
+export interface PerkinsReviewScopePlan extends ReviewScopePlan {
+  readonly priorConsolidatedSha256?: string;
+}
+
 export function planReviewScope(input: {
   readonly prior: PriorConvergenceMeta | null;
   readonly currentTargetSha: string;
@@ -776,21 +784,72 @@ export interface PriorConvergenceMeta {
    * array): bound to the native submission by count and digest so tampering
    * can never be credited whole-complete coverage. */
   readonly findings: { readonly blockers: number; readonly count: number; readonly sha256: string } | null;
+  /** The record's immutable integration linkage when its scope is
+   * `integration` (null for whole/delta/unknown/legacy records). Every
+   * reader must accept a recognized integration claim only with the FULL
+   * linkage validated by `validateRetainedReviewLinkage`. */
+  readonly integration: RetainedIntegrationLinkage | null;
+}
+
+/** The immutable linkage every retained `integration` coverage claim must
+ * carry: the prior covered feature head (H0), the advanced incoming base
+ * (B1, which must be the record's own frozen diff base) and the prior
+ * round's own pinned base (B0). */
+export interface RetainedIntegrationLinkage {
+  readonly fromSha: string;
+  readonly baseSha: string;
+  readonly priorDiffBase: string;
+}
+
+/** ONE shared verdict on a retained-coverage claim's scope + linkage, used
+ * by the scope planner, the posted-state parser and the recovery readers so
+ * no surface accepts a state another rejects: an `integration` claim must
+ * carry ALL THREE immutable linkage fields and its recorded incoming base
+ * must be its own frozen diff base; a `whole`/`delta` claim must carry none
+ * (a stray linkage field is damaged provenance, never coverage). */
+export function validateRetainedReviewLinkage(input: {
+  readonly reviewScope: unknown;
+  readonly diffBaseSha?: unknown;
+  readonly integrationFromSha?: unknown;
+  readonly integrationBaseSha?: unknown;
+  readonly integrationPriorDiffBase?: unknown;
+}): { readonly ok: true } | { readonly ok: false; readonly defect: string } {
+  const { reviewScope, integrationFromSha, integrationBaseSha, integrationPriorDiffBase } = input;
+  if (reviewScope !== 'whole' && reviewScope !== 'delta' && reviewScope !== 'integration') {
+    return { ok: false, defect: 'the review scope is missing or unrecognized' };
+  }
+  const linkage = [integrationFromSha, integrationBaseSha, integrationPriorDiffBase];
+  if (reviewScope !== 'integration') {
+    return linkage.some((value) => value !== undefined)
+      ? { ok: false, defect: `${reviewScope} coverage must not carry integration linkage fields` }
+      : { ok: true };
+  }
+  const names = ['integrationFromSha', 'integrationBaseSha', 'integrationPriorDiffBase'] as const;
+  for (const [index, value] of linkage.entries()) {
+    if (typeof value !== 'string' || !/^[0-9a-f]{40}$/u.test(value)) {
+      return { ok: false, defect: `integration linkage field ${names[index]} is missing or not a full commit SHA` };
+    }
+  }
+  if (typeof input.diffBaseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(input.diffBaseSha)) {
+    return { ok: false, defect: 'the record\'s own frozen diff base is missing or not a full commit SHA' };
+  }
+  if (integrationBaseSha !== input.diffBaseSha) {
+    return { ok: false, defect: 'the recorded incoming base is not the record\'s own frozen diff base' };
+  }
+  return { ok: true };
 }
 
 const MAX_CONSOLIDATED_META_BYTES = 8 * 1024 * 1024;
 
-/** Tolerant read of one prior round's consolidated record for scope
- * planning. Returns null when the file is missing, unreadable or not a
- * complete whole-PR record — the caller then plans as if no prior existed
- * (whole authority); it never guesses a scope from a damaged history. An
- * `integration` scope whose immutable linkage is missing is damaged and
- * reads as no coverage, never as inherited approval. */
-export function readPriorConvergenceMeta(file: string, seq: number): PriorConvergenceMeta | null {
+/** Parse one prior consolidated record from the EXACT bytes a reader
+ * obtained. Returns null when the record is not a complete whole-PR record —
+ * the caller then plans as if no prior existed (whole authority); it never
+ * guesses a scope from a damaged history. An `integration` scope whose
+ * immutable linkage is missing or inconsistent reads as damaged, never as
+ * inherited approval. */
+export function parsePriorConvergenceMeta(bytes: Buffer, seq: number): PriorConvergenceMeta | null {
   try {
-    const info = lstatSync(file);
-    if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_CONSOLIDATED_META_BYTES) return null;
-    const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
+    const parsed = JSON.parse(bytes.toString('utf8')) as {
       schemaVersion?: unknown;
       architecture?: unknown;
       canonicalVerdict?: unknown;
@@ -808,16 +867,27 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       return null;
     }
     const scope = parsed.convergence?.reviewScope;
-    if (scope === 'integration') {
-      const linkage = parsed.convergence!;
-      // Every immutable linkage field must be a full SHA, and the recorded
-      // incoming base must be exactly this record's own frozen diff base —
-      // a shape-valid but inconsistent linkage is damaged, never coverage.
-      for (const sha of [linkage.integrationFromSha, linkage.integrationBaseSha, linkage.integrationPriorDiffBase]) {
-        if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/u.test(sha)) return null;
-      }
-      if (linkage.integrationBaseSha !== parsed.frozen.diffBaseSha) return null;
+    // ONE shared full-linkage verdict: a recognized scope with missing,
+    // inconsistent or stray linkage is damaged, never coverage. An
+    // unrecognized scope keeps its tolerant 'unknown' read (pre-Stage-5
+    // records) but can never be credited whole-complete coverage.
+    if (scope === 'whole' || scope === 'delta' || scope === 'integration') {
+      const linkageCheck = validateRetainedReviewLinkage({
+        reviewScope: scope,
+        diffBaseSha: parsed.frozen.diffBaseSha,
+        integrationFromSha: parsed.convergence?.integrationFromSha,
+        integrationBaseSha: parsed.convergence?.integrationBaseSha,
+        integrationPriorDiffBase: parsed.convergence?.integrationPriorDiffBase,
+      });
+      if (!linkageCheck.ok) return null;
     }
+    const integration: RetainedIntegrationLinkage | null = scope === 'integration'
+      ? {
+          fromSha: parsed.convergence!.integrationFromSha as string,
+          baseSha: parsed.convergence!.integrationBaseSha as string,
+          priorDiffBase: parsed.convergence!.integrationPriorDiffBase as string,
+        }
+      : null;
     const rawAcceptance = parsed.frozen.acceptance as { version?: unknown; baseSha256?: unknown; contractSha256?: unknown; amendmentIds?: unknown } | null | undefined;
     // A PRESENT acceptance binding must be fully well-formed: a partial or
     // malformed one is damaged provenance, not an absent one, so it fails
@@ -868,10 +938,44 @@ export function readPriorConvergenceMeta(file: string, seq: number): PriorConver
       coverageComplete,
       legacyWhole,
       findings,
+      integration,
     };
   } catch {
     return null;
   }
+}
+
+/** One bounded read of a prior round's consolidated file: the parsed meta
+ * plus the sha256 of the EXACT bytes the meta was parsed from. The caller
+ * pins that digest into the engine, so the engine consumes only bytes that
+ * were authenticated together with their scope/coverage claims — a changed
+ * file refuses rather than silently substituting retained coverage. */
+export interface PriorConvergenceRead {
+  readonly meta: PriorConvergenceMeta | null;
+  readonly sha256: string | null;
+}
+
+export function readPriorConvergenceFile(file: string, seq: number): PriorConvergenceRead {
+  try {
+    const info = lstatSync(file);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_CONSOLIDATED_META_BYTES) return { meta: null, sha256: null };
+    const bytes = readFileSync(file);
+    // A bounded read that did not obtain exactly the statted file is not
+    // trustworthy enough to pin: fail closed without a digest.
+    if (bytes.byteLength !== info.size || bytes.byteLength > MAX_CONSOLIDATED_META_BYTES) return { meta: null, sha256: null };
+    return {
+      meta: parsePriorConvergenceMeta(bytes, seq),
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+  } catch {
+    return { meta: null, sha256: null };
+  }
+}
+
+/** Tolerant read of one prior round's consolidated record for scope
+ * planning: the parsed meta or null (see `parsePriorConvergenceMeta`). */
+export function readPriorConvergenceMeta(file: string, seq: number): PriorConvergenceMeta | null {
+  return readPriorConvergenceFile(file, seq).meta;
 }
 
 /** The ledger-native publication receipt for one prior round: the durable
@@ -889,6 +993,11 @@ export interface PriorNativeReceipt {
   /** Total retained finding count and exact digest of the native submission. */
   readonly retainedFindings?: unknown;
   readonly retainedFindingsSha256?: unknown;
+  /** The native submission's full integration linkage; required to corroborate
+   * an `integration` record's own linkage (all three or none). */
+  readonly integrationFromSha?: unknown;
+  readonly integrationBaseSha?: unknown;
+  readonly integrationPriorDiffBase?: unknown;
 }
 
 /** The prior round's accepted contract binding as recorded on the round's own
@@ -925,6 +1034,20 @@ export function authenticatePriorMeta(
   // A Stage-5 scope claim must be corroborated by the receipt; only a genuine
   // pre-Stage-5 record (no convergence block) may carry no receipt scope.
   if (receiptScope === undefined && !meta.legacyWhole) return null;
+  // Every required integration linkage field must be corroborated by the
+  // round's native receipt: an `integration` record is credited only when all
+  // three immutable linkage fields match the receipt exactly, and a
+  // non-integration record must carry none (a stray linkage field is damaged
+  // provenance, never coverage).
+  if (meta.reviewScope === 'integration') {
+    if (meta.integration === null ||
+      receipt.integrationFromSha !== meta.integration.fromSha ||
+      receipt.integrationBaseSha !== meta.integration.baseSha ||
+      receipt.integrationPriorDiffBase !== meta.integration.priorDiffBase) return null;
+  } else if (receipt.integrationFromSha !== undefined || receipt.integrationBaseSha !== undefined ||
+    receipt.integrationPriorDiffBase !== undefined) {
+    return null;
+  }
   // The retained findings must match the native submission exactly: a record
   // whose findings were swapped/emptied ("[]" over a genuine NEEDS CHANGES
   // review) can never be credited whole-complete coverage.
@@ -996,11 +1119,13 @@ export function planPerkinsReviewScope(input: {
     readonly finalWholePassAtReady: boolean;
     readonly integrationCoverage: boolean;
   };
-}): ReviewScopePlan {
+}): PerkinsReviewScopePlan {
   const priorFileProvided = input.priorConsolidatedFile !== undefined && input.priorSeq !== undefined;
-  const rawPrior = priorFileProvided
-    ? readPriorConvergenceMeta(input.priorConsolidatedFile!, input.priorSeq!)
-    : null;
+  const priorRead = priorFileProvided
+    ? readPriorConvergenceFile(input.priorConsolidatedFile!, input.priorSeq!)
+    : { meta: null, sha256: null };
+  const rawPrior = priorRead.meta;
+  const pin = priorRead.sha256 !== null ? { priorConsolidatedSha256: priorRead.sha256 } : {};
   // Distinguish "no prior round" from "a prior record that is not a
   // conclusive whole-PR record": the latter must be disclosed, not mislabelled
   // as the job's first review.
@@ -1009,6 +1134,7 @@ export function planPerkinsReviewScope(input: {
       scope: 'whole',
       reason: 'a prior review record exists but is not a conclusive whole-PR record — whole-change re-verification',
       priorCoverageComplete: false,
+      ...pin,
     };
   }
   const prior = authenticatePriorMeta(rawPrior, input.nativeReceipt ?? null);
@@ -1017,6 +1143,7 @@ export function planPerkinsReviewScope(input: {
       scope: 'whole',
       reason: 'the prior record\'s scope/coverage could not be authenticated against its native ledger receipt — whole-change re-verification',
       priorCoverageComplete: false,
+      ...pin,
     };
   }
   // The record's acceptance must equal its own round's ledger-native freeze
@@ -1050,5 +1177,5 @@ export function planPerkinsReviewScope(input: {
   });
   // A record whose own acceptance is not corroborated by its round's native
   // freeze binding can never carry retained coverage into the engine.
-  return acceptanceAuthenticated ? plan : { ...plan, priorCoverageComplete: false };
+  return acceptanceAuthenticated ? { ...plan, ...pin } : { ...plan, priorCoverageComplete: false, ...pin };
 }

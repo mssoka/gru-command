@@ -31,7 +31,7 @@ import type { CanonicalReviewVerdict, VerifiedFinding } from './perkins-review/t
 import { PerkinsWholeReview, verifiedSpecialistCheckpointResults, type PerkinsWholeResult, type RoundBudgetRefusal } from './perkins-review/whole.js';
 import { publicRecoveryModelIdentity } from '../runtime/review-model-identity.js';
 import { loadPerkinsPolicy, type PerkinsLens, type PerkinsPolicy } from './perkins-review/policy.js';
-import { planPerkinsReviewScope, type PriorAcceptanceBinding, type PriorNativeReceipt } from './perkins-review/convergence.js';
+import { planPerkinsReviewScope, validateRetainedReviewLinkage, type PriorAcceptanceBinding, type PriorNativeReceipt } from './perkins-review/convergence.js';
 import {
   freezeReviewInputs,
   compatibleReviewIdentity,
@@ -557,8 +557,11 @@ export interface PostedReviewState {
   readonly blockers?: number;
   readonly retainedFindings?: number;
   readonly retainedFindingsSha256?: string;
+  /** The round's full immutable integration linkage (all three together for
+   * an integration claim, none otherwise). */
   readonly integrationFromSha?: string;
   readonly integrationBaseSha?: string;
+  readonly integrationPriorDiffBase?: string;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -605,6 +608,10 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
   const commitId = receipt['commitId'];
   if (commitId !== null && !nonEmptyString(commitId)) return null;
   const parsedReview = parsePostedReviewState(value['review']);
+  // A PRESENT-but-damaged review block is not an absent historical one: the
+  // whole event refuses to parse (it can never be promoted or trusted), while
+  // an absent block keeps its documented fallback to the preserved record.
+  if (parsedReview.kind === 'damaged') return null;
   return {
     verdict,
     canonicalVerdict: canonicalVerdict as CanonicalReviewVerdict,
@@ -615,7 +622,7 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
     publicationFile,
     publicationSha256,
     reconciled,
-    ...(parsedReview !== null ? { review: parsedReview } : {}),
+    ...(parsedReview.kind === 'valid' ? { review: parsedReview.state } : {}),
     receipt: {
       reviewId: receipt['reviewId'], actor: receipt['actor'], event: receipt['event'],
       commitId: commitId as string | null, headSha: receipt['headSha'], baseSha: receipt['baseSha'],
@@ -624,43 +631,64 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
   };
 }
 
-/** Strict, throw-free parse of the optional posted `review` block. A malformed
- * block is treated as ABSENT (recovery then falls back to the preserved
- * consolidated record and fails closed when that is unusable). */
-function parsePostedReviewState(value: unknown): PostedReviewState | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+/** The tri-state verdict on the OPTIONAL posted `review` block: absent (a
+ * historical round without one — recovery may fall back to the preserved
+ * consolidated record), damaged (the block EXISTS but is not a coherent,
+ * fully-linked state — the event is refused), or valid. */
+type PostedReviewStateParse =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'damaged' }
+  | { readonly kind: 'valid'; readonly state: PostedReviewState };
+
+/** Strict, throw-free parse of the optional posted `review` block. A present
+ * block must be complete and self-consistent: scope, coverage/debt booleans,
+ * the frozen diff base, the retained-finding identity AND — for an
+ * integration claim — the FULL immutable linkage validated by the SAME
+ * shared validator the scope planner and recovery readers use. A block
+ * failing any of that is DAMAGED, never silently treated as absent. */
+function parsePostedReviewState(value: unknown): PostedReviewStateParse {
+  if (value === undefined) return { kind: 'absent' };
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { kind: 'damaged' };
   const review = value as Record<string, unknown>;
   const scope = review['reviewScope'];
-  if (scope !== 'whole' && scope !== 'delta' && scope !== 'integration') return null;
-  if (typeof review['coverageComplete'] !== 'boolean' || typeof review['finalPassRequired'] !== 'boolean') return null;
+  if (scope !== 'whole' && scope !== 'delta' && scope !== 'integration') return { kind: 'damaged' };
+  if (typeof review['coverageComplete'] !== 'boolean' || typeof review['finalPassRequired'] !== 'boolean') return { kind: 'damaged' };
   const diffBaseSha = review['diffBaseSha'];
-  if (typeof diffBaseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(diffBaseSha)) return null;
+  if (typeof diffBaseSha !== 'string' || !/^[0-9a-f]{40}$/u.test(diffBaseSha)) return { kind: 'damaged' };
   const blockers = review['blockers'];
   const retainedFindings = review['retainedFindings'];
   const retainedFindingsSha256 = review['retainedFindingsSha256'];
-  if (!Number.isSafeInteger(blockers) || (blockers as number) < 0) return null;
-  if (!Number.isSafeInteger(retainedFindings) || (retainedFindings as number) < 0) return null;
-  if (typeof retainedFindingsSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(retainedFindingsSha256)) return null;
+  if (!Number.isSafeInteger(blockers) || (blockers as number) < 0) return { kind: 'damaged' };
+  if (!Number.isSafeInteger(retainedFindings) || (retainedFindings as number) < 0) return { kind: 'damaged' };
+  if (typeof retainedFindingsSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(retainedFindingsSha256)) return { kind: 'damaged' };
   const from = review['integrationFromSha'];
   const base = review['integrationBaseSha'];
-  // An integration claim must carry its full linkage; a whole/delta claim
-  // must not carry a partial one.
-  if (scope === 'integration') {
-    if (typeof from !== 'string' || !/^[0-9a-f]{40}$/u.test(from)) return null;
-    if (typeof base !== 'string' || !/^[0-9a-f]{40}$/u.test(base)) return null;
-  } else if (from !== undefined || base !== undefined) {
-    return null;
-  }
-  return {
+  const priorDiffBase = review['integrationPriorDiffBase'];
+  // ONE shared full-linkage verdict: an integration claim must carry all
+  // three linkage fields with its incoming base equal to its own frozen diff
+  // base; a whole/delta claim must carry none.
+  const linkage = validateRetainedReviewLinkage({
     reviewScope: scope,
-    coverageComplete: review['coverageComplete'],
-    finalPassRequired: review['finalPassRequired'],
     diffBaseSha,
-    blockers: blockers as number,
-    retainedFindings: retainedFindings as number,
-    retainedFindingsSha256,
-    ...(typeof from === 'string' ? { integrationFromSha: from } : {}),
-    ...(typeof base === 'string' ? { integrationBaseSha: base } : {}),
+    integrationFromSha: from,
+    integrationBaseSha: base,
+    integrationPriorDiffBase: priorDiffBase,
+  });
+  if (!linkage.ok) return { kind: 'damaged' };
+  return {
+    kind: 'valid',
+    state: {
+      reviewScope: scope,
+      coverageComplete: review['coverageComplete'],
+      finalPassRequired: review['finalPassRequired'],
+      diffBaseSha,
+      blockers: blockers as number,
+      retainedFindings: retainedFindings as number,
+      retainedFindingsSha256,
+      ...(typeof from === 'string' ? { integrationFromSha: from } : {}),
+      ...(typeof base === 'string' ? { integrationBaseSha: base } : {}),
+      ...(typeof priorDiffBase === 'string' ? { integrationPriorDiffBase: priorDiffBase } : {}),
+    },
   };
 }
 
@@ -4899,19 +4927,21 @@ export class WaveRunner {
 
     let review: PerkinsWholeResult;
     try {
-      // The NEWEST completed predecessor is the required prior record: a
-      // missing or corrupt consolidated file for it fails loudly instead of
-      // silently presenting an older past as the whole history. A
-      // restart-PROMOTED round (round.post-recovered, no round.perkins-review)
-      // is just as conclusive and must never be skipped for an older whole
-      // record: its own posted review state and blockers are accounted for.
+      // The NEWEST conclusive predecessor, selected INDEPENDENTLY of its
+      // annotations: normal finalization commits `verdict-posted` before
+      // `round.perkins-review`, and restart promotion commits it before
+      // `round.post-recovered`, so a crash in either window leaves a
+      // delivered, terminal round carrying neither marker. Its posted receipt
+      // (persisted BEFORE delivery) authenticates it below; when that evidence
+      // is unusable the plan reviews whole with a durable reason rather than
+      // jumping to older coverage. A missing or corrupt consolidated file for
+      // the selected round fails loudly instead of silently presenting an
+      // older past as the whole history.
       let priorConsolidatedFile: string | undefined;
       const newestPredecessor = this.opts.ledger
         .listRounds(job.id)
         .filter((candidate) =>
-          candidate.seq < round.seq && candidate.status === 'verdict-posted' && candidate.verdict !== null &&
-          (this.opts.ledger.latestRoundEvent(candidate.id, 'round.perkins-review') !== null ||
-            this.opts.ledger.latestRoundEvent(candidate.id, 'round.post-recovered') !== null),
+          candidate.seq < round.seq && candidate.status === 'verdict-posted' && candidate.verdict !== null,
         )
         .sort((left, right) => right.seq - left.seq)[0];
       if (newestPredecessor !== undefined) {
@@ -5074,6 +5104,7 @@ export class WaveRunner {
         signal,
         ...(recoveredBaseTips.length > 0 && candidates.length > 0 ? { recoveredBaseTips } : {}),
         ...(priorConsolidatedFile !== undefined ? { priorConsolidatedFile } : {}),
+        ...(scopePlan.priorConsolidatedSha256 !== undefined ? { priorConsolidatedSha256: scopePlan.priorConsolidatedSha256 } : {}),
         reviewScope: scopePlan.scope,
         reviewScopeReason: scopePlan.reason,
         priorCoverageComplete: scopePlan.priorCoverageComplete,
@@ -5282,6 +5313,7 @@ export class WaveRunner {
                 retainedFindingsSha256: createHash('sha256').update(JSON.stringify(review.findings)).digest('hex'),
                 ...(review.convergence.integrationFromSha !== undefined ? { integrationFromSha: review.convergence.integrationFromSha } : {}),
                 ...(review.convergence.integrationBaseSha !== undefined ? { integrationBaseSha: review.convergence.integrationBaseSha } : {}),
+                ...(review.convergence.integrationPriorDiffBase !== undefined ? { integrationPriorDiffBase: review.convergence.integrationPriorDiffBase } : {}),
               },
             } : {}),
         };
@@ -6054,7 +6086,10 @@ export class WaveRunner {
    * record, authenticated to the posted head. Returns null when the record is
    * absent, unreadable, malformed or bound to a different head — recovery then
    * refuses to promote rather than assume no debt. A legacy record with no
-   * convergence block was a whole review and carries no debt. */
+   * convergence block was a whole review and carries no debt. A recognized
+   * scope whose full linkage is missing or inconsistent (the SAME shared
+   * validator the planner and posted parser use) is DAMAGED state, never a
+   * debt-free promotion. */
   private readPostedReviewState(roundId: string, headSha: string): PostedReviewState | null {
     const consolidated = join(reviewArtifactDirectory(this.artifactRoot(), roundId), 'consolidated.json');
     try {
@@ -6065,7 +6100,7 @@ export class WaveRunner {
         schemaVersion?: unknown;
         frozen?: { targetSha?: unknown; diffBaseSha?: unknown };
         findings?: unknown;
-        convergence?: { reviewScope?: unknown; coverageComplete?: unknown; finalPassRequired?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown };
+        convergence?: { reviewScope?: unknown; coverageComplete?: unknown; finalPassRequired?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
       };
       if (parsed.architecture !== 'perkins-whole-pr' || parsed.schemaVersion !== 3 || parsed.frozen?.targetSha !== headSha) return null;
       // A legacy record with no convergence block WAS a whole review: it
@@ -6073,25 +6108,35 @@ export class WaveRunner {
       if (parsed.convergence === undefined) {
         return { reviewScope: 'whole', coverageComplete: true, finalPassRequired: false };
       }
-      // Present-but-unrecognized scope is DAMAGED, never "unknown/debt-free":
-      // an empty or malformed convergence block cannot authorize promotion.
-      const scope = parsed.convergence.reviewScope;
-      if (scope !== 'whole' && scope !== 'delta' && scope !== 'integration') return null;
-      const from = parsed.convergence.integrationFromSha;
-      const base = parsed.convergence.integrationBaseSha;
-      // An integration claim must carry valid, self-consistent linkage.
-      if (scope === 'integration') {
-        if (typeof from !== 'string' || !/^[0-9a-f]{40}$/u.test(from)) return null;
-        if (typeof base !== 'string' || !/^[0-9a-f]{40}$/u.test(base)) return null;
-        if (typeof parsed.frozen.diffBaseSha !== 'string' || base !== parsed.frozen.diffBaseSha) return null;
-      }
+      const convergence = parsed.convergence;
+      // A present-but-mistyped coverage/debt field is damaged state, never a
+      // coerced 'no debt': the writer emits booleans or nothing.
+      if (convergence.coverageComplete !== undefined && typeof convergence.coverageComplete !== 'boolean') return null;
+      if (convergence.finalPassRequired !== undefined && typeof convergence.finalPassRequired !== 'boolean') return null;
+      const from = convergence.integrationFromSha;
+      const base = convergence.integrationBaseSha;
+      const priorDiffBase = convergence.integrationPriorDiffBase;
+      // ONE shared full-linkage verdict: a recognized integration claim must
+      // carry all three linkage fields with its incoming base equal to its
+      // own frozen diff base; whole/delta claims must carry none; an empty or
+      // unrecognized scope is never debt-free 'unknown'.
+      const linkage = validateRetainedReviewLinkage({
+        reviewScope: convergence.reviewScope,
+        diffBaseSha: parsed.frozen.diffBaseSha,
+        integrationFromSha: from,
+        integrationBaseSha: base,
+        integrationPriorDiffBase: priorDiffBase,
+      });
+      if (!linkage.ok) return null;
+      const scope = convergence.reviewScope as 'whole' | 'delta' | 'integration';
       return {
         reviewScope: scope,
-        coverageComplete: parsed.convergence.coverageComplete === true || scope === 'whole',
-        finalPassRequired: parsed.convergence.finalPassRequired === true,
+        coverageComplete: convergence.coverageComplete === true || scope === 'whole',
+        finalPassRequired: convergence.finalPassRequired === true,
         ...(typeof parsed.frozen.diffBaseSha === 'string' ? { diffBaseSha: parsed.frozen.diffBaseSha } : {}),
         ...(typeof from === 'string' ? { integrationFromSha: from } : {}),
         ...(typeof base === 'string' ? { integrationBaseSha: base } : {}),
+        ...(typeof priorDiffBase === 'string' ? { integrationPriorDiffBase: priorDiffBase } : {}),
       };
     } catch {
       return null;
@@ -6111,9 +6156,12 @@ export class WaveRunner {
     // A restart-PROMOTED round has no round.perkins-review event; its
     // scope/coverage/debt and retained-finding identity were persisted with
     // the posted event BEFORE delivery and are the authoritative receipt.
+    // The posted evidence is used only when it is bound to THIS round's own
+    // frozen target; anything else is an unusable receipt (the caller then
+    // reviews whole, never inherits from it).
     const postedEvent = this.opts.ledger.latestRoundEvent(round.id, 'round.posted');
     const posted = postedEvent === null ? null : parsePostedEventPayload(postedEvent.payload);
-    const postedReview = posted?.review;
+    const postedReview = posted !== null && posted.targetSha === round.targetRef ? posted.review : undefined;
     const debtMarker = this.opts.ledger.latestRoundEvent(round.id, 'round.final-pass-required') !== null;
     const frozenEvent = this.opts.ledger.latestRoundEvent(round.id, 'round.review-inputs-frozen');
     const frozenPayload = typeof frozenEvent?.payload === 'object' && frozenEvent.payload !== null
@@ -6145,6 +6193,9 @@ export class WaveRunner {
         blockers: payload['blockers'] ?? postedReview?.blockers,
         retainedFindings: payload['retainedFindings'] ?? postedReview?.retainedFindings,
         retainedFindingsSha256: payload['retainedFindingsSha256'] ?? postedReview?.retainedFindingsSha256,
+        integrationFromSha: payload['integrationFromSha'] ?? postedReview?.integrationFromSha,
+        integrationBaseSha: payload['integrationBaseSha'] ?? postedReview?.integrationBaseSha,
+        integrationPriorDiffBase: payload['integrationPriorDiffBase'] ?? postedReview?.integrationPriorDiffBase,
       },
       acceptance,
     };

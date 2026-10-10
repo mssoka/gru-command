@@ -7,7 +7,7 @@ import type { AgentHandle, NativeAgentTool, PromptOptions } from '../../runtime/
 import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPolicy } from '../../runtime/pacing.js';
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
 import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
-import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, integrationSince, probeIntegrationLineage, readPriorConvergenceMeta, type DeltaSince, type PriorCarryClassification } from './convergence.js';
+import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, integrationSince, parsePriorConvergenceMeta, probeIntegrationLineage, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -162,6 +162,11 @@ export interface RunWholeReviewInput {
   readonly movementRef: string;
   readonly noSpec: boolean;
   readonly priorConsolidatedFile?: string;
+  /** sha256 of the exact prior-record bytes the production scope planner
+   * authenticated. When present, the engine consumes ONLY bytes that hash to
+   * this pin: a file changed between planning and consumption refuses before
+   * any coverage credit instead of silently substituting prior coverage. */
+  readonly priorConsolidatedSha256?: string;
   /** Authenticated predecessor base tips when a compatible base-only fast-forward
    * occurred. The fresh lead must judge the current base, not inherited work. */
   readonly recoveredBaseTips?: readonly string[];
@@ -762,14 +767,36 @@ interface PriorReview {
 
 /** Load the prior round's consolidated record. schemaVersion 2 is the retired
  * chunk-protocol shape (read-only compatibility; its `chunks` field is
- * tolerated and ignored); schemaVersion 3 is the whole-PR shape. */
-function loadPriorReview(file: string | undefined): PriorReview {
-  if (file === undefined) return { findings: [], targetSha: null, diffBaseSha: null, validLenses: [], reviewScope: 'unknown', coverageComplete: false };
+ * tolerated and ignored); schemaVersion 3 is the whole-PR shape. When the
+ * production planner pinned the record's exact bytes, ONLY bytes matching
+ * that pin are consumed: a changed file refuses BEFORE any coverage credit
+ * (the authenticated scope can never be silently replaced by different
+ * findings), and the meta used for coverage is parsed from those same bytes
+ * rather than re-read from the mutable path. */
+function loadPriorReview(file: string | undefined, expectedSha256: string | undefined): PriorReview {
+  if (file === undefined) {
+    if (expectedSha256 !== undefined) {
+      throw new Error('internal: a pinned prior review was requested without a prior record path');
+    }
+    return { findings: [], targetSha: null, diffBaseSha: null, validLenses: [], reviewScope: 'unknown', coverageComplete: false };
+  }
   const size = statSync(file).size;
   if (size > 8 * 1024 * 1024) throw new Error('prior consolidated review exceeds 8 MiB');
   const bytes = readFileSync(file);
   if (bytes.byteLength !== size || bytes.byteLength > 8 * 1024 * 1024) {
     throw new Error('prior consolidated review changed while bounded bytes were read');
+  }
+  if (expectedSha256 !== undefined) {
+    if (!/^[a-f0-9]{64}$/u.test(expectedSha256)) {
+      throw new Error('internal: the authenticated prior review pin is malformed');
+    }
+    const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(
+        `the authenticated prior review record changed between scope planning and engine consumption ` +
+        `(pinned sha256 ${expectedSha256}, found ${actualSha256}) — refusing to credit retained coverage`,
+      );
+    }
   }
   const parsed = JSON.parse(bytes.toString('utf8')) as {
     schemaVersion?: unknown; findings?: unknown;
@@ -830,14 +857,15 @@ function loadPriorReview(file: string | undefined): PriorReview {
       }
     }
   }
-  const priorMeta = readPriorConvergenceMeta(file, 0);
+  const priorMeta = parsePriorConvergenceMeta(bytes, 0);
   return {
     findings,
     targetSha: parsed.frozen.targetSha,
     diffBaseSha: typeof parsed.frozen.diffBaseSha === 'string' ? parsed.frozen.diffBaseSha : null,
     validLenses,
     // One shared reader owns the linkage/coverage rules for both the scope
-    // planner and the engine, so they can never diverge.
+    // planner and the engine, so they can never diverge — and it parses the
+    // SAME pinned bytes the digest above verified.
     reviewScope: priorMeta?.reviewScope ?? 'unknown',
     coverageComplete: priorMeta?.coverageComplete ?? false,
   };
@@ -1132,7 +1160,7 @@ export class PerkinsWholeReview {
     const catalog = input.noSpec
       ? this.policy.portableContract.rules.noSpecLenses
       : this.policy.portableContract.rules.fullLenses;
-    const priorReview = loadPriorReview(input.priorConsolidatedFile);
+    const priorReview = loadPriorReview(input.priorConsolidatedFile, input.priorConsolidatedSha256);
     const prior = priorReview.findings;
     // Stage-5 convergence plan (issue #225): the round's review scope and,
     // for a delta round, the deterministic carry-forward classification of
@@ -3019,6 +3047,12 @@ export class PerkinsWholeReview {
     const evidenceSection = renderEvidencePromptSection(review.evidence.attachments, review.manifest.targetSha);
     const deltaRound = plan.reviewScope === 'delta' && priorTargetSha !== null;
     const integrationRound = plan.reviewScope === 'integration' && priorTargetSha !== null;
+    // The EFFECTIVE whole-candidate coverage of this integration round: the
+    // retained bit must hold AND no resolution may have discarded reviewed
+    // feature work (the same condition the engine's coversWhole uses). The
+    // prompt must never claim READY binds the head while a whole pass is owed.
+    const droppedPaths = plan.integrationDroppedPaths ?? [];
+    const effectiveCoverage = plan.priorCoverageComplete === true && droppedPaths.length === 0;
     // An incremental (delta OR integration) round lists only the priors the
     // lead must disposition; host-carried priors are listed separately
     // (accounting, never disposition).
@@ -3040,7 +3074,7 @@ export class PerkinsWholeReview {
       ].join('\n')
       : '';
     const scopeHeader = integrationRound
-      ? `REVIEW SCOPE: INTEGRATION ROUND — the reviewed feature head ${priorTargetSha} was integrated with an advanced base (new frozen diff base ${review.manifest.diffBaseSha}); the host retains the prior review of the unchanged feature work where its evidence still holds. The review unit is the new integration/conflict-resolution work since the prior covered candidate (below); unchanged incoming base code is baseline context, NOT new PR work. The complete frozen diff above stays your review context — judge the interactions across this boundary. The delta convergence rule does NOT apply in an integration round: a finding the integration introduced holds the PR wherever its evidence lies. ${plan.priorCoverageComplete === true ? 'The retained coverage is whole-complete: a READY here binds the current head.' : 'The retained coverage is only partial: a READY here still owes the final whole-change pass.'}`
+      ? `REVIEW SCOPE: INTEGRATION ROUND — the reviewed feature head ${priorTargetSha} was integrated with an advanced base (new frozen diff base ${review.manifest.diffBaseSha}); the host retains the prior review of the unchanged feature work where its evidence still holds. The review unit is the new integration/conflict-resolution work since the prior covered candidate (below); unchanged incoming base code is baseline context, NOT new PR work. The complete frozen diff above stays your review context — judge the interactions across this boundary. The delta convergence rule does NOT apply in an integration round: a finding the integration introduced holds the PR wherever its evidence lies. ${effectiveCoverage ? 'The retained coverage is whole-complete: a READY here binds the current head.' : droppedPaths.length > 0 ? `The retained coverage cannot certify the whole candidate: ${droppedPaths.length} previously reviewed feature change(s) no longer differ from the incoming base, so a READY here still owes the final whole-change pass.` : 'The retained coverage is only partial: a READY here still owes the final whole-change pass.'}`
       : deltaRound
         ? `REVIEW SCOPE: DELTA ROUND — the review unit is the delta since the last reviewed SHA (${priorTargetSha}..${review.manifest.targetSha}). Prior lens results stand for lenses with no open findings and no relevance to this delta; run a lens only where the delta or an open finding needs its fresh view.`
         : priorTargetSha !== null
@@ -3060,6 +3094,9 @@ export class PerkinsWholeReview {
         `Incoming base (this round's frozen diff base): ${plan.integrationBaseSha ?? review.manifest.diffBaseSha}`,
         `Unit paths (${plan.delta.touchedPaths.size}): ${[...plan.delta.touchedPaths].sort().join(', ') || 'none'}`,
         'This unit is exactly the part of the new whole diff (`base..target`) whose per-path content differs from the prior covered round: unchanged feature work (identical per-path diff) and incoming-base-only files (absent from the new whole diff) are NOT in it, while manual conflict resolutions, new feature edits and files BOTH sides changed ARE. The complete frozen diff above is still your review context; use it to judge the integration boundary. The delta convergence rule does NOT apply — any finding you ground can hold the PR wherever its evidence lies.',
+        ...(droppedPaths.length > 0
+          ? [`Discarded reviewed feature change(s) (${droppedPaths.length}): ${droppedPaths.join(', ')} — the resolution no longer carries these prior reviewed changes, so the whole-change pass is still owed and a READY here cannot bind the head.`]
+          : []),
         plan.delta.diff === '' ? ((plan.integrationDroppedPaths?.length ?? 0) > 0
           ? `(the integration unit is empty, but ${plan.integrationDroppedPaths!.length} prior feature change(s) no longer differ from the incoming base — a resolution discarded reviewed work, so the whole-change pass is still owed)`
           : '(the integration unit is empty: no candidate change differs from the prior frozen diff, so the retained coverage stands)') : plan.delta.diff,

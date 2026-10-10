@@ -1,4 +1,4 @@
-import { readFileSync, rmSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -65,7 +65,7 @@ function freeze(harness: IntegrationHarness, roundId: string, target: string): F
 
 function runRound(
   harness: IntegrationHarness,
-  input: { roundId: string; roundNumber: number; frozen: FrozenReview; reviewScope?: 'whole' | 'delta' | 'integration'; priorConsolidatedFile?: string },
+  input: { roundId: string; roundNumber: number; frozen: FrozenReview; reviewScope?: 'whole' | 'delta' | 'integration'; priorConsolidatedFile?: string; priorConsolidatedSha256?: string },
 ): Promise<PerkinsWholeResult> {
   return harness.engine.run({
     roundId: input.roundId,
@@ -75,6 +75,7 @@ function runRound(
     noSpec: false,
     ...(input.reviewScope !== undefined ? { reviewScope: input.reviewScope } : {}),
     ...(input.priorConsolidatedFile !== undefined ? { priorConsolidatedFile: input.priorConsolidatedFile } : {}),
+    ...(input.priorConsolidatedSha256 !== undefined ? { priorConsolidatedSha256: input.priorConsolidatedSha256 } : {}),
   });
 }
 
@@ -325,6 +326,66 @@ describe('native integration review retains prior coverage', () => {
     expect(round3.convergence).toMatchObject({ reviewScope: 'integration', finalPassRequired: true });
   });
 
+  it('refuses a predecessor record mutated between the authenticated scope plan and engine consumption', async () => {
+    const harness = makeEngine({
+      childAnswer: () => '[]',
+      specialists: [],
+      leadFinding: groundedFinding('lead', 'warning', { title: 'round1 retained warning', location: 'src/feature.ts:1', evidence: 'export const feature = 1;' }),
+    });
+    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+
+    // Round 1: a whole review with a retained finding and whole-complete coverage.
+    const frozen1 = freeze(harness, 'mut-round-1', h0);
+    const round1 = await runRound(harness, { roundId: 'mut-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    expect(round1.convergence?.coverageComplete).toBe(true);
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'mut-round-1'), 'consolidated.json');
+    const record1 = JSON.parse(readFileSync(consolidated1, 'utf8')) as { findings: unknown[] };
+    const retainedFindingsSha256 = createHash('sha256').update(JSON.stringify(record1.findings)).digest('hex');
+    const authenticatedBytes = readFileSync(consolidated1);
+
+    const { b1, h1 } = integrateClean(harness.repo);
+    // Separate frozen rounds: each engine run owns its own write-once artifact
+    // directory (the production shape: one round id per frozen review).
+    const frozenControl = freeze(harness, 'mut-round-2-control', h1);
+    const frozenMutated = freeze(harness, 'mut-round-2-mutated', h1);
+
+    // The production planner authenticates the prior record against its native
+    // receipt and pins the exact bytes it consumed.
+    const plan = planPerkinsReviewScope({
+      priorConsolidatedFile: consolidated1, priorSeq: 1, repoPath: harness.repo.path,
+      currentTargetSha: h1, currentDiffBaseSha: b1, currentAcceptance: undefined,
+      nativeReceipt: {
+        targetSha: h0, diffBaseSha: b0, reviewScope: 'whole', coverageComplete: true,
+        blockers: 0, retainedFindings: record1.findings.length, retainedFindingsSha256,
+      },
+      rules: { deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true },
+    });
+    expect(plan.scope).toBe('integration');
+    expect(plan.priorCoverageComplete).toBe(true);
+
+    // Control: the intact pinned bytes are consumed and the prior is carried.
+    const control = await runRound(harness, {
+      roundId: 'mut-round-2-control', roundNumber: 2, frozen: frozenControl,
+      reviewScope: plan.scope, priorConsolidatedFile: consolidated1, priorConsolidatedSha256: plan.priorConsolidatedSha256,
+    });
+    expect(control.convergence?.reviewScope).toBe('integration');
+    expect(control.convergence?.carriedPriors).toEqual([0]);
+
+    // The mutation: a schema-valid empty-findings replacement keeps the frozen
+    // identity but is NOT the authenticated record. The engine must refuse it
+    // before crediting any coverage, and must never run a review on it.
+    const mutated = JSON.parse(readFileSync(consolidated1, 'utf8')) as Record<string, unknown>;
+    writeFileSync(consolidated1, JSON.stringify({ ...mutated, findings: [] }));
+    await expect(runRound(harness, {
+      roundId: 'mut-round-2-mutated', roundNumber: 2, frozen: frozenMutated,
+      reviewScope: plan.scope, priorConsolidatedFile: consolidated1, priorConsolidatedSha256: plan.priorConsolidatedSha256,
+    })).rejects.toThrow(/changed between scope planning and engine consumption/);
+    expect(existsSync(join(reviewArtifactDirectory(harness.root, 'mut-round-2-mutated'), 'consolidated.json'))).toBe(false);
+    // The plan pinned the exact authenticated bytes — the reason the engine
+    // can refuse the later replacement at all.
+    expect(plan.priorConsolidatedSha256).toBe(createHash('sha256').update(authenticatedBytes).digest('hex'));
+  });
+
   it('discloses a whole fallback with no stale unit when the integration artifact cannot be written', async () => {
     const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
     const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
@@ -443,16 +504,34 @@ describe('native integration review retains prior coverage', () => {
     expect(round3.convergence?.finalPassRequired).toBeUndefined();
     expect(b0).toMatch(/^[0-9a-f]{40}$/u);
 
-    // The production planner also accepts the persisted same-head linkage.
+    // The production planner also accepts the persisted same-head linkage; a
+    // receipt without the full linkage can no longer authenticate it.
     const c2sha = harness.repo.git(['rev-parse', c2]);
+    const consolidated2Bytes = readFileSync(consolidated2);
     const plan = planPerkinsReviewScope({
+      priorConsolidatedFile: consolidated2, priorSeq: 2, repoPath: harness.repo.path,
+      currentTargetSha: h0, currentDiffBaseSha: c2sha, currentAcceptance: undefined,
+      nativeReceipt: {
+        targetSha: h0, diffBaseSha: harness.repo.git(['rev-parse', c1]), reviewScope: 'integration', coverageComplete: true,
+        integrationFromSha: h0, integrationBaseSha: harness.repo.git(['rev-parse', c1]), integrationPriorDiffBase: b0,
+      },
+      rules: { deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true },
+    });
+    expect(plan.scope).toBe('integration');
+    expect(plan.priorCoverageComplete).toBe(true);
+    // The plan pins the EXACT predecessor bytes the engine must consume.
+    expect(plan.priorConsolidatedSha256).toBe(createHash('sha256').update(consolidated2Bytes).digest('hex'));
+
+    // A receipt missing the integration linkage never authenticates the
+    // record: no retained coverage and a disclosed whole fallback.
+    const unlinked = planPerkinsReviewScope({
       priorConsolidatedFile: consolidated2, priorSeq: 2, repoPath: harness.repo.path,
       currentTargetSha: h0, currentDiffBaseSha: c2sha, currentAcceptance: undefined,
       nativeReceipt: { targetSha: h0, diffBaseSha: harness.repo.git(['rev-parse', c1]), reviewScope: 'integration', coverageComplete: true },
       rules: { deltaRoundsFrom: 2, finalWholePassAtReady: true, integrationCoverage: true },
     });
-    expect(plan.scope).toBe('integration');
-    expect(plan.priorCoverageComplete).toBe(true);
+    expect(unlinked.scope).toBe('whole');
+    expect(unlinked.priorCoverageComplete).toBe(false);
   });
 
   it('gives the specialist lenses the integration unit in their prompt', async () => {    const harness = makeEngine({ childAnswer: () => '[]', specialists: ['blind'] });
@@ -503,5 +582,10 @@ describe('native integration review retains prior coverage', () => {
     const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
     expect(prompt).toContain('no longer differ from the incoming base');
     expect(prompt).not.toContain('the integration was clean');
+    // The prompt must not claim READY binds the head while the dropped prior
+    // reviewed work still owes the whole-change pass; it discloses both.
+    expect(prompt).not.toContain('The retained coverage is whole-complete: a READY here binds the current head');
+    expect(prompt).toContain('a READY here still owes the final whole-change pass');
+    expect(prompt).toContain('Discarded reviewed feature change(s) (1): src/shared.ts');
   });
 });

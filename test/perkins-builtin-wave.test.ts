@@ -3338,7 +3338,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     writeFileSync(join(directory, 'consolidated.json'), JSON.stringify({
       schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
       complete: true, headMoved: false, frozen: { targetSha: target, diffBaseSha: 'c'.repeat(40) },
-      convergence: { reviewScope: 'integration', finalPassRequired: true, integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40) },
+      convergence: { reviewScope: 'integration', finalPassRequired: true, integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40), integrationPriorDiffBase: 'e'.repeat(40) },
     }));
     // The crash window: the posted event exists, the marker never landed.
     ledger.appendCustomEvent({
@@ -3431,7 +3431,7 @@ describe('WaveRunner built-in Perkins production path', () => {
     writeFileSync(join(partial.directory, 'consolidated.json'), JSON.stringify({
       schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
       complete: true, headMoved: false, frozen: { targetSha: partial.round.targetRef, diffBaseSha: 'c'.repeat(40) },
-      convergence: { reviewScope: 'integration', coverageComplete: false, integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40) },
+      convergence: { reviewScope: 'integration', coverageComplete: false, integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40), integrationPriorDiffBase: 'e'.repeat(40) },
     }));
     partial.ledger.appendCustomEvent({
       kind: 'round.posted', jobId: partial.jobId, roundId: partial.round.id,
@@ -3508,6 +3508,45 @@ describe('WaveRunner built-in Perkins production path', () => {
       complete: true, headMoved: false, frozen: { targetSha: target, diffBaseSha: 'c'.repeat(40) },
       convergence: { reviewScope: 'integration', coverageComplete: false, finalPassRequired: false },
     }), '9010');
+    // A WHOLE-COMPLETE integration state missing its prior-base linkage is
+    // damaged: it can never become a debt-free promotion (the R4 regression).
+    await refuseDamaged('refuse-missing-prior-base', (target) => ({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: target, diffBaseSha: 'c'.repeat(40) },
+      convergence: {
+        reviewScope: 'integration', coverageComplete: true, finalPassRequired: false,
+        integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40),
+      },
+    }), '9013');
+
+    // (f) An INCONSISTENT posted integration base (incoming base differs from
+    // the block's own frozen diff base) is DAMAGED posted state: the event is
+    // refused, never silently treated as absent and promoted from it.
+    const inconsistent = build('refuse-inconsistent-posted');
+    inconsistent.ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: inconsistent.jobId, roundId: inconsistent.round.id,
+      payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: inconsistent.prUrl, host: 'example.invalid',
+        targetSha: inconsistent.round.targetRef, baseSha: 'b'.repeat(40), publicationFile: inconsistent.publicationFile,
+        publicationSha256: inconsistent.publicationSha256, reconciled: false,
+        receipt: { reviewId: '9014', actor: 'gru-bot', event: 'COMMENTED', commitId: inconsistent.round.targetRef, headSha: inconsistent.round.targetRef, baseSha: 'b'.repeat(40), bodySha256: inconsistent.publicationSha256 },
+        review: {
+          reviewScope: 'integration', coverageComplete: true, finalPassRequired: false, diffBaseSha: 'c'.repeat(40),
+          blockers: 0, retainedFindings: 0, retainedFindingsSha256: createHash('sha256').update('[]').digest('hex'),
+          integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'e'.repeat(40), integrationPriorDiffBase: 'f'.repeat(40),
+        },
+      },
+    });
+    const inconsistentEscalations: string[] = [];
+    const inconsistentWave = new WaveRunner({
+      ledger: inconsistent.ledger, worktrees: inconsistent.port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: join(inconsistent.directory, '..'), poster: inconsistent.poster,
+      escalate: (title, detail) => inconsistentEscalations.push(`${title} :: ${detail}`),
+    });
+    expect(await inconsistentWave.recoverInterruptedRounds()).toBe(1);
+    expect(inconsistent.ledger.getRound(inconsistent.round.id)).toMatchObject({ status: 'aborted', verdict: null });
+    expect(inconsistent.ledger.latestRoundEvent(inconsistent.round.id, 'round.post-recovered')).toBeNull();
+    expect(inconsistentEscalations.some((line) => line.includes('without a provider-bound receipt'))).toBe(true);
   }, 180_000);
 
   it('keeps a restart-promoted integration review as the predecessor for the next integrated head', async () => {
@@ -3604,7 +3643,7 @@ describe('WaveRunner built-in Perkins production path', () => {
           reviewScope: 'integration', coverageComplete: false, finalPassRequired: false, diffBaseSha: b1,
           blockers: 1, retainedFindings: 1,
           retainedFindingsSha256: createHash('sha256').update(JSON.stringify([blocker])).digest('hex'),
-          integrationFromSha: h0, integrationBaseSha: b1,
+          integrationFromSha: h0, integrationBaseSha: b1, integrationPriorDiffBase: priorDiffBase,
         },
       },
     });
@@ -3633,6 +3672,278 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(review['blockers']).toBeGreaterThanOrEqual(1);
     expect(third.canonicalVerdict).toBe('NEEDS CHANGES');
     expect(thirdFake.leadCalls.at(-1)!.prompt ?? '').toContain('boundary blocker');
+
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }, 180_000);
+
+  it('keeps a verdict-committed round as predecessor when the normal annotation write is interrupted', async () => {
+    const repo = makeFixtureRepo('perkins-crash-annotation');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    repo.git(['checkout', '-b', 'feature/integration']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-crash-annotation-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-crash-annotation-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-crash-annotation-db-')));
+    dirs.push(root, artifacts); dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/integration', h0);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-crash-annotation' });
+    const job = ledger.addJob({ id: 'job-crash-annotation', repo: 'fixture', title: 'crash annotation', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const prUrl = 'https://git.example.invalid/acme/fixture/pull/46';
+    ledger.setJobPr(job.id, prUrl);
+    attachOrigin(repo, 'feature/integration', root);
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9015', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+      authenticatedActor: async () => 'gru-bot',
+    };
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    // Round 1 (whole) at H0/B0.
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster, reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-crash-annotation-s1-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+    const b0 = repo.git(['rev-parse', 'main']);
+
+    // Main advances and the feature integrates it into H1.
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main1.ts', 'export const main1 = 1;\n');
+    repo.git(['checkout', 'feature/integration']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/integration']);
+    const b1 = repo.git(['rev-parse', 'main']);
+    const h1 = repo.head();
+
+    // Round 2 reached a full delivery and verdict commit, but the NORMAL
+    // finalization crash window applies: `round.perkins-review` never landed.
+    const blocker = {
+      source: 'acceptance', severity: 'blocker', category: 'integration', title: 'boundary blocker',
+      location: 'src/feature.ts:1', evidence: 'export const feature = 1;', detail: 'the boundary defect remains',
+      recommended_fix: 'resolve the boundary defect',
+      verification: { disposition: 'confirmed', evidence: 'export const feature = 1;', reason: 'round 2' },
+      sources: ['acceptance'], roundOrigin: 2,
+    };
+    const round2 = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: h1 });
+    ledger.setRoundStatus(round2.id, 'live');
+    const priorAcceptance = (ledger.latestRoundEvent(first.round.id, 'round.review-inputs-frozen')!.payload as { acceptance?: unknown }).acceptance ?? null;
+    ledger.appendCustomEvent({
+      kind: 'round.review-inputs-frozen', jobId: job.id, roundId: round2.id,
+      payload: { acceptance: priorAcceptance },
+    });
+    const round2Directory = join(artifacts, round2.id);
+    mkdirSync(round2Directory, { recursive: true });
+    writeFileSync(join(round2Directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'NEEDS CHANGES',
+      complete: true, headMoved: false,
+      frozen: { targetSha: h1, diffBaseSha: b1, ...(priorAcceptance !== null ? { acceptance: priorAcceptance } : {}) },
+      convergence: {
+        reviewScope: 'integration', coverageComplete: true,
+        integrationFromSha: h0, integrationBaseSha: b1, integrationPriorDiffBase: b0,
+      },
+      findings: [blocker], specialistRuns: [],
+    }));
+    const publicationBody = '# Perkins Code Review\n\n**Verdict: NEEDS CHANGES**\n';
+    writeFileSync(join(round2Directory, 'perkins-report.publication.md'), publicationBody, 'utf8');
+    const publicationSha256 = createHash('sha256').update(publicationBody, 'utf8').digest('hex');
+    ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: job.id, roundId: round2.id,
+      payload: {
+        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: prUrl, host: 'git.example.invalid',
+        targetSha: h1, baseSha: 'b'.repeat(40), publicationFile: join(round2Directory, 'perkins-report.publication.md'),
+        publicationSha256, reconciled: false,
+        receipt: { reviewId: '9016', actor: 'gru-bot', event: 'COMMENTED', commitId: h1, headSha: h1, baseSha: 'b'.repeat(40), bodySha256: publicationSha256 },
+        review: {
+          reviewScope: 'integration', coverageComplete: true, finalPassRequired: false, diffBaseSha: b1,
+          blockers: 1, retainedFindings: 1,
+          retainedFindingsSha256: createHash('sha256').update(JSON.stringify([blocker])).digest('hex'),
+          integrationFromSha: h0, integrationBaseSha: b1, integrationPriorDiffBase: b0,
+        },
+      },
+    });
+    ledger.finalizeRoundVerdictWithLensOutcomes(round2.id, 'changes-requested', [
+      { lens: 'blind', state: 'done', note: 'fixture: verdict committed before the annotation write' },
+    ]);
+    expect(ledger.getRound(round2.id)).toMatchObject({ status: 'verdict-posted', verdict: 'changes-requested' });
+    expect(ledger.latestRoundEvent(round2.id, 'round.perkins-review')).toBeNull();
+    expect(ledger.latestRoundEvent(round2.id, 'round.post-recovered')).toBeNull();
+
+    // Main advances again; the feature integrates it into H2.
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main2.ts', 'export const main2 = 2;\n');
+    repo.git(['checkout', 'feature/integration']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/integration']);
+
+    const thirdFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-crash-annotation-s3-')), { childAnswer: () => '[]', specialists: [] });
+    const third = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster, reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: thirdFake.spawner,
+    }).runRound({ jobId: job.id }));
+    expect(third.round.seq).toBe(3);
+    const review = ledger.latestRoundEvent(third.round.id, 'round.perkins-review')!.payload as Record<string, unknown>;
+    // The verdict-committed round — NOT the older whole round — is the
+    // predecessor: its covered head and its unresolved blocker are accounted.
+    expect(review['reviewScope']).toBe('integration');
+    expect(review['integrationFromSha']).toBe(h1);
+    expect(thirdFake.leadCalls.at(-1)!.prompt ?? '').toContain('boundary blocker');
+    expect(third.canonicalVerdict).toBe('NEEDS CHANGES');
+
+    rmSync(root, { recursive: true, force: true });
+    rmSync(artifacts, { recursive: true, force: true });
+  }, 180_000);
+
+  it('keeps a verdict-committed round as predecessor when the promotion annotation write is interrupted', async () => {
+    const repo = makeFixtureRepo('perkins-crash-promotion');
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    repo.git(['checkout', '-b', 'feature/integration']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-crash-promotion-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-crash-promotion-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-crash-promotion-db-')));
+    dirs.push(root, artifacts); dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/integration', h0);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-crash-promotion' });
+    const job = ledger.addJob({ id: 'job-crash-promotion', repo: 'fixture', title: 'crash promotion', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    const prUrl = 'https://git.example.invalid/acme/fixture/pull/47';
+    ledger.setJobPr(job.id, prUrl);
+    attachOrigin(repo, 'feature/integration', root);
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9017', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+      authenticatedActor: async () => 'gru-bot',
+    };
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    // Round 1 (whole) at H0/B0.
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster, reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-crash-promotion-s1-')), { childAnswer: () => '[]', specialists: [] }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+    const b0 = repo.git(['rev-parse', 'main']);
+
+    // Main advances and the feature integrates it into H1.
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main1.ts', 'export const main1 = 1;\n');
+    repo.git(['checkout', 'feature/integration']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/integration']);
+    const b1 = repo.git(['rev-parse', 'main']);
+    const h1 = repo.head();
+
+    // Round 2: a bound posted integration NEEDS CHANGES awaiting promotion.
+    // Promotion commits the verdict and then writes `round.post-recovered`;
+    // the injected failure lands BETWEEN the two — the restart-promotion
+    // crash window.
+    const blocker = {
+      source: 'acceptance', severity: 'blocker', category: 'integration', title: 'promotion boundary blocker',
+      location: 'src/feature.ts:1', evidence: 'export const feature = 1;', detail: 'the boundary defect remains',
+      recommended_fix: 'resolve the boundary defect',
+      verification: { disposition: 'confirmed', evidence: 'export const feature = 1;', reason: 'round 2' },
+      sources: ['acceptance'], roundOrigin: 2,
+    };
+    const round2 = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: h1 });
+    ledger.setRoundStatus(round2.id, 'live');
+    const priorAcceptance = (ledger.latestRoundEvent(first.round.id, 'round.review-inputs-frozen')!.payload as { acceptance?: unknown }).acceptance ?? null;
+    ledger.appendCustomEvent({
+      kind: 'round.review-inputs-frozen', jobId: job.id, roundId: round2.id,
+      payload: { acceptance: priorAcceptance },
+    });
+    const round2Directory = join(artifacts, round2.id);
+    mkdirSync(round2Directory, { recursive: true });
+    writeFileSync(join(round2Directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'NEEDS CHANGES',
+      complete: true, headMoved: false,
+      frozen: { targetSha: h1, diffBaseSha: b1, ...(priorAcceptance !== null ? { acceptance: priorAcceptance } : {}) },
+      convergence: {
+        reviewScope: 'integration', coverageComplete: true,
+        integrationFromSha: h0, integrationBaseSha: b1, integrationPriorDiffBase: b0,
+      },
+      findings: [blocker], specialistRuns: [],
+    }));
+    const publicationBody = '# Perkins Code Review\n\n**Verdict: NEEDS CHANGES**\n';
+    writeFileSync(join(round2Directory, 'perkins-report.publication.md'), publicationBody, 'utf8');
+    const publicationSha256 = createHash('sha256').update(publicationBody, 'utf8').digest('hex');
+    ledger.appendCustomEvent({
+      kind: 'round.posted', jobId: job.id, roundId: round2.id,
+      payload: {
+        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', url: prUrl, host: 'git.example.invalid',
+        targetSha: h1, baseSha: 'b'.repeat(40), publicationFile: join(round2Directory, 'perkins-report.publication.md'),
+        publicationSha256, reconciled: false,
+        receipt: { reviewId: '9018', actor: 'gru-bot', event: 'COMMENTED', commitId: h1, headSha: h1, baseSha: 'b'.repeat(40), bodySha256: publicationSha256 },
+        review: {
+          reviewScope: 'integration', coverageComplete: true, finalPassRequired: false, diffBaseSha: b1,
+          blockers: 1, retainedFindings: 1,
+          retainedFindingsSha256: createHash('sha256').update(JSON.stringify([blocker])).digest('hex'),
+          integrationFromSha: h0, integrationBaseSha: b1, integrationPriorDiffBase: b0,
+        },
+      },
+    });
+
+    const originalAppend = ledger.appendCustomEvent.bind(ledger);
+    const appendSpy = vi.spyOn(ledger, 'appendCustomEvent').mockImplementation((fields: Parameters<LedgerApi['appendCustomEvent']>[0]) => {
+      if (fields.kind === 'round.post-recovered') {
+        throw new Error('simulated crash before the promotion annotation write');
+      }
+      return originalAppend(fields);
+    });
+    const recoveryWave = new WaveRunner({
+      ledger, worktrees: port, spawner: vi.fn() as unknown as AgentSpawner, reviewArtifactRoot: artifacts, poster,
+    });
+    await expect(recoveryWave.recoverInterruptedRounds()).rejects.toThrow(/simulated crash/);
+    appendSpy.mockRestore();
+    expect(ledger.getRound(round2.id)).toMatchObject({ status: 'verdict-posted', verdict: 'changes-requested' });
+    expect(ledger.latestRoundEvent(round2.id, 'round.post-recovered')).toBeNull();
+    expect(ledger.latestRoundEvent(round2.id, 'round.perkins-review')).toBeNull();
+
+    // Main advances again; the feature integrates it into H2.
+    repo.git(['checkout', 'main']);
+    repo.commitFile('src/main2.ts', 'export const main2 = 2;\n');
+    repo.git(['checkout', 'feature/integration']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/integration']);
+
+    const thirdFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-crash-promotion-s3-')), { childAnswer: () => '[]', specialists: [] });
+    const third = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster, reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/integration'),
+      spawner: thirdFake.spawner,
+    }).runRound({ jobId: job.id }));
+    expect(third.round.seq).toBe(3);
+    const review = ledger.latestRoundEvent(third.round.id, 'round.perkins-review')!.payload as Record<string, unknown>;
+    expect(review['reviewScope']).toBe('integration');
+    expect(review['integrationFromSha']).toBe(h1);
+    expect(thirdFake.leadCalls.at(-1)!.prompt ?? '').toContain('promotion boundary blocker');
+    expect(third.canonicalVerdict).toBe('NEEDS CHANGES');
 
     rmSync(root, { recursive: true, force: true });
     rmSync(artifacts, { recursive: true, force: true });

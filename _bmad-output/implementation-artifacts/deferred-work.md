@@ -147,3 +147,9 @@
 - [Review][Defer] Receipt validation is asymmetric — `readCaptureReceipt` validates only the `pings` field this change added; a v1 receipt with a missing/wrongly-typed `frames`/`capture_bytes`/`started` still reads back as a `CaptureReceipt`. Pre-existing; a full receipt validator is a separate change.
 - [Review][Defer] Ping wire literal duplicated — `PingFrame` is exported but the reader compares a bare `frame['type'] === 'ping'`; a rename on either side compiles clean and silently reclassifies the keepalive as a producer frame. Settled by: a shared `PING_FRAME_TYPE` constant (or type guard) owned by the verify wire vocabulary.
 - [Review][Defer] Synchronous write-failure branch has no test double — the `stopHeartbeat()` in `writeFrame`'s catch (ERR_STREAM_*/serialization) is defensive and unreachable by the current socket tests. Settled by: a fake `res` whose `write` throws, asserting the interval is cleared.
+
+## Deferred from: native R4 repair of job perkins-integration-review-coverage-20261009 (2026-10-10)
+
+- source_spec: `spec-perkins-integration-review-coverage.md`
+  summary: Ordinary delta planning treats a baseline whole record with nonempty findings but no findings digest as unusable, so a same-base fix round restarts whole review instead of delta convergence.
+  evidence: The R4 warning at `src/dispatch/perkins-review/convergence.ts:1014-1021` is a real behavior observation. Separating "ordinary delta predecessor usability" from "integration whole-complete credit" would reintroduce unauthenticated finding contents into carry-forward, which prior-finding 0 deliberately made fail closed; the change is safety-sensitive and outside the approved R4 repair scope. Settled by: a design that authenticates delta carry through a per-finding binding (digest or frozen-evidence re-proof) without trusting count-only receipts, reviewed as its own change.
