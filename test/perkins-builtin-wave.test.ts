@@ -8807,7 +8807,7 @@ describe('formal GitHub verdict publication from native judgments', () => {
     fix.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
     fix.repo.git(['push', '--quiet', 'origin', 'feature/formal-scenario']);
     const outcome = asWave(await runner(fix, poster, undefined, {
-      priorDisposition: () => [{ prior_index: 0, status: 'fixed', note: 'corrected in this delta' }],
+      priorDisposition: () => [{ prior_index: 1, status: 'fixed', note: 'corrected in this delta' }],
     }, escalations).runRound({ jobId: 'job-formal-lifecycle' }));
     const rounds = fix.ledger.listRounds('job-formal-lifecycle');
     expect(rounds, escalations.join('\n')).toHaveLength(4);
@@ -8847,7 +8847,9 @@ describe('formal GitHub verdict publication from native judgments', () => {
       })),
     };
     const outcome = asWave(await runner(fix, poster, groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }), {}, escalations).runRound({ jobId: 'job-formal-wrong-state' }));
-    expect(outcome.canonicalVerdict, escalations.join('\n')).toBe('READY TO MERGE');
+    // The lead judged READY, but an unproven delivery is never a completed
+    // formal approval: the round terminalizes honestly as INCOMPLETE.
+    expect(outcome.canonicalVerdict, escalations.join('\n')).toBe('INCOMPLETE');
     expect(outcome.verdict).toBeNull();
     expect(outcome.posted).toBe(false);
     expect(outcome.round.status).toBe('aborted');
