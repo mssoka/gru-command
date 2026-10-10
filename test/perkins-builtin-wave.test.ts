@@ -8748,7 +8748,13 @@ describe('formal GitHub verdict publication from native judgments', () => {
   }
 
   let formalRunnerSeq = 0;
-  function runner(fix: ReturnType<typeof scenario>, poster: unknown, finding?: ReturnType<typeof groundedFinding>, overrides: Record<string, unknown> = {}) {
+  function runner(
+    fix: Awaited<ReturnType<typeof scenario>>,
+    poster: unknown,
+    finding?: ReturnType<typeof groundedFinding>,
+    overrides: Record<string, unknown> = {},
+    escalations?: string[],
+  ) {
     formalRunnerSeq += 1;
     return new WaveRunner({
       ledger: fix.ledger, worktrees: fix.port, poster,
@@ -8759,6 +8765,10 @@ describe('formal GitHub verdict publication from native judgments', () => {
       }),
       reviewRuntimeIdentity: () => ({ id: 'pi', version: 'test-runtime-v1' }),
       reconcileReviewAgent: async () => true,
+      escalate: (title: string, detail: string) => {
+        escalations?.push(`${title}: ${detail}`);
+        if (escalations === undefined) console.error(`[formal-verdict escalation] ${title}: ${detail}`);
+      },
       spawner: fakeWholeSpawner(mkdtempSync(join(fix.sessions, `spawner-${formalRunnerSeq}`)), {
         childAnswer: () => '[]', specialists: [],
         ...(finding !== undefined ? { leadFinding: finding } : {}),
@@ -8775,18 +8785,19 @@ describe('formal GitHub verdict publication from native judgments', () => {
     fix.ledger.setJobPr('job-formal-lifecycle', 'https://github.com/acme/fixture/pull/61');
     attachOrigin(fix.repo, 'feature/formal-scenario', fix.root);
     const poster = intentPoster();
+    const escalations: string[] = [];
 
     // Round 1 — whole change, READY: the eligible final judgment enacts a
     // REAL approval bound to the frozen head.
-    const first = asWave(await runner(fix, poster, groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' })).runRound({ jobId: 'job-formal-lifecycle' }));
-    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+    const first = asWave(await runner(fix, poster, groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }), {}, escalations).runRound({ jobId: 'job-formal-lifecycle' }));
+    expect(first.canonicalVerdict, escalations.join('\n')).toBe('READY TO MERGE');
     expect(postedIntent(fix.ledger, first.round.id)).toEqual({ reviewEvent: 'APPROVE', enacted: 'APPROVED', reconciled: false });
 
     // Round 2 — a confirmed blocker inside the delta: a REAL change request.
     fix.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
     fix.repo.git(['push', '--quiet', 'origin', 'feature/formal-scenario']);
-    const second = asWave(await runner(fix, poster, groundedFinding('lead', 'blocker', { location: 'src/main.ts:2', title: 'delta blocker' })).runRound({ jobId: 'job-formal-lifecycle' }));
-    expect(second.canonicalVerdict).toBe('NEEDS CHANGES');
+    const second = asWave(await runner(fix, poster, groundedFinding('lead', 'blocker', { location: 'src/main.ts:2', title: 'delta blocker' }), {}, escalations).runRound({ jobId: 'job-formal-lifecycle' }));
+    expect(second.canonicalVerdict, escalations.join('\n')).toBe('NEEDS CHANGES');
     expect(postedIntent(fix.ledger, second.round.id)).toEqual({ reviewEvent: 'REQUEST_CHANGES', enacted: 'CHANGES_REQUESTED', reconciled: false });
 
     // Round 3 — the blocker is corrected in the delta and the lead confirms
@@ -8797,9 +8808,9 @@ describe('formal GitHub verdict publication from native judgments', () => {
     fix.repo.git(['push', '--quiet', 'origin', 'feature/formal-scenario']);
     const outcome = asWave(await runner(fix, poster, undefined, {
       priorDisposition: () => [{ prior_index: 0, status: 'fixed', note: 'corrected in this delta' }],
-    }).runRound({ jobId: 'job-formal-lifecycle' }));
+    }, escalations).runRound({ jobId: 'job-formal-lifecycle' }));
     const rounds = fix.ledger.listRounds('job-formal-lifecycle');
-    expect(rounds).toHaveLength(4);
+    expect(rounds, escalations.join('\n')).toHaveLength(4);
     expect(outcome.round.seq).toBe(4);
     const deltaRound = rounds.find((round) => round.seq === 3)!;
     expect(fix.ledger.latestRoundEvent(deltaRound.id, 'round.perkins-review')?.payload)
@@ -8835,17 +8846,8 @@ describe('formal GitHub verdict publication from native judgments', () => {
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
     };
-    const wave = new WaveRunner({
-      ledger: fix.ledger, worktrees: fix.port, poster,
-      reviewArtifactRoot: fix.artifacts, prHeadProbe: localHeadProbe('feature/formal-scenario'),
-      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
-      spawner: fakeWholeSpawner(mkdtempSync(join(fix.sessions, 'wrong-state-spawner')), {
-        childAnswer: () => '[]', specialists: [],
-        leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
-      }).spawner,
-    });
-    const outcome = asWave(await wave.runRound({ jobId: 'job-formal-wrong-state' }));
-    expect(outcome.canonicalVerdict).toBe('READY TO MERGE');
+    const outcome = asWave(await runner(fix, poster, groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }), {}, escalations).runRound({ jobId: 'job-formal-wrong-state' }));
+    expect(outcome.canonicalVerdict, escalations.join('\n')).toBe('READY TO MERGE');
     expect(outcome.verdict).toBeNull();
     expect(outcome.posted).toBe(false);
     expect(outcome.round.status).toBe('aborted');
