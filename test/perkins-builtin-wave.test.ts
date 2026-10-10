@@ -9518,10 +9518,13 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     const absentRound = absentFix.ledger.addRound({ jobId: 'job-durability-absent', lenses: ['blind'], targetRef: absentFix.target });
     absentFix.ledger.setRoundStatus(absentRound.id, 'live');
     seedAttempt(absentFix, 'job-durability-absent', absentRound.id, absentFix.target);
+    // The credible-absence path requires the prepared posting identity to be
+    // durably bound and provably continuous (native R2 F2).
+    absentFix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId: 'job-durability-absent', roundId: absentRound.id, payload: { actor: 'gru-bot', host: 'github.com', targetSha: absentFix.target } });
     const absentPost = vi.fn();
     const absentWave = new WaveRunner({
       ledger: absentFix.ledger, worktrees: durabilityPort(),
-      poster: { post: absentPost, reconcile: vi.fn(async () => null) },
+      poster: { post: absentPost, reconcile: vi.fn(async () => null), authenticatedActor: async () => 'gru-bot' },
       reviewArtifactRoot: absentFix.artifacts,
       spawner: vi.fn() as unknown as AgentSpawner,
     });
