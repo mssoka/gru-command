@@ -1250,7 +1250,7 @@ describe('branch-idle guard', () => {
         registry: { getHandle: () => null,
           spawn: async () => { throw new Error('boot recovery must not spawn a minion on this path'); },
           disposeHandle: async () => {} },
-      }, { bootAt: new Date(Date.now() + 60_000) });
+      }, { limit: 100 });
       await report.settled;
       expect(report.completed).toBe(1);
       expect((await startedPromise).jobId).toBe(jobId);

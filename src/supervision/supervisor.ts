@@ -24,6 +24,7 @@ import {
 } from '../runtime/pacing.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
+import { surfaceDirectiveRecovery } from '../dispatch/directive-progress.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -357,6 +358,7 @@ export type SupervisorRestartPolicy =
   | { readonly refuse: string };
 
 export class Supervisor {
+  private readonly retainedDirectiveProducers = new Map<string, AgentHandle>();
   private readonly cfg: SupervisionConfig;
   private readonly registry: SupervisorRegistry;
   private readonly ledger: LedgerApi;
@@ -1246,6 +1248,11 @@ export class Supervisor {
       // shutdown) while we waited — the identity check is the cancellation.
       if (this.disposed || agent.rateLimitRetry !== incident) return;
       if (this.agents.get(agent.agentId) !== agent) return;
+      if (incident.pending.directive !== undefined) {
+        surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, incident.pending.directive.identity.requestId, 'provider retry cannot replay a consumed native directive; inspect its checkpoint');
+        this.clearRateLimitRetry(agent, 'superseded');
+        return;
+      }
       const handle = agent.handle;
       if (handle === null || agent.breakerOpen) {
         this.clearRateLimitRetry(agent, 'superseded');
@@ -1802,6 +1809,22 @@ export class Supervisor {
         }
       }
 
+      if (agent.pendingRecovery?.pending?.directive !== undefined) {
+        const requestId = agent.pendingRecovery.pending.directive.identity.requestId;
+        if (old?.cessationEvidence?.() !== 'ceased') {
+          agent.handle = old;
+          if (old !== null) this.retainedDirectiveProducers.set(agent.agentId, old);
+          agent.state = 'stopped';
+          this.log('error', 'directive cleanup has unknown cessation — explicit supervisor ownership retained', { agent_id: agent.agentId, request_id: requestId });
+          surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, requestId, 'supervisor cleanup retains unknown producer ownership');
+          return;
+        }
+        agent.pendingRecovery = null;
+        agent.state = 'watching';
+        surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, requestId, 'supervisor ceased the interrupted turn; service must inspect native completion/checkpoint, never replay');
+        return;
+      }
+      if (!this.recoveryAuthorityCurrent(agent, agent.pendingRecovery)) return;
       if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
 
       // Issue #161: the owning subsystem may specialize or refuse a restart
@@ -1835,6 +1858,7 @@ export class Supervisor {
             : await this.registry.spawn(agent.role, spawnOptions);
         if (
           this.disposed ||
+          !this.recoveryAuthorityCurrent(agent, agent.pendingRecovery) ||
           (restartSlot !== null &&
             (this.slots.get(restartSlot.id) !== restartSlot ||
               restartSlot.generation !== restartGeneration))
@@ -2012,6 +2036,10 @@ export class Supervisor {
     agent.pendingRecovery = null;
     const laneAgentId = recovery.originAgentId;
     const pending = recovery.pending;
+    if (pending?.directive !== undefined) {
+      surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, pending.directive.identity.requestId, 'native directive continuation belongs to the service checkpoint coordinator');
+      return;
+    }
     if (
       pending !== null &&
       (pending.text.trim() !== '' || (pending.images !== undefined && pending.images.length > 0))
@@ -2430,6 +2458,11 @@ export class Supervisor {
    * while its durable agent row says idle/error/disposed. */
   pendingProducerBlockers(jobId: string): readonly string[] {
     return this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
+      const retained = this.retainedDirectiveProducers.get(row.id);
+      if (retained !== undefined) {
+        if (retained.cessationEvidence?.() !== 'ceased') return [`unproven directive producer cessation: ${row.id}`];
+        this.retainedDirectiveProducers.delete(row.id);
+      }
       const agent = this.agents.get(row.id);
       if (agent === undefined) {
         return this.registry.getHandle(row.id) !== null

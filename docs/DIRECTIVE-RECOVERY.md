@@ -1,9 +1,12 @@
-# Interrupted-directive recovery (retirement) — activation runbook
+# Evidence-first directive/rebrief recovery — runbook
 
 Owner approval: journal j-1348 (build), corrections j-1345. This runbook
-describes the ONE supported way to close an interrupted directive
-request's control ownership, and the exact boundary between that closure
-and everything it is NOT.
+describes the retained standalone retirement primitive and its non-effects.
+The GH-286 workflow below is now primary: evidence-first completion or
+checkpoint continuation, otherwise an executable generation-fenced Gru
+decision. Routine approved recovery no longer requires per-case owner
+intervention. Owner-reserved stops, merges, deployment and production
+restarts remain unchanged.
 
 ## What it is
 
@@ -185,12 +188,172 @@ other jobs.
 
 ## Activation rules
 
-- Per-case owner/authority decision (journal) required before calling it
-  on any real request — there is no bulk mode, no `force` option and no
-  age-based automatic policy; boot/tick reconcilers never retire.
+- Routine live approved recovery uses the guarded Gru decision described
+  below; owner-reserved destructive actions still require an owner ruling.
+  There is no bulk mode, `force` option or age-based work authority.
+  Historical terminal administrative retirement remains non-executing.
 - The activation this build ships is CODE + MIGRATION only: the schema
   migration applies at the next service boot under the owner's manual
   rollout. This build performed no live retirement, no migration against
   the production ledger and no service restart.
 - A retired request cannot revive a merged/done/binned job, and it is
   excluded from boot/tick reconciliation and digest offers by state.
+
+## Evidence-first progress recovery (GH-286)
+
+New directive **and rebrief** acceptance uses `pending_directives`, with
+`request_kind`, accepted contract/revision and authority epoch. Rebriefs
+no longer create new legacy marker pairs. Accepted is not admitted: the
+Pi adapter durably associates the exact request/hash/logical minion/native
+session and native user entry before calling the admission observer.
+Queued prompts retain these options but produce no admission receipt.
+Spawn/init/turn-start cannot establish acceptance. The native association
+journal is `<session.jsonl>.directives.jsonl`; native receipt identity and
+its role/cwd/tool/model authority manifest are validated on readback.
+Unknown/malformed/partial evidence is never repaired by guesswork.
+
+Boot and bounded deterministic reconsideration inspect correlated ledger
+completion, then exact native completion, **before** considering execution.
+A proven native user or complete successful tool-results checkpoint can
+continue once through the adapter-owned operation on the same logical
+minion/session, job lane, branch and PR. The original user prompt is never
+replayed. Every producer/permission fence is rechecked around asynchronous
+pacing/spawn/continuation boundaries. A durable checkpoint claim cannot be
+reissued by age or lease expiry. Native errors/aborts, unresolved tool
+results/effects, changed native authority and unsupported runtimes refuse
+loudly. Claude CLI currently cannot attest this exact checkpoint protocol;
+its capability refusal stays visible rather than inventing admission.
+
+Authenticated request readback exposes `native_target`, `native_binding`,
+`recovery_checkpoint`, `recovery_decision`, `authority_epoch`,
+`current_authority_epoch` and `recovery_obligation` (including generation).
+Concrete routine Gru judgment uses
+`POST /api/silas/directives/<request_id>/recover`:
+
+```json
+{
+  "by": "gru",
+  "expected_generation": 1,
+  "expected_payload_hash": "<accepted hash>",
+  "expected_head": "<fresh checkout HEAD>",
+  "expected_epoch": 0,
+  "expected_work_revision": 0,
+  "expected_contract_sha256": "<current approved contract SHA256>",
+  "reason": "inspect preserved effects and finish approved scope",
+  "decision": {
+    "kind": "successor",
+    "request_id": "<explicit fresh unused ID>",
+    "directive": "<concrete approved follow-through>"
+  }
+}
+```
+
+The service proves cessation and atomically retires only that exact
+request and accepts the named fresh successor. Retirement itself grants
+no authority. The old recovery debt settles on **actual successor native
+admission**, or its correlated completion, never mere acceptance. An
+identical decision replay appends nothing and starts no second turn;
+changed generation/hash/head/epoch, live/queued/unproven producers,
+terminal/held/superseded work and owner stops refuse (409). A concrete
+reserved-owner decision instead names a real still-open owner obligation
+using `decision: {"kind":"owner-decision","obligation_id":"..."}`; it
+settles Gru's recovery judgment only, preserving the owner stop and its
+debt. Generic Ops holds or notification prose cannot cover recovery debt.
+The existing bearer boundary authenticates the call; `by` remains audit
+attribution, not cryptographic role identity.
+
+Historical `pending_rebriefs` retain their original markers and audit.
+Their old blind replay/fresh-session boot pipeline is removed. Spent
+correlated evidence can settle, and terminal administrative retirement
+remains non-executing. Unprovable live markers instead expose concrete
+Gru debt through `GET /api/silas/rebriefs/<marker_id>` and its `/recover`
+route with the same fences. Guarded retirement records the exact marker
+pair in audit and accepts a fresh directive successor in one transaction;
+no bulk delete or age policy exists.
+
+This replaces the old per-case owner-intervention requirement for
+**routine approved recovery judgment** only. Owner-reserved destructive
+steps, every merge, deployment and production service restart remain
+unchanged. Implementation/verification uses isolated fixtures only: no
+live migration, recovery, deployment, restart or remote operation is
+performed by this build.
+
+
+Successor decisions additionally require **separate current-authority**
+`expected_work_revision` and `expected_contract_sha256` expectations,
+read from `current_approved_authority`. These are not the predecessor's
+accepted revision/hash. Owner amendment acceptance advances the control
+epoch and refuses old queued/in-flight continuation. An exact old request
+may nevertheless be retired with a distinctly named fresh successor on
+its still-approved live lane when **only approved amendments** account
+for its epoch mismatch, producer cessation is proven, and the new current
+revision/contract/HEAD/epoch all match atomically. Owner stops, holds,
+terminal/superseded dispositions and any other/unprovable control change
+cannot use this amendment-only exception. Execution rechecks the fresh
+snapshot around awaits; its prompt contains the current effective
+contract. Original native admission/delivery revisions are never rewritten.
+
+## Exact historical receipts and partial completion
+
+Historical observation uses bounded whole-job row-cursor pages at boot and on ticks. Neither wall-clock age nor a newer same-job event is correlation. Cancellation does not consume an unobserved page; unresolved early groups cannot starve independent later completion.
+
+Authenticated legacy GET `/api/silas/rebriefs/{marker_id}` exposes versioned `receipt_evidence` and `receipt_evidence_sha256`. The canonical SHA256 covers the exact stored generation, immutable original phase facts and relevant accepted/unproven receipt candidates. Explicit other jobs/generations do not perturb it. A legacy `/recover` judgment **requires** `expected_receipt_evidence_sha256`; the ledger recomputes it inside the write transaction. The hash fences stale intent only: it grants no permission and proves neither cessation nor effects. Native `/recover` request bodies are unchanged.
+
+An unmarked historical receipt needs explicit exact marker identity/hash, original bound minion and revision. A marked receipt needs a phase independently belonging to the exact original generation and consistent original minion facts. Missing duplicated revision on old marked `silas.rebrief` receipts remains absent; all available original marker/receipt revisions must agree. Reused/rebound/foreign phases, conflicting minions/revisions and same-job late unrelated events are not proof.
+
+A lone exact delivery is immutable **partial** evidence. Gru may explicitly judge a separately named fresh remaining-work successor after actual cessation, current permission and all producer fences; the old missing completion is never manufactured. Genuine original completion always wins over original-work successor judgment. A lost delivery is reconstructible only from explicit original correlated HEAD/revision facts, with their source event recorded. Today's branch HEAD/current approval and `?? 0` cannot supply history.
+
+For exact proven completion lacking original delivery facts, legacy-only `/recover` accepts:
+
+```json
+{
+  "by": "gru",
+  "expected_generation": 1,
+  "expected_payload_hash": "<readback>",
+  "expected_receipt_evidence_sha256": "<fresh readback>",
+  "expected_head": "<current original-lane checkout HEAD>",
+  "expected_epoch": 0,
+  "expected_work_revision": 0,
+  "expected_contract_sha256": "<current approved contract>",
+  "reason": "exact completion proven; missing historical delivery facts remain absent",
+  "decision": { "kind": "reconcile-completed", "inspection_request_id": "distinct-current-inspection" }
+}
+```
+
+This is a **non-executing old control closure**, not historical delivery or READY. It requires exact completion, fresh evidence/current scope/HEAD and actual producer/ownership fences; a reconcilable complete generation belongs to normal settlement instead. The immutable `silas.rebrief-control-closed` audit retains full markers, original receipt provenance, absent facts and exact current-inspection instruction. The old debt closes administratively into a discoverable Gru-owned `rebrief-current-inspection:{marker}` obligation. It is suspended when real owner stops/parking govern. No minion spawns and no `job.delivered` is emitted by this judgment.
+
+GET retains decision events and `current_inspection_obligations` after marker closure. Gru separately uses existing `/api/silas/directive` with the named unused inspection request and **exact current-inspection instruction**, then existing verification/review APIs. Its receipts are explicitly CURRENT evidence; they never replace the absent historical delivery or authorize READY. A changed/foreign instruction cannot consume the reserved inspection identity.
+
+## Reserved-owner transfer and explicit owner actions
+
+A routine recovery uncertainty owes Gru a concrete executable decision. Only a **real live same-job, job-wide `operation` / known `owner-hold` / `owner-decision`** may receive a reserved-owner transfer. Generic/unknown/Gru/foreign/limited decisions do not qualify. Suspended or incoherent legacy subjects may transfer their exact unknown context; this never authorizes a successor or synthesizes coherence. A suspended Gru debt closes via the existing superseded/closed transition, not an illegal suspended→settled transition. Requests, markers, producer ownership, real owner debt/stops and owner notification Ack remain unchanged.
+
+Readback `recovery_owner` exposes immutable per-subject/per-debt-generation decision history, the exact transfer target ID/generation/plan/authority/category/action, full evidence snapshot, current target, resolution/confirmation receipts, stop-lineage SHA and an explicit owner-action recipe. Consumed original-generation replay stays immutable after later decisions. Changed or generically closed targets create one new **suspended** Gru incarnation, never revive the old prompt or grant work. A genuine explicit resolution permits a separate current-fenced new incarnation only after separate job unpark; existing producer/review/verification/other owner-stop fences still apply.
+
+Permission recording is an explicitly attributed authenticated call, never invoked by Gru/service/supervisor:
+
+`POST /api/silas/{directives|rebriefs}/{id}/owner-resolution`
+
+```json
+{
+  "by": "owner", "confirm_intent": true,
+  "resolution_id": "stable-owner-resolution-identity",
+  "expected_transfer_event_seq": 123,
+  "expected_transfer_fingerprint": "<readback>",
+  "expected_subject_sha256": "<readback>",
+  "expected_target_generation": 2,
+  "expected_target_plan_revision": 1,
+  "expected_lineage_sha256": "<fresh readback>",
+  "expected_epoch": 120,
+  "expected_head": "<current original-lane checkout HEAD>",
+  "expected_work_revision": 1,
+  "expected_contract_sha256": "<current approved contract>",
+  "reason": "explicit narrow permission for this exact subject/current scope/governing stop"
+}
+```
+
+The server constructs an immutable narrow `ruling.recorded` permission and validates exact subject/transfer/target/lineage/current scope. It does **not** release a stop, unpark, Ack, execute work or assert cessation/effects/completion. Shared bearer authentication plus `by: owner` is attribution, **not independently verified owner identity**.
+
+A separate explicitly owner-attributed `POST .../owner-resolution/confirm-stop` uses fresh expectations plus `expected_resolution_fingerprint` from the real recorded ruling. It affirms the exact still-current target/ruling and atomically performs the legal resume-then-settle of **only that suspended target** with a genuine confirmation receipt. Parking, other holds, cards and work execution remain unchanged. Stable identity replay returns immutable original receipts; conflicting intent refuses. Missing/foreign/stale resolution, plan/scope/epoch changes and unrelated stop lineage do not grant permission.
+
+Then, only if intended, explicitly unpark via the existing board action and explicitly Ack any real owner notification separately. A fresh Gru recovery generation/judgment—not the owner recording/confirmation—may accept a distinct currently authorized successor after actual cessation. No automatic owner action, role substitution, original-work replay, additional scope or READY claim is permitted.

@@ -85,6 +85,7 @@ export const AWARENESS_BLOCK_HEADER = '[gru awareness · service context — not
 /** Prompt suffix for a policy-started turn (the block itself is prepended). */
 export const AWARENESS_WAKE_INSTRUCTION =
   'This turn was started by the service wake policy — no user message is waiting. ' +
+  'Directive/rebrief recovery debt requires its concrete generation/hash/head/epoch-fenced recovery endpoint; generic Ops holds and alert disposition do not answer it. Never replay a consumed prompt or Ack an owner-only stop. ' +
   'This is machine attention and it is meant to be acted on in-turn: diagnose the item, ' +
   'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
   'stage the rest. After acting on an action-required alert, explicitly resolve its ' +

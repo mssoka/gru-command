@@ -77,6 +77,8 @@ class FallbackHandle implements AgentHandle {
   readonly isCompacting?: () => boolean;
   readonly hasLiveProcess?: () => boolean;
   readonly pendingTurn?: () => PendingTurn | null;
+  readonly inspectDirective?: AgentHandle['inspectDirective'];
+  readonly resumeDirective?: AgentHandle['resumeDirective'];
 
   /** A turn is being delivered by THIS pipeline (set+clear per-path only). */
   private inFlight = false;
@@ -111,6 +113,14 @@ class FallbackHandle implements AgentHandle {
     if (inner.pendingTurn !== undefined) {
       this.pendingTurn = () => inner.pendingTurn!();
     }
+    if (inner.inspectDirective !== undefined) this.inspectDirective = (identity) => inner.inspectDirective!(identity);
+    if (inner.resumeDirective !== undefined) this.resumeDirective = async (identity, checkpointId, beforeContinuation) => {
+      this.assertLive();
+      if (this.busy || this.queue.length > 0) throw new Error('directive continuation requires an idle, unqueued session');
+      this.inFlight = true;
+      try { return await inner.resumeDirective!(identity, checkpointId, beforeContinuation); }
+      finally { this.inFlight = false; void this.pump(); }
+    };
     if (inner.getContextUsage !== undefined) {
       this.getContextUsage = () => inner.getContextUsage!();
     }

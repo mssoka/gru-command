@@ -333,13 +333,23 @@ describe('unmarked blocked-phase hand-back crash-window recovery (r4 blocker 2)'
     // A marked phase on a blocked lane: the phase path owns it; the unmarked
     // backstop must not double-publish the event-sequence card.
     seedJob(h.ledger, 'job-uwc3', 'blocked');
-    h.ledger.beginPendingRebrief({
+    const markers = h.ledger.beginPendingRebrief({
       jobId: 'job-uwc3',
       note: 'n',
       briefing: 'b',
       handoff: { kind: 'gru-decision', decision: 'marked' },
     });
-    finalizeRebriefRequest({ ledger: h.ledger, worktrees, jobId: 'job-uwc3', minionId: 'm1', lanePath: null, note: 'n' });
+    const finalize = (): void => { finalizeRebriefRequest({ ledger: h.ledger, worktrees, jobId: 'job-uwc3', minionId: 'm1', lanePath: null, note: 'n' }); };
+    expect(finalize).toThrow('historical rebrief completion is unproven');
+    expect(h.ledger.listPendingRebriefs({ jobId: 'job-uwc3' })).toEqual(markers);
+    expect(h.ledger.latestJobEvent('job-uwc3', 'job.delivered')).toBeNull();
+    // Seed an actual historical completion receipt for this marked phase;
+    // the finalizer may record its lost delivery, never invent completion.
+    h.ledger.bindPendingRebriefWorker({ ids: markers.map((marker) => marker.id), agentId: 'm1', sessionFile: null });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId: 'job-uwc3',
+      payload: { minion_id: 'm1', note: 'n', phase_id: markers[0]!.phaseId, work_revision: markers[0]!.workRevision,
+        sha: 'a'.repeat(40) } });
+    finalize();
     const markedPass = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
     expect(markedPass.deliveries).toBe(0);
     expect(markedPass.published).toBe(0);

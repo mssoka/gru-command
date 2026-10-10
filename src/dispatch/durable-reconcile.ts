@@ -378,6 +378,7 @@ export interface ProductionDeterministicPassDeps {
   readonly log?: Log;
   /** Reads the live wave handle at each pass (late-bound). */
   readonly getWave: () => { reconcilePendingHandoffs(): void } | undefined;
+  readonly directiveProgress?: { reconsider(): void };
   readonly budget?: DurableReconcileBudget;
 }
 
@@ -394,7 +395,7 @@ export function createProductionDeterministicPass(
     ledger: deps.ledger,
     notifications: deps.notifications,
     ...(deps.log !== undefined ? { log: deps.log } : {}),
-    wave: waveReconcileBinding(deps.getWave),
+    wave: { reconcilePendingHandoffs: () => { deps.getWave()?.reconcilePendingHandoffs(); deps.directiveProgress?.reconsider(); } },
     ...(deps.budget !== undefined ? { budget: deps.budget } : {}),
   });
 }

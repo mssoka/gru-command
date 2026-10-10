@@ -1,5 +1,6 @@
 import type { Role } from '../config.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
+import type { DirectiveCheckpoint, DirectiveNativeBinding, DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 /**
  * Runtime adapter interface (EPICS E2 story 1; SPEC ruling 4).
@@ -256,6 +257,12 @@ export interface PromptOptions {
    * supervision watchdog owns un-hanging the turn itself.
    */
   readonly timeoutMs?: number;
+  /** Exact accepted request correlation; retained while queued. */
+  readonly directive?: {
+    readonly identity: DirectiveTurnIdentity;
+    readonly beforeAdmission: () => void;
+    readonly onAdmitted: (binding: DirectiveNativeBinding) => void;
+  };
 }
 
 /**
@@ -269,6 +276,7 @@ export interface PendingTurn {
   /** Single-writer owner the prompt was delivered under, when known. */
   readonly owner: string | null;
   readonly images?: PromptOptions['images'];
+  readonly directive?: PromptOptions['directive'];
 }
 
 /** Terminal evidence for the turn a prompt call settled. Captured by the
@@ -328,6 +336,9 @@ export interface AgentHandle {
    * (`promptWithTerminalVerdict` encodes that fallback).
    */
   promptWithVerdict?(text: string, options?: PromptOptions): Promise<PromptTurnVerdict>;
+  /** Adapter-owned safe native continuation: never replays a user prompt. */
+  inspectDirective?(identity: DirectiveTurnIdentity): DirectiveCheckpoint;
+  resumeDirective?(identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void): Promise<PromptTurnVerdict>;
   /**
    * Interrupt/redirect the live turn. Native on pi; runtimes declaring
    * steer 'queued' get the fallback wrapper's queue-until-idle behavior.

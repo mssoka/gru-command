@@ -682,20 +682,31 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
       .toBe('binned');
   });
 
+  function originalReceipt(jobId: string, kind: 'silas.rebrief' | 'job.delivered'): void {
+    const stored = api.listPendingRebriefs({ jobId });
+    api.bindPendingRebriefWorker({ ids: stored.map((row) => row.id), agentId: 'original-worker', sessionFile: null });
+    const marker = api.listPendingRebriefs({ jobId }).find((row) => row.kind === kind)!;
+    api.appendCustomEvent({ kind, jobId, agentId: 'original-worker', payload: {
+      minion_id: 'original-worker', agentId: 'original-worker', work_revision: marker.workRevision,
+      ...(marker.phaseId === null ? { marker_id: marker.id, payload_hash: marker.payloadHash } : { phase_id: marker.phaseId }),
+    } });
+    expect(api.pendingRebriefReceipt(marker)).not.toBeNull();
+  }
+
   it('refuses direct retirement of a fully landed terminal request without an audit', () => {
     const jobId = 'retire-spent-refusal';
     api.addJob({ id: jobId, repo: 'terminal-retirement', title: 'completed request' });
     api.setJobStatus(jobId, 'working');
     const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
-    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    originalReceipt(jobId, 'silas.rebrief');
+    originalReceipt(jobId, 'job.delivered');
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
     const result = api.retirePendingRebriefs({ jobId, reason: 'terminal', candidates: candidatesOf(markers) });
     expect(result).toMatchObject({ retired: [], skippedIds: [], refused: 'events-already-landed' });
-    expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
+    expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
     expect(api.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
-    expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+    expect(api.clearPendingRebriefsIfCurrentAndSettle(api.listPendingRebriefs({ jobId }))).toBe(true);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
   });
@@ -726,21 +737,30 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const jobId = 'settle-atomic-rollback';
     api.addJob({ id: jobId, repo: 'settlement-rollback', title: 'atomic' });
     api.setJobStatus(jobId, 'working');
-    const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId });
-    api.appendCustomEvent({ kind: 'job.delivered', jobId });
+    const intent = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
+    originalReceipt(jobId, 'silas.rebrief');
+    originalReceipt(jobId, 'job.delivered');
+    // Settlement receives the original ADMITTED generation snapshot,
+    // including its immutable minion binding, not pre-binding intent rows.
+    const markers = api.listPendingRebriefs({ jobId });
+    expect(markers.map((row) => row.id)).toEqual(intent.map((row) => row.id));
+    expect(markers.every((row) => row.agentId === 'original-worker' && api.pendingRebriefReceipt(row) !== null)).toBe(true);
+    const receipts = api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered']);
     db.handle.exec(`CREATE TRIGGER fail_rebrief_settlement BEFORE INSERT ON events
       WHEN NEW.kind = 'silas.rebrief-settled' BEGIN SELECT RAISE(ABORT, 'settlement blocked'); END`);
     try {
       expect(() => api.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/settlement blocked/u);
-      expect(api.listPendingRebriefs({ jobId }).map((row) => row.id)).toEqual(markers.map((row) => row.id));
+      expect(api.listPendingRebriefs({ jobId })).toEqual(markers);
       expect(api.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      expect(api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered'])).toEqual(receipts);
     } finally {
       db.handle.exec('DROP TRIGGER fail_rebrief_settlement');
     }
     expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+    expect(api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(false);
     expect(api.listPendingRebriefs({ jobId })).toHaveLength(0);
     expect(api.listJobEvents(jobId).filter((event) => event.kind === 'silas.rebrief-settled')).toHaveLength(1);
+    expect(api.listJobEventsByKinds(jobId, ['silas.rebrief', 'job.delivered'])).toEqual(receipts);
   });
 
   it('retirement audit insertion failure rolls back marker deletion, then a retry commits once', () => {
@@ -855,7 +875,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     });
     const phaseId = markers[0]!.phaseId;
     expect(phaseId).not.toBeNull();
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: phaseId } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
@@ -874,7 +894,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     const markers = api.beginPendingRebrief({
       jobId, note: 'n', briefing: 'b', handoff: { kind: 'gru-decision', decision: 'review' },
     });
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: markers[0]!.phaseId } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { phase_id: 'foreign' } });
     for (let i = 0; i < 1001; i++) api.appendCustomEvent({ kind: 'job.note', jobId, payload: { index: i } });
     api.setJobStatus(jobId, 'in-review');
@@ -893,7 +913,7 @@ describe('pending re-brief terminal retirement (ledger boundary)', () => {
     api.setJobStatus(jobId, 'working');
     const markers = api.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
     // The guarded `silas.rebrief` event lands; the delivery never does.
-    api.appendCustomEvent({ kind: 'silas.rebrief', jobId, payload: { minion_id: 'w', note: 'n' } });
+    originalReceipt(jobId, 'silas.rebrief');
     api.setJobStatus(jobId, 'in-review');
     api.setJobStatus(jobId, 'merged');
     const result = api.retirePendingRebriefs({ jobId, reason: 'job terminal', candidates: candidatesOf(markers) });

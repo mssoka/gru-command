@@ -3262,3 +3262,69 @@ describe('typed provider-response provenance (r1 #13) — pure parsers', () => {
     });
   });
 });
+
+it('restart recovery records actual admission while the native prompt remains pending', async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
+  const f = await fixture([{ deltas: ['pending'], hold }]);
+  const handle = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: 'approved-minion' });
+  const admissions: { readonly userEntryId: string | null; readonly sessionFile: string }[] = [];
+  const options = {
+    owner: 'silas-directive:pending-admission',
+    directive: {
+      identity: { requestId: 'pending-admission', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'approved-job', workRevision: 1, authorityEpoch: 0 },
+      beforeAdmission: () => {},
+      onAdmitted: (binding: { readonly userEntryId: string | null; readonly sessionFile: string }) => admissions.push(binding),
+    },
+  };
+  let settled = false;
+  const turn = handle.prompt('approved pending native request', options).then(() => { settled = true; });
+  try {
+    await waitFor(() => f.script.calls.length === 1, 'native provider call');
+    expect(settled).toBe(false);
+    // Baseline 32fc2f6 has no actual-admission observer:
+    // this ASSERTION reds there, with no new-module import/setup failure.
+    expect(admissions).toHaveLength(1);
+    expect(admissions[0]?.userEntryId).toBeTruthy();
+    const entries = readFileSync(handle.sessionFile!, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { id?: string; message?: { role?: string } });
+    expect(entries.find((entry) => entry.id === admissions[0]?.userEntryId)?.message?.role).toBe('user');
+  } finally {
+    release();
+    await turn;
+    await f.runtime.dispose();
+    f.store.dispose();
+  }
+});
+
+it('restart recovery continues a durable SDK user checkpoint without replaying its prompt', async () => {
+  const f = await fixture([{ deltas: ['completed from original checkpoint'] }]);
+  const { SessionManager } = await import('@earendil-works/pi-coding-agent');
+  const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const identity = { requestId: 'sdk-checkpoint', payloadHash: 'a'.repeat(64), contractSha256: 'c'.repeat(64), jobId: 'sdk-job', workRevision: 0, authorityEpoch: 0 };
+  const original = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: 'sdk-logical-minion' });
+  const file = original.sessionFile!;
+  let preflights = 0;
+  try {
+    // Prepare the adapter-owned exact association, then stop BEFORE the
+    // native user entry/provider command. The fixture subsequently writes
+    // that actual SDK entry, modeling the admission/product-callback crash
+    // window without erasing any native abort or completion evidence.
+    await expect(original.prompt('already accepted SDK request', { directive: { identity,
+      beforeAdmission: () => { if (++preflights > 1) throw new Error('fixture stops before native acceptance'); },
+      onAdmitted: () => { throw new Error('unexpected admission before the fixture checkpoint'); },
+    } })).rejects.toThrow('fixture stops before native acceptance');
+    expect(f.script.calls).toHaveLength(0);
+    await original.dispose();
+    const manager = SessionManager.open(file);
+    manager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'already accepted SDK request' }], timestamp: Date.now() });
+    const proof = inspectDirectiveCheckpoint(file, identity);
+    expect(proof.state).toBe('resumable');
+    if (proof.state !== 'resumable') throw new Error('SDK checkpoint fixture is not resumable');
+    const resumed = await f.runtime.spawn('minion', { cwd: f.workspace, agentId: original.id, resumeFile: file });
+    expect(resumed.id).toBe(original.id); expect(resumed.sessionFile).toBe(file);
+    const prompt = vi.spyOn(resumed, 'prompt');
+    expect(await resumed.resumeDirective!(identity, proof.checkpointId, () => {})).toMatchObject({ ok: true });
+    expect(prompt).not.toHaveBeenCalled(); expect(f.script.calls).toHaveLength(1);
+    expect(inspectDirectiveCheckpoint(file, identity)).toMatchObject({ state: 'terminal', ok: true });
+  } finally { await f.runtime.dispose(); f.store.dispose(); }
+});

@@ -638,3 +638,46 @@ decision id that held the incident, `duplicate` the incident key already
 woken, `failed` the bounded-retry exhaustion that escalated. The board
 wakes tracker and the #214 yield report (wakes/day, avoided share) read
 this stream; nothing avoids a wake silently.
+
+### Exact directive/rebrief restart progress
+
+Migration 25 (`directive-native-progress`) is additive/nullable. Historical
+request rows retain NULL request kind/contract SHA/native target/native admission/
+checkpoint/authority epoch: NULL is unprovable, not safe-to-replay. New
+requests bind kind, immutable contract snapshot, revision and native
+control epoch at acceptance. Exact native target and admission binding
+cannot be replaced; actual admission and per-turn terminal readback are
+adapter-owned, not inferred from spawn, turn-start, health or Promise
+fulfillment. Native association precedes the ledger callback, so restart
+can restore a lost ledger bind without repeating a consumed request.
+
+A durable recovery checkpoint claim has no expiry-based retry. Recovery
+judgment is a generation-fenced `restart-recovery` Gru obligation, settled
+only by correlated actual handoff/completion or a concrete reserved-owner
+decision. `silas.directive-recovery-decided` plus the retired request and
+fresh successor acceptance commit transactionally. Historical marker
+recovery uses `rebrief_recovery_decisions` for exact decision replay and
+records the marker pair in `silas.rebrief-retired` audit; the fresh
+`silas.rebrief-recovery-handoff` advances the control epoch. No historical
+outcomes, native transcripts, verification run IDs/partial UNKNOWN
+captures, or review readiness are rewritten. Native error/abort is not a
+successful delivery, and retirement is neither completion nor no-effect.
+See `DIRECTIVE-RECOVERY.md` for readback and authenticated decision fields.
+
+Current-approved revision/contract expectations are distinct from the
+predecessor generation/hash. Amendment acceptance fences the old native
+request through the control epoch. Only an amendment-only mismatch can
+permit exact retirement plus a fresh current-snapshot successor; stops,
+holds and other/unprovable control changes do not. Durable
+`silas.directive-producer-unknown` cleanup events continue to fence the
+lane across restart, until an actual adapter cessation query records the
+matching `silas.directive-producer-ceased`; disposal fulfillment alone
+cannot release that ownership or mint readiness.
+
+### Restart-recovery historical evidence and reserved-owner lineage
+
+Migration 25 adds nullable native progress and latest recovery pointers without inferring old facts. Immutable `silas.{directive,rebrief}-recovery-decided` events are uniquely indexed by exact subject + debt generation; pointers are compatibility/latest views, never mutable history. Audits retain canonical decision fingerprint, full exact marker/native subject snapshot, versioned legacy accepted/unproven receipt evidence and any concrete reserved-owner target binding.
+
+Legacy receipt SHA is server-computed and compared inside judgment transactions; clocks/watermarks alone are not correlation. Missing historical HEAD/revision are never supplied from current state. `silas.rebrief-control-closed` is non-executing administrative closure of proven-completed control with absent delivery facts: full immutable evidence remains; a concrete current-inspection obligation owns the next fresh directive/verification action. No historical delivery/current revision/verification/READY is emitted by closure.
+
+`ruling.recorded` with permission `fresh-current-approved-recovery-successor` and separate `silas.recovery-owner-stop-confirmed` are explicit owner-attributed records bound to transfer/subject/target generation/plan/current scope/stop lineage. Shared bearer attribution is not independently verified identity. Confirmation legally resumes/settles only its exact suspended real owner target; neither writer changes job parking, notification Ack, other holds or execution. Nongenuine target closure/plan changes create new suspended Gru incarnations, not permission. Original-generation decision replay remains immutable after subsequent incarnations.

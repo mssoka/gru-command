@@ -11,7 +11,7 @@ import { appendWorkerRules, WORKER_RULE_BLOCKS } from './worker-rules.js';
 import { withRevisionContinuation } from './work-revision.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
-import type { PromptTurnVerdict } from '../runtime/types.js';
+import type { PromptOptions, PromptTurnVerdict } from '../runtime/types.js';
 import type { WorktreePort } from './worktree-port.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
@@ -99,6 +99,11 @@ export async function routeFixDirectiveToMinion(
     signal: AbortSignal;
     /** Prompt owner tag (audit); defaults to the shared routing owner. */
     owner?: string;
+    readonly directiveTurn?: PromptOptions['directive'];
+    readonly beforeTurnSideEffect?: () => void;
+    readonly onPrepared?: (handle: AgentHandle) => void;
+    readonly onCleanup?: (handle: AgentHandle) => void;
+    readonly freshSession?: boolean;
     /** The job's effective contract (original briefing plus every accepted
      * amendment): what a FRESH fallback minion is briefed with. Absent =
      * the original briefing (no amendment surface at the caller). */
@@ -126,6 +131,7 @@ export async function routeFixDirectiveToMinion(
   admission?: 'none' | 'unknown';
 }> {
   const owner = input.owner ?? 'fix-directive';
+  input.beforeTurnSideEffect?.();
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
@@ -136,12 +142,23 @@ export async function routeFixDirectiveToMinion(
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
-  const minions = input.ledger
+  let minions = input.ledger
     .listImplementerMinions(input.jobId)
     // Defense-in-depth for issue #161's writer rule (the ledger pick
     // already excludes children): a tracked child is never the primary
     // lane worker even if a future writer lets one into the table shape.
     .filter((agent) => agent.parentage !== 'child');
+  if (input.freshSession === true) {
+    for (const minion of minions) {
+      const prior = input.registry.getHandle(minion.id);
+      if (prior === null) continue;
+      input.beforeTurnSideEffect?.();
+      try { await input.registry.disposeHandle(prior); } finally { input.onCleanup?.(prior); }
+      input.beforeTurnSideEffect?.();
+      if (prior.cessationEvidence?.() !== 'ceased') throw new Error(`prior minion ${prior.id} retains unproven producer ownership — rebrief refused`);
+    }
+    minions = [];
+  }
   let evictedSessionFile: string | null = null;
   for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
@@ -153,6 +170,7 @@ export async function routeFixDirectiveToMinion(
       // the other turn's outcome. Await before taking the worker slot — the
       // retry re-acquires its own slot and must not be blocked by ours.
       const pending = await settleRetries(input.retrySettlement, handle.id, input.signal);
+      input.beforeTurnSideEffect?.();
       if (pending === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'none' };
       let lease: PacingLease | null = null;
       if (input.workerGate !== undefined) {
@@ -170,8 +188,10 @@ export async function routeFixDirectiveToMinion(
         // prompt error eligible for retry recovery. It must still release
         // the pacing lease acquired after the asynchronous wait above.
         assertDirectiveJobActive(input.ledger, input.jobId);
+        input.beforeTurnSideEffect?.();
+        input.onPrepared?.(handle);
         try {
-          verdict = await racedPrompt(handle, directive, input.signal, owner);
+          verdict = await racedPrompt(handle, directive, input.signal, owner, input.directiveTurn);
         } catch (error) {
           promptError = error;
         }
@@ -261,29 +281,37 @@ export async function routeFixDirectiveToMinion(
     // (owner rule 4) — when the caller supplied one.
     const freshPrompt = (contract: string): string =>
       `Fresh minion re-brief for job ${input.jobId}. Effective contract (original briefing plus accepted amendments):\n${contract}\n\nCurrent fix directive:\n${compose(input.continuation?.freshNote ?? '')}`;
-    let prompt = resumeFile === null && input.contract != null ? freshPrompt(input.contract) : directive;
+    let prompt = resumeFile === null && input.contract != null && input.freshSession !== true ? freshPrompt(input.contract) : directive;
     try {
       assertDirectiveJobActive(input.ledger, input.jobId);
+      input.beforeTurnSideEffect?.();
       handle = await input.registry.spawn('minion', {
         cwd: lane.path, signal: input.signal,
         ...(resumeFile !== null ? { resumeFile } : {}),
         ...identity,
       });
     } catch (error) {
-      if (resumeFile === null || input.signal.aborted) throw error;
+      if (resumeFile === null || input.signal.aborted || input.directiveTurn !== undefined) throw error;
       const job = input.ledger.getJob(input.jobId);
       const contract = input.contract ?? job?.briefing ?? null;
       if (job == null || contract == null) {
         throw new Error(`cannot resume prior minion session for job ${input.jobId} and no original briefing is available to re-brief: ${String(error)}`);
       }
       assertDirectiveJobActive(input.ledger, input.jobId);
+      input.beforeTurnSideEffect?.();
       handle = await input.registry.spawn('minion', { cwd: lane.path, signal: input.signal, ...identity });
       // A fresh session has no memory of accepted amendments: brief it with
       // the EFFECTIVE contract (original + amendments), never the original
       // alone (owner rule 4).
       prompt = freshPrompt(contract);
     }
-    assertDirectiveJobActive(input.ledger, input.jobId);
+    try {
+      assertDirectiveJobActive(input.ledger, input.jobId);
+      input.beforeTurnSideEffect?.();
+    } catch (error) {
+      try { await input.registry.disposeHandle(handle); } finally { input.onCleanup?.(handle); }
+      throw error;
+    }
     let promptError: unknown = null;
     let verdict: PromptTurnVerdict | null = null;
     const spawnedHandle = handle;
@@ -311,8 +339,10 @@ export async function routeFixDirectiveToMinion(
       throw error;
     }
     assertDirectiveJobActive(input.ledger, input.jobId);
+    input.beforeTurnSideEffect?.();
+    input.onPrepared?.(handle);
     try {
-      verdict = await racedPrompt(handle, prompt, input.signal, owner);
+      verdict = await racedPrompt(handle, prompt, input.signal, owner, input.directiveTurn);
     } catch (error) {
       promptError = error;
     } finally {
@@ -346,7 +376,9 @@ export async function routeFixDirectiveToMinion(
     return { delivered: true, minionId: handle.id, ...verdictFields(evidence) };
   } finally {
     lease?.release();
-    if (handle !== null) await handle.dispose();
+    if (handle !== null) {
+      try { await handle.dispose(); } finally { input.onCleanup?.(handle); }
+    }
   }
 }
 
@@ -358,10 +390,11 @@ function racedPrompt(
   text: string,
   signal: AbortSignal,
   owner: string,
+  directive?: PromptOptions['directive'],
 ): Promise<PromptTurnVerdict> {
   if (signal.aborted) return Promise.reject(new Error('review operation aborted'));
   return Promise.race([
-    promptWithTerminalVerdict(handle, text, { owner }),
+    promptWithTerminalVerdict(handle, text, { owner, ...(directive !== undefined ? { directive } : {}) }),
     new Promise<never>((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(new Error('review operation aborted')), { once: true });
     }),
@@ -404,6 +437,8 @@ export function recordFollowUpDelivery(input: {
    * no revision. Review admission compares it against the job's required
    * revision (owner rule 2). */
   readonly workRevision: number;
+  /** Correlation for a genuinely completed historical request's lost delivery. */
+  readonly rebriefMarker?: { readonly id: string; readonly payloadHash: string };
 }): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null; readonly eventSeq: number } {
   if (!Number.isSafeInteger(input.workRevision) || input.workRevision < 0) {
     throw new Error(`delivery work revision must be a non-negative integer, got ${String(input.workRevision)}`);
@@ -432,6 +467,7 @@ export function recordFollowUpDelivery(input: {
       sha,
       ...(input.requestId !== undefined ? { request_id: input.requestId } : {}),
       ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
+      ...(input.rebriefMarker === undefined ? {} : { marker_id: input.rebriefMarker.id, payload_hash: input.rebriefMarker.payloadHash }),
       work_revision: input.workRevision,
     },
   });

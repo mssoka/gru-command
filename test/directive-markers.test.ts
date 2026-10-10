@@ -20,8 +20,9 @@ import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import type { DispatchService } from '../src/dispatch/service.js';
 import type { WaveRunner } from '../src/dispatch/perkins.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { DirectiveNativeFixture } from './helpers/directive-native-fixture.js';
 import type { Role } from '../src/config.js';
-import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
+import type { AgentCapabilities, AgentHandle, PromptOptions, SpawnOptions } from '../src/runtime/types.js';
 
 /**
  * Durable directive requests (phase 3 slice). Offline and deterministic:
@@ -436,15 +437,20 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     private handleFor(id: string): AgentHandle {
       const gate = (): Promise<void> | null => this.gate;
       const prompts = this.prompts;
+      let disposed = false;
+      const native = new DirectiveNativeFixture(join(tmpDir(), `${id}.jsonl`), id);
       return {
         role: 'minion',
         id,
-        sessionFile: null,
+        sessionFile: native.file,
         capabilities: FAKE_CAPABILITIES,
-        async prompt(text: string): Promise<void> {
+        inspectDirective: native.inspect,
+        async prompt(text: string, options?: PromptOptions): Promise<void> {
+          native.begin(text, options);
           prompts.push({ id, text });
           const pending = gate();
           if (pending !== null) await pending;
+          native.end();
         },
         async steer(): Promise<void> {},
         async followUp(): Promise<void> {},
@@ -454,7 +460,8 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
         health(): { state: 'idle'; lastActivity: null; sessionFile: null } {
           return { state: 'idle', lastActivity: null, sessionFile: null };
         },
-        async dispose(): Promise<void> {},
+        async dispose(): Promise<void> { disposed = true; },
+        cessationEvidence: () => disposed ? 'ceased' : 'unknown',
       };
     }
   }
@@ -478,8 +485,9 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     const registry = new FakeMinions();
     ledger.addJob({ id: 'job-h1', repo: 'r', title: 'Job H1' });
     ledger.setJobStatus('job-h1', 'working');
-    ledger.registerAgent({ id: 'minion-h1', role: 'minion', sessionFile: null, jobId: 'job-h1' });
     registry.register('minion-h1');
+    ledger.registerAgent({ id: 'minion-h1', role: 'minion', sessionFile: registry.getHandle('minion-h1')!.sessionFile, jobId: 'job-h1' });
+    ledger.setAgentState('minion-h1', 'idle');
     // The directive route touches the silas ops surface + ledger, and asks
     // the review owner whether a review holds the lane (owner rule 5): this
     // lane is never under review, so the writer gate is an idle double.
@@ -557,7 +565,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
       // Readback mid-flight: accepted, admission may already be recorded.
       const inflight = await get(h.port, 'req-http-1');
       expect(inflight.status).toBe(200);
-      expect(['dispatching', 'admitted']).toContain(inflight.body['state']);
+      expect(inflight.body['state']).toBe('admitted');
       release();
       const settled = await until(() => {
         const row = h.ledger.getDirective('req-http-1');

@@ -90,6 +90,8 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'perkins-whole-review.test.ts',
     workload: 'whole-review engine over real worktrees and git',
   },
+  { file: 'review-supersession.test.ts', workload: 'real git lane lifecycle and held resident review cancellation/cessation gates over HTTP' },
+  { file: 'restart-recovery-progress.test.ts', workload: 'persisted native/ledger recovery transactions over real git job lanes and controlled adapter lifecycles' },
   { file: 'rehearsal.test.ts', workload: 'package/build/install rehearsal with real npm' },
   { file: 'service-port-guard.test.ts', workload: 'real service spawns and port behavior' },
   { file: 'shutdown.test.ts', workload: 'real service signal lifecycle' },

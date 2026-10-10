@@ -9,7 +9,7 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
-import { realpathSync, readFileSync } from 'node:fs';
+import { realpathSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -44,6 +44,7 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
+import { DirectiveCheckpointError, inspectDirectiveCheckpoint, prepareDirectiveBinding, readDirectiveBinding, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -271,6 +272,7 @@ interface QueuedMessage {
   readonly text: string;
   readonly owner: string;
   readonly images?: PromptOptions['images'];
+  readonly directive?: PromptOptions['directive'];
   readonly resolve: (verdict: PromptTurnVerdict) => void;
   readonly reject: (error: Error) => void;
   /** Opt-in queued-wait cap (E7): rejects THIS caller when it fires. */
@@ -743,10 +745,20 @@ export class PiRuntime implements AgentRuntime {
       lockAcquired = true;
     }
     try {
-      const sessionManager =
+      let sessionManager =
         resumeFile !== undefined
           ? SessionManager.open(resumeFile, dirname(resumeFile), cwd)
           : SessionManager.create(cwd, this.store.sessionDirFor(role, cwd));
+      if (resumeFile === undefined) {
+        // The SDK delays fresh-file flushing until an assistant arrives.
+        // Initialize only its real header, then reopen through its public
+        // API so the first actual user acceptance is persisted immediately.
+        const file = sessionManager.getSessionFile();
+        const header = sessionManager.getHeader();
+        if (file === undefined || header === null) throw new DirectiveCheckpointError('Pi fresh session has no durable native identity');
+        writeFileSync(file, `${JSON.stringify(header)}\n`, { flag: 'wx', mode: 0o600 });
+        sessionManager = SessionManager.open(file, dirname(file), cwd);
+      }
       const isolatedSettings = reviewMode === undefined
         ? undefined
         : SettingsManager.inMemory({}, { projectTrusted: false });
@@ -853,7 +865,10 @@ export class PiRuntime implements AgentRuntime {
           this.activeFiles.delete(sessionFile);
         },
         this.heartbeatMs(),
-        ...(options.agentId !== undefined ? [options.agentId] : []),
+        options.agentId,
+        () => createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: session.agent.state.systemPrompt,
+          tools: session.agent.state.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters, implementation: tool.execute.toString() })).sort((a, b) => a.name.localeCompare(b.name)),
+          model: session.model ?? null })).digest('hex'),
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -934,6 +949,8 @@ export class PiAgentHandle implements AgentHandle {
   /** The text/images behind the live turn — supervision's resume snapshot. */
   private livePromptText: string | null = null;
   private livePromptImages: PromptOptions['images'] | undefined;
+  private liveDirective: PromptOptions['directive'] | undefined;
+  private directiveAdmissionError: unknown = null;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
    * settle capture reads it before `drain()` starts a successor. */
@@ -985,6 +1002,7 @@ export class PiAgentHandle implements AgentHandle {
       readonly sessionFile: string | undefined;
       /** The session's resolved model (provider identity for error events). */
       readonly model?: { readonly id: string; readonly provider: string } | undefined;
+      readonly agent?: { continue(): Promise<void> };
     },
     sessionFile: string,
     capabilities: AgentCapabilities,
@@ -998,6 +1016,7 @@ export class PiAgentHandle implements AgentHandle {
      * identity, which must exist before the session for a tracked child.
      * The session file and its lock stay SDK-minted. */
     agentId?: string,
+    private readonly directiveAuthorityManifest?: () => string,
   ) {
     this.role = role;
     // The SDK-minted session identity, retained separately from the
@@ -1040,6 +1059,7 @@ export class PiAgentHandle implements AgentHandle {
       text: this.livePromptText,
       owner: this.liveOwner,
       ...(this.livePromptImages !== undefined ? { images: this.livePromptImages } : {}),
+      ...(this.liveDirective !== undefined ? { directive: this.liveDirective } : {}),
     };
   };
 
@@ -1063,12 +1083,30 @@ export class PiAgentHandle implements AgentHandle {
     }
     const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null) {
-      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      return this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs, options.directive);
     }
-    const turn = this.runTurn(text, owner, options.images);
+    const turn = this.runTurn(text, owner, options.images, options.directive);
     await turn.done;
     return turn.verdict();
   }
+
+  inspectDirective = (identity: DirectiveTurnIdentity) => inspectDirectiveCheckpoint(this.sessionFile, identity);
+
+  resumeDirective = async (identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void): Promise<PromptTurnVerdict> => {
+    this.assertLive();
+    if (this.liveTurn !== null || this.queue.length > 0 || this.isCompacting() || !this.session.isIdle || this.session.agent === undefined) {
+      throw new DirectiveCheckpointError('native directive continuation requires an idle, unqueued, supported Pi session');
+    }
+    const proof = this.inspectDirective(identity);
+    if (proof.state !== 'resumable' || proof.checkpointId !== checkpointId || proof.binding.agentId !== this.id || proof.binding.sessionId !== this.nativeSessionId || proof.binding.authorityManifest !== this.directiveAuthorityManifest?.()) {
+      throw new DirectiveCheckpointError('native directive checkpoint changed or is not safely resumable');
+    }
+    beforeContinuation();
+    const turn = this.runTurn('', `directive-recovery:${identity.requestId}`, undefined,
+      { identity, beforeAdmission: beforeContinuation, onAdmitted: () => {} }, () => this.session.agent!.continue());
+    await turn.done;
+    return turn.verdict();
+  };
 
   async steer(text: string, options: PromptOptions = {}): Promise<void> {
     this.assertLive();
@@ -1076,15 +1114,15 @@ export class PiAgentHandle implements AgentHandle {
       throw new Error('agent session is compacting; steer requires an idle session');
     }
     const owner = options.owner ?? this.principal;
-    if (this.liveTurn !== null && owner === this.liveOwner) {
+    if (this.liveTurn !== null && owner === this.liveOwner && options.directive === undefined) {
       await this.session.steer(text, mapImages(options.images));
       return;
     }
     if (this.liveTurn !== null) {
-      await this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      await this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs, options.directive);
       return;
     }
-    await this.runTurn(text, owner, options.images).done;
+    await this.runTurn(text, owner, options.images, options.directive).done;
   }
 
   async followUp(text: string, options: PromptOptions = {}): Promise<void> {
@@ -1093,15 +1131,15 @@ export class PiAgentHandle implements AgentHandle {
       throw new Error('agent session is compacting; follow-up requires an idle session');
     }
     const owner = options.owner ?? this.principal;
-    if (this.liveTurn !== null && owner === this.liveOwner) {
+    if (this.liveTurn !== null && owner === this.liveOwner && options.directive === undefined) {
       await this.session.followUp(text, mapImages(options.images));
       return;
     }
     if (this.liveTurn !== null) {
-      await this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs);
+      await this.enqueue(text, owner, 'single-writer', options.images, options.timeoutMs, options.directive);
       return;
     }
-    await this.runTurn(text, owner, options.images).done;
+    await this.runTurn(text, owner, options.images, options.directive).done;
   }
 
   getContextUsage = (): ContextUsage | null => {
@@ -1308,6 +1346,7 @@ export class PiAgentHandle implements AgentHandle {
     reason: 'single-writer' | 'steer-unable',
     images?: PromptOptions['images'],
     timeoutMs?: number,
+    directive?: PromptOptions['directive'],
   ): Promise<PromptTurnVerdict> {
     this.emit({ type: 'queued', reason, owner });
     this.log('info', 'message queued (single-writer)', {
@@ -1320,6 +1359,7 @@ export class PiAgentHandle implements AgentHandle {
         text,
         owner,
         ...(images !== undefined ? { images } : {}),
+        ...(directive !== undefined ? { directive } : {}),
         resolve,
         reject,
         timer: null,
@@ -1345,17 +1385,32 @@ export class PiAgentHandle implements AgentHandle {
     text: string,
     owner: string,
     images?: PromptOptions['images'],
+    directive?: PromptOptions['directive'],
+    continuation?: () => Promise<void>,
   ): { readonly done: Promise<void>; readonly verdict: () => PromptTurnVerdict } {
+    if (directive !== undefined && continuation === undefined) {
+      directive.beforeAdmission();
+      prepareDirectiveBinding({ identity: directive.identity, runtime: 'pi', agentId: this.id, sessionId: this.nativeSessionId,
+        sessionFile: this.sessionFile, text, authorityManifest: this.directiveAuthorityManifest?.(), ...(images !== undefined ? { images } : {}) });
+    }
     this.liveOwner = owner;
     this.livePromptText = text;
     this.livePromptImages = images;
     this.liveTurnStop = { stopReason: null, error: null };
+    this.liveDirective = directive;
+    this.directiveAdmissionError = null;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
     if (mapped !== undefined) promptOptions['images'] = mapped;
+    if (directive !== undefined) promptOptions['preflightResult'] = (accepted: boolean) => {
+      if (!accepted) return;
+      directive.beforeAdmission();
+      if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
+        throw new DirectiveCheckpointError('native directive authority changed during prompt preparation');
+      }
+    };
     let captured: PromptTurnVerdict = { ok: true, error: null };
-    const turn = this.session
-      .prompt(text, promptOptions)
+    const turn = (continuation === undefined ? this.session.prompt(text, promptOptions) : continuation())
       .catch((error: unknown) => {
         // A turn rejected by dispose() must not overwrite the terminal
         // 'disposed' state with 'error'.
@@ -1405,6 +1460,16 @@ export class PiAgentHandle implements AgentHandle {
                         : `stopReason: ${terminal.stopReason}`) +
                       (terminal?.error == null ? ')' : `: ${terminal.error})`),
                   };
+          if (directive !== undefined) {
+            try {
+              const proof = inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
+              captured = proof.state === 'terminal' ? { ok: proof.ok, error: proof.error } : { ok: false, error: 'native correlated terminal proof unavailable' };
+            } catch (error) {
+              captured = { ok: false, error: `native correlated terminal proof unavailable: ${String(error)}` };
+            }
+            if (this.directiveAdmissionError !== null) captured = { ok: false, error: String(this.directiveAdmissionError) };
+          }
+          this.liveDirective = undefined;
           this.liveTurn = null;
           this.liveOwner = null;
           this.livePromptText = null;
@@ -1422,7 +1487,7 @@ export class PiAgentHandle implements AgentHandle {
       const next = this.queue.shift()!;
       if (next.timer !== null) clearTimeout(next.timer);
       try {
-        const turn = this.runTurn(next.text, next.owner, next.images);
+        const turn = this.runTurn(next.text, next.owner, next.images, next.directive);
         await turn.done;
         next.resolve(turn.verdict());
       } catch (error) {
@@ -1514,6 +1579,18 @@ export class PiAgentHandle implements AgentHandle {
         return;
       case 'message_end': {
         const msg = e['message'] as Record<string, unknown> | undefined;
+        if (msg?.['role'] === 'user' && this.liveDirective !== undefined) {
+          const directive = this.liveDirective;
+          // Pi emits before its synchronous append. The microtask reads the
+          // real persisted native user entry, fsyncs it, then calls the host.
+          queueMicrotask(() => {
+            try {
+              inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
+              const binding = readDirectiveBinding(this.sessionFile, directive.identity.requestId);
+              if (binding?.userEntryId != null) directive.onAdmitted(binding);
+            } catch (error) { this.directiveAdmissionError = error; }
+          });
+        }
         if (msg !== undefined && msg['role'] === 'assistant') {
           // Per-turn terminal evidence for the live prompt: every assistant
           // message updates it; the LAST one decides success vs failure.

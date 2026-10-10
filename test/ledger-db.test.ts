@@ -176,3 +176,16 @@ describe('ledger db + migration runner', () => {
     db.close();
   });
 });
+
+it('directive native progress migration preserves legacy truth without inventing request authority or admission', () => {
+  const dir = tmpDir();
+  const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, 24) });
+  old.handle.prepare("INSERT INTO jobs (id, repo, title, status, created_at, updated_at) VALUES ('legacy-progress', 'r', 't', 'working', 't', 't')").run();
+  old.handle.prepare("INSERT INTO pending_directives (request_id, job_id, payload, payload_hash, state, baseline_seq, attempts, created_at, updated_at) VALUES ('legacy-request', 'legacy-progress', '{}', 'hash', 'dispatching', 0, 0, 't', 't')").run();
+  old.close();
+  const upgraded = new LedgerDb(dir);
+  expect(upgraded.handle.prepare('SELECT state, authority_epoch, native_binding, recovery_checkpoint, recovery_decision, request_kind FROM pending_directives WHERE request_id = ?').get('legacy-request')).toMatchObject({
+    state: 'dispatching', authority_epoch: null, native_binding: null, recovery_checkpoint: null, recovery_decision: null, request_kind: null,
+  });
+  upgraded.close();
+});
