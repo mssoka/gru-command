@@ -8774,7 +8774,7 @@ describe('formal GitHub verdict publication from native judgments', () => {
   let formalRunnerSeq = 0;
   function runner(
     fix: Awaited<ReturnType<typeof scenario>>,
-    poster: unknown,
+    poster: VerdictPoster,
     finding?: ReturnType<typeof groundedFinding>,
     overrides: Record<string, unknown> = {},
     escalations?: string[],
@@ -8833,7 +8833,7 @@ describe('formal GitHub verdict publication from native judgments', () => {
     const outcome = asWave(await runner(fix, poster, undefined, {
       // Every revisited prior (the round-2 blocker AND its carried round-1
       // warning, both cited on the corrected file) is dispositioned fixed.
-      priorDisposition: (priors) => priors.map((_entry, index) => ({ prior_index: index, status: 'fixed' as const, note: 'corrected in this delta' })),
+      priorDisposition: (priors: readonly unknown[]) => priors.map((_entry: unknown, index: number) => ({ prior_index: index, status: 'fixed' as const, note: 'corrected in this delta' })),
     }, escalations).runRound({ jobId: 'job-formal-lifecycle' }));
     const rounds = fix.ledger.listRounds('job-formal-lifecycle');
     expect(rounds, escalations.join('\n')).toHaveLength(4);
