@@ -77,6 +77,7 @@ import {
 import {
   appendRecordedVerification,
   renderRecordedVerification,
+  selectNewestBoundVerification,
 } from '../verify/evidence.js';
 import {
   PrHeadVerificationError,
@@ -4146,13 +4147,18 @@ export class WaveRunner {
         // R7-5: the newest run BINDING THIS TARGET governs — a newer
         // completed run for a DIFFERENT sha must not erase an older clean
         // run for the reviewed head (and never fabricates one).
-        // R8-2: KIND-SCOPED history with a loud window bound — the search
-        // for the newest binding run cannot be truncated by unrelated job
-        // events, and an over-window history fails loud instead of
-        // masquerading as absence.
-        const bindingVerification = this.opts.ledger
-          .listJobVerificationCompleted(job.id)
-          .find((event) => renderRecordedVerification(event, targetSha) !== null) ?? null;
+        // R8-2 (corrected, j-1594): the KIND-SCOPED history is read in
+        // bounded keyset pages over the COMPLETE record with NO lifetime
+        // ceiling — a job with more completed runs than one page stays
+        // reviewable. The scan stops at the newest binding run; absence is
+        // rendered only after the history is exhausted.
+        // The iterable is newest-first: the ledger read orders by seq DESC
+        // (the selector takes the FIRST binding element, so ordering governs
+        // which run is "newest").
+        const bindingVerification = selectNewestBoundVerification(
+          this.opts.ledger.iterateJobVerificationCompleted(job.id),
+          targetSha,
+        );
         const evidence = renderRecordedVerification(bindingVerification, targetSha);
         // Verification evidence is ALWAYS explicit (gh-169): a binding run
         // renders its block; no binding run freezes the UNAVAILABLE
