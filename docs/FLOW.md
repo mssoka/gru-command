@@ -41,10 +41,11 @@ worker identity. Older jobs without it use a shortened title on minion cards:
    'local-head-fallback'` recorded, never silently). Status `working`.
 3. **Minion** — a fresh agent session spawned with `cwd` = the worktree
    (SPEC ruling 17: dispatch cwd is the PROJECT root on every runtime;
-   the minion discovers the project's own skills and BMAD settings from
-   there). The lane is bound to the GC-managed BMAD runtime on its first
-   minion spawn and keeps that binding for its life
-   ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)). The briefing prompt is
+   project conventions remain applicable there). New jobs receive the
+   GC-owned workflow plus explicit registered job/private artifact context;
+   ambient BMAD does not select execution settings. The lane keeps its exact
+   binding for its life; historical BMAD jobs retain their original contract
+   ([GC-WORKFLOWS.md](./GC-WORKFLOWS.md)). The briefing prompt is
    delivered as the session's first turn.
 
 Failures are loud and leave no half lanes: a spawn failure sweeps the
@@ -274,8 +275,9 @@ route:
 4. **Review policy enabled** — `[review] enabled = true` in config.
 
 All legs pass → Perkins review (the gate). Any leg fails → the request
-routes to the bmad-review skill **if installed** (never bundled with the
-product). The fallback carries FULL GATE semantics: the session returns
+routes to GC's verified owned fallback review helper. The stable API route is
+still `bmad-review-fallback`; no external BMAD skill is discovered or required.
+The fallback carries FULL GATE semantics: the session returns
 findings; the host triages them (release-safety categories — correctness,
 security, data loss, broken builds, and related crash/regression/
 vulnerability/injection/secret-leak tags — are BLOCKERS; the rest are
@@ -284,16 +286,17 @@ session, the lane's working diff is re-read, and the gate re-reviews after
 fixes (bounded rounds); 0 blockers = PASS that clears review/fix routing
 only — the fallback PASS is the review gate of record for routing and
 fixes, never a Perkins READY and never merge clearance. The
-fallback session is a full-capability minion by design — it must load the
-ambient BMAD skill — and is instructed never to gate, approve, merge, or
+fallback session is a bounded minion report task with read tools and one JSON
+report write, without build-workflow injection, implementation edit or shell tools.
+It reads the owned helper and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
 never records a Perkins verdict and never moves merge authority: only
 required final CI plus an exact-head Perkins READY can authorize a final
 PR merge, and the owner performs every final PR merge, everywhere — this
 repository included. A failed pre-flight is never a silent downgrade — the failed
-legs, their remediations, and both recovery options (install the global
-bmad-review skill, which the GC-managed BMAD runtime does not bundle /
-restore Perkins) are escalated and recorded on the job as
+legs, their remediations, and both recovery options (restore the exact retained
+owned package/context or repair a new GC install / restore Perkins) are escalated
+and recorded on the job as
 `job.fallback-review` events. GitLab merge requests get the same SHA-bound
 delivery discipline as GitHub (the frozen HEAD is verified before a note is
 posted; a PR's recorded base is refreshed into the delivery record rather
@@ -540,12 +543,12 @@ ledger surfaces remain runtime-agnostic).
 
 ## 4f. Minion-owned build cycle (owner ruling 2026-10-02)
 
-Implementation briefings hand the worker the whole job. The minion selects
-the task-relevant BMAD skills by capability from its session's actual
-skill catalog/metadata (the lane-bound GC-managed BMAD runtime plus the
-project's own skills) and follows their current workflows —
-names and workflow structure change between BMAD versions, so brief by
-the task, never by a fixed skill name. The selected workflow's built-in
+Implementation briefings hand the worker the whole job. The minion follows the
+GC-owned workflow and explicit registered job context named in its system prompt.
+Private operational material stays under the configured GC data home; approved
+portable knowledge stays in the assigned `gru-output/`. Project conventions remain
+applicable, but ambient BMAD skills/config cannot select GC execution authority.
+Historical lane bindings and output references remain unchanged. The workflow's built-in
 review runs on fresh, context-free reviewer contexts the minion
 commissions as separately tracked review jobs — each with its own session
 and worktree, a read-only brief, and the immutable diff head; never an

@@ -47,21 +47,23 @@ plain and factual.
   compiled product. Perkins reviews never fall back to source files,
   ambient skills, extensions, settings, or general shell/task tools;
   missing, escaping, or tampered assets fail closed. A failed capability
-  pre-flight routes the review request to the installed bmad-review
-  fallback gate instead — never a silent downgrade.
+  pre-flight routes the review request to the GC-owned fallback review
+  helper instead — never a silent downgrade. Its PASS is not native READY;
+  a missing retained package/context blocks with restoration guidance.
 
 ## Minion-owned build cycle (owner ruling 2026-10-02)
 
 Implementation briefings hand the worker the whole job — goal,
-boundaries, acceptance, verification — and the worker selects the
-task-relevant BMAD skills from its session's actual skill catalog (the
-Gru Command-managed BMAD runtime bound to its lane, plus the project's
-own skills) and follows their current workflows: the workflow's built-in review on fresh
+boundaries, acceptance, verification — and the worker follows the
+GC-owned build workflow and explicit project/job artifact context bound to
+its registered lane. Project conventions still apply; ambient BMAD skills
+or configuration never replace GC execution authority. Historical lanes
+retain their recorded workflow and paths. The workflow's built-in review uses fresh
 independent reviewer contexts (separately tracked review jobs the worker
 commissions through the service dispatch surface, each with its own
 session and worktree), finding resolution, verification, and the
 authorized ordinary PR. Do not pull that work back between phases, never
-demand a fixed skill name in a briefing, and do not commission a
+substitute a project skill for the bound workflow, and do not commission a
 supplementary review duplicating the built-in one. Those reviewer jobs
 share the worker budget with the lane that commissions them: a
 worker-reported nested-admission capability gap (a reviewer dispatch that

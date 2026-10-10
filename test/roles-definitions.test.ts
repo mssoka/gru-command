@@ -55,7 +55,7 @@ describe('role definitions (E8)', () => {
       'ambient skills',
       'general shell/task tools',
       'tampered assets fail closed',
-      'bmad-review',
+      'gc-owned fallback review',
       'never a silent downgrade',
     ]) expect(silas).toContain(clause);
     expect(silas).toContain('service-restart clean abort');
@@ -187,12 +187,13 @@ describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability ame
   const minion = ROLE_DEFINITIONS.minion.systemPrompt.replace(/\s+/gu, ' ');
   const silas = ROLE_DEFINITIONS.silas.systemPrompt.replace(/\s+/gu, ' ');
 
-  it('the worker selects the installed build-workflow skill by capability and owns the cycle end to end', () => {
-    expect(minion).toContain("your session's actual skill catalog/metadata");
-    // Issue #283: the catalog carries the lane-bound GC-managed runtime.
-    expect(minion).toContain('the Gru Command-managed BMAD runtime bound to your lane');
-    expect(minion).toContain('task-relevant BMAD skills by capability');
-    expect(minion).toContain('never by a fixed skill name, a remembered file path, or a hand-maintained rename table');
+  it('the worker follows the bound GC-owned workflow and owns the cycle end to end', () => {
+    expect(minion).toContain('GC-owned build workflow bound to your registered lane');
+    expect(minion).toContain('explicit project/job artifact context');
+    expect(minion).toContain('takes precedence over same-named copies');
+    expect(minion).toContain('approved portable specs/decisions/docs');
+    expect(minion).toContain('`gru-output/`');
+    expect(minion).toContain('Honor project AGENTS.md');
     expect(minion).toContain('You own the');
     expect(minion).toContain('no per-phase hand-back and no source-only hand-back');
     // The literal fixed-name requirement is retired (j-761): no bmad-* token
@@ -216,16 +217,17 @@ describe('build-workflow playbook (owner ruling 2026-10-02; j-761 capability ame
     expect(flatMinion).toContain("makes your job each reviewer's commissioner");
     expect(flatMinion).toContain('POST /api/jobs/<review job id>/disposition');
     expect(minion).toContain('an inline self-review is not a substitute');
-    // The loud missing-capability stop names the supported provisioning path.
-    expect(minion).toContain('"GC-managed BMAD runtime" section');
+    expect(minion).toContain('Restore the retained package for the same worker/lane');
+    expect(minion).toContain('not BMAD onboarding');
+    expect(minion).not.toContain("setup wizard's BMAD provisioning step");
     expect(minion).not.toContain('pi -p');
     expect(minion).not.toContain('claude -p');
   });
 
-  it('the ops persona carries the minion-owned build cycle without fixed names', () => {
+  it('the ops persona carries the minion-owned GC build cycle', () => {
     expect(silas).toContain('Minion-owned build cycle');
-    expect(silas).toContain("selects the task-relevant BMAD skills from its session's actual skill catalog");
-    expect(silas).toContain('never demand a fixed skill name');
+    expect(silas).toContain('GC-owned build workflow and explicit project/job artifact context');
+    expect(silas).toContain('Do not pull that work back between phases');
     expect(silas).toContain('"deliverable": "review"');
     expect(silas).toContain('exact-final-head READY');
     expect(silas).not.toContain('bmad-build');

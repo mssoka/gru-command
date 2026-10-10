@@ -341,7 +341,9 @@ async function run() {
   }
   recordInvocation(prompt, images);
 
-  if (prompt.includes('crash')) {
+  // The real fallback brief names the release-safety category "crash"; that
+  // structured task is not the test double's deliberate crash sentinel.
+  if (prompt.includes('crash') && !prompt.includes('gc_submit_fallback_findings({ findings: [...] })')) {
     process.stderr.write('double crash requested\n');
     process.exit(2);
   }
@@ -420,6 +422,22 @@ async function run() {
       }
       if (process.env['CLAUDE_DOUBLE_COMPACT_EXIT_ERROR'] === '1') process.exitCode = 7;
     }
+    return;
+  }
+
+  if (prompt.includes('gc_submit_fallback_findings({ findings: [...] })')) {
+    const configFile = flagValue('--mcp-config');
+    if (configFile === undefined) throw new Error('fallback prompt requires its scoped MCP report tool');
+    const session = await mcpSession(configFile);
+    try {
+      const listed = await session.call('tools/list', {});
+      const names = listed.result.tools.map((tool) => tool.name);
+      if (names.length !== 1 || names[0] !== 'gc_submit_fallback_findings') throw new Error('fallback exposes unexpected native authority');
+      const response = await session.call('tools/call', { name: names[0], arguments: { findings: [] } });
+      if (!mcpToolText(response).includes('captured by the host')) throw new Error('fallback submission failed');
+      await emitTextTurn('DONE');
+      out(resultFrame('DONE', false));
+    } finally { session.close(); }
     return;
   }
 

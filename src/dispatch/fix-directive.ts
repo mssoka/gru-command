@@ -24,20 +24,20 @@ import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement 
  */
 
 /** The product-owned identity + GC-mediated child tools for a
- * (re)dispatched parent session (issue #161). A resumed row keeps its id
- * (one logical worker, one identity); a fresh replacement mints one. */
+ * (re)dispatched parent session (issue #161). A fresh physical session
+ * still belongs to its recorded logical minion; only a job without an
+ * implementer record mints an identity. */
 function parentIdentitySpawnOptions(
   input: {
     readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
-    readonly ledger: Pick<LedgerApi, 'listAgents'>;
+    readonly ledger: Pick<LedgerApi, 'listImplementerMinions'>;
   },
+  jobId: string,
   resumeFile: string | null,
 ): Pick<SpawnOptions, 'agentId' | 'nativeTools'> {
-  const resumed =
-    resumeFile === null
-      ? undefined
-      : input.ledger.listAgents().find((agent) => agent.sessionFile === resumeFile);
-  const agentId = resumed?.id ?? `minion_${randomUUID()}`;
+  const implementers = input.ledger.listImplementerMinions(jobId);
+  const original = implementers.find((agent) => resumeFile !== null && agent.sessionFile === resumeFile) ?? implementers[0];
+  const agentId = original?.id ?? `minion_${randomUUID()}`;
   const nativeTools = input.parentTools?.(agentId) ?? [];
   return {
     agentId,
@@ -253,9 +253,9 @@ export async function routeFixDirectiveToMinion(
       : null;
     const resumeFile = evictedSessionFile ?? fallback;
     // Issue #161: the (re)dispatched parent keeps one product-owned id
-    // (the resumed row's id, else a fresh one) and receives the GC-mediated
+    // (its recorded row's id, even without a transcript) and receives the
     // child tools bound to it — re-briefed parents stay able to commission.
-    const identity = parentIdentitySpawnOptions(input, resumeFile);
+    const identity = parentIdentitySpawnOptions(input, input.jobId, resumeFile);
     // A brand-new session (nothing to resume) has no memory of the contract:
     // brief it with the effective contract like the resume fallback below
     // (owner rule 4) — when the caller supplied one.
@@ -585,9 +585,10 @@ export async function rebriefFreshMinion(
     }
     input.beforeTurnSideEffect?.();
     // Issue #161: a fresh/resumed re-brief parent keeps a product-owned id
-    // (the resumed row's id, else a fresh one) plus the child tools.
+    // (its recorded row's id, even without a transcript) plus child tools.
     const identity = parentIdentitySpawnOptions(
       input,
+      input.jobId,
       input.resumeFile !== undefined && input.resumeFile !== null ? input.resumeFile : null,
     );
     const handle = await input.registry.spawn('minion', {

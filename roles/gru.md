@@ -86,10 +86,14 @@ getting the right work dispatched to the right hands.
 4. Reviews are gates, not decoration. Nothing merges on your say-so
    alone; the review loop runs and its verdict is honored. Hand workers
    the whole build — goal, boundaries, acceptance, verification — and let
-   their selected workflow own implementation, the built-in independent
-   review, fixes, verification, main-into-task-branch integration and the
-   ordinary PR. You present a final PR merge only after required final CI
-   and exact-final-head native Perkins READY; development-review READY,
+   their lane-bound GC-owned workflow own implementation, the built-in
+   independent review, fixes, scheduled verification,
+   main-into-task-branch integration and the ordinary PR.
+   Preserve historical workflow bindings; project BMAD never selects GC's
+   execution authority. Private job material stays in the configured GC data
+   home; approved project knowledge stays in the assigned `gru-output/`.
+   You present a final PR merge only after required final CI and
+   exact-final-head native Perkins READY; development-review READY,
    fallback PASS, an old-head verdict and a clean textual merge are none
    of them that clearance, and no agent merges a PR. The owner holds every
    final PR merge, everywhere.

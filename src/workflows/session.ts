@@ -1,0 +1,173 @@
+import { join } from 'node:path';
+import { createArtifactContext } from '../artifacts/context.js';
+import { materializeBmadRuntime, PACKAGE_ROOT, readBmadRuntimeBinding } from '../bmad/runtime.js';
+import type { WorktreeLane, WorktreePort } from '../dispatch/worktree-port.js';
+import type { AgentRecord, JobRecord } from '../ledger/api.js';
+import type { ManagedSkillSet, ManagedWorkflowSession, SpawnOptions } from '../runtime/types.js';
+import { WORKFLOW_SOURCE } from './manifest.js';
+import { verifiedWorkflowResourceText, createWorkflowRuntimeBinder, loadBundledWorkflowRuntime, renderWorkflow, validateWorkflowContext, workflowRuntimeForInvocation, type WorkflowContext } from './runtime.js';
+
+export class WorkflowSessionError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = 'WorkflowSessionError';
+  }
+}
+
+type WorkflowAgent = Pick<AgentRecord, 'id' | 'jobId' | 'sessionFile' | 'role' | 'parentage'>;
+
+interface WorkflowOwners {
+  getAgent(id: string): WorkflowAgent | null;
+  listAgents(): readonly WorkflowAgent[];
+}
+
+/** One ownership interpretation for both assigned cwd and logical identity. */
+function recordedWorkflowAgent(options: SpawnOptions, ledger: WorkflowOwners): WorkflowAgent | null {
+  const resumed = options.resumeFile === undefined ? [] : ledger.listAgents().filter((agent) => agent.sessionFile === options.resumeFile);
+  if (resumed.length > 1) throw new WorkflowSessionError(`ambiguous workflow assignment for session ${options.resumeFile}; repair the agent records`);
+  if (options.resumeFile !== undefined && resumed.length === 0) {
+    throw new WorkflowSessionError(`workflow resume requires the registered session owner for ${options.resumeFile}; restore its agent record before resuming`);
+  }
+  const named = options.agentId === undefined ? null : ledger.getAgent(options.agentId);
+  if (resumed[0] !== undefined && options.agentId !== undefined && options.agentId !== resumed[0].id) {
+    throw new WorkflowSessionError('workflow resume identity conflicts with the registered session owner');
+  }
+  return named ?? resumed[0] ?? null;
+}
+
+/** Read only the existing assignment records, never derive a job from a basename.
+ * A supervised resume with no cwd recovers the same lane through its session row. */
+export function registeredWorkflowLane(
+  options: SpawnOptions,
+  worktrees: Pick<WorktreePort, 'getWorktree' | 'listWorktrees'>,
+  ledger: WorkflowOwners,
+): WorktreeLane | null {
+  const agent = recordedWorkflowAgent(options, ledger);
+  const assigned = agent === undefined || agent === null ? null
+    : worktrees.getWorktree(agent.id) ?? (agent.jobId === null || agent.parentage === 'child' ? null : worktrees.getWorktree(agent.jobId));
+  if (assigned !== null) {
+    if (assigned.jobId !== agent?.jobId) {
+      throw new WorkflowSessionError(`registered workflow lane ${assigned.id} does not belong to worker ${agent?.id}; repair its job/worktree ownership records`);
+    }
+    if (options.cwd !== undefined && options.cwd !== assigned.path) {
+      throw new WorkflowSessionError(`workflow cwd conflicts with registered assignment ${assigned.id}: ${options.cwd}`);
+    }
+    return assigned;
+  }
+  if (agent !== undefined && agent !== null) return null; // never redirect a known owner to another lane
+  if (options.cwd === undefined) return null;
+  const candidates = worktrees.listWorktrees().filter((lane) => lane.path === options.cwd && lane.status !== 'swept');
+  if (candidates.length > 1) throw new WorkflowSessionError(`ambiguous registered workflow lane at ${options.cwd}`);
+  const candidate = candidates[0];
+  if (candidate?.kind === 'job') {
+    if (ledger.listAgents().some((owner) => owner.jobId === candidate.jobId && owner.role === 'minion' && owner.parentage !== 'child')) {
+      throw new WorkflowSessionError(`registered job ${candidate.jobId} already has a logical worker; resume its recorded session/identity instead of attaching an unknown worker by cwd`);
+    }
+  }
+  return candidate ?? null;
+}
+
+/** Production build selection: #292 immutable resources + #293 registered storage.
+ * Bounded child/report tasks are not another top-level implementation workflow. */
+export function createWorkflowSessionBinder(
+  dataDir: string,
+  laneFor: (options: SpawnOptions) => WorktreeLane | null,
+  packageRoot = PACKAGE_ROOT,
+  runsBuildFor: (lane: WorktreeLane) => boolean = () => true,
+  agentFor?: (options: SpawnOptions) => string | undefined,
+): (options: SpawnOptions) => ManagedWorkflowSession {
+  const storeRoot = join(dataDir, 'bmad-runtime'); // retain the historical store and private Git binding
+  const bind = createWorkflowRuntimeBinder(storeRoot, packageRoot);
+  return (options) => {
+    const lane = laneFor(options);
+    if (lane === null || lane.status === 'swept') {
+      throw new WorkflowSessionError(`GC workflow requires the live registered assignment for ${options.cwd ?? options.resumeFile ?? options.agentId ?? 'this minion'}; restore its job/worktree records before resuming`);
+    }
+    const agentId = agentFor?.(options) ?? options.agentId;
+    const assignment = { cwd: lane.path, ...(agentId !== undefined ? { agentId } : {}) };
+    const reference = readBmadRuntimeBinding(lane.path, storeRoot);
+    let retained: ManagedSkillSet | undefined;
+    if (reference !== null) {
+      try {
+        retained = bind(lane.path);
+      } catch (error) {
+        throw new WorkflowSessionError(`job ${lane.jobId} retains workflow ${reference.id} at ${reference.dir}; restore that exact retained package and retry the same worker/lane. ${String(error)}`, error);
+      }
+      // Historical bindings precede the NEW-job build/report routing decision.
+      if (retained.source !== WORKFLOW_SOURCE) return { ...assignment, managedSkills: retained };
+    }
+    if (lane.kind !== 'job' || !runsBuildFor(lane) || (options.roleTools !== undefined && !options.roleTools.includes('edit'))) {
+      return assignment;
+    }
+    // Select read-only, then validate paths/context and render before publishing
+    // a first lane binding. Failed initialization must not pin a never-started job.
+    const bundle = workflowRuntimeForInvocation(lane.path, storeRoot, packageRoot);
+    const artifacts = createArtifactContext({ dataDir, worktree: lane,
+      workflow: { id: bundle.id, sha256: bundle.contentSha256 } });
+    const context: WorkflowContext = {
+      projectId: artifacts.projectKey, projectRoot: lane.repoPath, worktreeRoot: lane.path,
+      jobId: artifacts.jobId, artifactRoot: artifacts.operationalDirectory, knowledgeRoot: artifacts.knowledgeDirectory,
+    };
+    validateWorkflowContext(bundle, context, [join(storeRoot, bundle.dirName)]);
+    const invocation = renderWorkflow(materializeBmadRuntime(bundle, storeRoot), context);
+    artifacts.writeOperational({ path: 'workflow-context.json', contents: `${JSON.stringify(context, null, 2)}\n`, sources: [] });
+    const managed = retained ?? bind(lane.path);
+    if (managed.runtimeId !== bundle.id || managed.contentSha256 !== bundle.contentSha256) {
+      throw new WorkflowSessionError(`job ${lane.jobId} acquired a conflicting workflow binding during initialization; restore its exact artifact/runtime records before retrying`);
+    }
+    return { ...assignment, managedSkills: { ...managed, workflow: {
+      context, invocation, contextFile: join(context.artifactRoot, 'workflow-context.json'),
+    } } };
+  };
+}
+
+/** The fallback uses a single owned adversarial helper, not the build/review
+ * orchestrator or an ambient bmad-review skill. Legacy build bindings stay intact. */
+export function ownedFallbackReviewResources(
+  session: ManagedWorkflowSession, dataDir: string, packageRoot = PACKAGE_ROOT,
+): { readonly skillPath: string; readonly skillContent: string; readonly artifactRoot: string } {
+  const managed = session.managedSkills;
+  const workflow = managed?.workflow;
+  const resource = 'skills/gc-build/review-prompts/adversarial.md';
+  if (workflow !== undefined && managed !== undefined) return {
+    skillPath: join(workflow.invocation.snapshotDir, resource),
+    skillContent: verifiedWorkflowResourceText({ id: managed.runtimeId, dir: managed.root, contentSha256: managed.contentSha256 }, resource),
+    artifactRoot: workflow.context.artifactRoot,
+  };
+  const runtime = materializeBmadRuntime(loadBundledWorkflowRuntime(packageRoot), join(dataDir, 'bmad-runtime'));
+  return { skillPath: join(runtime.dir, resource), skillContent: verifiedWorkflowResourceText(runtime, resource), artifactRoot: join(dataDir, 'reviews') };
+}
+
+/** Shared production wiring, exercised directly by dispatch/runtime/gate proofs.
+ * The lazy ledger accessor preserves boot order without copying assignment rules. */
+export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<WorktreePort, 'getWorktree' | 'listWorktrees'> & {
+  getAgent(id: string): WorkflowAgent | null;
+  listAgents(): readonly WorkflowAgent[];
+  getJob(id: string): Pick<JobRecord, 'id' | 'deliverable'> | null;
+}, packageRoot = PACKAGE_ROOT): {
+  readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
+  readonly workflowBuildFor: (lane: WorktreeLane) => boolean;
+  readonly workflowAgentFor: (options: SpawnOptions) => string | undefined;
+  readonly resolveReviewResources: (jobId: string) => { readonly skillPath: string; readonly skillContent: string; readonly artifactRoot: string };
+} {
+  const workflowLaneFor = (options: SpawnOptions): WorktreeLane | null => registeredWorkflowLane(options, records(), records());
+  return {
+    workflowLaneFor,
+    workflowAgentFor: (options) => recordedWorkflowAgent(options, records())?.id,
+    workflowBuildFor: (lane) => {
+      const job = records().getJob(lane.id);
+      if (job === null) throw new WorkflowSessionError(`GC workflow requires the registered job record for ${lane.id}`);
+      return job.deliverable === null || job.deliverable === 'pr';
+    },
+    resolveReviewResources: (jobId) => {
+      const lane = records().getWorktree(jobId);
+      if (lane === null || lane.kind !== 'job' || lane.jobId !== jobId || lane.status === 'swept') {
+        throw new WorkflowSessionError(`GC fallback review requires the live registered job worktree for ${jobId}`);
+      }
+      // Resource selection is authorized by the explicit registered JOB, not
+      // permission to spawn a replacement implementation worker by its cwd.
+      const session = createWorkflowSessionBinder(dataDir, () => lane, packageRoot)({ cwd: lane.path });
+      return ownedFallbackReviewResources(session, dataDir, packageRoot);
+    },
+  };
+}

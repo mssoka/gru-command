@@ -10,6 +10,8 @@
     "resources/perkins-code-review/policy.json",
     "resources/silas-skills/",
     "resources/bmad-runtime/",
+    "resources/gc-workflows/",
+    "docs/GC-WORKFLOWS.md",
     "roles/",
     "tools/verify-perkins-resource.mjs",
     "tools/patch-vitest-rpc-timeout.mjs",
@@ -33,7 +35,7 @@
     "gru-service": "dist/cli/service.js"
   },
   "scripts": {
-    "build": "tsc && node tools/prune-stale-dist.mjs . && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node dist/cli/bmad-runtime.js verify . && node tools/write-build-rev.mjs && node tools/write-review-dependency-identity.mjs",
+    "build": "tsc && node tools/prune-stale-dist.mjs . && node -e \"const fs=require('node:fs'); fs.mkdirSync('dist/runtime',{recursive:true}); fs.copyFileSync('src/runtime/review-mcp-server.mjs', 'dist/runtime/review-mcp-server.mjs')\" && node tools/verify-perkins-resource.mjs . && node dist/cli/bmad-runtime.js verify . && node dist/cli/workflow-runtime.js verify . && node tools/write-build-rev.mjs && node tools/write-review-dependency-identity.mjs",
     "postinstall": "node tools/unshare-review-hardlinks.mjs",
     "prepack":"node -e \"const fs=require('node:fs'); for (const path of ['dist','web/dist']) fs.rmSync(path,{recursive:true,force:true})\" && npm run build:web && npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",

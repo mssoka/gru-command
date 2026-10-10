@@ -1,12 +1,14 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
-import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
+import { RuntimeRegistry, applyThinkingFallback, serviceRegistryOptions } from '../src/runtime/registry.js';
+import { makeWorkflowLane } from './helpers/workflow-lane.js';
+import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
@@ -841,6 +843,79 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     } finally {
       await review.dispose();
     }
+  });
+
+  it('production file-only supervised-shaped resumes keep the logical minion through two real SDK restarts', async () => {
+    const { LedgerApi } = await import('../src/ledger/api.js');
+    const { LedgerDb } = await import('../src/ledger/db.js');
+    const { serviceWorkflowAuthority } = await import('../src/workflows/session.js');
+    const fx = await fixture([{ deltas: ['offline resume canary'] }]);
+    const f = makeWorkflowLane(); cleanupDirs.push(f.root);
+    const dataDir = realpathSync(fx.home); const db = new LedgerDb(dataDir); const ledger = new LedgerApi(db.handle);
+    ledger.addJob({ id: f.lane.id, repo: f.lane.repoName, title: 'original job', briefing: 'original contract' });
+    ledger.registerWorktree(f.lane);
+    const authority = serviceWorkflowAuthority(dataDir, () => ledger);
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+      workflowLaneFor: authority.workflowLaneFor, workflowBuildFor: authority.workflowBuildFor, workflowAgentFor: authority.workflowAgentFor }),
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    try {
+      const first = await registry.spawn('minion', { cwd: f.lane.path, agentId: 'original-logical-minion' });
+      await first.prompt('offline canary');
+      const file = first.sessionFile!;
+      ledger.registerAgent({ id: first.id, role: 'minion', jobId: f.lane.id, sessionFile: file, parentage: 'top-level' });
+      await first.dispose();
+      for (let restart = 0; restart < 2; restart++) {
+        const resumed = await registry.spawn('minion', { resumeFile: file }); // exactly the supervisor input, no id/cwd
+        expect(resumed.id).toBe('original-logical-minion');
+        expect(resumed.sessionFile).toBe(file);
+        ledger.registerAgent({ id: resumed.id, role: 'minion', jobId: f.lane.id, sessionFile: resumed.sessionFile });
+        await resumed.dispose();
+      }
+      expect(ledger.listAgents().filter((agent) => agent.sessionFile === file).map((agent) => agent.id)).toEqual(['original-logical-minion']);
+    } finally { await registry.dispose(); await fx.runtime.dispose(); db.close(); }
+  });
+
+  it('production owned workflow reaches the Pi loader ahead of hostile project/global copies and survives resume', async () => {
+    const fx = await fixture([{ deltas: ['built'] }, { deltas: ['resumed'] }]);
+    const f = makeWorkflowLane(); cleanupDirs.push(f.root);
+    for (const base of [join(f.lane.path, '.agents'), fx.agentDir]) {
+      mkdirSync(join(base, 'skills/gc-build'), { recursive: true });
+      writeFileSync(join(base, 'skills/gc-build/SKILL.md'), '---\nname: gc-build\ndescription: incompatible ambient copy\n---\nWRONG-WORKFLOW');
+    }
+    mkdirSync(join(f.lane.path, '_bmad/custom'), { recursive: true });
+    writeFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'NOT TOML');
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir: f.dataDir },
+      store: new SessionStore(f.dataDir), workflowLaneFor: () => f.lane }),
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    const first = await registry.spawn('minion', { cwd: f.lane.path, agentId: 'same-worker' });
+    const assertBoundary = () => {
+      const options = twinGate.lastOptions as { cwd: string; resourceLoader: { getSkills(): { skills: Array<{ name: string; filePath: string }> }; getSystemPrompt(): string } };
+      expect(options.cwd).toBe(f.lane.path);
+      const selected = options.resourceLoader.getSkills().skills.filter((skill) => skill.name === 'gc-build');
+      expect(selected).toHaveLength(1);
+      expect(selected[0]!.filePath).toContain(join(f.dataDir, 'bmad-runtime/gru-command-workflows-'));
+      const note = options.resourceLoader.getSystemPrompt();
+      expect(note).toContain('## Gru Command owned delivery workflow');
+      expect(note).toContain(join(f.dataDir, 'projects'));
+      expect(note).toContain(join(f.lane.path, 'gru-output'));
+      expect(note).toContain('workflow-context.json');
+      return selected[0]!.filePath;
+    };
+    try {
+      const selected = assertBoundary();
+      await first.prompt('build');
+      await first.dispose();
+      const resumed = await registry.spawn('minion', { agentId: 'same-worker', resumeFile: first.sessionFile! });
+      try {
+        expect(resumed.id).toBe('same-worker');
+        expect(assertBoundary()).toBe(selected);
+        await resumed.prompt('continue');
+      } finally { await resumed.dispose(); }
+      expect(readFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'utf8')).toBe('NOT TOML');
+      expect(existsSync(join(f.lane.path, '_bmad/render'))).toBe(false);
+    } finally { await first.dispose(); await registry.dispose(); }
   });
 
   it('enforces isolated-review tools and strips ambient Pi resources', async () => {
@@ -3252,6 +3327,53 @@ describe('spawn cwd (SPEC ruling 17 — dispatch roots in the project)', () => {
     await expect(
       fx.runtime.spawn('minion', { cwd: project, roleTools: ['read', 'undeclared-tool'] }),
     ).rejects.toThrowError(/role tool override names "undeclared-tool"/);
+  });
+
+  it('default fallback reaches the real Pi SDK with read-only tools and host-captured findings', async () => {
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'fallback-submit', name: 'gc_submit_fallback_findings', args: { findings: [] } } },
+      { deltas: ['DONE'] },
+    ]);
+    const dataDir = realpathSync(fx.home);
+    const h = makeFallbackRuntimeHarness((role, opts) => registry.spawn(role, opts), dataDir);
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+      workflowLaneFor: h.authority.workflowLaneFor, workflowBuildFor: h.authority.workflowBuildFor }),
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback');
+      expect(outcome.clearToMerge).toBe(true);
+      const options = twinGate.lastOptions as { tools: string[]; customTools: { name: string }[]; noTools: string };
+      expect(options.noTools).toBe('all');
+      expect(options.tools).toEqual(['review_read', 'review_grep', 'review_find', 'review_ls', 'gc_submit_fallback_findings']);
+      expect(options.customTools.map((tool) => tool.name)).toEqual(options.tools);
+      expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
+      expect(outcome.reportFiles[0]).toContain(join(dataDir, 'projects'));
+      expect(readFileSync(join(h.lane.path, 'candidate.ts'), 'utf8')).toBe('export const candidate = 1;\n');
+      expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    } finally { await h.wave.shutdown(); await registry.dispose(); await fx.runtime.dispose(); h.close(); }
+  });
+
+  it('real Pi in-band error after host submission cannot turn the empty fallback report into PASS', async () => {
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'fallback-submit-before-error', name: 'gc_submit_fallback_findings', args: { findings: [] } } },
+      { deltas: [], error: 'review failed in-band', stopReason: 'error' },
+    ]);
+    const dataDir = realpathSync(fx.home);
+    const h = makeFallbackRuntimeHarness((role, opts) => registry.spawn(role, opts), dataDir);
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+      workflowLaneFor: h.authority.workflowLaneFor, workflowBuildFor: h.authority.workflowBuildFor }),
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('fallback reviewer turn did not successfully complete');
+      expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
+      expect(h.ledger.listEvents().some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally { await h.wave.shutdown(); await registry.dispose(); await fx.runtime.dispose(); h.close(); }
   });
 
   it('fails loud on a relative or nonexistent cwd (never a silent fallback)', async () => {
