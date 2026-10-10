@@ -9281,12 +9281,97 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     expect(pendingPublicationAttempt(fix.ledger, outcome.round.id)?.kind).toBe('uncredited-receipt');
   }, 180_000);
 
+  it('keeps the automatic re-arm closed when the unresolved-rebind hold cannot be persisted (formal GitHub)', async () => {
+    // An isolated ledger fault ONLY at the new hold append: the delivery and
+    // every other recovery operation can still succeed. Both recovery entry
+    // paths (registered review lane and missing registration) must leave the
+    // round un-aborted, because every automatic re-arm requires an aborted
+    // round; the failure is escalated, never silently swallowed.
+    class HoldWriteLostLedger extends LedgerApi {
+      failHoldWrites = true;
+      override appendCustomEvent(fields: Parameters<LedgerApi['appendCustomEvent']>[0]): ReturnType<LedgerApi['appendCustomEvent']> {
+        if (this.failHoldWrites && fields.kind === PUBLICATION_REBIND_UNRESOLVED_EVENT) {
+          throw new Error('simulated ledger fault: the rebind hold write was lost');
+        }
+        return super.appendCustomEvent(fields);
+      }
+    }
+
+    const body = '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
+    const bodySha256 = createHash('sha256').update(body).digest('hex');
+    const run = async (name: string, withLane: boolean) => {
+      const fix = durabilityFixture(name, HoldWriteLostLedger);
+      const jobId = `job-holdwrite-${name}`;
+      fix.ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+      fix.ledger.setJobStatus(jobId, 'working');
+      const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+      fix.ledger.setRoundStatus(round.id, 'live');
+      const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target, false);
+      fix.ledger.setJobPr(jobId, attemptPayload.url);
+      // A supported historical COMMENT-era record: no reviewEvent, a
+      // COMMENTED receipt, honest identity preserved.
+      fix.ledger.appendCustomEvent({
+        kind: 'round.posted', jobId, roundId: round.id,
+        payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: attemptPayload.url, host: attemptPayload.host,
+          targetSha: fix.target, baseSha: 'b'.repeat(40),
+          publicationFile: attemptPayload.publicationFile, publicationSha256: bodySha256,
+          receipt: {
+            reviewId: '9999', actor: 'gru-bot', event: 'COMMENTED', commitId: fix.target,
+            headSha: fix.target, baseSha: 'b'.repeat(40), bodySha256,
+          },
+          reconciled: false,
+        },
+      });
+      const lanes = withLane
+        ? [{
+            id: round.id, kind: 'review' as const, repoPath: fix.repo.path, repoName: 'fixture',
+            path: fix.root, branch: 'feature/hold-write', sha: fix.target, jobId, roundId: round.id, status: 'active' as const,
+          }]
+        : [];
+      const escalations: string[] = [];
+      const post = vi.fn();
+      const wave = new WaveRunner({
+        ledger: fix.ledger, worktrees: { listWorktrees: () => lanes } as unknown as WorktreePort,
+        reviewArtifactRoot: fix.artifacts,
+        spawner: vi.fn() as unknown as AgentSpawner,
+        poster: { post, reconcile: vi.fn(), authenticatedActor: async () => { throw new Error('actor probe unavailable'); } },
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      await wave.recoverInterruptedRounds();
+      expect(post, name).not.toHaveBeenCalled();
+      // Un-aborted: the status gate every automatic re-arm requires is closed.
+      expect(fix.ledger.getRound(round.id)?.status, name).toBe('live');
+      expect(fix.ledger.latestRoundEvent(round.id, 'round.perkins-incomplete'), name).toBeNull();
+      expect(escalations.join('\n'), name).toMatch(/could not be processed during startup recovery/u);
+      expect(escalations.join('\n'), name).toMatch(/rebind hold write was lost/u);
+      return { fix, round, wave };
+    };
+
+    const lanePath = await run('holdwrite-lane', true);
+    const laneLess = await run('holdwrite-nolane', false);
+
+    // With the fault cleared the next restart lands the hold, terminalizes
+    // the round and closes the guard: the failure left no ungated window.
+    for (const scenario of [lanePath, laneLess]) {
+      (scenario.fix.ledger as unknown as { failHoldWrites: boolean }).failHoldWrites = false;
+      await scenario.wave.recoverInterruptedRounds();
+      expect(scenario.fix.ledger.latestRoundEvent(scenario.round.id, PUBLICATION_REBIND_UNRESOLVED_EVENT)).not.toBeNull();
+      expect(pendingPublicationAttempt(scenario.fix.ledger, scenario.round.id)?.kind).toBe('unresolved-rebinding');
+      expect(scenario.fix.ledger.getRound(scenario.round.id)?.status).toBe('aborted');
+    }
+  }, 180_000);
+
   it('holds a recorded-but-unbound delivery against same-head re-arm and still promotes a bindable one (formal GitHub)', async () => {
     // The crash-after-round.posted state: the provider committed, the
     // delivery was credited durably, and the process died before the round
     // finalized. At restart promotion re-proves the posting actor; a
     // transient probe failure leaves the recorded delivery unbound.
-    async function crashedRound(name: string, actorProbe: () => Promise<string>, options: { readonly withoutAttempt?: boolean } = {}) {
+    async function crashedRound(
+      name: string,
+      actorProbe: () => Promise<string>,
+      options: { readonly withoutAttempt?: boolean; readonly historicalComment?: boolean } = {},
+    ) {
       const fix = durabilityFixture(name);
       const jobId = `job-rebind-${name}`;
       fix.ledger.addJob({ id: jobId, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
@@ -9301,9 +9386,13 @@ describe('formal GitHub publication durability and restart reconciliation', () =
           verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: attemptPayload.url, host: attemptPayload.host,
           targetSha: fix.target, baseSha: 'b'.repeat(40),
           publicationFile: attemptPayload.publicationFile, publicationSha256: attemptPayload.publicationSha256,
-          reviewEvent: 'APPROVE',
+          // Historical COMMENT-era records carry no reviewEvent and a
+          // COMMENTED receipt; the parser accepts them and they stay honest.
+          ...(options.historicalComment === true ? {} : { reviewEvent: 'APPROVE' }),
           receipt: {
-            reviewId: '9999', actor: 'gru-bot', event: 'APPROVED', commitId: fix.target,
+            reviewId: '9999', actor: 'gru-bot',
+            event: options.historicalComment === true ? 'COMMENTED' : 'APPROVED',
+            commitId: fix.target,
             headSha: fix.target, baseSha: 'b'.repeat(40), bodySha256: attemptPayload.publicationSha256,
           },
           reconciled: false,
@@ -9341,7 +9430,7 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     // The pre-upgrade shape: a recorded delivery with NO durable intent
     // (only its round.posted) whose re-binding fails at restart. The hold
     // must still apply — the marker check precedes the attempt early-return.
-    const markerOnly = await crashedRound('rebind-marker-only', async () => { throw new Error('actor probe unavailable'); }, { withoutAttempt: true });
+    const markerOnly = await crashedRound('rebind-marker-only', async () => { throw new Error('actor probe unavailable'); }, { withoutAttempt: true, historicalComment: true });
     await markerOnly.wave.recoverInterruptedRounds();
     expect(markerOnly.post).not.toHaveBeenCalled();
     expect(markerOnly.fix.ledger.latestRoundEvent(markerOnly.round.id, PUBLICATION_REBIND_UNRESOLVED_EVENT)).not.toBeNull();

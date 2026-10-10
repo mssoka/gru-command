@@ -1127,8 +1127,9 @@ describe('dispatch server (E8)', () => {
           verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
           targetSha: sha, baseSha: 'b'.repeat(40),
           publicationFile: '/tmp/held/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+          // Historical COMMENT-era record: no reviewEvent, COMMENTED receipt.
           receipt: {
-            reviewId: '9001', actor: 'gru-bot', event: 'APPROVED', commitId: sha,
+            reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: sha,
             headSha: sha, baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64),
           },
           reconciled: false,

@@ -1243,8 +1243,9 @@ describe('silas digest (the four actionable states)', () => {
         url: 'https://git.example.invalid/pull/held', host: 'git.example.invalid',
         targetSha: 'sha-held', baseSha: 'b'.repeat(40),
         publicationFile: '/tmp/held/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+        // Historical COMMENT-era record: no reviewEvent, COMMENTED receipt.
         receipt: {
-          reviewId: '9001', actor: 'gru-bot', event: 'APPROVED', commitId: 'sha-held',
+          reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: 'sha-held',
           headSha: 'sha-held', baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64),
         },
         reconciled: false,
