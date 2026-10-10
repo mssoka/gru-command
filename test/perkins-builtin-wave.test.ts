@@ -4103,7 +4103,7 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
 
   /** A provider receipt for the reviewed head carrying the live base at
    * its identity probe, not a subsequent advance during delivery. */
-  function liveBaseReceipt(reviewId: string, call: { readonly body: string; readonly targetSha: string }, liveBase: string) {
+  function liveBaseReceipt(reviewId: string, call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }, liveBase: string) {
     return {
       reviewId, actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
       headSha: call.targetSha, baseSha: liveBase,
@@ -5577,6 +5577,7 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       });
       await expect(poster.post({
         prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'x', targetSha: head, baseSha: base,
+        reviewEvent: 'COMMENT',
       })).resolves.toMatchObject({ reviewId: '58', headSha: head, baseSha: base });
 
       const wrongRepo = mkdtempSync(join(tmpdir(), 'perkins-gl-wrong-'));

@@ -18,6 +18,14 @@ import { attachBareOrigin, makeFixtureRepo } from './helpers/fixture-repo.js';
 import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 import { fakeWholeSpawner, groundedFinding } from './helpers/perkins-whole-double.js';
 
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
+
 const roots: string[] = [];
 const fixture = (prefix: string): string => {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -340,13 +348,6 @@ import { join } from 'node:path';
 import { RuntimeRegistry } from ${JSON.stringify(pathToFileURL(join(root, 'dist/runtime/registry.js')).href)};
 import { fakeWholeSpawner, groundedFinding } from ${JSON.stringify(pathToFileURL(fake).href)};
 
-/** The enacted provider state a fixture publisher reports for the intent the
- * host hands it. An intent-less call (a base-era poster) keeps the historical
- * COMMENTED shape, so the overlay stays compilable against the old build. */
-const ENACTED_REVIEW_STATE: Record<string, string> = {
-  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
-};
-const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
 const stage = process.env.GRU_TEST_STAGE;
 if (process.platform === 'linux') {
   const probe = spawnSync('python3', ['--version'], { env: process.env, encoding: 'utf8' });
