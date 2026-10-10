@@ -481,6 +481,30 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     input.repoPath = join(dirname(boundList.log), 'repo');
     await expect(boundList.poster.reconcile!(input)).resolves.toMatchObject({ reviewId: '11', commitId: head, headSha: head });
   });
+
+  it('never certifies absence when the frozen head carries a body-identical review in the wrong state (formal GitHub)', async () => {
+    const head = '1'.repeat(40);
+    const base = '2'.repeat(40);
+    const root = mkdtempSync(join(tmpdir(), 'perkins-gh-wrong-state-'));
+    const log = join(root, 'calls.jsonl');
+    const binary = join(root, 'gh-double.mjs');
+    const repoPath = join(root, 'repo');
+    execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
+    // The provider committed the SAME body to the SAME head, but as a plain
+    // COMMENTED review — evidence of a different delivery, not absence.
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), input }) + '\\n');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 77, user: { login: 'gru-bot' }, state: 'COMMENTED', commit_id: ${JSON.stringify(head)}, body: 'review body\\n' }]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    chmodSync(binary, 0o755);
+    const poster = new GhPrPoster(binary);
+    const input = {
+      prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
+      body: 'review body\n', targetSha: head, baseSha: base, reviewEvent: 'APPROVE' as const,
+    };
+    // The COMMENTED review cannot be credited as an approval, and it also
+    // forbids an absence certificate: the lookup stays openly unresolved.
+    await expect(poster.reconcile!(input)).rejects.toThrow(/wrong state|instead of the required APPROVED|unresolved/u);
+    rmSync(root, { recursive: true, force: true });
+  });
 });
 
 describe('review publication redaction', () => {

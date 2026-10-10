@@ -843,11 +843,14 @@ export class GhPrPoster implements VerdictPoster {
     observedBase: string,
   ): PostedReviewReceipt | null {
     const wantedEvent = enactedStateFor(input.reviewEvent);
-    const matches = reviews.filter((review) =>
+    // Reviews matching this publication's author, frozen head and body —
+    // the state split below decides credit vs wrong-state evidence.
+    const samePublication = (review: { user?: { login?: unknown }; commit_id?: unknown; body?: unknown }): boolean =>
       review.commit_id === input.targetSha &&
       typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body) &&
-      typeof review.user?.login === 'string' && review.user.login.toLowerCase() === authenticatedLogin.toLowerCase() &&
-      review.state === wantedEvent);
+      typeof review.user?.login === 'string' && review.user.login.toLowerCase() === authenticatedLogin.toLowerCase();
+    const wrongState = reviews.find((review) => samePublication(review) && review.state !== wantedEvent);
+    const matches = reviews.filter((review): boolean => samePublication(review) && review.state === wantedEvent);
     // Newest usable match wins; a later match with an unusable review id
     // must not mask an earlier fully bound one (R13/R28). If EVERY match
     // carries an unusable id, refuse loudly instead of reporting absence.
@@ -873,6 +876,15 @@ export class GhPrPoster implements VerdictPoster {
       );
     }
     if (sawUnusableId) throw new Error('provider receipt is missing a review id — delivery not recorded');
+    if (wrongState !== undefined) {
+      // A body-identical review in a different state is evidence of a
+      // DIFFERENT delivery: it neither fulfills the intent nor certifies
+      // that the intended review is absent.
+      const observed = typeof wrongState.state === 'string' ? wrongState.state.slice(0, 64) : '(none)';
+      throw new Error(
+        `provider review for the frozen head and body was enacted in state ${observed} instead of the required ${wantedEvent} — the intended delivery is not proved; delivery stays unresolved, never absence`,
+      );
+    }
     return null;
   }
 

@@ -548,13 +548,22 @@ function usableProviderReviewId(id: unknown): string | null {
  * Older rounds' identical bytes outside the margin are never credited as
  * this delivery, and a review in any other state (a COMMENTED review
  * beside an approval intent, an unexpected APPROVED beside a change-request
- * intent) is never a match. */
-function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string, notBeforeMs: number | null): boolean {
+ * intent) is never a match. A null `wantedState` matches ANY enacted state
+ * — the wrong-state evidence test below, never a credit predicate. */
+function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string | null, notBeforeMs: number | null): boolean {
   if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
-  if (review.state !== wantedState || review.commit_id !== targetSha || review.body !== body) return false;
+  if ((wantedState !== null && review.state !== wantedState) || review.commit_id !== targetSha || review.body !== body) return false;
   if (notBeforeMs === null) return true;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
   return Number.isFinite(submittedAt) && submittedAt >= notBeforeMs;
+}
+
+/** A review matching this publication's author, frozen head, body and
+ * window in ANY enacted state — evidence the publication exists, but NOT in
+ * the state this delivery intended. It can neither be credited nor read as
+ * absence: the delivery stays explicitly unresolved. */
+function isMatchingAppReviewInAnyState(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+  return matchesDeliveryPredicates(review, botLogin, targetSha, body, null, notBeforeMs);
 }
 
 /** Provider-proved evidence that OUR App bot published exactly this review
@@ -791,11 +800,19 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     }
     const { grant, botLogin, owner, repo, prNumber, baseSha } = await this.prepare(input);
     const wantedState = enactedStateFor(input.reviewEvent);
-    const { matched, provablyAbsent, matchedButUnreceiptable } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, null);
+    const { matched, provablyAbsent, matchedButUnreceiptable, matchedButWrongState } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, null);
     if (matched !== null) {
       return verifyPostedReceipt(
         this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body, wantedState),
         { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState },
+      );
+    }
+    if (matchedButWrongState !== null) {
+      // A body-identical review in the wrong state is real evidence of a
+      // DIFFERENT delivery: it neither fulfills the intent nor certifies
+      // that the intended review is absent.
+      throw new PerkinsAppError(
+        `review reconciliation found a review matching the intended publication's author, frozen head and body in state ${sanitize(matchedButWrongState)} instead of the intended ${wantedState} — delivery stays unresolved; verify that review manually before any retry, never assume absence`,
       );
     }
     if (matchedButUnreceiptable) {
@@ -1235,7 +1252,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // counts as this round's (provider clock drift); anything older is
     // another round's bytes.
     const notBeforeMs = postStartMs - 60_000;
-    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean };
+    let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean; readonly matchedButWrongState: string | null };
     try {
       walked = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, targetSha, body, wantedState, notBeforeMs);
     } catch (lookupError) {
@@ -1247,6 +1264,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       return verifyPostedReceipt(
         this.receiptFromReview(walked.matched, botLogin, targetSha, targetSha, baseSha, body, wantedState),
         { targetSha, bodySha256: receiptDigest(body), event: wantedState },
+      );
+    }
+    if (walked.matchedButWrongState !== null) {
+      throw unproven(
+        `a review matching this publication's author, frozen head and body was found in state ${sanitize(walked.matchedButWrongState)} instead of the intended ${wantedState}; whether the intended delivery landed stays unresolved`,
       );
     }
     if (walked.matchedButUnreceiptable) {
@@ -1291,7 +1313,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     body: string,
     wantedState: string,
     notBeforeMs: number | null,
-  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean }> {
+  ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean; readonly matchedButWrongState: string | null }> {
     const visited = new Set<number>();
     let lastPage: number | null = null;
     // Set when a response's rel="last" evidence is malformed or
@@ -1311,6 +1333,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       return null;
     };
     let matchedButUnreceiptable = false;
+    // The enacted state observed on a review that matches this publication's
+    // author, frozen head, body and window but NOT the intended state: it
+    // forbids an absence certificate exactly like an unusable id does.
+    let matchedButWrongState: string | null = null;
     for (let fetched = 0; fetched < this.maxReconciliationPages; fetched += 1) {
       visited.add(page);
       const result = await this.callApi(
@@ -1344,7 +1370,13 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       const reviews = list as readonly ProviderReview[];
       const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, wantedState, notBeforeMs));
       if (match !== undefined) {
-        return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false };
+        return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false, matchedButWrongState: null };
+      }
+      if (matchedButWrongState === null) {
+        const wrongState = reviews.find((review) => isMatchingAppReviewInAnyState(review, botLogin, targetSha, body, notBeforeMs));
+        if (wrongState !== undefined) {
+          matchedButWrongState = typeof wrongState.state === 'string' && wrongState.state !== '' ? wrongState.state : '(none)';
+        }
       }
       if (
         !matchedButUnreceiptable &&
@@ -1398,7 +1430,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     const provablyAbsent = !contradictoryPagination &&
       [...observedNextPages].every((nextPage) => visited.has(nextPage) && (lastPage === null || nextPage <= lastPage)) &&
       (lastPage !== null ? coveredThrough(lastPage) : shortEndPage !== null && coveredThrough(shortEndPage));
-    return { matched: null, provablyAbsent, matchedButUnreceiptable };
+    return { matched: null, provablyAbsent, matchedButUnreceiptable, matchedButWrongState };
   }
 }
 
