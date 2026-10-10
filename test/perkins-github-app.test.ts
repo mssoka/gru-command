@@ -3363,13 +3363,16 @@ describe('startup wiring pin (src/main.ts)', () => {
 // ---------------------------------------------------------------------------
 
 describe('formal GitHub verdict publication', () => {
-  /** A provider review object the App bot enacted for `state`. */
-  const botReview = (state: string) => ({
+  /** A provider review object the App bot enacted for `state`. `submittedAt`
+   * defaults to the fixture clock (inside the strict reconciliation window);
+   * pass null to model a provider record with no usable submission time. */
+  const botReview = (state: string, submittedAt: string | null = new Date(NOW).toISOString()) => ({
     id: 987654,
     user: { login: 'perkins-review[bot]', type: 'Bot', id: 308038895 },
     commit_id: HEAD,
     state,
     body: 'review body\n',
+    ...(submittedAt === null ? {} : { submitted_at: submittedAt }),
   });
 
   it('delivers a formal APPROVE bound to the frozen head and proves the APPROVED state (formal GitHub)', async () => {
@@ -3401,12 +3404,87 @@ describe('formal GitHub verdict publication', () => {
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('COMMENTED') }) },
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED')] }) },
     ]);
-    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' }))
-      .rejects.toThrow(/COMMENTED instead of the required APPROVED/u);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' })
+      .then(() => null, (cause: unknown) => cause as Error);
+    // The submission time IS parseable here, so the wrong-state branch must
+    // be the one that refuses — never the false "did not land" certificate.
+    expect(error?.message).toMatch(/found in state COMMENTED instead of the intended APPROVED/u);
+    expect(error?.message).not.toContain('did not land');
     // One POST, one bounded lookup — the ambiguous outcome is never retried,
     // and a comment review is never promoted into the intended approval.
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
     expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(1);
+  });
+
+  it('keeps a same-body review with an unverifiable submission time unresolved in every state, for both formal intents (formal GitHub)', async () => {
+    for (const [intent, wrongState] of [['APPROVE', 'COMMENTED'], ['REQUEST_CHANGES', 'APPROVED']] as const) {
+      for (const unverifiable of [null, 'not-a-timestamp'] as const) {
+        const fixture = bundleFixture();
+        // The provider committed the review but the response was lost; the
+        // list holds the same body/head/author in the WRONG state with no
+        // usable submission time. It can be neither credited nor excluded.
+        const { poster, calls } = posterWith(fixture, [
+          { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+          { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview(wrongState, unverifiable)] }) },
+        ]);
+        const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: intent })
+          .then(() => null, (cause: unknown) => cause as Error);
+        expect(error, `${intent} / ${String(unverifiable)}`).toBeInstanceOf(PerkinsAppError);
+        expect(error?.message, `${intent} / ${String(unverifiable)}`).not.toContain('did not land');
+        expect(error?.message, `${intent} / ${String(unverifiable)}`).toMatch(/submission time|unresolved/u);
+        expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), `${intent} / ${String(unverifiable)}`).toHaveLength(1);
+      }
+    }
+  });
+
+  it('cancels before the irreversible POST when the round aborts during a suspended preparation probe (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const controller = new AbortController();
+    let releaseMint: (() => void) | null = null;
+    const mintGate = new Promise<void>((resolve) => { releaseMint = resolve; });
+    let mintRequested = false;
+    const { poster, calls } = posterWith(fixture, [
+      {
+        method: 'POST', test: /\/app\/installations\/164552969\/access_tokens$/,
+        handler: async () => {
+          mintRequested = true;
+          await mintGate;
+          return {
+            status: 201,
+            body: {
+              token: 'stub-installation-token-not-a-real-credential',
+              expires_at: new Date(NOW + 3_600_000).toISOString(),
+              permissions: { 'pull_requests': 'write', 'metadata': 'read' },
+              repositories: [{ full_name: 'acme/widget', id: 1 }],
+            },
+          };
+        },
+      },
+    ]);
+    const pending = poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE', signal: controller.signal });
+    // Wait until the mint probe is suspended, then let the round abort and
+    // only afterwards resolve the probe: the poster must refuse before the
+    // irreversible write, not approve an already-cancelled round.
+    while (!mintRequested) await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    releaseMint!();
+    const error = await pending.then(() => null, (cause: unknown) => cause as Error);
+    expect(error).toBeInstanceOf(PerkinsAppError);
+    expect(error?.message).toMatch(/cancelled before the irreversible POST/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+    expect(calls.some((call) => call.url.endsWith('/reviews'))).toBe(false);
+  });
+
+  it('starts no provider work at all when the round is already cancelled (formal GitHub)', async () => {
+    const fixture = bundleFixture();
+    const controller = new AbortController();
+    controller.abort();
+    const { poster, calls } = posterWith(fixture);
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE', signal: controller.signal })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(error).toBeInstanceOf(PerkinsAppError);
+    expect(error?.message).toMatch(/cancelled before the irreversible POST/u);
+    expect(calls.some((call) => call.url.endsWith('/reviews'))).toBe(false);
   });
 
   it('reconciles an approval against provider proof of the APPROVED state only (formal GitHub)', async () => {

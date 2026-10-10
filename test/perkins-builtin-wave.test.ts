@@ -21,6 +21,13 @@ import {
   type WaveOutcome,
 } from '../src/dispatch/perkins.js';
 import { PerkinsAppPrPoster, type AppFetch, type AppFetchInit } from '../src/dispatch/perkins-github-app.js';
+import {
+  PUBLICATION_ABSENT_EVENT,
+  PUBLICATION_ATTEMPT_EVENT,
+  PUBLICATION_RECEIPT_EVENT,
+  parsePublicationReceiptEvidencePayload,
+  pendingPublicationAttempt,
+} from '../src/dispatch/publication-evidence.js';
 import { preflightFailure, runRuntimeReviewPreflight, type FallbackFinding } from '../src/dispatch/review-path.js';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
@@ -9113,5 +9120,230 @@ describe('formal GitHub verdict publication from native judgments', () => {
     expect(poster.post).toHaveBeenCalledTimes(1);
     expect(fix.ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
     expect(escalations.join('\n')).toContain('COMMENTED instead of the required APPROVED');
+  }, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// Formal GitHub publication durability and restart reconciliation (native
+// blockers 2/3 on PR #289): the irreversible provider write is never lost to
+// a crash window, never duplicated by a blind re-arm, and never credited to a
+// moved head.
+// ---------------------------------------------------------------------------
+
+describe('formal GitHub publication durability and restart reconciliation', () => {
+  /** A ledger whose round.posted journal write is lost exactly as a process
+   * crash loses it: everything before it (the immutable intent and the proven
+   * receipt) is already durable, nothing after it (the credited delivery)
+   * exists. */
+  class PostedWriteLostLedger extends LedgerApi {
+    private lost = false;
+    override appendCustomEvent(fields: Parameters<LedgerApi['appendCustomEvent']>[0]): ReturnType<LedgerApi['appendCustomEvent']> {
+      if (!this.lost && fields.kind === 'round.posted') {
+        this.lost = true;
+        throw new Error('simulated crash: the round.posted journal write was lost');
+      }
+      return super.appendCustomEvent(fields);
+    }
+  }
+
+  const durabilityPort = () => ({ listWorktrees: () => [] }) as unknown as WorktreePort;
+
+  function durabilityFixture(name: string, Ledger: new (handle: LedgerDb['handle'], opts: { bus: EventBus }) => LedgerApi = LedgerApi) {
+    const repo = makeFixtureRepo(`formal-durability-${name}`);
+    repos.push(repo);
+    repo.git(['checkout', '-b', `feature/durability-${name}`]);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), `durability-${name}-port-`));
+    const artifacts = mkdtempSync(join(tmpdir(), `durability-${name}-artifacts-`));
+    const sessions = mkdtempSync(join(tmpdir(), `durability-${name}-sessions-`));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), `durability-${name}-db-`)));
+    const ledger = new Ledger(db.handle, { bus: new EventBus() });
+    return { repo, target, root, artifacts, sessions, ledger };
+  }
+
+  function seedAttempt(
+    fix: ReturnType<typeof durabilityFixture>,
+    jobId: string,
+    roundId: string,
+    target: string,
+  ) {
+    const roundDir = join(fix.artifacts, roundId);
+    mkdirSync(roundDir, { recursive: true });
+    const body = '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
+    writeFileSync(join(roundDir, 'perkins-report.publication.md'), body, 'utf8');
+    writeFileSync(join(roundDir, 'manifest.json'), JSON.stringify({ repoPath: fix.repo.path }), 'utf8');
+    const publicationFile = join(roundDir, 'perkins-report.publication.md');
+    const publicationSha256 = createHash('sha256').update(body).digest('hex');
+    const attemptPayload = {
+      verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
+      url: 'https://github.com/acme/fixture/pull/77', host: 'github.com',
+      targetSha: target, baseSha: 'b'.repeat(40),
+      publicationFile, publicationSha256, reviewEvent: 'APPROVE',
+    };
+    fix.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId, payload: attemptPayload });
+    return { attemptPayload, publicationSha256 };
+  }
+
+  it('journals the immutable intent before the POST and retains the proven receipt when the crash window loses round.posted (formal GitHub)', async () => {
+    const fix = durabilityFixture('crash-window', PostedWriteLostLedger);
+    const jobId = 'job-durability-crash-window';
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: 'durability crash window', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    settleLane(fix.ledger, jobId);
+    fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/77');
+    attachOrigin(fix.repo, 'feature/durability-crash-window', fix.root);
+    const port = new GitReviewPort(fix.root, 'feature/durability-crash-window', fix.target);
+    await port.createJobWorktree({ repoPath: fix.repo.path, jobId });
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9801', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fix.ledger as unknown as LedgerApi, worktrees: port, poster,
+      reviewArtifactRoot: fix.artifacts, prHeadProbe: localHeadProbe('feature/durability-crash-window'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      spawner: fakeWholeSpawner(mkdtempSync(join(fix.sessions, 'crash-window')), {
+        childAnswer: () => '[]', specialists: [],
+        leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+      }).spawner,
+    });
+    const outcome = asWave(await wave.runRound({ jobId }));
+    expect(outcome.posted).toBe(false);
+    expect(poster.post).toHaveBeenCalledTimes(1);
+    const attemptEvent = fix.ledger.latestRoundEvent(outcome.round.id, PUBLICATION_ATTEMPT_EVENT);
+    const receiptEvent = fix.ledger.latestRoundEvent(outcome.round.id, PUBLICATION_RECEIPT_EVENT);
+    expect(attemptEvent).not.toBeNull();
+    expect(receiptEvent).not.toBeNull();
+    // The intent precedes the proof, and both precede any credit.
+    expect(attemptEvent!.seq).toBeLessThan(receiptEvent!.seq);
+    const evidence = parsePublicationReceiptEvidencePayload(receiptEvent!.payload);
+    expect(evidence?.credited).toBe(false);
+    expect(evidence?.receipt.reviewId).toBe('9801');
+    expect(evidence?.receipt.event).toBe('APPROVED');
+    expect(fix.ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    // A same-head re-arm is closed until the proven receipt is reconciled.
+    expect(pendingPublicationAttempt(fix.ledger, outcome.round.id)?.kind).toBe('uncredited-receipt');
+  }, 180_000);
+
+  it('retains the verified receipt when the source moves after the provider POST and never credits the moved head (formal GitHub)', async () => {
+    const fix = durabilityFixture('moved-head');
+    const jobId = 'job-durability-moved-head';
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: 'durability moved head', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    settleLane(fix.ledger, jobId);
+    fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/78');
+    attachOrigin(fix.repo, 'feature/durability-moved-head', fix.root);
+    const port = new GitReviewPort(fix.root, 'feature/durability-moved-head', fix.target);
+    await port.createJobWorktree({ repoPath: fix.repo.path, jobId });
+    // The provider accepted the frozen-commit review; the branch moves while
+    // the POST response is in flight.
+    const poster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => {
+        fix.repo.commitFile('src/moved.ts', 'export const moved = true;\n');
+        fix.repo.git(['push', '--quiet', 'origin', 'feature/durability-moved-head']);
+        return {
+          reviewId: '9802', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
+          headSha: call.targetSha, baseSha: 'b'.repeat(40),
+          bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+        };
+      }),
+    };
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: port, poster,
+      reviewArtifactRoot: fix.artifacts, prHeadProbe: localHeadProbe('feature/durability-moved-head'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(fix.sessions, 'moved-head')), {
+        childAnswer: () => '[]', specialists: [],
+        leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+      }).spawner,
+    });
+    const outcome = asWave(await wave.runRound({ jobId }));
+    expect(outcome.posted).toBe(false);
+    expect(poster.post).toHaveBeenCalledTimes(1);
+    // The proven frozen-commit receipt survives the movement refusal…
+    const receiptEvent = fix.ledger.latestRoundEvent(outcome.round.id, PUBLICATION_RECEIPT_EVENT);
+    expect(receiptEvent).not.toBeNull();
+    const evidence = parsePublicationReceiptEvidencePayload(receiptEvent!.payload);
+    expect(evidence?.credited).toBe(false);
+    expect(evidence?.receipt.headSha).toBe(fix.target);
+    // …is never credited to the moved head…
+    expect(fix.ledger.latestRoundEvent(outcome.round.id, 'round.posted')).toBeNull();
+    expect(fix.ledger.getRound(outcome.round.id)?.verdict).toBeNull();
+    // …and closes a same-head re-arm until it is reconciled.
+    expect(pendingPublicationAttempt(fix.ledger, outcome.round.id)?.kind).toBe('uncredited-receipt');
+  }, 180_000);
+
+  it('reconciles an unresolved publication attempt on restart without a second POST and holds the proven receipt uncredited (formal GitHub)', async () => {
+    const fix = durabilityFixture('recover-match');
+    const jobId = 'job-durability-recover-match';
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: 'durability recover match', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+    fix.ledger.setRoundStatus(round.id, 'live');
+    const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target);
+    const post = vi.fn();
+    const reconcile = vi.fn(async () => ({
+      reviewId: '9901', actor: 'gru-bot', event: 'APPROVED', commitId: fix.target,
+      headSha: fix.target, baseSha: 'b'.repeat(40), bodySha256: attemptPayload.publicationSha256,
+    }));
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: durabilityPort(), poster: { post, reconcile },
+      reviewArtifactRoot: fix.artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    expect(await wave.recoverInterruptedRounds()).toBeGreaterThanOrEqual(1);
+    expect(post).not.toHaveBeenCalled();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    const evidence = parsePublicationReceiptEvidencePayload(fix.ledger.latestRoundEvent(round.id, PUBLICATION_RECEIPT_EVENT)?.payload);
+    expect(evidence?.credited).toBe(false);
+    expect(evidence?.receipt.reviewId).toBe('9901');
+    expect(fix.ledger.latestRoundEvent(round.id, 'round.posted')).toBeNull();
+    expect(pendingPublicationAttempt(fix.ledger, round.id)?.kind).toBe('uncredited-receipt');
+    expect(escalations.join('\n')).toContain('UNCREDITED');
+  }, 120_000);
+
+  it('records a bounded absence on restart reconciliation, and keeps an unprovable attempt closed (formal GitHub)', async () => {
+    // Proved absent: the ONLY outcome that clears the attempt.
+    const absentFix = durabilityFixture('recover-absent');
+    absentFix.ledger.addJob({ id: 'job-durability-absent', repo: 'fixture', title: 'durability absent', baseBranch: 'main', briefing: 'review' });
+    absentFix.ledger.setJobStatus('job-durability-absent', 'working');
+    const absentRound = absentFix.ledger.addRound({ jobId: 'job-durability-absent', lenses: ['blind'], targetRef: absentFix.target });
+    absentFix.ledger.setRoundStatus(absentRound.id, 'live');
+    seedAttempt(absentFix, 'job-durability-absent', absentRound.id, absentFix.target);
+    const absentPost = vi.fn();
+    const absentWave = new WaveRunner({
+      ledger: absentFix.ledger, worktrees: durabilityPort(),
+      poster: { post: absentPost, reconcile: vi.fn(async () => null) },
+      reviewArtifactRoot: absentFix.artifacts,
+    });
+    await absentWave.recoverInterruptedRounds();
+    expect(absentPost).not.toHaveBeenCalled();
+    expect(absentFix.ledger.latestRoundEvent(absentRound.id, PUBLICATION_ABSENT_EVENT)).not.toBeNull();
+    expect(pendingPublicationAttempt(absentFix.ledger, absentRound.id)).toBeNull();
+
+    // Unprovable: no absence certificate, guard stays closed.
+    const stuckFix = durabilityFixture('recover-stuck');
+    stuckFix.ledger.addJob({ id: 'job-durability-stuck', repo: 'fixture', title: 'durability stuck', baseBranch: 'main', briefing: 'review' });
+    stuckFix.ledger.setJobStatus('job-durability-stuck', 'working');
+    const stuckRound = stuckFix.ledger.addRound({ jobId: 'job-durability-stuck', lenses: ['blind'], targetRef: stuckFix.target });
+    stuckFix.ledger.setRoundStatus(stuckRound.id, 'live');
+    seedAttempt(stuckFix, 'job-durability-stuck', stuckRound.id, stuckFix.target);
+    const stuckEscalations: string[] = [];
+    const stuckWave = new WaveRunner({
+      ledger: stuckFix.ledger, worktrees: durabilityPort(),
+      poster: { post: vi.fn(), reconcile: vi.fn(async () => { throw new Error('provider lookup unavailable'); }) },
+      reviewArtifactRoot: stuckFix.artifacts,
+      escalate: (title, detail) => stuckEscalations.push(`${title}: ${detail}`),
+    });
+    await stuckWave.recoverInterruptedRounds();
+    expect(stuckFix.ledger.latestRoundEvent(stuckRound.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
+    expect(stuckFix.ledger.latestRoundEvent(stuckRound.id, PUBLICATION_RECEIPT_EVENT)).toBeNull();
+    expect(pendingPublicationAttempt(stuckFix.ledger, stuckRound.id)?.kind).toBe('unresolved-attempt');
+    expect(stuckEscalations.join('\n')).toContain('unresolved');
   }, 120_000);
 });

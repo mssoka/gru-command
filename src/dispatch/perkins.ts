@@ -2648,8 +2648,12 @@ export class WaveRunner {
         );
         return 'clear';
       }
+      const wantedEnacted = wantedEnactedStateFor(publicationProviderKindFor(attempt.url), attempt.reviewEvent);
+      const verified = verifyPostedReceipt(found, {
+        targetSha: attempt.targetSha, bodySha256: attempt.publicationSha256, event: wantedEnacted,
+      });
       const receiptEvidence: PublicationReceiptEvidencePayload = {
-        ...attempt, receipt: found, credited: false, reason: 'recovered-uncredited-after-restart',
+        ...attempt, receipt: verified, credited: false, reason: 'recovered-uncredited-after-restart',
       };
       this.opts.ledger.appendCustomEvent({
         kind: PUBLICATION_RECEIPT_EVENT,
@@ -2659,7 +2663,7 @@ export class WaveRunner {
       });
       this.escalate(
         `Perkins publication for round ${round.id} was found at the provider after restart and is retained UNCREDITED`,
-        `provider reconciliation proved review ${found.reviewId} (${found.event}) on frozen head ${attempt.targetSha}; it is retained as uncredited frozen-commit evidence, is never credited to a newer head, and no duplicate POST is attempted — reconcile the delivery manually before re-arming a publication on this head`,
+        `provider reconciliation proved review ${verified.reviewId} (${verified.event}) on frozen head ${attempt.targetSha}; it is retained as uncredited frozen-commit evidence, is never credited to a newer head, and no duplicate POST is attempted — reconcile the delivery manually before re-arming a publication on this head`,
         { jobId: round.jobId, roundId: round.id },
       );
       return 'held';
