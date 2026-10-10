@@ -14,10 +14,10 @@
  * legitimately cannot pass at the old base) are reported as excluded
  * context, never as part of the claim.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import process from 'node:process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 /** Every named assertion the pre-change base must fail by AssertionError.
  *  Each one discriminates at least one side of the boundary: permitted
@@ -96,7 +96,20 @@ export function assertMergeAuthorityBaseline(report) {
   return `merge-authority boundary proven — ${EXPECTED_BASELINE_ASSERTIONS.length} named assertion(s) RED by assertion against the pre-change base; ${excluded} unrelated failure(s) excluded from the claim`;
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+/** True only when this module IS the CLI entry point. Canonical paths are
+ *  compared (realpath on both sides), so invoking the tool through a
+ *  symlinked path still runs the classifier instead of silently exiting 0
+ *  without classifying anything. */
+function invokedDirectly() {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) {
   try {
     const [path] = process.argv.slice(2);
     if (!path) throw new Error('usage: assert-merge-authority-baseline.mjs REPORT_JSON');

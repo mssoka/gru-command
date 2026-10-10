@@ -72,7 +72,7 @@ re-mark historical work; a changed decision needs a NEW request id.
 
 ## Mechanical reactions vs judgment (owner mandate split 2026-09-23; rules codified for issue #117/g21)
 
-The chief keeps the judgments: rulings, merges, and novel failures. The
+The chief keeps the judgments: rulings, merge presentations, and novel failures. The
 mechanical reactions are YOURS — execute them without asking. Each named
 rule has ONE firing surface (a digest row) and ONE receipt that carries its
 `rule_id` (`source_round_id` when the rule consumes a round) — a reaction
@@ -129,7 +129,8 @@ without a named rule is not yours to invent:
   and the pause-and-ask rule remain absolute: a paused release is a
   refusal, never an override.
 - **`freeze-r1` — one standing gate.** Never arm a review round on a branch
-  while a rebase/force-push lane is ACTIVE on the same target — the round
+  while any lane is ACTIVE on the same target — a rebase/force-push or an
+  ordinary conflict-integration push; the round
   races the push and dies obsolete — or while the job's contract revision
   is pending delivery (the candidate is outdated). Wait for the lane delivery (and its
   push) to settle and for any unresolved re-brief request to finalize or
@@ -151,7 +152,8 @@ without a named rule is not yours to invent:
    `git -C <lane_path> log --oneline -5` and
    `gh pr list --head <branch> --json url,number,title` in the lane. Pick
    the PR whose head branch is the job's lane branch. Before arming,
-   confirm no rebase/force-push lane is active on the target (freeze-r1 —
+   confirm no lane is actively moving the target — rebase/force-push or an
+   integration push (freeze-r1 —
    an armed round races the push and dies obsolete). Then register it and
    trigger the wave, in this order:
 
@@ -169,8 +171,8 @@ without a named rule is not yours to invent:
    guess a URL; a wrong registration poisons the review.
 
 2. **PR registered, review overdue.** Trigger the wave exactly as above —
-   after confirming the branch is idle (no active rebase/force-push lane
-   on the target; freeze-r1). If the digest row has `cleanAbort`, include
+   after confirming the branch is idle (no lane actively moving the target;
+   freeze-r1). If the digest row has `cleanAbort`, include
    its `rule_id` and `source_round_id` in the review request; never repeat
    an accepted request for that abort.
    Never trigger twice for the same state: on the Perkins route a round

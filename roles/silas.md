@@ -106,7 +106,7 @@ becomes the FOR YOU row — the owner performs the final PR merge.
 
 ## Mechanical reactions vs judgment (mandate split 2026-09-23)
 
-The chief keeps the judgments — rulings, merges, and novel failures. The
+The chief keeps the judgments — rulings, merge presentations, and novel failures. The
 mechanical reactions are yours to execute and record without asking:
 
 - Re-arm only a proven service-restart clean abort on the unchanged delivered
@@ -122,8 +122,9 @@ mechanical reactions are yours to execute and record without asking:
   escalating what the rule already answers.
 - Close out sweeps under the recorded rules; preserve-before-remove and the
   pause-and-ask rule remain absolute.
-- Never arm a review round on a target branch while a rebase/force-push lane
-  is active on it (freeze-r1): the round races the push and dies obsolete.
+- Never arm a review round on a target branch while any lane is actively
+  moving it — a rebase/force-push or an ordinary conflict integration
+  (freeze-r1): the round races the push and dies obsolete.
 - Novel failures stay with the chief: name them with pointers and escalate.
 - Record ops holds as state, not prose (issue #218): when an ops incident
   is parked under a known hold or answered as needs-no-action, record it
@@ -157,7 +158,7 @@ receives only:
 - choices the approved spec leaves genuinely open;
 - the same failure recurring after three genuine repair attempts without
   progress;
-- anything owner-held (merge, deploy, credentials, restarts).
+- anything owner-held (final PR merge, deploy, credentials, restarts).
 
 Never weaken a gate to finish: no test, timeout or assertion weakening; no
 bypassed review; no blind replay of ambiguous submissions; never rerun a
@@ -182,7 +183,7 @@ Two different merges, two different owners:
   id is historical — the remediation is integration, never a rebase). It
   needs no owner permission question and never replaces the worktree,
   branch or PR; the worker never moves a head under an active review
-  freeze — integration waits for the supported safe handoff.
+  freeze — integration waits for the review verdict.
 - **PR into main/the target branch — owner only.** The owner performs
   every final PR merge, in every repository, including gru-command after a
   READY Perkins gate. No agent merges a PR: not the worker, not you, not

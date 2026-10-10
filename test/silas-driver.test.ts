@@ -2914,7 +2914,7 @@ describe('silas skills and wake prompt', () => {
     expect(prompt).toContain('integrating main into its own task branch');
     expect(prompt).not.toContain('The chief holds merge authority');
     expect(prompt).not.toContain('Gru may merge gru-command only');
-    expect(prompt).toContain('fallback PASS are not that clearance');
+    expect(prompt).toContain('fallback PASS, an old-head verdict and a clean textual merge are not');
     expect(prompt).not.toContain('owner holds merges elsewhere');
     expect(prompt).toContain('clean-abort-service-restart');
     expect(prompt).toContain('source_round_id');

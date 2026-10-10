@@ -307,7 +307,7 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     const brief = staged.silasBrief.replace(/\s+/gu, ' ');
     expect(brief).toContain('every final PR merge');
     expect(brief).toContain('integrating main into its own task branch');
-    expect(brief).toContain('fallback PASS are not that clearance');
+    expect(brief).toContain('fallback PASS, an old-head verdict and a clean textual merge are not');
   });
 
   it('a renamed/replacement project catalog still satisfies the worker contract (no fixed skill name)', () => {

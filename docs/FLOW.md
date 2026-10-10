@@ -89,9 +89,9 @@ the same way. The guard compares a lane's RECORDED branch (or the
 checks out its own branch but pushes a FOREIGN PR branch (a rebase/
 salvage lane) is invisible to that comparison — no lane declares a push
 target yet (issue #121 records the evidence and the declared-push-target
-extension). Silas's standing freeze-r1 rule — never arm while a known
-rebase/force-push lane is active on the target — is the control for that
-class. The same recheck runs after a failed pre-flight and before
+extension). Silas's standing freeze-r1 rule — never arm while any known
+lane is actively moving/pushing the target (rebase/force-push or
+integration) — is the control for that class. The same recheck runs after a failed pre-flight and before
 the bmad-review fallback gate admits — a re-brief or lane re-open landing
 during the awaited pre-flight refuses the fallback arm (409, or a queued
 replay re-queue) instead of starting a fallback reviewer; the fallback
@@ -287,9 +287,10 @@ fixes, never a Perkins READY and never merge clearance. The
 fallback session is a full-capability minion by design — it must load the
 ambient BMAD skill — and is instructed never to gate, approve, merge, or
 modify implementation code; every gate decision is the host's. The fallback
-never records a Perkins verdict and never moves merge authority: only an
-exact-head Perkins READY can authorize a merge, and the owner performs
-every final PR merge, everywhere — this repository included. A failed pre-flight is never a silent downgrade — the failed
+never records a Perkins verdict and never moves merge authority: only
+required final CI plus an exact-head Perkins READY can authorize a final
+PR merge, and the owner performs every final PR merge, everywhere — this
+repository included. A failed pre-flight is never a silent downgrade — the failed
 legs, their remediations, and both recovery options (install the global
 bmad-review skill, which the GC-managed BMAD runtime does not bundle /
 restore Perkins) are escalated and recorded on the job as
@@ -850,8 +851,9 @@ IDs remain pending for rate-limited retry.
 **Mandate — act (tier-2).** A wake is machine attention meant to be acted
 on in-turn: Gru diagnoses the incident and takes one substantive step per
 incident (a fix lane, a re-arm, a disposition) within budget, staging the
-rest; novel failures and judgment calls stay with Gru. Gru holds merge
-authority for this repository; the owner retains it elsewhere. The owner
+rest; novel failures and judgment calls stay with Gru. Every final PR merge is
+the owner's, in this repository and everywhere else; no agent merges a
+PR. The owner
 is reached only through `needs-owner` — and sparingly; an empty FOR YOU
 band is the healthy state.
 
@@ -862,7 +864,7 @@ next user-directed context block:
 | routing | meaning | surface |
 |---|---|---|
 | `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue (live rows only; terminal-job rows are closed receipts under FEED); wakes Gru; never rings the owner bell |
-| `needs-owner` | owner-only decisions (merges outside this repo, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
+| `needs-owner` | owner-only decisions (every final PR merge, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
 **Unresolved follow-up.** A successful prompt is delivery, not resolution.
@@ -897,10 +899,12 @@ actual resolutions and job events must be counted separately.
 **Silas mandate split** (same lane). Mechanical reactions move to Silas's
 ops driver — re-arm review rounds after clean aborts, pattern respins for
 known failure classes, sweep acks under recorded rules. Gru keeps the
-judgments: rulings, merges, and novel failures. One standing rule from the
-2026-09-23 freeze: never auto-arm a review round on a branch while a
-rebase/force-push lane is active on the same target (the round races the
-push and dies obsolete); arm only after the lane genuinely settles — the
+judgments: rulings, merge presentations, and novel failures. One standing
+rule from the
+2026-09-23 freeze: never auto-arm a review round on a branch while any
+lane is actively moving/pushing the target (rebase/force-push or an
+ordinary integration push; the round races the push and dies obsolete);
+arm only after the lane genuinely settles — the
 attempt delivered AND no unresolved re-brief request standing (marker/
 control settlement, not delivery alone; see the branch-idle guard
 section). Service restarts remain manual until self-roll-34 lands.

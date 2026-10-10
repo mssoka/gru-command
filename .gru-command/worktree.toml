@@ -719,12 +719,13 @@ repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea;
 # Merge authority boundary (job merge-authority-boundary-20261010; journal
 # j-1671/j-1667): focused regression for the corrected worker/owner merge
 # boundary across the role prompts, the shipped ops skill, the assembled
-# Silas operating brief and the conflict notification wording, plus the
+# Silas operating brief, the conflict notification wording and the
+# fail-before classifier's own accept/refuse contract, plus the
 # suite/scope pins. The installed-layout leg loads the packaged role and
 # skill trees through the shipped loaders, so the scope builds the current
 # committed head first (the suite refuses a stale dist); approved RPC
 # patch prerequisite first, exits never masked.
-merge-authority-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/roles-definitions.test.ts test/roles-gru.test.ts test/roles-installed-playbook.test.ts test/silas-driver.test.ts test/silas-rules.test.ts test/github-poll.test.ts test/test-budgets.test.ts test/suite-shape.test.ts"
+merge-authority-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/roles-definitions.test.ts test/roles-gru.test.ts test/roles-installed-playbook.test.ts test/silas-driver.test.ts test/silas-rules.test.ts test/github-poll.test.ts test/awareness.test.ts test/assert-merge-authority-baseline.test.ts test/test-budgets.test.ts test/suite-shape.test.ts"
 
 # Static product checks for the same change (lint, compiler, full build
 # including the pinned Perkins resource verifier); approved RPC patch first.

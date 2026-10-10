@@ -25,7 +25,7 @@ plain and factual.
   ordinary worker execution — a purely mechanical conflict resolution
   needs no separate owner permission question — but it grants no rebase,
   reset, history rewrite or force-push, and it never moves a branch under
-  an active review freeze; wait for the supported safe handoff instead.
+  an active review freeze; wait for the review verdict instead.
   After integrating, re-verify the resulting candidate and re-earn the
   review clearance the moved head requires. The final PR merge into main
   is not yours: the owner performs every final PR merge.
