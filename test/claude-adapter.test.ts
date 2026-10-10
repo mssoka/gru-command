@@ -11,7 +11,8 @@ import {
   ClaudeCodeRuntime,
   mapRoleTools,
 } from '../src/runtime/claude-adapter.js';
-import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
+import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import {
   ClaudeControlTranslator,
   ClaudeTurnTranslator,
@@ -1209,6 +1210,37 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     expect(build!.argv[build!.argv.indexOf('--append-system-prompt') + 1]).toContain(
       'worker agent',
     );
+  });
+
+  it('production owned workflow reaches Claude plugin/prompt/cwd and retains the same binding on resume', async () => {
+    const fx = fixture(); const f = makeWorkflowLane(); cleanupDirs.push(f.root);
+    const config = loadConfig({ GRU_COMMAND_HOME: f.dataDir });
+    mkdirSync(join(f.lane.path, '_bmad/custom'), { recursive: true });
+    writeFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'NOT TOML');
+    class ClaudeRegistry extends RuntimeRegistry { override runtimeIdFor() { return 'claude-code' as const; } }
+    const claude = new ClaudeRegistry({ ...serviceRegistryOptions({ config, store: new SessionStore(f.dataDir),
+      workflowLaneFor: () => f.lane }), claude: { binary: DOUBLE } });
+    const first = await claude.spawn('minion', { cwd: f.lane.path, agentId: 'same-worker' });
+    try {
+      await first.prompt('build'); await first.dispose();
+      const resumed = await claude.spawn('minion', { agentId: 'same-worker', resumeFile: first.sessionFile! });
+      try { expect(resumed.id).toBe(first.id); await resumed.prompt('continue'); } finally { await resumed.dispose(); }
+      const [build, resume] = doubleInvocations(fx);
+      expect(resume!.argv).toContain('--resume');
+      const plugin = build!.argv[build!.argv.indexOf('--plugin-dir') + 1]!;
+      expect(plugin).toContain(join(f.dataDir, 'bmad-runtime/gru-command-workflows-'));
+      for (const turn of [build!, resume!]) {
+        expect(turn.cwd).toBe(f.lane.path);
+        expect(turn.argv[turn.argv.indexOf('--plugin-dir') + 1]).toBe(plugin);
+        const note = turn.argv[turn.argv.indexOf('--append-system-prompt') + 1]!;
+        expect(note).toContain('`gru-command-workflows:gc-build`');
+        expect(note).toContain(join(f.dataDir, 'projects'));
+        expect(note).toContain(join(f.lane.path, 'gru-output'));
+        expect(note).toContain('workflow-context.json');
+      }
+      expect(readFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'utf8')).toBe('NOT TOML');
+      expect(existsSync(join(f.lane.path, '_bmad/render'))).toBe(false);
+    } finally { await first.dispose(); await claude.dispose(); }
   });
 
   it('a lane-bound managed BMAD runtime loads as a session plugin named in the prompt; reviews never get it', async () => {

@@ -34,6 +34,7 @@ import { readBmadRuntimeManifest, tarballIntegrity, writeBmadRuntimeManifest } f
 import { runBmadRuntimeCli } from '../src/cli/bmad-runtime.js';
 import { loadConfig, type Role, type RuntimeId } from '../src/config.js';
 import { RuntimeRegistry, serviceRegistryOptions } from '../src/runtime/registry.js';
+import { loadBundledWorkflowRuntime } from '../src/workflows/runtime.js';
 import type { AgentHandle, AgentRuntime, ManagedSkillSet, SpawnOptions } from '../src/runtime/types.js';
 import type { SessionStore } from '../src/sessions/store.js';
 
@@ -544,7 +545,10 @@ describe('job binding', () => {
     // The options main.ts builds its registry from bind a minion's lane under the data dir.
     const home = tempDir('gru-command-bmad-service-');
     const config = loadConfig({ GRU_COMMAND_HOME: home });
-    const options = serviceRegistryOptions({ config, store: {} as SessionStore });
+    const options = serviceRegistryOptions({ config, store: {} as SessionStore,
+      workflowLaneFor: () => ({ id: 'j-service', jobId: 'j-service', kind: 'job', repoPath: repo, repoName: 'fixture',
+        path: serviceLane, branch: 'gru/service', sha: git(repo, ['rev-parse', 'HEAD']), roundId: null, status: 'active' }),
+    });
     const seen: Array<ManagedSkillSet | undefined> = [];
     const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
     const adapter: AgentRuntime = {
@@ -568,7 +572,7 @@ describe('job binding', () => {
     git(repo, ['worktree', 'add', '-q', '-b', 'gru/service', serviceLane]);
     const handle = await new ServiceRegistry(options).spawn('minion', { cwd: serviceLane });
     await handle.dispose();
-    expect(seen[0]).toMatchObject({ runtimeId: shipped.id, laneBound: true, skills: ['bmad-build'] });
+    expect(seen[0]).toMatchObject({ runtimeId: loadBundledWorkflowRuntime().id, laneBound: true, skills: ['gc-build'] });
     expect(seen[0]!.root.startsWith(join(config.dataDir, 'bmad-runtime'))).toBe(true);
     const serviceBinding = join(git(serviceLane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command', 'bmad-runtime.json');
     expect(JSON.parse(readFileSync(serviceBinding, 'utf-8')).runtime_dir).toBe(seen[0]!.root);

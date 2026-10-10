@@ -6,7 +6,8 @@ import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
-import { RuntimeRegistry, applyThinkingFallback } from '../src/runtime/registry.js';
+import { RuntimeRegistry, applyThinkingFallback, serviceRegistryOptions } from '../src/runtime/registry.js';
+import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import { LockBusyError, SessionStore } from '../src/sessions/store.js';
 import { capabilitiesForModelInput, type AgentHandle, type RuntimeEvent } from '../src/runtime/types.js';
 import { makeIsolatedModelRuntime, makeStubModelRuntime, StubScript, type StubResponder, type StubTurn } from './helpers/stub-model.js';
@@ -841,6 +842,48 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     } finally {
       await review.dispose();
     }
+  });
+
+  it('production owned workflow reaches the Pi loader ahead of hostile project/global copies and survives resume', async () => {
+    const fx = await fixture([{ deltas: ['built'] }, { deltas: ['resumed'] }]);
+    const f = makeWorkflowLane(); cleanupDirs.push(f.root);
+    for (const base of [join(f.lane.path, '.agents'), fx.agentDir]) {
+      mkdirSync(join(base, 'skills/gc-build'), { recursive: true });
+      writeFileSync(join(base, 'skills/gc-build/SKILL.md'), '---\nname: gc-build\ndescription: incompatible ambient copy\n---\nWRONG-WORKFLOW');
+    }
+    mkdirSync(join(f.lane.path, '_bmad/custom'), { recursive: true });
+    writeFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'NOT TOML');
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir: f.dataDir },
+      store: new SessionStore(f.dataDir), workflowLaneFor: () => f.lane }),
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    const first = await registry.spawn('minion', { cwd: f.lane.path, agentId: 'same-worker' });
+    const assertBoundary = () => {
+      const options = twinGate.lastOptions as { cwd: string; resourceLoader: { getSkills(): { skills: Array<{ name: string; filePath: string }> }; getSystemPrompt(): string } };
+      expect(options.cwd).toBe(f.lane.path);
+      const selected = options.resourceLoader.getSkills().skills.filter((skill) => skill.name === 'gc-build');
+      expect(selected).toHaveLength(1);
+      expect(selected[0]!.filePath).toContain(join(f.dataDir, 'bmad-runtime/gru-command-workflows-'));
+      const note = options.resourceLoader.getSystemPrompt();
+      expect(note).toContain('## Gru Command owned delivery workflow');
+      expect(note).toContain(join(f.dataDir, 'projects'));
+      expect(note).toContain(join(f.lane.path, 'gru-output'));
+      expect(note).toContain('workflow-context.json');
+      return selected[0]!.filePath;
+    };
+    try {
+      const selected = assertBoundary();
+      await first.prompt('build');
+      await first.dispose();
+      const resumed = await registry.spawn('minion', { agentId: 'same-worker', resumeFile: first.sessionFile! });
+      try {
+        expect(resumed.id).toBe('same-worker');
+        expect(assertBoundary()).toBe(selected);
+        await resumed.prompt('continue');
+      } finally { await resumed.dispose(); }
+      expect(readFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'utf8')).toBe('NOT TOML');
+      expect(existsSync(join(f.lane.path, '_bmad/render'))).toBe(false);
+    } finally { await first.dispose(); await registry.dispose(); }
   });
 
   it('enforces isolated-review tools and strips ambient Pi resources', async () => {

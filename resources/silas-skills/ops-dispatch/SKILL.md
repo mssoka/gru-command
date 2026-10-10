@@ -396,14 +396,15 @@ authorizes its full completion cycle, and YOU own driving it:
    verification output before acting).
 2. Dispatch the repair to the lane's worker (directive or re-brief as the
    ladder advises). Ordinary private commits on the lane are normal work.
-   Implementation workers select the task-relevant BMAD skills from the
-   project's actual installed catalog and own their workflows' built-in
+   Implementation workers follow the GC-owned workflow and explicit
+   project/job artifact context bound to their registered lane, preserving
+   project conventions and any historical lane bindings. They own its built-in
    review on fresh independent reviewer contexts (separately tracked
    review jobs they commission through the dispatch surface, each with
    its own session and worktree — never an untracked launcher or
    extension subagent), their finding resolution, and their verification —
-   do not pull that work back between phases, never demand a fixed skill
-   name (BMAD names and workflows change between versions), and do not
+   do not pull that work back between phases, never substitute an ambient
+   BMAD skill/configuration for the bound GC workflow, and do not
    commission a supplementary review duplicating the built-in one; your
    gate is the native Perkins round on the exact final settled PR head.
    Those reviewer jobs share the worker budget with the lane that

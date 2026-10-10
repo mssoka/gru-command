@@ -6,10 +6,10 @@ import { PiRuntime } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
-import type { AgentHandle, AgentRuntime, ManagedSkillSet, RuntimeEvent, SpawnOptions } from './types.js';
+import type { AgentHandle, AgentRuntime, ManagedSkillSet, ManagedWorkflowSession, RuntimeEvent, SpawnOptions } from './types.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
-import { createBmadRuntimeBinder } from '../bmad/runtime.js';
-import { join } from 'node:path';
+import { createWorkflowSessionBinder } from '../workflows/session.js';
+import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
@@ -102,17 +102,21 @@ export interface RuntimeRegistryOptions {
    * real binder; omitted = no managed runtime (unit tests).
    */
   readonly bmadRuntime?: (cwd: string) => ManagedSkillSet;
+  /** Production GC-owned selection with an explicit registered assignment. */
+  readonly workflowRuntime?: (options: SpawnOptions) => ManagedWorkflowSession;
 }
 
-/**
- * The service's registry options (main.ts): the base options plus the
- * issue #283 binder that gives build-workflow sessions the GC-managed BMAD
- * runtime of their job lane, materialized under `<dataDir>/bmad-runtime`.
- */
+/** New jobs use GC-owned resources; retained historical bindings keep their bytes.
+ * The caller supplies ledger/registry authority, never a directory-name guess. */
 export function serviceRegistryOptions(
-  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & { readonly config: { readonly dataDir: string } },
+  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & {
+    readonly config: { readonly dataDir: string };
+    readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
+    readonly workflowBuildFor?: (lane: WorktreeLane) => boolean;
+  },
 ): RuntimeRegistryOptions {
-  return { ...base, bmadRuntime: createBmadRuntimeBinder(join(base.config.dataDir, 'bmad-runtime')) };
+  const { workflowLaneFor, workflowBuildFor, ...options } = base;
+  return { ...options, workflowRuntime: createWorkflowSessionBinder(base.config.dataDir, workflowLaneFor, undefined, workflowBuildFor) };
 }
 
 /**
@@ -632,10 +636,18 @@ export class RuntimeRegistry {
         : {},
     );
     const thinkingLevel = applyThinkingFallback(adapter, policy.thinkingLevel, this.log);
-    const managedSkills = this.managedSkillsFor(role, options);
+    const workflowSession = this.opts.workflowRuntime !== undefined && ROLE_DEFINITIONS[role].managedBmadRuntime &&
+      (options.reviewLead ?? options.isolatedReview) === undefined
+      ? this.opts.workflowRuntime(options) : undefined;
+    const managedSkills = workflowSession !== undefined ? workflowSession.managedSkills : this.managedSkillsFor(role, options);
+    const cwd = workflowSession?.cwd ?? options.cwd;
+    if (managedSkills !== undefined) this.log('info', 'managed workflow bound', {
+      role, cwd, runtime: managedSkills.runtimeId, content_sha256: managedSkills.contentSha256,
+      artifact_root: managedSkills.workflow?.context.artifactRoot ?? null,
+    });
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
-      ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+      ...(cwd !== undefined ? { cwd } : {}),
       ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),

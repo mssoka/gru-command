@@ -6,13 +6,26 @@ not an upstream fork, synchronization service or compatibility promise.
 Project BMAD is optional and independent: this package never reads its config,
 renderer, skills or output and never modifies its installation.
 
-**This PR (#292) supplies the resource package and explicit invocation API.**
-Production session/review selection and setup remain on their existing paths
-until #294/#295 land. Merely shipping this package does not switch live jobs,
-retire the old package, change the external fallback or remove any user files.
-Artifact allocation/configuration is #293; the paths below are explicit caller
-inputs, not a second storage allocator. The intake workflow added by #296 can
-use the same manifest/resource/reference mechanism.
+**Production new-job execution uses these resources (#294), with #293 storage.**
+Both Pi and Claude receive the owned skill, verified rendered instructions and
+explicit registered assignment through the existing managed-skill mechanism.
+Resume resolves the same worktree from recorded agent/session ownership when cwd
+is absent. Unknown/conflicting/swept assignments fail loudly, never at a guessed
+workspace. Bounded child/report tasks do not start another top-level build cycle.
+Project AGENTS.md, testing conventions and approved source documents still apply.
+No project/global skill or malformed `_bmad/custom`/legacy answer selects GC's
+workflow. Setup provisioning is still transitional until #295; independent BMAD
+installations, historical records and live sessions are not modified.
+
+Production fallback review verifies the assigned owned package and uses its
+adversarial review helper. Reports stay under the same private job operational
+root. Historical build lanes retain their original bindings and use an owned
+fallback helper without reinterpreting their historical build/output contract;
+their existing private review store remains addressable. The fallback runtime
+runs one bounded report task, not build onboarding or another review orchestrator.
+Missing owned resources record an actionable blocked result, never borrow an
+ambient skill. Stable `bmad-review-fallback` API/event identifiers are retained;
+this is routing compatibility, not an external BMAD dependency.
 
 ## Supported delivery paths
 
@@ -107,8 +120,12 @@ when no new bundle is available. GC does not reinterpret that old workflow as
 consumer must honor the returned historical skill set until the lane retires.
 A missing runtime can be restored only when the current package ships identical
 bytes; corrupt retained bytes fail loudly, never silently switch the lane.
-`createWorkflowRuntimeBinder` is available for the later execution cutover; this
-change does not wire it into the production registry or setup wizard.
+`createWorkflowSessionBinder` wires this selection into the production registry
+and composes `createArtifactContext` with the verified renderer. It records raw
+caller context privately in `workflow-context.json` (usable by the skill launcher)
+and renders a separate immutable invocation receipt with package identity. The
+system prompt names exact skill/entrypoint/context/output paths. This does not
+change setup provisioning.
 
 ## Editing and shipping (maintainers)
 
@@ -126,7 +143,7 @@ content hashes independently distinguish every set of bytes. There is no BMAD
 fetch/re-vendoring step or byte-for-byte upstream comparison on GC resources.
 `npm run build` verifies the owned manifest; `npm pack` rebuilds backend/web and
 ships the complete resource directory plus this document. The old bundle is
-still separately verified only for its transitional production consumers.
+still separately verified for retained historical lanes and transitional setup.
 
 `test/workflow-runtime.test.ts` covers edits, integrity, closure, explicit context,
 ambient independence, isolation, shell-special paths, immutable snapshots, lane
@@ -134,6 +151,11 @@ updates/races and historical continuity. `test/workflow-runtime-packaged.test.ts
 extracts the actual npm archive, without source/config/global BMAD or even a
 `node_modules` tree, and drives the compiled CLI for both build routes. These
 prove deterministic mechanics, not paid model execution or live rollout.
+`test/workflow-session.test.ts` plus the real Pi offline SDK and Claude CLI double
+assert production spawn/loader/plugin/prompt/cwd selection, raw context, output
+destinations, resume, conflicts and retained-package failure. Fallback-gate tests
+assert the selected owned helper, private report routing, blocked resource failure
+and absence of native READY.
 
 No automatic migration/deletion of old outputs, bindings, captures or independent
 BMAD installs accompanies this package. Existing owner-run legacy handling remains

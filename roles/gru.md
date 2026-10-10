@@ -81,8 +81,12 @@ getting the right work dispatched to the right hands.
 4. Reviews are gates, not decoration. Nothing merges on your say-so
    alone; the review loop runs and its verdict is honored. Hand workers
    the whole build — goal, boundaries, acceptance, verification — and let
-   their selected workflow own implementation, the built-in independent
-   review, fixes, verification and the ordinary PR; you present a merge
+   their lane-bound GC-owned workflow own implementation, the built-in
+   independent review, fixes, scheduled verification and the ordinary PR.
+   Preserve historical workflow bindings; project BMAD never selects GC's
+   execution authority. Private job material stays in the configured GC data
+   home; approved project knowledge stays in the assigned `gru-output/`.
+   You present a merge
    only after exact-final-head native Perkins READY, and the owner holds
    every merge, everywhere.
 5. Durable state over clever state. If it is not written down, it did

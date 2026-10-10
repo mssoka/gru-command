@@ -1,5 +1,6 @@
 import type { Role } from '../config.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
+import type { WorkflowContext, WorkflowInvocation } from '../workflows/runtime.js';
 
 /**
  * Runtime adapter interface (EPICS E2 story 1; SPEC ruling 4).
@@ -116,7 +117,7 @@ export interface IsolatedReviewPolicy {
 
 /**
  * Skills Gru Command supplies to a session from a bound, read-only runtime
- * directory (issue #283: the GC-managed BMAD runtime). The session keeps its
+ * directory (GC-owned resources or a retained historical BMAD runtime). The session keeps its
  * project cwd; these skills are added beside the project's own and win a
  * name collision, so the job runs exactly the runtime it is bound to.
  */
@@ -132,6 +133,18 @@ export interface ManagedSkillSet {
   readonly skills: readonly string[];
   /** True when the binding is recorded for the job lane (survives GC updates). */
   readonly laneBound: boolean;
+  /** Present only for GC-owned jobs; historical workflows keep their old contract. */
+  readonly workflow?: {
+    readonly context: WorkflowContext;
+    readonly invocation: WorkflowInvocation;
+    /** Raw caller context for the skill launcher (not the augmented snapshot receipt). */
+    readonly contextFile: string;
+  };
+}
+
+export interface ManagedWorkflowSession {
+  readonly cwd: string;
+  readonly managedSkills?: ManagedSkillSet;
 }
 
 /** Options for spawn(). */
@@ -206,8 +219,8 @@ export interface SpawnOptions {
   };
   /**
    * Skills the product supplies from a bound, read-only runtime directory
-   * (issue #283: the GC-managed BMAD runtime of the job lane). The registry
-   * fills this for roles that run BMAD build workflows; adapters add the
+   * (GC-owned workflow of the job lane, or its retained historical runtime).
+   * The registry fills this for build-workflow roles; adapters add the
    * skills beside the project's own (winning a name collision) and name
    * the binding in the system prompt. Never applied to review sessions.
    */

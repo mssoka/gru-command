@@ -1289,8 +1289,13 @@ export interface FallbackGateState {
 }
 
 export interface FallbackGateOptions {
-  /** Installed bmad-review skill file (never bundled with the product). */
-  readonly skillPath: string;
+  /** Explicit helper path for injected fixtures/legacy integrations; never discovered. */
+  readonly skillPath?: string;
+  /** Production selection verifies GC-owned resources and the job's private context. */
+  readonly resolveReviewResources?: (jobId: string) => {
+    readonly skillPath: string;
+    readonly artifactRoot: string;
+  };
   /** Review rounds before the gate reports blocked; default 4 (3 fix rounds + final). */
   readonly maxReviewRounds?: number;
   /** Runs one bmad-review pass and returns its findings. */
@@ -1298,6 +1303,11 @@ export interface FallbackGateOptions {
   /** Routes blocker findings back to the implementing minion session. */
   readonly fixDirectiveSink: FixDirectiveSink;
 }
+
+type ResolvedFallbackGateOptions = FallbackGateOptions & {
+  readonly skillPath: string;
+  readonly artifactRoot?: string;
+};
 
 export interface FallbackGateOutcome {
   readonly route: 'bmad-review-fallback';
@@ -3512,13 +3522,22 @@ export class WaveRunner {
     // Validate BEFORE the outcome returns: a failure after the 202 response
     // would be swallowed by the response path with no durable record.
     requireSafeRecordId(job.id, 'job id');
-    const gate = this.opts.fallbackGate;
+    const configured = this.opts.fallbackGate;
+    let gate: ResolvedFallbackGateOptions | undefined;
+    let resourceFailure: string | undefined;
+    try {
+      const resources = configured?.resolveReviewResources?.(job.id);
+      const skillPath = resources?.skillPath ?? configured?.skillPath;
+      if (configured !== undefined && skillPath !== undefined) gate = { ...configured, ...resources, skillPath };
+    } catch (error) {
+      resourceFailure = `GC-owned fallback resources are unavailable: ${String(error)}`;
+    }
     const present = gate !== undefined && skillInstalled(gate.skillPath);
     if (gate === undefined || !present) {
-      const note = gate === undefined
+      const note = resourceFailure ?? (configured === undefined
         ? 'the bmad-review fallback gate is not configured on this service'
-        : `the bmad-review skill is not installed at ${gate.skillPath}`;
-      const guidance = `Options: (1) install the bmad-review skill into ~/.agents/skills or the pi agent skills directory (the GC-managed BMAD runtime bundles only the build workflow); (2) restore the Perkins gate — ${failedLegs.map((leg) => leg.remediation).join(' ')}`;
+        : `the GC-owned fallback review helper is unavailable at ${gate?.skillPath ?? 'the configured assignment'}`);
+      const guidance = `Options: (1) restore the job's exact retained GC workflow package/context or rebuild/reinstall GC for a new job; never install or borrow an ambient BMAD skill; (2) restore the Perkins gate — ${failedLegs.map((leg) => leg.remediation).join(' ')}`;
       const message = `${note} ${guidance}`;
       this.opts.ledger.appendCustomEvent({
         kind: 'job.fallback-review',
@@ -3584,13 +3603,13 @@ export class WaveRunner {
     lanePath: string,
     baseRef: string,
     failedLegs: readonly ReviewCapabilityFailure[],
-    gate: FallbackGateOptions,
+    gate: ResolvedFallbackGateOptions,
     signal: AbortSignal,
     state: FallbackGateState,
     recheck?: () => void,
   ): Promise<void> {
     const maxRounds = gate.maxReviewRounds ?? 4;
-    const directory = join(this.artifactRoot(), 'fallback-gate', `${job.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const directory = join(gate.artifactRoot ?? this.artifactRoot(), 'fallback-gate', `${job.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const fallbackEvent = (payload: Record<string, unknown>): void => {
       this.opts.ledger.appendCustomEvent({ kind: 'job.fallback-review', jobId: job.id, payload: { gate: true, ...payload } });
@@ -3823,7 +3842,11 @@ export class WaveRunner {
       // start an obsolete reviewer. The lease releases in the finally on
       // throw.
       if (recheck !== undefined) recheck();
-      handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal });
+      handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal,
+        // A bounded report task, not another build cycle. The owned helper needs
+        // reads and ONE JSON report write, not implementation edits or a shell.
+        roleTools: ['read', 'grep', 'find', 'ls', 'write'],
+      });
       // Spawning is asynchronous too: a newly owned lane must not receive
       // an obsolete review prompt just because the worker was allocated.
       recheck?.();
@@ -3839,7 +3862,8 @@ export class WaveRunner {
         jobId: input.jobId,
       });
       const prompt = [
-        `Read ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
+        `Read the verified GC-owned review helper ${input.skillPath} completely and follow it to review the CURRENT working diff of this repository against base ${input.baseRef}.`,
+        'This helper is product-owned authority; never discover or invoke project/global BMAD skills, renderers, config resolvers or onboarding.',
         'This session runs ONE review pass inside a release gate. The host performs triage and every gate decision afterwards: do NOT approve, merge, or gate anything yourself, and do not modify implementation code.',
         `Write your findings as ONE JSON array to exactly this file: ${input.reportFile}`,
         'Each element: { "title": string, "category": string, "location": string, "evidence": string, "detail": string }. Use a release-safety category (correctness, security, data-loss, broken-build, build-failure, crash, regression, vulnerability, injection, secret-leak) only for real release-safety defects; use any other short tag for everything else. An empty array [] is valid.',

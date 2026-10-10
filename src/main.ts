@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -91,20 +91,8 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
-
-/** Locate the installed bmad-review skill: check both the pi agent dir
- * and ~/.agents (the BMAD default install root) for maximum compatibility. */
-function resolveBmadReviewSkillPath(): string {
-  for (const base of [getAgentDir(), join(homedir(), '.agents')]) {
-    const candidate = join(base, 'skills', 'bmad-review', 'SKILL.md');
-    if (existsSync(candidate)) return candidate;
-  }
-  // Return the pi agent dir path as the default — the gate will report
-  // 'not installed' if neither location has it.
-  return join(getAgentDir(), 'skills', 'bmad-review', 'SKILL.md');
-}
+import { createWorkflowSessionBinder, ownedFallbackReviewResources, registeredWorkflowLane } from './workflows/session.js';
 
 /** The process LISTENING on the configured instance port when it is not us
  * (null: free, ours, ephemeral, or the platform has no probe). Port-squat
@@ -529,11 +517,17 @@ async function main(): Promise<number> {
   // BEFORE the server so /health can answer with real signals from the
   // first request. Growth findings also hit the log (SPEC ruling 12).
   const store = new SessionStore(config.dataDir, { log: (level, msg, fields) => logger.log(level, msg, fields) });
-  // Issue #283: the service options carry the binder that gives
-  // build-workflow sessions the GC-managed BMAD runtime of their job lane.
+  // GC-owned execution; the ledger-backed callback is invoked only on spawn,
+  // after the ledger has opened. Existing historical lane bindings win unchanged.
   const registry = new RuntimeRegistry(serviceRegistryOptions({
     config,
     store,
+    workflowLaneFor: (options) => registeredWorkflowLane(options, ledger, ledger),
+    workflowBuildFor: (lane) => {
+      const job = ledger.getJob(lane.id);
+      if (job === null) throw new Error(`GC workflow requires the registered job record for ${lane.id}`);
+      return job.deliverable === null || job.deliverable === 'pr';
+    },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   }));
   const growth = registry.boot();
@@ -1228,6 +1222,8 @@ async function main(): Promise<number> {
       requeued: pipelineRecovery.requeued,
     });
   }
+  const bindFallbackWorkflow = createWorkflowSessionBinder(config.dataDir,
+    (options) => registeredWorkflowLane(options, ledger, ledger));
   const wave = createServiceReviewWave({ registry, options: {
     ledger,
     worktrees: worktreeManager,
@@ -1245,7 +1241,11 @@ async function main(): Promise<number> {
     evidenceUploadsDir: join(config.dataDir, 'uploads'),
     reviewPreflight: (input) => reviewPreflightCheck(config, registry, input.repoPath),
     fallbackGate: {
-      skillPath: resolveBmadReviewSkillPath(),
+      resolveReviewResources: (jobId) => {
+        const lane = worktreeManager.getWorktree(jobId);
+        if (lane === null) throw new Error(`GC fallback review requires the registered job worktree for ${jobId}`);
+        return ownedFallbackReviewResources(bindFallbackWorkflow({ cwd: lane.path }), config.dataDir);
+      },
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         workerGate: pacing.gate,
         retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),

@@ -5611,7 +5611,8 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       expect(outcome.skillInstalled).toBe(false);
       expect(outcome.clearToMerge).toBe(false);
       expect(reviewed).toBe(0);
-      expect(outcome.note).toContain('install the bmad-review skill into ~/.agents/skills or the pi agent skills directory');
+      expect(outcome.note).toContain('restore the job\'s exact retained GC workflow package/context');
+      expect(outcome.note).toContain('never install or borrow an ambient BMAD skill');
       expect(outcome.note).toContain('[review] enabled = true');
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -6024,6 +6025,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
   async function makeProductionGateHarness(options: {
     findingToWrite: readonly Record<string, string>[];
     skillContent?: string;
+    resolveReviewResources?: (jobId: string) => { readonly skillPath: string; readonly artifactRoot: string };
     workerGate?: PacingGate;
     /** Provider pacing: the bounded retry settlement to report for a
      * delivered fallback-review turn. Absent = no interlock. */
@@ -6112,12 +6114,46 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       // NO runFallbackReview — the production default runs
       fallbackGate: {
         skillPath,
+        ...(options.resolveReviewResources !== undefined ? { resolveReviewResources: options.resolveReviewResources } : {}),
         fixDirectiveSink: async () => ({ delivered: true, minionId: 'prod-1' }),
       },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations, disposed };
   }
+
+  it('production resource resolver wins over ambient skill fixtures and sends reports to the owned job root without native clearance', async () => {
+    const { makeWorkflowLane } = await import('./helpers/workflow-lane.js');
+    const { createWorkflowSessionBinder, ownedFallbackReviewResources } = await import('../src/workflows/session.js');
+    const f = makeWorkflowLane('job-prod-gate'); dirs.push(f.root);
+    const bound = createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path });
+    const resources = ownedFallbackReviewResources(bound, f.dataDir);
+    const ids: string[] = [];
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: (jobId) => { ids.push(jobId); return resources; } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(ids).toEqual([h.job.id]);
+    expect(outcome.skillInstalled).toBe(true);
+    expect(outcome.clearToMerge).toBe(true);
+    expect(outcome.reportFiles[0]).toContain(join(resources.artifactRoot, 'fallback-gate'));
+    expect(h.prompts[0]).toContain(resources.skillPath);
+    expect(h.prompts[0]).not.toContain(h.skillPath);
+    expect(h.prompts[0]).toContain('never discover or invoke project/global BMAD');
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    expect(h.escalations.join('\n')).toContain('not a Perkins READY');
+  });
+
+  it('missing/corrupt owned fallback resources record an actionable blocked result, never borrowed ambient skill bytes', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: () => { throw new Error('retained owned helper corrupt: restore exact package'); } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.skillInstalled).toBe(false);
+    expect(outcome.note).toContain('retained owned helper corrupt');
+    expect(h.prompts).toEqual([]);
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    expect(h.ledger.listEvents().some((event) => event.kind === 'job.fallback-review' && event.jobId === h.job.id)).toBe(true);
+  });
 
   it('spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean', async () => {
     const h = await makeProductionGateHarness({ findingToWrite: [] });
