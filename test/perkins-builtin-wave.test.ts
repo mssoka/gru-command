@@ -24,6 +24,7 @@ import { PerkinsAppPrPoster, type AppFetch, type AppFetchInit } from '../src/dis
 import {
   PUBLICATION_ABSENT_EVENT,
   PUBLICATION_ATTEMPT_EVENT,
+  PUBLICATION_IDENTITY_EVENT,
   PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
   parsePublicationReceiptEvidencePayload,
