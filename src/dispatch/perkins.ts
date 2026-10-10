@@ -692,6 +692,37 @@ function parsePostedReviewState(value: unknown): PostedReviewStateParse {
   };
 }
 
+/** What a DIGEST-VERIFIED publication body discloses about its round's review
+ * scope: the immutable native scope evidence for a round whose posted event
+ * predates the persisted `review` block. `legacy` is a body written before
+ * scope disclosure existed (a genuine pre-Stage-5 whole review); `scoped`
+ * names the disclosed scope plus whether the body also discloses an owed
+ * final whole-change pass; null is a missing or unrecognized body, which can
+ * never corroborate retention (refuse, never guess). */
+type PublishedScopeDisclosure =
+  | { readonly kind: 'legacy' }
+  | { readonly kind: 'scoped'; readonly reviewScope: 'whole' | 'delta' | 'integration'; readonly finalPassRequired: boolean };
+
+function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure | null {
+  if (text === null) return null;
+  const line = text.split('\n').find((entry) => entry.startsWith('- Review scope: '));
+  if (line === undefined) return { kind: 'legacy' };
+  const disclosed = line.slice('- Review scope: '.length);
+  const reviewScope = disclosed.startsWith('whole change')
+    ? 'whole' as const
+    : disclosed.startsWith('delta since')
+      ? 'delta' as const
+      : disclosed.startsWith('integration review')
+        ? 'integration' as const
+        : null;
+  if (reviewScope === null) return null;
+  return {
+    kind: 'scoped',
+    reviewScope,
+    finalPassRequired: text.includes('- Final whole-change pass: STILL OWED'),
+  };
+}
+
 /** Host-side binding of a provider receipt before anything is recorded as
  * delivered: the receipt must name the reviewed commit, carry the digest of
  * the exact published body, and identify the provider review/actor/event. A
@@ -2443,6 +2474,7 @@ export class WaveRunner {
     // publication file still exists as a regular non-symlink file and
     // carries exactly the digested bytes (T3/R21).
     let bound = false;
+    let publicationText: string | null = null;
     if (event !== null && bindingProblem === null && actorProblem === null) {
       bound = true;
       try {
@@ -2451,8 +2483,13 @@ export class WaveRunner {
         if (!info.isFile() || info.isSymbolicLink()) {
           bound = false;
         } else {
-          const digest = createHash('sha256').update(readFileSync(canonical, 'utf8')).digest('hex');
+          const bytes = readFileSync(canonical);
+          const digest = createHash('sha256').update(bytes).digest('hex');
           bound = digest === event.publicationSha256 && digest === event.receipt.bodySha256;
+          // Keep the VERIFIED bytes: the scope fallback corroborates a
+          // historical round's scope from this exact body, never from a
+          // second (mutable) read.
+          if (bound) publicationText = bytes.toString('utf8');
         }
       } catch {
         bound = false;
@@ -2467,7 +2504,10 @@ export class WaveRunner {
       // Absent/damaged evidence is NEVER treated as "no debt": the promotion
       // is refused and the round stays interrupted for inspection.
       if (postedVerdict === 'approved') {
-        const postedReview = event.review ?? this.readPostedReviewState(round.id, event.receipt.headSha);
+        const postedReview = event.review ?? this.readPostedReviewState(round.id, event.receipt.headSha, {
+          canonicalVerdict: event.canonicalVerdict,
+          publicationText,
+        });
         if (postedReview === null) {
           this.escalate(
             `Review round ${round.id} cannot be promoted: its review coverage state is missing or damaged`,
@@ -6083,14 +6123,23 @@ export class WaveRunner {
   }
 
   /** Read the review scope/coverage/debt from a round's preserved consolidated
-   * record, authenticated to the posted head. Returns null when the record is
-   * absent, unreadable, malformed or bound to a different head — recovery then
-   * refuses to promote rather than assume no debt. A legacy record with no
-   * convergence block was a whole review and carries no debt. A recognized
-   * scope whose full linkage is missing or inconsistent (the SAME shared
-   * validator the planner and posted parser use) is DAMAGED state, never a
-   * debt-free promotion. */
-  private readPostedReviewState(roundId: string, headSha: string): PostedReviewState | null {
+   * record when the posted event carries no persisted `review` block,
+   * authenticated to the posted head AND to the round's immutable native
+   * evidence. Returns null when the record is absent, unreadable, malformed,
+   * bound to a different head, not a conclusive unchanged-head completion, or
+   * its verdict disagrees with the posted event — recovery then refuses to
+   * promote rather than assume no debt. Absent convergence is NOT itself
+   * whole-review proof: the DIGEST-VERIFIED publication body must corroborate
+   * whole scope (a pre-disclosure body IS the genuine historical whole
+   * review); a body that discloses a delta/integration/owed-pass scope keeps
+   * its debt instead of promoting debt-free. A recognized scope whose full
+   * linkage is missing or inconsistent (the SAME shared validator the planner
+   * and posted parser use) is DAMAGED state, never a debt-free promotion. */
+  private readPostedReviewState(
+    roundId: string,
+    headSha: string,
+    posted: { readonly canonicalVerdict: string; readonly publicationText: string | null },
+  ): PostedReviewState | null {
     const consolidated = join(reviewArtifactDirectory(this.artifactRoot(), roundId), 'consolidated.json');
     try {
       const info = lstatSync(consolidated);
@@ -6098,14 +6147,28 @@ export class WaveRunner {
       const parsed = JSON.parse(readFileSync(consolidated, 'utf8')) as {
         architecture?: unknown;
         schemaVersion?: unknown;
+        complete?: unknown;
+        headMoved?: unknown;
+        canonicalVerdict?: unknown;
         frozen?: { targetSha?: unknown; diffBaseSha?: unknown };
         findings?: unknown;
         convergence?: { reviewScope?: unknown; coverageComplete?: unknown; finalPassRequired?: unknown; integrationFromSha?: unknown; integrationBaseSha?: unknown; integrationPriorDiffBase?: unknown };
       };
       if (parsed.architecture !== 'perkins-whole-pr' || parsed.schemaVersion !== 3 || parsed.frozen?.targetSha !== headSha) return null;
-      // A legacy record with no convergence block WAS a whole review: it
-      // carries no debt and recovers normally.
+      // A recovery fallback may credit only a CONCLUSIVE, unchanged-head
+      // completion whose verdict agrees with the posted event: an incomplete,
+      // moved-head or verdict-inconsistent record must never promote.
+      if (parsed.complete !== true || parsed.headMoved !== false) return null;
+      if (typeof parsed.canonicalVerdict !== 'string' || parsed.canonicalVerdict !== posted.canonicalVerdict) return null;
       if (parsed.convergence === undefined) {
+        // Absent convergence is authenticated against the round's immutable
+        // scope evidence or refused: never treated as whole clearance on the
+        // mutable file's word alone.
+        const disclosure = publishedScopeDisclosure(posted.publicationText);
+        if (disclosure === null) return null;
+        if (disclosure.kind === 'scoped' && (disclosure.reviewScope !== 'whole' || disclosure.finalPassRequired)) {
+          return { reviewScope: disclosure.reviewScope, coverageComplete: false, finalPassRequired: true };
+        }
         return { reviewScope: 'whole', coverageComplete: true, finalPassRequired: false };
       }
       const convergence = parsed.convergence;

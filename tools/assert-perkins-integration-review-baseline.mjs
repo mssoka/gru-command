@@ -29,6 +29,9 @@ export const BASELINE_TITLES = {
     'keeps a verdict-committed round as predecessor when the promotion annotation write is interrupted',
     'refuses a WaveRunner predecessor mutated between the authenticated plan and engine consumption',
   ],
+  r7: [
+    'authenticates the historical fallback before treating absent convergence as whole clearance',
+  ],
 };
 
 /** A behavioral RED: a Vitest matcher failure or a rejects/resolves report —

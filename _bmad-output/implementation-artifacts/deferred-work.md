@@ -153,3 +153,12 @@
 - source_spec: `spec-perkins-integration-review-coverage.md`
   summary: Ordinary delta planning treats a baseline whole record with nonempty findings but no findings digest as unusable, so a same-base fix round restarts whole review instead of delta convergence.
   evidence: The R4 warning at `src/dispatch/perkins-review/convergence.ts:1014-1021` is a real behavior observation. Separating "ordinary delta predecessor usability" from "integration whole-complete credit" would reintroduce unauthenticated finding contents into carry-forward, which prior-finding 0 deliberately made fail closed; the change is safety-sensitive and outside the approved R4 repair scope. Settled by: a design that authenticates delta carry through a per-finding binding (digest or frozen-evidence re-proof) without trusting count-only receipts, reviewed as its own change.
+
+## Deferred from: native R7 whole-change review of job perkins-integration-review-coverage-20261009 (2026-10-10)
+
+- source_spec: `spec-perkins-integration-review-coverage.md`
+  summary: A baseline whole receipt with `blockers: 0` and no total finding count or digest cannot authenticate an empty finding set, so erased warnings/notes can be credited as whole-complete coverage.
+  evidence: R7 warning at `src/dispatch/perkins-review/convergence.ts:1073-1076`. The erasure can only lose warning/note entries (a blocker-bearing record fails the count comparison at `:1054-1055`), and requiring an authoritative zero total for every legacy empty receipt would reclassify genuine pre-digest empties as unauthenticated. Settled by: a design binding emptiness to digest/publication evidence without resetting genuinely empty legacy predecessors.
+- source_spec: `spec-perkins-integration-review-coverage.md`
+  summary: A transient post-commit annotation failure retries with `blockers: 0`, so a genuine blocker-bearing predecessor fails authentication and the next integration unnecessarily restarts whole review.
+  evidence: R7 warning at `src/dispatch/perkins.ts:5826-5827`. The behavior fails closed (whole re-review, never unsafe approval). Settled by: rebuilding the retry annotation from the validated posted review state, with its own annotation-crash-window regression.

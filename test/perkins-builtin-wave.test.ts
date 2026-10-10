@@ -3375,38 +3375,49 @@ describe('WaveRunner built-in Perkins production path', () => {
     rmSync(artifacts, { recursive: true, force: true });
   }, 180_000);
 
-  it('refuses to promote an approval whose coverage state is absent or damaged, and preserves historical whole recovery', async () => {
-    const build = (name: string): { ledger: LedgerApi; port: GitReviewPort; jobId: string; round: ReturnType<LedgerApi['addRound']>; directory: string; publicationFile: string; publicationSha256: string; prUrl: string; poster: { post: () => Promise<never>; authenticatedActor: () => Promise<string> } } => {
-      const repo = makeFixtureRepo(name);
-      repos.push(repo);
-      repo.git(['config', 'user.name', 'Fixture Tests']);
-      repo.git(['config', 'user.email', 'tests@example.invalid']);
-      repo.git(['checkout', '-b', `feature/${name}`]);
-      const target = repo.commitFile('src/main.ts', 'export const answer = 1;\n');
-      const root = mkdtempSync(join(tmpdir(), `perkins-${name}-port-`));
-      const artifacts = mkdtempSync(join(tmpdir(), `perkins-${name}-artifacts-`));
-      const db = new LedgerDb(mkdtempSync(join(tmpdir(), `perkins-${name}-db-`)));
-      dirs.push(root, artifacts); dbs.push(db);
-      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-      const port = new GitReviewPort(root, `feature/${name}`, target);
-      const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
-      ledger.setJobStatus(job.id, 'working');
-      ledger.setJobStatus(job.id, 'in-review');
-      const prUrl = 'https://example.invalid/acme/fixture/pull/77';
-      ledger.setJobPr(job.id, prUrl);
-      const round = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: target });
-      ledger.setRoundStatus(round.id, 'live');
-      const directory = join(artifacts, round.id);
-      mkdirSync(directory, { recursive: true });
-      const publicationBody = '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
-      const publicationFile = join(directory, 'perkins-report.publication.md');
-      writeFileSync(publicationFile, publicationBody, 'utf8');
-      const publicationSha256 = createHash('sha256').update(publicationBody, 'utf8').digest('hex');
-      return {
-        ledger, port, jobId: job.id, round, directory, publicationFile, publicationSha256, prUrl,
-        poster: { post: (() => { throw new Error('unused'); }) as unknown as () => Promise<never>, authenticatedActor: async () => 'gru-bot' },
-      };
+  /** One interrupted-round recovery fixture: a live round whose bound
+   * `round.posted` event and canonical publication artifact exist while the
+   * caller supplies the mutable consolidated record. `publicationBody`
+   * overrides the published bytes (and therefore the digest the posted event
+   * must carry). */
+  function recoveryCase(name: string, options: { readonly publicationBody?: string } = {}): {
+    ledger: LedgerApi; port: GitReviewPort; jobId: string; round: ReturnType<LedgerApi['addRound']>;
+    directory: string; publicationFile: string; publicationSha256: string; prUrl: string;
+    poster: { post: () => Promise<never>; authenticatedActor: () => Promise<string> };
+  } {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    repo.git(['checkout', '-b', `feature/${name}`]);
+    const target = repo.commitFile('src/main.ts', 'export const answer = 1;\n');
+    const root = mkdtempSync(join(tmpdir(), `perkins-${name}-port-`));
+    const artifacts = mkdtempSync(join(tmpdir(), `perkins-${name}-artifacts-`));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), `perkins-${name}-db-`)));
+    dirs.push(root, artifacts); dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, `feature/${name}`, target);
+    const job = ledger.addJob({ id: `job-${name}`, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'in-review');
+    const prUrl = 'https://example.invalid/acme/fixture/pull/77';
+    ledger.setJobPr(job.id, prUrl);
+    const round = ledger.addRound({ jobId: job.id, lenses: ['blind'], targetRef: target });
+    ledger.setRoundStatus(round.id, 'live');
+    const directory = join(artifacts, round.id);
+    mkdirSync(directory, { recursive: true });
+    const publicationBody = options.publicationBody ?? '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
+    const publicationFile = join(directory, 'perkins-report.publication.md');
+    writeFileSync(publicationFile, publicationBody, 'utf8');
+    const publicationSha256 = createHash('sha256').update(publicationBody, 'utf8').digest('hex');
+    return {
+      ledger, port, jobId: job.id, round, directory, publicationFile, publicationSha256, prUrl,
+      poster: { post: (() => { throw new Error('unused'); }) as unknown as () => Promise<never>, authenticatedActor: async () => 'gru-bot' },
     };
+  }
+
+  it('refuses to promote an approval whose coverage state is absent or damaged, and preserves historical whole recovery', async () => {
+    const build = (name: string) => recoveryCase(name);
 
     // (a) A bound approved round whose consolidated state is ABSENT: recovery
     // refuses to promote rather than assume no debt.
@@ -3566,6 +3577,131 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(inconsistent.ledger.getRound(inconsistent.round.id)).toMatchObject({ status: 'aborted', verdict: null });
     expect(inconsistent.ledger.latestRoundEvent(inconsistent.round.id, 'round.post-recovered')).toBeNull();
     expect(inconsistentEscalations.some((line) => line.includes('without a provider-bound receipt'))).toBe(true);
+  }, 180_000);
+
+  it('authenticates the historical fallback before treating absent convergence as whole clearance', async () => {
+    const postApproved = (target: ReturnType<typeof recoveryCase>, reviewId: string): void => {
+      target.ledger.appendCustomEvent({
+        kind: 'round.posted', jobId: target.jobId, roundId: target.round.id,
+        payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: target.prUrl, host: 'example.invalid',
+          targetSha: target.round.targetRef, baseSha: 'b'.repeat(40), publicationFile: target.publicationFile,
+          publicationSha256: target.publicationSha256, reconciled: false,
+          receipt: { reviewId, actor: 'gru-bot', event: 'COMMENTED', commitId: target.round.targetRef, headSha: target.round.targetRef, baseSha: 'b'.repeat(40), bodySha256: target.publicationSha256 },
+        },
+      });
+    };
+    const refuseFallback = async (fallback: ReturnType<typeof recoveryCase>, reviewId: string): Promise<void> => {
+      postApproved(fallback, reviewId);
+      const escalations: string[] = [];
+      const wave = new WaveRunner({
+        ledger: fallback.ledger, worktrees: fallback.port, spawner: vi.fn() as unknown as AgentSpawner,
+        reviewArtifactRoot: join(fallback.directory, '..'), poster: fallback.poster,
+        escalate: (title, detail) => escalations.push(`${title} :: ${detail}`),
+      });
+      expect(await wave.recoverInterruptedRounds()).toBe(1);
+      expect(fallback.ledger.getRound(fallback.round.id)).toMatchObject({ status: 'aborted', verdict: null });
+      expect(fallback.ledger.latestRoundEvent(fallback.round.id, 'round.post-recovered')).toBeNull();
+      expect(escalations.some((line) => line.includes('missing or damaged'))).toBe(true);
+    };
+
+    // (a) A historical posted approval whose mutable DELTA record lost its
+    // convergence block: the digest-verified publication still proves the
+    // round was a delta that owed the final whole-change pass, so promotion
+    // must keep the debt instead of crediting debt-free whole coverage.
+    const stripped = recoveryCase('authenticate-stripped-delta', {
+      publicationBody: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\n${hostDisclosureAppendix({
+        findings: [], specialistRuns: [], priorDispositions: [],
+        convergence: { reviewScope: 'delta', finalPassRequired: true },
+      }, 'github', [])}\n`,
+    });
+    writeFileSync(join(stripped.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: stripped.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+    }));
+    postApproved(stripped, '9022');
+    const strippedWave = new WaveRunner({
+      ledger: stripped.ledger, worktrees: stripped.port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: join(stripped.directory, '..'), poster: stripped.poster,
+    });
+    expect(await strippedWave.recoverInterruptedRounds()).toBe(1);
+    expect(stripped.ledger.getRound(stripped.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+    const restoredDebt = stripped.ledger.latestRoundEvent(stripped.round.id, 'round.final-pass-required');
+    expect(restoredDebt).not.toBeNull();
+    expect(restoredDebt!.payload).toMatchObject({ reviewScope: 'delta' });
+    // The restored debt keeps this approval out of owner-readiness.
+    stripped.ledger.appendCustomEvent({
+      kind: 'github.branch-state', jobId: stripped.jobId,
+      payload: {
+        repo: 'example/fixture', branch: `gru/${stripped.jobId}`, sha: stripped.round.targetRef, merged: false, pr_open: true,
+        mergeable_state: 'clean', pr_number: 3, pr_url: 'https://example.invalid/acme/fixture/pull/3', merge_commit_sha: null,
+        ci: { sha: stripped.round.targetRef, status: 'green', signature: '', failures: [], checks: ['ci'] },
+      },
+    });
+    expect(new BoardEngine({ ledger: stripped.ledger, bus: new EventBus() }).snapshot().ownerPrs).toEqual([]);
+
+    // (b) An INCOMPLETE historical record must refuse promotion: absent
+    // convergence plus complete:false is not a whole clearance.
+    const incomplete = recoveryCase('authenticate-incomplete');
+    writeFileSync(join(incomplete.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: false, headMoved: false, frozen: { targetSha: incomplete.round.targetRef },
+    }));
+    await refuseFallback(incomplete, '9023');
+
+    // (c) A head-moved historical record must refuse promotion.
+    const moved = recoveryCase('authenticate-head-moved');
+    writeFileSync(join(moved.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: true, frozen: { targetSha: moved.round.targetRef },
+    }));
+    await refuseFallback(moved, '9024');
+
+    // (d) A verdict-inconsistent historical record (NEEDS CHANGES record
+    // behind an approved posted event) must refuse promotion.
+    const inconsistent = recoveryCase('authenticate-verdict-inconsistent');
+    writeFileSync(join(inconsistent.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'NEEDS CHANGES',
+      complete: true, headMoved: false, frozen: { targetSha: inconsistent.round.targetRef },
+    }));
+    await refuseFallback(inconsistent, '9025');
+
+    // (e) A genuine pre-disclosure historical whole review (no convergence
+    // block, a publication body that predates scope disclosure) still
+    // promotes debt-free.
+    const legacy = recoveryCase('authenticate-legacy-whole');
+    writeFileSync(join(legacy.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: legacy.round.targetRef },
+    }));
+    postApproved(legacy, '9026');
+    const legacyWave = new WaveRunner({
+      ledger: legacy.ledger, worktrees: legacy.port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: join(legacy.directory, '..'), poster: legacy.poster,
+    });
+    expect(await legacyWave.recoverInterruptedRounds()).toBe(1);
+    expect(legacy.ledger.getRound(legacy.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+    expect(legacy.ledger.latestRoundEvent(legacy.round.id, 'round.final-pass-required')).toBeNull();
+
+    // (f) A damaged whole record whose immutable body discloses whole scope
+    // with no owed pass is still usable: the body proves the scope.
+    const disclosed = recoveryCase('authenticate-whole-disclosure', {
+      publicationBody: `# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\n${hostDisclosureAppendix({
+        findings: [], specialistRuns: [], priorDispositions: [], convergence: { reviewScope: 'whole' },
+      }, 'github', [])}\n`,
+    });
+    writeFileSync(join(disclosed.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: disclosed.round.targetRef },
+    }));
+    postApproved(disclosed, '9027');
+    const disclosedWave = new WaveRunner({
+      ledger: disclosed.ledger, worktrees: disclosed.port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: join(disclosed.directory, '..'), poster: disclosed.poster,
+    });
+    expect(await disclosedWave.recoverInterruptedRounds()).toBe(1);
+    expect(disclosed.ledger.getRound(disclosed.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+    expect(disclosed.ledger.latestRoundEvent(disclosed.round.id, 'round.final-pass-required')).toBeNull();
   }, 180_000);
 
   it('keeps a restart-promoted integration review as the predecessor for the next integrated head', async () => {
