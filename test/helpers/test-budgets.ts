@@ -112,6 +112,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'uploads-dir.test.ts', workload: 'real service boot against real filesystem state' },
   { file: 'verification-server.test.ts', workload: 'verification runner spawning real declared commands' },
   { file: 'wake-e2e.test.ts', workload: 'real service wake-on-alert flow' },
+  { file: 'workflow-runtime-packaged.test.ts', workload: 'extracts the actual npm archive and drives compiled workflow CLIs over a real git lane' },
   { file: 'wizard-interactive.test.ts', workload: 'PTY wizard session against the built CLI' },
   { file: 'wizard-register.test.ts', workload: 'install.sh service registration subprocess' },
   { file: 'wizard.test.ts', workload: 'built wizard CLI subprocesses' },

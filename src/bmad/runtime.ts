@@ -16,6 +16,7 @@ import {
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ManagedSkillSet } from '../runtime/types.js';
+import { parseWorkflowManifest, verifyWorkflowFiles, workflowDirName } from '../workflows/manifest.js';
 
 /**
  * The Gru Command-managed BMAD runtime (issue #283).
@@ -84,15 +85,19 @@ export interface BmadRuntimeManifest {
   readonly layout: readonly BmadRuntimeLayoutEntry[];
 }
 
-export interface BundledBmadRuntime {
+/** Shared immutable bytes: new GC resources reuse the #283 store and lane records. */
+export interface RuntimeBundle {
   readonly id: string;
-  readonly manifest: BmadRuntimeManifest;
   /** sha256 over the composed layout (every path and its bytes). */
   readonly contentSha256: string;
   /** Directory name of the materialized runtime (identity + content hash). */
   readonly dirName: string;
   /** Composed runtime: path → bytes (includes `runtime.json`). */
   readonly files: ReadonlyMap<string, Buffer>;
+}
+
+export interface BundledBmadRuntime extends RuntimeBundle {
+  readonly manifest: BmadRuntimeManifest;
 }
 
 export interface MaterializedBmadRuntime {
@@ -369,9 +374,20 @@ export function inspectMaterializedBmadRuntime(dir: string): MaterializedBmadRun
   for (const rel of listRegularFiles(dir, `BMAD runtime ${dir}`)) files.set(rel, readFileSync(join(dir, rel)));
   const manifestBytes = files.get(BMAD_RUNTIME_MANIFEST);
   if (manifestBytes === undefined) throw new BmadRuntimeError(`BMAD runtime ${dir} has no ${BMAD_RUNTIME_MANIFEST}`);
-  const manifest = parseBmadRuntimeManifest(manifestBytes.toString('utf-8'), join(dir, BMAD_RUNTIME_MANIFEST));
+  const text = manifestBytes.toString('utf-8');
+  // Only two known schemas: #283's retained runtimes and GC-owned delivery resources.
+  // This is historical continuity, not ambient/arbitrary BMAD compatibility.
+  let schema: unknown;
+  try { schema = (JSON.parse(text) as { schema_version?: unknown }).schema_version; } catch {
+    throw new BmadRuntimeError(`runtime manifest ${join(dir, BMAD_RUNTIME_MANIFEST)} is not valid JSON`);
+  }
+  const manifest = schema === 2
+    ? parseWorkflowManifest(text, join(dir, BMAD_RUNTIME_MANIFEST))
+    : parseBmadRuntimeManifest(text, join(dir, BMAD_RUNTIME_MANIFEST));
+  if (manifest.schema_version === 2) verifyWorkflowFiles(manifest, files);
   const content = contentHash(files);
-  if (basename(dir) !== runtimeDirName(manifest, content)) {
+  const expectedName = manifest.schema_version === 2 ? workflowDirName(manifest, content) : runtimeDirName(manifest, content);
+  if (basename(dir) !== expectedName) {
     throw new BmadRuntimeError(
       `BMAD runtime ${dir} was modified after it was installed (its content no longer matches its name)`,
     );
@@ -387,7 +403,7 @@ export function inspectMaterializedBmadRuntime(dir: string): MaterializedBmadRun
  * or verify the copy already there. Content-addressed: a directory name
  * names exactly one set of bytes, so concurrent writers converge.
  */
-export function materializeBmadRuntime(runtime: BundledBmadRuntime, storeRoot: string): MaterializedBmadRuntime {
+export function materializeBmadRuntime(runtime: RuntimeBundle, storeRoot: string): MaterializedBmadRuntime {
   mkdirSync(storeRoot, { recursive: true, mode: 0o700 });
   if (lstatSync(storeRoot).isSymbolicLink()) {
     throw new BmadRuntimeError(`BMAD runtime store is a symlink: ${storeRoot}`);
@@ -500,7 +516,7 @@ export interface BmadRuntimeBinderOptions {
   /** Where runtimes are materialized (`<dataDir>/bmad-runtime`). */
   readonly storeRoot: string;
   /** The verified runtime this GC build ships (memoize it: one bundle per process). */
-  readonly bundled: () => BundledBmadRuntime;
+  readonly bundled: () => RuntimeBundle;
   /** Test seam: runs just before a first binding is published (race proofs). */
   readonly beforePublish?: () => void;
 }

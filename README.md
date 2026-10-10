@@ -170,7 +170,23 @@ npm run config:generate                 # refuses an existing file
 npm run config:generate -- --force      # timestamped 0600 backup first
 ```
 
-### GC-managed BMAD runtime
+### GC-owned delivery resources
+
+GC ships directly editable build/planning/review resources with their own
+identity and content integrity in `resources/gc-workflows/`. Both normal and
+small-change paths retain independent tracked review, reasoned fixes,
+verification and ordinary PR handoff, without finding or tool-call quotas.
+The new package resolves with explicit project/job/worktree/artifact/knowledge
+context and no project/global BMAD, Python/uv or external skill dependency.
+See [docs/GC-WORKFLOWS.md](docs/GC-WORKFLOWS.md) for invocation, local manifest
+refresh, packaging tests and retained lane bindings.
+
+This resource-package change (#292) does **not** switch production sessions,
+review fallback selection or setup; those cutovers belong to #294/#295.
+Independent project BMAD installations and historical outputs are untouched.
+The existing transitional session/setup path is documented below.
+
+### GC-managed BMAD runtime (transitional)
 
 Gru Command ships the BMAD framework its build workflow uses: a pinned
 `bmad-method@6.12.0` `bmad-build` skill, unchanged, plus a small GC
