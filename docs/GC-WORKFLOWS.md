@@ -54,6 +54,12 @@ but never created or populated by rendering; approved portable knowledge can be
 written there later through that worktree. Private prompts/logs/review reports
 belong in the artifact root, never in repository knowledge.
 
+The CLI performs full read-only context validation **before** installing a runtime
+or publishing a lane binding. It executes the verified `scripts/context.mjs`
+bytes in memory; the retained renderer uses that same validator, avoiding two
+context contracts. Invalid identities, escaping/linked roots and nonprivate
+artifact roots cannot pin a rejected request's workflow version.
+
 The helper resolves all operational `[[gc-resource:...]]` links and context tokens
 into an immutable snapshot under `<artifactRoot>/workflow-snapshots/<hash>/`.
 It records the exact context plus selected workflow identity/content hash in

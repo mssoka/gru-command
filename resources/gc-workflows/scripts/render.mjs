@@ -4,8 +4,9 @@ import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import process from 'node:process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertNoLinks, validateContext } from './context.mjs';
 
 class WorkflowResourceError extends Error {
   constructor(message) { super(message); this.name = 'WorkflowResourceError'; }
@@ -63,61 +64,15 @@ function verifiedRuntime() {
   return { files, manifest, contentSha256 };
 }
 
-function noLinks(path) {
-  let current = path;
-  while (true) {
-    // lstat, rather than exists, also detects broken links.
-    try { if (lstatSync(current).isSymbolicLink()) fail(`context path is a symlink: ${current}`); } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-    const parent = dirname(current);
-    if (parent === current) return;
-    current = parent;
-  }
-}
-function inside(parent, child) {
-  const path = relative(parent, child);
-  return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path));
-}
-function contextFrom(raw) {
-  if (!record(raw)) fail('GC workflow context must be an explicit JSON object');
-  const context = {};
-  const keys = ['projectId', 'jobId', 'projectRoot', 'worktreeRoot', 'artifactRoot', 'knowledgeRoot'];
-  if (Object.keys(raw).some((key) => !keys.includes(key))) fail('unknown GC workflow context field');
-  for (const key of keys) {
-    const value = raw[key];
-    if (typeof value !== 'string' || value.trim() === '' || /[\0\r\n]/u.test(value)) fail(`GC workflow context ${key} must be a non-empty string`);
-    if (key === 'projectId' || key === 'jobId') {
-      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value)) fail(`GC workflow context ${key} must be a stable identity, not a path`);
-      context[key] = value;
-    } else {
-      if (!isAbsolute(value)) fail(`GC workflow context ${key} must be an absolute path`);
-      context[key] = resolve(value);
-      noLinks(context[key]);
-    }
-  }
-  for (const key of ['projectRoot', 'worktreeRoot']) {
-    if (!lstatSync(context[key]).isDirectory()) fail(`GC workflow context ${key} is not a directory: ${context[key]}`);
-  }
-  for (const path of [context.projectRoot, context.worktreeRoot, root]) {
-    if (inside(path, context.artifactRoot) || inside(context.artifactRoot, path)) fail('GC workflow artifactRoot must be private and outside project/worktree/runtime roots');
-  }
-  if (context.knowledgeRoot === context.worktreeRoot || !inside(context.worktreeRoot, context.knowledgeRoot)) {
-    fail('GC workflow knowledgeRoot must be beneath the assigned worktreeRoot');
-  }
-  if (existsSync(context.knowledgeRoot) && !lstatSync(context.knowledgeRoot).isDirectory()) fail('GC workflow knowledgeRoot is not a directory');
-  return context;
-}
-
 function render(raw, route) {
   const { files, manifest, contentSha256 } = verifiedRuntime();
   if (!Object.hasOwn(manifest.entrypoints, route)) fail(`unsupported GC workflow route: ${route}`);
-  const context = contextFrom(raw);
+  const context = validateContext(raw, [root, dirname(root)]);
   const receipt = { ...context, runtimeId: manifest.id, contentSha256 };
   const generation = sha(JSON.stringify(receipt));
   const snapshots = join(context.artifactRoot, 'workflow-snapshots');
   const snapshotDir = join(snapshots, generation);
-  noLinks(snapshotDir);
+  assertNoLinks(snapshotDir);
   const contextFile = join(snapshotDir, 'invocation.json');
   const values = { ...receipt, contextFile };
   const expected = new Map([['invocation.json', Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`)]]);

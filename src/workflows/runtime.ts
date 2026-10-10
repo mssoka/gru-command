@@ -85,6 +85,32 @@ export function writeWorkflowManifest(packageRoot: string, version?: number): Wo
   return manifest;
 }
 
+/** Validate without installing/binding. Execute the already-verified validator bytes,
+ * not a mutable package pathname, so the CLI and retained renderer share one contract. */
+export function validateWorkflowContext(bundle: BundledWorkflowRuntime, context: unknown, protectedRoots: readonly string[] = []): WorkflowContext {
+  const source = bundle.files.get('scripts/context.mjs');
+  if (source === undefined) throw new WorkflowResourceError('missing GC workflow resource scripts/context.mjs');
+  const validator = `
+    import { readFileSync } from 'node:fs';
+    try {
+      const { validateContext } = await import(process.argv[1]);
+      const input = JSON.parse(readFileSync(0, 'utf-8'));
+      process.stdout.write(JSON.stringify(validateContext(input.context, input.protectedRoots)));
+    } catch (error) {
+      process.stderr.write(error.message);
+      process.exitCode = 1;
+    }
+  `;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', validator,
+    `data:text/javascript;base64,${source.toString('base64')}`], {
+    input: JSON.stringify({ context, protectedRoots }), encoding: 'utf-8', timeout: 30_000,
+  });
+  if (result.error !== undefined || result.status !== 0) {
+    throw new WorkflowResourceError(`GC workflow context validation failed: ${result.error?.message ?? result.stderr.trim()}`);
+  }
+  return JSON.parse(result.stdout) as WorkflowContext;
+}
+
 /** Same atomic binding record as #283. A retained historical runtime wins unchanged. */
 export function bindWorkflowRuntime(cwd: string, options: BmadRuntimeBinderOptions): BmadRuntimeBinding {
   return bindBmadRuntime(cwd, options);

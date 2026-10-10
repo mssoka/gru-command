@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { bindWorkflowRuntime, loadBundledWorkflowRuntime, renderWorkflow, writeWorkflowManifest, type WorkflowContext } from '../workflows/runtime.js';
-import { WorkflowResourceError, WORKFLOW_ENTRYPOINTS, type WorkflowRoute } from '../workflows/manifest.js';
+import { bindWorkflowRuntime, loadBundledWorkflowRuntime, renderWorkflow, validateWorkflowContext, writeWorkflowManifest } from '../workflows/runtime.js';
+import { WorkflowResourceError, WORKFLOW_ENTRYPOINTS, WORKFLOW_RESOURCE_DIR, type WorkflowRoute } from '../workflows/manifest.js';
 
 const USAGE = 'usage: workflow-runtime verify|manifest [package-root] [--version <n>]\n' +
   '       workflow-runtime render --context <file.json> --store <dir> [--package-root <dir>] [--route normal|small-change|plan|review]';
@@ -37,11 +37,13 @@ export function runWorkflowRuntimeCli(args: readonly string[], write: (line: str
     const store = options.get('--store');
     const route = options.get('--route') ?? 'normal';
     if (contextFile === undefined || store === undefined || !Object.hasOwn(WORKFLOW_ENTRYPOINTS, route)) throw new WorkflowResourceError(USAGE);
-    const context = JSON.parse(readFileSync(resolve(contextFile), 'utf-8')) as WorkflowContext;
-    if (typeof context.worktreeRoot !== 'string') throw new WorkflowResourceError('GC workflow context lacks worktreeRoot');
-    const binding = bindWorkflowRuntime(context.worktreeRoot, {
-      storeRoot: resolve(store), bundled: () => loadBundledWorkflowRuntime(resolve(options.get('--package-root') ?? '.')),
-    });
+    const packageRoot = resolve(options.get('--package-root') ?? '.');
+    const storeRoot = resolve(store);
+    const bundle = loadBundledWorkflowRuntime(packageRoot);
+    const context = validateWorkflowContext(bundle, JSON.parse(readFileSync(resolve(contextFile), 'utf-8')) as unknown,
+      [join(packageRoot, WORKFLOW_RESOURCE_DIR), storeRoot]);
+    // Validation is read-only and precedes every durable store/lane side effect.
+    const binding = bindWorkflowRuntime(context.worktreeRoot, { storeRoot, bundled: () => bundle });
     const result = renderWorkflow(binding, context, route as WorkflowRoute);
     write(JSON.stringify(result));
     return 0;

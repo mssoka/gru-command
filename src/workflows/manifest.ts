@@ -13,7 +13,7 @@ export type WorkflowRoute = keyof typeof WORKFLOW_ENTRYPOINTS;
 
 /** The supported delivery path, not a catalog of arbitrary skills. */
 export const REQUIRED_WORKFLOW_FILES: readonly string[] = [
-  'LICENSE', 'NOTICE.md', '.claude-plugin/plugin.json', 'scripts/render.mjs',
+  'LICENSE', 'NOTICE.md', '.claude-plugin/plugin.json', 'scripts/render.mjs', 'scripts/context.mjs',
   'skills/gc-build/SKILL.md', ...Object.values(WORKFLOW_ENTRYPOINTS),
   'skills/gc-build/implement.md', 'skills/gc-build/present.md', 'skills/gc-build/spec-template.md',
   'skills/gc-build/review-prompts/adversarial.md', 'skills/gc-build/review-prompts/edge-cases.md',
@@ -64,7 +64,7 @@ export function verifyWorkflowFiles(manifest: WorkflowManifest, files: ReadonlyM
     }
   }
   for (const path of files.keys()) {
-    if (path !== WORKFLOW_MANIFEST && manifest.files[path] === undefined) {
+    if (path !== WORKFLOW_MANIFEST && !Object.hasOwn(manifest.files, path)) {
       throw new WorkflowResourceError(`undeclared GC workflow resource ${path}`);
     }
     if (path.endsWith('.md')) {

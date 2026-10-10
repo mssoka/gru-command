@@ -77,8 +77,11 @@ describe('GC-owned workflow resources', () => {
   it('rejects missing, corrupt, undeclared and symlinked resources by name without ambient fallback', () => {
     const cases: Array<[string, (dir: string) => void, RegExp]> = [
       ['missing helper', (dir) => rmSync(join(dir, 'scripts/render.mjs')), /scripts\/render\.mjs/u],
+      ['missing validator', (dir) => rmSync(join(dir, 'scripts/context.mjs')), /scripts\/context\.mjs/u],
       ['corrupt template', (dir) => appendFileSync(join(dir, 'skills/gc-build/small-change.md'), 'changed'), /small-change\.md.*sha256/u],
       ['undeclared', (dir) => writeFileSync(join(dir, 'extra.txt'), 'x'), /undeclared.*extra\.txt/u],
+      ['prototype-named undeclared file', (dir) => writeFileSync(join(dir, 'toString'), 'x'), /undeclared.*toString/u],
+      ['another prototype-named undeclared file', (dir) => writeFileSync(join(dir, 'constructor'), 'x'), /undeclared.*constructor/u],
       ['missing manifest', (dir) => rmSync(join(dir, 'runtime.json')), /missing runtime\.json/u],
       ['symlink', (dir) => { rmSync(join(dir, 'scripts/render.mjs')); symlinkSync(join(repoRoot, WORKFLOW_RESOURCE_DIR, 'scripts/render.mjs'), join(dir, 'scripts/render.mjs')); }, /symlink.*render\.mjs/u],
     ];
@@ -293,6 +296,37 @@ describe('GC-owned workflow resources', () => {
     appendFileSync(target, 'corrupt');
     expect(() => bind(lane)).toThrow(/review\.md.*sha256/u);
     expect(readFileSync(target, 'utf-8')).toContain('corrupt');
+  });
+
+  it('rejects full CLI context before creating a runtime store or publishing a lane binding', () => {
+    const context = fixture();
+    const lane = join(dirname(context.projectRoot), 'invalid-context-lane');
+    git(context.projectRoot, ['worktree', 'add', '-qb', 'invalid-context', lane]);
+    const valid = { ...context, worktreeRoot: lane, knowledgeRoot: join(lane, 'gru-output') };
+    const store = join(temp(), 'store-must-remain-absent');
+    const bindingFile = join(git(lane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json');
+    const file = join(temp(), 'context.json');
+    const external = temp();
+    const publicArtifacts = join(temp(), 'public-artifacts');
+    mkdirSync(publicArtifacts);
+    chmodSync(publicArtifacts, 0o755);
+    const linkedKnowledge = join(lane, 'linked-knowledge');
+    symlinkSync(external, linkedKnowledge);
+    for (const patch of [{ projectId: '' }, { jobId: '' }, { artifactRoot: join(lane, 'private') },
+      { knowledgeRoot: external }, { knowledgeRoot: linkedKnowledge }, { artifactRoot: publicArtifacts }, { artifactRoot: join(store, 'wrong-place') }]) {
+      writeFileSync(file, JSON.stringify({ ...valid, ...patch }));
+      expect(() => runWorkflowRuntimeCli(['render', '--context', file, '--store', store, '--package-root', repoRoot], () => {})).toThrow(WorkflowResourceError);
+      expect(existsSync(bindingFile), JSON.stringify(patch)).toBe(false);
+      expect(existsSync(store), JSON.stringify(patch)).toBe(false);
+      expect(existsSync(valid.artifactRoot)).toBe(false);
+    }
+    const packageB = packageCopy();
+    writeWorkflowManifest(packageB, 2);
+    writeFileSync(file, JSON.stringify(valid));
+    const output: string[] = [];
+    runWorkflowRuntimeCli(['render', '--context', file, '--store', store, '--package-root', packageB], (line) => output.push(line));
+    expect(JSON.parse(output[0]!)).toMatchObject({ runtimeId: 'gru-command-workflows@2' });
+    expect(JSON.parse(readFileSync(bindingFile, 'utf-8'))).toMatchObject({ runtime_id: 'gru-command-workflows@2' });
   });
 
   it('the explicit render CLI records the bound workflow and rejects incomplete/unknown arguments', () => {
