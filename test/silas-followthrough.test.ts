@@ -225,7 +225,23 @@ async function bootFollowThrough(input: {
   let minionTurns = 0;
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
-    if (role === 'perkins') return hybrid.spawner(role, options);
+    if (role === 'perkins') {
+      const handle = await hybrid.spawner(role, options);
+      // The fixture bypasses RuntimeRegistry's event tap. Relay the fake's
+      // actual lifecycle so completed reviews do not remain spawning owners.
+      return {
+        ...handle,
+        async prompt(text, promptOptions) {
+          ledger.setAgentState(handle.id, 'streaming');
+          try { await handle.prompt(text, promptOptions); }
+          finally { ledger.setAgentState(handle.id, handle.health().state); }
+        },
+        async dispose() {
+          await handle.dispose();
+          if (ledger.getAgent(handle.id) !== null) ledger.setAgentState(handle.id, 'disposed');
+        },
+      };
+    }
     if (role === 'silas') throw new Error('the integration fakes the silas slot, never spawns it');
     const id = options?.agentId ?? `agent-${spawns.length}`;
     return withNativeDirectiveFixture({
@@ -494,7 +510,9 @@ describe('silas follow-through (no human input)', () => {
       expect(['dispatching', 'admitted', 'settled']).toContain(h.directiveReceipts[0]?.readbackState);
 
       const rounds = h.ledger.listRounds('pr-651');
-      const events = h.ledger.listJobEvents('pr-651');
+      const events = h.ledger.listJobEventsByKinds('pr-651', [
+        'silas.directive-sent', 'silas.review-triggered', 'job.delivered',
+      ]);
       // The directive closed round 1's gap and the delivery re-armed review.
       expect(events.map((event) => event.kind)).toContain('silas.directive-sent');
       expect(events.filter((event) => event.kind === 'silas.review-triggered')).toHaveLength(2);
