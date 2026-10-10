@@ -6238,7 +6238,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
       mutate = () => {
         if (change === 'working-bytes') writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 3;\n');
-        else h.repo.git(['commit', '--allow-empty', '-qm', 'head moved without content change']);
+        else h.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '--allow-empty', '-qm', 'head moved without content change']);
       };
       const outcome = await h.wave.runRound({ jobId: h.job.id });
       if (!('route' in outcome)) throw new Error('expected fallback route');
@@ -6253,7 +6253,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
     const path = join(h.repo.path, 'binary.bin');
     const first = Buffer.from('\0' + '00006161'); const second = Buffer.from('\0' + '00031931');
-    writeFileSync(path, Buffer.from('\0base')); h.repo.git(['add', 'binary.bin']); h.repo.git(['commit', '-qm', 'binary baseline']);
+    writeFileSync(path, Buffer.from('\0base')); h.repo.git(['add', 'binary.bin']); h.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-qm', 'binary baseline']);
     // Both candidate payloads stay uncommitted, so Git's object database
     // cannot widen their same-prefix abbreviated identities to disambiguate.
     writeFileSync(path, first);
