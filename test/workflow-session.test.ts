@@ -215,6 +215,15 @@ describe('production owned workflow session binding', () => {
     } finally { await wave.shutdown(); db.close(); }
   });
 
+  it('refuses retained helper corruption before capturing any fallback instructions', () => {
+    const f = fixture();
+    const bound = createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path });
+    const helper = join(bound.managedSkills!.root, 'skills/gc-build/review-prompts/adversarial.md');
+    chmodSync(helper, 0o600); writeFileSync(helper, 'unverified retained helper before capture');
+    expect(() => ownedFallbackReviewResources(bound, f.dataDir)).toThrow(/failed verification|retained identity/u);
+    expect(readBmadRuntimeBinding(f.lane.path, join(f.dataDir, 'bmad-runtime'))!.contentSha256).toBe(bound.managedSkills!.contentSha256);
+  });
+
   it('ambient name collisions/malformed BMAD answers cannot replace authority or write paths', () => {
     const f = fixture();
     mkdirSync(join(f.lane.path, '_bmad/custom'), { recursive: true });
