@@ -42,6 +42,9 @@ describe('perkins integration R4 fail-before classifier', () => {
       red(BASELINE_TITLES.r8[0]!, ['AssertionError: expected null not to be null']),
       red(BASELINE_TITLES.r8[1]!, ['AssertionError: expected [ { …(2) } ] to match object { …(1) }']),
     ))).toEqual(BASELINE_TITLES.r8);
+    expect(assertPerkinsIntegrationBaseline('r9', report(red(BASELINE_TITLES.r9[0]!, [
+      "AssertionError: expected { …(9) } to match object { status: 'aborted', verdict: null }",
+    ])))).toEqual(BASELINE_TITLES.r9);
     // A plain matcher failure (and the promise-resolution variant) both count;
     // a timeout or setup error text does not.
     expect(isBehavioralAssertion('AssertionError: nope')).toBe(true);
@@ -63,6 +66,8 @@ describe('perkins integration R4 fail-before classifier', () => {
       red(BASELINE_TITLES.r8[0]!),
       passed(BASELINE_TITLES.r8[1]!),
     ))).toThrow(/did not fail/u);
+    expect(() => assertPerkinsIntegrationBaseline('r9', report(passed(BASELINE_TITLES.r9[0]!))))
+      .toThrow(/did not fail/u);
   });
 
   it('refuses a collection/setup failure, an unlisted failure and a non-behavioral message', () => {

@@ -171,3 +171,5 @@
 - source_spec: `spec-perkins-integration-review-coverage.md`
   summary: `PriorReview.reviewScope` parsed in `whole.ts` is dead state — it is populated but no consumer reads it.
   evidence: R8-repair blind review follow-up at `src/dispatch/perkins-review/whole.ts:760` (populated at `:869`); the file was untouched by the R8 repair. Settled by: removing it or wiring it into a real cross-check.
+
+- source_spec: `spec-perkins-integration-review-coverage.md` — RESOLVED by contract revision 2 / amendment #2 (j-1762): the redaction-span follow-up recorded above is repaired reader-side. The scope-disclosure decoder now refuses evidence whose absence is consistent with a publication-redaction span (no anchored heading with a redaction placeholder present, or an in-region placeholder with no scope line), while genuine pre-disclosure legacy records (no placeholder) keep whole-complete credit. Regression: `redaction-erased disclosure cannot grant historical whole clearance` (real assembler/redactor + recovery/readiness assertions, fail-before at b930417 via `perkins-int-r9-baseline-heavy`).

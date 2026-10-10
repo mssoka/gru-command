@@ -13,6 +13,7 @@ import {
   GitLabMrPoster,
   WaveRunner,
   hostDisclosureAppendix,
+  publicationBodyFor,
   redactReviewForPublication,
   settledExecutionFactsLine,
   type EscalationContext,
@@ -3906,6 +3907,101 @@ describe('WaveRunner built-in Perkins production path', () => {
       convergence: { reviewScope: 'integration', coverageComplete: false, integrationFromSha: 'd'.repeat(40), integrationBaseSha: 'c'.repeat(40), integrationPriorDiffBase: 'e'.repeat(40) },
     }));
     await promoteWithDebt(matching, '9037', 'integration');
+  }, 180_000);
+
+  it('redaction-erased disclosure cannot grant historical whole clearance', async () => {
+    // Attack bodies are assembled and redacted by the REAL production
+    // functions (publicationBodyFor + redactReviewForPublication) and the
+    // fixture binds exactly those produced bytes, so this exercises the
+    // genuine published shape a historical round can carry.
+    const deferredReview: Parameters<typeof hostDisclosureAppendix>[0] = {
+      findings: [],
+      specialistRuns: [],
+      priorDispositions: [],
+      convergence: {
+        reviewScope: 'delta',
+        finalPassRequired: true,
+        deferredFollowups: [{ title: 'deferred followup', location: 'src/x.ts:1', severity: 'note' }],
+      },
+    };
+
+    // (i) A quoted-secret span opened in the lead report closes inside the
+    // host appendix: the heading and the scope/debt lines are erased.
+    const headingErased = redactReviewForPublication(publicationBodyFor(
+      '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\ncredential-shaped: token="',
+      deferredReview, 'github', [],
+    ));
+    expect(headingErased).not.toContain('## Execution and findings');
+    expect(headingErased).not.toContain('- Review scope: ');
+    expect(headingErased).toContain('[REDACTED]');
+    const erasedHeadingCase = recoveryCase('ac2-heading-erased', { publicationBody: headingErased });
+    writeFileSync(join(erasedHeadingCase.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: erasedHeadingCase.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+    }));
+    await refuseFallback(erasedHeadingCase, '9040');
+
+    // (ii) A span opened inside the appendix (a retained finding title) closes
+    // after the scope lines: the heading survives but the scope/debt evidence
+    // is erased.
+    const scopeErased = redactReviewForPublication(publicationBodyFor(
+      '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n\nClean apart from the noted item.',
+      {
+        findings: [{ severity: 'note', title: 'token="', location: 'src/y.ts:2', source: 'lead' }],
+        specialistRuns: [],
+        priorDispositions: [],
+        convergence: {
+          reviewScope: 'delta',
+          finalPassRequired: true,
+          deferredFollowups: [{ title: 'deferred followup', location: 'src/x.ts:1', severity: 'note' }],
+        },
+      }, 'github', [],
+    ));
+    expect(scopeErased).toContain('## Execution and findings');
+    expect(scopeErased).not.toContain('- Review scope: ');
+    expect(scopeErased).toContain('[REDACTED]');
+    const erasedScopeCase = recoveryCase('ac2-scope-erased', { publicationBody: scopeErased });
+    writeFileSync(join(erasedScopeCase.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: erasedScopeCase.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+    }));
+    await refuseFallback(erasedScopeCase, '9041');
+
+    // Neither erased body can expose owner-readiness.
+    for (const refused of [erasedHeadingCase, erasedScopeCase]) {
+      refused.ledger.appendCustomEvent({
+        kind: 'github.branch-state', jobId: refused.jobId,
+        payload: {
+          repo: 'example/fixture', branch: `gru/${refused.jobId}`, sha: refused.round.targetRef, merged: false, pr_open: true,
+          mergeable_state: 'clean', pr_number: 5, pr_url: 'https://example.invalid/acme/fixture/pull/5', merge_commit_sha: null,
+          ci: { sha: refused.round.targetRef, status: 'green', signature: '', failures: [], checks: ['ci'] },
+        },
+      });
+      expect(new BoardEngine({ ledger: refused.ledger, bus: new EventBus() }).snapshot().ownerPrs).toEqual([]);
+    }
+
+    // A genuine pre-disclosure whole record (the real assembler with no
+    // convergence block, no placeholder) still promotes debt-free.
+    const legacyBody = publicationBodyFor(
+      '# Perkins Code Review\n\n**Verdict: READY TO MERGE**',
+      { findings: [], specialistRuns: [], priorDispositions: [] }, 'github', [],
+    );
+    expect(legacyBody).toContain('## Execution and findings');
+    expect(legacyBody).not.toContain('- Review scope: ');
+    expect(legacyBody).not.toContain('[REDACTED]');
+    const legacyCase = recoveryCase('ac2-legacy-whole', { publicationBody: legacyBody });
+    writeFileSync(join(legacyCase.directory, 'consolidated.json'), JSON.stringify({
+      schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
+      complete: true, headMoved: false, frozen: { targetSha: legacyCase.round.targetRef, diffBaseSha: 'c'.repeat(40) },
+    }));
+    postApproved(legacyCase, '9042');
+    const legacyWave = new WaveRunner({
+      ledger: legacyCase.ledger, worktrees: legacyCase.port, spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: join(legacyCase.directory, '..'), poster: legacyCase.poster,
+    });
+    expect(await legacyWave.recoverInterruptedRounds()).toBe(1);
+    expect(legacyCase.ledger.getRound(legacyCase.round.id)).toMatchObject({ status: 'verdict-posted', verdict: 'approved' });
+    expect(legacyCase.ledger.latestRoundEvent(legacyCase.round.id, 'round.final-pass-required')).toBeNull();
   }, 180_000);
 
   it('keeps a restart-promoted integration review as the predecessor for the next integrated head', async () => {

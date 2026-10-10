@@ -101,10 +101,14 @@ export function lensAgentLabel(lens: string, attempt: number): string {
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
+const REDACTION_PLACEHOLDER = '[REDACTED]';
+
 function redaction(_value: string): string {
   // A fixed placeholder: any digest of the redacted bytes would publish an
-  // offline brute-force oracle for low-entropy secrets.
-  return '[REDACTED]';
+  // offline brute-force oracle for low-entropy secrets. The scope-disclosure
+  // decoder uses the same literal to distinguish evidence erased by a
+  // redaction span from an authentic pre-disclosure absence.
+  return REDACTION_PLACEHOLDER;
 }
 
 /** Keep verification evidence private when it resembles a credential. The
@@ -703,11 +707,12 @@ const HOST_APPENDIX_HEADING = '## Execution and findings (host-recorded facts)';
 /** What a DIGEST-VERIFIED publication body discloses about its round's review
  * scope: the immutable native scope evidence for a round whose posted event
  * predates the persisted `review` block. `legacy` is a body with no host
- * appendix or no scope disclosure in it (a genuine pre-Stage-5 whole
- * review); `scoped` names the disclosed scope plus whether the appendix
- * still discloses an owed final whole-change pass; null is a missing body or
- * an unrecognized disclosure, which can never corroborate retention (refuse,
- * never guess). */
+ * appendix scope disclosure AND no trace of publication-redaction erasure (a
+ * genuine pre-Stage-5 whole review); `scoped` names the disclosed scope plus
+ * whether the appendix still discloses an owed final whole-change pass; null
+ * is a missing body, an unrecognized disclosure, or missing evidence whose
+ * absence is consistent with a redaction span — none of which can corroborate
+ * retention (refuse, never guess). */
 type PublishedScopeDisclosure =
   | { readonly kind: 'legacy' }
   | { readonly kind: 'scoped'; readonly reviewScope: 'whole' | 'delta' | 'integration'; readonly finalPassRequired: boolean };
@@ -719,11 +724,23 @@ function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure
   // heading inside a longer line can never move the boundary, and more than
   // one anchored heading is ambiguous scope evidence and refuses.
   const heading = lineAnchoredPosition(text, HOST_APPENDIX_HEADING);
-  if (heading.count === 0) return { kind: 'legacy' };
   if (heading.count > 1) return null;
+  if (heading.count === 0) {
+    // No host heading: either a genuine pre-heading-era whole record or
+    // evidence erased by a publication redaction span — which always leaves
+    // its placeholder. With a placeholder present the absence is ambiguous:
+    // refuse rather than credit whole clearance.
+    return text.includes(REDACTION_PLACEHOLDER) ? null : { kind: 'legacy' };
+  }
   const host = text.slice(heading.index);
   const scopeLines = host.split('\n').filter((entry) => entry.startsWith('- Review scope: '));
-  if (scopeLines.length === 0) return { kind: 'legacy' };
+  if (scopeLines.length === 0) {
+    // A missing disclosure is either the genuine pre-Stage-5 whole review (no
+    // scope lines were ever emitted) or scope evidence erased by a redaction
+    // span, whose placeholder remains in the region. An erased region can
+    // never be told from the absent era, so refuse rather than credit whole.
+    return host.includes(REDACTION_PLACEHOLDER) ? null : { kind: 'legacy' };
+  }
   // The host appendix emits exactly ONE scope line: two or more is ambiguous
   // scope evidence and refuses rather than picking one.
   if (scopeLines.length > 1) return null;

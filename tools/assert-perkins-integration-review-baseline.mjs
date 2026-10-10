@@ -4,7 +4,7 @@
  *
  * The fail-before evidence is discriminating only when the NAMED regression
  * fails by ASSERTION against the named uncorrected lineage: a nonzero exit
- * from import, collection, setup or an unrelated test is NOT RED. Four legs:
+ * from import, collection, setup or an unrelated test is NOT RED. Five legs:
  *
  *   fast  — the consumed-byte mutation refusal at e9772af: the pre-fix base
  *           accepts the replaced record, so `rejects` reports "promise
@@ -21,6 +21,10 @@
  *           field embeds the heading as legacy/debt-free, and its
  *           present-convergence branch skips the unusable-disclosure
  *           refusal, so the debt and refusal assertions fail.
+ *   r9    — the redaction-erasure fix at b930417: the uncorrected decoder
+ *           credits a body whose heading/scope evidence was erased by a real
+ *           publication redaction span as legacy whole clearance, so the
+ *           refusal and owner-readiness assertions fail.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -43,6 +47,9 @@ export const BASELINE_TITLES = {
   r8: [
     'keeps review debt when dynamic appendix fields embed the host heading after the scope lines',
     'refuses an unusable publication disclosure even with present mutable convergence',
+  ],
+  r9: [
+    'redaction-erased disclosure cannot grant historical whole clearance',
   ],
 };
 
@@ -126,7 +133,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   try {
     const [leg, path] = process.argv.slice(2);
     if (leg === undefined || path === undefined) {
-      throw new Error('usage: assert-perkins-integration-review-baseline.mjs <fast|heavy|r7|r8> REPORT_JSON');
+      throw new Error('usage: assert-perkins-integration-review-baseline.mjs <fast|heavy|r7|r8|r9> REPORT_JSON');
     }
     const titles = assertPerkinsIntegrationBaseline(leg, JSON.parse(readFileSync(path, 'utf8')));
     process.stdout.write(
