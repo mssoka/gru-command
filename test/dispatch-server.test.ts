@@ -1149,6 +1149,37 @@ describe('dispatch server (E8)', () => {
     } finally { await h.close(); }
   }, 90_000);
 
+  it('refuses a clean-abort re-arm for an already-aborted round with a recorded historical delivery (revision 3)', async () => {
+    // Amendment #3 (j-1717): the mechanical dispatch admission must refuse
+    // an already-terminal historical delivery with no intent and no marker.
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-historical');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const { sha, roundId } = await prepareCleanAbort(h, repo, 'clean-abort-historical');
+      h.ledger.appendCustomEvent({ kind: 'round.posted', jobId: 'clean-abort-historical', roundId, payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
+        targetSha: sha, baseSha: 'b'.repeat(40),
+        publicationFile: '/tmp/historical/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+        receipt: {
+          reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: sha,
+          headSha: sha, baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64),
+        },
+        reconciled: false,
+      } });
+      const refused = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'clean-abort-historical', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      }, TOKEN);
+      expect(refused).toMatchObject({
+        status: 400,
+        json: { error: 'bad_request', detail: expect.stringMatching(/was never credited|reconcile it before re-arming/u) },
+      });
+      expect(h.ledger.latestJobEvent('clean-abort-historical', 'silas.review-triggered')).toBeNull();
+      expect(h.ledger.listRounds('clean-abort-historical')).toHaveLength(1);
+    } finally { await h.close(); }
+  }, 90_000);
+
   it('binds a clean-abort re-arm to the proved delivered head, never a moved live PR head', async () => {
     const h = await boot();
     const repo = makeFixtureRepo('fixture-clean-abort-target');

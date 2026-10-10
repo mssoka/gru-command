@@ -1256,6 +1256,45 @@ describe('silas digest (the four actionable states)', () => {
     } finally { h.cleanup(); }
   });
 
+  it('does not offer a clean-abort re-arm for an already-aborted round with a recorded historical delivery (revision 3)', async () => {
+    // Amendment #3 (j-1717): a historical COMMENT-era round.posted with a
+    // verified receipt, NO publication intent and NO rebind marker, already
+    // aborted by the old recovery after an unbound promotion, must not be
+    // automatically re-armed on the same head — the recorded provider write
+    // stays unresolved until reconciliation establishes the actual result.
+    const h = makeLedger();
+    try {
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      addJobWithDelivery(h.ledger, 'clean-historical', { prUrl: 'https://git.example.invalid/pull/historical' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'clean-historical', payload: { sha: 'sha-historical' } });
+      const round = h.ledger.addRound({ jobId: 'clean-historical', targetRef: 'sha-historical' });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus('clean-historical', 'in-review');
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: 'clean-historical', roundId: round.id, payload: { reason: 'service_restart' } });
+      // No provider delivery is outstanding yet: ordinary clean-abort
+      // eligibility is preserved.
+      expect((await digestOf()).prWithoutReview).toMatchObject([
+        { jobId: 'clean-historical', cleanAbort: { roundId: round.id, ruleId: 'clean-abort-service-restart' } },
+      ]);
+      // The historical recorded delivery closes the automatic re-arm.
+      h.ledger.appendCustomEvent({ kind: 'round.posted', jobId: 'clean-historical', roundId: round.id, payload: {
+        verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES',
+        url: 'https://git.example.invalid/pull/historical', host: 'git.example.invalid',
+        targetSha: 'sha-historical', baseSha: 'b'.repeat(40),
+        publicationFile: '/tmp/historical/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+        receipt: {
+          reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: 'sha-historical',
+          headSha: 'sha-historical', baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64),
+        },
+        reconciled: false,
+      } });
+      expect((await digestOf()).prWithoutReview).toEqual([]);
+    } finally { h.cleanup(); }
+  });
+
   it('retires a clean-abort re-arm on the state it was answered by, keeping failed and deferred attempts eligible', async () => {
     const h = makeLedger();
     try {

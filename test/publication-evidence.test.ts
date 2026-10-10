@@ -56,21 +56,46 @@ describe('publication re-arm guard', () => {
     expect(problem?.detail).toContain('9001');
   });
 
-  it('clears an attempt that a later credited round.posted or bounded absence resolved', () => {
-    expect(pendingPublicationAttempt(ledgerWith([
-      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
-      { kind: 'round.posted', seq: 2, payload: { verdict: 'approved' } },
-    ]), 'r1')).toBeNull();
+  it('clears only a bounded absence for an attempt with no recorded delivery', () => {
     expect(pendingPublicationAttempt(ledgerWith([
       { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
       { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: 'a'.repeat(64), detail: 'proved absent' } },
     ]), 'r1')).toBeNull();
   });
 
+  it('holds ANY recorded delivery whose credit is unresolved, with or without intent or marker', () => {
+    // The pre-upgrade terminal shape: a historical round.posted (COMMENT-era
+    // receipt, no intent, no marker) aborted after an unbound promotion.
+    const historical = {
+      verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
+      url: 'https://github.com/acme/widget/pull/7', host: 'github.com',
+      targetSha: TARGET, baseSha: 'b'.repeat(40),
+      publicationFile: '/tmp/round/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+      receipt: { reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: TARGET, headSha: TARGET, baseSha: 'b'.repeat(40), bodySha256: 'a'.repeat(64) },
+      reconciled: false,
+    };
+    const noIntent = pendingPublicationAttempt(ledgerWith([
+      { kind: 'round.posted', seq: 1, payload: historical },
+    ]), 'r1');
+    expect(noIntent?.kind).toBe('recorded-delivery-unresolved');
+    expect(noIntent?.detail).toContain(TARGET);
+    expect(noIntent?.detail).toContain('9001');
+    // An attempt whose delivered record was never credited holds the same way.
+    expect(pendingPublicationAttempt(ledgerWith([
+      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
+      { kind: 'round.posted', seq: 2, payload: historical },
+    ]), 'r1')?.kind).toBe('recorded-delivery-unresolved');
+    // A stale marker does not change that: the later recorded delivery is
+    // still uncredited.
+    expect(pendingPublicationAttempt(ledgerWith([
+      { kind: PUBLICATION_REBIND_UNRESOLVED_EVENT, seq: 1, payload: { targetSha: TARGET, reviewId: '9001', detail: 'old rebind failure' } },
+      { kind: 'round.posted', seq: 2, payload: historical },
+    ]), 'r1')?.kind).toBe('recorded-delivery-unresolved');
+  });
+
   it('holds a marker-only recorded delivery (no durable intent) as unresolved rebinding', () => {
-    // The pre-upgrade shape: only the recorded round.posted and the failed
-    // rebind marker exist. The marker check must precede the attempt
-    // early-return so this state is held, never cleared.
+    // The pre-upgrade shape with a failed rebind marker: the marker check
+    // precedes the recorded-delivery hold and names the failed rebinding.
     const problem = pendingPublicationAttempt(ledgerWith([
       { kind: 'round.posted', seq: 1, payload: { verdict: 'approved' } },
       { kind: PUBLICATION_REBIND_UNRESOLVED_EVENT, seq: 2, payload: { targetSha: TARGET, reviewId: '9001', detail: 'unbound at restart' } },
@@ -78,16 +103,6 @@ describe('publication re-arm guard', () => {
     expect(problem?.kind).toBe('unresolved-rebinding');
     expect(problem?.detail).toContain('9001');
     expect(problem?.detail).toContain(TARGET);
-  });
-
-  it('respects event order: a stale marker does not hold a later recorded delivery', () => {
-    // The hold applies when the marker postdates the latest recorded
-    // delivery; a delivery recorded AFTER the marker has not been assessed
-    // yet (the next restart promotes it or writes a fresh marker).
-    expect(pendingPublicationAttempt(ledgerWith([
-      { kind: PUBLICATION_REBIND_UNRESOLVED_EVENT, seq: 1, payload: { targetSha: TARGET, reviewId: '9001', detail: 'old rebind failure' } },
-      { kind: 'round.posted', seq: 2, payload: { verdict: 'approved' } },
-    ]), 'r1')).toBeNull();
   });
 
   it('fails closed on a malformed attempt or absence payload', () => {
@@ -101,11 +116,12 @@ describe('publication re-arm guard', () => {
     ]), 'r1')?.kind).toBe('unresolved-attempt');
   });
 
-  it('ignores an attempt superseded by an earlier posted/absence event order', () => {
-    // A posted/absence event OLDER than the latest attempt cannot resolve it.
+  it('holds a recorded delivery that predates the attempt as recorded-but-uncredited', () => {
+    // A posted event OLDER than the latest attempt is still an uncredited
+    // recorded delivery (the round is aborted at consultation time).
     expect(pendingPublicationAttempt(ledgerWith([
       { kind: 'round.posted', seq: 1, payload: { verdict: 'approved' } },
       { kind: PUBLICATION_ATTEMPT_EVENT, seq: 2, payload: attempt },
-    ]), 'r1')?.kind).toBe('unresolved-attempt');
+    ]), 'r1')?.kind).toBe('recorded-delivery-unresolved');
   });
 });

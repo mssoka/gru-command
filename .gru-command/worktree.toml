@@ -726,7 +726,7 @@ repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea;
 # exit is masked.
 formal-verdicts-app = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts test/publication-evidence.test.ts"
 formal-verdicts-wave = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts"
-formal-verdicts-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts test/publication-evidence.test.ts test/review-build-identity.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/dispatch-e2e.test.ts test/dispatch-server.test.ts test/silas-followthrough.test.ts && npx vitest run test/directive-retirement.test.ts test/perkins-crash-child.test.ts"
+formal-verdicts-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-github-app.test.ts test/perkins-review-convergence.test.ts test/publication-evidence.test.ts test/silas-driver.test.ts test/review-build-identity.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-freeze-freshhead.test.ts test/dispatch-e2e.test.ts test/dispatch-server.test.ts test/silas-followthrough.test.ts && npx vitest run test/directive-retirement.test.ts test/perkins-crash-child.test.ts"
 
 # Static product checks for the same change: lint, both compilers through
 # the build (the pinned Perkins resource verifier included) and the web
@@ -747,3 +747,10 @@ formal-verdicts-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lin
 # the ignored pointer file are preserved for inspection; nothing is deleted
 # or checked out and no branch/worktree holds the sha.
 formal-verdicts-baseline = "sh tools/formal-verdicts-baseline.sh"
+
+# Amendment #3 (j-1717) fail-before proof: the FINAL revision-3 admission
+# refusals run against an isolated archive of the named uncorrected head
+# bd58d605 (whose guard cleared a recorded delivery carrying no intent and no
+# marker). Expected RED by behavioral assertion; classified inside the
+# script; the snapshot is preserved for inspection.
+formal-verdicts-rev3-baseline = "sh tools/formal-verdicts-rev3-baseline.sh"

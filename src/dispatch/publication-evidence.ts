@@ -175,25 +175,44 @@ export interface PublicationEvidenceReader {
 }
 
 export interface PendingPublicationProblem {
-  readonly kind: 'uncredited-receipt' | 'unresolved-attempt' | 'unresolved-rebinding';
+  readonly kind: 'uncredited-receipt' | 'unresolved-attempt' | 'unresolved-rebinding' | 'recorded-delivery-unresolved';
   readonly detail: string;
 }
 
-/** The shared re-arm guard. Returns null only when the round's latest
- * publication attempt has a conclusive outcome: a credited `round.posted`
- * after the attempt (already recorded), or a bounded `round.publication-absent`
- * (proved not to have landed). Anything else - an uncredited proven receipt,
- * a reconciled-but-uncertain attempt, or a bare intent - may describe a
- * provider write that is not yet resolved, so a new same-head publication
- * must not be re-armed. A malformed attempt payload fails closed too. */
+/** Best-effort summary of a recorded `round.posted` payload for escalation
+ * detail: a structural read only (never a validator). */
+function postedDeliverySummary(payload: unknown): { readonly head: string; readonly reviewId: string | null } {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return { head: 'unknown', reviewId: null };
+  const value = payload as Record<string, unknown>;
+  const head = typeof value['targetSha'] === 'string' && value['targetSha'].trim() !== '' ? value['targetSha'] : 'unknown';
+  const receipt = value['receipt'];
+  const reviewId = typeof receipt === 'object' && receipt !== null && !Array.isArray(receipt) &&
+    typeof (receipt as Record<string, unknown>)['reviewId'] === 'string' && ((receipt as Record<string, unknown>)['reviewId'] as string).trim() !== ''
+    ? ((receipt as Record<string, unknown>)['reviewId'] as string)
+    : null;
+  return { head, reviewId };
+}
+
+/** The shared re-arm guard. Returns null only when the round has NO recorded
+ * provider delivery without a conclusive outcome. Callers consult it for a
+ * round the admission already knows is NOT credited (both mechanical
+ * clean-abort paths require an aborted round; a credited delivery leaves the
+ * round verdict-posted), so:
+ *
+ * - a rebind marker that postdates the latest recorded delivery means the
+ *   recorded write's re-binding stayed unresolved;
+ * - a `round.posted` at all means a provider write was recorded whose credit
+ *   was never established - including pre-upgrade rounds aborted after an
+ *   unbound promotion whose failure left no marker, and rounds whose rebuild
+ *   was interrupted before finalization. The frozen-commit write provably
+ *   exists, so a same-head re-arm must not start a second publication until
+ *   the delivery is reconciled;
+ * - a durable attempt with no recorded delivery stays unresolved unless a
+ *   bounded absence proved it did not land (the only conclusive clear for an
+ *   unconcluded attempt); an uncredited receipt or a bare intent holds.
+ * A malformed attempt or absence payload fails closed. */
 export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, roundId: string): PendingPublicationProblem | null {
   const posted = ledger.latestRoundEvent(roundId, 'round.posted');
-  // A recorded delivery whose re-binding stayed unresolved is NOT a
-  // conclusion: the provider write exists and must be reconciled before any
-  // same-head publication is re-armed. This holds for ANY recorded delivery,
-  // including pre-upgrade rounds that carry no durable publication intent
-  // (their posted event is the only evidence), so the marker check must
-  // precede the attempt early-return.
   const rebindEvent = ledger.latestRoundEvent(roundId, PUBLICATION_REBIND_UNRESOLVED_EVENT);
   if (rebindEvent !== null && (posted === null || rebindEvent.seq > posted.seq)) {
     const rebind = parsePublicationRebindUnresolvedPayload(rebindEvent.payload);
@@ -202,11 +221,21 @@ export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, rou
       detail: `a recorded provider delivery${rebind?.reviewId === null || rebind?.reviewId === undefined ? '' : ` (review ${rebind.reviewId})`} on frozen head ${rebind?.targetSha ?? 'unknown'} could not be re-bound/credited at restart, so whether it is the final delivery stays unresolved - reconcile it before re-arming`,
     };
   }
+  if (posted !== null) {
+    const recorded = postedDeliverySummary(posted.payload);
+    // A credited delivery makes the round verdict-posted, which neither
+    // re-arm admission accepts; reaching this point therefore means the
+    // recorded delivery's credit is unresolved (unbound/interrupted
+    // promotion), with or without a durable intent or a rebind marker.
+    return {
+      kind: 'recorded-delivery-unresolved',
+      detail: `a provider delivery recorded on frozen head ${recorded.head}${recorded.reviewId === null ? '' : ` (review ${recorded.reviewId})`} was never credited; the frozen-commit write stays unresolved and no second same-head publication may be re-armed until it is reconciled`,
+    };
+  }
   const attemptEvent = ledger.latestRoundEvent(roundId, PUBLICATION_ATTEMPT_EVENT);
   if (attemptEvent === null) return null;
   const attempt = parsePublicationAttemptPayload(attemptEvent.payload);
   const head = attempt?.targetSha ?? 'unknown';
-  if (posted !== null && posted.seq > attemptEvent.seq) return null;
   const absent = ledger.latestRoundEvent(roundId, PUBLICATION_ABSENT_EVENT);
   if (absent !== null && absent.seq > attemptEvent.seq && parsePublicationAbsentPayload(absent.payload) !== null) return null;
   const receiptEvent = ledger.latestRoundEvent(roundId, PUBLICATION_RECEIPT_EVENT);
