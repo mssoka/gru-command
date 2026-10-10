@@ -55,9 +55,12 @@ written there later through that worktree. Private prompts/logs/review reports
 belong in the artifact root, never in repository knowledge.
 
 The CLI performs full read-only context validation **before** installing a runtime
-or publishing a lane binding. It executes the verified `scripts/context.mjs`
+or publishing a lane binding. It reads any existing lane reference without
+mutation and executes the **selected** workflow's verified `scripts/context.mjs`
 bytes in memory; the retained renderer uses that same validator, avoiding two
-context contracts. Invalid identities, escaping/linked roots and nonprivate
+context contracts. Bound A uses A's validator, never installed B's stricter or
+broken contract; a valid retained A remains invokable with no current B bundle.
+New lanes validate B before binding. Invalid identities, escaping/linked roots and nonprivate
 artifact roots cannot pin a rejected request's workflow version.
 
 The helper resolves all operational `[[gc-resource:...]]` links and context tokens

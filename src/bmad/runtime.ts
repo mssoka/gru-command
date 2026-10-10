@@ -512,6 +512,32 @@ function laneGitDir(cwd: string): string | null {
   return gitDir === commonDir ? null : gitDir;
 }
 
+export interface BmadRuntimeBindingReference {
+  readonly id: string;
+  readonly dir: string;
+  readonly contentSha256: string;
+  readonly bindingFile: string;
+}
+
+function assertBindingStore(record: BindingRecord, bindingFile: string, storeRoot: string): void {
+  if (dirname(record.runtime_dir) !== storeRoot) {
+    throw new BmadRuntimeError(
+      `BMAD runtime binding ${bindingFile} names ${record.runtime_dir}, outside the runtime store ${storeRoot}`,
+    );
+  }
+}
+
+/** Read a lane's selected identity without installing, restoring or publishing anything. */
+export function readBmadRuntimeBinding(cwd: string, storeRoot: string): BmadRuntimeBindingReference | null {
+  const gitDir = laneGitDir(cwd);
+  if (gitDir === null) return null;
+  const bindingFile = join(gitDir, BINDING_FILE);
+  if (!existsSync(bindingFile)) return null;
+  const record = parseBindingRecord(readFileSync(bindingFile, 'utf-8'), bindingFile);
+  assertBindingStore(record, bindingFile, storeRoot);
+  return { id: record.runtime_id, dir: record.runtime_dir, contentSha256: record.content_sha256, bindingFile };
+}
+
 export interface BmadRuntimeBinderOptions {
   /** Where runtimes are materialized (`<dataDir>/bmad-runtime`). */
   readonly storeRoot: string;
@@ -562,11 +588,7 @@ export function bindBmadRuntime(cwd: string, options: BmadRuntimeBinderOptions):
 /** The runtime a lane's existing binding record names — never another one. */
 function boundRuntime(cwd: string, bindingFile: string, options: BmadRuntimeBinderOptions): BmadRuntimeBinding {
   const record = parseBindingRecord(readFileSync(bindingFile, 'utf-8'), bindingFile);
-  if (dirname(record.runtime_dir) !== options.storeRoot) {
-    throw new BmadRuntimeError(
-      `BMAD runtime binding ${bindingFile} names ${record.runtime_dir}, outside the runtime store ${options.storeRoot}`,
-    );
-  }
+  assertBindingStore(record, bindingFile, options.storeRoot);
   let bound: MaterializedBmadRuntime;
   try {
     bound = inspectMaterializedBmadRuntime(record.runtime_dir);

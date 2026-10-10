@@ -329,6 +329,44 @@ describe('GC-owned workflow resources', () => {
     expect(JSON.parse(readFileSync(bindingFile, 'utf-8'))).toMatchObject({ runtime_id: 'gru-command-workflows@2' });
   });
 
+  it('CLI invocation validates a bound lane under retained A, not the installed B validator', () => {
+    const context = fixture();
+    const lane = join(dirname(context.projectRoot), 'retained-validation');
+    const fresh = join(dirname(context.projectRoot), 'new-validation');
+    git(context.projectRoot, ['worktree', 'add', '-qb', 'retained-validation', lane]);
+    git(context.projectRoot, ['worktree', 'add', '-qb', 'new-validation', fresh]);
+    const store = join(temp(), 'store');
+    const file = join(temp(), 'context.json');
+    const valid = { ...context, projectId: 'legacy', worktreeRoot: lane, knowledgeRoot: join(lane, 'gru-output') };
+    writeFileSync(file, JSON.stringify(valid));
+    const invoke = (packageRoot: string): { runtimeId: string } => {
+      const output: string[] = [];
+      runWorkflowRuntimeCli(['render', '--context', file, '--store', store, '--package-root', packageRoot], (line) => output.push(line));
+      return JSON.parse(output[0]!) as { runtimeId: string };
+    };
+    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@1');
+    const bindingFile = join(git(lane, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json');
+    const original = readFileSync(bindingFile, 'utf-8');
+    rmSync((JSON.parse(original) as { runtime_dir: string }).runtime_dir, { recursive: true });
+    expect(invoke(repoRoot).runtimeId).toBe('gru-command-workflows@1'); // identical-byte restoration after validation
+    expect(readFileSync(bindingFile, 'utf-8')).toBe(original);
+    const packageB = packageCopy();
+    const validator = join(packageB, WORKFLOW_RESOURCE_DIR, 'scripts/context.mjs');
+    writeFileSync(validator, readFileSync(validator, 'utf-8').replace('export function validateContext(raw, protectedRoots = []) {',
+      'export function validateContext(raw, protectedRoots = []) {\n  if (raw?.projectId === "legacy") throw new Error("B rejects legacy");'));
+    writeWorkflowManifest(packageB, 2);
+    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@1');
+    expect(readFileSync(bindingFile, 'utf-8')).toBe(original);
+    const next = { ...valid, worktreeRoot: fresh, knowledgeRoot: join(fresh, 'gru-output'), artifactRoot: join(temp(), 'new-job') };
+    writeFileSync(file, JSON.stringify(next));
+    expect(() => invoke(packageB)).toThrow(/B rejects legacy/u);
+    expect(existsSync(join(git(fresh, ['rev-parse', '--path-format=absolute', '--git-dir']), 'gru-command/bmad-runtime.json'))).toBe(false);
+    expect(existsSync(next.artifactRoot)).toBe(false);
+    rmSync(join(packageB, WORKFLOW_RESOURCE_DIR), { recursive: true });
+    writeFileSync(file, JSON.stringify(valid));
+    expect(invoke(packageB).runtimeId).toBe('gru-command-workflows@1'); // no current bundle available
+  });
+
   it('the explicit render CLI records the bound workflow and rejects incomplete/unknown arguments', () => {
     const context = fixture();
     const file = join(temp(), 'context.json');

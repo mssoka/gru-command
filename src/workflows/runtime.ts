@@ -1,9 +1,9 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
-  bindBmadRuntime, inspectMaterializedBmadRuntime, managedSkillSet, PACKAGE_ROOT,
+  bindBmadRuntime, inspectMaterializedBmadRuntime, managedSkillSet, PACKAGE_ROOT, readBmadRuntimeBinding,
   type BmadRuntimeBinding, type BmadRuntimeBinderOptions, type MaterializedBmadRuntime, type RuntimeBundle,
 } from '../bmad/runtime.js';
 import type { ManagedSkillSet } from '../runtime/types.js';
@@ -17,6 +17,7 @@ export { WorkflowResourceError } from './manifest.js';
 
 export interface BundledWorkflowRuntime extends RuntimeBundle {
   readonly manifest: WorkflowManifest;
+  readonly resourceRoot: string;
 }
 
 /** Explicit caller-owned authority/context; storage allocation belongs to #293. */
@@ -52,9 +53,7 @@ function resourceFiles(root: string, prefix = ''): Map<string, Buffer> {
   return files;
 }
 
-/** Shipped GC bytes only: never consult project/global BMAD or a source checkout. */
-export function loadBundledWorkflowRuntime(packageRoot = PACKAGE_ROOT): BundledWorkflowRuntime {
-  const root = join(packageRoot, WORKFLOW_RESOURCE_DIR);
+function readWorkflowResources(root: string): BundledWorkflowRuntime {
   try {
     const files = resourceFiles(root);
     const bytes = files.get(WORKFLOW_MANIFEST);
@@ -62,9 +61,38 @@ export function loadBundledWorkflowRuntime(packageRoot = PACKAGE_ROOT): BundledW
     const manifest = parseWorkflowManifest(bytes.toString('utf-8'), join(root, WORKFLOW_MANIFEST));
     verifyWorkflowFiles(manifest, files);
     const contentSha256 = workflowContentHash(files);
-    return { id: manifest.id, manifest, files, contentSha256, dirName: workflowDirName(manifest, contentSha256) };
+    return { id: manifest.id, manifest, resourceRoot: root, files, contentSha256, dirName: workflowDirName(manifest, contentSha256) };
   } catch (error) {
     throw new WorkflowResourceError(`GC workflow package ${root} failed verification: ${(error as Error).message}. Rebuild or reinstall GC; no ambient workflow fallback is permitted.`);
+  }
+}
+
+/** Shipped GC bytes only: never consult project/global BMAD or a source checkout. */
+export function loadBundledWorkflowRuntime(packageRoot = PACKAGE_ROOT): BundledWorkflowRuntime {
+  return readWorkflowResources(join(packageRoot, WORKFLOW_RESOURCE_DIR));
+}
+
+/** Read-only selection precedes context validation and binding. Retained A is the
+ * validation authority too; installed B may be different, corrupt or absent. */
+export function workflowRuntimeForInvocation(cwd: string, storeRoot: string, packageRoot = PACKAGE_ROOT): BundledWorkflowRuntime {
+  const reference = readBmadRuntimeBinding(cwd, storeRoot);
+  if (reference === null) return loadBundledWorkflowRuntime(packageRoot);
+  try {
+    const retained = readWorkflowResources(reference.dir);
+    if (retained.id !== reference.id || retained.contentSha256 !== reference.contentSha256 ||
+        basename(reference.dir) !== retained.dirName) {
+      throw new WorkflowResourceError(`retained GC workflow ${reference.dir} does not match binding ${reference.bindingFile}`);
+    }
+    return retained;
+  } catch (error) {
+    // Permit the existing binder's identical-byte restoration only. Still no
+    // writes here: invalid context must not install a runtime or bind a lane.
+    const current = loadBundledWorkflowRuntime(packageRoot);
+    if (current.id !== reference.id || current.contentSha256 !== reference.contentSha256 ||
+        join(storeRoot, current.dirName) !== reference.dir) {
+      throw new WorkflowResourceError(`lane ${cwd} retains workflow ${reference.id} at ${reference.dir}, which cannot be invoked: ${(error as Error).message}. Restore that retained runtime; never switch the lane to ${current.id}.`);
+    }
+    return current;
   }
 }
 
