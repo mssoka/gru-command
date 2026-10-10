@@ -96,6 +96,18 @@ export function workflowRuntimeForInvocation(cwd: string, storeRoot: string, pac
   }
 }
 
+/** Capture a declared helper from the SAME verified read used to attest its
+ * retained package. Consumers never reopen a mutable pathname after admission. */
+export function verifiedWorkflowResourceText(runtime: Pick<MaterializedBmadRuntime, 'id' | 'dir' | 'contentSha256'>, path: string): string {
+  const bundle = readWorkflowResources(runtime.dir);
+  if (bundle.id !== runtime.id || bundle.contentSha256 !== runtime.contentSha256) {
+    throw new WorkflowResourceError(`owned helper package ${runtime.dir} does not match its retained identity; restore that exact package`);
+  }
+  const bytes = bundle.files.get(path);
+  if (bytes === undefined) throw new WorkflowResourceError(`owned helper ${path} is not a declared verified resource`);
+  return bytes.toString('utf8');
+}
+
 /** Maintainer-local integrity refresh: no upstream release, archive or comparison. */
 export function writeWorkflowManifest(packageRoot: string, version?: number): WorkflowManifest {
   const root = join(packageRoot, WORKFLOW_RESOURCE_DIR);

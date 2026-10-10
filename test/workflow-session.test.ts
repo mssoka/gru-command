@@ -26,7 +26,7 @@ afterAll(() => { for (const root of roots) rmSync(root, { recursive: true, force
 function fixture() { const f = makeWorkflowLane(); roots.push(f.root); return f; }
 const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
 
-function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>, authority?: Pick<ReturnType<typeof serviceWorkflowAuthority>, 'workflowLaneFor' | 'workflowBuildFor'>) {
+function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>, authority?: Pick<ReturnType<typeof serviceWorkflowAuthority>, 'workflowLaneFor' | 'workflowBuildFor' | 'workflowAgentFor'>) {
   const config = loadConfig({ GRU_COMMAND_HOME: f.dataDir });
   const seen: SpawnOptions[] = [];
   const adapter: AgentRuntime = {
@@ -102,7 +102,7 @@ describe('production owned workflow session binding', () => {
     };
     const h = host('pi', f, serviceWorkflowAuthority(f.dataDir, () => records));
     try {
-      const resumed = await h.registry.spawn('minion', { agentId: worker.id, resumeFile: `file://${file}` });
+      const resumed = await h.registry.spawn('minion', { resumeFile: `file://${file}` });
       expect(resumed.id).toBe(worker.id);
       expect(h.seen[0]!.cwd).toBe(f.lane.path);
       expect(h.seen[0]!.managedSkills!.workflow!.context.jobId).toBe(f.lane.id);
@@ -156,6 +156,9 @@ describe('production owned workflow session binding', () => {
   });
 
   it('production fallback gates select each registered job retained package and private report root', async () => {
+    const historicalGuide = readFileSync(join(repoRoot, 'docs/BMAD-RUNTIME.md'), 'utf8');
+    expect(historicalGuide).toContain('production fallback gate selects the verified GC-owned helper');
+    expect(historicalGuide).not.toContain('It reads an installed global');
     const a = makeWorkflowLane('j-gate-a'); const b = makeWorkflowLane('j-gate-b'); const historical = makeWorkflowLane('j-gate-history');
     roots.push(a.root, b.root, historical.root);
     const db = new LedgerDb(a.dataDir);

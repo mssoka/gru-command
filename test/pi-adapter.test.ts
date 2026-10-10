@@ -845,6 +845,37 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     }
   });
 
+  it('production file-only supervised-shaped resumes keep the logical minion through two real SDK restarts', async () => {
+    const { LedgerApi } = await import('../src/ledger/api.js');
+    const { LedgerDb } = await import('../src/ledger/db.js');
+    const { serviceWorkflowAuthority } = await import('../src/workflows/session.js');
+    const fx = await fixture([{ deltas: ['offline resume canary'] }]);
+    const f = makeWorkflowLane(); cleanupDirs.push(f.root);
+    const dataDir = realpathSync(fx.home); const db = new LedgerDb(dataDir); const ledger = new LedgerApi(db.handle);
+    ledger.addJob({ id: f.lane.id, repo: f.lane.repoName, title: 'original job', briefing: 'original contract' });
+    ledger.registerWorktree(f.lane);
+    const authority = serviceWorkflowAuthority(dataDir, () => ledger);
+    const registry = new RuntimeRegistry({ ...serviceRegistryOptions({ config: { ...fx.config, dataDir }, store: fx.store,
+      workflowLaneFor: authority.workflowLaneFor, workflowBuildFor: authority.workflowBuildFor, workflowAgentFor: authority.workflowAgentFor }),
+      pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime },
+    });
+    try {
+      const first = await registry.spawn('minion', { cwd: f.lane.path, agentId: 'original-logical-minion' });
+      await first.prompt('offline canary');
+      const file = first.sessionFile!;
+      ledger.registerAgent({ id: first.id, role: 'minion', jobId: f.lane.id, sessionFile: file, parentage: 'top-level' });
+      await first.dispose();
+      for (let restart = 0; restart < 2; restart++) {
+        const resumed = await registry.spawn('minion', { resumeFile: file }); // exactly the supervisor input, no id/cwd
+        expect(resumed.id).toBe('original-logical-minion');
+        expect(resumed.sessionFile).toBe(file);
+        ledger.registerAgent({ id: resumed.id, role: 'minion', jobId: f.lane.id, sessionFile: resumed.sessionFile });
+        await resumed.dispose();
+      }
+      expect(ledger.listAgents().filter((agent) => agent.sessionFile === file).map((agent) => agent.id)).toEqual(['original-logical-minion']);
+    } finally { await registry.dispose(); await fx.runtime.dispose(); db.close(); }
+  });
+
   it('production owned workflow reaches the Pi loader ahead of hostile project/global copies and survives resume', async () => {
     const fx = await fixture([{ deltas: ['built'] }, { deltas: ['resumed'] }]);
     const f = makeWorkflowLane(); cleanupDirs.push(f.root);

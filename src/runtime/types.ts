@@ -144,6 +144,8 @@ export interface ManagedSkillSet {
 
 export interface ManagedWorkflowSession {
   readonly cwd: string;
+  /** Recorded logical owner, including resumes that supplied only a file. */
+  readonly agentId?: string;
   readonly managedSkills?: ManagedSkillSet;
 }
 

@@ -6051,6 +6051,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     repo: FixtureRepo;
     skillPath: string;
     prompts: string[];
+    systemPrompts: string[];
     spawnCwds: string[];
     escalations: string[];
     disposed: string[];
@@ -6074,11 +6075,13 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     mkdirSync(dirname(skillPath), { recursive: true });
     writeFileSync(skillPath, options.skillContent ?? '---\nname: bmad-review\n---\nreview skill bytes', 'utf8');
     const prompts: string[] = [];
+    const systemPrompts: string[] = [];
     const spawnCwds: string[] = [];
     const escalations: string[] = [];
     const disposed: string[] = [];
     const spawner: AgentSpawner = async (role, spawnOptions = {}) => {
       spawnCwds.push(spawnOptions.cwd ?? '');
+      systemPrompts.push(spawnOptions.isolatedReview?.systemPrompt ?? '');
       const file = join(sessions, `prod-${spawnCwds.length}.jsonl`);
       writeFileSync(file, '', 'utf8');
       return {
@@ -6128,7 +6131,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
-    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations, disposed };
+    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, systemPrompts, spawnCwds, escalations, disposed };
   }
 
   it('production resource resolver wins over ambient skill fixtures and sends reports to the owned job root without native clearance', async () => {
@@ -6150,6 +6153,44 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     expect(h.prompts[0]).toContain('never discover or invoke project/global BMAD');
     expect(h.ledger.listRounds(h.job.id)).toEqual([]);
     expect(h.escalations.join('\n')).toContain('not a Perkins READY');
+  });
+
+  it('uses verified helper bytes captured at resolution even when its later pathname is corrupted', async () => {
+    const { makeWorkflowLane } = await import('./helpers/workflow-lane.js');
+    const { createWorkflowSessionBinder, ownedFallbackReviewResources } = await import('../src/workflows/session.js');
+    const f = makeWorkflowLane('job-prod-gate'); dirs.push(f.root);
+    const bound = createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path });
+    const resources = ownedFallbackReviewResources(bound, f.dataDir);
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: () => {
+      chmodSync(resources.skillPath, 0o600); writeFileSync(resources.skillPath, 'UNVERIFIED HELPER OVERRIDE');
+      return resources;
+    } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
+    expect(h.systemPrompts[0]).toContain(resources.skillContent);
+    expect(h.systemPrompts[0]).not.toContain('UNVERIFIED HELPER OVERRIDE');
+  });
+
+  it('ignores inherited Git routing variables and reviews only the assigned working tree', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    const foreign = join(h.root, 'foreign-worktree');
+    h.repo.git(['worktree', 'add', '-q', '-b', 'feature/foreign-env', foreign, 'main']);
+    writeFileSync(join(foreign, 'foreign.ts'), 'export const foreignEnvironment = true;\n');
+    const gitDir = h.repo.git(['rev-parse', '--absolute-git-dir']);
+    const keys = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'] as const;
+    const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.GIT_DIR = gitDir; process.env.GIT_WORK_TREE = foreign;
+      process.env.GIT_INDEX_FILE = join(h.root, 'foreign-index');
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      expect(h.prompts[0]).toContain('export const prod = 1;');
+      expect(h.prompts[0]).not.toContain('foreignEnvironment');
+    } finally {
+      for (const key of keys) { if (before[key] === undefined) delete process.env[key]; else process.env[key] = before[key]; }
+    }
   });
 
   it('missing/corrupt owned fallback resources record an actionable blocked result, never borrowed ambient skill bytes', async () => {

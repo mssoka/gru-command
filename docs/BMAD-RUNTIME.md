@@ -149,9 +149,11 @@ repo-local installer and fail loud.
   skill as `gru-command-bmad:bmad-build`. The session's system prompt names
   the bound runtime id, its content hash and its location. Review sessions
   (Perkins) never get it.
-- The bmad-review fallback gate is unaffected. It reads an installed global
-  `bmad-review` skill, which was never repo-local. That skill falls back to
-  its own defaults when a repo has no `_bmad/scripts`.
+- The production fallback gate selects the verified GC-owned helper via the
+  registered job's workflow authority, including for historical build lanes.
+  It never reads an installed global/project `bmad-review` skill. Historical
+  build bindings and their private review-output contract remain unchanged;
+  see [GC-owned workflows](GC-WORKFLOWS.md).
 
 ## Upgrading the bundled runtime (maintainers)
 

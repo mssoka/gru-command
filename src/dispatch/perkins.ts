@@ -41,6 +41,7 @@ import {
   probeAdvertisedTipMovementAsync,
   sourceMovementSinceFreeze,
   resolveGitCommit,
+  repositoryGitEnv,
   resolveReviewBaseRef,
   reviewArtifactDirectory,
   readReviewCheckpointBytes,
@@ -1262,6 +1263,8 @@ export interface FallbackReviewRunInput {
   readonly diffSha256: string;
   readonly diff: string;
   readonly skillPath: string;
+  /** Verified package bytes frozen at resource resolution, not a late file read. */
+  readonly skillContent?: string;
   /** Host-bound destination for ONE JSON findings array. */
   readonly reportFile: string;
   readonly iteration: number;
@@ -1298,6 +1301,7 @@ export interface FallbackGateOptions {
   /** Production selection verifies GC-owned resources and the job's private context. */
   readonly resolveReviewResources?: (jobId: string) => {
     readonly skillPath: string;
+    readonly skillContent?: string;
     readonly artifactRoot: string;
   };
   /** Review rounds before the gate reports blocked; default 4 (3 fix rounds + final). */
@@ -1310,6 +1314,7 @@ export interface FallbackGateOptions {
 
 type ResolvedFallbackGateOptions = FallbackGateOptions & {
   readonly skillPath: string;
+  readonly skillContent?: string;
   readonly artifactRoot?: string;
 };
 
@@ -1469,13 +1474,14 @@ class FallbackSafetyRefusal extends Error {
  * not just ledger events. Untracked and uncommitted changes are included. */
 function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackReviewRunInput, 'headRef' | 'diff' | 'diffSha256'> {
   const headRef = resolveGitCommit(lanePath, 'HEAD');
-  const prepared = spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { encoding: 'utf8', timeout: 10_000 });
+  const env = repositoryGitEnv(false);
+  const prepared = spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { encoding: 'utf8', env, timeout: 10_000 });
   if (prepared.error !== undefined || prepared.status !== 0) {
     throw new Error(`cannot prepare the complete fallback working diff: ${prepared.error?.message ?? prepared.stderr.trim().slice(0, 200)}`);
   }
   const result = spawnSync('git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--full-index', baseRef],
-    { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
-  const restored = spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { encoding: 'utf8', timeout: 10_000 });
+    { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+  const restored = spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { encoding: 'utf8', env, timeout: 10_000 });
   if (restored.error !== undefined || restored.status !== 0) {
     throw new Error(`cannot restore fallback diff intake markers: ${restored.error?.message ?? restored.stderr.trim().slice(0, 200)}`);
   }
@@ -3562,7 +3568,7 @@ export class WaveRunner {
     } catch (error) {
       resourceFailure = `GC-owned fallback resources are unavailable: ${String(error)}`;
     }
-    const present = gate !== undefined && skillInstalled(gate.skillPath);
+    const present = gate !== undefined && (gate.skillContent !== undefined || skillInstalled(gate.skillPath));
     if (gate === undefined || !present) {
       const note = resourceFailure ?? (configured === undefined
         ? 'the bmad-review fallback gate is not configured on this service'
@@ -3707,8 +3713,8 @@ export class WaveRunner {
       let findings: readonly FallbackFinding[];
       try {
         findings = gate.runFallbackReview !== undefined
-          ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, reportFile, iteration, signal })
-          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, reportFile, iteration, signal }, recheckRound);
+          ? await gate.runFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, ...(gate.skillContent !== undefined ? { skillContent: gate.skillContent } : {}), reportFile, iteration, signal })
+          : await this.defaultFallbackReview({ jobId: job.id, lanePath, baseRef, headRef, diffSha256, diff, skillPath: gate.skillPath, ...(gate.skillContent !== undefined ? { skillContent: gate.skillContent } : {}), reportFile, iteration, signal }, recheckRound);
         // A completed review of an older diff is not a PASS on a lane that
         // acquired and possibly settled a newer request while it ran.
         recheckRound();
@@ -3867,7 +3873,7 @@ export class WaveRunner {
       // start an obsolete reviewer. The lease releases in the finally on
       // throw.
       if (recheck !== undefined) recheck();
-      const policy = fallbackReviewPolicy(input.skillPath, input.reportFile);
+      const policy = fallbackReviewPolicy(input.skillPath, input.reportFile, input.skillContent);
       handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal,
         // Reuse the existing ambient-free read-only host on both runtimes.
         // The scoped submission closure, never ordinary write, captures a report.

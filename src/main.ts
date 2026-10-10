@@ -525,6 +525,7 @@ async function main(): Promise<number> {
     store,
     workflowLaneFor: workflowAuthority.workflowLaneFor,
     workflowBuildFor: workflowAuthority.workflowBuildFor,
+    workflowAgentFor: workflowAuthority.workflowAgentFor,
     log: (level, msg, fields) => logger.log(level, msg, fields),
   }));
   const growth = registry.boot();

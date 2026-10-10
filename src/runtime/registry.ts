@@ -113,10 +113,11 @@ export function serviceRegistryOptions(
     readonly config: { readonly dataDir: string };
     readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
     readonly workflowBuildFor?: (lane: WorktreeLane) => boolean;
+    readonly workflowAgentFor?: (options: SpawnOptions) => string | undefined;
   },
 ): RuntimeRegistryOptions {
-  const { workflowLaneFor, workflowBuildFor, ...options } = base;
-  return { ...options, workflowRuntime: createWorkflowSessionBinder(base.config.dataDir, workflowLaneFor, undefined, workflowBuildFor) };
+  const { workflowLaneFor, workflowBuildFor, workflowAgentFor, ...options } = base;
+  return { ...options, workflowRuntime: createWorkflowSessionBinder(base.config.dataDir, workflowLaneFor, undefined, workflowBuildFor, workflowAgentFor) };
 }
 
 /**
@@ -652,7 +653,7 @@ export class RuntimeRegistry {
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
       ...(cwd !== undefined ? { cwd } : {}),
-      ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
+      ...((workflowSession?.agentId ?? options.agentId) !== undefined ? { agentId: workflowSession?.agentId ?? options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),

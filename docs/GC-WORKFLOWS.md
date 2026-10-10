@@ -9,8 +9,9 @@ renderer, skills or output and never modifies its installation.
 **Production new-job execution uses these resources (#294), with #293 storage.**
 Both Pi and Claude receive the owned skill, verified rendered instructions and
 explicit registered assignment through the existing managed-skill mechanism.
-Resume resolves the same worktree from recorded agent/session ownership when cwd
-is absent. Unknown/conflicting/swept assignments fail loudly, never at a guessed
+Resume resolves the same worktree and logical minion identity from recorded
+agent/session ownership when cwd or agentId is absent; repeated supervised
+restarts do not invent duplicate owners for the same transcript. Unknown/conflicting/swept assignments fail loudly, never at a guessed
 workspace. Once a job has an implementer record, it requires that logical minion,
 not an unknown identity attached by cwd. Authorized sessionless fix/re-brief
 recovery keeps its recorded identity and parentage as well as the retained lane.
@@ -33,8 +34,11 @@ their existing private review store remains addressable. The fallback runtime
 runs one ambient-free read-only report task using the existing isolated review
 host on both adapters. Its only write capability is `gc_submit_fallback_findings`,
 a host-bound private report submission; ordinary shell/Edit/Write tools are absent.
-The host supplies the verified helper and canonical base/HEAD/complete working-diff
-hash, including full binary patches/full blob identities and disabling configured
+The host captures the helper's declared bytes in the same verified package read,
+then supplies that frozen content without reopening a mutable helper path after
+admission. Git intake strips inherited repository/worktree/index routing variables
+using the existing repository environment guard. It supplies canonical
+base/HEAD/complete working-diff hash, including full binary patches/full blob identities and disabling configured
 textconv (which could otherwise hide code bytes). Failed Git preparation and
 oversize input block before spawning, never
 pass an incomplete/truncated diff. Before triage, the host captures the input
