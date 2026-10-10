@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
   EXPECTED_BASELINE_ASSERTIONS,
   assertMergeAuthorityBaseline,
@@ -40,6 +40,11 @@ function report(...assertions: readonly AssertionResult[]): unknown {
 const RED: readonly AssertionResult[] = EXPECTED_BASELINE_ASSERTIONS.map((title) =>
   assertion(title, 'failed', ['AssertionError: expected true to be false']),
 );
+
+const cleanupDirs: string[] = [];
+afterAll(() => {
+  for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
+});
 
 describe('merge-authority fail-before classifier', () => {
   it('accepts a report only when every named boundary assertion failed as an AssertionError', () => {
@@ -94,6 +99,7 @@ describe('merge-authority fail-before classifier', () => {
     // code/markers. A broken entry guard would exit 0 with no output and
     // let the scope's own `exit 1` masquerade as the fail-before proof.
     const dir = mkdtempSync(join(tmpdir(), 'gru-merge-authority-classifier-'));
+    cleanupDirs.push(dir);
     const tool = join(import.meta.dirname, '..', 'tools', 'assert-merge-authority-baseline.mjs');
     const acceptPath = join(dir, 'accept.json');
     const refusePath = join(dir, 'refuse.json');
