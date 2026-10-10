@@ -75,6 +75,7 @@ function mountBoardDom(): void {
     <nav id="board-nav" hidden></nav>
     <section id="board-owner" hidden></section>
     <div id="board-jobs"></div>
+    <div id="board-repos"></div>
     <div id="board-agents"></div>
     <span id="rail-agents-count">0</span>
     <button id="notification-bell"><span id="notification-badge">0</span></button>
