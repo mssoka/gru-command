@@ -9294,6 +9294,7 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     const wave = new WaveRunner({
       ledger: fix.ledger, worktrees: durabilityPort(), poster: { post, reconcile },
       reviewArtifactRoot: fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
     expect(await wave.recoverInterruptedRounds()).toBeGreaterThanOrEqual(1);
@@ -9320,6 +9321,7 @@ describe('formal GitHub publication durability and restart reconciliation', () =
       ledger: absentFix.ledger, worktrees: durabilityPort(),
       poster: { post: absentPost, reconcile: vi.fn(async () => null) },
       reviewArtifactRoot: absentFix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
     });
     await absentWave.recoverInterruptedRounds();
     expect(absentPost).not.toHaveBeenCalled();
@@ -9338,6 +9340,7 @@ describe('formal GitHub publication durability and restart reconciliation', () =
       ledger: stuckFix.ledger, worktrees: durabilityPort(),
       poster: { post: vi.fn(), reconcile: vi.fn(async () => { throw new Error('provider lookup unavailable'); }) },
       reviewArtifactRoot: stuckFix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
       escalate: (title, detail) => stuckEscalations.push(`${title}: ${detail}`),
     });
     await stuckWave.recoverInterruptedRounds();
