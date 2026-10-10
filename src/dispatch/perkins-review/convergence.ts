@@ -940,11 +940,24 @@ export function authenticatePriorMeta(
   }
   const receiptDebt = receipt.finalPassRequired === true;
   const receiptComplete = receipt.coverageComplete === true;
+  // The retained FINDING CONTENTS must be authenticated before a record can
+  // be credited whole-complete coverage. A digest binds them exactly; a
+  // trivially EMPTY finding set needs no further proof. A count-only baseline
+  // receipt over findings cannot prove the contents were not substituted
+  // same-count (a schema-valid replacement blocker keeps every count intact),
+  // so whole-complete credit is withheld and the caller reviews the
+  // uncovered work instead.
+  const contentAuthenticated = typeof receipt.retainedFindingsSha256 === 'string' ||
+    (meta.findings !== null && meta.findings.count === 0 &&
+      (receipt.retainedFindings === undefined || receipt.retainedFindings === 0) &&
+      (receipt.blockers === undefined || receipt.blockers === 0));
   if (meta.legacyWhole) {
     // A stripped/forged convergence block on a Stage-5 round is caught here:
     // the legacy credit is granted ONLY when the native receipt also carries
-    // no Stage-5 scope/coverage/debt evidence at all.
+    // no Stage-5 scope/coverage/debt evidence at all, and the retained
+    // findings are content-authenticated.
     if (receiptScope !== undefined || receiptComplete || receiptDebt) return null;
+    if (!contentAuthenticated) return null;
     return { ...meta, coverageComplete: true };
   }
   if (receiptDebt) {
@@ -952,11 +965,13 @@ export function authenticatePriorMeta(
     if (meta.coverageComplete) return null;
     return { ...meta, coverageComplete: false };
   }
-  // A whole-scope round covered the whole candidate by construction. Baseline
-  // Stage-5 receipts predate the coverageComplete field, so the authenticated
-  // SCOPE (not the field) is what credits them — no whole replay just to mint
-  // metadata. A delta/integration round needs an explicit, corroborated bit.
-  if (meta.reviewScope === 'whole') return { ...meta, coverageComplete: true };
+  // A whole-scope round covered the whole candidate by construction, but only
+  // content-authenticated findings may be credited: a baseline receipt whose
+  // digest is absent cannot prove the contents are the ones the round found.
+  if (meta.reviewScope === 'whole') {
+    if (!contentAuthenticated) return null;
+    return { ...meta, coverageComplete: true };
+  }
   if (meta.coverageComplete && !receiptComplete) return null;
   return { ...meta, coverageComplete: meta.coverageComplete && receiptComplete };
 }

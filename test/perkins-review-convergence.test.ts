@@ -572,6 +572,7 @@ describe('production scope planning wiring (planPerkinsReviewScope)', () => {
     const wholePrior = {
       schemaVersion: 3, architecture: 'perkins-whole-pr', canonicalVerdict: 'READY TO MERGE',
       complete: true, headMoved: false, frozen: { targetSha: h0, diffBaseSha: b0 },
+      findings: [],
       convergence: { reviewScope: 'whole', coverageComplete: true },
     };
     const call = (priorConsolidatedFile: string, extra: Partial<Parameters<typeof planPerkinsReviewScope>[0]> = {}) =>
@@ -679,6 +680,36 @@ describe('production scope planning wiring (planPerkinsReviewScope)', () => {
     const tamperedPlan = call(tampered, { nativeReceipt: nativeNeedsChanges });
     expect(tamperedPlan.scope).toBe('whole');
     expect(tamperedPlan.priorCoverageComplete).toBe(false);
+
+    // (count-preserving substitution) A BASELINE receipt (blockers but no
+    // findings digest) over a genuine NEEDS CHANGES record whose blocker was
+    // replaced by a DIFFERENT schema-valid blocker with the same count: the
+    // contents are not authenticated, so whole-complete credit is withheld
+    // and the uncovered work is reviewed instead.
+    const substitutedFindings = [{
+      source: 'lead', severity: 'blocker', category: 'correctness', title: 'replacement blocker',
+      location: 'src/other.ts:1', evidence: 'export const other = 1;', detail: 'a substitute',
+      recommended_fix: 'fix the substitute', verification: { disposition: 'confirmed', evidence: 'e', reason: 'round 1' },
+      sources: ['lead'], roundOrigin: 1,
+    }];
+    const baselineNeedsChanges = writePrior('prior-baseline-needs-changes.json', {
+      ...wholePrior, canonicalVerdict: 'NEEDS CHANGES', findings: genuineFindings,
+      convergence: { reviewScope: 'whole' },
+    });
+    // Baseline receipt: scope + blocker count only; NO findings digest fields.
+    const baselineReceipt = { targetSha: h0, diffBaseSha: b0, reviewScope: 'whole', blockers: 1 };
+    expect(call(baselineNeedsChanges, { nativeReceipt: baselineReceipt }).scope).toBe('whole');
+    const substitute = writePrior('prior-baseline-substituted.json', {
+      ...wholePrior, canonicalVerdict: 'NEEDS CHANGES', findings: substitutedFindings,
+      convergence: { reviewScope: 'whole' },
+    });
+    const substitutePlan = call(substitute, { nativeReceipt: baselineReceipt });
+    expect(substitutePlan.scope).toBe('whole');
+    expect(substitutePlan.priorCoverageComplete).toBe(false);
+    // A content-authenticated (digest) receipt still credits the same record.
+    expect(call(baselineNeedsChanges, {
+      nativeReceipt: { ...baselineReceipt, retainedFindings: 1, retainedFindingsSha256: createHash('sha256').update(JSON.stringify(genuineFindings)).digest('hex') },
+    }).scope).toBe('integration');
   });
 });
 
