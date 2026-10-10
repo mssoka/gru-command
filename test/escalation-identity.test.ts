@@ -260,7 +260,9 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(35);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(32);
+    // 35 pre-existing wave call sites + the 8 durable-publication-recovery
+    // escalations added by the PR #289 native correction cycle.
+    expect(sites).toHaveLength(43);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(40);
   });
 });
