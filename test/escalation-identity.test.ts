@@ -230,6 +230,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${String(lane.roundId)} could not be processed during startup recovery`', '{ ...(lane.jobId !== null ? { jobId: lane.jobId } : {}), ...(lane.roundId !== null ? { roundId: lane.roundId } : {}), }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Review round ${String(round.id)} could not be processed during startup recovery`', '{ jobId: job.id, roundId: round.id }'],
       ['`Queued review handoff for job ${jobId} is held`', '{ jobId }'],
       ['`Queued review handoff failed for job ${jobId}`', '{ jobId }'],
       // Owner decision 2026-10-08: a transient refusal retries; only the
@@ -261,10 +262,10 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    // 35 pre-existing wave call sites + the 9 durable-publication-recovery
-    // escalations added by the PR #289 native correction cycle and its
-    // amendment #1 rebind hold.
-    expect(sites).toHaveLength(44);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(41);
+    // 35 pre-existing wave call sites + the 10 durable-publication-recovery
+    // escalations added by the PR #289 native correction cycle, its
+    // amendment #1 rebind hold and the lane-less recovery resilience.
+    expect(sites).toHaveLength(45);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(42);
   });
 });
