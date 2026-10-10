@@ -762,8 +762,10 @@ describe('github signal poll tick', () => {
         dedupe: 'unacked',
         agentId: 'minion-conflict',
       });
-      expect(notifications.posts[0]?.detail).toContain('rebase');
-      expect(notifications.posts[0]?.detail).toContain('Silas owns the rebase within mandate');
+      // Merge boundary (owner ruling 2026-10-10): the mechanical conflict
+      // tier coordinates integration, never a rebase.
+      expect(notifications.posts[0]?.detail).toContain('Silas coordinates the conflict integration within mandate');
+      expect(notifications.posts[0]?.detail).not.toContain('rebase');
 
       // one dedupe cursor per job, recording the observed state
       for (const jobId of ['job-merge', 'job-conflict']) {

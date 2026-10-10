@@ -901,6 +901,13 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
       expect(note).toContain(join(f.dataDir, 'projects'));
       expect(note).toContain(join(f.lane.path, 'gru-output'));
       expect(note).toContain('workflow-context.json');
+      // Bound-workflow boundary (native r2 blocker): the note composes after
+      // the corrected role, qualifies owner-held merges to final PR merges
+      // only, and keeps ordinary same-branch integration intact.
+      expect(note).toContain('worker agent');
+      expect(note).toContain('merge main into your task branch');
+      expect(note).toContain('final PR merges remain owner-held');
+      expect(note).not.toContain('READY; merges remain owner-held');
       return selected[0]!.filePath;
     };
     try {

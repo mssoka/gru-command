@@ -1269,6 +1269,13 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(note).toContain(join(f.dataDir, 'projects'));
         expect(note).toContain(join(f.lane.path, 'gru-output'));
         expect(note).toContain('workflow-context.json');
+        // Bound-workflow boundary (native r2 blocker): the appended prompt
+        // composes the corrected role plus the note, qualifying owner-held
+        // merges to final PR merges only.
+        expect(note).toContain('worker agent');
+        expect(note).toContain('merge main into your task branch');
+        expect(note).toContain('final PR merges remain owner-held');
+        expect(note).not.toContain('READY; merges remain owner-held');
       }
       expect(readFileSync(join(f.lane.path, '_bmad/custom/config.toml'), 'utf8')).toBe('NOT TOML');
       expect(existsSync(join(f.lane.path, '_bmad/render'))).toBe(false);

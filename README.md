@@ -90,8 +90,9 @@ GitHub signal ingestion is poll-only — no webhooks, no inbound tunnel.
    and `repos/{owner}/{repo}/commits/{sha}/check-runs` for the latest
    check-run conclusions. Each observed state CHANGE applies exactly
    once: a merged PR closes its lane (`github.pr-merged`), a conflicting
-   PR (`mergeable_state: dirty`) cascades an action-required
-   notification, a CI failure posts a notification carrying the run URL
+   PR (`mergeable_state: dirty`) cascades an fyi notification (mechanical
+   tier — Silas coordinates the conflict integration), a CI failure posts
+   a notification carrying the run URL
    (mechanical checks → fyi, judgment checks → action-required), and CI
    green records the review-gate signal event (`github.ci-green`). The
    per-tick call budget caps usage at 3 000 of the authenticated
@@ -202,7 +203,8 @@ The pinned `bmad-method@6.12.0` build package remains available for already-boun
 historical lanes. New jobs select GC-owned delivery resources instead. An upgrade
 never switches a running lane's workflow; missing retained bytes require restoring
 that exact package, not recreating the worker/worktree/PR. Perkins (GitHub/GitLab)
-remains the exact-head native release gate, and the owner holds every merge.
+remains the exact-head native release gate, and the owner performs every final PR
+merge.
 
 You need the selected runtime CLI (`pi` or `claude`) for agents. Only retained
 historical BMAD rendering uses `uv`; current setup and owned GC execution do not.

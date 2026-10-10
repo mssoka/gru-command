@@ -147,3 +147,7 @@
 - [Review][Defer] Receipt validation is asymmetric — `readCaptureReceipt` validates only the `pings` field this change added; a v1 receipt with a missing/wrongly-typed `frames`/`capture_bytes`/`started` still reads back as a `CaptureReceipt`. Pre-existing; a full receipt validator is a separate change.
 - [Review][Defer] Ping wire literal duplicated — `PingFrame` is exported but the reader compares a bare `frame['type'] === 'ping'`; a rename on either side compiles clean and silently reclassifies the keepalive as a producer frame. Settled by: a shared `PING_FRAME_TYPE` constant (or type guard) owned by the verify wire vocabulary.
 - [Review][Defer] Synchronous write-failure branch has no test double — the `stopHeartbeat()` in `writeFrame`'s catch (ERR_STREAM_*/serialization) is defensive and unreachable by the current socket tests. Settled by: a fake `res` whose `write` throws, asserting the interval is cleared.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-merge-authority-boundary.md`
+  summary: The BMAD-onboarding rehearsal script still describes the fallback as "clear to merge" and Perkins as carrying "autonomous-merge authority".
+  evidence: `scripts/rehearsal-bmad-onboarding.mjs:62-66` — repo-internal rehearsal harness (not shipped in the package, not session-reaching). The round-3 concluding review flagged it as a follow-up on untouched code; the shipped boundary (a fallback PASS is not a Perkins READY; no agent merges a PR) already governs real sessions.
