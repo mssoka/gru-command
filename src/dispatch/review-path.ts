@@ -319,8 +319,14 @@ function validateFallbackFindings(parsed: unknown): readonly FallbackFinding[] {
 
 /** Use the existing ambient-free review host on both adapters. Its only write
  * capability is this host closure: the model cannot supply a filesystem path. */
-export function fallbackReviewPolicy(skillPath: string, reportFile: string): IsolatedReviewPolicy {
+export function fallbackReviewPolicy(skillPath: string, reportFile: string): IsolatedReviewPolicy & { readonly assertReportValid: () => void } {
+  let submitted = false;
+  let conflicted = false;
   return {
+    assertReportValid: () => {
+      if (conflicted) throw new Error('fallback reviewer made conflicting findings submissions; this report cannot pass');
+      if (!submitted) throw new Error('fallback reviewer did not submit findings through the host-bound tool');
+    },
     systemPrompt: [
       'You are one bounded GC-owned fallback reviewer, not a build worker or review orchestrator.',
       'Review the complete host-supplied working diff read-only. The host attests its canonical base and HEAD; HEAD alone does not name uncommitted bytes.',
@@ -354,8 +360,12 @@ export function fallbackReviewPolicy(skillPath: string, reportFile: string): Iso
           // existing bytes or follow a symlink to another destination.
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST' ||
               !lstatSync(reportFile).isFile() || lstatSync(reportFile).isSymbolicLink() ||
-              readFileSync(reportFile, 'utf8') !== bytes) throw error;
+              readFileSync(reportFile, 'utf8') !== bytes) {
+            conflicted = true;
+            throw error;
+          }
         }
+        submitted = true;
         return { text: 'Fallback findings captured by the host.', details: { reportFile, findings: findings.length } };
       },
     }],

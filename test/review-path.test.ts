@@ -302,9 +302,11 @@ describe('host-bound fallback report capability', () => {
       await expect(tool.execute({ findings: [], path: victim })).rejects.toThrow(/path cannot be supplied/u);
       await expect(tool.execute({ findings: [{}] })).rejects.toThrow(/non-empty string/u);
       await tool.execute({ findings: [] }); await tool.execute({ findings: [] });
+      expect(() => policy.assertReportValid()).not.toThrow();
       expect(readFileSync(report, 'utf8').trim()).toBe('[]');
       expect(statSync(report).mode & 0o777).toBe(0o600);
       await expect(tool.execute({ findings: [finding('correctness')] })).rejects.toThrow();
+      expect(() => policy.assertReportValid()).toThrow(/conflicting findings submissions/u);
       expect(readFileSync(victim, 'utf8')).toBe('DO_NOT_TOUCH');
       expect(parseFallbackFindingsReport(report)).toEqual([]);
     } finally { rmSync(root, { recursive: true, force: true }); }

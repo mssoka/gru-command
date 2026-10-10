@@ -2,7 +2,7 @@ import { RUNTIME_IDS, resolveSpawnPolicy, type Role, type RuntimeId } from '../c
 import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { PiRuntime } from './pi-adapter.js';
+import { PiRuntime, normalizeSessionPath } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
@@ -636,9 +636,13 @@ export class RuntimeRegistry {
         : {},
     );
     const thinkingLevel = applyThinkingFallback(adapter, policy.thinkingLevel, this.log);
+    // Assignment lookup must see the same canonical URI/tilde path that both
+    // adapters lock/open, otherwise a legitimate recorded resume looks unowned.
+    const workflowOptions = options.resumeFile === undefined ? options
+      : { ...options, resumeFile: normalizeSessionPath(options.resumeFile) };
     const workflowSession = this.opts.workflowRuntime !== undefined && ROLE_DEFINITIONS[role].managedBmadRuntime &&
       (options.reviewLead ?? options.isolatedReview) === undefined
-      ? this.opts.workflowRuntime(options) : undefined;
+      ? this.opts.workflowRuntime(workflowOptions) : undefined;
     const managedSkills = workflowSession !== undefined ? workflowSession.managedSkills : this.managedSkillsFor(role, options);
     const cwd = workflowSession?.cwd ?? options.cwd;
     if (managedSkills !== undefined) this.log('info', 'managed workflow bound', {

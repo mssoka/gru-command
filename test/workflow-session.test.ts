@@ -91,6 +91,24 @@ describe('production owned workflow session binding', () => {
   it('Pi registry spawn carries exact identity/context and resumes the same cwd/worker', async () => assertHost('pi'));
   it('Claude registry spawn carries exact identity/context and resumes the same cwd/worker', async () => assertHost('claude-code'));
 
+  it('canonicalizes adapter-supported file URIs before resolving recorded resume ownership', async () => {
+    const f = fixture();
+    const file = join(f.dataDir, 'worker.jsonl'); writeFileSync(file, '');
+    const worker = { id: 'worker', jobId: f.lane.id, sessionFile: file, role: 'minion' as const, parentage: 'top-level' as const };
+    const records = { getAgent: () => worker, listAgents: () => [worker], listJobAdmissions: () => [],
+      getJob: () => ({ id: f.lane.id, deliverable: 'pr' as const }),
+      getWorktree: (id: string) => id === f.lane.id ? f.lane : null, listWorktrees: () => [f.lane],
+    };
+    const h = host('pi', f, serviceWorkflowAuthority(f.dataDir, () => records));
+    try {
+      const resumed = await h.registry.spawn('minion', { agentId: worker.id, resumeFile: `file://${file}` });
+      expect(resumed.id).toBe(worker.id);
+      expect(h.seen[0]!.cwd).toBe(f.lane.path);
+      expect(h.seen[0]!.managedSkills!.workflow!.context.jobId).toBe(f.lane.id);
+      await resumed.dispose();
+    } finally { await h.registry.dispose(); }
+  });
+
   it('production dispatch/registry selects PR builds but excludes new review/artifact workflows', async () => {
     const a = makeWorkflowLane('j-pr'); const b = makeWorkflowLane('j-review'); const c = makeWorkflowLane('j-artifact');
     roots.push(a.root, b.root, c.root);
@@ -105,7 +123,8 @@ describe('production owned workflow session binding', () => {
       override getWorktree(id: string) { return ledger.getWorktree(id); }
       override listWorktrees(options?: { jobId?: string }) { return ledger.listWorktrees(options); }
     }
-    const h = host('pi', a, serviceWorkflowAuthority(a.dataDir, () => ledger));
+    const authority = serviceWorkflowAuthority(a.dataDir, () => ledger);
+    const h = host('pi', a, authority);
     const dispatch = new DispatchService({ ledger, worktrees: new Port(), spawner: (role, options) => h.registry.spawn(role, options) });
     try {
       for (const [f, deliverable] of [[a, 'pr'], [b, 'review'], [c, 'artifact']] as const) {
@@ -121,14 +140,26 @@ describe('production owned workflow session binding', () => {
       expect(h.seen.map((opts) => opts.cwd)).toEqual([a.lane.path, b.lane.path, c.lane.path]);
       expect(readBmadRuntimeBinding(b.lane.path, join(a.dataDir, 'bmad-runtime'))).toBeNull();
       expect(readBmadRuntimeBinding(c.lane.path, join(a.dataDir, 'bmad-runtime'))).toBeNull();
+      // Helper retention is not build execution: fallback can pin owned bytes,
+      // but subsequent report-worker sessions still receive no build workflow.
+      for (const f of [b, c]) {
+        const resources = authority.resolveReviewResources(f.lane.id);
+        expect(resources.artifactRoot).toContain(join('jobs', f.lane.id, 'operational'));
+        const owner = ledger.listAgents().find((agent) => agent.jobId === f.lane.id)!;
+        const worker = await h.registry.spawn('minion', { agentId: owner.id, cwd: f.lane.path });
+        await worker.dispose();
+        expect(h.seen.at(-1)!.managedSkills).toBeUndefined();
+        expect(authority.resolveReviewResources(f.lane.id)).toEqual(resources);
+      }
     } finally { await h.registry.dispose(); db.close(); }
   });
 
   it('production fallback gates select each registered job retained package and private report root', async () => {
-    const a = makeWorkflowLane('j-gate-a'); const b = makeWorkflowLane('j-gate-b'); roots.push(a.root, b.root);
+    const a = makeWorkflowLane('j-gate-a'); const b = makeWorkflowLane('j-gate-b'); const historical = makeWorkflowLane('j-gate-history');
+    roots.push(a.root, b.root, historical.root);
     const db = new LedgerDb(a.dataDir);
     const ledger = new LedgerApi(db.handle);
-    for (const f of [a, b]) {
+    for (const f of [a, b, historical]) {
       ledger.addJob({ id: f.lane.id, repo: 'app', title: 'review', baseBranch: 'main' });
       ledger.registerWorktree(f.lane);
       ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.lane.id, payload: {} });
@@ -139,6 +170,9 @@ describe('production owned workflow session binding', () => {
     writeWorkflowManifest(pkg, 2);
     const authority = serviceWorkflowAuthority(a.dataDir, () => ledger, pkg);
     const second = authority.resolveReviewResources(b.lane.id);
+    const old = createBmadRuntimeBinder(join(a.dataDir, 'bmad-runtime'))(historical.lane.path);
+    const retained = authority.resolveReviewResources(historical.lane.id);
+    expect(retained.artifactRoot).toBe(join(a.dataDir, 'reviews'));
     const seen: SpawnOptions[] = [];
     class Port extends UnavailableWorktreePort {
       override getWorktree(id: string) { return ledger.getWorktree(id); }
@@ -158,7 +192,7 @@ describe('production owned workflow session binding', () => {
       },
     });
     try {
-      for (const [f, resources] of [[a, first], [b, second]] as const) {
+      for (const [f, resources] of [[a, first], [b, second], [historical, retained]] as const) {
         const outcome = await wave.runRound({ jobId: f.lane.id });
         if (!('route' in outcome)) throw new Error('expected fallback');
         expect(outcome.clearToMerge).toBe(true);
@@ -171,6 +205,8 @@ describe('production owned workflow session binding', () => {
       expect(readBmadRuntimeBinding(a.lane.path, join(a.dataDir, 'bmad-runtime'))!.id).toBe(loadBundledWorkflowRuntime().id);
       expect(readBmadRuntimeBinding(b.lane.path, join(a.dataDir, 'bmad-runtime'))!.id).toBe(loadBundledWorkflowRuntime(pkg).id);
       expect(authority.resolveReviewResources(a.lane.id)).toEqual(first);
+      expect(seen[2]!.isolatedReview!.systemPrompt).toContain(retained.skillPath);
+      expect(readBmadRuntimeBinding(historical.lane.path, join(a.dataDir, 'bmad-runtime'))!.id).toBe(old.runtimeId);
       expect(() => authority.resolveReviewResources('j-missing')).toThrow(/live registered job worktree/u);
     } finally { await wave.shutdown(); db.close(); }
   });
@@ -259,18 +295,37 @@ describe('production owned workflow session binding', () => {
 
   it('resolves resumes only through recorded ownership, refusing conflicts and swept/missing assignments', () => {
     const f = fixture();
-    const records = [{ id: 'worker', jobId: f.lane.id, sessionFile: '/private/session.jsonl' }];
-    const ledger = { getAgent: (id: string) => records.find((r) => r.id === id) ?? null, listAgents: () => records };
+    const records = [{ id: 'worker', jobId: f.lane.id, sessionFile: '/private/session.jsonl', role: 'minion' as const, parentage: 'top-level' as const }];
+    const ledger = { getAgent: (id: string) => records.find((r) => r.id === id) ?? null, listAgents: () => records, listJobAdmissions: () => [] };
     const port = { getWorktree: (id: string) => id === f.lane.id ? f.lane : null, listWorktrees: () => [f.lane] };
     const resolve = (options: SpawnOptions) => registeredWorkflowLane(options, port, ledger);
     expect(resolve({ resumeFile: records[0]!.sessionFile })).toEqual(f.lane);
-    expect(resolve({ cwd: f.lane.path })).toEqual(f.lane);
+    expect(() => resolve({ cwd: f.lane.path })).toThrow(/already has a logical worker/u);
+    expect(() => resolve({ agentId: 'unknown-fresh-id', cwd: f.lane.path })).toThrow(/already has a logical worker/u);
+    expect(() => registeredWorkflowLane({ agentId: 'unknown-without-records', cwd: f.lane.path }, port,
+      { getAgent: () => null, listAgents: () => [], listJobAdmissions: () => [] })).toThrow(/initial dispatch admission/u);
+    expect(registeredWorkflowLane({ agentId: 'admitted-fresh', cwd: f.lane.path }, port,
+      { getAgent: () => null, listAgents: () => [], listJobAdmissions: () => ['initial dispatch'] })).toEqual(f.lane);
     expect(() => resolve({ agentId: 'worker', cwd: '/foreign' })).toThrow(/conflicts/u);
     expect(() => resolve({ resumeFile: '/private/unowned.jsonl', cwd: f.lane.path })).toThrow(/registered session owner/u);
     expect(() => resolve({ resumeFile: '/private/unowned.jsonl', agentId: 'worker' })).toThrow(/registered session owner/u);
     expect(() => resolve({ resumeFile: records[0]!.sessionFile, agentId: 'unknown' })).toThrow(/identity conflicts/u);
-    records.push({ id: 'other', jobId: 'j-other', sessionFile: records[0]!.sessionFile });
+    records.push({ id: 'other', jobId: 'j-other', sessionFile: records[0]!.sessionFile, role: 'minion', parentage: 'top-level' });
     expect(() => resolve({ resumeFile: records[0]!.sessionFile })).toThrow(/ambiguous/u);
     expect(resolve({ cwd: join(f.lane.path, '..', 'guessed-job') })).toBeNull();
+  });
+
+  it('refuses cross-job ID collisions and never redirects a missing child assignment into the parent lane', () => {
+    const a = fixture(); const b = fixture();
+    const records = [
+      { id: 'worker', jobId: a.lane.id, sessionFile: '/owner.jsonl', role: 'minion' as const, parentage: 'top-level' as const },
+      { id: 'child', jobId: a.lane.id, sessionFile: '/child.jsonl', role: 'minion' as const, parentage: 'child' as const },
+    ];
+    const ledger = { getAgent: (id: string) => records.find((record) => record.id === id) ?? null, listAgents: () => records, listJobAdmissions: () => [] };
+    const port = { getWorktree: (id: string) => id === 'worker' ? { ...b.lane, id: 'worker', jobId: 'worker' } : id === a.lane.id ? a.lane : null,
+      listWorktrees: () => [a.lane, b.lane],
+    };
+    expect(() => registeredWorkflowLane({ agentId: 'worker', resumeFile: '/owner.jsonl' }, port, ledger)).toThrow(/does not belong/u);
+    expect(registeredWorkflowLane({ agentId: 'child', resumeFile: '/child.jsonl' }, port, ledger)).toBeNull();
   });
 });

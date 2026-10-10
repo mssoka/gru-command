@@ -1463,6 +1463,32 @@ class FallbackSafetyRefusal extends Error {
   }
 }
 
+/** The existing working-tree intake, now fail-closed at every Git boundary.
+ * Capturing again after a reviewer settles binds its report to actual bytes,
+ * not just ledger events. Untracked and uncommitted changes are included. */
+function captureFallbackInput(lanePath: string, baseRef: string): Pick<FallbackReviewRunInput, 'headRef' | 'diff' | 'diffSha256'> {
+  const headRef = resolveGitCommit(lanePath, 'HEAD');
+  const prepared = spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { encoding: 'utf8', timeout: 10_000 });
+  if (prepared.error !== undefined || prepared.status !== 0) {
+    throw new Error(`cannot prepare the complete fallback working diff: ${prepared.error?.message ?? prepared.stderr.trim().slice(0, 200)}`);
+  }
+  const result = spawnSync('git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-color', baseRef],
+    { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 30_000 });
+  const restored = spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { encoding: 'utf8', timeout: 10_000 });
+  if (restored.error !== undefined || restored.status !== 0) {
+    throw new Error(`cannot restore fallback diff intake markers: ${restored.error?.message ?? restored.stderr.trim().slice(0, 200)}`);
+  }
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error(`cannot compute the complete fallback working diff: ${result.error?.message ?? result.stderr.trim().slice(0, 200)}`);
+  }
+  if (resolveGitCommit(lanePath, 'HEAD') !== headRef) throw new FallbackSafetyRefusal('fallback HEAD changed while capturing its working diff');
+  const diff = result.stdout;
+  if (boundedDiff(diff) !== diff) {
+    throw new Error('complete working diff exceeds the fallback transport size; no truncated review can pass. Restore native Perkins review or reduce the candidate scope');
+  }
+  return { headRef, diff, diffSha256: createHash('sha256').update(diff).digest('hex') };
+}
+
 /** A late delivered STATUS after an already-recorded delivery is harmless.
  * A working hop hidden by a later status is not: the old diff is obsolete.
  * If the bounded history cannot prove no hop occurred, fail closed. */
@@ -3665,35 +3691,18 @@ export class WaveRunner {
         }
       };
       const reportFile = join(directory, `review-${iteration}.json`);
-      // Re-read the lane's working diff every round: the fix directive may
-      // have changed the tree, and the next review must see those bytes.
-      // Working-tree diff against the base commit: uncommitted minion fixes
-      // MUST be visible to the re-review round.
-      // Mark untracked files as intent-to-add so `git diff` sees them, then
-      // undo the markers — the gate reviews the full working tree.
-      spawnSync('git', ['-C', lanePath, 'add', '-N', '.'], { timeout: 10_000 });
-      const diffResult = spawnSync(
-        'git', ['-C', lanePath, 'diff', '--no-ext-diff', '--no-color', baseRef],
-        { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024, timeout: 30_000 },
-      );
-      spawnSync('git', ['-C', lanePath, 'reset', '-q', '--'], { timeout: 10_000 });
-      if (diffResult.error !== undefined || diffResult.status !== 0) {
-        this.terminalFallbackBlocked(
-          job.id,
-          `cannot compute the working diff for fallback round ${iteration}: ${(diffResult.stderr ?? '').trim().slice(0, 200)}`,
-          iteration, [...state.reportFiles], fallbackEvent, state,
-        );
+      let captured: ReturnType<typeof captureFallbackInput>;
+      try {
+        captured = captureFallbackInput(lanePath, baseRef);
+      } catch (error) {
+        if (error instanceof FallbackSafetyRefusal) {
+          this.terminalFallbackAborted(job.id, error.message, iteration, [...state.reportFiles], fallbackEvent, state);
+        } else {
+          this.terminalFallbackBlocked(job.id, `fallback round ${iteration} input failed: ${sanitizeErrorLog(error)}`, iteration, [...state.reportFiles], fallbackEvent, state);
+        }
         return;
       }
-      const diff = diffResult.stdout ?? '';
-      if (boundedDiff(diff) !== diff) {
-        this.terminalFallbackBlocked(job.id,
-          `complete working diff exceeds the fallback transport size in round ${iteration}; no truncated review can pass. Restore native Perkins review or reduce the candidate's scope`,
-          iteration, [...state.reportFiles], fallbackEvent, state);
-        return;
-      }
-      const headRef = resolveGitCommit(lanePath, 'HEAD');
-      const diffSha256 = createHash('sha256').update(diff).digest('hex');
+      const { headRef, diff, diffSha256 } = captured;
       let findings: readonly FallbackFinding[];
       try {
         findings = gate.runFallbackReview !== undefined
@@ -3706,6 +3715,10 @@ export class WaveRunner {
         // rule 3, or shutdown) never records a verdict on that diff.
         if (signal.aborted) {
           throw new FallbackSafetyRefusal(`the fallback gate for job "${job.id}" was cancelled while its reviewer ran — its findings are not a verdict`);
+        }
+        const current = captureFallbackInput(lanePath, baseRef);
+        if (current.headRef !== headRef || current.diffSha256 !== diffSha256) {
+          throw new FallbackSafetyRefusal(`fallback working diff or HEAD changed during round ${iteration}; the old report cannot pass`);
         }
       } catch (error) {
         if (existsSync(reportFile)) state.reportFiles.push(reportFile);
@@ -3853,18 +3866,19 @@ export class WaveRunner {
       // start an obsolete reviewer. The lease releases in the finally on
       // throw.
       if (recheck !== undefined) recheck();
+      const policy = fallbackReviewPolicy(input.skillPath, input.reportFile);
       handle = await this.opts.spawner('minion', { cwd: input.lanePath, signal: input.signal,
         // Reuse the existing ambient-free read-only host on both runtimes.
         // The scoped submission closure, never ordinary write, captures a report.
         roleTools: ['read', 'grep', 'find', 'ls'],
-        isolatedReview: fallbackReviewPolicy(input.skillPath, input.reportFile),
+        isolatedReview: policy,
       });
+      // Revocation after asynchronous allocation takes precedence even if the
+      // adapter also failed to expose a capability: no obsolete prompt can run.
+      recheck?.();
       if (!handle.reviewTools?.includes('gc_submit_fallback_findings')) {
         throw new Error('fallback runtime did not expose the required host-bound findings tool; restore that native adapter capability before retrying');
       }
-      // Spawning is asynchronous too: a newly owned lane must not receive
-      // an obsolete review prompt just because the worker was allocated.
-      recheck?.();
       // The ledger role is the review-worker role on purpose (Gru ruling
       // 2026-09-29): this session runs ONE review pass and is forbidden
       // from implementation edits, so it must never win an implementer
@@ -3962,6 +3976,7 @@ export class WaveRunner {
       // report file the retried turn wrote is parsed below; only a
       // rejection with no recovered retry keeps the fail-loud throw.
       if (promptError !== null && disposition !== 'recovered') throw promptError;
+      policy.assertReportValid();
     } finally {
       try { await handle?.dispose(); } finally { lease?.release(); }
     }

@@ -6034,6 +6034,8 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
     missingReportTool?: boolean;
+    conflictingReport?: boolean;
+    onPrompt?: () => void;
     /** Hold every fallback minion turn open until the test releases it, so a
      * transport wait slice can expire while the review is genuinely live. */
     promptHold?: { readonly release: Promise<void> };
@@ -6088,7 +6090,13 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         async prompt(text: string) {
           prompts.push(text);
           // Exercise the host closure, never grant the fake model file writes.
-          await spawnOptions.isolatedReview!.nativeTools![0]!.execute({ findings: options.findingToWrite });
+          const submit = spawnOptions.isolatedReview!.nativeTools![0]!;
+          await submit.execute({ findings: options.findingToWrite });
+          if (options.conflictingReport === true) {
+            try { await submit.execute({ findings: [{ title: 'Late blocker', category: 'correctness', location: 'src/prod.ts:1', evidence: 'prod = 1', detail: 'A corrected report must not be ignored.' }] }); }
+            catch { /* Model ignores the native tool error and replies DONE. */ }
+          }
+          options.onPrompt?.();
           if (options.promptHold !== undefined) await options.promptHold.release;
           if (options.failPrompt === true) throw new Error('429 too many requests');
         },
@@ -6164,6 +6172,61 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     expect(h.spawnCwds).toEqual([]);
     expect(h.prompts).toEqual([]);
     expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+  });
+
+  it('records exact base/HEAD and complete diff digest including uncommitted bytes', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 2;\n');
+    const baseRef = h.repo.git(['rev-parse', 'main']); const headRef = h.repo.head();
+    const diff = execFileSync('git', ['-C', h.repo.path, 'diff', '--no-ext-diff', '--no-color', baseRef], { encoding: 'utf8' });
+    const diffSha256 = createHash('sha256').update(diff).digest('hex');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
+    expect(h.prompts[0]).toContain(`canonical base: ${baseRef}; checkout HEAD: ${headRef}; complete working diff SHA-256: ${diffSha256}`);
+    expect(h.prompts[0]).toContain(diff);
+    const triaged = h.ledger.listEvents({ limit: 100 }).find((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'triaged');
+    expect(triaged?.payload).toMatchObject({ baseRef, headRef, diffSha256, completeDiff: true });
+  });
+
+  it('aborts if working bytes or HEAD move during a fallback turn without a ledger event', async () => {
+    for (const change of ['working-bytes', 'head-only']) {
+      let mutate = () => {};
+      const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+      mutate = () => {
+        if (change === 'working-bytes') writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 3;\n');
+        else h.repo.git(['commit', '--allow-empty', '-qm', 'head moved without content change']);
+      };
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('working diff or HEAD changed');
+      expect(h.ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    }
+  });
+
+  it('blocks when intent-to-add preparation fails instead of claiming an incomplete diff is complete', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'untracked.ts'), 'export const missed = true;\n');
+    const lock = h.repo.git(['rev-parse', '--path-format=absolute', '--git-path', 'index.lock']);
+    writeFileSync(lock, 'held by another writer');
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('cannot prepare the complete fallback working diff');
+      expect(h.prompts).toEqual([]);
+      expect(h.spawnCwds).toEqual([]);
+    } finally { rmSync(lock); }
+  });
+
+  it('blocks contradictory findings even when the model ignores the report-tool error', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], conflictingReport: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('conflicting findings submissions');
+    expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
   });
 
   it('blocks a fallback runtime that did not actually expose its scoped report tool', async () => {

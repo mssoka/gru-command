@@ -14,14 +14,17 @@ export class WorkflowSessionError extends Error {
   }
 }
 
+type WorkflowAgent = Pick<AgentRecord, 'id' | 'jobId' | 'sessionFile' | 'role' | 'parentage'>;
+
 /** Read only the existing assignment records, never derive a job from a basename.
  * A supervised resume with no cwd recovers the same lane through its session row. */
 export function registeredWorkflowLane(
   options: SpawnOptions,
   worktrees: Pick<WorktreePort, 'getWorktree' | 'listWorktrees'>,
   ledger: {
-    getAgent(id: string): Pick<AgentRecord, 'id' | 'jobId' | 'sessionFile'> | null;
-    listAgents(): readonly Pick<AgentRecord, 'id' | 'jobId' | 'sessionFile'>[];
+    getAgent(id: string): WorkflowAgent | null;
+    listAgents(): readonly WorkflowAgent[];
+    listJobAdmissions(jobId: string): readonly string[];
   },
 ): WorktreeLane | null {
   const resumed = options.resumeFile === undefined ? [] : ledger.listAgents().filter((agent) => agent.sessionFile === options.resumeFile);
@@ -35,8 +38,11 @@ export function registeredWorkflowLane(
   }
   const agent = named ?? resumed[0];
   const assigned = agent === undefined || agent === null ? null
-    : worktrees.getWorktree(agent.id) ?? (agent.jobId === null ? null : worktrees.getWorktree(agent.jobId));
+    : worktrees.getWorktree(agent.id) ?? (agent.jobId === null || agent.parentage === 'child' ? null : worktrees.getWorktree(agent.jobId));
   if (assigned !== null) {
+    if (assigned.jobId !== agent?.jobId) {
+      throw new WorkflowSessionError(`registered workflow lane ${assigned.id} does not belong to worker ${agent?.id}; repair its job/worktree ownership records`);
+    }
     if (options.cwd !== undefined && options.cwd !== assigned.path) {
       throw new WorkflowSessionError(`workflow cwd conflicts with registered assignment ${assigned.id}: ${options.cwd}`);
     }
@@ -46,7 +52,16 @@ export function registeredWorkflowLane(
   if (options.cwd === undefined) return null;
   const candidates = worktrees.listWorktrees().filter((lane) => lane.path === options.cwd && lane.status !== 'swept');
   if (candidates.length > 1) throw new WorkflowSessionError(`ambiguous registered workflow lane at ${options.cwd}`);
-  return candidates[0] ?? null;
+  const candidate = candidates[0];
+  if (candidate?.kind === 'job') {
+    if (ledger.listAgents().some((owner) => owner.jobId === candidate.jobId && owner.role === 'minion' && owner.parentage !== 'child')) {
+      throw new WorkflowSessionError(`registered job ${candidate.jobId} already has a logical worker; resume its recorded session/identity instead of attaching an unknown worker by cwd`);
+    }
+    if (!ledger.listJobAdmissions(candidate.id).includes('initial dispatch')) {
+      throw new WorkflowSessionError(`fresh workflow worker for ${candidate.id} requires its recorded initial dispatch admission; restore missing worker ownership records rather than replacing it by cwd`);
+    }
+  }
+  return candidate ?? null;
 }
 
 /** Production build selection: #292 immutable resources + #293 registered storage.
@@ -117,8 +132,9 @@ export function ownedFallbackReviewResources(
 /** Shared production wiring, exercised directly by dispatch/runtime/gate proofs.
  * The lazy ledger accessor preserves boot order without copying assignment rules. */
 export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<WorktreePort, 'getWorktree' | 'listWorktrees'> & {
-  getAgent(id: string): Pick<AgentRecord, 'id' | 'jobId' | 'sessionFile'> | null;
-  listAgents(): readonly Pick<AgentRecord, 'id' | 'jobId' | 'sessionFile'>[];
+  getAgent(id: string): WorkflowAgent | null;
+  listAgents(): readonly WorkflowAgent[];
+  listJobAdmissions(jobId: string): readonly string[];
   getJob(id: string): Pick<JobRecord, 'id' | 'deliverable'> | null;
 }, packageRoot = PACKAGE_ROOT): {
   readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
@@ -126,7 +142,6 @@ export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<Wo
   readonly resolveReviewResources: (jobId: string) => { readonly skillPath: string; readonly artifactRoot: string };
 } {
   const workflowLaneFor = (options: SpawnOptions): WorktreeLane | null => registeredWorkflowLane(options, records(), records());
-  const bindFallback = createWorkflowSessionBinder(dataDir, workflowLaneFor, packageRoot);
   return {
     workflowLaneFor,
     workflowBuildFor: (lane) => {
@@ -139,7 +154,10 @@ export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<Wo
       if (lane === null || lane.kind !== 'job' || lane.jobId !== jobId || lane.status === 'swept') {
         throw new WorkflowSessionError(`GC fallback review requires the live registered job worktree for ${jobId}`);
       }
-      return ownedFallbackReviewResources(bindFallback({ cwd: lane.path }), dataDir, packageRoot);
+      // Resource selection is authorized by the explicit registered JOB, not
+      // permission to spawn a replacement implementation worker by its cwd.
+      const session = createWorkflowSessionBinder(dataDir, () => lane, packageRoot)({ cwd: lane.path });
+      return ownedFallbackReviewResources(session, dataDir, packageRoot);
     },
   };
 }

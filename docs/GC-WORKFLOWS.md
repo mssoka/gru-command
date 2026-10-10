@@ -11,7 +11,8 @@ Both Pi and Claude receive the owned skill, verified rendered instructions and
 explicit registered assignment through the existing managed-skill mechanism.
 Resume resolves the same worktree from recorded agent/session ownership when cwd
 is absent. Unknown/conflicting/swept assignments fail loudly, never at a guessed
-workspace. Bounded child/report tasks do not start another top-level build cycle.
+workspace. An owned job requires its recorded logical worker, not a new identity
+attached by cwd; child assignments never fall back into their parent's lane. Bounded child/report tasks do not start another top-level build cycle.
 Project AGENTS.md, testing conventions and approved source documents still apply.
 No project/global skill or malformed `_bmad/custom`/legacy answer selects GC's
 workflow. Setup provisioning is still transitional until #295; independent BMAD
@@ -26,7 +27,11 @@ runs one ambient-free read-only report task using the existing isolated review
 host on both adapters. Its only write capability is `gc_submit_fallback_findings`,
 a host-bound private report submission; ordinary shell/Edit/Write tools are absent.
 The host supplies the verified helper and canonical base/HEAD/complete working-diff
-hash. Oversize input blocks before spawning, never passes a truncated diff.
+hash. Failed Git preparation and oversize input block before spawning, never
+pass an incomplete/truncated diff. Before triage, the host captures the input
+again; moved HEAD or changed working bytes invalidate the old report even when
+no ledger event was emitted. Conflicting report submissions also block, including
+when the model ignores the tool error and replies DONE.
 Missing owned resources or the required report-tool capability record an actionable
 blocked result, never borrow an
 ambient skill. Stable `bmad-review-fallback` API/event identifiers are retained;
