@@ -172,16 +172,38 @@ function directory(path: string, create: boolean, privateFrom?: string, exactFro
   }
 }
 
-/** Only our fully-written atomic publication links may temporarily share an
- * inode. Foreign hardlinks (including links outside this directory) refuse. */
-function stagingLinks(path: string, info: Stats): readonly string[] {
-  return readdirSync(dirname(path))
-    .filter((name) => /^\.gc-artifact-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.tmp$/u.test(name))
-    .map((name) => join(dirname(path), name))
-    .filter((candidate) => {
-      const stat = maybeStat(candidate);
-      return stat !== null && stat.isFile() && stat.ino === info.ino && stat.dev === info.dev;
-    });
+interface StagingLink {
+  readonly temporary: string;
+  readonly record: string;
+  readonly sha256: string;
+}
+
+/** A UUID name alone is not ownership. Each fully-written staging inode has
+ * an exclusive private publication record created BEFORE linking the target. */
+function stagingLinks(path: string, info: Stats, stagingRoot: string): readonly StagingLink[] {
+  directory(stagingRoot, false, stagingRoot);
+  const links: StagingLink[] = [];
+  for (const name of readdirSync(dirname(path))) {
+    const uuid = /^\.gc-artifact-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.tmp$/u.exec(name)?.[1];
+    if (uuid === undefined) continue;
+    const temporary = join(dirname(path), name);
+    const stat = maybeStat(temporary);
+    if (stat === null || !stat.isFile() || stat.ino !== info.ino || stat.dev !== info.dev) continue;
+    const record = join(stagingRoot, `${uuid}.json`);
+    const bytes = readRegular(record, true);
+    if (bytes === null) continue;
+    const raw = JSON.parse(bytes.toString('utf8')) as { readonly sha256: string };
+    const identity = lstatSync(temporary, { bigint: true });
+    const expected = {
+      schemaVersion: 1, target: path, temporary: name, dev: identity.dev.toString(), ino: identity.ino.toString(),
+      sha256: sha256(raw.sha256, 'publication staging sha256'),
+    };
+    if (!bytes.equals(Buffer.from(json(expected)))) {
+      throw new ArtifactContextError(`publication staging record does not match its target/inode: ${record}`);
+    }
+    links.push({ temporary, record, sha256: expected.sha256 });
+  }
+  return links;
 }
 
 function unlinkStaging(path: string): void {
@@ -193,15 +215,18 @@ function unlinkStaging(path: string): void {
   }
 }
 
-function readRegular(path: string, privateFile: boolean): Buffer | null {
+function readRegular(path: string, privateFile: boolean, stagingRoot?: string): Buffer | null {
   const info = maybeStat(path);
   if (info === null) return null;
   exactEntry(path);
+  const stagingHashes = new Set<string>();
   const check = (stat: Stats): void => {
     if (!stat.isFile() || stat.isSymbolicLink()) {
       throw new ArtifactContextError(`artifact must be a regular file, not a symlink or hardlink: ${path}`);
     }
-    if (stat.nlink !== 1 && stat.nlink !== stagingLinks(path, stat).length + 1) {
+    const ownedLinks = stat.nlink === 1 || stagingRoot === undefined ? [] : stagingLinks(path, stat, stagingRoot);
+    for (const link of ownedLinks) stagingHashes.add(link.sha256);
+    if (stat.nlink !== 1 && stat.nlink !== ownedLinks.length + 1) {
       // The winning publisher may have removed its staging name while we listed.
       const current = lstatSync(path);
       if (current.ino !== stat.ino || current.dev !== stat.dev || current.nlink !== 1) {
@@ -220,14 +245,18 @@ function readRegular(path: string, privateFile: boolean): Buffer | null {
     if (opened.ino !== info.ino || opened.dev !== info.dev) {
       throw new ArtifactContextError(`artifact changed while opening: ${path}`);
     }
-    return readFileSync(fd);
+    const bytes = readFileSync(fd);
+    if (stagingHashes.size > 0 && [...stagingHashes].some((expected) => expected !== hash(bytes))) {
+      throw new ArtifactContextError(`publication staging record sha256 does not match content: ${path}`);
+    }
+    return bytes;
   } finally {
     closeSync(fd);
   }
 }
 
-function sameBytes(path: string, bytes: Buffer, privateFile: boolean): boolean {
-  const existing = readRegular(path, privateFile);
+function sameBytes(path: string, bytes: Buffer, privateFile: boolean, stagingRoot?: string): boolean {
+  const existing = readRegular(path, privateFile, stagingRoot);
   if (existing === null) return false;
   if (!existing.equals(bytes)) throw new ArtifactContextError(`artifact contains different bytes or identity: ${path}`);
   return true;
@@ -235,18 +264,31 @@ function sameBytes(path: string, bytes: Buffer, privateFile: boolean): boolean {
 
 /** Exclusive atomic publish. A crash before receipt publication is completed by
  * an identical retry; a different revision needs a different relative path. */
-function publish(path: string, bytes: Buffer, privateFrom?: string, exactFrom = privateFrom ?? dirname(path)): void {
+function publish(path: string, bytes: Buffer, stagingRoot: string, privateFrom?: string, exactFrom = privateFrom ?? dirname(path)): void {
   directory(dirname(path), true, privateFrom, exactFrom);
-  if (sameBytes(path, bytes, privateFrom !== undefined)) {
-    // Finish only same-inode staging links of this exact verified publication,
-    // including a crash at link-before-unlink. This is not a directory sweep.
-    for (const staging of stagingLinks(path, lstatSync(path))) unlinkStaging(staging);
+  directory(stagingRoot, true, stagingRoot);
+  if (sameBytes(path, bytes, privateFrom !== undefined, stagingRoot)) {
+    // Finish only privately authenticated links of this exact verified
+    // publication. A similarly named foreign hardlink is never removed.
+    for (const staging of stagingLinks(path, lstatSync(path), stagingRoot)) {
+      unlinkStaging(staging.temporary);
+      unlinkStaging(staging.record);
+    }
     return;
   }
-  const temporary = join(dirname(path), `.gc-artifact-${randomUUID()}.tmp`);
+  const uuid = randomUUID();
+  const temporary = join(dirname(path), `.gc-artifact-${uuid}.tmp`);
+  const record = join(stagingRoot, `${uuid}.json`);
   writeFileSync(temporary, bytes, { flag: 'wx', mode: privateFrom === undefined ? 0o644 : 0o600 });
+  let recordOwned = false;
   let raced = false;
   try {
+    const identity = lstatSync(temporary, { bigint: true });
+    writeFileSync(record, json({
+      schemaVersion: 1, target: path, temporary: basename(temporary),
+      dev: identity.dev.toString(), ino: identity.ino.toString(), sha256: hash(bytes),
+    }), { flag: 'wx', mode: 0o600 });
+    recordOwned = true;
     directory(dirname(path), false, privateFrom, exactFrom);
     try {
       linkSync(temporary, path);
@@ -256,10 +298,10 @@ function publish(path: string, bytes: Buffer, privateFrom?: string, exactFrom = 
     }
   } finally {
     unlinkStaging(temporary);
+    if (recordOwned) unlinkStaging(record);
   }
-  // Concurrent identical publishers may observe an owned staging hardlink;
-  // the payload was fully written before that link became visible.
-  if (raced) sameBytes(path, bytes, privateFrom !== undefined);
+  // A concurrent identical writer sees complete bytes plus private proof.
+  if (raced) sameBytes(path, bytes, privateFrom !== undefined, stagingRoot);
 }
 
 const gitEnv = (): NodeJS.ProcessEnv => ({
@@ -278,8 +320,18 @@ function refuseCheckoutDataHome(path: string): void {
 }
 
 function refuseIgnoredDocument(worktreePath: string, path: string): void {
-  const result = spawnSync('git', ['-C', worktreePath, 'check-ignore', '-q', '--', `gru-output/${path}`], {
-    encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv(),
+  // Visibility must agree with normal Git/sweep excludes (global, system,
+  // info/exclude and config carriers). Strip repository routing, then pin
+  // core.worktree explicitly so ambient configuration cannot redirect it.
+  const env: NodeJS.ProcessEnv = { ...process.env, LC_ALL: 'C' };
+  for (const name of [
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_PREFIX',
+    'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE', 'GIT_REPLACE_REF_BASE', 'GIT_NO_REPLACE_OBJECTS',
+    'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_QUARANTINE_PATH',
+  ]) delete env[name];
+  const result = spawnSync('git', ['-C', worktreePath, '-c', `core.worktree=${worktreePath}`, 'check-ignore', '-q', '--', `gru-output/${path}`], {
+    encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env,
   });
   if (result.status === 0) {
     throw new ArtifactContextError(`approved document is Git-ignored; change the ignore rule explicitly before publication: gru-output/${path}`);
@@ -357,11 +409,12 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
     const operationalDirectory = join(jobDirectory, 'operational');
     const knowledgeDirectory = join(worktreePath, 'gru-output');
     const references = join(jobDirectory, 'references');
+    const stagingRecords = join(jobDirectory, 'publication-staging');
     const bindingFile = join(jobDirectory, 'context.json');
     const bindingBytes = Buffer.from(json({
       schemaVersion: 1, projectKey, repoPath, jobId, worktreePath, workflow,
     }));
-    const directories = [jobDirectory, operationalDirectory, references];
+    const directories = [jobDirectory, operationalDirectory, references, stagingRecords];
     const checkBoundaries = (create: boolean): void => {
       for (const path of directories) directory(path, create, projects);
       directory(knowledgeDirectory, create);
@@ -369,18 +422,19 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
     // Refuse all existing wrong-kind paths/identity conflicts before initialization
     // publishes anything. Existing documents are not scanned, copied or rewritten.
     checkBoundaries(false);
-    const hasBinding = sameBytes(bindingFile, bindingBytes, true);
+    const hasBinding = sameBytes(bindingFile, bindingBytes, true, stagingRecords);
     if (!hasBinding && maybeStat(jobDirectory) !== null && readdirSync(jobDirectory).length !== 0) {
       throw new ArtifactContextError(`artifact context binding is missing from an existing namespace; restore it explicitly: ${bindingFile}`);
     }
     directory(jobDirectory, true, projects);
-    publish(bindingFile, bindingBytes, projects);
+    publish(bindingFile, bindingBytes, stagingRecords, projects);
     checkBoundaries(true);
 
     const checkContext = (): void => {
       verifyLane(repoPath, worktreePath);
       checkBoundaries(false);
-      if (!sameBytes(bindingFile, bindingBytes, true)) {
+      refuseCheckoutDataHome(dataDir);
+      if (!sameBytes(bindingFile, bindingBytes, true, stagingRecords)) {
         throw new ArtifactContextError(`artifact context binding is missing; restore it explicitly: ${bindingFile}`);
       }
     };
@@ -405,16 +459,16 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
       const receipt = receiptPath(scope, path);
       const privateFrom = scope === 'operational' ? projects : undefined;
       directory(dirname(payload), false, privateFrom, scope === 'document' ? knowledgeDirectory : projects);
-      const hasPayload = sameBytes(payload, bytes, scope === 'operational');
-      const hasReceipt = sameBytes(receipt, receiptBytes, true);
+      const hasPayload = sameBytes(payload, bytes, scope === 'operational', stagingRecords);
+      const hasReceipt = sameBytes(receipt, receiptBytes, true, stagingRecords);
       if (hasPayload && !hasReceipt) {
         throw new ArtifactContextError(`artifact receipt is missing for existing content; restore it explicitly: ${receipt}`);
       }
       if (scope === 'document') refuseIgnoredDocument(worktreePath, path);
       // Bind exact provenance BEFORE payload publication. A crash can leave a
       // receipt without content, never content whose provenance can be guessed.
-      publish(receipt, receiptBytes, projects);
-      publish(payload, bytes, privateFrom, scope === 'document' ? knowledgeDirectory : projects);
+      publish(receipt, receiptBytes, stagingRecords, projects);
+      publish(payload, bytes, stagingRecords, privateFrom, scope === 'document' ? knowledgeDirectory : projects);
       return reference;
     });
 
@@ -427,7 +481,7 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
         const path = artifactPath(value);
         checkContext();
         const receipt = receiptPath(scope, path);
-        const bytes = readRegular(receipt, true);
+        const bytes = readRegular(receipt, true, stagingRecords);
         if (bytes === null) throw new ArtifactContextError(`artifact reference is missing: ${receipt}`);
         const record = JSON.parse(bytes.toString('utf8')) as ArtifactReference;
         const expected: ArtifactReference = Object.freeze({
@@ -442,7 +496,7 @@ export function createArtifactContext(input: ArtifactContextInput): ArtifactCont
         const payload = payloadPath(scope, path);
         directory(dirname(payload), false, scope === 'operational' ? projects : undefined,
           scope === 'document' ? knowledgeDirectory : projects);
-        const content = readRegular(payload, scope === 'operational');
+        const content = readRegular(payload, scope === 'operational', stagingRecords);
         if (content === null || hash(content) !== expected.sha256) {
           throw new ArtifactContextError(`artifact content does not match reference sha256: ${payload}`);
         }

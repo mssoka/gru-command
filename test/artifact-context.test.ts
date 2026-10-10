@@ -480,6 +480,53 @@ describe('explicit GC artifact context (#293)', () => {
     expect(readFileSync(join(f.worktree.path, '.gitignore'), 'utf8')).toBe('gru-output/\n');
   });
 
+  it('honors global and environment-carried Git excludes while pinning visibility to the assigned checkout', () => {
+    const f = fixture();
+    const excludes = join(f.root, 'global-excludes');
+    const config = join(f.root, 'gitconfig');
+    writeFileSync(excludes, 'gru-output/\n');
+    writeFileSync(config, `[core]\n  excludesFile = ${excludes}\n`);
+    vi.stubEnv('GIT_CONFIG_GLOBAL', config);
+    const context = createArtifactContext(f.input);
+    const document = { path: 'spec.md', contents: 'approved', sources, approvalId: 'owner' };
+    expect(() => context.publishDocument(document)).toThrow(/Git-ignored/u);
+    vi.stubEnv('GIT_CONFIG_GLOBAL', join(f.root, 'absent-global-config'));
+    vi.stubEnv('GIT_CONFIG_COUNT', '1');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'core.excludesFile');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', excludes);
+    expect(() => context.publishDocument(document)).toThrow(/Git-ignored/u);
+    expect(tree(context.knowledgeDirectory)).toEqual([]);
+    expect(tree(join(context.jobDirectory, 'references'))).toEqual([]);
+  });
+
+  it('refuses private writes when the configured data home becomes a Git checkout after binding', () => {
+    const f = fixture();
+    const context = createArtifactContext(f.input);
+    git(f.dataDir, ['init', '-qb', 'main']);
+    const before = snapshot(context.jobDirectory);
+    expect(() => context.writeOperational({ path: 'secret.txt', contents: 'secret', sources })).toThrow(/outside all Git/u);
+    expect(() => context.publishDocument({ path: 'spec.md', contents: 'approved', sources, approvalId: 'owner' })).toThrow(/outside all Git/u);
+    expect(snapshot(context.jobDirectory)).toBe(before);
+    expect(tree(context.knowledgeDirectory)).toEqual([]);
+  });
+
+  it('never treats a UUID-shaped foreign hardlink as an authenticated GC publication', () => {
+    const f = fixture();
+    const context = createArtifactContext(f.input);
+    const document = { path: 'spec.md', contents: 'approved', sources, approvalId: 'owner' };
+    const reference = context.publishDocument(document);
+    const payload = join(context.knowledgeDirectory, document.path);
+    const foreign = join(context.knowledgeDirectory, '.gc-artifact-123e4567-e89b-42d3-a456-426614174000.tmp');
+    linkSync(payload, foreign);
+    expect(() => context.readReference('document', document.path)).toThrow(/foreign hardlink/u);
+    expect(() => context.publishDocument(document)).toThrow(/foreign hardlink/u);
+    expect(readFileSync(foreign, 'utf8')).toBe(document.contents);
+    expect(lstatSync(payload).nlink).toBe(2);
+    expect(tree(join(context.jobDirectory, 'publication-staging'))).toEqual([]);
+    rmSync(foreign); // only the test removes the foreign fixture it created
+    expect(context.readReference('document', document.path)).toEqual(reference);
+  });
+
   it('an existing context refuses a legally swept and removed lane, even with its original registry snapshot', () => {
     const f = fixture();
     const context = createArtifactContext(f.input);
@@ -532,10 +579,20 @@ describe('explicit GC artifact context (#293)', () => {
         if (mode === 'crash') {
           child.kill('SIGKILL');
           expect((await done).signal).toBe('SIGKILL');
+          const stagingRoot = join(context.jobDirectory, 'publication-staging');
+          const proof = join(stagingRoot, readdirSync(stagingRoot)[0]!);
+          const proofBytes = readFileSync(proof, 'utf8');
+          for (const corruption of [{ target: 'foreign' }, { sha256: hash('corrupt staging') }]) {
+            writeFileSync(proof, JSON.stringify({ ...JSON.parse(proofBytes), ...corruption }, null, 2) + '\n');
+            expect(() => context.writeOperational(artifact)).toThrow(/staging record/u);
+            expect(tree(join(context.operationalDirectory, mode))).toHaveLength(2);
+          }
+          writeFileSync(proof, proofBytes);
         }
         const resumed = context.writeOperational(artifact);
         expect(context.readReference('operational', artifact.path)).toEqual(resumed);
         expect(tree(join(context.operationalDirectory, mode))).toEqual(['draft.md']);
+        expect(tree(join(context.jobDirectory, 'publication-staging'))).toEqual([]);
         if (mode === 'concurrent') {
           child.stdin.end('x');
           expect((await done).code, stderr).toBe(0);

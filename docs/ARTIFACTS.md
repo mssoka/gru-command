@@ -15,6 +15,7 @@ that integration lands.
 | Job binding | `<data_dir>/projects/<project-key>/jobs/<job-id>/context.json` | Registered repository, job, assigned worktree and selected workflow identity |
 | Operational artifacts | `<job-directory>/operational/<relative-path>` | Explicitly supplied plans, drafts, rendered instructions, import snapshots |
 | Artifact references | `<job-directory>/references/<reference-key>.json` | Logical output location, exact SHA-256, workflow/source identities, document approval receipt; **not** document content |
+| Publication staging proofs | `<job-directory>/publication-staging/<uuid>.json` | Private temporary ownership records for exclusive staging inodes; never approved-document bytes |
 | Project knowledge | `<assigned-worktree>/gru-output/<relative-path>` | Explicitly approved specs, architecture/decision documents and relevant knowledge |
 
 `data_dir` comes from GC configuration (default `~/.gru-command`). The helper
@@ -79,7 +80,8 @@ the caller.
 The approved document's **one authoritative mutable copy** is the ordinary
 worktree file. Its private receipt is immutable metadata, not a competing
 editable contract. `gru-output/` is neither auto-ignored nor auto-committed;
-publication refuses a Git-ignored document path and never edits ignore rules.
+publication refuses a Git-ignored document path (including global/system
+excludes and configuration carriers) and never edits ignore rules.
 Review/version its documents normally. They remain readable without GC or
 BMAD. Editing a document changes its hash, so the old reference subsequently
 refuses verification; a new approved revision needs a new publication path.
@@ -109,9 +111,11 @@ refuses verification; a new approved revision needs a new publication path.
   is finished by an identical retry; orphaned content without a receipt is
   refused rather than assigned guessed provenance. A missing receipt/content
   is never treated as a verified reference. A concurrent/crashed publisher's
-  fully-written internal staging hardlink is recognized by its exact reserved
-  UUID name and inode/link count. An identical publication finishes only those
-  links; external or other hardlinks still refuse. This narrow staging cleanup
+  fully-written internal staging hardlink requires an exclusive **private
+  ownership record** matching its UUID, target, inode and hash; names alone
+  never establish ownership. An identical publication finishes only those
+  authenticated links/proofs; foreign hardlinks remain unchanged and refuse.
+  This narrow staging cleanup
   is not a retention sweep.
 - Absolute output paths, traversal, empty components, backslashes, colon
   paths, control characters, wrong-kind entries, symlinks (including dangling
@@ -120,7 +124,8 @@ refuses verification; a new approved revision needs a new publication path.
   stored directory entry, so one document cannot acquire competing approvals.
   Use normalized absolute roots without symlink components; on systems with
   `/tmp` or `/var` aliases, supply their canonical paths. Boundaries are
-  checked again on every operation. Files are opened without following leaf
+  checked again on every operation, including whether the data home became
+  part of a Git checkout after binding. Files are opened without following leaf
   symlinks and read through a checked descriptor. Do not permit an untrusted
   process to rename/replace trusted ancestor directories during operations;
   this API is not a filesystem sandbox against a concurrent hostile owner.
