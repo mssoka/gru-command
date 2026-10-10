@@ -9,6 +9,8 @@ import { isJobTerminal } from '../ledger/states.js';
 import { isReportDispositionOutcome, parseCompletionHandoffIntent, type CompletionHandoffIntent } from '../ledger/obligations.js';
 import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger/pipeline.js';
 import type { PipelineService } from './pipeline.js';
+import type { IntakeService } from '../intake/service.js';
+import { IntakeError } from '../intake/types.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
@@ -80,6 +82,8 @@ export interface DispatchServerOptions {
   /** Durable pipeline queue surface (approved j-239/j-1064); absent =
    * /api/pipeline/* answers 503 (queue not hosted in this build). */
   readonly pipeline?: PipelineService;
+  /** Read-only native intake preview; never connected to executable enqueue. */
+  readonly intake?: IntakeService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   readonly log?: Log;
@@ -297,7 +301,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
     return true;
   }
 
-  function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  function readBody(req: IncomingMessage, destroyOnLimit = true): Promise<Record<string, unknown>> {
     return new Promise((resolveBody, rejectBody) => {
       let seen = 0;
       const chunks: Buffer[] = [];
@@ -307,8 +311,10 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         seen += chunk.length;
         if (seen > 512 * 1024) {
           rejected = true;
+          chunks.length = 0;
           rejectBody(new Error('request body exceeds 512 KiB'));
-          req.destroy();
+          if (destroyOnLimit) req.destroy();
+          else req.pause();
           return;
         }
         chunks.push(chunk);
@@ -367,6 +373,55 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
   }
 
   async function handleApi(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
+    if (path === '/api/intake' || path.startsWith('/api/intake/')) {
+      if (!authed(req, res)) return true;
+      const intake = options.intake;
+      if (intake === undefined) {
+        json(res, 503, { error: 'intake_not_hosted', detail: 'native intake preview is not hosted on this service' });
+        return true;
+      }
+      try {
+        if (req.method === 'POST' && path === '/api/intake/preview') {
+          let body: Record<string, unknown>;
+          try { body = await readBody(req, false); } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw new IntakeError('intake_invalid_request', message, message.includes('exceeds 512 KiB') ? 413 : 400);
+          }
+          json(res, 200, await intake.preview(body) as unknown as Record<string, unknown>);
+          return true;
+        }
+        const read = /^\/api\/intake\/([^/]+)\/requests\/([^/]+)$/u.exec(path);
+        const diff = /^\/api\/intake\/([^/]+)\/diff$/u.exec(path);
+        if (req.method === 'GET' && (read !== null || diff !== null)) {
+          if ((req.url?.length ?? 0) > 8192) throw new IntakeError('intake_invalid_request', 'intake URL exceeds 8 KiB');
+          const params = new URL(req.url ?? '/', 'http://localhost').searchParams;
+          const keys = read !== null ? ['repoPath'] : ['repoPath', 'from', 'to'];
+          for (const key of params.keys()) {
+            if (!keys.includes(key) || params.getAll(key).length !== 1) throw new IntakeError('intake_invalid_request', 'unsupported or duplicated intake query parameter');
+          }
+          for (const key of keys) if (!params.get(key)) throw new IntakeError('intake_invalid_request', `missing intake query parameter ${key}`);
+          const result = read !== null
+            ? intake.read(params.get('repoPath')!, decodeURIComponent(read[1]!), decodeURIComponent(read[2]!))
+            : intake.diff(params.get('repoPath')!, decodeURIComponent(diff![1]!), params.get('from')!, params.get('to')!);
+          json(res, 200, result as unknown as Record<string, unknown>);
+          return true;
+        }
+        json(res, 404, { error: 'intake_not_found', detail: 'unsupported intake route' });
+      } catch (error) {
+        if (error instanceof IntakeError) {
+          if (error.status === 413) {
+            res.setHeader('connection', 'close');
+            const socket = req.socket;
+            // Flush the named response, then terminate even an unfinished
+            // chunked sender. Merely pausing/draining leaves it alive forever.
+            res.once('finish', () => socket.destroySoon());
+          }
+          json(res, error.status, { error: error.code, detail: error.message });
+        } else if (error instanceof URIError) json(res, 400, { error: 'intake_invalid_request', detail: 'malformed percent escape in intake identity' });
+        else json(res, 500, { error: 'intake_failed', detail: error instanceof Error ? error.message : String(error) });
+      }
+      return true;
+    }
     if (req.method === 'POST' && path === '/api/dispatch') {
       if (!authed(req, res)) return true;
       const body = await readBody(req);
@@ -1978,7 +2033,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // report disposition endpoint this hook adds — claim only that exact
       // shape, or /api/jobs/{id}/status and friends would 404 here.
       const isDisposition = path.startsWith('/api/jobs/') && path.endsWith('/disposition');
-      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && !isDisposition) {
+      if (!path.startsWith('/api/dispatch') && !path.startsWith('/api/silas') && !path.startsWith('/api/pipeline') && path !== '/api/intake' && !path.startsWith('/api/intake/') && !isDisposition) {
         return false;
       }
       const startedAt = Date.now();

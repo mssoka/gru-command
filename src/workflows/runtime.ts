@@ -10,6 +10,7 @@ import type { ManagedSkillSet } from '../runtime/types.js';
 import {
   parseWorkflowManifest, verifyWorkflowFiles, workflowContentHash, workflowDirName, workflowId,
   WorkflowResourceError, WORKFLOW_ENTRYPOINTS, WORKFLOW_MANIFEST, WORKFLOW_RESOURCE_DIR, WORKFLOW_SOURCE,
+  REQUIRED_INTAKE_WORKFLOW_FILE,
   type WorkflowManifest, type WorkflowRoute,
 } from './manifest.js';
 
@@ -69,7 +70,11 @@ function readWorkflowResources(root: string): BundledWorkflowRuntime {
 
 /** Shipped GC bytes only: never consult project/global BMAD or a source checkout. */
 export function loadBundledWorkflowRuntime(packageRoot = PACKAGE_ROOT): BundledWorkflowRuntime {
-  return readWorkflowResources(join(packageRoot, WORKFLOW_RESOURCE_DIR));
+  const bundle = readWorkflowResources(join(packageRoot, WORKFLOW_RESOURCE_DIR));
+  if (!bundle.files.has(REQUIRED_INTAKE_WORKFLOW_FILE)) {
+    throw new WorkflowResourceError(`current GC workflow package lacks required intake helper ${REQUIRED_INTAKE_WORKFLOW_FILE}; rebuild or reinstall GC`);
+  }
+  return bundle;
 }
 
 /** Read-only selection precedes context validation and binding. Retained A is the
@@ -121,6 +126,7 @@ export function writeWorkflowManifest(packageRoot: string, version?: number): Wo
       .map(([path, bytes]) => [path, createHash('sha256').update(bytes).digest('hex')])),
   }), root);
   verifyWorkflowFiles(manifest, files);
+  if (!files.has(REQUIRED_INTAKE_WORKFLOW_FILE)) throw new WorkflowResourceError(`missing required intake helper ${REQUIRED_INTAKE_WORKFLOW_FILE}`);
   writeFileSync(join(root, WORKFLOW_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`);
   return manifest;
 }
