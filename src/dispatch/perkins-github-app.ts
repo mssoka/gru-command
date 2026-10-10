@@ -2,7 +2,7 @@ import { createHash, createPrivateKey, createSign } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { PostedReviewReceipt, PrIdentity, VerdictPoster, VerdictPosterInput, VerdictReconcileContext } from './perkins.js';
-import { AutoVerdictPoster, GhPrPoster, verifyPostedReceipt } from './perkins.js';
+import { AutoVerdictPoster, enactedStateFor, GhPrPoster, verifyPostedReceipt } from './perkins.js';
 import { repoRemote } from './review-path.js';
 
 /**
@@ -540,15 +540,18 @@ function usableProviderReviewId(id: unknown): string | null {
 }
 
 /** The delivery predicate without the provider-id requirement: author
- * login+type, event state, frozen head, and byte-identical body. With a
+ * login+type, the ENACTED state this delivery intended, frozen head, and
+ * byte-identical body. With a
  * recency bound (the ambiguous-POST path) only submissions inside this
  * round's window — POST start minus the 60 s clock-skew margin — count;
  * null (the idempotent recovery seam) matches any identical publication.
  * Older rounds' identical bytes outside the margin are never credited as
- * this delivery. */
-function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+ * this delivery, and a review in any other state (a COMMENTED review
+ * beside an approval intent, an unexpected APPROVED beside a change-request
+ * intent) is never a match. */
+function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string, notBeforeMs: number | null): boolean {
   if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
-  if (review.state !== 'COMMENTED' || review.commit_id !== targetSha || review.body !== body) return false;
+  if (review.state !== wantedState || review.commit_id !== targetSha || review.body !== body) return false;
   if (notBeforeMs === null) return true;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
   return Number.isFinite(submittedAt) && submittedAt >= notBeforeMs;
@@ -557,8 +560,8 @@ function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, tar
 /** Provider-proved evidence that OUR App bot published exactly this review
  * during this round: every delivery predicate plus a usable provider id
  * (a receipt can only be certified with one). */
-function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
-  return usableProviderReviewId(review.id) !== null && matchesDeliveryPredicates(review, botLogin, targetSha, body, notBeforeMs);
+function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string, notBeforeMs: number | null): boolean {
+  return usableProviderReviewId(review.id) !== null && matchesDeliveryPredicates(review, botLogin, targetSha, body, wantedState, notBeforeMs);
 }
 
 /** A review matching every delivery predicate but carrying an unusable (or
@@ -566,18 +569,18 @@ function isMatchingAppReview(review: ProviderReview, botLogin: string, targetSha
  * this round's landed publication. The walk must neither credit it nor
  * silently skip it into an absence certificate — one such review keeps the
  * delivery unresolved. */
-function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
-  return usableProviderReviewId(review.id) === null && matchesDeliveryPredicates(review, botLogin, targetSha, body, notBeforeMs);
+function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string, notBeforeMs: number | null): boolean {
+  return usableProviderReviewId(review.id) === null && matchesDeliveryPredicates(review, botLogin, targetSha, body, wantedState, notBeforeMs);
 }
 
 /** A review identical on author/state/commit/body whose submission time is
  * missing or unparseable: with a recency bound it can be neither credited
  * (its window is unprovable) nor excluded as an older round's, so it also
  * forbids an absence certificate. */
-function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
+function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string, notBeforeMs: number | null): boolean {
   if (notBeforeMs === null) return false;
   if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
-  if (review.state !== 'COMMENTED' || review.commit_id !== targetSha || review.body !== body) return false;
+  if (review.state !== wantedState || review.commit_id !== targetSha || review.body !== body) return false;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
   return !Number.isFinite(submittedAt);
 }
@@ -717,6 +720,11 @@ export class PerkinsAppPrPoster implements VerdictPoster {
   }
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
+    // The wanted formal event travels WITH the delivery (owner ruling
+    // j-1615): an eligible native READY enacts APPROVE, a confirmed blocker
+    // set enacts REQUEST_CHANGES, everything else stays a COMMENT. The
+    // provider's enacted state is verified against exactly this below.
+    const wantedState = enactedStateFor(input.reviewEvent);
     const { grant, botLogin, owner, repo, prNumber, headSha, baseSha } = await this.prepare(input);
     const postStartMs = this.now();
     let review: unknown;
@@ -724,7 +732,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
         method: 'POST',
         headers: this.bearerHeaders(grant.token),
-        body: JSON.stringify({ body: input.body, event: 'COMMENT', commit_id: input.targetSha }),
+        body: JSON.stringify({ body: input.body, event: input.reviewEvent, commit_id: input.targetSha }),
         signal: AbortSignal.timeout(this.postTimeoutMs),
       }, { ambiguousOutcome: true })).body;
     } catch (error) {
@@ -743,12 +751,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         }
         throw error;
       }
-      return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
+      return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, baseSha, error, postStartMs);
     }
     try {
       return verifyPostedReceipt(
-        this.receiptFromReview(review, botLogin, input.targetSha, headSha, baseSha, input.body),
-        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+        this.receiptFromReview(review, botLogin, input.targetSha, headSha, baseSha, input.body, wantedState),
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState },
       );
     } catch (error) {
       if (error instanceof PerkinsAppError) {
@@ -756,7 +764,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // event, wrong commit, mismatched or unreadable body) leaves the
         // delivery identity ambiguous — the same bounded reconciliation
         // decides it, never a blind retry.
-        return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, baseSha, error, postStartMs);
+        return await this.reconcileAmbiguousPost(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, baseSha, error, postStartMs);
       }
       throw error;
     }
@@ -782,11 +790,12 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       );
     }
     const { grant, botLogin, owner, repo, prNumber, baseSha } = await this.prepare(input);
-    const { matched, provablyAbsent, matchedButUnreceiptable } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, null);
+    const wantedState = enactedStateFor(input.reviewEvent);
+    const { matched, provablyAbsent, matchedButUnreceiptable } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, null);
     if (matched !== null) {
       return verifyPostedReceipt(
-        this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body),
-        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body) },
+        this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body, wantedState),
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState },
       );
     }
     if (matchedButUnreceiptable) {
@@ -1057,10 +1066,10 @@ export class PerkinsAppPrPoster implements VerdictPoster {
 
   /** Parse the provider's review object into a PostedReviewReceipt,
    * proving on the way: the author is the verified App bot (a Bot), the
-   * enacted event is COMMENTED, the provider bound the review to the
-   * reviewed commit, and the echoed body is byte-identical to what this
-   * delivery published. Any failure throws — the delivery identity stays
-   * unproven. */
+   * enacted event is the state this delivery intended, the provider bound
+   * the review to the reviewed commit, and the echoed body is byte-
+   * identical to what this delivery published. Any failure throws — the
+   * delivery identity stays unproven. */
   private receiptFromReview(
     review: unknown,
     botLogin: string,
@@ -1068,6 +1077,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     headSha: string,
     baseSha: string,
     publishedBody: string,
+    wantedState: string,
   ): PostedReviewReceipt {
     const parsed = review as { id?: unknown; user?: { login?: unknown; type?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown } | null;
     const reviewId = usableProviderReviewId(parsed?.id);
@@ -1083,9 +1093,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         `review publication identity mismatch: provider review ${reviewId} is authored by ${sanitize(loginText)} (${sanitize(typeText)}), expected the verified App bot ${botLogin} — delivery identity is unproven`,
       );
     }
-    if (parsed?.state !== 'COMMENTED') {
+    if (parsed?.state !== wantedState) {
       throw new PerkinsAppError(
-        `review publication state mismatch: provider review ${reviewId} enacted ${parsed?.state === undefined || parsed?.state === null ? '(none)' : sanitize(String(parsed?.state))} instead of COMMENTED — delivery identity is unproven`,
+        `review publication state mismatch: provider review ${reviewId} enacted ${parsed?.state === undefined || parsed?.state === null ? '(none)' : sanitize(String(parsed?.state))} instead of the required ${wantedState} — delivery identity is unproven`,
       );
     }
     if (parsed?.commit_id !== targetSha) {
@@ -1102,7 +1112,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     return {
       reviewId,
       actor: botLogin,
-      event: 'COMMENTED',
+      event: wantedState,
       commitId: parsed?.commit_id ?? null,
       headSha,
       baseSha,
@@ -1212,6 +1222,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     botLogin: string,
     targetSha: string,
     body: string,
+    wantedState: string,
     baseSha: string,
     cause: unknown,
     postStartMs: number,
@@ -1226,7 +1237,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     const notBeforeMs = postStartMs - 60_000;
     let walked: { readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean };
     try {
-      walked = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, targetSha, body, notBeforeMs);
+      walked = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, targetSha, body, wantedState, notBeforeMs);
     } catch (lookupError) {
       throw unproven(
         `the bounded proof lookup itself failed (${lookupError instanceof Error ? sanitize(lookupError.message) : 'lookup error'})`,
@@ -1234,8 +1245,8 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     }
     if (walked.matched !== null) {
       return verifyPostedReceipt(
-        this.receiptFromReview(walked.matched, botLogin, targetSha, targetSha, baseSha, body),
-        { targetSha, bodySha256: receiptDigest(body) },
+        this.receiptFromReview(walked.matched, botLogin, targetSha, targetSha, baseSha, body, wantedState),
+        { targetSha, bodySha256: receiptDigest(body), event: wantedState },
       );
     }
     if (walked.matchedButUnreceiptable) {
@@ -1258,7 +1269,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
    * Skipped pages are backfilled within the same request bound.
    * `notBeforeMs` bounds credit to this round's submissions when given;
    * null matches any identical publication (the idempotent recovery
-   * seam). `provablyAbsent` is true ONLY when the walk provably covered
+   * seam). `wantedState` is the enacted state this delivery intended —
+   * only a review in that exact state can be this publication.
+   * `provablyAbsent` is true ONLY when the walk provably covered
    * the ENTIRE review list: the last-page number is tracked as the MAXIMUM
    * any response reported, so a list that grows mid-walk can never be
    * certified absent from a stale snapshot, and the short-page end signal
@@ -1276,6 +1289,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     botLogin: string,
     targetSha: string,
     body: string,
+    wantedState: string,
     notBeforeMs: number | null,
   ): Promise<{ readonly matched: ProviderReview | null; readonly provablyAbsent: boolean; readonly matchedButUnreceiptable: boolean }> {
     const visited = new Set<number>();
@@ -1328,15 +1342,15 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
       const reviews = list as readonly ProviderReview[];
-      const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
+      const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, wantedState, notBeforeMs));
       if (match !== undefined) {
         return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false };
       }
       if (
         !matchedButUnreceiptable &&
         reviews.some((review) =>
-          isMatchingAppReviewWithUnusableId(review, botLogin, targetSha, body, notBeforeMs) ||
-          isMatchingAppReviewWithUnverifiableTime(review, botLogin, targetSha, body, notBeforeMs))
+          isMatchingAppReviewWithUnusableId(review, botLogin, targetSha, body, wantedState, notBeforeMs) ||
+          isMatchingAppReviewWithUnverifiableTime(review, botLogin, targetSha, body, wantedState, notBeforeMs))
       ) {
         // A predicate-complete publication that cannot form a this-round
         // receipt (unusable id, or an unverifiable submission time) — keep
