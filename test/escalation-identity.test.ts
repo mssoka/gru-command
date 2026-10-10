@@ -216,6 +216,16 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       // Owner rule 3: an unproven supersession stop blocks the writer.
       ['`Review of job ${input.jobId} could not be confirmed stopped — its writer is blocked`', '{ jobId: input.jobId, ...(roundIds.size === 1 ? { roundId: [...roundIds][0]! } : {}) }'],
       ['`Review round ${round.id} carries a posted verdict without a provider-bound receipt`', '{ jobId: round.jobId, roundId: round.id }'],
+      // Native correction cycle (PR #289 blockers 2/3): durable publication
+      // attempt reconciliation after restart, each bound to its round.
+      ['`Perkins publication attempt for round ${round.id} is malformed`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication for round ${round.id} was proven at the provider but never credited`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} could not be reconciled after restart`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} did not land`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication for round ${round.id} was found at the provider after restart and is retained UNCREDITED`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} stays unresolved after restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${String(lane.roundId)} could not be processed during startup recovery`', '{ ...(lane.jobId !== null ? { jobId: lane.jobId } : {}), ...(lane.roundId !== null ? { roundId: lane.roundId } : {}), }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
