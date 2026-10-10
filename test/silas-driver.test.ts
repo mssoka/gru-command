@@ -2921,6 +2921,10 @@ describe('silas skills and wake prompt', () => {
     // Issue #125: the assembled prompt never instructs the phantom action
     // (whitespace-normalized, so a line-broken spelling cannot slip past).
     const flatPrompt = prompt.replace(/\s+/gu, ' ');
+    // Regression hardening (native r2 warning): the original unqualified
+    // owner-every/ALL-merges bans must not return in any case variant.
+    expect(flatPrompt.toLowerCase()).not.toContain('owner holds every merge');
+    expect(flatPrompt.toLowerCase()).not.toContain('owner holds all merges');
     expect(flatPrompt).not.toContain('a lens retry');
     expect(flatPrompt).toContain('In-round lens retries are Perkins-owned machinery');
     expect(prompt).not.toContain('human holds the merge);');

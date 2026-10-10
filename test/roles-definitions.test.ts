@@ -89,6 +89,11 @@ describe('role definitions (E8)', () => {
     expect(minion).toContain('never moves a branch under an active review freeze');
     expect(minion).toContain('the owner performs every final PR merge');
     expect(minion).not.toContain('merging belongs to the review verdict');
+    // Regression hardening (native r2 warning): the original unqualified
+    // owner-every/ALL-merges bans must not return in any case variant.
+    const minionLower = minion.toLowerCase();
+    expect(minionLower).not.toContain('owner holds every merge');
+    expect(minionLower).not.toContain('owner holds all merges');
   });
 
   it('maps cwd policy per ruling 17: chat/ops/memory at workspace root, workers rooted in projects', () => {
@@ -149,6 +154,8 @@ describe('merge authority boundary (owner ruling 2026-10-10)', () => {
     expect(gru).toContain('exact-final-head native Perkins READY');
     // The blanket wording that read as covering both operations is gone.
     expect(gru).not.toContain('The owner holds every merge, everywhere');
+    expect(gru.toLowerCase()).not.toContain('owner holds every merge');
+    expect(gru.toLowerCase()).not.toContain('owner holds all merges');
   });
 
   it('Silas: integration is coordinated mechanical work; final PR merges stay owner-only in every repository', () => {
@@ -160,6 +167,7 @@ describe('merge authority boundary (owner ruling 2026-10-10)', () => {
     expect(silas).toContain('never moves a head under an active review freeze');
     expect(silas).not.toContain('owner holds ALL merges');
     expect(silas).not.toContain('Gru no longer merges anything');
+    expect(silas.toLowerCase()).not.toContain('owner holds every merge');
   });
 
   it('the minion: same-branch integration needs no owner checkpoint; the final PR merge is not theirs', () => {
@@ -169,6 +177,8 @@ describe('merge authority boundary (owner ruling 2026-10-10)', () => {
     expect(minion).toContain('needs no separate owner permission');
     expect(minion).toContain('the owner performs every final PR merge');
     expect(minion).not.toContain('merging belongs to the review verdict');
+    expect(minion.toLowerCase()).not.toContain('owner holds every merge');
+    expect(minion.toLowerCase()).not.toContain('owner holds all merges');
   });
 
   it('the shipped ops skill drops the chief-merge exception and the rebase-default conflict path', () => {
@@ -180,6 +190,9 @@ describe('merge authority boundary (owner ruling 2026-10-10)', () => {
     expect(ops).toContain('`pr-conflict-rebase`');
     expect(ops).not.toContain('The chief holds merge authority');
     expect(ops).not.toContain('"directive":"rebase');
+    expect(ops.toLowerCase()).not.toContain('owner holds every merge');
+    expect(ops.toLowerCase()).not.toContain('owner holds all merges');
+    expect(ops.toLowerCase()).not.toContain('gru no longer merges anything');
   });
 });
 

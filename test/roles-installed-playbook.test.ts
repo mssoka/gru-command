@@ -43,6 +43,13 @@ interface StagedPrompt {
   /** The assembled Silas operating brief (brief + skills) from the staged
    *  install — the composition a real session receives. */
   readonly silasBrief: string;
+  /** The packaged bound-workflow note for each runtime adapter. */
+  readonly managedNotePi: string;
+  readonly managedNoteClaude: string;
+  /** The worker role + note exactly as both adapters compose the shipped
+   *  session system prompt (`${role}\n\n${note}`). */
+  readonly workerWithPiNote: string;
+  readonly workerWithClaudeNote: string;
   readonly loadError?: undefined;
 }
 interface StagedFailure {
@@ -144,14 +151,35 @@ function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
       'try {',
       '  const { ROLE_DEFINITIONS } = await import("./dist/roles.js");',
       '  const { loadSilasSkills, silasBriefSections } = await import("./dist/dispatch/silas-driver.js");',
+      '  const { managedSkillsPromptNote } = await import("./dist/runtime/managed-skills.js");',
       '  const skills = loadSilasSkills();',
       '  const opsSkill = skills.find((skill) => skill.name === "ops-dispatch");',
+      '  const managed = {',
+      '    source: "gru-command-workflows",',
+      '    runtimeId: "gc-build-probe",',
+      '    contentSha256: "0".repeat(64),',
+      '    root: "/staged/gc-runtime",',
+      '    skillsDir: "/staged/gc-runtime/skills",',
+      '    skills: ["gc-build"],',
+      '    laneBound: true,',
+      '    workflow: {',
+      '      context: { projectId: "probe-project", projectRoot: "/staged/project", worktreeRoot: "/staged/worktree", jobId: "probe-job", artifactRoot: "/staged/artifacts", knowledgeRoot: "/staged/knowledge" },',
+      '      invocation: { runtimeId: "gc-build-probe", contentSha256: "0".repeat(64), entrypoint: "/staged/worktree/implement.md", snapshotDir: "/staged/snapshot", contextFile: "/staged/worktree/context.json" },',
+      '      contextFile: "/staged/worktree/context.json",',
+      '    },',
+      '  };',
+      '  const notePi = managedSkillsPromptNote(managed, "pi");',
+      '  const noteClaude = managedSkillsPromptNote(managed, "claude-code");',
       '  process.stdout.write(JSON.stringify({',
       '    minion: ROLE_DEFINITIONS.minion.systemPrompt,',
       '    silas: ROLE_DEFINITIONS.silas.systemPrompt,',
       '    gru: ROLE_DEFINITIONS.gru.systemPrompt,',
       '    opsSkill: opsSkill === undefined ? null : opsSkill.body,',
       '    silasBrief: silasBriefSections({ skills, ops: { baseUrl: "http://127.0.0.1:1", configPath: "/tmp/merge-authority-probe-config" } }).join("\\n"),',
+      '    managedNotePi: notePi,',
+      '    managedNoteClaude: noteClaude,',
+      '    workerWithPiNote: ROLE_DEFINITIONS.minion.systemPrompt + "\\n\\n" + notePi,',
+      '    workerWithClaudeNote: ROLE_DEFINITIONS.minion.systemPrompt + "\\n\\n" + noteClaude,',
       '  }));',
       '} catch (error) {',
       '  process.stdout.write(JSON.stringify({ loadError: String(error && error.message ? error.message : error) }));',
@@ -172,7 +200,9 @@ function runProbe(installedRoot: string): StagedPrompt | StagedFailure {
   const parsed = JSON.parse(stdout) as StagedPrompt | StagedFailure;
   if (parsed.loadError !== undefined) return parsed;
   if (typeof parsed.minion !== 'string' || typeof parsed.silas !== 'string' || typeof parsed.gru !== 'string' ||
-    typeof parsed.silasBrief !== 'string' || (parsed.opsSkill !== null && typeof parsed.opsSkill !== 'string')) {
+    typeof parsed.silasBrief !== 'string' || (parsed.opsSkill !== null && typeof parsed.opsSkill !== 'string') ||
+    typeof parsed.managedNotePi !== 'string' || typeof parsed.managedNoteClaude !== 'string' ||
+    typeof parsed.workerWithPiNote !== 'string' || typeof parsed.workerWithClaudeNote !== 'string') {
     throw new Error(`unexpected probe output: ${stdout.slice(0, 200)}`);
   }
   return parsed;
@@ -264,6 +294,11 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(flat).toContain('merge main into your task branch');
     expect(flat).toContain('the owner performs every final PR merge');
     expect(flat).toContain('never moves a branch under an active review freeze');
+    // Regression hardening (native r2 warning): the original unqualified
+    // owner-every/ALL-merges bans must not return in any case variant.
+    const minionLower = flat.toLowerCase();
+    expect(minionLower).not.toContain('owner holds every merge');
+    expect(minionLower).not.toContain('owner holds all merges');
     expect(flat).toContain('read-only brief that names the exact immutable head');
     expect(flat).toContain('never echo or copy');
     // Owner clarification j-761: never a fixed skill-name dependency —
@@ -285,6 +320,10 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     // Merge boundary on the installed ops prompt.
     expect(flat).toContain('The owner performs every final PR merge, in every repository');
     expect(flat).toContain('integrates main into the existing task branch');
+    const silasLower = flat.toLowerCase();
+    expect(silasLower).not.toContain('owner holds every merge');
+    expect(silasLower).not.toContain('owner holds all merges');
+    expect(silasLower).not.toContain('gru no longer merges anything');
     expect(flat).not.toContain('bmad-build');
     // Fixed build-skill names must not return on the ops surface either,
     // while the legitimate review tokens stay allowed.
@@ -301,10 +340,37 @@ describe('installed-layout playbook loading (shipped artifact, clean install)', 
     expect(ops).toContain('`pr-conflict-rebase`');
     expect(ops).not.toContain('The chief holds merge authority');
     expect(ops).not.toContain('"directive":"rebase');
+    expect(ops.toLowerCase()).not.toContain('owner holds every merge');
+    expect(ops.toLowerCase()).not.toContain('owner holds all merges');
     const brief = staged.silasBrief.replace(/\s+/gu, ' ');
     expect(brief).toContain('every final PR merge');
     expect(brief).toContain('integrating main into its own task branch');
     expect(brief).toContain('fallback PASS, an old-head verdict and a clean textual merge are not');
+    expect(brief.toLowerCase()).not.toContain('owner holds every merge');
+    expect(brief.toLowerCase()).not.toContain('owner holds all merges');
+  });
+
+  it('the installed bound-workflow note composes with the worker role for both adapters as final-PR-only', () => {
+    const norm = (text: string): string => text.replace(/\s+/gu, ' ').toLowerCase();
+    for (const [adapter, composed, note] of [
+      ['pi', staged.workerWithPiNote, staged.managedNotePi],
+      ['claude-code', staged.workerWithClaudeNote, staged.managedNoteClaude],
+    ] as const) {
+      // Both adapters append the note after the role: `${role}\n\n${note}`.
+      expect(composed, adapter).toBe(`${staged.minion}\n\n${note}`);
+      // Permitted: ordinary same-task-branch integration survives the suffix
+      // (native r2 blocker: the suffix must not read as a blanket ban).
+      expect(norm(composed), adapter).toContain('merge main into your task branch');
+      // Forbidden: owner-held merges are qualified to final PR merges only;
+      // the original blanket ban must not return in any case variant.
+      expect(norm(note), adapter).toContain('final pr merges remain owner-held');
+      expect(norm(note), adapter).toContain('merging main into this task branch is the worker');
+      expect(norm(note), adapter).not.toMatch(/ready; merges remain owner-held/u);
+      expect(norm(note), adapter).not.toContain('owner holds every merge');
+      expect(norm(note), adapter).not.toContain('owner holds all merges');
+      // Final-CI/native clearance protection retained.
+      expect(norm(note), adapter).toContain('not native exact-final-head perkins ready');
+    }
   });
 
   it('a renamed/replacement project catalog still satisfies the worker contract (no fixed skill name)', () => {
