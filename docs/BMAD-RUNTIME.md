@@ -1,4 +1,11 @@
-# GC-managed BMAD runtime
+# GC-managed BMAD runtime (historical/transitional)
+
+For the new directly editable GC-owned resource package, explicit invocation
+context and local integrity maintenance, see [GC-WORKFLOWS.md](GC-WORKFLOWS.md).
+This document describes the retained #283 package and current session/setup
+consumers until the separate #294/#295 cutover. It is not the maintenance
+procedure for new GC workflows, and shipping those resources does not migrate
+or remove anything described here.
 
 Gru Command (GC) ships the BMAD framework its build workflow uses. A managed
 repository does not need its own BMAD installation for GC builds: it keeps

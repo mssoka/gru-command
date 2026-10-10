@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "name": "gru-command-workflows",
+  "version": 1,
+  "id": "gru-command-workflows@1",
+  "skills": [
+    "gc-build"
+  ],
+  "entrypoints": {
+    "normal": "skills/gc-build/workflow.md",
+    "small-change": "skills/gc-build/small-change.md",
+    "plan": "skills/gc-build/plan.md",
+    "review": "skills/gc-build/review.md"
+  },
+  "files": {
+    ".claude-plugin/plugin.json": "881e63d6a2a29e6157d56e53cb2660dead3db2860d9726bf93e9884758f8c16a",
+    "LICENSE": "0aa79baf6328b4a1e694ce10a12ffc36d7666554da128dff0e8fcda0fc536a66",
+    "NOTICE.md": "ea61beae7da7956c27a9fa3ad3141994acb294cc61cd7a2a298b92cb7a0ca889",
+    "scripts/context.mjs": "f35b092013dd05a802f7404e0aa06590cec50c61258e3854a20ae5bd7dd80bc7",
+    "scripts/render.mjs": "48a14257320d7ce6034dbf543fe37b2243efd70c940828223612fdd49d446121",
+    "skills/gc-build/SKILL.md": "8464d4b68100cb5b7f362a3c9766e1b29f3643ada1a0444a1d1decbdc62ab302",
+    "skills/gc-build/implement.md": "ec4269dc3206c266c33a0fb2bb43a109776344cdb1a2d5c50db67073678924ba",
+    "skills/gc-build/plan.md": "847918811297199dcd33218eb228823db6e46388eb2baf355c312fc4632f3352",
+    "skills/gc-build/present.md": "82f55b5a5fa247c66a7621c0cc1cec2021ca8075c6d2589b7b7c512c71819bee",
+    "skills/gc-build/references/claims-check.md": "6c355ef9488de25407cd96d4006cf59044a4a475ebecaf4aca370d67d92dc5e2",
+    "skills/gc-build/references/deletion-check.md": "46430638c907171821a3ce748c14163d74656dd905eeff5c14a45d9015c32680",
+    "skills/gc-build/review-prompts/adversarial.md": "f9aa42ed8f6f5378137c312c674e72b734dc6f53026e46b77419ae4dcbdc5d81",
+    "skills/gc-build/review-prompts/edge-cases.md": "8f6e16149e36e174e3653c621c3f3a832c76148b88558e069b2ebca6766fb693",
+    "skills/gc-build/review-prompts/verification.md": "3f12ff433305f41041f25cc7a40d86ce79fd53c5c1424af4fe67eed710193199",
+    "skills/gc-build/review.md": "377cf97f56bcf9ab98f93c02a0fad0e0d2b3ec6ded1c58b4b851dcf9991c98d6",
+    "skills/gc-build/small-change.md": "f683e9e99f68822d4cb4c564ccbf61127fdb84f3675e08faf79c27698d02fe32",
+    "skills/gc-build/spec-template.md": "53b2ec9be490bd82577fce2f229e4c915ba64ac72498d76f4c0ebe0e35db6a92",
+    "skills/gc-build/workflow.md": "645c401dcc30fbab7daa39500a20e414d044fcfac88e7ceefb13e7d16650aec7"
+  }
+}
