@@ -444,3 +444,7 @@ Three fresh tracked reviewers inspected the immutable range `79c032e5a5a1ba7607b
 | VG-01 — browser fail-before can classify a render/setup failure as feature-absence RED | high | The harness proved only the board shell and the classifier matched titles as well as failure messages. Added an independent rendered-section check, page-error detection, message-only classification, and classifier tests that exclude unrelated companion-suite assertions from the unit-baseline claim. |
 
 This log records the findings, evidence, and patch routes. Exact-head scheduler receipts and final CI/native-review state are recorded separately; no result is inferred from the review reports themselves.
+
+### Round 11 proposal-browser test correction at `ccef66c5`
+
+The exact-head `lesson-proposal-browser` run `c0de034a-8376-42b8-a11c-e3aa7b60b65e` failed 4/4: the three phone hit-target checks sampled the intentionally open Gru chat sheet over the board row, and the desktop pointer test compared `getComputedStyle().marginLeft` to the authored `auto` token even though Chromium returns the used pixel value. The complete failure capture is retained at `/Users/moses/.gru-command/captures/dashboard-slim-strip-current-main-20261007/r11-lesson-proposal-browser-failed-ccef66c5-20261011T203232Z/`. The test now closes the chat sheet before measuring the proposal row and checks the pointer button's resulting right-edge alignment; no product source changed. A fresh scheduler run at the resulting committed head is required before claiming this scope green.

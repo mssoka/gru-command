@@ -148,7 +148,7 @@ interface Box {
 }
 
 for (const width of [360, 375, 390]) {
-  test(`the open proposal review stays one column and reachable at ${width}px`, async ({ page }) => {
+  test(`the open proposal review stays one column and reachable with chat closed at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 });
     const { pageErrors, decisions } = await seed(page);
     await page.goto('/');
@@ -156,6 +156,14 @@ for (const width of [360, 375, 390]) {
     await page.locator('#pair-token').fill(MOCK_TOKEN);
     await page.locator('#pair-submit').click();
     await expect(page.locator('#board-view')).toBeVisible();
+
+    const chatSheet = page.locator('#chat-sheet');
+    if (await chatSheet.getAttribute('data-open') === 'true') {
+      // The mock board opens Gru chat as a mobile sheet. Close that intentional
+      // overlay so this check measures the proposal row, not the chat drawer.
+      await page.locator('#chat-sheet .chat-panel__collapse').click();
+      await expect(chatSheet).not.toHaveAttribute('data-open', 'true');
+    }
 
     const row = page.locator('#board-owner .board-owner__row--proposal');
     await expect(row).toBeVisible();
@@ -243,23 +251,28 @@ test('desktop bell pointer keeps panel flow and the long proposal detail wraps',
       const rect = node.querySelector(selector)!.getBoundingClientRect();
       return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width };
     };
-    const go = node.querySelector<HTMLElement>('.board-owner__goto')!;
+    const rowStyle = getComputedStyle(node);
+    const rowRect = node.getBoundingClientRect();
+    const contentRight =
+      rowRect.right - Number.parseFloat(rowStyle.borderRightWidth) - Number.parseFloat(rowStyle.paddingRight);
     const title = box('.board-owner__title');
     const meta = box('.board-owner__meta');
     return {
-      display: getComputedStyle(node).display,
-      flexWrap: getComputedStyle(node).flexWrap,
+      display: rowStyle.display,
+      flexWrap: rowStyle.flexWrap,
       title,
       meta,
       go: box('.board-owner__goto'),
-      goMarginLeft: getComputedStyle(go).marginLeft,
+      contentRight,
     };
   });
   expect(layout.display).toBe('flex');
   expect(layout.flexWrap).toBe('wrap');
   expect(layout.meta.top).toBeGreaterThanOrEqual(layout.title.bottom - 1);
   expect(layout.go.top).toBeGreaterThanOrEqual(layout.meta.bottom - 1);
-  expect(layout.goMarginLeft).toBe('auto');
+  // `margin-left:auto` computes to its used pixel value; assert the resulting
+  // alignment rather than the authored CSS token.
+  expect(Math.abs(layout.go.right - layout.contentRight)).toBeLessThanOrEqual(1);
   expect(decisions).toEqual([]);
   expect(pageErrors).toEqual([]);
 });
