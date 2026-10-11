@@ -2740,12 +2740,12 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.textContent).toContain('Close the shell first.\nThen restart.');
     expect(band.textContent).toContain('updated · recurred 2 → 3 · drain');
     expect(band.textContent).toContain('4 oldest journal handle(s) released to fit');
-    band.querySelector<HTMLButtonElement>('[data-action-id="owner-proposal:lp-1"]')!.click();
+    band.querySelector<HTMLButtonElement>('[data-action-id="owner-proposal:lp-1"][data-control="accept"]')!.click();
     await flush();
     expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
-    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    expect(document.getElementById('board-owner')!.querySelector('[data-proposal-id="lp-1"]')).not.toBeNull();
     view.render(snapshot({ notifications: [{ ...proposalNotice, resolvedAt: '2026-01-01T00:09:00.000Z' }] }));
-    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).toBeNull();
+    expect(document.getElementById('board-owner')!.querySelector('[data-proposal-id="lp-1"]')).toBeNull();
     expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
   });
 
@@ -2795,7 +2795,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     await flush();
     band = document.getElementById('board-owner')!;
     expect(band.querySelector('[role="alert"]')?.textContent).toContain('Couldn’t confirm the decision (fetch failed)');
-    expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    expect(band.querySelector('.board-owner__row--proposal')).not.toBeNull();
   });
 
   it('the review names summary and tag changes, every removed lesson with its text, and retired chapters plainly', async () => {
@@ -3004,7 +3004,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     );
     expect([band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled, band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled])
       .toEqual([false, true]);
-    expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull();
+    expect(band.querySelector('.board-owner__row--proposal')).not.toBeNull();
     // A second view (fresh state) whose Reject is recorded but blocked.
     const second = new BoardView(() => {}, client);
     second.render(snapshot({ notifications: [proposalNotice] }));
@@ -3158,7 +3158,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     await flush();
     expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
     expect(client.wake).toHaveBeenCalledTimes(1);
-    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-proposal:lp-1"]')).not.toBeNull(); // the snapshot closes it
+    expect(document.getElementById('board-owner')!.querySelector('.board-owner__row--proposal')).not.toBeNull(); // the snapshot closes it
   });
 
   it('a review that loads on retry clears the earlier failure', async () => {
@@ -3269,7 +3269,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       const band = document.getElementById('board-owner')!;
       expect(band.textContent, choice).toContain(`Your ${label} is recorded, but finishing it could not be confirmed (the server failed (500: disk I/O error))`);
       expect(band.textContent, choice).not.toContain('Not applied');
-      expect(band.querySelector('[data-action-id="owner-proposal:lp-1"]'), choice).not.toBeNull(); // the snapshot closes it
+      expect(band.querySelector('.board-owner__row--proposal'), choice).not.toBeNull(); // the snapshot closes it
       expect(button().disabled, choice).toBe(false); // the same decision may be pressed again
       expect(opposite().disabled, choice).toBe(true); // a recorded decision never flips
       expect(calls, choice).toBe(2);
