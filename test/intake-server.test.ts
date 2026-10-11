@@ -11,13 +11,16 @@ import { createDispatchServer, type DispatchServer } from '../src/dispatch/serve
 import { PipelineService } from '../src/dispatch/pipeline.js';
 import { EventBus } from '../src/events/bus.js';
 import { IntakeService } from '../src/intake/service.js';
+import { IntakeApprovalService } from '../src/intake/approval.js';
+import { resolvedIntakePlan } from './helpers/intake-plan.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 
 const TOKEN = 'intake-test-token';
-const cleanup: { root: string; server: Server; hook: DispatchServer; db: LedgerDb }[] = [];
+const cleanup: { root: string; server: Server; hook: DispatchServer; db: LedgerDb; pipeline: PipelineService }[] = [];
 afterEach(async () => {
   for (const h of cleanup.splice(0)) {
+    h.pipeline.dispose();
     h.hook.dispose();
     await new Promise<void>((resolve) => h.server.close(() => resolve()));
     h.db.close();
@@ -39,17 +42,17 @@ async function boot(hosted = true) {
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
   const dispatch = vi.fn(async () => ({ settled: Promise.resolve() }));
-  const pipeline = new PipelineService({ ledger, dispatch: { dispatch }, bus, capacity: () => ({ capacity: 4, occupied: 0, queued: 0, available: 4 }) });
+  const pipeline = new PipelineService({ ledger, dispatch: { dispatch }, bus, capacity: () => ({ capacity: 4, occupied: 4, queued: 0, available: 0 }) });
   const intake = new IntakeService({
     dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'),
     remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
     ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 296, html_url: 'https://github.com/owner/demo/issues/296', title: 'Issue', body: 'APPROVED: schedule work', updated_at: '2026-10-10T12:00:00Z' }) }),
   });
-  const hook = createDispatchServer({ config, ledger, dispatch: { dispatch } as never, wave: {} as never, pipeline, pendingProducerBlockers: () => [], ...(hosted ? { intake } : {}) });
+  const hook = createDispatchServer({ config, ledger, dispatch: { dispatch } as never, wave: {} as never, pipeline, pendingProducerBlockers: () => [], ...(hosted ? { intake, intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }) } : {}) });
   const server = createServer((req, res) => {
     if (!hook.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) { res.statusCode = 404; res.end(); }
   });
-  cleanup.push({ root, server, hook, db });
+  cleanup.push({ root, server, hook, db, pipeline });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const request = { repoPath: repo, intakeId: 'intake-296', requestId: 'r1', source: { kind: 'spec', document: { path: 'spec.md' } } };
@@ -122,7 +125,7 @@ describe('native intake HTTP boundary — zero executable admission', () => {
     const gap = await h.api('POST', '/api/intake/preview', { ...h.request, requestId: 'missing', source: { kind: 'spec', document: { path: 'missing.md' } } });
     expect(gap.status).toBe(200);
     expect(gap.body.gaps).toEqual([expect.objectContaining({ code: 'intake_source_unavailable' })]);
-    expect((await h.api('POST', '/api/intake/approve', { approved: true })).status).toBe(404);
+    expect((await h.api('POST', '/api/intake/approve', { approved: true })).status).toBe(400);
     expect((await h.api('GET', '/api/intakewhatever')).status).toBe(404);
     expect(h.ledger.listPipelineEntries()).toEqual([]);
     expect(h.ledger.listJobs()).toEqual([]);
@@ -296,4 +299,103 @@ describe('intake HTTP observational read and malformed nesting boundaries', () =
     expect(h.ledger.listEvents()).toEqual([]);
     expect(h.dispatch).not.toHaveBeenCalled();
   });
+});
+
+describe('authenticated intake review and approval HTTP', () => {
+  it('refuses mismatched refinement revision bytes without creating a replacement proposal', async () => {
+    const h = await boot();
+    const first = (await h.api('POST', '/api/intake/preview', h.request)).body as unknown as Proposal;
+    const decision = { repoPath: h.repo, intakeId: first.intakeId, requestId: first.requestId, revisionId: first.revisionId, expectedToken: null };
+    const reviewed = await h.api('POST', '/api/intake/review', decision);
+    const beforeEvents = h.ledger.listEvents();
+    expect(await h.api('POST', '/api/intake/revision', { ...decision, expectedToken: undefined, requestId: 'stale-refinement', previousRequestId: first.requestId, revisionId: '0'.repeat(64), plan: resolvedIntakePlan(first) })).toMatchObject({ status: 409, body: { error: 'intake_stale_revision' } });
+    expect((await h.api('GET', `/api/intake/${first.intakeId}/requests/${first.requestId}?${query(h.repo)}`)).body).toEqual(first);
+    expect(await h.api('GET', `/api/intake/${first.intakeId}/requests/stale-refinement?${query(h.repo)}`)).toMatchObject({ status: 404, body: { error: 'intake_not_found' } });
+    expect((await h.api('GET', `/api/intake/${first.intakeId}/review?${query(h.repo)}`)).body).toEqual(reviewed.body);
+    expect(h.ledger.listEvents()).toEqual(beforeEvents);
+    expect(h.ledger.listPipelineEntries()).toEqual([]);
+    expect(h.ledger.listJobs()).toEqual([]);
+    expect(h.dispatch).not.toHaveBeenCalled();
+  });
+  it('guards every decision, persists a concrete revision, rejects stale/concurrent decisions and reads accepted identities', async () => {
+    const h = await boot();
+    for (const route of ['revision', 'review', 'reject', 'approve']) expect((await h.api('POST', `/api/intake/${route}`, {}, null)).status).toBe(401);
+    const first = (await h.api('POST', '/api/intake/preview', h.request)).body as unknown as Proposal;
+    const revised = await h.api('POST', '/api/intake/revision', { repoPath: h.repo, intakeId: first.intakeId, requestId: 'resolved', previousRequestId: 'r1', revisionId: first.revisionId, plan: resolvedIntakePlan(first) });
+    expect(revised.status).toBe(200);
+    expect(h.ledger.listJobs()).toEqual([]);
+    const p = revised.body as unknown as Proposal;
+    const decision = { repoPath: h.repo, intakeId: p.intakeId, requestId: p.requestId, revisionId: p.revisionId, expectedToken: null };
+    const reviewed = await h.api('POST', '/api/intake/review', decision);
+    const review = reviewed.body.review as { token: string };
+    const approve = { ...decision, expectedToken: review.token, selected: ['heist-1'] };
+    const [accepted, rejection] = await Promise.all([h.api('POST', '/api/intake/approve', approve), h.api('POST', '/api/intake/reject', { ...decision, expectedToken: review.token })]);
+    expect([accepted.status, rejection.status].sort()).toEqual([200, 409]);
+    expect(h.ledger.listPipelineEntries()).toHaveLength(accepted.status === 200 ? 1 : 0);
+    if (accepted.status === 200) {
+      expect((await h.api('POST', '/api/intake/approve', approve)).body).toEqual(accepted.body);
+      expect((await h.api('GET', `/api/intake/${p.intakeId}/review?${query(h.repo)}`)).body).toEqual(accepted.body);
+    }
+  });
+  it('returns partial-failure accepted/remaining readback and converges after explicit identical retry', async () => {
+    const h = await boot();
+    const first = (await h.api('POST', '/api/intake/preview', h.request)).body as unknown as Proposal;
+    const p = (await h.api('POST', '/api/intake/revision', { repoPath: h.repo, intakeId: first.intakeId, requestId: 'complete', previousRequestId: 'r1', revisionId: first.revisionId, plan: resolvedIntakePlan(first) })).body as unknown as Proposal;
+    const d = { repoPath: h.repo, intakeId: p.intakeId, requestId: p.requestId, revisionId: p.revisionId, expectedToken: null };
+    const review = (await h.api('POST', '/api/intake/review', d)).body.review as { token: string };
+    const input = { ...d, expectedToken: review.token, selected: ['heist-1'] };
+    const enqueue = vi.spyOn(h.pipeline, 'enqueue').mockImplementationOnce(() => { throw new Error('interrupted'); });
+    const failure = await h.api('POST', '/api/intake/approve', input);
+    expect(failure).toMatchObject({ status: 503, body: { error: 'intake_partial_failure', readback: { accepted: [], remaining: [expect.objectContaining({ heistId: 'heist-1' })] } } });
+    enqueue.mockRestore();
+    expect((await h.api('POST', '/api/intake/approve', input)).body).toMatchObject({ remaining: [] });
+    expect(h.ledger.listPipelineEntries()).toHaveLength(1);
+  });
+});
+
+it('forwards historical decision tokens after a newer review and retries the original partial acceptance', async () => {
+  const h = await boot();
+  const first = (await h.api('POST', '/api/intake/preview', h.request)).body as unknown as Proposal;
+  const plan = resolvedIntakePlan(first), base = plan.heists[0]!;
+  const a = (await h.api('POST', '/api/intake/revision', { repoPath: h.repo, intakeId: first.intakeId, requestId: 'a', previousRequestId: first.requestId, revisionId: first.revisionId, plan: { ...plan, heists: [{ ...base, id: 'a' }, { ...base, id: 'b' }] } })).body as unknown as Proposal;
+  const d = { repoPath: h.repo, intakeId: a.intakeId, requestId: a.requestId, revisionId: a.revisionId, expectedToken: null };
+  const reviewed = (await h.api('POST', '/api/intake/review', d)).body.review as { token: string };
+  const request = { ...d, expectedToken: reviewed.token, selected: ['a', 'b'] };
+  const enqueue = h.pipeline.enqueue.bind(h.pipeline);
+  const spy = vi.spyOn(h.pipeline, 'enqueue').mockImplementationOnce(enqueue).mockImplementationOnce(() => { throw new Error('interrupted second enqueue'); });
+  const failure = await h.api('POST', '/api/intake/approve', request);
+  expect(failure.status).toBe(503);
+  const partial = failure.body.readback as { review: { token: string }; accepted: unknown[]; remaining: unknown[] };
+  expect(partial.accepted).toHaveLength(1); expect(partial.remaining).toHaveLength(1);
+  spy.mockRestore();
+  const b = (await h.api('POST', '/api/intake/revision', { repoPath: h.repo, intakeId: a.intakeId, requestId: 'newer', previousRequestId: a.requestId, revisionId: a.revisionId, plan: a.plan })).body as unknown as Proposal;
+  const reviewedB = await h.api('POST', '/api/intake/review', { ...d, requestId: b.requestId, revisionId: b.revisionId, expectedToken: partial.review.token });
+  expect(reviewedB.status).toBe(200);
+  const path = `/api/intake/${a.intakeId}/review?${query(h.repo)}`;
+  expect((await h.api('GET', `${path}&token=${partial.review.token}`)).body).toEqual(partial);
+  expect((await h.api('GET', path)).body).toEqual(reviewedB.body);
+  const retry = await h.api('POST', '/api/intake/approve', request);
+  expect(retry.status).toBe(200);
+  expect(retry.body).toMatchObject({ review: partial.review, remaining: [] });
+  expect(h.ledger.listPipelineEntries()).toHaveLength(2);
+  expect((await h.api('GET', path)).body).toEqual(reviewedB.body);
+});
+
+it('refuses concrete unreviewed B with reviewed A current token and leaves zero entries and A head', async () => {
+  const h = await boot();
+  const first = (await h.api('POST', '/api/intake/preview', h.request)).body as unknown as Proposal;
+  const a = (await h.api('POST', '/api/intake/revision', { repoPath: h.repo, intakeId: first.intakeId, requestId: 'reviewed-a', previousRequestId: first.requestId, revisionId: first.revisionId, plan: resolvedIntakePlan(first) })).body as unknown as Proposal;
+  const decision = { repoPath: h.repo, intakeId: a.intakeId, requestId: a.requestId, revisionId: a.revisionId, expectedToken: null };
+  const reviewed = await h.api('POST', '/api/intake/review', decision);
+  const b = (await h.api('POST', '/api/intake/revision', { repoPath: h.repo, intakeId: a.intakeId, requestId: 'unreviewed-b', previousRequestId: a.requestId, revisionId: a.revisionId, plan: a.plan })).body as unknown as Proposal;
+  expect(await h.api('POST', '/api/intake/approve', { ...decision, requestId: b.requestId, revisionId: b.revisionId, expectedToken: (reviewed.body.review as { token: string }).token, selected: ['heist-1'] })).toMatchObject({ status: 409, body: { error: 'intake_stale_review' } });
+  expect((await h.api('GET', `/api/intake/${a.intakeId}/review?${query(h.repo)}`)).body).toEqual(reviewed.body);
+  expect(h.ledger.listPipelineEntries()).toEqual([]); expect(h.dispatch).not.toHaveBeenCalled();
+});
+
+it('declares existing scoped paired-shell intake acceptance in CI', () => {
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  expect(ci).toContain('run: npm run build:web');
+  expect(ci).toContain('run: npx playwright install --with-deps chromium');
+  expect(ci).toMatch(/working-directory: web\s+run: npx playwright test --project=intake/u);
 });
