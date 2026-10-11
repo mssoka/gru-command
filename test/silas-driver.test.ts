@@ -1424,12 +1424,14 @@ describe('silas digest (the four actionable states)', () => {
           ? `[{ id: 9400, user: { login: 'account-a' }, state: 'COMMENTED', commit_id: ${JSON.stringify(sha)}, body: ${JSON.stringify(body)} }]`
           : '[]';
         writeFileSync(binary, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(list)});\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  ${mode === 'rotated' ? `if (!existsSync(${JSON.stringify(userState)})) { writeFileSync(${JSON.stringify(userState)}, 'b'); process.stdout.write('account-b'); } else { process.stdout.write('account-a'); }` : "process.stdout.write('account-a');"}\n} else {\n  process.stdout.write(${JSON.stringify(`${sha}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
+        const escalations: string[] = [];
         const wave = new WaveRunner({
           ledger: h.ledger, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
           reviewArtifactRoot: artifacts, spawner: vi.fn() as unknown as AgentSpawner,
           poster: new GhPrPoster(binary),
+          escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
         });
-        return { round, wave };
+        return { round, wave, escalations };
       };
 
       const rotated = seed('clean-r3-rotated', 'sha-r3-rotated', 'rotated');
@@ -1437,10 +1439,12 @@ describe('silas digest (the four actionable states)', () => {
       expect(h.ledger.getRound(rotated.round.id)?.status).toBe('aborted');
       expect(h.ledger.latestRoundEvent(rotated.round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
       expect((await digestOf()).prWithoutReview.filter((row) => row.jobId === 'clean-r3-rotated')).toEqual([]);
+      expect(rotated.escalations.join('\n')).toMatch(/cannot be certified absent/u);
+      expect(rotated.escalations.join('\n')).toMatch(/account-b/u);
 
       const same = seed('clean-r3-same', 'sha-r3-same', 'same');
       await same.wave.recoverInterruptedRounds();
-      expect(h.ledger.latestRoundEvent(same.round.id, PUBLICATION_ABSENT_EVENT)).not.toBeNull();
+      expect(h.ledger.latestRoundEvent(same.round.id, PUBLICATION_ABSENT_EVENT), same.escalations.join('\n')).not.toBeNull();
       expect((await digestOf()).prWithoutReview).toMatchObject([
         { jobId: 'clean-r3-same', cleanAbort: { roundId: same.round.id, ruleId: 'clean-abort-service-restart' } },
       ]);
