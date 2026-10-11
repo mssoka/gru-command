@@ -999,4 +999,13 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    id: 26,
+    name: 'intake-recovery-query-indexes',
+    sql: `
+      CREATE INDEX idx_intake_reviews_scope ON intake_reviews(repo_path, intake_id, revision_id);
+      CREATE INDEX idx_pipeline_enqueued_entry ON events(json_extract(payload, '$.entry_id'))
+        WHERE kind = 'pipeline.enqueued' AND json_valid(payload);
+    `,
+  },
 ];

@@ -63,6 +63,32 @@ test('all three sources preview and reject with zero executable jobs; chat and b
   await expect(page.locator('.msg--user').last()).toContainText('native intake preview is readable');
   await expect(page.locator('#board-view')).toBeVisible();
 });
+test('committed revision response loss reloads its original pending identity without replacement POSTs', async ({ page }) => {
+  await pair(page); await selectRepo(page); await page.getByLabel('Intake source', { exact: true }).selectOption('spec'); await pickDocument(page, 'spec.md');
+  const preview = page.waitForResponse((response) => response.url().endsWith('/api/intake/preview') && response.ok());
+  await page.getByRole('button', { name: 'Preview sources', exact: true }).click();
+  const initial = await (await preview).json() as Proposal;
+  await expect(page.locator('.intake-status')).toContainText('zero executable work');
+  const before = await page.evaluate(() => JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).draft as { repoPath: string; intakeId: string; requestId: string });
+  let revisions = 0, approvals = 0;
+  page.on('request', (request) => { if (request.method() === 'POST' && request.url().endsWith('/api/intake/approve')) approvals += 1; });
+  await page.route('**/api/intake/revision', async (route) => { revisions += 1; const committed = await route.fetch(); expect(committed.status()).toBe(200); await route.abort('failed'); });
+  await page.getByLabel('Concrete intake plan JSON', { exact: true }).fill(JSON.stringify(resolvedIntakePlan(initial), null, 2));
+  await page.getByRole('button', { name: 'Save new revision', exact: true }).click();
+  await expect(page.locator('.intake-status')).toContainText('Response lost');
+  const pending = await page.evaluate(() => JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).pendingRevision as { identity: { repoPath: string; intakeId: string; requestId: string }; previous: unknown });
+  expect(pending).not.toBeNull(); expect(pending.previous).toEqual(before); expect(pending.identity.requestId).not.toBe(before.requestId);
+  const recovered = await page.request.get(`${service.baseUrl}/api/intake/${encodeURIComponent(pending.identity.intakeId)}/requests/${encodeURIComponent(pending.identity.requestId)}?${new URLSearchParams({ repoPath: pending.identity.repoPath })}`, { headers: { authorization: `Bearer ${token}` } });
+  expect(recovered.status()).toBe(200); const exact = await recovered.json() as Proposal;
+  await page.reload(); await page.getByText('Review source intake', { exact: true }).click();
+  await expect(page.locator('.intake-review')).toContainText(exact.revisionId);
+  await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).pendingRevision)).toBeNull();
+  expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).draft)).toEqual(pending.identity);
+  await page.getByRole('button', { name: 'Read back / recover', exact: true }).click();
+  await expect(page.locator('.intake-review')).toContainText(exact.revisionId);
+  expect(revisions).toBe(1); expect(approvals).toBe(0);
+});
+
 test('concrete edits, dependency refusal, lost approval response and reload/reconnect retain accepted identities', async ({ page }) => {
   await pair(page); await selectRepo(page); await page.getByLabel('Intake source', { exact: true }).selectOption('spec'); await pickDocument(page, 'spec.md');
   let captured!: Proposal;
@@ -159,6 +185,87 @@ test('duplicate browser clicks issue one explicit approval and one accepted entr
   expect(approvalCalls).toBe(1);
   expect(accepted.accepted).toHaveLength(1);
   expect(accepted.remaining).toEqual([]);
+});
+
+async function retainedPairingIntents(page: Page): Promise<{ readonly saved: string; readonly approvalToken: string; readonly requestId: string }> {
+  const { proposal } = await concreteReview(page);
+  await page.getByRole('button', { name: 'Approve selected work', exact: true }).click();
+  await expect(page.locator('.intake-status')).toContainText('approved. Accepted:');
+  await page.route('**/api/intake/revision', (route) => route.abort('failed'));
+  await page.getByLabel('Concrete intake plan JSON', { exact: true }).fill(JSON.stringify({ ...proposal.plan, questions: ['New uncommitted local clarification'] }, null, 2));
+  await page.getByRole('button', { name: 'Save new revision', exact: true }).click();
+  await expect(page.locator('.intake-status')).toContainText('Response lost');
+  const saved = await page.evaluate(() => sessionStorage.getItem('gru-intake-recovery')!);
+  const state = JSON.parse(saved) as { draft: unknown; pendingRevision: unknown; approvals: { request: { requestId: string }; token: string }[] };
+  expect(state.draft).not.toBeNull(); expect(state.pendingRevision).not.toBeNull(); expect(state.approvals).toHaveLength(1);
+  expect(state.approvals[0]!.token).toMatch(/^[0-9a-f]{64}$/u);
+  return { saved, approvalToken: state.approvals[0]!.token, requestId: state.approvals[0]!.request.requestId };
+}
+
+test('automatic fatal and wrong-credential pairing preserve exact intake identities without decision replay', async ({ page }) => {
+  let fail!: () => void;
+  await page.routeWebSocket(/\/board\/ws$/u, (socket) => {
+    let authenticated = false;
+    socket.onMessage(() => { if (!authenticated) { authenticated = true; socket.send(JSON.stringify({ type: 'auth_ok' })); } });
+    fail = () => socket.send(JSON.stringify({ type: 'error', message: 'Injected protocol failure', fatal: true }));
+  });
+  let approvals = 0, revisions = 0;
+  page.on('request', (request) => { if (request.method() !== 'POST') return; if (request.url().endsWith('/api/intake/approve')) approvals += 1; if (request.url().endsWith('/api/intake/revision')) revisions += 1; });
+  const { saved } = await retainedPairingIntents(page);
+  fail(); await expect(page.locator('#pairing-view')).toBeVisible();
+  expect(await page.evaluate(() => sessionStorage.getItem('gru-intake-recovery'))).toBe(saved);
+  await page.locator('#pair-token').fill('wrong-intake-recovery-credential'); await page.locator('#pair-submit').click();
+  await expect(page.locator('#pair-error')).toContainText(/unauthori[sz]ed|authentication|invalid token/iu);
+  expect(await page.evaluate(() => sessionStorage.getItem('gru-intake-recovery'))).toBe(saved);
+  await page.locator('#pair-token').fill(token); await page.locator('#pair-submit').click();
+  await expect(page.locator('#chat-view')).toBeVisible(); await page.getByText('Review source intake', { exact: true }).click();
+  await expect(page.locator('.intake-review')).toContainText('Snapshot revision:');
+  const original = JSON.parse(saved) as { pendingRevision: { previous: unknown }; approvals: unknown };
+  const recovered = await page.evaluate(() => JSON.parse(sessionStorage.getItem('gru-intake-recovery')!));
+  expect(recovered).toEqual({ draft: original.pendingRevision.previous, pendingRevision: original.pendingRevision, approvals: original.approvals });
+  expect(approvals).toBe(1); expect(revisions).toBe(2);
+});
+
+test('explicit Unpair clears draft, pending revision and original approval tokens before reload and re-pair', async ({ page }) => {
+  let approvals = 0, revisions = 0;
+  page.on('request', (request) => { if (request.method() !== 'POST') return; if (request.url().endsWith('/api/intake/approve')) approvals += 1; if (request.url().endsWith('/api/intake/revision')) revisions += 1; });
+  const { approvalToken, requestId } = await retainedPairingIntents(page);
+  const readRecovery = () => page.evaluate(() => JSON.parse(sessionStorage.getItem('gru-intake-recovery') ?? '{"draft":null,"pendingRevision":null,"approvals":[]}'));
+  const empty = { draft: null, pendingRevision: null, approvals: [] };
+  await page.locator('#settings-toggle').click(); await page.locator('#settings-unpair').click();
+  await expect(page.locator('#pairing-view')).toBeVisible();
+  expect(await readRecovery()).toEqual(empty);
+  await page.reload(); await expect(page.locator('#pairing-view')).toBeVisible();
+  expect(await readRecovery()).toEqual(empty);
+  await page.locator('#pair-token').fill(token); await page.locator('#pair-submit').click();
+  await expect(page.locator('#chat-view')).toBeVisible(); await page.getByText('Review source intake', { exact: true }).click();
+  await expect(page.locator('.intake-approval-recovery')).toBeHidden(); await expect(page.locator('.intake-review')).toBeEmpty();
+  await expect(page.locator('.intake')).not.toContainText(`Original approval ${requestId}`);
+  expect(await readRecovery()).toEqual(empty);
+  expect(await page.evaluate((value) => sessionStorage.getItem('gru-intake-recovery')?.includes(value) ?? false, approvalToken)).toBe(false);
+  expect(approvals).toBe(1); expect(revisions).toBe(2);
+});
+
+test('failed supporting batch blocks narrowed intake decisions while ordinary chat remains independent', async ({ page }) => {
+  await concreteReview(page);
+  let approvals = 0, previews = 0;
+  page.on('request', (request) => { if (request.method() !== 'POST') return; if (request.url().endsWith('/api/intake/approve')) approvals += 1; if (request.url().endsWith('/api/intake/preview')) previews += 1; });
+  let release!: () => void; const hold = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/api/attach/uploads', async (route) => { await hold; await route.fulfill({ status: 503, json: { error: 'injected_upload_failure' } }); });
+  await page.getByRole('button', { name: 'Browse / upload documents', exact: true }).click();
+  const chooser = page.waitForEvent('filechooser'); await page.locator('#attach-picker-device').click();
+  await (await chooser).setFiles({ name: 'missing-support.md', mimeType: 'text/markdown', buffer: Buffer.from('required supporting detail') });
+  await expect(page.locator('.intake-status')).toContainText('complete document upload batch');
+  await expect(page.locator('#chat-chips .attach-chip')).toHaveCount(0);
+  await page.locator('#chat-input').fill('ordinary chat remains independent'); await page.locator('#chat-send').click();
+  await expect(page.locator('#chat-input')).toHaveValue('');
+  release(); await expect(page.locator('.intake-status')).toContainText('upload failed');
+  await expect(page.getByRole('button', { name: 'Preview sources', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Approve selected work', exact: true })).toBeDisabled();
+  expect(previews).toBe(0); expect(approvals).toBe(0);
+  await page.getByRole('button', { name: 'Abandon failed document selection', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Approve selected work', exact: true })).toBeEnabled();
+  expect(previews).toBe(0); expect(approvals).toBe(0);
 });
 
 test('intake stays in a bounded explicit row above chat on desktop, tablet and phone', async ({ page }) => {

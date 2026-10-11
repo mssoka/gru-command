@@ -4,7 +4,7 @@ import { el } from './dom.js';
 import { uuidV4 } from '../lib/uuid.js';
 
 interface Picker {
-  pickIntakeFile(callback: (chip: AttachmentChip, uploaded: boolean) => void, repoPath?: string, remaining?: number, batch?: (pending: boolean) => void): void;
+  pickIntakeFile(callback: (chip: AttachmentChip, uploaded: boolean) => void, repoPath?: string, remaining?: number, batch?: (pending: boolean, error?: string) => void): void;
   pickIntakeRepository(callback: (path: string) => void): void;
 }
 interface RecoveryIdentity { readonly repoPath: string; readonly intakeId: string; readonly requestId: string; }
@@ -60,6 +60,7 @@ export class IntakeView {
   private busy = false;
   private storageError = false;
   private documentsPending = false;
+  private documentsError: string | null = null;
   private receiptActive = 0;
   private readonly receiptWaiters = new Set<() => void>();
   private proposal: Proposal | null = null;
@@ -103,13 +104,13 @@ export class IntakeView {
         if (this.busy || this.client !== client || this.sourceGeneration !== generation) return;
         if (this.files.length >= 8) { this.status.textContent = 'At most eight explicit documents.'; return; }
         if (!this.files.some((file) => file.chip.path === chip.path)) this.files = [...this.files, { chip, uploaded }];
-        this.invalidateSource(false); this.renderFiles();
-      }, this.repo.value, 8 - this.files.length, (pending) => {
+        this.documentsError = null; this.invalidateSource(false); this.renderFiles();
+      }, this.repo.value, 8 - this.files.length, (pending, error) => {
         if (this.client !== client || this.sourceGeneration !== generation) return;
-        this.documentsPending = pending;
+        this.documentsPending = pending; this.documentsError = error ?? null;
         this.lockedInputs = pending ? { repo: this.repo.value, kind: this.kind.value, issue: this.issue.value, comments: this.comments.value, editor: this.editor.value } : null;
         this.renderActions();
-        this.status.textContent = pending ? 'Wait for the complete document upload batch before preview.' : 'Complete document batch finished; preview all selected documents.';
+        this.status.textContent = error ?? (pending ? 'Wait for the complete document upload batch before preview.' : 'Complete document batch finished; preview all selected documents.');
       });
     });
     this.kind.addEventListener('change', () => { if (!this.guardInputs()) return; this.invalidateSource(); this.renderSource(); });
@@ -127,7 +128,7 @@ export class IntakeView {
   bind(client: IntakeClient | null): void {
     this.generation += 1; this.wakeReceiptWaiters(); this.sourceGeneration += 1; this.client = client; this.busy = false; this.lockedInputs = null;
     this.proposal = null; this.readback = null; this.selected.clear(); this.reviewBody.replaceChildren(); this.editor.value = ''; this.editor.hidden = true;
-    this.documentsPending = false; this.files = []; this.repo.value = ''; this.issue.value = ''; this.comments.value = ''; this.renderFiles();
+    this.documentsPending = false; this.documentsError = null; this.files = []; this.repo.value = ''; this.issue.value = ''; this.comments.value = ''; this.renderFiles();
     this.identity = null; this.approvals = []; this.pendingRevision = null; this.approvalReadbacks.clear(); this.approvalErrors.clear();
     this.storageError = false;
     try {
@@ -164,7 +165,7 @@ export class IntakeView {
   }
   private invalidateSource(invalidatePicker = true): void {
     if (this.busy) return;
-    if (invalidatePicker) { this.sourceGeneration += 1; this.documentsPending = false; }
+    if (invalidatePicker) { this.sourceGeneration += 1; this.documentsPending = false; this.documentsError = null; }
     this.generation += 1; this.proposal = null; this.readback = null; this.selected.clear(); this.reviewBody.replaceChildren(); this.editor.hidden = true; this.editor.value = ''; this.renderActions();
   }
   private renderFiles(): void {
@@ -187,7 +188,12 @@ export class IntakeView {
   }
   private persistRecovery(): void { this.commitRecovery(this.identity, this.pendingRevision, this.approvals); }
   private saveIdentity(identity: RecoveryIdentity, pending = this.pendingRevision): void { this.commitRecovery(identity, pending, this.approvals); }
+  private matchesApproval(request: ApprovalRecovery['request'], readback: IntakeReadback): boolean {
+    const review = readback.review;
+    return review?.status === 'approved' && review.repoPath === request.repoPath && review.intakeId === request.intakeId && review.requestId === request.requestId && review.revisionId === request.revisionId && review.previousToken === request.expectedToken && Array.isArray(review.selected) && JSON.stringify([...review.selected].sort()) === JSON.stringify([...request.selected].sort());
+  }
   private rememberApproval(request: ApprovalRecovery['request'], readback?: IntakeReadback): void {
+    if (readback && !this.matchesApproval(request, readback)) throw new IntakeClientError('intake_acceptance_conflict', `Receipt does not confirm original approval ${request.requestId}: its selection or review binding differs. Original identity retained; explicitly retry only the original approval to resolve it.`);
     const token = readback?.review?.status === 'approved' ? readback.review.token : undefined;
     const previous = this.approvals.find((item) => item.request.revisionId === request.revisionId && item.request.intakeId === request.intakeId && item.request.repoPath === request.repoPath);
     if (previous && JSON.stringify(previous.request) !== JSON.stringify(request)) throw new IntakeClientError('intake_approval_pending', `Original approval ${previous.request.requestId} is unconfirmed or accepted. Read back or explicitly retry its original selection before changing it.`);
@@ -230,14 +236,21 @@ export class IntakeView {
     await this.run(async (client, current) => {
       if (this.pendingRevision) throw new Error('Recover or explicitly abandon the pending revision before replacing it.');
       if (this.documentsPending) throw new Error('Wait for the complete document upload batch before preview.');
+      if (this.documentsError) throw new Error(`${this.documentsError} Retry the complete selection or explicitly abandon it before preview.`);
       if (!this.repo.value) throw new Error('Choose a managed repository first.');
       const document = ({ chip, uploaded }: typeof this.files[number]) => uploaded ? { uploadPath: chip.path } : { path: chip.path.startsWith(`${this.repo.value}/`) ? chip.path.slice(this.repo.value.length + 1) : chip.path };
       const kind = this.kind.value as 'issue' | 'spec' | 'bmad';
       if (kind !== 'issue' && !this.files[0]) throw new Error('Choose the primary source document.');
       const source = kind === 'issue' ? { kind, reference: this.issue.value, commentIds: this.comments.value.trim() === '' ? [] : this.comments.value.split(',').map((id) => Number(id.trim())) } : { kind, document: document(this.files[0]!), supporting: this.files.slice(1).map(document) };
       const identity = { repoPath: this.repo.value, intakeId: `intake-${uuidV4()}`, requestId: `r-${uuidV4()}` };
+      const previous = this.identity;
       this.saveIdentity(identity, null);
-      const proposal = await client.preview({ ...identity, source });
+      let proposal: Proposal;
+      try { proposal = await client.preview({ ...identity, source }); }
+      catch (error) {
+        if (current() && error instanceof IntakeClientError && error.code === 'intake_invalid_request') this.commitRecovery(previous, null, this.approvals);
+        throw error;
+      }
       if (!current()) return;
       this.showProposal(proposal);
       const readback = await client.readback(identity.repoPath, identity.intakeId);
@@ -297,8 +310,9 @@ export class IntakeView {
         if (!current()) return;
         const readback = await client.readback(identity.repoPath, identity.intakeId);
         if (!current()) return;
+        const preserveEditor = this.dirty() && (!recoveredPending || !this.editorMatches(proposal.plan));
         if (recoveredPending) this.saveIdentity(identity, null);
-        this.showProposal(proposal); this.readback = readback;
+        this.showProposal(proposal, preserveEditor); this.readback = readback;
         if (readback.review?.revisionId === proposal.revisionId && readback.review.status === 'approved') { this.selected.clear(); readback.review.selected.forEach((id) => this.selected.add(id)); }
         this.status.textContent = this.receiptText();
       }
@@ -318,16 +332,28 @@ export class IntakeView {
     return { repoPath: p.repoPath, intakeId: p.intakeId, requestId: p.requestId, revisionId: p.revisionId, expectedToken: this.readback?.review?.token ?? null };
   }
   private dirty(): boolean { return this.proposal !== null && this.editor.value !== JSON.stringify(this.proposal.plan, null, 2); }
+  private editorMatches(plan: Plan): boolean {
+    const ordered = (_key: string, value: unknown): unknown => typeof value === 'object' && value !== null && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) : value;
+    try { return JSON.stringify(JSON.parse(this.editor.value), ordered) === JSON.stringify(plan, ordered); }
+    catch { return false; } // Invalid local JSON is still authored text, not permission to discard it.
+  }
   private renderActions(): void {
     this.actions.replaceChildren();
     this.buttons = this.buttons.filter((button) => this.root.contains(button));
-    for (const button of this.buttons) button.disabled = this.client === null || this.busy || this.storageError || this.documentsPending || button.textContent === 'Preview sources' && this.pendingRevision !== null;
+    for (const button of this.buttons) button.disabled = this.client === null || this.busy || this.storageError || this.documentsPending || button.textContent === 'Preview sources' && (this.pendingRevision !== null || this.documentsError !== null);
     for (const input of [this.repo, this.kind, this.issue, this.comments, this.editor]) input.disabled = this.client === null || this.busy || this.documentsPending;
     this.editor.hidden = this.proposal === null;
     this.renderApprovalRecovery();
     const action = (label: string, enabled: boolean, operation: (client: IntakeClient, current: () => boolean) => Promise<void>): void => {
       const button = this.button(label, () => { void this.run(operation); }); button.disabled = !enabled || this.client === null || this.busy || this.storageError || this.documentsPending; this.actions.append(button);
     };
+    if (this.documentsError) {
+      this.actions.append(el('p', '', `${this.documentsError} Retry a complete selection or explicitly abandon the failed selection before preview or new decisions.`));
+      action('Abandon failed document selection', true, async () => {
+        this.documentsError = null;
+        this.status.textContent = 'Failed document selection explicitly abandoned. Previously selected sources and reviewed bytes are unchanged.';
+      });
+    }
     if (this.pendingRevision) action('Abandon pending revision', true, async () => {
       this.saveIdentity(this.pendingRevision!.previous, null);
       this.status.textContent = 'Pending identity explicitly abandoned in this tab. No replacement revision or approval was sent; any committed original revision remains on the server.';
@@ -347,7 +373,7 @@ export class IntakeView {
       const details = el('details'); details.open = true; details.append(el('summary', '', 'Immutable revision comparison'), el('pre', '', JSON.stringify(comparison, null, 2))); this.reviewBody.append(details);
       this.status.textContent = 'Compare captured scope, acceptance, dependencies and provenance before review or approval.';
     });
-    action('Save new revision', this.dirty() && this.pendingRevision === null, async (client, current) => {
+    action('Save new revision', this.documentsError === null && this.dirty() && this.pendingRevision === null, async (client, current) => {
       const p = this.proposal!; const plan = JSON.parse(this.editor.value) as Plan;
       const identity = { repoPath: p.repoPath, intakeId: p.intakeId, requestId: `r-${uuidV4()}` };
       const previous = { repoPath: p.repoPath, intakeId: p.intakeId, requestId: p.requestId };
@@ -361,23 +387,29 @@ export class IntakeView {
       if (!current()) return;
       this.saveIdentity(identity, null); this.showProposal(proposal); this.status.textContent = 'New captured revision; review again before approval.';
     });
-    action('Review this revision', !this.dirty() && !reviewed && !approved && !(same && this.readback?.review?.status === 'rejected'), async (client, current) => {
+    action('Review this revision', this.documentsError === null && !this.dirty() && !reviewed && !approved && !(same && this.readback?.review?.status === 'rejected'), async (client, current) => {
       const readback = await client.review(this.decision()); if (!current()) return; this.readback = readback; this.status.textContent = 'Reviewed. Select complete work and explicitly approve, or reject.';
     });
-    action('Reject revision', reviewed && !this.dirty(), async (client, current) => {
+    action('Reject revision', this.documentsError === null && reviewed && !this.dirty(), async (client, current) => {
       const readback = await client.reject(this.decision()); if (!current()) return; this.readback = readback; this.status.textContent = this.receiptText();
     });
     const blocked = this.proposal.gaps.length > 0 || this.proposal.plan.unmapped.length > 0 || this.proposal.plan.questions.length > 0 || this.proposal.plan.heists.some((heist) => this.selected.has(heist.id) && heist.unresolvedQuestions.length > 0);
-    if (blocked && !approved) this.actions.append(el('p', '', 'Resolve source gaps, unmapped requirements and unanswered questions in the plan editor, save a new revision, then review again before approval.'));
-    action(approved ? 'Retry identical approval' : 'Approve selected work', !this.dirty() && this.selected.size > 0 && (reviewed && !blocked || approved && (this.readback?.remaining.length ?? 0) > 0), async (client, current) => {
+    if (blocked && !approved) this.actions.append(el('p', '', this.proposal.gaps.length > 0
+      ? 'Repair or reselect source documents and preview again: captured source gaps cannot be removed in the plan editor. Then resolve remaining plan questions, save and review the new revision before approval.'
+      : 'Resolve unmapped requirements and unanswered questions in the plan editor, save a new revision, then review again before approval.'));
+    const original = this.approvals.find(({ request }) => request.repoPath === this.proposal!.repoPath && request.intakeId === this.proposal!.intakeId && request.revisionId === this.proposal!.revisionId);
+    const originalMatches = !original || this.readback !== null && this.matchesApproval(original.request, this.readback);
+    if (approved && !originalMatches) this.actions.append(el('p', '', 'Current acceptance differs from this tab’s original approval. Resolve its original retry below; no substituted selection will be sent.'));
+    action(approved ? 'Retry identical approval' : 'Approve selected work', this.documentsError === null && !this.dirty() && this.selected.size > 0 && (reviewed && !blocked || approved && originalMatches && (this.readback?.remaining.length ?? 0) > 0), async (client, current) => {
       const d = this.decision();
-      const original = this.approvals.find(({ request }) => request.repoPath === d.repoPath && request.intakeId === d.intakeId && request.revisionId === d.revisionId);
+      if (approved && original && !this.matchesApproval(original.request, this.readback!)) throw new IntakeClientError('intake_acceptance_conflict', 'Current acceptance does not bind this tab’s original approval; resolve the original retry below.');
       const request = approved ? original?.request ?? { ...d, expectedToken: this.readback!.review!.previousToken, selected: this.readback!.review!.selected } : { ...d, selected: [...this.selected] };
       const readback = await this.transmitApproval(client, request); if (!current()) return; this.readback = readback; this.status.textContent = this.receiptText();
     });
   }
   private renderApprovalRecovery(): void {
     this.recoveryBody.replaceChildren();
+    this.buttons = this.buttons.filter((button) => this.root.contains(button));
     for (const recovery of this.approvals) {
       const readback = this.approvalReadbacks.get(recovery.request.revisionId);
       const row = el('div', '', `Original approval ${recovery.request.requestId}. Accepted: ${readback?.accepted.map(({ heistId, entryId }) => `${heistId} → ${entryId}`).join(', ') || (readback ? 'none' : 'not confirmed')}. Remaining: ${readback?.remaining.map(({ heistId, entryId }) => `${heistId} → ${entryId}`).join(', ') || (readback ? 'none' : `not confirmed (${recovery.request.selected.join(', ')})`)}.`);
@@ -395,10 +427,10 @@ export class IntakeView {
       this.recoveryBody.append(row);
     }
   }
-  private showProposal(proposal: Proposal): void {
+  private showProposal(proposal: Proposal, preserveEditor = false): void {
     this.saveIdentity({ repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: proposal.requestId });
     this.proposal = proposal; this.selected.clear(); this.repo.value = proposal.repoPath;
-    this.editor.value = JSON.stringify(proposal.plan, null, 2);
+    if (!preserveEditor) this.editor.value = JSON.stringify(proposal.plan, null, 2);
     if (this.busy && this.lockedInputs) this.lockedInputs = { ...this.lockedInputs, repo: this.repo.value, editor: this.editor.value };
     this.reviewBody.replaceChildren(el('p', '', `Repository: ${proposal.repoPath}\nSnapshot revision: ${proposal.revisionId}`));
     for (const snapshot of proposal.snapshots) {

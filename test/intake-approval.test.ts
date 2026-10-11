@@ -8,7 +8,7 @@ import { IntakeService } from '../src/intake/service.js';
 import { resolvedIntakePlan } from './helpers/intake-plan.js';
 import { PipelineService } from '../src/dispatch/pipeline.js';
 import { LedgerApi } from '../src/ledger/api.js';
-import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerDb, MIGRATIONS } from '../src/ledger/db.js';
 import { canonical, digest, type IntakeReviewRecord } from '../src/intake/types.js';
 
 const cleanups: (() => void)[] = [];
@@ -36,6 +36,77 @@ async function fixture(kind: 'issue' | 'spec' | 'bmad' = 'spec') {
   const accept = { ...decision, expectedToken: review.token, selected: proposal.plan.heists.map(({ id }) => id) };
   return { root, repoPath, db, ledger, pipeline, capacity, dispatch, intake, approval, first, proposal, decision, review, accept, request };
 }
+describe('intake durable recovery integrity', () => {
+  const missingCommittedRow = async (proof: 'job' | 'enqueue event'): Promise<void> => {
+    const h = await fixture();
+    const accepted = h.approval.approve(h.accept);
+    const entry = accepted.review!.entries[0]!;
+    h.db.handle.prepare('DELETE FROM pipeline_entries WHERE id = ?').run(entry.id);
+    if (proof === 'job') {
+      h.db.handle.prepare("DELETE FROM events WHERE kind = 'pipeline.enqueued'").run();
+      h.ledger.addJob({ id: entry.id, repo: 'demo', title: entry.title, briefing: entry.briefing });
+    }
+    const events = h.ledger.listEvents();
+    for (const operation of [() => h.approval.read(h.repoPath, 'feature', accepted.review!.token), () => h.approval.approve(h.accept)]) {
+      let failure: unknown;
+      try { operation(); } catch (error) { failure = error; }
+      expect(failure).toMatchObject({ code: 'intake_acceptance_conflict', message: expect.stringMatching(/restore.*ledger/iu) });
+    }
+    expect(h.ledger.listPipelineEntries()).toEqual([]);
+    expect(h.ledger.getIntakeReview(h.repoPath, 'feature')).toEqual(accepted.review);
+    expect(h.ledger.listEvents()).toEqual(events);
+    expect(h.dispatch).not.toHaveBeenCalled();
+  };
+  it('refuses a missing committed pipeline row proven by job without recreating it', () => missingCommittedRow('job'));
+  it('refuses a missing committed pipeline row proven by enqueue event without recreating it', () => missingCommittedRow('enqueue event'));
+
+  it('upgrades retained v25 history and uses intake/committed-enqueue indexes without rewriting records', async () => {
+    const h = await fixture();
+    const dir = join(h.root, 'old-ledger');
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.filter(({ id }) => id <= 25) });
+    const oldApi = new LedgerApi(old.handle);
+    oldApi.recordIntakeReview(h.review);
+    oldApi.enqueuePipelineEntry({ id: 'legacy-accepted', repoPath: h.repoPath, title: 'Legacy accepted', briefing: 'Immutable legacy bytes' });
+    const records = old.handle.prepare('SELECT * FROM intake_reviews ORDER BY token').all();
+    const events = old.handle.prepare('SELECT * FROM events ORDER BY seq').all();
+    old.close();
+    const upgraded = new LedgerDb(dir);
+    try {
+      expect(upgraded.handle.prepare('SELECT * FROM intake_reviews ORDER BY token').all()).toEqual(records);
+      expect(upgraded.handle.prepare('SELECT * FROM events ORDER BY seq').all()).toEqual(events);
+      const historyPlan = upgraded.handle.prepare('EXPLAIN QUERY PLAN SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(record AS BLOB))), 0) AS bytes FROM intake_reviews WHERE repo_path = ? AND intake_id = ?').all(h.repoPath, 'feature');
+      expect(historyPlan.map((row) => String(row.detail)).join('\n')).toContain('idx_intake_reviews_scope');
+      const enqueuePlan = upgraded.handle.prepare("EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE kind = 'pipeline.enqueued' AND json_valid(payload) AND json_extract(payload, '$.entry_id') = ? LIMIT 1").all('legacy-accepted');
+      expect(enqueuePlan.map((row) => String(row.detail)).join('\n')).toContain('idx_pipeline_enqueued_entry');
+      expect(new LedgerApi(upgraded.handle).getIntakeReview(h.repoPath, 'feature')).toEqual(h.review);
+    } finally { upgraded.close(); }
+  });
+
+  const midwriteRollback = async (boundary: 'head' | 'event'): Promise<void> => {
+    const h = await fixture();
+    const proposal = await h.intake.preview({ ...h.request, intakeId: 'rollback', requestId: 'new-review' });
+    const decision = { repoPath: h.repoPath, intakeId: proposal.intakeId, requestId: proposal.requestId, revisionId: proposal.revisionId, expectedToken: null };
+    const before = { decisions: h.db.handle.prepare('SELECT * FROM intake_reviews ORDER BY token').all(), heads: h.db.handle.prepare('SELECT * FROM intake_review_heads ORDER BY intake_id').all(), events: h.ledger.listEvents() };
+    h.db.handle.exec(boundary === 'head'
+      ? "CREATE TRIGGER intake_midwrite BEFORE INSERT ON intake_review_heads BEGIN SELECT RAISE(ABORT, 'injected mid-write failure'); END"
+      : "CREATE TRIGGER intake_midwrite BEFORE INSERT ON events WHEN NEW.kind = 'intake.reviewed' BEGIN SELECT RAISE(ABORT, 'injected mid-write failure'); END");
+    expect(() => h.approval.review(decision)).toThrow('injected mid-write failure');
+    expect(h.db.handle.prepare('SELECT * FROM intake_reviews ORDER BY token').all()).toEqual(before.decisions);
+    expect(h.db.handle.prepare('SELECT * FROM intake_review_heads ORDER BY intake_id').all()).toEqual(before.heads);
+    expect(h.ledger.listEvents()).toEqual(before.events);
+    expect(h.ledger.getIntakeReview(h.repoPath, 'rollback')).toBeNull();
+    h.db.handle.exec('DROP TRIGGER intake_midwrite');
+    const retried = h.approval.review(decision);
+    expect(h.ledger.getIntakeReview(h.repoPath, 'rollback')).toEqual(retried.review);
+    expect(h.approval.review(decision)).toEqual(retried);
+    expect(h.ledger.listEvents()).toHaveLength(before.events.length + 1);
+    expect(h.ledger.listPipelineEntries()).toEqual([]);
+    expect(h.dispatch).not.toHaveBeenCalled();
+  };
+  it('rolls back a real mid-write head failure and permits the identical review retry', () => midwriteRollback('head'));
+  it('rolls back a real mid-write event failure and permits the identical review retry', () => midwriteRollback('event'));
+});
+
 describe('intake exact explicit acceptance', () => {
   const checkSource = async (kind: 'issue' | 'spec' | 'bmad'): Promise<void> => {
     const h = await fixture(kind);

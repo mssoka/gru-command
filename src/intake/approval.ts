@@ -72,8 +72,10 @@ export class IntakeApprovalService {
     for (const [index, entry] of review.entries.entries()) {
       const row = this.options.pipeline.entry(entry.id);
       const identity = { heistId: review.selected[index]!, entryId: entry.id };
-      if (row === null) remaining.push(identity);
-      else {
+      if (row === null) {
+        if (this.options.ledger.getJob(entry.id) !== null || this.options.ledger.hasPipelineEnqueueEvidence(entry.id)) throw new IntakeError('intake_acceptance_conflict', `Pipeline entry ${entry.id} has committed enqueue or minion evidence but its row is missing. Restore the pipeline ledger before retrying; committed work will not be recreated.`, 409);
+        remaining.push(identity);
+      } else {
         const repo = entry.repoPath.split('/').filter(Boolean).pop() ?? entry.repoPath;
         // The original enqueue fingerprint includes a null initial hold. Owner
         // holds and lifecycle fields may subsequently change; they are not frozen.

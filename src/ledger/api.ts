@@ -7554,6 +7554,11 @@ export class LedgerApi {
     } catch (error) { throw new IntakeError('intake_storage_error', `Cannot verify durable intake decision: ${String(error)}`, 500); }
   }
 
+  /** Indexed durable enqueue witness; no event payload list is loaded. */
+  hasPipelineEnqueueEvidence(id: string): boolean {
+    return this.db.prepare("SELECT 1 FROM events WHERE kind = 'pipeline.enqueued' AND json_valid(payload) AND json_extract(payload, '$.entry_id') = ? LIMIT 1").get(id) !== undefined;
+  }
+
   getPipelineEntry(id: string): PipelineEntryRecord | null {
     const row = this.db.prepare('SELECT * FROM pipeline_entries WHERE id = ?').get(id) as Row | undefined;
     return row === undefined ? null : this.pipelineEntryFromRow(row);

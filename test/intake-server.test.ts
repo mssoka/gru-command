@@ -302,6 +302,21 @@ describe('intake HTTP observational read and malformed nesting boundaries', () =
 });
 
 describe('authenticated intake review and approval HTTP', () => {
+  it('refuses mismatched refinement revision bytes without creating a replacement proposal', async () => {
+    const h = await boot();
+    const first = (await h.api('POST', '/api/intake/preview', h.request)).body as unknown as Proposal;
+    const decision = { repoPath: h.repo, intakeId: first.intakeId, requestId: first.requestId, revisionId: first.revisionId, expectedToken: null };
+    const reviewed = await h.api('POST', '/api/intake/review', decision);
+    const beforeEvents = h.ledger.listEvents();
+    expect(await h.api('POST', '/api/intake/revision', { ...decision, expectedToken: undefined, requestId: 'stale-refinement', previousRequestId: first.requestId, revisionId: '0'.repeat(64), plan: resolvedIntakePlan(first) })).toMatchObject({ status: 409, body: { error: 'intake_stale_revision' } });
+    expect((await h.api('GET', `/api/intake/${first.intakeId}/requests/${first.requestId}?${query(h.repo)}`)).body).toEqual(first);
+    expect(await h.api('GET', `/api/intake/${first.intakeId}/requests/stale-refinement?${query(h.repo)}`)).toMatchObject({ status: 404, body: { error: 'intake_not_found' } });
+    expect((await h.api('GET', `/api/intake/${first.intakeId}/review?${query(h.repo)}`)).body).toEqual(reviewed.body);
+    expect(h.ledger.listEvents()).toEqual(beforeEvents);
+    expect(h.ledger.listPipelineEntries()).toEqual([]);
+    expect(h.ledger.listJobs()).toEqual([]);
+    expect(h.dispatch).not.toHaveBeenCalled();
+  });
   it('guards every decision, persists a concrete revision, rejects stale/concurrent decisions and reads accepted identities', async () => {
     const h = await boot();
     for (const route of ['revision', 'review', 'reject', 'approve']) expect((await h.api('POST', `/api/intake/${route}`, {}, null)).status).toBe(401);

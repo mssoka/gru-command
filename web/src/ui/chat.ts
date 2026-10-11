@@ -148,11 +148,11 @@ export class ChatView {
   private intakeRepoPick: ((path: string) => void) | null = null;
   private intakeRepoPath: string | null = null;
   private intakeRemaining = 8;
-  private intakeBatch: ((pending: boolean) => void) | undefined;
-  private deviceChooser: { readonly epoch: number; readonly generation: number; readonly pick: ((chip: AttachmentChip, uploaded: boolean) => void) | null; readonly remaining: number; readonly batch: ((pending: boolean) => void) | undefined } | null = null;
+  private intakeBatch: ((pending: boolean, error?: string) => void) | undefined;
+  private deviceChooser: { readonly epoch: number; readonly generation: number; readonly pick: ((chip: AttachmentChip, uploaded: boolean) => void) | null; readonly remaining: number; readonly batch: ((pending: boolean, error?: string) => void) | undefined } | null = null;
   private readonly intakeUploading = new Set<number>();
 
-  pickIntakeFile(callback: (chip: AttachmentChip, uploaded: boolean) => void, repoPath?: string, remaining = 8, batch?: (pending: boolean) => void): void {
+  pickIntakeFile(callback: (chip: AttachmentChip, uploaded: boolean) => void, repoPath?: string, remaining = 8, batch?: (pending: boolean, error?: string) => void): void {
     this.closePicker();
     this.intakeRepoPath = repoPath ?? null; this.intakeRemaining = remaining; this.intakeBatch = batch;
     this.intakeFilePick = callback;
@@ -242,7 +242,7 @@ export class ChatView {
       if (text === '' && this.pending.length === 0) return;
       // Review r1: uploads still in flight must not silently miss the
       // send — hold the gesture until they land (or fail).
-      if (this.uploading.size > 0) {
+      if (this.uploading.size > this.intakeUploading.size) {
         this.ephemeralNote('an upload is still on its way — one moment…');
         return;
       }
@@ -605,8 +605,10 @@ export class ChatView {
       const chooser = this.deviceChooser; this.deviceChooser = null;
       if (chooser === null || chooser.epoch !== this.attachEpoch || chooser.generation !== this.browseGeneration || this.intakeRepoPick !== null || this.fileInput.disabled) return;
       const { pick, remaining, batch } = chooser;
+      if (files.length === 0) return;
       if (pick !== null && files.length > remaining) {
-        this.ephemeralNote('Intake document cap reached (8). Retry a complete selection within the remaining document slots.'); this.closePicker(); return;
+        const error = 'Intake document cap reached (8). Retry a complete selection within the remaining document slots.';
+        batch?.(false, error); this.ephemeralNote(error); this.closePicker(); return;
       }
       if (pick === null) for (const file of files) void this.takeDeviceFile(file);
       else {
@@ -619,15 +621,15 @@ export class ChatView {
           await this.takeDeviceFile(file, (uploaded) => { chip = uploaded; });
           return chip;
         })).then((chips) => {
-          batch?.(false);
           // Once captured, this batch belongs to its original consumer. Opening
           // the independent chat picker must not silently discard its sources;
           // the intake callback still guards its own source/pairing generation.
           if (epoch !== this.attachEpoch) return;
           if (chips.some((chip) => chip === undefined)) {
-            this.ephemeralNote('Intake documents were not selected: an upload failed. Retry the complete selection.');
-            return;
+            const error = 'Intake documents were not selected: an upload failed. Retry the complete selection.';
+            batch?.(false, error); this.ephemeralNote(error); return;
           }
+          batch?.(false);
           for (const chip of chips) if (chip !== undefined) pick(chip, true);
         });
       }
@@ -809,7 +811,8 @@ export class ChatView {
 
   private renderChips(): void {
     this.chipsRow.replaceChildren();
-    for (const name of this.uploading.values()) {
+    for (const [id, name] of this.uploading) {
+      if (this.intakeUploading.has(id)) continue;
       const chip = el('span', 'attach-chip attach-chip--busy', `⏳ ${name}`);
       this.chipsRow.append(chip);
     }

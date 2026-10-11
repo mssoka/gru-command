@@ -49,7 +49,6 @@ const wsUrl = `${secure ? 'wss' : 'ws'}://${location.host}${WS_PATH}`;
 let client: ChatClient | null = null;
 let chatView: ChatView | null = null;
 let intakeView: IntakeView | null = null;
-let intakeToken: string | null = null;
 let boardClient: BoardClient | null = null;
 let boardView: BoardView | null = null;
 let transcriptView: TranscriptView | null = null;
@@ -121,8 +120,9 @@ function failPairing(message: string): void {
   clearBanner('conn');
   storage.removeItem(TOKEN_KEY);
   showPairing();
+  // Transport/credential failure does not abandon an ambiguous decision.
+  // Disable effects, retaining identities for read-only recovery after pairing.
   intakeView?.bind(null);
-  intakeView?.clearRecovery();
   showPairingError(`Pairing failed: ${message}`);
 }
 
@@ -260,8 +260,6 @@ function startChat(token: string): void {
     setItem: (key, value) => window.sessionStorage.setItem(key, value),
     removeItem: (key) => window.sessionStorage.removeItem(key),
   });
-  if (intakeToken !== null && intakeToken !== token) intakeView.clearRecovery();
-  intakeToken = token;
   intakeView.bind(new IntakeClient({ token, host: location.host, secure }));
   client?.stop();
   let replaying = false;
@@ -445,7 +443,6 @@ initSettings({
   onUnpair: () => {
     intakeView?.bind(null);
     intakeView?.clearRecovery();
-    intakeToken = null;
     client?.stop();
     boardClient?.stop();
     client = null;

@@ -23,6 +23,127 @@ function fixture() {
   };
   return { root, picker, client, view, button, click, preview };
 }
+describe('intake exact observational recovery', () => {
+  it('keeps failed document selection blocked until explicit abandonment or a complete retry', async () => {
+    const h = fixture(); await h.preview(); await h.click('Review this revision');
+    const box = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; box.checked = true; box.dispatchEvent(new Event('change'));
+    let batch!: (pending: boolean, error?: string) => void;
+    let publish!: (chip: AttachmentChip, uploaded: boolean) => void;
+    h.picker.pickIntakeFile.mockImplementation((callback, _repo, _remaining, update) => { publish = callback; batch = update!; });
+    await h.click('Browse / upload documents'); batch(true); batch(false, 'Intake documents were not selected: an upload failed. Retry the complete selection.');
+    expect(h.root.querySelector('.intake-status')!.textContent).toContain('upload failed');
+    expect(h.root.textContent).not.toContain('Complete document batch finished');
+    expect(h.button('Preview sources').disabled).toBe(true); expect(h.button('Approve selected work').disabled).toBe(true);
+    h.button('Preview sources').click(); h.button('Approve selected work').click();
+    expect(h.client.preview).toHaveBeenCalledTimes(1); expect(h.client.approve).not.toHaveBeenCalled();
+    await h.click('Abandon failed document selection');
+    expect(h.button('Approve selected work').disabled).toBe(false);
+    await h.click('Browse / upload documents'); batch(true); batch(false, 'Retry still failed');
+    await h.click('Browse / upload documents'); batch(true); batch(false);
+    publish({ path: '/uploads/support.md', name: 'support.md', kind: 'file' }, true);
+    await h.click('Preview sources');
+    expect(h.client.preview.mock.calls.at(-1)![0].source).toMatchObject({ document: { path: 'spec.md' }, supporting: [{ uploadPath: '/uploads/support.md' }] });
+  });
+
+  it.each(['selection', 'review token'])('never associates a competing %s receipt with the original intent', async (difference) => {
+    const h = fixture();
+    const p = { ...proposal, plan: { ...proposal.plan, heists: [proposal.plan.heists[0]!, { ...proposal.plan.heists[0]!, id: 'two' }] } };
+    h.client.preview.mockResolvedValue(p); h.client.read.mockResolvedValue(p);
+    await h.preview(); await h.click('Review this revision');
+    const box = h.root.querySelector<HTMLInputElement>('[data-heist-id="one"]')!; box.checked = true; box.dispatchEvent(new Event('change'));
+    h.client.approve.mockRejectedValueOnce(new IntakeClientError('intake_unreachable', 'Response lost')); await h.click('Approve selected work');
+    const original = h.client.approve.mock.calls[0]![0];
+    const other: IntakeReadback = { ...partial, review: { ...partial.review!, previousToken: difference === 'review token' ? '9'.repeat(64) : partial.review!.previousToken, selected: difference === 'selection' ? ['two'] : ['one'] }, remaining: [{ heistId: difference === 'selection' ? 'two' : 'one', entryId: 'other-entry' }] };
+    h.client.readback.mockResolvedValue(other); h.view.bind(h.client as unknown as IntakeClient);
+    await vi.waitFor(() => expect(h.root.querySelector('.intake-approval-recovery')!.textContent).toContain('intake_acceptance_conflict'));
+    expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).approvals).toEqual([{ request: original }]);
+    expect(h.root.querySelector('.intake-approval-recovery')!.textContent).toContain('not confirmed');
+    expect(h.button('Retry original approval r1')).toBeDefined();
+    expect(h.button('Retry identical approval').disabled).toBe(true);
+    expect(h.client.approve).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a mismatched successful approval response without stamping its token onto original intent', async () => {
+    const h = fixture(); await h.preview(); await h.click('Review this revision');
+    const box = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; box.checked = true; box.dispatchEvent(new Event('change'));
+    h.client.approve.mockResolvedValueOnce({ ...partial, review: { ...partial.review!, selected: ['another'] } });
+    await h.click('Approve selected work');
+    expect(h.root.querySelector('.intake-status')!.textContent).toContain('intake_acceptance_conflict');
+    expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).approvals[0]).toEqual({ request: h.client.approve.mock.calls[0]![0] });
+    expect(h.root.querySelector('.intake-approval-recovery')!.textContent).toContain('not confirmed');
+  });
+
+  it('matches the original selected set regardless of click order', async () => {
+    const h = fixture(); const p = { ...proposal, plan: { ...proposal.plan, heists: [proposal.plan.heists[0]!, { ...proposal.plan.heists[0]!, id: 'two' }] } };
+    h.client.preview.mockResolvedValue(p); await h.preview(); await h.click('Review this revision');
+    for (const id of ['two', 'one']) { const box = h.root.querySelector<HTMLInputElement>(`[data-heist-id="${id}"]`)!; box.checked = true; box.dispatchEvent(new Event('change')); }
+    const accepted: IntakeReadback = { ...partial, review: { ...partial.review!, selected: ['one', 'two'] }, accepted: [{ heistId: 'one', entryId: 'accepted-one', state: 'waiting' }, { heistId: 'two', entryId: 'accepted-two', state: 'waiting' }], remaining: [] };
+    h.client.approve.mockResolvedValueOnce(accepted); await h.click('Approve selected work');
+    expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).approvals[0].token).toBe(accepted.review!.token);
+    expect(h.root.querySelector('.intake-approval-recovery')!.textContent).toContain('two → accepted-two');
+  });
+
+  it('refreshes the same immutable proposal without discarding dirty editor bytes or allowing approval', async () => {
+    const h = fixture(); await h.preview(); await h.click('Review this revision');
+    const box = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; box.checked = true; box.dispatchEvent(new Event('change'));
+    const editor = h.root.querySelector('textarea')!;
+    const bytes = JSON.stringify({ ...proposal.plan, questions: ['Unsaved private clarification'] });
+    editor.value = bytes; editor.dispatchEvent(new Event('input'));
+    h.client.readback.mockResolvedValue(reviewed); await h.click('Read back / recover');
+    expect(editor.value).toBe(bytes); expect(h.button('Save new revision').disabled).toBe(false); expect(h.button('Approve selected work').disabled).toBe(true);
+    expect(sessionStorage.getItem('gru-intake-recovery')).not.toContain('Unsaved private clarification');
+    expect(h.client.revise).not.toHaveBeenCalled(); expect(h.client.approve).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('recovers a committed pending revision, preserving only newer local edits: %s', async (editedAgain) => {
+    const h = fixture(); await h.preview();
+    const editor = h.root.querySelector('textarea')!;
+    const sent = { ...proposal.plan, questions: ['Sent original refinement'] };
+    editor.value = JSON.stringify(sent); editor.dispatchEvent(new Event('input'));
+    let committed!: Proposal;
+    h.client.revise.mockImplementationOnce(async (request) => { committed = { ...proposal, requestId: request.requestId, revisionId: 'f'.repeat(64), plan: { heists: request.plan.heists, questions: request.plan.questions, unmapped: request.plan.unmapped } }; throw new IntakeClientError('intake_unreachable', 'Response lost'); });
+    await h.click('Save new revision');
+    const newer = JSON.stringify({ ...sent, questions: ['Newer unsaved private clarification'] });
+    if (editedAgain) { editor.value = newer; editor.dispatchEvent(new Event('input')); }
+    h.client.read.mockResolvedValue(committed); await h.click('Read back / recover');
+    expect(editor.value).toBe(editedAgain ? newer : JSON.stringify(committed.plan, null, 2)); expect(h.button('Save new revision').disabled).toBe(!editedAgain);
+    expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!)).toMatchObject({ draft: { requestId: committed.requestId }, pendingRevision: null });
+    expect(sessionStorage.getItem('gru-intake-recovery')).not.toContain('Newer unsaved');
+    expect(h.client.revise).toHaveBeenCalledTimes(1); expect(h.client.approve).not.toHaveBeenCalled();
+  });
+
+  it.each(['intake_invalid_request', 'intake_unreachable', 'intake_storage_error'])('handles replacement preview refusal %s without confusing definite and ambiguous outcomes', async (code) => {
+    const h = fixture(); await h.preview(); const previous = JSON.parse(sessionStorage.getItem('gru-intake-recovery')!);
+    h.client.preview.mockRejectedValueOnce(new IntakeClientError(code, 'Preview refused')); await h.click('Preview sources');
+    const saved = JSON.parse(sessionStorage.getItem('gru-intake-recovery')!);
+    if (code === 'intake_invalid_request') {
+      expect(saved).toEqual(previous); h.view.bind(h.client as unknown as IntakeClient);
+      await vi.waitFor(() => expect(h.client.read).toHaveBeenCalledWith(proposal.repoPath, proposal.intakeId, proposal.requestId));
+    } else expect(saved.draft.requestId).not.toBe(previous.draft.requestId);
+    expect(h.client.approve).not.toHaveBeenCalled();
+  });
+
+  it('prunes removed receipt buttons during delayed progressive recovery', async () => {
+    const h = fixture();
+    const approvals = Array.from({ length: 20 }, (_, index) => ({ request: { repoPath: proposal.repoPath, intakeId: `progress-${index}`, requestId: 'r1', revisionId: index.toString(16).padStart(64, '0'), expectedToken: reviewed.review!.token, selected: ['one'] } }));
+    sessionStorage.setItem('gru-intake-recovery', JSON.stringify({ draft: { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: 'r1' }, pendingRevision: null, approvals }));
+    const releases = new Map<string, (value: IntakeReadback) => void>();
+    h.client.readback.mockImplementation((_repo, intake) => intake === proposal.intakeId ? Promise.resolve(reviewed) : new Promise((resolve) => releases.set(intake, resolve)));
+    h.view.bind(h.client as unknown as IntakeClient);
+    await vi.waitFor(() => expect(h.button('Choose repository').disabled).toBe(false));
+    for (const { request } of approvals) {
+      await vi.waitFor(() => expect(releases.has(request.intakeId)).toBe(true));
+      releases.get(request.intakeId)!({ ...reviewed, review: { ...reviewed.review!, intakeId: request.intakeId, revisionId: request.revisionId } });
+      await Promise.resolve(); await Promise.resolve();
+    }
+    await vi.waitFor(() => expect((h.view as unknown as { receiptActive: number }).receiptActive).toBe(0));
+    const buttons = (h.view as unknown as { buttons: HTMLButtonElement[] }).buttons;
+    expect(buttons.every((button) => h.root.contains(button))).toBe(true);
+    expect(buttons).toHaveLength(h.root.querySelectorAll('button').length);
+    expect(h.client.approve).not.toHaveBeenCalled();
+  });
+});
+
 describe('compact intake review in existing chat', () => {
   it.each(['issue', 'spec', 'bmad'])('previews %s without any automatic approval and displays captured review', async (kind) => {
     const h = fixture(); await h.preview(kind);
@@ -426,7 +547,7 @@ it('atomically refuses serialized over-budget recovery before sending approval o
 
 it('reads healthy current draft independently of slow receipts with bounded progressive recovery', async () => {
   const h = fixture();
-  const approvals = Array.from({ length: 6 }, (_, i) => ({ request: { repoPath: proposal.repoPath, intakeId: `slow-${i}`, requestId: 'r1', revisionId: i.toString(16).padStart(64, '0'), expectedToken: null, selected: ['one'] }, token: i.toString(16).padStart(64, '0') }));
+  const approvals = Array.from({ length: 6 }, (_, i) => ({ request: { repoPath: proposal.repoPath, intakeId: `slow-${i}`, requestId: 'r1', revisionId: i.toString(16).padStart(64, '0'), expectedToken: reviewed.review!.token, selected: ['one'] }, token: i.toString(16).padStart(64, '0') }));
   sessionStorage.setItem('gru-intake-recovery', JSON.stringify({ draft: { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: 'r1' }, pendingRevision: null, approvals }));
   const release: ((r: IntakeReadback) => void)[] = [];
   h.client.readback.mockImplementation((_repo, _intake, token) => token === undefined ? Promise.resolve(reviewed) : new Promise((resolve) => release.push(resolve)));
@@ -443,7 +564,7 @@ it.each(['gaps', 'unmapped', 'plan-question', 'heist-question'])('disables new a
   const h = fixture(); const p = { ...proposal, gaps: blocker === 'gaps' ? [{ code: 'missing', locator: 'source', question: 'Source missing' }] : [], plan: { ...proposal.plan, unmapped: blocker === 'unmapped' ? [{ requirementId: 'requirement', question: 'Requirement missing' }] : [], questions: blocker === 'plan-question' ? ['Plan missing'] : [], heists: proposal.plan.heists.map((heist) => ({ ...heist, unresolvedQuestions: blocker === 'heist-question' ? ['Heist missing'] : [] })) } } as Proposal;
   h.client.preview.mockResolvedValueOnce(p); await h.preview(); await h.click('Review this revision');
   const box = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; box.checked = true; box.dispatchEvent(new Event('change'));
-  expect(h.button('Approve selected work').disabled).toBe(true); expect(h.root.textContent).toContain('Resolve source gaps, unmapped requirements and unanswered questions'); expect(h.client.approve).not.toHaveBeenCalled();
+  expect(h.button('Approve selected work').disabled).toBe(true); expect(h.root.textContent).toContain(blocker === 'gaps' ? 'Repair or reselect source documents and preview again' : 'unmapped requirements and unanswered questions in the plan editor'); expect(h.client.approve).not.toHaveBeenCalled();
 });
 
 it('exposes immutable previous revision comparison in this intake disclosure', async () => {

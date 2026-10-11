@@ -235,8 +235,11 @@ spec or BMAD Markdown document. Workspace file choices are bounded to the select
 repository; device documents use the managed upload store. The first selected
 document is primary, regardless of upload completion order; subsequent documents
 are explicit supporting inputs. An incomplete upload batch is refused visibly,
-not silently narrowed. Intake's eight-document limit is independent of ready chat
-attachments. Preview and intake decisions wait for the complete in-flight batch.
+not silently narrowed. Retry the complete selection or explicitly **Abandon failed
+document selection** before preview or new decisions. Intake's eight-document limit
+is independent of ready chat attachments. Its in-flight uploads do not appear in
+composer chips or block ordinary chat sends. Preview and intake decisions wait for
+the complete in-flight batch.
 Changing repositories clears previously selected documents. Device chooser results
 remain bound to the picker/pairing that opened them, never a later chat/intake target.
 Once a selection is captured, opening the ordinary chat picker does not discard
@@ -251,7 +254,9 @@ this disclosure before review/approval. Clearing default questions or cosmetical
 changing known default case/terminal punctuation cannot make a plan executable.
 Concrete clarification statements remain allowed; syntax is not semantic proof.
 Known source gaps, unmapped requirements and plan/selected-heist questions disable
-new approval with instructions to refine and review again; the server enforces them.
+new approval; the server enforces them. Captured source gaps require repairing or
+reselecting sources and a new preview, not deleting questions in the plan editor.
+Editable plan questions/unmapped requirements require refinement and renewed review.
 
 Click **Review this revision**, select the complete heists and their prerequisite
 closure, then **Approve selected work**. Selection never implies approval.
@@ -288,7 +293,10 @@ releases only this tab's pending identity without posting replacement work.
 Recovery writes validate the reader's full identity/selection limits and 2-MiB
 serialized bound before effects; the tab retains at most 128 original approvals.
 Unavailable durable browser storage fails intake visibly closed; chat's existing
-safe storage fallback is unchanged. Unpairing clears this tab recovery.
+safe storage fallback is unchanged. Automatic authentication/protocol failures and
+credential re-pairing retain these identities; only explicit **Unpair this browser**
+clears them. Observational recovery preserves unsaved editor text, including edits
+made after an ambiguous revision submission, without storing those private bytes.
 
 Accepted contracts never change after later previews or source edits. Previously
 accepted history remains readable, including when a newer revision is reviewed.
@@ -297,6 +305,9 @@ receipts. Original approval rows name accepted/remaining entries; their explicit
 retry buttons reuse the original token and selection without replacing the newer
 draft. If a response was lost before its receipt arrived, the original approval
 remains unconfirmed until readback or an explicit identical retry succeeds.
+Receipts must match the original repository/intake/request/revision, preceding
+review token and canonical selected set. A competing decision stays visibly
+conflicting rather than substituting another selection or hiding the original retry.
 Each failed historical receipt is reported without preventing independent healthy
 receipt/draft reads. The current draft reads independently; historical receipts
 render progressively with at most four concurrent receipt reads, including across
@@ -308,7 +319,11 @@ never synthesize an accepted plan. Verification is bounded to 4,096 decisions an
 over-budget history. Further appends refuse with `intake_storage_error`; use a new
 intake, retaining the original history. Accepted readback verifies every immutable
 pipeline field/fingerprint, including default priority/scopes; owner holds and
-lifecycle transitions remain valid. Execution retains GC-owned routing and private
+lifecycle transitions remain valid. A missing entry with an existing minion or durable
+enqueue witness returns `intake_acceptance_conflict`: restore the pipeline ledger,
+never recreate committed/occupied identities. Truly never-enqueued frozen entries
+remain retryable. Additive recovery indexes retain existing decisions/events.
+Execution retains GC-owned routing and private
 operational artifacts; approved repository knowledge belongs only to the assigned
 worktree's `gru-output/`. This feature never rewrites sources, upstream status,
 old jobs, historical workflow bindings, Perkins policy or the Book of Lessons.

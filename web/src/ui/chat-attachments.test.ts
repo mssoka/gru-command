@@ -485,6 +485,22 @@ describe('composer attach consumer paths', () => {
   });
 });
 
+it('keeps intake progress out of the composer and permits chat during the captured upload', async () => {
+  const onSend = vi.fn(() => true), view = new ChatView(onSend);
+  let release!: (uploaded: UploadedFile) => void;
+  view.bindAttach(surface({ upload: () => new Promise((resolve) => { release = resolve; }) }));
+  const picked = vi.fn(), batch = vi.fn(); view.pickIntakeFile(picked, '/workspace/app', 8, batch); await settle();
+  const input = document.getElementById('chat-attach-file') as HTMLInputElement;
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['source'], 'intake-only.md')] });
+  document.getElementById('attach-picker-device')!.click(); input.dispatchEvent(new Event('change'));
+  expect(batch).toHaveBeenLastCalledWith(true); expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(0);
+  (document.getElementById('chat-input') as HTMLTextAreaElement).value = 'ordinary chat remains independent';
+  document.getElementById('chat-form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+  expect(onSend).toHaveBeenCalledWith('ordinary chat remains independent', undefined); expect(picked).not.toHaveBeenCalled();
+  release({ path: '/uploads/intake-only.md', name: 'intake-only.md', bytes: 6 });
+  await vi.waitFor(() => expect(picked).toHaveBeenCalledOnce()); expect(batch).toHaveBeenLastCalledWith(false);
+});
+
 it('publishes intake device uploads in chooser order despite reversed completion, without composer chips', async () => {
   const view = new ChatView(() => true);
   const resolves = new Map<string, (value: UploadedFile) => void>();
@@ -507,12 +523,11 @@ it.each(['primary.md', 'support.md'])('refuses an incomplete intake upload selec
     if (file.name === failed) throw new Error('upload unavailable');
     return { path: `/uploads/${file.name}`, name: file.name, bytes: file.size };
   } }));
-  const picked = vi.fn(); view.pickIntakeFile(picked);
+  const picked = vi.fn(), batch = vi.fn(); view.pickIntakeFile(picked, '/workspace/app', 8, batch);
   const input = document.getElementById('chat-attach-file') as HTMLInputElement;
   Object.defineProperty(input, 'files', { configurable: true, value: [new File(['primary'], 'primary.md'), new File(['support'], 'support.md')] });
   document.getElementById('attach-picker-device')!.click(); input.dispatchEvent(new Event('change'));
-  await vi.waitFor(() => expect(document.querySelectorAll('.attach-chip--busy')).toHaveLength(0));
-  await settle();
+  await vi.waitFor(() => expect(batch).toHaveBeenLastCalledWith(false, 'Intake documents were not selected: an upload failed. Retry the complete selection.'));
   expect(picked).not.toHaveBeenCalled();
   expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(0);
   expect(document.getElementById('chat-log')!.textContent).toContain('Intake documents were not selected: an upload failed. Retry the complete selection.');
