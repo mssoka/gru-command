@@ -254,6 +254,38 @@ function proposalReviewView(): Record<string, unknown> {
   };
 }
 
+/** A discussion-only owner decision: no options yet, so the card's
+ * supported action is the chat route — used to measure the discussion
+ * text's contrast under the real text-only zoom. */
+function discussionNotification(): NotificationView {
+  return {
+    id: 'discuss-1',
+    ts: T0,
+    kind: 'gru.owner-escalation',
+    routing: 'needs-owner',
+    severity: 'info',
+    title: 'Which shape should the dashboard take?',
+    detail: 'Talk it through with Gru before a choice is recorded.',
+    agentId: null,
+    shownAt: null,
+    ackedAt: null,
+    resolvedAt: null,
+    resolvedBy: null,
+    decision: {
+      question: 'Which shape should the dashboard take?',
+      context: 'The discussion has not converged on a concrete option.',
+      recommendation: null,
+      reservedClass: 'scope-design',
+      whyNotDelegable: 'It changes the agreed product scope.',
+      options: [],
+      discussion: true,
+    },
+    decidedAt: null,
+    decidedBy: null,
+    decidedOption: null,
+  };
+}
+
 function job(id: string, status: string, title: string): JobView {
   return {
     id,
@@ -433,6 +465,38 @@ async function clickBell(page: Page): Promise<void> {
   const bell = page.locator('#notification-bell');
   await bell.click();
   await expect(page.locator('#notification-panel')).toBeVisible();
+}
+
+/** Real TEXT-ONLY zoom for Chromium, which exposes no native text-only
+ * mode: snapshot every element's computed font size and set it to EXACTLY
+ * 2x inline — no root/page zoom, no viewport or deviceScaleFactor change,
+ * so layout/container widths stay fixed while the rendered glyphs double
+ * and text wraps the way Firefox's "zoom text only" makes it. Elements are
+ * marked so a later re-application (needed after the SPA rebuilds DOM) only
+ * scales NEW nodes and never compounds; the returned samples let tests
+ * assert the mechanism itself rather than infer it from a title or image. */
+async function applyTextOnlyZoom(
+  page: Page,
+  factor = 2,
+  probeSelector = '[data-notification-id="decision-1"] .board-notification__title',
+): Promise<{ scaled: number; probeBefore: number; probeAfter: number }> {
+  return page.evaluate(
+    ({ scale, selector }) => {
+      const mark = 'textZoomApplied';
+      const probe = document.querySelector<HTMLElement>(selector) ?? document.body;
+      const fresh = [...document.querySelectorAll<HTMLElement>('*')]
+        .filter((element) => element.dataset[mark] !== String(scale))
+        .map((element) => [element, Number.parseFloat(getComputedStyle(element).fontSize)] as const)
+        .filter(([, size]) => Number.isFinite(size) && size > 0);
+      const probeBefore = Number.parseFloat(getComputedStyle(probe).fontSize);
+      for (const [element, size] of fresh) {
+        element.style.fontSize = `${size * scale}px`;
+        element.dataset[mark] = String(scale);
+      }
+      return { scaled: fresh.length, probeBefore, probeAfter: Number.parseFloat(getComputedStyle(probe).fontSize) };
+    },
+    { scale: factor, selector: probeSelector },
+  );
 }
 
 test.describe('notification readability — fixed long-content fixtures', () => {
@@ -619,15 +683,12 @@ test.describe('notification readability — fixed long-content fixtures', () => 
     }
   });
 
-  test('real 200% text zoom (CSS zoom): the board and the proposal review reflow with nonzero geometry', async ({ browser }) => {
-    // Chromium exposes no text-only zoom; `zoom: 2` on the root scales text
-    // AND layout exactly like browser zoom (the honest approximation, and
-    // the assertions below prove reflow rather than a viewport change). The
-    // 1600px window stands for a 1600px display at 200%: the rendered CSS
-    // layout width is 800px, one of the widths exercised above. (On a
-    // 1280px display the console split keeps its own pre-existing minimum
-    // width and scrolls horizontally; the notification surfaces asserted
-    // here are unaffected by that chrome behavior.)
+  test('200% PAGE zoom (CSS zoom scales text AND layout together): the board and the proposal review reflow', async ({ browser }) => {
+    // This case is page zoom, NOT text-only zoom: `zoom: 2` on the root
+    // scales text and layout together and halves the effective layout width
+    // (the 1600px window renders like an 800px one). It is retained as a
+    // page-zoom reflow check only — the actual 200% TEXT-ONLY requirement is
+    // covered by the computed-font-size tests below.
     for (const theme of ['light', 'dark'] as const) {
       const page = await browser.newPage({ viewport: { width: 1600, height: 1200 } });
       try {
@@ -664,7 +725,199 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         expect(reviewBox?.height ?? 0).toBeGreaterThan(0);
         const proposalOverflow = await overflows(page, '#board-owner [data-proposal-id="proposal-1"]');
         expect(proposalOverflow.scrollWidth).toBeLessThanOrEqual(proposalOverflow.clientWidth + 1);
-        await captureViewport(page, `${theme}-text-zoom-200`, `${theme}: real 200% text zoom, decision + proposal review expanded`);
+        await captureViewport(page, `${theme}-page-zoom-200`, `${theme}: 200% page zoom (CSS zoom; text and layout scale), decision + proposal review expanded`);
+      } finally {
+        await page.close();
+      }
+    }
+  });
+
+  test('actual 200% text-only zoom: rendered text doubles while viewport and container scale stay fixed', async ({ browser }) => {
+    for (const theme of ['light', 'dark'] as const) {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+      try {
+        const withDiscussion = fixtureSnapshot({
+          notifications: [...fixtureSnapshot().notifications, discussionNotification()],
+        });
+        const seed = await seedBoard(page, withDiscussion, proposalReviewView());
+        await pairAndOpenBoard(page);
+        if (theme === 'dark') {
+          await page.locator('#theme-toggle').click();
+          await expect(page.locator('html')).toHaveClass(/dark/);
+        }
+        await settled(page);
+        expect(seed.pageErrors).toEqual([]);
+
+        // Fixed-scale invariants BEFORE the text pass.
+        const before = await page.evaluate(() => ({
+          viewport: window.innerWidth,
+          dpr: window.devicePixelRatio,
+          ownerWidth: document.getElementById('board-owner')!.clientWidth,
+        }));
+        const titleBefore = await page
+          .locator('#board-owner [data-notification-id="decision-1"] .board-notification__title')
+          .boundingBox();
+
+        // The operative text-only mechanism: computed font sizes x2, nothing
+        // else — no page/root zoom, no viewport or DPR change.
+        const zoom = await applyTextOnlyZoom(page);
+        expect(zoom.scaled).toBeGreaterThan(200);
+        expect(zoom.probeBefore).toBeGreaterThan(0);
+        expect(zoom.probeAfter).toBeGreaterThanOrEqual(zoom.probeBefore * 2 - 0.5);
+        expect(await page.evaluate(() => document.documentElement.style.zoom)).toBe('');
+        const after = await page.evaluate(() => ({
+          viewport: window.innerWidth,
+          dpr: window.devicePixelRatio,
+          ownerWidth: document.getElementById('board-owner')!.clientWidth,
+        }));
+        // Not doubled, not halved: only scrollbar toggling may differ.
+        expect(Math.abs(after.viewport - before.viewport)).toBeLessThanOrEqual(20);
+        expect(after.dpr).toBe(before.dpr);
+        expect(after.ownerWidth).toBe(before.ownerWidth);
+        // Actual measured glyph growth at the fixed width: the same title
+        // needs more vertical space and never more than its container.
+        const titleAfter = await page
+          .locator('#board-owner [data-notification-id="decision-1"] .board-notification__title')
+          .boundingBox();
+        expect(titleAfter!.height).toBeGreaterThan(titleBefore!.height);
+        expect(titleAfter!.width).toBeLessThanOrEqual(titleBefore!.width + 1);
+
+        // Full expanded content: geometry, non-overlap, reachability.
+        const card = page.locator('#board-owner [data-notification-id="decision-1"]');
+        await card.locator('.board-notification__details summary').click();
+        const detail = card.locator('.board-notification__detail-text');
+        await expect(detail).toContainText(LONG_PATH);
+        const detailBox = await detail.boundingBox();
+        expect(detailBox?.width ?? 0).toBeGreaterThan(0);
+        expect(detailBox?.height ?? 0).toBeGreaterThan(0);
+        const cardOverflow = await overflows(page, '#board-owner [data-notification-id="decision-1"]');
+        expect(cardOverflow.scrollWidth, `decision card @1280 ${theme} text-only`).toBeLessThanOrEqual(cardOverflow.clientWidth + 1);
+        const option = card.locator('[data-action-id$=":option:approve"]');
+        await option.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+        await expect(option).toBeVisible();
+        const hit = await option.evaluate((element) => {
+          const rect = element.getBoundingClientRect();
+          const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          return topmost !== null && (topmost === element || element.contains(topmost));
+        });
+        expect(hit).toBe(true);
+        await option.click({ trial: true });
+
+        // Focus + open disclosure survive a snapshot replacement; the SPA
+        // rebuild drops inline sizing, so the mechanism is re-applied — and
+        // the marker keeps it from compounding.
+        const summary = card.locator('.board-notification__details summary');
+        await summary.focus();
+        expect(await summary.evaluate((element) => (element.parentElement as HTMLDetailsElement).open)).toBe(true);
+        seed.push(withDiscussion);
+        await settled(page);
+        const reapplied = await applyTextOnlyZoom(page);
+        expect(reapplied.scaled).toBeGreaterThan(0);
+        const summaryAfter = page.locator('#board-owner [data-notification-id="decision-1"] .board-notification__details summary');
+        expect(await summaryAfter.evaluate((element) => (element.parentElement as HTMLDetailsElement).open)).toBe(true);
+        await expect(summaryAfter).toBeFocused();
+
+        // Owner-only proposal boundaries stay shown and untouched.
+        const proposal = page.locator('#board-owner [data-proposal-id="proposal-1"]');
+        await expect(proposal.locator('.board-owner__accept')).toBeVisible();
+        await expect(proposal.locator('.board-owner__reject')).toBeVisible();
+
+        // AA 4.5 under text-only zoom: error-card text and the discussion
+        // guidance keep their measured contrast in both themes.
+        await clickBell(page);
+        await expect(
+          page.locator('#notification-list [data-notification-id="discuss-1"] .board-notification__discuss-text'),
+        ).toBeVisible();
+        const pairs: readonly (readonly [string, string])[] = [
+          ['#notification-list [data-notification-id="machine-1"] .board-notification__title', 'machine (error) title'],
+          ['#notification-list [data-notification-id="machine-1"] .board-notification__detail-text', 'machine (error) expanded evidence'],
+          ['#notification-list [data-notification-id="discuss-1"] .board-notification__discuss-text', 'discussion guidance text'],
+        ];
+        const failures: { pair: string; ratio: number }[] = [];
+        for (const [selector, label] of pairs) {
+          const ratio = await contrastOf(page, selector);
+          if (ratio < 4.5) failures.push({ pair: `${label} (${theme})`, ratio });
+        }
+        expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
+        await captureViewport(page, `${theme}-text-only-zoom-200-desktop`, `${theme}: actual 200% text-only zoom, decision Details + discussion card`);
+      } finally {
+        await page.close();
+      }
+    }
+  });
+
+  test('actual 200% text-only zoom at 390/768/1280 and the 320px container: expanded content stays reachable in both themes', async ({ browser }) => {
+    for (const theme of ['light', 'dark'] as const) {
+      for (const width of [390, 768, 1280]) {
+        const page = await browser.newPage({ viewport: { width, height: 900 } });
+        try {
+          const seed = await seedBoard(page, fixtureSnapshot());
+          await pairAndOpenBoard(page);
+          if (theme === 'dark') {
+            await page.locator('#theme-toggle').click();
+            await expect(page.locator('html')).toHaveClass(/dark/);
+          }
+          await settled(page);
+          expect(seed.pageErrors).toEqual([]);
+          const zoom = await applyTextOnlyZoom(page);
+          expect(zoom.probeAfter).toBeGreaterThanOrEqual(zoom.probeBefore * 2 - 0.5);
+          const card = page.locator('#board-owner [data-notification-id="decision-1"]');
+          await card.locator('.board-notification__details summary').click();
+          await expect(card.locator('.board-notification__detail-text')).toContainText(LONG_PATH);
+          await settled(page);
+          for (const selector of [
+            '#board-owner [data-notification-id="decision-1"]',
+            '#board-owner [data-notification-id="decision-1"] .board-notification__detail-text',
+          ]) {
+            const box = await overflows(page, selector);
+            expect(box.scrollWidth, `${selector} @${width} ${theme} text-only`).toBeLessThanOrEqual(box.clientWidth + 1);
+          }
+          const detailBox = await card.locator('.board-notification__detail-text').boundingBox();
+          expect(detailBox?.width ?? 0, `expanded width @${width} ${theme} text-only`).toBeGreaterThan(0);
+          expect(detailBox?.height ?? 0, `expanded height @${width} ${theme} text-only`).toBeGreaterThan(0);
+          const option = card.locator('[data-action-id$=":option:approve"]');
+          await option.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+          await settled(page);
+          const hit = await option.evaluate((element) => {
+            const rect = element.getBoundingClientRect();
+            const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+            return topmost !== null && (topmost === element || element.contains(topmost));
+          });
+          expect(hit, `option reachable @${width} ${theme} text-only`).toBe(true);
+          await captureViewport(page, `${theme}-text-only-zoom-200-width-${width}`, `${theme}: actual 200% text-only zoom at ${width}px`);
+        } finally {
+          await page.close();
+        }
+      }
+      // The 320px notification container under the same real text zoom.
+      const page = await browser.newPage({ viewport: { width: 320, height: 800 } });
+      try {
+        const seed = await seedBoard(page, fixtureSnapshot());
+        await pairAndOpenBoard(page);
+        if (theme === 'dark') {
+          await page.locator('#theme-toggle').click();
+          await expect(page.locator('html')).toHaveClass(/dark/);
+        }
+        await clickBell(page);
+        await settled(page);
+        expect(seed.pageErrors).toEqual([]);
+        const zoom = await applyTextOnlyZoom(page);
+        expect(zoom.probeAfter).toBeGreaterThanOrEqual(zoom.probeBefore * 2 - 0.5);
+        await page.locator('#notification-list [data-notification-id="machine-1"] .board-notification__details summary').click();
+        await expect(
+          page.locator('#notification-list [data-notification-id="machine-1"] .board-notification__detail-text'),
+        ).toContainText(LONG_SHA);
+        await settled(page);
+        for (const id of ['decision-1', 'machine-1', 'feed-resolved']) {
+          const panelCard = await overflows(page, `#notification-list [data-notification-id="${id}"]`);
+          expect(panelCard.scrollWidth, `${id} @320 panel ${theme} text-only`).toBeLessThanOrEqual(panelCard.clientWidth + 1);
+        }
+        const expandedBox = await page
+          .locator('#notification-list [data-notification-id="machine-1"] .board-notification__detail-text')
+          .boundingBox();
+        expect(expandedBox?.width ?? 0).toBeGreaterThan(0);
+        expect(expandedBox?.height ?? 0).toBeGreaterThan(0);
+        await captureViewport(page, `${theme}-text-only-zoom-200-container-320`, `${theme}: actual 200% text-only zoom, notification panel at 320px`);
       } finally {
         await page.close();
       }
