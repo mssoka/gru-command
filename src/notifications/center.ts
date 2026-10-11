@@ -3,6 +3,7 @@ import type { LogLevel } from '../logger.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { DecisionService } from '../decisions/types.js';
 import { DECISION_SURFACE_EVENT_TRIAGE, eventDecisionRequest, redactedText } from '../decisions/questions.js';
+import { eventTriageRouting } from '../decisions/effects.js';
 import { requiresTypedDecision, resolveNotificationRouting } from './attention.js';
 import {
   parseNotificationDecision,
@@ -373,13 +374,8 @@ export class NotificationCenter {
         const severityAnswer = severityRoute.path === 'fallback'
           ? request.fallback.severity
           : outcome.answers.severity;
-        // Jev may only route UP (fyi → action-required). A deterministic
-        // provenance, a fallback-band action metric, or any low-confidence
-        // answer leaves the safe FYI route in place (fail toward attention).
-        const routing: NotificationRouting =
-          outcome.provenance.source === 'jev' && actionRoute.path !== 'fallback'
-            ? 'action-required'
-            : 'fyi';
+        // Jev may only route UP (fyi → action-required); see eventTriageRouting.
+        const routing: NotificationRouting = eventTriageRouting(outcome);
         const severityLabels = ['low', 'medium', 'high'] as const;
         const severityIndex = Math.min(
           severityLabels.length - 1,

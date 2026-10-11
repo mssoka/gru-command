@@ -2565,6 +2565,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/decisions/cli.js",
   "dist/decisions/config-template.js",
   "dist/decisions/credentials.js",
+  "dist/decisions/effects.js",
   "dist/decisions/enforce.js",
   "dist/decisions/profile.js",
   "dist/decisions/provider.js",
