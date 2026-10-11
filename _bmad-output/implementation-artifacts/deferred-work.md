@@ -153,3 +153,7 @@
 ## Deferred from: native R6 whole review of PR #289 (2026-10-11)
 
 - [Review][Defer] A submitted exact frozen-head/publication-body review with unknown authorship can still be filtered from foreign-account reconciliation (`src/dispatch/perkins.ts` / configured-App review path) — the R6 report verified this F2 shape but marked it explicitly nonholding and outside the current foreign submitted-state correction. It remains a final whole-change follow-up, not a waiver: preserve nullable/covered-empty-list distinctions and do not launch a blanket null/history campaign; the exact-final-head whole native judgment must still resolve the accepted scope.
+
+## Deferred from: tracked review of PR #289 R6 correction (2026-10-11)
+
+- [Review][Defer] Preserve the prior whole-change blocker: GitHub CLI's prepared identity is not bound to the credential used for the irreversible POST (`src/dispatch/perkins.ts`, `GhPrPoster`). The earlier full native review source-traced preparation as A, POST as B after external credential rotation, lost response/crash, and restart as A; the current R6 foreign-submission correction holds an exact visible B-authored review but does not pin credentials. The new blind review repeats the gap and notes the conditional case where the review is not visible to the later lookup. No credential/provider change or live rotation/owner-account experiment is authorized in this lane. Do not mark the blocker false or fixed; leave it for exact-final-head whole native judgment and an explicitly authorized design/test if that judgment requires it.

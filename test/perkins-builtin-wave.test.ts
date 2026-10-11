@@ -12,6 +12,7 @@ import {
   publicationProviderKindFor,
   GitLabMrPoster,
   WaveRunner,
+  parsePostedEventPayload,
   hostDisclosureAppendix,
   redactReviewForPublication,
   settledExecutionFactsLine,
@@ -474,6 +475,66 @@ describe('GitHub SHA-bound Perkins delivery', () => {
       body: 'x', targetSha: head, baseSha: base, reviewEvent: 'COMMENT',
     })).rejects.toThrow(/reviewed repository origin/);
     rmSync(root, { recursive: true, force: true });
+  });
+
+  it('serializes both formal GitHub review intents and verifies their enacted receipt states', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'perkins-gh-formal-post-'));
+    dirs.push(root);
+    const log = join(root, 'calls.jsonl');
+    const binary = join(root, 'gh-double.mjs');
+    const repoPath = join(root, 'repo');
+    execFileSync('git', ['init', repoPath], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repoPath, 'remote', 'add', 'origin', 'https://git.example.test/acme/widget.git']);
+    const head = '1'.repeat(40);
+    const base = '2'.repeat(40);
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nappendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv, input }) + '\\n');\nif (argv.includes('--method') && argv.includes('POST')) {\n  const request = JSON.parse(input);\n  const state = request.event === 'APPROVE' ? 'APPROVED' : request.event === 'REQUEST_CHANGES' ? 'CHANGES_REQUESTED' : 'COMMENTED';\n  const id = request.event === 'APPROVE' ? 9101 : 9102;\n  process.stdout.write(JSON.stringify({ id, user: { login: 'gru-bot' }, state, commit_id: request.commit_id, body: request.body }));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('gru-bot');\n} else {\n  process.stdout.write(${JSON.stringify(`${head}\t${base}\n`)});\n}\n`, 'utf8');
+    chmodSync(binary, 0o755);
+    const poster = new GhPrPoster(binary);
+    const common = {
+      prUrl: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test', repoPath,
+      targetSha: head, baseSha: base,
+    };
+    const approvalBody = 'approval publication\n';
+    const changesBody = 'changes-requested publication\n';
+    await expect(poster.post({ ...common, body: approvalBody, reviewEvent: 'APPROVE' }))
+      .resolves.toMatchObject({ actor: 'gru-bot', event: 'APPROVED', commitId: head, headSha: head });
+    await expect(poster.post({ ...common, body: changesBody, reviewEvent: 'REQUEST_CHANGES' }))
+      .resolves.toMatchObject({ actor: 'gru-bot', event: 'CHANGES_REQUESTED', commitId: head, headSha: head });
+
+    const calls = readFileSync(log, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as { readonly argv: readonly string[]; readonly input: string });
+    const posts = calls.filter((call) => call.argv.includes('--method'));
+    expect(posts.map((call) => JSON.parse(call.input))).toEqual([
+      { body: approvalBody, event: 'APPROVE', commit_id: head },
+      { body: changesBody, event: 'REQUEST_CHANGES', commit_id: head },
+    ]);
+  });
+
+  it('rejects a stored round.posted event whose formal intent contradicts its verdict', () => {
+    const head = '1'.repeat(40);
+    const base = '2'.repeat(40);
+    const digest = 'a'.repeat(64);
+    const common = {
+      url: 'https://git.example.test/acme/widget/pull/42', host: 'git.example.test',
+      targetSha: head, baseSha: base, publicationFile: '/tmp/perkins-report.publication.md',
+      publicationSha256: digest, reconciled: false,
+    };
+    const receipt = (event: string) => ({
+      reviewId: '9001', actor: 'gru-bot', event, commitId: head,
+      headSha: head, baseSha: base, bodySha256: digest,
+    });
+    expect(parsePostedEventPayload({
+      ...common, verdict: 'approved', canonicalVerdict: 'READY TO MERGE', reviewEvent: 'REQUEST_CHANGES',
+      receipt: receipt('CHANGES_REQUESTED'),
+    })).toBeNull();
+    expect(parsePostedEventPayload({
+      ...common, verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', reviewEvent: 'APPROVE',
+      receipt: receipt('APPROVED'),
+    })).toBeNull();
+    expect(parsePostedEventPayload({
+      ...common, verdict: 'approved', canonicalVerdict: 'READY TO MERGE', reviewEvent: 'COMMENT',
+      receipt: receipt('COMMENTED'),
+    })).not.toBeNull();
   });
 
   it('refuses a zero-exit POST with no parsable or unbound receipt, and reconciles an ambiguous post by head+body', async () => {
@@ -9573,6 +9634,38 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     expect(stuckFix.ledger.latestRoundEvent(stuckRound.id, PUBLICATION_RECEIPT_EVENT)).toBeNull();
     expect(pendingPublicationAttempt(stuckFix.ledger, stuckRound.id)?.kind).toBe('unresolved-attempt');
     expect(stuckEscalations.join('\n')).toContain('unresolved');
+  }, 120_000);
+
+  it('keeps a mismatched well-formed absence marker from clearing the interrupted publication attempt', async () => {
+    const fix = durabilityFixture('recover-mismatched-absence');
+    const jobId = 'job-durability-mismatched-absence';
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: 'mismatched absence', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+    fix.ledger.setRoundStatus(round.id, 'live');
+    const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target);
+    const mismatchedAbsence = {
+      targetSha: 'f'.repeat(40), publicationSha256: 'b'.repeat(64),
+      detail: `stale absence for ${attemptPayload.targetSha}`,
+    };
+    fix.ledger.appendCustomEvent({ kind: PUBLICATION_ABSENT_EVENT, jobId, roundId: round.id, payload: mismatchedAbsence });
+    const post = vi.fn();
+    const reconcile = vi.fn(async () => null);
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: durabilityPort(), poster: { post, reconcile },
+      reviewArtifactRoot: fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+
+    await wave.recoverInterruptedRounds();
+    expect(post).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(fix.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT)?.payload).toEqual(mismatchedAbsence);
+    expect(pendingPublicationAttempt(fix.ledger, round.id)?.kind).toBe('unresolved-attempt');
+    expect(fix.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(escalations.join('\n')).toMatch(/absence.*(malformed|does not match|mismatch)|(?:malformed|does not match|mismatch).*absence/iu);
   }, 120_000);
 
   it('never certifies absence when the canonical publication bytes changed after the intent (native R2 F1)', async () => {

@@ -14,7 +14,9 @@
  *   proven frozen-commit receipt as UNCREDITED evidence instead of
  *   discarding it.
  * - `round.publication-absent` is journaled when bounded reconciliation
- *   proves the attempt did not land (a conclusive absence, never assumed).
+ *   proves the attempt did not land; it clears only the later attempt whose
+ *   frozen target and publication digest it binds (a conclusive absence,
+ *   never assumed).
  *
  * `pendingPublicationAttempt` is the shared re-arm guard: a round whose
  * latest attempt has no conclusive outcome (no credited `round.posted`, no
@@ -86,6 +88,13 @@ export interface PublicationIdentityPayload {
   readonly targetSha: string;
 }
 
+export function reviewEventMatchesVerdict(
+  verdict: 'approved' | 'changes-requested',
+  reviewEvent: VerdictReviewEvent,
+): boolean {
+  return reviewEvent === 'COMMENT' || (verdict === 'approved' ? reviewEvent === 'APPROVE' : reviewEvent === 'REQUEST_CHANGES');
+}
+
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
 }
@@ -106,6 +115,7 @@ function parseCommon(payload: unknown): PublicationAttemptPayload | null {
     return null;
   }
   if (reviewEvent !== 'APPROVE' && reviewEvent !== 'REQUEST_CHANGES' && reviewEvent !== 'COMMENT') return null;
+  if (!reviewEventMatchesVerdict(verdict, reviewEvent)) return null;
   if (!boundedString(value['url'], 2_000) || !boundedString(value['host'], 255)) return null;
   if (!boundedString(value['targetSha'], 200) || !boundedString(value['baseSha'], 200)) return null;
   if (!boundedString(value['publicationFile'], 4_096) || !boundedString(value['publicationSha256'], 128)) return null;
@@ -230,9 +240,10 @@ function postedDeliverySummary(payload: unknown): { readonly head: string; reado
  *   exists, so a same-head re-arm must not start a second publication until
  *   the delivery is reconciled;
  * - a durable attempt with no recorded delivery stays unresolved unless a
- *   bounded absence proved it did not land (the only conclusive clear for an
- *   unconcluded attempt); an uncredited receipt or a bare intent holds.
- * A malformed attempt or absence payload fails closed. */
+ *   matching bounded absence proved it did not land (the only conclusive
+ *   clear for an unconcluded attempt, and only when no later provider receipt
+ *   contradicts it); an uncredited receipt or a bare intent holds. A
+ * malformed, mismatched or unbound attempt/absence payload fails closed. */
 export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, roundId: string): PendingPublicationProblem | null {
   const posted = ledger.latestRoundEvent(roundId, 'round.posted');
   const rebindEvent = ledger.latestRoundEvent(roundId, PUBLICATION_REBIND_UNRESOLVED_EVENT);
@@ -258,8 +269,6 @@ export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, rou
   if (attemptEvent === null) return null;
   const attempt = parsePublicationAttemptPayload(attemptEvent.payload);
   const head = attempt?.targetSha ?? 'unknown';
-  const absent = ledger.latestRoundEvent(roundId, PUBLICATION_ABSENT_EVENT);
-  if (absent !== null && absent.seq > attemptEvent.seq && parsePublicationAbsentPayload(absent.payload) !== null) return null;
   const receiptEvent = ledger.latestRoundEvent(roundId, PUBLICATION_RECEIPT_EVENT);
   if (receiptEvent !== null && receiptEvent.seq > attemptEvent.seq) {
     const evidence = parsePublicationReceiptEvidencePayload(receiptEvent.payload);
@@ -267,6 +276,11 @@ export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, rou
       kind: 'uncredited-receipt',
       detail: `an uncredited provider receipt (review ${evidence?.receipt.reviewId ?? 'unknown'}) exists for frozen head ${head}; reconcile it before re-arming a publication on the same head`,
     };
+  }
+  const absent = ledger.latestRoundEvent(roundId, PUBLICATION_ABSENT_EVENT);
+  if (absent !== null && absent.seq > attemptEvent.seq && attempt !== null) {
+    const evidence = parsePublicationAbsentPayload(absent.payload);
+    if (evidence !== null && evidence.targetSha === attempt.targetSha && evidence.publicationSha256 === attempt.publicationSha256) return null;
   }
   return {
     kind: 'unresolved-attempt',

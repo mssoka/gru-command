@@ -56,10 +56,12 @@ import {
   PUBLICATION_IDENTITY_EVENT,
   PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
+  parsePublicationAbsentPayload,
   parsePublicationAttemptPayload,
   parsePublicationIdentityPayload,
   parsePublicationRebindUnresolvedPayload,
   parsePublicationReceiptEvidencePayload,
+  reviewEventMatchesVerdict,
   type PublicationAttemptPayload,
   type PublicationReceiptEvidencePayload,
 } from './publication-evidence.js';
@@ -659,6 +661,7 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
   // records; a present value must be one of the three known events so a
   // corrupt row can never be promoted as a formal delivery.
   if (reviewEventValue !== undefined && reviewEventValue !== 'APPROVE' && reviewEventValue !== 'REQUEST_CHANGES' && reviewEventValue !== 'COMMENT') return null;
+  if (reviewEventValue !== undefined && !reviewEventMatchesVerdict(verdict, reviewEventValue)) return null;
   if (typeof canonicalVerdict !== 'string') return null;
   // The ledger verdict and the recorded canonical verdict must agree — a
   // posted event claiming approval beside a NEEDS CHANGES review is not a
@@ -2687,8 +2690,6 @@ export class WaveRunner {
     const attemptEvent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ATTEMPT_EVENT);
     if (attemptEvent === null) return 'none';
     if (credited !== null && credited.seq > attemptEvent.seq) return 'clear';
-    const absent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT);
-    if (absent !== null && absent.seq > attemptEvent.seq) return 'clear';
     const attempt = parsePublicationAttemptPayload(attemptEvent.payload);
     if (attempt === null) {
       this.escalate(
@@ -2704,6 +2705,19 @@ export class WaveRunner {
       this.escalate(
         `Perkins publication for round ${round.id} was proven at the provider but never credited`,
         `an uncredited receipt (review ${evidence?.receipt.reviewId ?? 'unknown'}) exists for frozen head ${attempt.targetSha}: the round terminalizes as interrupted and same-head re-publication stays closed until the delivery is reconciled; the frozen-commit receipt is retained as truthful evidence`,
+        { jobId: round.jobId, roundId: round.id },
+      );
+      return 'held';
+    }
+    const absent = this.opts.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT);
+    if (absent !== null && absent.seq > attemptEvent.seq) {
+      const evidence = parsePublicationAbsentPayload(absent.payload);
+      if (evidence !== null && evidence.targetSha === attempt.targetSha && evidence.publicationSha256 === attempt.publicationSha256) {
+        return 'clear';
+      }
+      this.escalate(
+        `Perkins publication absence for round ${round.id} is not bound to its intent`,
+        `the later absence record is malformed or does not match the current frozen target ${attempt.targetSha} and publication digest ${attempt.publicationSha256}; the provider outcome stays unresolved and same-head re-publication stays closed`,
         { jobId: round.jobId, roundId: round.id },
       );
       return 'held';

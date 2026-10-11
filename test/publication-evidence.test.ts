@@ -4,6 +4,7 @@ import {
   PUBLICATION_ATTEMPT_EVENT,
   PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
+  parsePublicationAttemptPayload,
   parsePublicationIdentityPayload,
   pendingPublicationAttempt,
   type PublicationEvidenceReader,
@@ -38,6 +39,31 @@ function ledgerWith(events: ReadonlyArray<{ kind: string; seq: number; payload: 
 describe('publication re-arm guard', () => {
   it('clears a round that never recorded a publication attempt', () => {
     expect(pendingPublicationAttempt(ledgerWith([]), 'r1')).toBeNull();
+  });
+
+  it('does not let an absence record override a later retained provider receipt', () => {
+    const problem = pendingPublicationAttempt(ledgerWith([
+      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
+      { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'bounded absence' } },
+      { kind: PUBLICATION_RECEIPT_EVENT, seq: 3, payload: { ...attempt, receipt, credited: false, reason: 'recovered receipt' } },
+    ]), 'receipt-after-absence');
+    expect(problem?.kind).toBe('uncredited-receipt');
+    expect(problem?.detail).toContain('9001');
+  });
+
+  it('does not clear an absence whose target or body digest differs from the attempt or is malformed', () => {
+    const mismatches: readonly unknown[] = [
+      { targetSha: '3'.repeat(40), publicationSha256: attempt.publicationSha256, detail: 'wrong target' },
+      { targetSha: attempt.targetSha, publicationSha256: 'b'.repeat(64), detail: 'wrong digest' },
+      { targetSha: attempt.targetSha, publicationSha256: attempt.publicationSha256 },
+    ];
+    for (const [index, absence] of mismatches.entries()) {
+      const problem = pendingPublicationAttempt(ledgerWith([
+        { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
+        { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: absence },
+      ]), `mismatch-${index}`);
+      expect(problem?.kind).toBe('unresolved-attempt');
+    }
   });
 
   it('holds a bare attempt as unresolved until its provider outcome is reconciled', () => {
@@ -104,6 +130,16 @@ describe('publication re-arm guard', () => {
     expect(problem?.kind).toBe('unresolved-rebinding');
     expect(problem?.detail).toContain('9001');
     expect(problem?.detail).toContain(TARGET);
+  });
+
+  it('requires formal publication intent to agree with its verdict while preserving COMMENT', () => {
+    expect(parsePublicationAttemptPayload({ ...attempt, reviewEvent: 'REQUEST_CHANGES' })).toBeNull();
+    expect(parsePublicationAttemptPayload({ ...attempt, reviewEvent: 'COMMENT' })).not.toBeNull();
+    const changesRequested = {
+      ...attempt, verdict: 'changes-requested', canonicalVerdict: 'NEEDS CHANGES', reviewEvent: 'APPROVE',
+    };
+    expect(parsePublicationAttemptPayload(changesRequested)).toBeNull();
+    expect(parsePublicationAttemptPayload({ ...changesRequested, reviewEvent: 'REQUEST_CHANGES' })).not.toBeNull();
   });
 
   it('parses a well-formed prepared posting identity and rejects malformed evidence', () => {
