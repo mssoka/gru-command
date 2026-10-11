@@ -17,7 +17,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
-import { PUBLICATION_ATTEMPT_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
+import { PUBLICATION_ATTEMPT_EVENT, PUBLICATION_IDENTITY_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
@@ -1205,6 +1205,40 @@ describe('dispatch server (E8)', () => {
       });
       expect(h.ledger.latestJobEvent('clean-abort-r2-attempt', 'silas.review-triggered')).toBeNull();
       expect(h.ledger.listRounds('clean-abort-r2-attempt')).toHaveLength(1);
+    } finally { await h.close(); }
+  }, 90_000);
+
+  it('refuses a clean-abort re-arm for the held native-R5 recovery state (native R5)', async () => {
+    // Native R5 F1/F2: a held App/gh reconciliation (an omitted-body or
+    // foreign-actor review that could not certify absence) leaves exactly
+    // this state — a durable attempt with its prepared posting identity
+    // bound and NO absence certificate. The authenticated dispatch
+    // admission must refuse the same-head re-arm rather than start a
+    // second publication.
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-r5-held');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const { sha, roundId } = await prepareCleanAbort(h, repo, 'clean-abort-r5-held');
+      h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId: 'clean-abort-r5-held', roundId, payload: {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
+        targetSha: sha, baseSha: 'b'.repeat(40),
+        publicationFile: '/tmp/r5/perkins-report.publication.md', publicationSha256: 'a'.repeat(64),
+        reviewEvent: 'APPROVE',
+      } });
+      h.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId: 'clean-abort-r5-held', roundId, payload: {
+        actor: 'gru-bot', host: new URL(PR_URL).host, targetSha: sha,
+      } });
+      const refused = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'clean-abort-r5-held', by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      }, TOKEN);
+      expect(refused).toMatchObject({
+        status: 400,
+        json: { error: 'bad_request', detail: expect.stringMatching(/reconcile it before re-arming|publication attempt/u) },
+      });
+      expect(h.ledger.latestJobEvent('clean-abort-r5-held', 'silas.review-triggered')).toBeNull();
+      expect(h.ledger.listRounds('clean-abort-r5-held')).toHaveLength(1);
     } finally { await h.close(); }
   }, 90_000);
 

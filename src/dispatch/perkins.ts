@@ -978,6 +978,29 @@ export class GhPrPoster implements VerdictPoster {
         `provider review for the frozen head and body was enacted in state ${observed} instead of the required ${wantedEvent} — the intended delivery is not proved; delivery stays unresolved, never absence`,
       );
     }
+    // A review carrying our exact frozen head and published body IN the
+    // required state, but authored by a DIFFERENT account than the one this
+    // lookup authenticated as: the gh identity probe and the POST are
+    // separate processes, so an external credential rotation can prepare as
+    // A, commit the exact intent review as B and lose the response (native
+    // R5 F2). Such a review is potentially THIS delivery — it is never
+    // credited to the lookup account, and its existence forbids an absence
+    // certificate. A foreign body/head match in any OTHER state is not
+    // treated this way: the lookup cannot say whether that is a different
+    // delivery or this one, but only the required-state match evidences the
+    // exact review this intent asked for.
+    const foreignEnactment = reviews.find((review): boolean =>
+      review.state === wantedEvent &&
+      review.commit_id === input.targetSha &&
+      typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body) &&
+      typeof review.user?.login === 'string' && review.user.login.trim() !== '' &&
+      review.user.login.toLowerCase() !== authenticatedLogin.toLowerCase());
+    if (foreignEnactment !== undefined) {
+      const actor = typeof foreignEnactment.user?.login === 'string' ? foreignEnactment.user.login.slice(0, 128) : '(none)';
+      throw new Error(
+        `provider review for the frozen head was enacted in the required state by account ${actor} instead of the reconciled account ${authenticatedLogin} — the intended delivery is not proved; delivery stays unresolved, never absence`,
+      );
+    }
     return null;
   }
 

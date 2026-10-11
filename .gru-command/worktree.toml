@@ -764,3 +764,9 @@ formal-verdicts-r2-baseline = "sh tools/formal-verdicts-r2-baseline.sh"
 # regressions run against an isolated archive of the uncorrected head
 # 1f70503; both legs are classified by exact named behavioral AssertionErrors.
 formal-verdicts-r3-baseline = "sh tools/formal-verdicts-r3-baseline.sh"
+
+# Native R5 (whole-review) fail-before proof: the FINAL omitted-body and
+# foreign-actor absence regressions run against an isolated archive of the
+# uncorrected whole-review head 4014ca03; both named cases are classified by
+# exact behavioral AssertionErrors.
+formal-verdicts-r5-baseline = "sh tools/formal-verdicts-r5-baseline.sh"

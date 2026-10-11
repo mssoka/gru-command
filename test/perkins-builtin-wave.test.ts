@@ -31,7 +31,8 @@ import {
   pendingPublicationAttempt,
 } from '../src/dispatch/publication-evidence.js';
 import { preflightFailure, runRuntimeReviewPreflight, type FallbackFinding } from '../src/dispatch/review-path.js';
-import { configPathFor, loadConfig } from '../src/config.js';
+import { DEFAULT_SILAS_CONFIG, configPathFor, loadConfig } from '../src/config.js';
+import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
 import { SessionStore } from '../src/sessions/store.js';
 import type { PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
@@ -9704,4 +9705,229 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     expect(escalations.join('\n')).toMatch(/cannot be certified absent/u);
     expect(escalations.join('\n')).toMatch(/account-b/u);
   }, 120_000);
+
+  it('keeps a foreign-actor review that enacted the required state from being read as absence (native R5 F2)', async () => {
+    // Preparation probed account A and journaled it; the POST committed the
+    // exact intent review as account B and its response was lost; the
+    // restart runs as A. B's review carries the frozen head, published body
+    // and required state, so the bounded lookup is NOT absence: it is
+    // unresolved foreign-actor evidence — never credited to A, never a
+    // second POST — and the shared re-arm stays closed.
+    const fix = durabilityFixture('r5-foreign-actor');
+    const jobId = 'job-r5-foreign-actor';
+    try { fix.repo.git(['remote', 'add', 'origin', 'https://github.com/acme/fixture.git']); }
+    catch { fix.repo.git(['remote', 'set-url', 'origin', 'https://github.com/acme/fixture.git']); }
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: 'r5 foreign actor', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    fix.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: fix.target } });
+    fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/77');
+    const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+    fix.ledger.setRoundStatus(round.id, 'live');
+    fix.ledger.setJobStatus(jobId, 'in-review');
+    const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target);
+    fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'account-a', host: 'github.com', targetSha: fix.target } });
+    const committedBody = readFileSync(attemptPayload.publicationFile, 'utf8');
+    const ghRoot = mkdtempSync(join(tmpdir(), 'perkins-gh-r5-foreign-'));
+    dirs.push(ghRoot);
+    const binary = join(ghRoot, 'gh-double.mjs');
+    const postLog = join(ghRoot, 'post-log');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.includes('--method') && argv.includes('POST')) appendFileSync(${JSON.stringify(postLog)}, 'post\\n');\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 9500, user: { login: 'account-b' }, state: 'APPROVED', commit_id: ${JSON.stringify(fix.target)}, body: ${JSON.stringify(committedBody)} }]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  process.stdout.write('account-a');\n} else {\n  process.stdout.write(${JSON.stringify(`${fix.target}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
+    chmodSync(binary, 0o755);
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      poster: new GhPrPoster(binary),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    await wave.recoverInterruptedRounds();
+    expect(fix.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT), escalations.join('\n')).toBeNull();
+    expect(pendingPublicationAttempt(fix.ledger, round.id)?.kind).toBe('unresolved-attempt');
+    expect(fix.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(escalations.join('\n')).toMatch(/stays unresolved/u);
+    expect(escalations.join('\n')).toMatch(/account-b/u);
+    // Zero second POSTs: recovery is read-only reconciliation.
+    expect(existsSync(postLog)).toBe(false);
+    // The same held state keeps the digest's automatic clean-abort offer
+    // closed (the authenticated dispatch admission refuses it; pinned in
+    // test/dispatch-server.test.ts).
+    const digest = await computeSilasDigest({
+      ledger: fix.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+      config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+    });
+    expect(digest.prWithoutReview.filter((row) => row.jobId === jobId)).toEqual([]);
+  }, 120_000);
+
+  it('keeps an interrupted App publication unresolved when the provider omits the review body (native R5 F1)', async () => {
+    // The REAL configured-App publisher reconciles an interrupted attempt
+    // whose provider list carries one review with the prepared bot, the
+    // frozen head and the required state, but NO body. That entry can be
+    // neither matched nor excluded, so it is no absence certificate: the
+    // attempt holds, the digest's automatic re-arm stays closed and zero
+    // second reviews are posted.
+    const { fix, home, fetchImpl, postCount } = appRecoveryFixture('r5-omitted-body', {
+      reviews: () => [{
+        id: 778899,
+        user: { login: 'perkins-review[bot]', type: 'Bot' },
+        commit_id: fix.target,
+        state: 'APPROVED',
+        submitted_at: new Date(1_800_000_000_000).toISOString(),
+      }],
+    });
+    const jobId = 'job-r5-app-omitted-body';
+    seedRecoveryJob(fix, jobId);
+    const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+    fix.ledger.setRoundStatus(round.id, 'live');
+    seedAttempt(fix, jobId, round.id, fix.target);
+    fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'perkins-review[bot]', host: 'github.com', targetSha: fix.target } });
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      poster: new PerkinsAppPrPoster({ instanceDir: home, fetchImpl, now: () => 1_800_000_000_000 }),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    await wave.recoverInterruptedRounds();
+    expect(fix.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT), escalations.join('\n')).toBeNull();
+    expect(pendingPublicationAttempt(fix.ledger, round.id)?.kind).toBe('unresolved-attempt');
+    expect(fix.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(escalations.join('\n')).toMatch(/stays unresolved/u);
+    expect(postCount()).toBe(0);
+    const digest = await computeSilasDigest({
+      ledger: fix.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+      config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+    });
+    expect(digest.prWithoutReview.filter((row) => row.jobId === jobId)).toEqual([]);
+  }, 120_000);
+
+  it('clears a legitimate covered App absence and holds a changed lookup identity (native R5 F1/W1)', async () => {
+    // Control 1 — the legitimate same-bot covered empty list MUST clear:
+    // prepared identity continuous, no entry, fully covered walk. Dropping
+    // the poster's onLookupIdentity notification would leave the identity
+    // unknown and fail this control (it would hold instead of absencing).
+    const clear = appRecoveryFixture('r5-app-empty', { reviews: () => [] });
+    const clearJob = 'job-r5-app-empty';
+    seedRecoveryJob(clear.fix, clearJob);
+    const clearRound = clear.fix.ledger.addRound({ jobId: clearJob, lenses: ['blind'], targetRef: clear.fix.target });
+    clear.fix.ledger.setRoundStatus(clearRound.id, 'live');
+    seedAttempt(clear.fix, clearJob, clearRound.id, clear.fix.target);
+    clear.fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId: clearJob, roundId: clearRound.id, payload: { actor: 'perkins-review[bot]', host: 'github.com', targetSha: clear.fix.target } });
+    const clearWave = new WaveRunner({
+      ledger: clear.fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: clear.fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      poster: new PerkinsAppPrPoster({ instanceDir: clear.home, fetchImpl: clear.fetchImpl, now: () => 1_800_000_000_000 }),
+    });
+    await clearWave.recoverInterruptedRounds();
+    expect(clear.fix.ledger.latestRoundEvent(clearRound.id, PUBLICATION_ABSENT_EVENT)).not.toBeNull();
+    expect(pendingPublicationAttempt(clear.fix.ledger, clearRound.id)).toBeNull();
+    const clearDigest = await computeSilasDigest({
+      ledger: clear.fix.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+      config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+    });
+    expect(clearDigest.prWithoutReview).toMatchObject([
+      { jobId: clearJob, cleanAbort: { roundId: clearRound.id, ruleId: 'clean-abort-service-restart' } },
+    ]);
+
+    // Control 2 — the restart's App authenticates as a DIFFERENT bot than
+    // the prepared one: the bounded lookup found nothing, but absence may
+    // only be bound to the prepared identity, so the attempt holds.
+    const rotated = appRecoveryFixture('r5-app-rotated', { reviews: () => [], slug: () => 'other-app' });
+    const rotatedJob = 'job-r5-app-rotated';
+    seedRecoveryJob(rotated.fix, rotatedJob);
+    const rotatedRound = rotated.fix.ledger.addRound({ jobId: rotatedJob, lenses: ['blind'], targetRef: rotated.fix.target });
+    rotated.fix.ledger.setRoundStatus(rotatedRound.id, 'live');
+    seedAttempt(rotated.fix, rotatedJob, rotatedRound.id, rotated.fix.target);
+    rotated.fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId: rotatedJob, roundId: rotatedRound.id, payload: { actor: 'perkins-review[bot]', host: 'github.com', targetSha: rotated.fix.target } });
+    const rotatedEscalations: string[] = [];
+    const rotatedWave = new WaveRunner({
+      ledger: rotated.fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: rotated.fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      poster: new PerkinsAppPrPoster({ instanceDir: rotated.home, fetchImpl: rotated.fetchImpl, now: () => 1_800_000_000_000 }),
+      escalate: (title, detail) => rotatedEscalations.push(`${title}: ${detail}`),
+    });
+    await rotatedWave.recoverInterruptedRounds();
+    expect(rotated.fix.ledger.latestRoundEvent(rotatedRound.id, PUBLICATION_ABSENT_EVENT), rotatedEscalations.join('\n')).toBeNull();
+    expect(pendingPublicationAttempt(rotated.fix.ledger, rotatedRound.id)?.kind).toBe('unresolved-attempt');
+    expect(rotatedEscalations.join('\n')).toMatch(/cannot be certified absent/u);
+    expect(rotatedEscalations.join('\n')).toMatch(/other-app\[bot\]/u);
+    expect(rotated.postCount()).toBe(0);
+  }, 120_000);
+
+  /** A REAL configured-App publisher wired to a deterministic fake provider
+   * for interrupted-publication restart fixtures (native R5 F1): bundle,
+   * repository origin and ssh transport mirror the production App path;
+   * only the provider HTTP surface is doubled. */
+  function appRecoveryFixture(name: string, options: {
+    readonly reviews: () => ReadonlyArray<unknown>;
+    readonly slug?: () => string;
+  }) {
+    const { privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+    const home = mkdtempSync(join(tmpdir(), `perkins-app-r5-${name}-home-`));
+    dirs.push(home);
+    mkdirSync(join(home, 'perkins'), { recursive: true });
+    chmodSync(join(home, 'perkins'), 0o700);
+    writeFileSync(join(home, 'perkins', 'app-key.pem'), privateKey, 'utf8');
+    chmodSync(join(home, 'perkins', 'app-key.pem'), 0o600);
+    const configPath = join(home, 'perkins', 'config');
+    writeFileSync(configPath, 'app_id=424242\nkey_path="app-key.pem"\ninstallation_id_acme=164552969\n', 'utf8');
+    chmodSync(configPath, 0o600);
+
+    const fix = durabilityFixture(`app-${name}`);
+    const branch = `feature/durability-app-${name}`;
+    try { fix.repo.git(['remote', 'add', 'origin', 'git@github.com:acme/fixture.git']); }
+    catch { fix.repo.git(['remote', 'set-url', 'origin', 'git@github.com:acme/fixture.git']); }
+    const originRoot = mkdtempSync(join(tmpdir(), `perkins-app-r5-${name}-origin-`));
+    dirs.push(originRoot);
+    const origin = join(originRoot, 'origin.git');
+    execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+    fix.repo.git(['push', '--quiet', origin, `refs/heads/${branch}`]);
+    const sshDouble = join(originRoot, 'ssh-double.sh');
+    writeFileSync(sshDouble, `#!/bin/sh\nexec git-upload-pack ${JSON.stringify(origin)}\n`, 'utf8');
+    chmodSync(sshDouble, 0o755);
+    fix.repo.git(['config', 'core.sshCommand', sshDouble]);
+
+    const NOW = 1_800_000_000_000;
+    let posts = 0;
+    const fetchImpl: AppFetch = async (url: string, init: AppFetchInit = {}) => {
+      const method = init.method ?? 'GET';
+      const json = (status: number, body: unknown) => ({ ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(body) });
+      if (method === 'GET' && /\/app$/u.test(url)) {
+        return json(200, { id: 424242, slug: options.slug === undefined ? 'perkins-review' : options.slug(), owner: { login: 'solarity-services' } });
+      }
+      if (method === 'POST' && /\/app\/installations\/164552969\/access_tokens$/u.test(url)) {
+        return json(201, {
+          token: `ghs_${'S'.repeat(36)}`,
+          expires_at: new Date(NOW + 3_600_000).toISOString(),
+          permissions: { 'pull_requests': 'write', 'metadata': 'read' },
+          repositories: [{ full_name: 'acme/fixture', id: 1 }],
+        });
+      }
+      if (method === 'GET' && /\/repos\/acme\/fixture\/pulls\/77$/u.test(url)) {
+        return json(200, { number: 77, head: { sha: fix.target }, base: { sha: 'b'.repeat(40) } });
+      }
+      if (method === 'POST' && /\/repos\/acme\/fixture\/pulls\/77\/reviews$/u.test(url)) {
+        posts += 1;
+        return json(200, { id: 990001, user: { login: 'perkins-review[bot]', type: 'Bot' }, state: 'APPROVED', commit_id: fix.target, body: 'review body\n' });
+      }
+      if (method === 'GET' && /\/repos\/acme\/fixture\/pulls\/77\/reviews\?/u.test(url)) {
+        return json(200, options.reviews());
+      }
+      return json(404, { message: `no test route for ${method} ${url}` });
+    };
+    return { fix, home, fetchImpl, postCount: () => posts };
+  }
+
+  /** The delivered/registered shape an interrupted round's job carries so
+   * the digest can adjudicate it after recovery. */
+  function seedRecoveryJob(fix: ReturnType<typeof durabilityFixture>, jobId: string): void {
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: jobId, baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    fix.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: fix.target } });
+    fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/77');
+    fix.ledger.setJobStatus(jobId, 'in-review');
+  }
 });

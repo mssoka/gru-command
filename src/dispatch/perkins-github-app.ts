@@ -602,11 +602,20 @@ function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogi
 
 /** Whether a review-list entry is a decidable review record that an
  * absence proof may rest on: a plain record (never an array), carrying the
- * provider's numeric review id, and — when present — the fields the
- * delivery predicates read, in their provider types. Anything else —
- * `[[]]`, `[{}]`, `[{user: …}]`, `[42]` — is a broken list, not a review
- * that happens to differ: its non-match proves nothing, so a walk over it
- * must stay unresolved rather than certify absence. */
+ * provider's numeric review id, and the fields every credit/ambiguity rule
+ * reads, in their provider types. The delivery predicates themselves —
+ * enacted state, frozen commit binding, published body — must be PRESENT,
+ * provider-typed strings: a record whose body was not serialized (or whose
+ * state/commit is missing) can be neither matched nor excluded, so its
+ * presence must keep the whole walk from certifying absence — it may BE
+ * this publication's review with a missing field (native R5 F1). Anything
+ * else — `[[]]`, `[{}]`, `[{user: …}]`, `[42]` — is a broken list, not a
+ * review that happens to differ: its non-match proves nothing, so a walk
+ * over it must stay unresolved rather than certify absence. `submitted_at`
+ * keeps its documented three-way shape (string when serialized, null or
+ * absent otherwise): an unprovable time on OUR publication is held by the
+ * recency rules on its own, and an unrelated review's absent time is not a
+ * delivery predicate. */
 function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
   const record = entry as Record<string, unknown>;
@@ -626,10 +635,11 @@ function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
       if (typeof author[field] !== 'string') return false;
     }
   }
-  for (const field of ['state', 'commit_id', 'body', 'submitted_at'] as const) {
-    const value = record[field];
-    if (!(value === null || value === undefined || typeof value === 'string')) return false;
+  for (const field of ['state', 'commit_id', 'body'] as const) {
+    if (typeof record[field] !== 'string') return false;
   }
+  const submittedAt = record['submitted_at'];
+  if (!(submittedAt === null || submittedAt === undefined || typeof submittedAt === 'string')) return false;
   return true;
 }
 
