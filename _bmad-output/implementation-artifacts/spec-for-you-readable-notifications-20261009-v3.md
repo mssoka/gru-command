@@ -182,6 +182,11 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
   diagnostics and bell-list content, including relative-size text and fresh
   nodes after snapshot replacement. Root/body, viewport, DPR, composer and
   panel geometry are pinned; no product styles were changed.
+- Scheduled browser capture on c69a5b92 reached 64/66 tests; both failures
+  were the 320px container assertion using `clientWidth`, which measured
+  314px after an internal scrollbar. Container-size checks now use the
+  border-box width; client width remains the horizontal-overflow oracle.
+  The complete failed capture and failure images remain preserved.
 
 ## Spec Change Log
 

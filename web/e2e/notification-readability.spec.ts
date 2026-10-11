@@ -666,7 +666,9 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         await clickBell(page);
         await settled(page);
         expect(seed.pageErrors).toEqual([]);
-        expect(await page.locator('#notification-panel').evaluate((panel) => panel.clientWidth)).toBe(320);
+        expect(
+          await page.locator('#notification-panel').evaluate((panel) => panel.getBoundingClientRect().width),
+        ).toBe(320);
         expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
         for (const id of ['decision-1', 'machine-1', 'feed-resolved']) {
           await page.locator(`#notification-list [data-notification-id="${id}"]`).scrollIntoViewIfNeeded();
@@ -831,8 +833,8 @@ test.describe('notification readability — fixed long-content fixtures', () => 
             viewport: window.innerWidth,
             viewportHeight: window.innerHeight,
             dpr: window.devicePixelRatio,
-            ownerWidth: document.getElementById('board-owner')!.clientWidth,
-            panelWidth: panel.clientWidth,
+            ownerWidth: document.getElementById('board-owner')!.getBoundingClientRect().width,
+            panelWidth: panel.getBoundingClientRect().width,
             rootFontSize: getComputedStyle(document.documentElement).fontSize,
             bodyFontSize: getComputedStyle(document.body).fontSize,
             bodyZoom: document.body.style.zoom,
@@ -876,8 +878,8 @@ test.describe('notification readability — fixed long-content fixtures', () => 
             viewport: window.innerWidth,
             viewportHeight: window.innerHeight,
             dpr: window.devicePixelRatio,
-            ownerWidth: document.getElementById('board-owner')!.clientWidth,
-            panelWidth: panel.clientWidth,
+            ownerWidth: document.getElementById('board-owner')!.getBoundingClientRect().width,
+            panelWidth: panel.getBoundingClientRect().width,
             rootFontSize: getComputedStyle(document.documentElement).fontSize,
             bodyFontSize: getComputedStyle(document.body).fontSize,
             bodyZoom: document.body.style.zoom,
@@ -1080,7 +1082,9 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         await clickBell(page);
         await settled(page);
         expect(seed.pageErrors).toEqual([]);
-        const panelWidthBefore = await page.locator('#notification-panel').evaluate((panel) => panel.clientWidth);
+        const panelWidthBefore = await page
+          .locator('#notification-panel')
+          .evaluate((panel) => panel.getBoundingClientRect().width);
         expect(panelWidthBefore).toBe(320);
         const panelDecision = page.locator('#notification-list [data-notification-id="decision-1"]');
         const panelDecisionTitleSelector = '#notification-list [data-notification-id="decision-1"] .board-notification__title';
@@ -1098,7 +1102,9 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         expect(zoom.probeAfter).toBeCloseTo(panelDecisionTitleBase * 2, 1);
         expect(await computedFontSize(page, panelDecisionDetailSelector)).toBeCloseTo(panelDecisionDetailBase * 2, 1);
         expect(await computedFontSize(page, panelMachineDetailSelector)).toBeCloseTo(panelMachineDetailBase * 2, 1);
-        expect(await page.locator('#notification-panel').evaluate((panel) => panel.clientWidth)).toBe(panelWidthBefore);
+        expect(
+          await page.locator('#notification-panel').evaluate((panel) => panel.getBoundingClientRect().width),
+        ).toBe(panelWidthBefore);
         await settled(page);
         // Every measured card must be PROVEN present first: a missing card
         // can no longer satisfy the overflow comparison vacuously.
