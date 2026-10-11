@@ -5,7 +5,7 @@ created: '2026-10-11'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'f738b9b1594081cdbb4929af7be256454951eb43'
-review_loop_iteration: 1
+review_loop_iteration: 2
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/BOARD.md'
@@ -239,6 +239,46 @@ real and are patched in this round. Verdicts:
 - Mock fixture no longer represented the shipped owner surfaces — patch.
   Updated to the typed decision + machine rows (also resolves the stale
   smoke assertions above).
+
+Round 2 (head 4d9d724c; same three tracked lenses). Round-1 resolutions
+were verified; the remaining/new findings were all real and are patched:
+
+- `reconcileMissingTree`'s `onSwept` call sat after an unconditional
+  `return` (dead code) — high; patch. Moved before the return; a
+  manager-level test now drives both the missing-tree reconcile and the
+  direct sweep and asserts the callback (added to the focused scope under
+  the classified heavy config).
+- `focusNotification`'s fallback was document-wide, so a decision recorded
+  from the bell landed focus on the band's lookalike — high; patch.
+  `focusNotification(id, root)` now takes the owning surface; the
+  disappearing-control bell path has its own unit test.
+- A resolved decided row still read "awaiting follow-through" — high;
+  patch. The line is conditional and a FEED test pins "follow-through
+  resolved".
+- The option-submit error line was unreadable on error cards (dark:
+  `--danger` IS `--alert`) — high; patch. Forced to `--on-state` on the
+  alert surface and pinned in the palette suite.
+- Legacy unattributable `worktree-sweep-paused` rows had no settlement —
+  medium; patch. The boot migration re-triages them to Gru with a note
+  (scoped rows keep their own sweep-evidence resolution).
+- Enforce-gate settlement used a LIKE prefix that could bleed between
+  surface names — medium; patch. `resolveNotificationsByExactKind` + test.
+- No negative protocol test for junk decision payloads — patch. Malformed
+  question/discussion/options/decided fields now pinned invalid.
+- The registry override warn log named the wrong direction when an
+  owner-required kind was forced owner — low; patch. Direction-aware copy.
+- Remaining Ack-model docs/strings (SUPERVISION/OPERATIONS/LEDGER/CONFIG,
+  generated config reference, example config, chat breaker messages,
+  board/engine comments, Silas role and ops-skill lists) — medium; patch.
+  All updated to the disposition/decision model.
+- The focused scope omitted the new regression files — patch. Added
+  decisions-shadow, roles-gru/roles-definitions and the worktree-manager
+  case.
+
+Round-2 verification result: the reviews ran against 4d9d724c; the
+hygiene fixture-path commit and these fixes move the head, so a final
+whole-change round (3) reviews the exact final head before any merge
+presentation.
 
 ## Design Notes
 

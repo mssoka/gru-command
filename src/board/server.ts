@@ -35,8 +35,7 @@ export interface BoardServerOptions {
   readonly bus: EventBus;
   /** E7: the notification write path (shown receipts + acks). */
   readonly notifications: NotificationCenter;
-  /** E7: fired after a successful ack — the supervisor re-arms an open
-   * breaker whose notification was acked. */
+  /** E7: fired after a successful ack (feed/notice receipts). */
   readonly onNotificationAck?: (id: string) => void;
   /** E7 (owner release 2026-10-11): fired after a successful machine
    * disposition — the supervisor re-arms a stopped lane whose breaker

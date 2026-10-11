@@ -463,6 +463,39 @@ describe('legacy owner-attention reconciliation', () => {
     }
   });
 
+  it('re-triages an unattributable legacy sweep pause to Gru and keeps the scoped one', () => {
+    const rig = boot();
+    rig.api.recordNotification({
+      id: 'legacy-sweep-pause',
+      kind: 'worktree-sweep-paused',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Worktree sweep paused: live processes',
+      detail: 'pre-registry pause with no worktree id',
+    });
+    const scoped = rig.center.post({
+      kind: 'worktree-sweep-paused:lane-x:pause-1',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Worktree sweep paused: lane-x',
+      detail: 'scoped',
+    });
+    const report = reconcileLegacyOwnerAttention({ ledger: rig.api });
+    expect(report.retriaged).toBe(1);
+    expect(rig.api.getNotification('legacy-sweep-pause')).toMatchObject({ routing: 'action-required' });
+    expect(rig.api.getNotification('legacy-sweep-pause')?.detail).toContain('without a worktree attribution');
+    expect(rig.api.getNotification(scoped.id)?.routing).toBe('needs-owner');
+  });
+
+  it('resolves an EXACT kind without bleeding into a lookalike prefix', () => {
+    const rig = boot();
+    const triage = rig.center.post({ kind: 'decisions.enforce-gate.triage', routing: 'needs-owner', severity: 'error', title: 'Triage gate' });
+    const extra = rig.center.post({ kind: 'decisions.enforce-gate.triage-extra', routing: 'needs-owner', severity: 'error', title: 'Triage-extra gate' });
+    const resolved = rig.center.resolveExactKind('decisions.enforce-gate.triage', 'enforce-gate-passed');
+    expect(resolved.map((row) => row.id)).toEqual([triage.id]);
+    expect(rig.api.getNotification(extra.id)?.resolvedAt).toBeNull();
+  });
+
   it('never touches acked or resolved rows (history stays exact)', () => {
     const rig = boot();
     rig.api.recordNotification({

@@ -2991,6 +2991,13 @@ a.repo-row__name:hover {
   opacity: 1;
 }
 
+/* The submit-refusal line must stay readable on the alert surface: in the
+ * dark theme --danger IS --alert (1.00:1), and light is below AA. */
+.board-notification--error .board-notification__option-error {
+  color: var(--on-state);
+  opacity: 1;
+}
+
 .board-notification--error .board-notification__context,
 .board-notification--error .board-notification__question,
 .board-notification--error .board-notification__recommendation,

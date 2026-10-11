@@ -81,7 +81,7 @@ restart_backoff_ms = 2000
 # bounded automatic retry for the provider rate-limit error class (HTTP 429,
 # "rate limit"/"too many requests"/throttling). Every automatic retry is
 # recorded as a pacing.auto-retry ledger event; non-rate-limit failures and an
-# exhausted budget still stop to the supervisor ladder + owner ACK. Ledger
+# exhausted budget still stop to the supervisor ladder + Gru's machine queue. Ledger
 # vocabulary: pacing.queued, pacing.admitted, pacing.wait-cancelled,
 # pacing.queued-rollback, pacing.auto-retry, pacing.auto-retry-recovered,
 # pacing.auto-retry-exhausted. max_auto_retries = 0 disables automatic retry

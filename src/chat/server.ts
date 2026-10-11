@@ -112,7 +112,7 @@ export interface ChatServerOptions {
   /** Spawn (or resume) the single Gru session. Injected: the chat layer
    * never touches a concrete adapter or the registry (runtime-agnostic). */
   readonly spawnGru: (resumeFile: string | null, source?: 'chat' | 'wake') => Promise<AgentHandle>;
-  /** Supervisor owner-held breaker gate: machine turns never re-arm it. */
+  /** Supervisor breaker gate: machine turns never re-arm it (Gru dispositions do). */
   readonly canWakeGru?: () => boolean;
   /** Mint a native session without resume/transcript context. This is
    * mandatory: reusing spawnGru(null) could return the supervised old handle. */
@@ -281,7 +281,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   function ensureGru(source: 'chat' | 'wake' = 'wake'): Promise<AgentHandle> {
     if (source === 'wake' && options.canWakeGru?.() === false) {
-      return Promise.reject(new Error('owner-held Gru breaker is open; wake waits for authorized re-arm'));
+      return Promise.reject(new Error('Gru breaker is open; wake waits for authorized re-arm'));
     }
     if (handle !== null) return Promise.resolve(handle);
     // Bounded retries: after a failure, a reconnect (or a fresh message)
@@ -722,7 +722,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     if (disposed || !wakeRequested || wakeRunning || options.awareness === undefined) return;
     if (recoveryBlockedReason !== null || options.canWakeGru?.() === false) {
       wakeRequested = false;
-      options.awareness.noteWakeBlocked?.(recoveryBlockedReason ?? 'owner-held Gru breaker is open; authorized re-arm required');
+      options.awareness.noteWakeBlocked?.(recoveryBlockedReason ?? 'Gru breaker is open; authorized re-arm required');
       return;
     }
     if (
@@ -844,7 +844,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             }
             log('error', 'Gru delivery spawn failed', { error: errorMessage(error) });
             if (wake && options.canWakeGru?.() === false) {
-              options.awareness?.noteWakeBlocked?.('owner-held Gru breaker is open; authorized re-arm required');
+              options.awareness?.noteWakeBlocked?.('Gru breaker is open; authorized re-arm required');
             } else if (wake) options.awareness?.noteWakeOutcome?.(false, errorMessage(error));
             return;
           }
@@ -892,7 +892,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             );
           } else {
             if (wake && options.canWakeGru?.() === false) {
-              options.awareness?.noteWakeBlocked?.('owner-held Gru breaker is open; authorized re-arm required');
+              options.awareness?.noteWakeBlocked?.('Gru breaker is open; authorized re-arm required');
               return;
             }
             if (wake && options.awareness?.admitWake?.() === false) return;

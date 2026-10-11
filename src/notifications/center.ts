@@ -156,12 +156,18 @@ export class NotificationCenter {
     }
     const resolved = resolveNotificationRouting(input.kind, input.routing);
     if (resolved.overridden) {
-      this.log('warn', 'owner attention refused by the attention registry — routed to Gru', {
-        id: input.id ?? null,
-        kind: input.kind,
-        requested: input.routing,
-        effective: resolved.routing,
-      });
+      this.log(
+        'warn',
+        resolved.routing === 'needs-owner'
+          ? 'owner-required kind forced onto the owner surface by the attention registry'
+          : 'owner attention refused by the attention registry — routed to Gru',
+        {
+          id: input.id ?? null,
+          kind: input.kind,
+          requested: input.routing,
+          effective: resolved.routing,
+        },
+      );
     }
     if (input.id !== undefined) {
       const existing = this.ledger.getNotification(input.id);
@@ -270,6 +276,11 @@ export class NotificationCenter {
 
   resolveIncidents(kindPrefix: string, by: string): readonly NotificationRecord[] {
     return this.ledger.resolveNotificationsByKindPrefix(kindPrefix, by);
+  }
+
+  /** Producer-evidence settlement for an EXACT kind (no prefix bleed). */
+  resolveExactKind(kind: string, by: string): readonly NotificationRecord[] {
+    return this.ledger.resolveNotificationsByExactKind(kind, by);
   }
 
   /** Producer-declared routing migration (issue #215): an UNACKED row of

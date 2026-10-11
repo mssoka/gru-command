@@ -2602,6 +2602,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     // Reload (fresh render of the same authoritative row): still decided.
     view.render(snapshot({ notifications: [stop] }));
     expect(band.textContent).toContain('Decision recorded');
+
     // Details: opening is a view action, never a decision; the open state
     // survives the next snapshot push.
     const details = band.querySelector<HTMLDetailsElement>('.board-notification__details')!;
@@ -2610,6 +2611,15 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     details.dispatchEvent(new Event('toggle'));
     view.render(snapshot({ notifications: [stop] }));
     expect(document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-notification__details')?.open).toBe(true);
+    // Follow-through resolved: the row leaves FOR YOU and its FEED copy must
+    // never claim it is still awaiting completion (decision vs completion
+    // stay distinct).
+    view.render(snapshot({ notifications: [{ ...stop, resolvedAt: '2026-01-01T00:12:00.000Z', resolvedBy: 'gru' }] }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const feedCard = document.getElementById('notification-list')!;
+    expect(feedCard.textContent).toContain('follow-through resolved');
+    expect(feedCard.textContent).not.toContain('awaiting follow-through');
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
     expect(client.decideNotification).not.toHaveBeenCalled();
     expect(client.ackNotification).not.toHaveBeenCalled();
   });
@@ -3375,6 +3385,34 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(more.textContent).toBe('+3 older pending');
     more.click();
     expect(document.getElementById('board-owner')!.querySelectorAll('.board-owner__row')).toHaveLength(9);
+  });
+
+  it('recording a decision from the bell keeps focus inside the bell after the option disappears', async () => {
+    const stop = notification('bell-decide', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision(),
+    });
+    const decidedRow = { ...stop, decidedAt: '2026-01-01T00:09:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decidedRow)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [stop], unackedNeedsOwner: 1 }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    document.querySelector<HTMLButtonElement>('#notification-list [data-action-id="notif:bell-decide:option:approve"]')!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')!.textContent).toContain('Decision recorded'),
+    );
+    const active = document.activeElement as HTMLElement | null;
+    expect(active).not.toBeNull();
+    // The vanished option's surface owns the fallback: focus stays in the
+    // bell, never on the band's lookalike card.
+    expect(document.getElementById('notification-list')!.contains(active)).toBe(true);
+    expect(document.getElementById('board-owner')!.contains(active)).toBe(false);
   });
 
   it('focus on the open bell copy of a shared decision card survives a re-render (never jumps to the band lookalike)', () => {

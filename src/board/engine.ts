@@ -276,8 +276,8 @@ export interface BoardSnapshot {
    * the record keeps them, this count (and the banding) does not. Read
    * from the table, not the 30-row feed window, so the tracker is true. */
   readonly unackedActionRequired: number;
-  /** FOR YOU: needs-owner rows still awaiting a human ack — the only
-   * class that rings the bell. */
+  /** FOR YOU: registered needs-owner rows still owed an owner decision or
+   * notice resolution — the only class that rings the bell. */
   readonly unackedNeedsOwner: number;
   /** Autonomous Gru turns recorded as durable `gru.wake` events. */
   readonly wakes: {

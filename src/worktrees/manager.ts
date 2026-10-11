@@ -1418,13 +1418,12 @@ export class WorktreeManager {
         error: String(error),
       });
     }
-    return branchOutcome;
-  
     try {
       this.opts.onSwept?.({ worktree: row });
     } catch (error) {
       this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
     }
+    return branchOutcome;
   }
 
   /** Guarded containment-verified disposal for an owner lane's branch.

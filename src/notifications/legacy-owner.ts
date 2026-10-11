@@ -62,14 +62,21 @@ export function reconcileLegacyOwnerAttention(deps: LegacyOwnerReconcileDeps): L
   for (const row of rows) {
     const attention = ownerAttentionFor(row.kind);
     const decisionMissing = requiresTypedDecision(row.kind) && row.decision === null;
-    if ((attention === 'owner-required' && !decisionMissing) || attention === 'owner-allowed') {
+    // Pre-registry sweep pauses carry no worktree attribution (the scoped
+    // `worktree-sweep-paused:<id>:<pause>` form resolves on its worktree's
+    // completed sweep); an unattributable row cannot be resolved by any
+    // producer, so Gru verifies the tree state and closes it.
+    const unattributableSweepPause = row.kind === 'worktree-sweep-paused';
+    if (((attention === 'owner-required' && !decisionMissing) || attention === 'owner-allowed') && !unattributableSweepPause) {
       kept += 1;
       continue;
     }
     const reason =
-      attention === 'owner-forbidden'
-        ? 'not an owner-reserved matter — routed to Gru for triage'
-        : 'legacy owner escalation without a typed reserved decision — routed to Gru to re-escalate if an owner decision is owed';
+      unattributableSweepPause
+        ? 'legacy sweep pause without a worktree attribution — routed to Gru to verify the tree state'
+        : attention === 'owner-forbidden'
+          ? 'not an owner-reserved matter — routed to Gru for triage'
+          : 'legacy owner escalation without a typed reserved decision — routed to Gru to re-escalate if an owner decision is owed';
     const note = [row.detail, `[owner-attention migration 2026-10-11] ${reason}`]
       .filter((part): part is string => part !== null && part !== '')
       .join('\n\n');

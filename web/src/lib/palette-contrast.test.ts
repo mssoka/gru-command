@@ -147,6 +147,10 @@ describe('palette contrast (v5)', () => {
       // they never inherit the faint label color on the alert surface.
       const errorMetaToken = colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__meta');
       expect(errorMetaToken).toBe('on-state');
+      // The submit-refusal line must also stay on-state on the alert surface
+      // (in dark, --danger IS --alert).
+      const errorOptionToken = colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__option-error');
+      expect(errorOptionToken).toBe('on-state');
       const pairs: readonly (readonly [string, string])[] = [
         ['ink', 'card'],
         ['muted', 'card'],

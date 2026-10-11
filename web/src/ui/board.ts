@@ -579,7 +579,7 @@ export class BoardView {
     // The focused control may have changed state (an option just recorded):
     // land on its card so focus stays inside the item the operator acted on.
     const id = focusKey.split(':')[1] ?? null;
-    if (id !== null) this.focusNotification(id);
+    if (id !== null) this.focusNotification(id, this.ownerMount);
   }
 
   /** One pending owner decision or owner-only notice (owner release
@@ -2103,7 +2103,7 @@ export class BoardView {
       }
     }
     const id = key.split(':')[1] ?? null;
-    if (id !== null) this.focusNotification(id);
+    if (id !== null) this.focusNotification(id, list);
   }
 
   /** D3: fetch the next page of closed receipts and merge it into FEED.
@@ -2200,7 +2200,9 @@ export class BoardView {
           el(
             'div',
             'board-notification__decided',
-            `Decision recorded: “${decidedOptionLabel(decision, item.decidedOption)}” — awaiting follow-through.`,
+            item.resolvedAt === null
+              ? `Decision recorded: “${decidedOptionLabel(decision, item.decidedOption)}” — awaiting follow-through.`
+              : `Decision recorded: “${decidedOptionLabel(decision, item.decidedOption)}” — follow-through resolved.`,
           ),
         );
       }
@@ -2312,12 +2314,16 @@ export class BoardView {
     const label = button.textContent;
     button.disabled = true;
     button.textContent = 'recording…';
+    // The surface that owns this control: after a state change the fallback
+    // must land on THAT surface's card, never the lookalike in the other
+    // (the band precedes the bell in document order).
+    const surfaceRoot = optionNode.closest<HTMLElement>('#notification-list, #board-owner') ?? document.body;
     void client
       .decideNotification(item.id, optionId)
       .then((row) => {
         this.decisionOverrides.set(item.id, row);
         if (this.snapshot !== null) this.render(this.snapshot);
-        this.focusNotification(item.id);
+        this.focusNotification(item.id, surfaceRoot);
       })
       .catch((error: unknown) => {
         button.disabled = false;
@@ -2352,9 +2358,10 @@ export class BoardView {
   }
 
   /** Sane focus after a state-changing submit: land on the item's card
-   * when the control that had focus no longer renders. */
-  private focusNotification(notificationId: string): void {
-    const target = [...document.querySelectorAll<HTMLElement>('[data-focus-target="card"]')].find(
+   * within the SURFACE that owned the interaction (the band and the bell
+   * render the same card; an unscoped lookup would jump surfaces). */
+  private focusNotification(notificationId: string, root: ParentNode): void {
+    const target = [...root.querySelectorAll<HTMLElement>('[data-focus-target="card"]')].find(
       (node) => node.dataset.notificationId === notificationId,
     );
     target?.focus();

@@ -4505,6 +4505,33 @@ export class LedgerApi {
     });
   }
 
+  /** Resolve every open row of an EXACT kind (no LIKE wildcard semantics):
+   * producer-evidence settlement where one kind must never bleed into a
+   * lookalike kind that shares its prefix (e.g. `triage` vs `triage-extra`). */
+  resolveNotificationsByExactKind(kind: string, by: string): readonly NotificationRecord[] {
+    if (kind === '' || by === '') throw new Error('resolution kind/by must be non-empty');
+    return this.transaction(() => {
+      const rows = this.db
+        .prepare('SELECT * FROM notifications WHERE kind = ? AND resolved_at IS NULL ORDER BY ts, id')
+        .all(kind) as Row[];
+      const resolved: NotificationRecord[] = [];
+      for (const raw of rows) {
+        const id = str(raw.id);
+        const at = nowIso();
+        this.db
+          .prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ? AND resolved_at IS NULL')
+          .run(at, by, id);
+        this.appendEvent({
+          kind: 'notification.resolved',
+          agentId: nstr(raw.agent_id),
+          payload: { id, by },
+        });
+        resolved.push(this.getNotification(id) as NotificationRecord);
+      }
+      return resolved;
+    });
+  }
+
   /** Resolve one exact incident ID without acknowledging it for the owner. */
   /** Replace an OPEN notification's detail (and, when given, title) in place — id, acknowledgement
    * and routing unchanged (a long-running incident refreshing its latest
@@ -4605,7 +4632,7 @@ export class LedgerApi {
       const current = this.getNotification(id);
       if (current === null) return null;
       if (current.routing !== 'action-required') {
-        throw new Error('only action-required notifications accept a Gru disposition; owner stops require owner acknowledgement');
+        throw new Error('only action-required notifications accept a machine disposition; owner decisions resolve through the recorded-decision follow-through');
       }
       const closer = producerResolvedBy(current.kind);
       if (closer !== null) {

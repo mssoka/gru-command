@@ -440,7 +440,7 @@ export class DecisionRuntime implements DecisionService {
         // is satisfied again: its owner-only incident resolves here
         // (owner release 2026-10-11) instead of persisting forever.
         try {
-          this.options.notifications?.resolveIncidents(`decisions.enforce-gate.${opts.surface}`, 'enforce-gate-passed');
+          this.options.notifications?.resolveExactKind(`decisions.enforce-gate.${opts.surface}`, 'enforce-gate-passed');
         } catch (error) {
           this.log('warn', 'enforce-gate incident resolution failed; row stays open', { surface: opts.surface, error: String(error) });
         }

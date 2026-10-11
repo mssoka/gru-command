@@ -111,13 +111,15 @@ fatal errors climb.
 
 **Crash-loop breaker.** ≥ `max_restarts` (default 3) restarts within a
 rolling `restart_window_ms` (default 10 min) trips the breaker: the agent
-is **stopped** (no further restarts), a **needs-owner** notification
-escalates (re-arm is the human's ack), and the board marks the agent (`⛔ stopped` on the rail + the
-notification). Acking that notification **re-arms** supervision: the ring
+is **stopped** (no further restarts), an **action-required** machine alert
+wakes Gru, and the board marks the agent (`⛔ stopped` on the rail + the
+alert). Gru **re-arms** supervision through the guarded disposition on
+that alert (or an operator resumes the lane by using its slot): the ring
 clears, a fresh window opens, one restart attempt resumes the agent. A
-service restart also resets breaker state (in-memory by design) — the ack
-record is durable, an open breaker is not, so an ack can never strand an
-agent across a service restart.
+service restart also resets breaker state (in-memory by design) — the
+resolution record is durable, an open breaker is not, so a re-arm can
+never strand an agent across a service restart. The owner is never asked
+to ack a breaker.
 
 **Watchdog config** (`[supervision]` in `config.toml`):
 
@@ -148,9 +150,10 @@ computed per-snapshot.
 - **Action-required** — machine attention for Gru. Eligible rows open a
   rate-limited Gru wake turn; Gru diagnoses and dispositions them. They appear
   in NEEDS GRU (live rows only) and not the owner bell; rows bound to a
-  terminal merged/done/binned lane are closed receipts rendered under FEED. Breakers
-  requiring owner re-arm and other owner-only decisions use **needs-owner**,
-  not action-required.
+  terminal merged/done/binned lane are closed receipts rendered under FEED.
+  Crash-loop breakers and provider-wall stops are machine attention; only
+  registered reserved owner decisions and owner-only notices use
+  **needs-owner** (the attention registry enforces it server-side).
 - **Stopped-worker truth (2026-09-29)** — a supervision-stopped or
   breaker-open worker leaves the job status working, but the lane renders an
   explicit waiting state with its recorded reason (`waiting · quota wall`);
@@ -167,12 +170,16 @@ stable id (the ack contract). When a client displays one — a toast, the
 bell panel, a browser notification — it posts
 `POST /api/notifications/:id/shown {surface}` and the row records the
 receipt (`shown_at`, one per surface, idempotent). An **ack**
-(`POST /api/notifications/:id/ack`) is the owner clearance for owner/FYI
-rows. The bell badge counts all unseen needs-owner rows, including info;
-the NEEDS GRU machine queue is tracked separately and never rings the bell.
-Only owner/FYI rows expose Ack or Mark seen controls; Gru dispositions
-machine rows through the notification disposition endpoint. Existing routing
-never changes by age or at boot. Gru may post an explicit needs-owner decision
+(`POST /api/notifications/:id/ack`) is the feed/notice clearance: the UI
+offers it only on FYI rows (`Mark seen`), and it refuses machine rows and
+typed decision rows. The bell badge counts all unseen needs-owner rows,
+including info; the NEEDS GRU machine queue is tracked separately and
+never rings the bell. Typed owner decisions are recorded with
+`POST /api/notifications/:id/decision`; their follow-through resolves
+through the disposition endpoint. Gru dispositions machine rows through
+the notification disposition endpoint. Routing never changes by age or
+display; pre-registry legacy owner rows are re-triaged to Gru at boot with
+a recorded note. Gru may post an explicit needs-owner decision
 through the authenticated endpoint; a blocked wake creates a durable
 needs-owner stop asking for manual service recovery.
 
