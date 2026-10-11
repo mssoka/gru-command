@@ -12,8 +12,8 @@ export const INTAKE_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 export interface IntakeServiceOptions extends SourcePorts {
   readonly dataDir: string;
   readonly workspaceRoot: string;
-  /** Explicit managed registry seam; never an ambient cwd. */
-  readonly managedRepos?: () => readonly string[];
+  /** Explicit per-request managed-root guard; never an ambient cwd. */
+  readonly managedRepos?: (requestedRepoPath: string) => readonly string[];
   readonly workflow?: () => BundledWorkflowRuntime;
   readonly planner?: IntakePlanner;
 }
@@ -78,7 +78,9 @@ export class IntakeService {
   constructor(private readonly options: IntakeServiceOptions) {}
 
   private context(repoPath: string, intakeId: string, existingOnly = false): PreviewArtifactContext {
-    const registered = (this.options.managedRepos ?? (() => discoverManagedRepos(this.options.workspaceRoot).map((name) => join(this.options.workspaceRoot, name))))();
+    const registered = this.options.managedRepos === undefined
+      ? discoverManagedRepos(this.options.workspaceRoot).map((name) => join(this.options.workspaceRoot, name))
+      : this.options.managedRepos(repoPath);
     const repo = canonicalManagedRepo(repoPath, registered);
     let runtime: BundledWorkflowRuntime;
     try { runtime = (this.options.workflow ?? loadBundledWorkflowRuntime)(); } catch (error) {

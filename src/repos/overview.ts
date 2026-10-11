@@ -11,7 +11,7 @@ import {
   type RepoRef,
 } from '../dispatch/github-poll.js';
 import { isGitHubRemote, parseRepoRemote } from '../dispatch/review-path.js';
-import { resolveManagedRepoPath, type ManagedRepoPath } from './managed-names.js';
+import { gitProbeEnvironment, resolveManagedRepoPath, type ManagedRepoPath } from './managed-names.js';
 
 /**
  * Managed repository overview (owner-approved compact rows A): a
@@ -614,7 +614,7 @@ async function gitOriginUrl(repoPath: string): Promise<string | null> {
     execFile(
       'git',
       ['-C', repoPath, 'remote', 'get-url', 'origin'],
-      { encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024 },
+      { encoding: 'utf8', env: gitProbeEnvironment(), timeout: 10_000, maxBuffer: 64 * 1024 },
       (error, stdout, stderr) => {
         if (error !== null) {
           const code = (error as NodeJS.ErrnoException).code;

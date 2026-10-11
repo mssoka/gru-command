@@ -1032,8 +1032,9 @@ describe('board engine — managed repository overview wiring', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toMatch(/createManagedRepoOverviewTracker\(config,/);
     expect(mainSource).toContain(
-      'managedRepos: () => managedRepoPathsForIntake(config.workspaceRoot, config.managedRepos)',
+      'const resolveIntakeRepos = createManagedRepoIntakeResolver(config.workspaceRoot, config.managedRepos);',
     );
+    expect(mainSource).toContain('managedRepos: resolveIntakeRepos');
     const runtimeSource = readFileSync(join(import.meta.dirname, '..', 'src', 'repos', 'runtime.ts'), 'utf8');
     expect(runtimeSource).toMatch(/managedRepos:\s*config\.managedRepos/);
     expect(mainSource).toMatch(/repoOverview:\s*\(\)\s*=>\s*repoOverview\.view\(\)/);

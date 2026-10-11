@@ -1321,6 +1321,35 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     }
   });
 
+  it('keeps inherited Git routing from selecting an unconfigured origin for provider calls', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-git-routing-'));
+    const selected = join(root, 'selected');
+    const foreign = join(root, 'foreign');
+    try {
+      execFileSync('git', ['init', '-q', selected]);
+      execFileSync('git', ['-C', selected, 'remote', 'add', 'origin', 'https://github.com/acme/selected.git']);
+      execFileSync('git', ['init', '-q', foreign]);
+      execFileSync('git', ['-C', foreign, 'remote', 'add', 'origin', 'https://github.com/acme/foreign.git']);
+      vi.stubEnv('GIT_DIR', join(foreign, '.git'));
+      vi.stubEnv('GIT_WORK_TREE', selected);
+
+      const api = new FakeApi();
+      const tracker = new ManagedRepoOverviewTracker({
+        workspaceRoot: root,
+        managedRepos: ['selected'],
+        api,
+        intervalMs: 0,
+      });
+      const view = await tracker.refresh();
+      expect(row(view, 'selected').fullName).toBe('acme/selected');
+      expect(api.calls).toContain('fetchRepo:acme/selected');
+      expect(api.calls.some((call) => call.endsWith(':acme/foreign'))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects (never nulls) when the production resolver cannot spawn git', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-path-'));
     const emptyPath = mkdtempSync(join(tmpdir(), 'gru-repo-overview-emptypath-'));

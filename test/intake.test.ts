@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeService, INTAKE_HELPER, type IntakeServiceOptions } from '../src/intake/service.js';
 import { conservativePlan, validatePlan } from '../src/intake/planner.js';
 import { captureSources } from '../src/intake/sources.js';
-import { managedRepoPathsForIntake, resolveManagedRepoPath } from '../src/repos/managed-names.js';
+import { createManagedRepoIntakeResolver, managedRepoPathsForIntake, resolveManagedRepoPath } from '../src/repos/managed-names.js';
 import { canonical, boundedCanonical, INTAKE_MAX_JSON_NESTING, digest, type IntakeRequest, type Plan, type Proposal } from '../src/intake/types.js';
 import { loadBundledWorkflowRuntime, writeWorkflowManifest } from '../src/workflows/runtime.js';
 import { parseWorkflowManifest, WORKFLOW_MANIFEST } from '../src/workflows/manifest.js';
@@ -368,6 +368,20 @@ describe('intake review regressions', () => {
     vi.stubEnv('GIT_WORK_TREE', stale);
     expect(managedRepoPathsForIntake(h.workspace, ['stale'])).toEqual([]);
     await expect(resolveManagedRepoPath(h.workspace, 'stale')).resolves.toMatchObject({ kind: 'unavailable' });
+    vi.unstubAllEnvs();
+
+    const fakeBin = join(h.root, 'fake-bin');
+    const probeLog = join(h.root, 'git-probe.log');
+    const fakeGit = join(fakeBin, 'git');
+    mkdirSync(fakeBin);
+    writeFileSync(fakeGit, '#!/bin/sh\nprintf "%s\\n" "$2" >> "$GIT_PROBE_LOG"\nprintf "%s\\n" "$GIT_PROBE_ROOT"\n');
+    chmodSync(fakeGit, 0o755);
+    vi.stubEnv('PATH', fakeBin);
+    vi.stubEnv('GIT_PROBE_LOG', probeLog);
+    vi.stubEnv('GIT_PROBE_ROOT', h.repo);
+    const resolveIntakeRepo = createManagedRepoIntakeResolver(h.workspace, ['stale', 'demo']);
+    expect(resolveIntakeRepo(h.repo)).toEqual([h.repo]);
+    expect(readFileSync(probeLog, 'utf8')).toBe(`${h.repo}\n`);
     vi.unstubAllEnvs();
 
     const source = join(h.root, 'worktree-source');

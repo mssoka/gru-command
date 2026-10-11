@@ -38,7 +38,7 @@ import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { GhRepoOverviewApi, type ManagedRepoOverviewTracker } from './repos/overview.js';
 import { createManagedRepoOverviewTracker } from './repos/runtime.js';
-import { managedRepoPathsForIntake } from './repos/managed-names.js';
+import { createManagedRepoIntakeResolver } from './repos/managed-names.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
 import { reconcilePendingRebriefs, reconcilePendingDirectives } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
@@ -1435,10 +1435,11 @@ async function main(): Promise<number> {
         spawn: (spawnOptions) => registry.spawn('silas', spawnOptions ?? {}),
       })
     : null;
+  const resolveIntakeRepos = createManagedRepoIntakeResolver(config.workspaceRoot, config.managedRepos);
   const intake = new IntakeService({
     dataDir: config.dataDir,
     workspaceRoot: config.workspaceRoot,
-    managedRepos: () => managedRepoPathsForIntake(config.workspaceRoot, config.managedRepos),
+    managedRepos: resolveIntakeRepos,
     uploadsDir,
   });
   const dispatchServer = createDispatchServer({

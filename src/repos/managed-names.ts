@@ -24,7 +24,7 @@ const GIT_ROUTING_ENV = new Set([
 
 /** Keep owner Git configuration, but prevent inherited routing from replacing
  * the selected project's actual .git identity. */
-function gitProbeEnvironment(): NodeJS.ProcessEnv {
+export function gitProbeEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(
     Object.entries(process.env).filter(([name]) => !GIT_ROUTING_ENV.has(name)),
   );
@@ -44,7 +44,7 @@ async function isGitWorktreeRoot(project: string): Promise<boolean> {
         },
         (error, output) => {
           if (error !== null) reject(error);
-          else resolveOutput(typeof output === 'string' ? output : output.toString('utf8'));
+          else resolveOutput(output);
         },
       );
     });
@@ -183,8 +183,9 @@ export function resolveManagedRepoPathSync(
   }
 }
 
-/** Canonical, currently available roots for the intake registry. Unavailable,
- * escaped and symlinked configured names never expand intake membership. */
+/** Canonical, currently available roots for offline registry consumers.
+ * Runtime intake should use createManagedRepoIntakeResolver to validate only
+ * the single requested configured repository. */
 export function managedRepoPathsForIntake(
   workspaceRoot: string,
   names: readonly string[],
@@ -197,4 +198,35 @@ export function managedRepoPathsForIntake(
     }
   }
   return paths;
+}
+
+/** Build a bounded per-request intake guard once. It does an O(1) configured
+ * name lookup and at most one bounded Git probe, rather than blocking the
+ * event loop once per configured repository on every intake request. */
+export function createManagedRepoIntakeResolver(
+  workspaceRoot: string,
+  names: readonly string[],
+): (requestedPath: string) => readonly string[] {
+  const managedNames = new Set(names);
+  return (requestedPath: string): readonly string[] => {
+    try {
+      const workspace = realpathSync(workspaceRoot);
+      if (!isAbsolute(requestedPath)) return [];
+      const name = relative(workspace, requestedPath);
+      if (
+        name === '' ||
+        name === '..' ||
+        name.startsWith(`..${sep}`) ||
+        name.includes(sep) ||
+        join(workspace, name) !== requestedPath ||
+        !managedNames.has(name)
+      ) {
+        return [];
+      }
+      const resolved = resolveManagedRepoPathSync(workspace, name);
+      return resolved.kind === 'available' && resolved.path === requestedPath ? [resolved.path] : [];
+    } catch {
+      return [];
+    }
+  };
 }
