@@ -11,6 +11,7 @@ import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger
 import type { PipelineService } from './pipeline.js';
 import type { IntakeService } from '../intake/service.js';
 import { IntakeError } from '../intake/types.js';
+import { IntakePartialFailure, type IntakeApprovalService } from '../intake/approval.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
@@ -82,8 +83,9 @@ export interface DispatchServerOptions {
   /** Durable pipeline queue surface (approved j-239/j-1064); absent =
    * /api/pipeline/* answers 503 (queue not hosted in this build). */
   readonly pipeline?: PipelineService;
-  /** Read-only native intake preview; never connected to executable enqueue. */
+  /** Preview remains read-only; approval is a separate explicit boundary. */
   readonly intake?: IntakeService;
+  readonly intakeApproval?: IntakeApprovalService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   readonly log?: Log;
@@ -381,13 +383,30 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         return true;
       }
       try {
-        if (req.method === 'POST' && path === '/api/intake/preview') {
+        if (req.method === 'POST' && ['/api/intake/preview', '/api/intake/revision', '/api/intake/review', '/api/intake/reject', '/api/intake/approve'].includes(path)) {
           let body: Record<string, unknown>;
           try { body = await readBody(req, false); } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             throw new IntakeError('intake_invalid_request', message, message.includes('exceeds 512 KiB') ? 413 : 400);
           }
-          json(res, 200, await intake.preview(body) as unknown as Record<string, unknown>);
+          if (path === '/api/intake/preview' || path === '/api/intake/revision') {
+            json(res, 200, await (path.endsWith('/preview') ? intake.preview(body) : intake.revise(body)) as unknown as Record<string, unknown>);
+          } else {
+            const approval = options.intakeApproval;
+            if (approval === undefined) throw new IntakeError('intake_approval_not_hosted', 'Explicit intake approval is not hosted on this service', 503);
+            const result = path.endsWith('/approve') ? approval.approve(body) : path.endsWith('/reject') ? approval.reject(body) : approval.review(body);
+            json(res, 200, result as unknown as Record<string, unknown>);
+          }
+          return true;
+        }
+        const reviewRead = /^\/api\/intake\/([^/]+)\/review$/u.exec(path);
+        if (req.method === 'GET' && reviewRead !== null) {
+          if ((req.url?.length ?? 0) > 8192) throw new IntakeError('intake_invalid_request', 'intake URL exceeds 8 KiB');
+          const params = new URL(req.url ?? '/', 'http://localhost').searchParams;
+          for (const key of params.keys()) if (!['repoPath', 'token'].includes(key) || params.getAll(key).length !== 1) throw new IntakeError('intake_invalid_request', 'unsupported or duplicated review query parameter');
+          if (!params.get('repoPath')) throw new IntakeError('intake_invalid_request', 'missing repoPath');
+          if (options.intakeApproval === undefined) throw new IntakeError('intake_approval_not_hosted', 'Explicit intake approval is not hosted on this service', 503);
+          json(res, 200, options.intakeApproval.read(params.get('repoPath')!, decodeURIComponent(reviewRead[1]!), params.get('token') ?? undefined) as unknown as Record<string, unknown>);
           return true;
         }
         const read = /^\/api\/intake\/([^/]+)\/requests\/([^/]+)$/u.exec(path);
@@ -416,7 +435,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             // chunked sender. Merely pausing/draining leaves it alive forever.
             res.once('finish', () => socket.destroySoon());
           }
-          json(res, error.status, { error: error.code, detail: error.message });
+          json(res, error.status, { error: error.code, detail: error.message, ...(error instanceof IntakePartialFailure ? { readback: error.readback } : {}) });
         } else if (error instanceof URIError) json(res, 400, { error: 'intake_invalid_request', detail: 'malformed percent escape in intake identity' });
         else json(res, 500, { error: 'intake_failed', detail: error instanceof Error ? error.message : String(error) });
       }

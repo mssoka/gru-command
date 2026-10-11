@@ -2392,7 +2392,7 @@ describe('packaged product and terminal-frame coverage (N6)', () => {
     // web's tsc typechecks its e2e specs, which import the shared real-service
     // helper from the parent tree — the pack staging needs it for build:web.
     mkdirSync(join(packRoot, 'test', 'helpers'), { recursive: true });
-    for (const entry of ['real-service.mjs', 'real-service.d.mts']) {
+    for (const entry of ['real-service.mjs', 'real-service.d.mts', 'intake-plan.ts']) {
       cpSync(join(productRoot, 'test', 'helpers', entry), join(packRoot, 'test', 'helpers', entry));
     }
     mkdirSync(join(packRoot, 'web'), { recursive: true });

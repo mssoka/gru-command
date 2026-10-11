@@ -1,4 +1,4 @@
-# Native GC intake: preview, never approval
+# Native GC intake: review and explicit approval
 
 GitHub issues, Markdown/plain-text specs, and Markdown BMAD epics/stories enter
 one immutable GC proposal. BMAD is optional **source data**, not a runtime. No
@@ -7,8 +7,9 @@ Gru can supply a structured refinement from the existing conversation.
 
 **Preview creates zero executable work:** no jobs, minion dispatches, lanes,
 pipeline entries, or held entries. Imported commands, labels, statuses,
-frontmatter and model output cannot approve execution. Browser approval and
-setup are separate features. Nothing here changes Perkins or merge authority.
+frontmatter and model output cannot approve execution. Only an explicit
+revision/selection approval enters the existing pipeline. Nothing here changes
+Perkins, owner approval or merge authority.
 
 ## Sources and identities
 
@@ -103,7 +104,8 @@ nonempty context, damaged recorded bytes, or either orphan side of a payload/
 receipt pair returns `intake_storage_error`, never a concealed not-found. Exact
 POST retry recovers receipt-before-payload interruption; a lost receipt requires
 restoration of the exact original receipt, not guessed provenance.
-These routes do not call `/api/pipeline/enqueue`.
+Preview, revision, read, diff, review and rejection never enqueue. The separate
+explicit approval boundary uses the existing pipeline service.
 
 ```bash
 curl -H "Authorization: Bearer $PAIRING_TOKEN" \
@@ -165,8 +167,12 @@ nonblank source line, including metadata, without assuming it is an instruction
 or satisfied requirement. Headings and BMAD boundaries do not mechanically split
 heists. Missing and contradictory material remains to be clarified.
 
-To refine, copy the returned `plan`, edit it in the existing Gru conversation,
-and POST a new request with `plan` and `previousRequestId`. The public schema is
+To refine, copy the returned `plan`, edit it in the existing Gru conversation
+or compact browser review, and create a new revision. `POST /api/intake/revision`
+requires `repoPath`, `intakeId`, a new `requestId`, `previousRequestId`, the exact
+previous `revisionId` and `plan`. It retains the captured source bytes, even if
+the source files changed. A new preview is a source refresh, not a plan edit.
+The earlier preview/refinement POST remains supported. The public schema is
 in `src/intake/types.ts`; the owned planning contract is
 `resources/gc-workflows/skills/gc-build/intake.md`.
 
@@ -219,3 +225,70 @@ immutable capture. A receipt without payload is a named storage error, not
 not-found; exact original POST retry remains the recovery path.
 Private snapshots/briefings are visible only to authenticated readers, not
 public board summaries. Sources are never edited or cleaned up.
+
+## Browser review and execution authority
+
+Open **Review source intake** inside the existing Gru chat. Choose the managed
+repository with the existing browse picker (directory selection only, not device
+upload). Choose an issue (with optional explicit comment IDs), or browse/upload a
+spec or BMAD Markdown document. Workspace file choices are bounded to the selected
+repository; device documents use the managed upload store. The first selected
+document is primary, regardless of upload completion order; subsequent documents
+are explicit supporting inputs. An incomplete upload batch is refused visibly,
+not silently narrowed. Intake's eight-document limit is independent of ready chat
+attachments.
+No links are crawled, and no BMAD installation/configuration is consulted.
+
+**Preview sources** shows repository, exact source/version/hash, goal, scope,
+exclusions, acceptance, verification, dependencies and unresolved questions.
+The plan JSON is editable: retain requirement IDs and exact source traces while
+writing concrete statements. **Save new revision** creates immutable captured
+refinement. Clearing default question arrays alone cannot make a plan executable.
+Unresolved source gaps, unmapped requirements and questions refuse approval.
+
+Click **Review this revision**, select the complete heists and their prerequisite
+closure, then **Approve selected work**. Selection never implies approval.
+**Reject revision** invalidates the reviewed token, creating no executable work.
+Rejected revisions cannot reopen: use a new edited revision. Dependencies enter
+as existing GC milestone gates: imported “done”, “approved”, or “merged” labels
+are never completion evidence. Only GC's ledger evaluator can release work.
+
+Review/rejection/approval POST routes are `/api/intake/review`, `/reject` and
+`/approve`. Decisions contain `repoPath`, `intakeId`, `requestId`, `revisionId`
+and `expectedToken` (null for an initial review). Approval additionally requires
+an explicit unique `selected` array of heist IDs. Read current coordination via
+`GET /api/intake/<intakeId>/review?repoPath=...`; optional `token=...` reads an
+immutable historical decision. The response names `review`, `accepted` and
+`remaining` heist-to-pipeline-entry mappings. Changed review state returns
+`409 intake_stale_review`; changed revision bytes return `intake_stale_revision`;
+changed accepted selections/entries return `intake_acceptance_conflict`.
+Incomplete briefings return `intake_incomplete_plan`; missing prerequisite
+selection returns `intake_dependency_selection`.
+
+Approval freezes exact briefings/provenance and stable pipeline/job/request IDs
+in the configured private ledger **before** enqueue effects. It does not create
+another queue. If enqueue is interrupted, `503 intake_partial_failure` includes
+accepted and remaining identities in `readback`. Read back after a timeout,
+reconnect or reload; then explicitly retry the identical approval. Replays
+reconcile immutable pipeline payloads and never mint replacement plans/minions.
+Browser mount/reconnect/readback never approve automatically. Tab recovery stores
+proposal/pending-revision identities and original explicit approval identities,
+review tokens and selected heist IDs; private source/briefing content remains in
+GC storage. A lost revision response is recovered by reading the original pending
+request, not by creating a replacement revision. Unpairing clears this tab recovery.
+
+Accepted contracts never change after later previews or source edits. Previously
+accepted history remains readable, including when a newer revision is reviewed.
+**Read back / recover** refreshes both the current draft and saved original approval
+receipts. Original approval rows name accepted/remaining entries; their explicit
+retry buttons reuse the original token and selection without replacing the newer
+draft. If a response was lost before its receipt arrived, the original approval
+remains unconfirmed until readback or an explicit identical retry succeeds.
+Each failed historical receipt is reported without preventing independent healthy
+receipt/draft reads. Invalid tab recovery data produces a named actionable error
+without breaking chat or sending approval. Damage to proposal receipts, decision
+records or their predecessor chain fails loudly; restore exact original private bytes,
+never synthesize an accepted plan. Execution retains GC-owned routing and private
+operational artifacts; approved repository knowledge belongs only to the assigned
+worktree's `gru-output/`. This feature never rewrites sources, upstream status,
+old jobs, historical workflow bindings, Perkins policy or the Book of Lessons.

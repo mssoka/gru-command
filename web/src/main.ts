@@ -9,6 +9,8 @@ import './styles/components.css';
 import { ChatClient, type ConnectionState } from './lib/chat-client.js';
 import { migrateLegacyOutbox, safeStorage } from './lib/chat-storage.js';
 import { AttachClient, readFileBytes } from './lib/attach-client.js';
+import { IntakeClient } from './lib/intake-client.js';
+import { IntakeView } from './ui/intake.js';
 import { WS_PATH, type LoggedFrame } from './lib/protocol.js';
 import { BoardClient } from './lib/board-client.js';
 import { consoleModeForWidth } from './lib/console-layout.js';
@@ -46,6 +48,8 @@ const wsUrl = `${secure ? 'wss' : 'ws'}://${location.host}${WS_PATH}`;
 
 let client: ChatClient | null = null;
 let chatView: ChatView | null = null;
+let intakeView: IntakeView | null = null;
+let intakeToken: string | null = null;
 let boardClient: BoardClient | null = null;
 let boardView: BoardView | null = null;
 let transcriptView: TranscriptView | null = null;
@@ -117,6 +121,8 @@ function failPairing(message: string): void {
   clearBanner('conn');
   storage.removeItem(TOKEN_KEY);
   showPairing();
+  intakeView?.bind(null);
+  intakeView?.clearRecovery();
   showPairingError(`Pairing failed: ${message}`);
 }
 
@@ -249,6 +255,10 @@ function startChat(token: string): void {
     browse: (path) => attachClient.browse(path),
     upload: async (file) => attachClient.upload(file.name, await readFileBytes(file)),
   });
+  intakeView ??= new IntakeView(mustGet('intake-mount'), chatView, chatStorage);
+  if (intakeToken !== null && intakeToken !== token) intakeView.clearRecovery();
+  intakeToken = token;
+  intakeView.bind(new IntakeClient({ token, host: location.host, secure }));
   client?.stop();
   let replaying = false;
   let contextReady = false;
@@ -429,6 +439,9 @@ initSettings({
   storage,
   wsUrl,
   onUnpair: () => {
+    intakeView?.bind(null);
+    intakeView?.clearRecovery();
+    intakeToken = null;
     client?.stop();
     boardClient?.stop();
     client = null;

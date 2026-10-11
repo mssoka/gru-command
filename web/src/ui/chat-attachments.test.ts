@@ -483,3 +483,87 @@ describe('composer attach consumer paths', () => {
     expect(notices.at(-1)?.textContent).toBe('⚠️ attachment cap reached (8)');
   });
 });
+
+it('publishes intake device uploads in chooser order despite reversed completion, without composer chips', async () => {
+  const view = new ChatView(() => true);
+  const resolves = new Map<string, (value: UploadedFile) => void>();
+  view.bindAttach(surface({ upload: (file) => new Promise((resolve) => resolves.set(file.name, resolve)) }));
+  const picked = vi.fn(); view.pickIntakeFile(picked);
+  const input = document.getElementById('chat-attach-file') as HTMLInputElement;
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['primary'], 'primary.md'), new File(['support'], 'support.md')] });
+  input.dispatchEvent(new Event('change'));
+  resolves.get('support.md')!({ path: '/uploads/support.md', name: 'support.md', bytes: 7 });
+  await settle(); expect(picked).not.toHaveBeenCalled();
+  resolves.get('primary.md')!({ path: '/uploads/primary.md', name: 'primary.md', bytes: 7 });
+  await vi.waitFor(() => expect(picked).toHaveBeenCalledTimes(2));
+  expect(picked.mock.calls.map(([chip]) => chip.name)).toEqual(['primary.md', 'support.md']);
+  expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(0);
+});
+
+it.each(['primary.md', 'support.md'])('refuses an incomplete intake upload selection when %s fails', async (failed) => {
+  const view = new ChatView(() => true);
+  view.bindAttach(surface({ upload: async (file) => {
+    if (file.name === failed) throw new Error('upload unavailable');
+    return { path: `/uploads/${file.name}`, name: file.name, bytes: file.size };
+  } }));
+  const picked = vi.fn(); view.pickIntakeFile(picked);
+  const input = document.getElementById('chat-attach-file') as HTMLInputElement;
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['primary'], 'primary.md'), new File(['support'], 'support.md')] });
+  input.dispatchEvent(new Event('change'));
+  await vi.waitFor(() => expect(document.querySelectorAll('.attach-chip--busy')).toHaveLength(0));
+  await settle();
+  expect(picked).not.toHaveBeenCalled();
+  expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(0);
+  expect(document.getElementById('chat-log')!.textContent).toContain('Intake documents were not selected: an upload failed. Retry the complete selection.');
+});
+
+it('disables files outside the selected intake repository while ordinary workspace browsing still picks them', async () => {
+  const view = new ChatView(() => true);
+  view.bindAttach(surface({ browse: async (path) => path === 'app' ? result('app', [{ name: 'inside.md', kind: 'file', size: 1, image: false, pickable: true }]) : result('', [{ name: 'outside.md', kind: 'file', size: 1, image: false, pickable: true }, { name: 'app', kind: 'dir', size: null, image: false, pickable: true }]) }));
+  const picked = vi.fn(); view.pickIntakeFile(picked, '/workspace/app'); await settle();
+  const outside = document.querySelector<HTMLButtonElement>('[data-name="outside.md"]')!;
+  expect(outside.disabled).toBe(true); expect(outside.title).toContain('selected intake repository'); outside.click(); expect(picked).not.toHaveBeenCalled();
+  document.querySelector<HTMLButtonElement>('[data-name="app"]')!.click(); await settle();
+  document.querySelector<HTMLButtonElement>('[data-name="inside.md"]')!.click();
+  expect(picked).toHaveBeenCalledWith(expect.objectContaining({ path: '/workspace/app/inside.md' }), false);
+  document.getElementById('chat-attach')!.click(); await settle();
+  document.querySelector<HTMLButtonElement>('[data-name="outside.md"]')!.click();
+  expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(1);
+});
+
+it('repository picker forbids device and stale file-input uploads, then restores normal/document consumers', async () => {
+  const view = new ChatView(() => true), upload = vi.fn(async (file: File) => ({ path: `/uploads/${file.name}`, name: file.name, bytes: file.size }));
+  view.bindAttach(surface({ upload }));
+  const repository = vi.fn(), documentPick = vi.fn(); view.pickIntakeRepository(repository); await settle();
+  const input = document.getElementById('chat-attach-file') as HTMLInputElement;
+  const click = vi.spyOn(input, 'click');
+  const device = document.getElementById('attach-picker-device') as HTMLButtonElement;
+  expect(device.disabled).toBe(true); expect(device.hidden).toBe(true);
+  device.dispatchEvent(new Event('click'));
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['bytes'], 'source.md')] });
+  input.dispatchEvent(new Event('change'));
+  document.getElementById('attach-picker-close')!.click(); input.dispatchEvent(new Event('change'));
+  expect(click).not.toHaveBeenCalled(); expect(upload).not.toHaveBeenCalled(); expect(repository).not.toHaveBeenCalled();
+  expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(0);
+  document.getElementById('chat-attach')!.click(); await settle(); input.dispatchEvent(new Event('change')); await settle();
+  expect(upload).toHaveBeenCalledOnce();
+  view.pickIntakeFile(documentPick, '/workspace/app'); await settle(); input.dispatchEvent(new Event('change'));
+  await vi.waitFor(() => expect(documentPick).toHaveBeenCalledOnce());
+  expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(1);
+});
+
+it('admits eight ordered intake documents independently of a ready composer chip and refuses an oversized intake batch atomically', async () => {
+  const view = new ChatView(() => true), upload = vi.fn(async (file: File) => ({ path: `/uploads/${file.name}`, name: file.name, bytes: file.size }));
+  view.bindAttach(surface({ upload }));
+  const input = document.getElementById('chat-attach-file') as HTMLInputElement;
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['chat'], 'chat.md')] }); input.dispatchEvent(new Event('change')); await settle();
+  expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(1);
+  const picked = vi.fn(); view.pickIntakeFile(picked, '/workspace/app', 8); await settle();
+  const files = Array.from({ length: 8 }, (_, index) => new File(['intake'], `document-${index}.md`));
+  Object.defineProperty(input, 'files', { configurable: true, value: files }); input.dispatchEvent(new Event('change'));
+  await vi.waitFor(() => expect(picked).toHaveBeenCalledTimes(8));
+  expect(picked.mock.calls.map(([chip]) => chip.name)).toEqual(files.map(({ name }) => name));
+  expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(1);
+  view.pickIntakeFile(picked, '/workspace/app', 0); await settle(); input.dispatchEvent(new Event('change'));
+  await settle(); expect(upload).toHaveBeenCalledTimes(9); expect(picked).toHaveBeenCalledTimes(8);
+});

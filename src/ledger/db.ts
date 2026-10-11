@@ -978,4 +978,25 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE pending_directives ADD COLUMN work_revision INTEGER;
     `,
   },
+  {
+    id: 25,
+    name: 'intake-review-acceptance',
+    sql: `
+      CREATE TABLE intake_reviews (
+        token TEXT PRIMARY KEY,
+        repo_path TEXT NOT NULL,
+        intake_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reviewed','rejected','approved')),
+        record TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX intake_one_approval ON intake_reviews(repo_path, intake_id, revision_id) WHERE status = 'approved';
+      CREATE TABLE intake_review_heads (
+        repo_path TEXT NOT NULL,
+        intake_id TEXT NOT NULL,
+        token TEXT NOT NULL REFERENCES intake_reviews(token),
+        PRIMARY KEY(repo_path, intake_id)
+      );
+    `,
+  },
 ];
