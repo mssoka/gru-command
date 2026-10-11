@@ -5,7 +5,7 @@ created: '2026-10-11'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'f738b9b1594081cdbb4929af7be256454951eb43'
-review_loop_iteration: 4
+review_loop_iteration: 5
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/BOARD.md'
@@ -96,7 +96,7 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
 
 - `src/notifications/attention.ts` (new) — authoritative owner-attention registry: `owner-required | owner-allowed | owner-forbidden` per kind/prefix; unknown defaults to Gru triage; `requiresTypedDecision(kind)`.
 - `src/ledger/notification-decision.ts` (new) — typed `NotificationDecision` (question/context/recommendation/reservedClass/whyNotDelegable/options/discussion) + strict validation and safe parse.
-- `src/ledger/db.ts` — migration 25: `ALTER TABLE notifications ADD COLUMN decision_json/decided_at/decided_by/decided_option`.
+- `src/ledger/db.ts` — migration 28: `ALTER TABLE notifications ADD COLUMN decision_json/decided_at/decided_by/decided_option`.
 - `src/ledger/api.ts` — `NotificationRecord` + `recordNotification(decision)` + `recordNotificationDecision()` + `notificationFromRow`; keep `ackNotification` (record-only now) and `disposeMachineNotification`.
 - `src/notifications/center.ts` — enforce the registry in `post()` (force/deny owner routing; require typed decision for `gru.owner-escalation`); gh-97 openIncident logic follows the effective routing.
 - `src/board/server.ts` — `POST /api/notifications/needs-owner` requires a valid `decision`; new `POST /api/notifications/:id/decision`; `onNotificationDisposition` hook after a successful machine disposition.
@@ -187,6 +187,16 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
   314px after an internal scrollbar. Container-size checks now use the
   border-box width; client width remains the horizontal-overflow oracle.
   The complete failed capture and failure images remain preserved.
+- 2026-10-11 main integration: `origin/main` at
+  `79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37` was merged as
+  `8d98be911a23df52a1abc786722157df3913308f`. The migration collision was
+  resolved by retaining main's migrations 26–27 and assigning the
+  never-applied owner-decision migration ID 28. The exact-head `full`
+  scope passed; the browser scope passed 65/66, with the mock theme
+  snapshot at `web/e2e/smoke.spec.ts:1470` still unresolved. The expected
+  main snapshot shows three legacy FOR YOU rows while the current smoke
+  test expects two rows with the typed decision card; the targeted snapshot
+  repair is pending.
 
 ## Spec Change Log
 
@@ -339,6 +349,17 @@ R12 actual text-only zoom reports (review target 8e1e20f48b56bed52880560386efb16
 - `high` — verification-gap: the global relative-size descendant can be over-scaled while fixed-size title checks pass. The current notification-only mechanism and relative probe assert exact doubling on initial and rebuilt content (patch).
 - `high` — verification-gap: the original exact-factor check used its own pass’s baseline. Current assertions use separately captured pre-pass and rebuilt-DOM baselines (patch).
 - `high` — verification-gap: panel text could remain unzoomed while the owner card oracle passed. Current tests assert exact pre/post sizes in `#notification-list`, including the 320px panel condition (patch).
+
+R13 actual text-only proof round (candidate
+`8d98be911a23df52a1abc786722157df3913308f`; three tracked reviewers). The
+blind-hunter reported no actionable findings. Edge-cases and
+verification-gap independently found that the post-rebuild 2× assertions
+omitted the fresh owner Details diagnostic and the bell decision Details
+diagnostic. Both findings were acted on: add replacement probes and
+independently measure each fresh-node baseline before asserting 2× after
+reapplication. No product CSS changed. Verification-gap also surfaced the
+65/66 browser result; the stale main smoke snapshot remains an open
+verification issue outside the R13 test hunk.
 
 ## Design Notes
 

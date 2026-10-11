@@ -801,6 +801,7 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         const optionSelector = `${cardSelector} [data-action-id$=":option:approve"]`;
         const detailSelector = `${cardSelector} .board-notification__detail-text`;
         const panelDecisionTitleSelector = '#notification-list [data-notification-id="decision-1"] .board-notification__title';
+        const panelDecisionDetailSelector = '#notification-list [data-notification-id="decision-1"] .board-notification__detail-text';
         const panelMachineDetailSelector = '#notification-list [data-notification-id="machine-1"] .board-notification__detail-text';
         const relativeProbeSelector = '[data-text-zoom-relative-probe="true"]';
         const card = page.locator(cardSelector);
@@ -848,6 +849,7 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           option: await computedFontSize(page, optionSelector),
           detail: await computedFontSize(page, detailSelector),
           panelTitle: await computedFontSize(page, panelDecisionTitleSelector),
+          panelDecisionDetail: await computedFontSize(page, panelDecisionDetailSelector),
           panelDetail: await computedFontSize(page, panelMachineDetailSelector),
           relative: await computedFontSize(page, relativeProbeSelector),
         };
@@ -866,6 +868,7 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         expect(await computedFontSize(page, optionSelector)).toBeCloseTo(beforeFonts.option * 2, 1);
         expect(await computedFontSize(page, detailSelector)).toBeCloseTo(beforeFonts.detail * 2, 1);
         expect(await computedFontSize(page, panelDecisionTitleSelector)).toBeCloseTo(beforeFonts.panelTitle * 2, 1);
+        expect(await computedFontSize(page, panelDecisionDetailSelector)).toBeCloseTo(beforeFonts.panelDecisionDetail * 2, 1);
         expect(await computedFontSize(page, panelMachineDetailSelector)).toBeCloseTo(beforeFonts.panelDetail * 2, 1);
         expect(await computedFontSize(page, relativeProbeSelector)).toBeCloseTo(beforeFonts.relative * 2, 1);
         expect(await computedFontSize(page, metaSelector)).toBe(22);
@@ -941,7 +944,13 @@ test.describe('notification readability — fixed long-content fixtures', () => 
             if (element === null) throw new Error(`rebuild probe target not found: ${selector}`);
             element.setAttribute('data-rebuild-probe', 'before');
           }
-        }, [titleSelector, panelDecisionTitleSelector, panelMachineDetailSelector]);
+        }, [
+          titleSelector,
+          detailSelector,
+          panelDecisionTitleSelector,
+          panelDecisionDetailSelector,
+          panelMachineDetailSelector,
+        ]);
         seed.push(withDiscussion);
         await expect.poll(() => page.locator('[data-rebuild-probe="before"]').count()).toBe(0);
         await page.locator(detailSelector).evaluate((element) => {
@@ -953,17 +962,22 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         });
         const rebuiltFonts = {
           title: await computedFontSize(page, titleSelector),
+          detail: await computedFontSize(page, detailSelector),
           panelTitle: await computedFontSize(page, panelDecisionTitleSelector),
+          panelDecisionDetail: await computedFontSize(page, panelDecisionDetailSelector),
           panelDetail: await computedFontSize(page, panelMachineDetailSelector),
           relative: await computedFontSize(page, relativeProbeSelector),
         };
         const reapplied = await applyTextOnlyZoom(page);
-        // Each baseline is measured from the fresh DOM before reapplication;
-        // neither relative children nor inherited text can compound.
+        // Every copied decision diagnostic is measured from the fresh DOM
+        // before reapplication; neither relative children nor inherited text
+        // can compound.
         expect(reapplied.scaled).toBeGreaterThan(0);
         expect(reapplied.probeBase).toBeCloseTo(rebuiltFonts.title, 1);
         expect(reapplied.probeAfter).toBeCloseTo(rebuiltFonts.title * 2, 1);
+        expect(await computedFontSize(page, detailSelector)).toBeCloseTo(rebuiltFonts.detail * 2, 1);
         expect(await computedFontSize(page, panelDecisionTitleSelector)).toBeCloseTo(rebuiltFonts.panelTitle * 2, 1);
+        expect(await computedFontSize(page, panelDecisionDetailSelector)).toBeCloseTo(rebuiltFonts.panelDecisionDetail * 2, 1);
         expect(await computedFontSize(page, panelMachineDetailSelector)).toBeCloseTo(rebuiltFonts.panelDetail * 2, 1);
         expect(await computedFontSize(page, relativeProbeSelector)).toBeCloseTo(rebuiltFonts.relative * 2, 1);
         await page.locator(relativeProbeSelector).evaluate((element) => element.remove());
