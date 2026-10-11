@@ -104,7 +104,7 @@ const EVENT_CLASSES = [
   'unknown',
 ] as const;
 
-const EVENT_QUESTIONS = {
+export const EVENT_QUESTIONS = {
   needs_action: {
     type: 'noul',
     instructions: 'Does this orchestration transition require an operator action rather than informational display?',
@@ -131,6 +131,7 @@ const EVENT_QUESTIONS = {
     criteria: ['low: routine informational state', 'medium: inspect soon', 'high: action is required now'],
   },
 } as const satisfies QuestionSet;
+export type EventQuestions = typeof EVENT_QUESTIONS;
 
 export interface EventDecisionContext {
   /** Bounded redacted tail of the event's primary text (the transcript
@@ -202,7 +203,7 @@ export function deterministicFailureClass(reason: string): FailureClass {
   return 'unknown';
 }
 
-const SUPERVISION_QUESTIONS = {
+export const SUPERVISION_QUESTIONS = {
   failure_class: {
     type: 'choice',
     instructions: 'Classify the observed runtime failure signature into exactly one operational class.',
@@ -231,6 +232,7 @@ const SUPERVISION_QUESTIONS = {
     criteria: ['low: transient and recoverable', 'medium: degraded; inspect', 'high: operator intervention required'],
   },
 } as const satisfies QuestionSet;
+export type SupervisionQuestions = typeof SUPERVISION_QUESTIONS;
 
 export function supervisionDecisionRequest(input: {
   readonly reason: string;

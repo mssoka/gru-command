@@ -212,7 +212,16 @@ Routing rules:
   "report": "...\\n**Verdict: READY TO MERGE**" }`. Perkins
   `consolidated.json` review rounds are not report-type handbacks; verdict
   lines are removed from the request state. Yield telemetry (#214) reports
-  shadow disagreement rates per surface and provider.
+  shadow disagreement rates per surface and provider: the share of
+  answered asks on which the surface's consumer would have acted
+  differently than on the deterministic baseline (`src/decisions/effects.ts`,
+  the same functions the consumers call). `event_triage` disagrees when
+  the notification would be promoted to action-required (class and
+  severity only annotate its detail text); `supervision_guidance` when the
+  supervisor would stop instead of restart, or stop for a different
+  reason; `escalation_triage` and `same_blocker` when their case spec's
+  `answerAction` differs. Provider misses are counted separately and kept
+  out of the share and the latency quantiles.
 - Production callers pass stable surface names: event/notification triage
   uses `event_triage`; supervisor runtime-health guidance uses
   `supervision_guidance`.
