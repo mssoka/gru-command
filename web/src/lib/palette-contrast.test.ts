@@ -166,8 +166,13 @@ describe('palette contrast (v5)', () => {
       expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__discuss-text')).toBe('on-state');
       expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__submission')).toBe('on-state');
       expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__option-label')).toBe('on-state');
+      // State chips can appear on an error card but are intentionally
+      // neutral: pin their own AA-safe pair rather than inherited on-state.
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification__state')).toBe('ink');
+      expect(declarationIn(COMPONENTS_CSS, '.board-notification__state', 'background')).toBe('var(--paper)');
       const pairs: readonly (readonly [string, string])[] = [
         ['ink', 'card'],
+        ['ink', 'paper'],
         ['muted', 'card'],
         ['on-state', 'alert'],
         ['ink', 'accent-soft'],

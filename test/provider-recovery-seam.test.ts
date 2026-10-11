@@ -251,6 +251,27 @@ class SeamHarness {
     this.supervisor.start();
   }
 
+  /** A jobless Silas logical slot with an open turn, then a structured
+   * GLM quota error; its provider wait must stay owned by the sensor. */
+  async runSilasIntoQuotaWall(): Promise<FakeHandle> {
+    const slot = this.supervisor.declareSlot({
+      id: 'silas-ops',
+      role: 'silas',
+      spawn: (options) => this.registry.spawn('silas', options),
+    });
+    const handle = await slot.ensure() as FakeHandle;
+    handle.emit({ type: 'turn_start' });
+    handle.emit({
+      type: 'error',
+      error: '429: {"error":{"code":"1302","message":"usage window limit reached"}}',
+      fatal: false,
+      provider: 'zai-coding-cn',
+      model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
+    });
+    return handle;
+  }
+
   /** A live minion with an open turn, then a structured GLM quota error. */
   async runMinionIntoQuotaWall(jobId: string): Promise<FakeHandle> {
     const sessionDir = mkdtempSync(join(tmpdir(), 'pr-seam-session-'));
@@ -383,6 +404,29 @@ describe('supervisor ⇄ sensor seam', () => {
     expect(waits[0]?.incidentId).toBe(incident?.id);
     // The stop itself is unchanged: the handle is disposed.
     expect(handle.disposed).toBe(true);
+  });
+
+  it('a jobless Silas notification disposition cannot bypass its open provider wait', async () => {
+    const h = new SeamHarness();
+    try {
+      const handle = await h.runSilasIntoQuotaWall();
+      await h.settle();
+      const wait = h.ledger.openProviderWaitForAgent(handle.id);
+      expect(wait).toMatchObject({ waiterKind: 'silas-slot', jobId: null, slotId: 'silas-ops', status: 'waiting' });
+      const incident = h.ledger.listNotifications({ routing: 'action-required', unackedOnly: true })
+        .find((row) => row.kind.startsWith('supervision.provider-wall.'));
+      expect(incident?.agentId).toBe(handle.id);
+      expect(incident?.resolvedAt).toBeNull();
+      const spawnsBeforeDisposition = h.registry.spawns;
+      const refused = h.supervisor.onNotificationDisposed(incident!.id);
+      expect(refused).toMatchObject({ ok: false });
+      if (!refused.ok) expect(refused.reason).toContain(`open provider recovery ${wait!.id}`);
+      expect(h.registry.spawns).toBe(spawnsBeforeDisposition);
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(h.ledger.openProviderWaitForAgent(handle.id)?.id).toBe(wait?.id);
+    } finally {
+      h.dispose();
+    }
   });
 
   it('exhausted pacing retries hand the latest typed provider evidence to the recovery sensor', async () => {

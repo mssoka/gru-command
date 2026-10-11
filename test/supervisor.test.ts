@@ -242,6 +242,7 @@ function boot(
      * simulate hours with a realistic window instead of flake-prone
      * microsecond beats). */
     turnSilenceMs?: number;
+    restartBackoffMs?: number;
   } = {},
 ): Harness {
   const dir = tmpDir();
@@ -277,7 +278,7 @@ function boot(
       turnSilenceMs: opts.turnSilenceMs ?? 50,
       restartWindowMs: 600_000,
       maxRestarts: 3,
-      restartBackoffMs: 1,
+      restartBackoffMs: opts.restartBackoffMs ?? 1,
     },
     registry,
     ledger: api,
@@ -3406,6 +3407,31 @@ describe('supervision decision surface identity (issue #222)', () => {
   });
 });
 describe('supervisor — guarded re-arm fences (R1: parking and live producers)', () => {
+  function directlyStoppedTurn(jobId: string, agentId: string): {
+    readonly rig: Harness;
+    readonly handle: FakeHandle;
+    readonly stop: NotificationRecord;
+  } {
+    const rig = boot(undefined, { restartBackoffMs: 1_000 });
+    rig.api.addJob({ id: jobId, repo: 'fixture', title: 'stopped lane' });
+    rig.api.setJobStatus(jobId, 'working');
+    rig.api.registerAgent({ id: agentId, role: 'minion', jobId });
+    const handle = new FakeHandle('minion', agentId, null);
+    handle.pendingTurnSnapshot = { text: 'saved interrupted prompt', owner: 'dispatch:fixture' };
+    rig.registry.adopt(handle);
+    hang(handle);
+    const internals = rig.supervisor as unknown as {
+      agents: Map<string, unknown>;
+      tripBreaker(agent: unknown): void;
+    };
+    const agent = internals.agents.get(agentId);
+    if (agent === undefined) throw new Error(`missing test agent ${agentId}`);
+    internals.tripBreaker(agent);
+    const stop = rig.api.listNotifications({ limit: 30 }).find((row) => row.kind === 'supervision.breaker');
+    if (stop === undefined) throw new Error(`breaker stop for ${agentId} was not posted`);
+    return { rig, handle, stop };
+  }
+
   function tripBreaker(): {
     api: LedgerApi;
     center: NotificationCenter;
@@ -3481,6 +3507,149 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       expect(rig.supervisor.viewFor('fenced-agent-resumed')?.breakerOpen).toBe(false);
     } finally {
       rig.close();
+    }
+  });
+
+  it('a failed notification re-arm retry keeps the full fence and reconstructs the durable stop', async () => {
+    const { rig, stop } = directlyStoppedTurn('retry-durable-job', 'retry-durable-agent');
+    let attempts = 0;
+    let restored: Supervisor | null = null;
+    vi.useFakeTimers();
+    try {
+      rig.registry.spawnImpl = async (role) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('first re-arm spawn failed');
+        return new FakeHandle(role, 'must-not-cross-park', null);
+      };
+      expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(1);
+      // The accepted attempt failed and entered its backoff. Parking during
+      // that wait must survive into the scheduled re-arm rung.
+      rig.api.setJobStatus('retry-durable-job', 'parked');
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(rig.registry.spawnCalls).toHaveLength(1);
+      expect(rig.supervisor.viewFor('retry-durable-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      const fenced = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(fenced).toMatchObject({ routing: 'action-required', resolvedAt: null });
+      const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get('retry-durable-agent');
+      expect(agent?.pendingRecovery).not.toBeNull();
+      expect(rig.api.latestSupervisionEvent('retry-durable-agent')?.kind).toBe('supervision.rearm-fenced');
+      expect(rig.api.durableSupervisionStops().get('retry-durable-agent')?.reason).toContain('re-arm fenced:');
+
+      // A fresh process reconstructs the accepted-rearm → later-fence stop
+      // from the newest lifecycle event and exposes it to the board again.
+      rig.supervisor.dispose();
+      restored = new Supervisor({
+        config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+        registry: rig.registry,
+        ledger: rig.api,
+        notifications: rig.center,
+        tickMs: 5,
+        now: () => rig.nowMs,
+      });
+      restored.start();
+      expect(restored.viewFor('retry-durable-agent')).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: expect.stringContaining('re-arm fenced:') });
+      const engine = new BoardEngine({ ledger: rig.api, bus: new EventBus(), supervisionFor: (agentId) => restored?.viewFor(agentId) ?? null });
+      expect(engine.snapshot().agents.find((row) => row.id === 'retry-durable-agent')?.supervision)
+        .toMatchObject({ state: 'stopped', stopReason: expect.stringContaining('re-arm fenced:') });
+    } finally {
+      restored?.dispose();
+      rig.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('a park during queued replay fences the handle and retains the prompt for the same control', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'fence-holder', label: 'hold recovery slot' });
+    let holderReleased = false;
+    const releaseHolder = (): void => {
+      if (holderReleased) return;
+      holderReleased = true;
+      holder.release();
+    };
+    const { rig, stop } = directlyStoppedTurn('replay-park-job', 'replay-park-agent');
+    let firstReplacement: FakeHandle | null = null;
+    try {
+      rig.registry.spawnImpl = async (role, options) => {
+        const replacement = new FakeHandle(role, 'replay-park-first', options?.resumeFile ?? null);
+        firstReplacement = replacement;
+        return replacement;
+      };
+      expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(gate.view().worker.queued.map((entry) => entry.id)).toContain('replay-park-agent'));
+      rig.api.setJobStatus('replay-park-job', 'parked');
+      releaseHolder();
+      await vi.waitFor(() => expect(rig.supervisor.viewFor('replay-park-agent')).toMatchObject({ state: 'stopped', breakerOpen: true }));
+      expect(firstReplacement?.disposed).toBe(true);
+      expect(firstReplacement?.promptCalls).toHaveLength(0);
+      const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get('replay-park-agent');
+      expect(agent?.pendingRecovery).not.toBeNull();
+      const fresh = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(fresh).toMatchObject({ routing: 'action-required', resolvedAt: null });
+
+      rig.api.setJobStatus('replay-park-job', 'working');
+      let retryReplacement: FakeHandle | null = null;
+      rig.registry.spawnImpl = async (role, options) => {
+        const replacement = new FakeHandle(role, 'replay-park-retried', options?.resumeFile ?? null);
+        retryReplacement = replacement;
+        return replacement;
+      };
+      expect(rig.supervisor.onNotificationDisposed(fresh!.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(retryReplacement?.promptCalls).toEqual([
+        { text: 'saved interrupted prompt', owner: 'dispatch:fixture' },
+      ]));
+      expect(retryReplacement?.disposed).toBe(false);
+    } finally {
+      releaseHolder();
+      rig.dispose();
+    }
+  });
+
+  it('a stopped implementer cannot re-arm while an active Perkins round owns the lane', () => {
+    const { rig, stop } = directlyStoppedTurn('review-fence-job', 'review-fence-agent');
+    try {
+      const round = rig.api.addRound({ jobId: 'review-fence-job', targetRef: 'PR-306', lenses: ['blind'] });
+      rig.api.setJobStatus('review-fence-job', 'in-review');
+      rig.api.setRoundStatus(round.id, 'live');
+      rig.supervisor.setActiveReviewProbe((jobId) => rig.api.listRounds(jobId).some((candidate) => candidate.status === 'pending' || candidate.status === 'live'));
+      const refused = rig.supervisor.onNotificationDisposed(stop.id);
+      expect(refused).toMatchObject({ ok: false });
+      if (!refused.ok) expect(refused.reason).toContain('active Perkins review');
+      expect(rig.registry.spawnCalls).toHaveLength(0);
+      expect(rig.supervisor.viewFor('review-fence-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+    } finally {
+      rig.dispose();
+    }
+  });
+
+  it('a Perkins round admitted during spawn disposes the replacement before adoption', async () => {
+    const { rig, stop } = directlyStoppedTurn('review-mid-spawn-job', 'review-mid-spawn-agent');
+    let spawned: FakeHandle | null = null;
+    let releaseSpawn!: () => void;
+    const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve; });
+    rig.supervisor.setActiveReviewProbe((jobId) => rig.api.listRounds(jobId).some((candidate) => candidate.status === 'pending' || candidate.status === 'live'));
+    try {
+      rig.registry.spawnImpl = async (role, options) => {
+        const replacement = new FakeHandle(role, 'review-mid-spawn-replacement', options?.resumeFile ?? null);
+        spawned = replacement;
+        await spawnGate;
+        return replacement;
+      };
+      expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(spawned).not.toBeNull());
+      const round = rig.api.addRound({ jobId: 'review-mid-spawn-job', targetRef: 'PR-306', lenses: ['blind'] });
+      rig.api.setJobStatus('review-mid-spawn-job', 'in-review');
+      rig.api.setRoundStatus(round.id, 'live');
+      releaseSpawn();
+      await vi.waitFor(() => expect(rig.supervisor.viewFor('review-mid-spawn-agent')).toMatchObject({ state: 'stopped', breakerOpen: true }));
+      expect(spawned?.disposed).toBe(true);
+      expect(spawned?.promptCalls).toHaveLength(0);
+      expect(rig.api.listNotifications({ limit: 50 }).some((row) => row.kind === 'supervision.rearm-fenced')).toBe(true);
+    } finally {
+      releaseSpawn?.();
+      rig.dispose();
     }
   });
 

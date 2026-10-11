@@ -1308,6 +1308,9 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   } });
   state.wave = wave;
+  // Notification-driven re-arms share Perkins' current-candidate writer
+  // fence, including in-flight setup operations that have no round row yet.
+  supervisorLive.setActiveReviewProbe((jobId) => wave.activeReview(jobId) !== null);
   await wave.recoverInterruptedRounds();
   wave.resumeQueuedHandoffs();
   // Automatic admission retries live in memory (owner decision 2026-10-08):

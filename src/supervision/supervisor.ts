@@ -233,6 +233,13 @@ interface InterruptedTurn {
   readonly authorityEpoch: number | null;
 }
 
+/** The notification re-arm authority must survive each restart attempt and
+ * the asynchronous recovery delivery that follows a successful spawn. */
+interface RestartRungOptions {
+  readonly rearmFence?: boolean;
+  readonly rearmNotificationId?: string | null;
+}
+
 /** Structured provider identity from a runtime error, when the runtime
  * carried one (the provider-recovery sensor's evidence input; never
  * guessed from prose). */
@@ -376,6 +383,9 @@ export class Supervisor {
   private readonly jitter: (capMs: number) => number;
   /** Late-bound restart specialization (issue #161; see the option doc). */
   private restartPolicyFor: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined;
+  /** Late-bound Perkins ownership probe: the review wave is assembled after
+   * the supervisor, but notification re-arms must honor its writer fence. */
+  private activeReviewFor: (jobId: string) => boolean = () => false;
   private readonly agents = new Map<string, SupervisedAgent>();
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
@@ -414,6 +424,13 @@ export class Supervisor {
    * here. Returning undefined = default restart. */
   setRestartPolicy(policy: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined): void {
     this.restartPolicyFor = policy;
+  }
+
+  /** Install the late-bound Perkins writer-ownership probe. A throw is
+   * treated as unknown ownership and therefore refuses a notification
+   * re-arm. */
+  setActiveReviewProbe(probe: (jobId: string) => boolean): void {
+    this.activeReviewFor = probe;
   }
 
   /** Start the watchdog ticker. */
@@ -1729,7 +1746,7 @@ export class Supervisor {
   private async restartRung(
     agentRef: SupervisedAgent,
     reason: string,
-    opts: { readonly rearmFence?: boolean; readonly rearmNotificationId?: string | null } = {},
+    opts: RestartRungOptions = {},
   ): Promise<void> {
     const agent = agentRef;
     if (this.disposed || !this.cfg.enabled || agent.inRestart || agent.breakerOpen) return;
@@ -1737,7 +1754,7 @@ export class Supervisor {
     if (recovery !== null) agent.pendingRecovery = recovery;
     if (opts.rearmFence === true) {
       // The notification-driven re-arm re-proves the full fence set here:
-      // parking, holds, live single writers, provider waits and the epoch
+      // parking, holds, active writers/reviews, provider waits and the epoch
       // all refuse instead of being bypassed by the disposition path.
       const refusal = this.rearmRefusal(agent, recovery);
       if (refusal !== null) {
@@ -1771,7 +1788,7 @@ export class Supervisor {
   private async restartRungInner(
     agentRef: SupervisedAgent,
     reason: string,
-    opts: { readonly rearmFence?: boolean; readonly rearmNotificationId?: string | null } = {},
+    opts: RestartRungOptions = {},
   ): Promise<void> {
     let agent = agentRef;
     const restartSlot = agent.slot;
@@ -1835,7 +1852,7 @@ export class Supervisor {
 
       if (opts.rearmFence === true) {
         // Fences are re-proved AFTER the awaits: a parking hold, live
-        // directive/re-brief admission, provider wait or newer epoch that
+        // directive/re-brief/review writer, provider wait or newer epoch that
         // appeared while the old handle was being disposed must refuse the
         // respawn and keep the stop visible (retryable via supported
         // controls), never replay a saved prompt across it.
@@ -1953,7 +1970,7 @@ export class Supervisor {
           }
         }
         // Resume (or visibly orphan) the turn this rung interrupted.
-        this.recoverInterruptedTurn(agent, spawned, reason);
+        this.recoverInterruptedTurn(agent, spawned, reason, opts);
       } catch (error) {
         if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
         // Failed rung: count it, back off, schedule the next.
@@ -1973,7 +1990,7 @@ export class Supervisor {
           agent.backoffTimer = null;
           if (!this.disposed && !agent.breakerOpen) {
             agent.inRestart = false;
-            void this.restartRung(agent, reason);
+            void this.restartRung(agent, reason, opts);
           }
         }, delay);
         agent.backoffTimer.unref?.();
@@ -2070,10 +2087,18 @@ export class Supervisor {
     agent: SupervisedAgent,
     handle: AgentHandle,
     reason: string,
+    opts: RestartRungOptions = {},
   ): void {
     const recovery = agent.pendingRecovery;
-    if (recovery === null || !this.recoveryAuthorityCurrent(agent, recovery)) return;
-    agent.pendingRecovery = null;
+    if (recovery === null) return;
+    if (opts.rearmFence === true) {
+      const refusal = this.rearmRefusal(agent, recovery);
+      if (refusal !== null) {
+        this.fenceRecoveredHandle(agent, handle, opts.rearmNotificationId ?? null, refusal);
+        return;
+      }
+    } else if (!this.recoveryAuthorityCurrent(agent, recovery)) return;
+    if (opts.rearmFence !== true) agent.pendingRecovery = null;
     const laneAgentId = recovery.originAgentId;
     const pending = recovery.pending;
     if (
@@ -2090,9 +2115,10 @@ export class Supervisor {
         reason,
         owner: pending.owner,
       });
-      void this.deliverRecoveredTurn(agent, handle, laneAgentId, pending, reason, recovery);
+      void this.deliverRecoveredTurn(agent, handle, laneAgentId, pending, reason, recovery, opts);
       return;
     }
+    agent.pendingRecovery = null;
     this.postOrphanedTurn(
       laneAgentId,
       reason,
@@ -2117,17 +2143,27 @@ export class Supervisor {
     pending: PendingTurn,
     reason: string,
     recovery: InterruptedTurn,
+    opts: RestartRungOptions = {},
   ): Promise<void> {
     let lease: PacingLease | null = null;
     const controller = new AbortController();
     this.clearRecoveryAdmission(agent); // supersede any older recovery wait
     agent.recoveryAdmission = controller;
-    const stillCurrent = (): boolean =>
-      !this.disposed &&
-      !controller.signal.aborted &&
-      this.agents.get(agent.agentId) === agent &&
-      agent.handle === handle &&
-      this.recoveryAuthorityCurrent(agent, recovery);
+    const stillCurrent = (): boolean => {
+      if (
+        this.disposed ||
+        controller.signal.aborted ||
+        this.agents.get(agent.agentId) !== agent ||
+        agent.handle !== handle
+      ) return false;
+      if (opts.rearmFence !== true) return this.recoveryAuthorityCurrent(agent, recovery);
+      const refusal = this.rearmRefusal(agent, recovery);
+      if (refusal !== null) {
+        this.fenceRecoveredHandle(agent, handle, opts.rearmNotificationId ?? null, refusal);
+        return false;
+      }
+      return true;
+    };
     try {
       if (!stillCurrent()) return;
       if (agent.role === 'minion' && this.workerGate !== undefined) {
@@ -2152,6 +2188,9 @@ export class Supervisor {
       if (!verdict.ok) {
         throw new Error(verdict.error ?? 'runtime settled the recovered turn with an in-band error');
       }
+      // The prompt itself succeeded; a later hold may stop follow-through,
+      // but must not make the same interrupted prompt eligible for replay.
+      if (opts.rearmFence === true && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
       if (!stillCurrent()) return;
       // Release the slot before waiting on a bounded rate-limit retry so
       // the retry can reacquire admission for its next attempt.
@@ -2159,6 +2198,7 @@ export class Supervisor {
       lease = null;
       const disposition = await this.awaitRetrySettlement(agent.agentId);
       if (disposition === 'exhausted' || disposition === 'superseded') {
+        if (opts.rearmFence === true && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
         this.log('warn', 'interrupted turn did not resume under its automatic retries', {
           agent_id: laneAgentId,
           reason,
@@ -2166,6 +2206,7 @@ export class Supervisor {
         });
         return;
       }
+      if (opts.rearmFence === true && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
       this.recordEvent('supervision.turn-recovery', laneAgentId, {
         disposition: 'resumed',
         reason,
@@ -2189,6 +2230,7 @@ export class Supervisor {
       const disposition = await this.awaitRetrySettlement(agent.agentId);
       if (!stillCurrent()) return;
       if (disposition === 'recovered') {
+        if (opts.rearmFence === true && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
         this.recordEvent('supervision.turn-recovery', laneAgentId, {
           disposition: 'resumed',
           reason,
@@ -2200,6 +2242,7 @@ export class Supervisor {
         return;
       }
       if (disposition === 'exhausted' || disposition === 'superseded') {
+        if (opts.rearmFence === true && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
         this.log('warn', 'interrupted turn did not resume under its automatic retries', {
           agent_id: laneAgentId,
           reason,
@@ -2207,6 +2250,7 @@ export class Supervisor {
         });
         return;
       }
+      if (opts.rearmFence === true && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
       this.log('error', 'interrupted turn could not be resumed — posting recoverable-lane note', {
         agent_id: laneAgentId,
         reason,
@@ -2352,14 +2396,19 @@ export class Supervisor {
 
   /** The fences a NOTIFICATION-DRIVEN re-arm must re-prove (never a new
    * authority): terminal or missing jobs, an open directive-retirement
-   * hold, explicit owner parking, a live single writer (directive,
-   * re-brief or in-flight admission), an open provider recovery, and a
-   * superseded directive epoch. Returns the refusal reason, or null when
-   * the re-arm may proceed. */
+   * hold, explicit owner parking, live directive/re-brief/review writers,
+   * in-flight producer admission, open provider recovery, and a superseded
+   * directive epoch. Returns the refusal reason, or null when the re-arm
+   * may proceed. */
   private rearmRefusal(agent: SupervisedAgent, recovery: InterruptedTurn | null): string | null {
-    const jobId = recovery?.jobId ?? this.ledger.getAgent(agent.agentId)?.jobId ?? null;
-    if (jobId === null) return null;
     try {
+      // Provider ownership can belong to a jobless logical slot (Silas).
+      // Check it before the job-binding fast path so only the sensor's
+      // evidence-backed transition can release that wait.
+      const wait = this.ledger.openProviderWaitForAgent(agent.agentId);
+      if (wait !== null) return `open provider recovery ${wait.id} owns this stop`;
+      const jobId = recovery?.jobId ?? this.ledger.getAgent(agent.agentId)?.jobId ?? null;
+      if (jobId === null) return null;
       const job = this.ledger.getJob(jobId);
       if (job === null) return `job "${jobId}" is missing`;
       if (isJobTerminal(job.status)) return `job "${jobId}" is ${job.status}`;
@@ -2376,8 +2425,7 @@ export class Supervisor {
       if (this.ledger.listJobAdmissions(jobId).length > 0) {
         return `an in-flight producer owns job "${jobId}"`;
       }
-      const wait = this.ledger.openProviderWaitForAgent(agent.agentId);
-      if (wait !== null) return `open provider recovery ${wait.id} owns this stop`;
+      if (this.activeReviewFor(jobId)) return `active Perkins review owns job "${jobId}"`;
       const epoch = this.ledger.directiveRecoveryEpoch(jobId);
       const current = recovery?.authorityEpoch === epoch || (epoch === 0 && recovery?.authorityEpoch == null);
       if (!current) return 'recovery was superseded by a newer directive epoch';
@@ -2399,15 +2447,43 @@ export class Supervisor {
     agent.state = 'stopped';
     agent.stopReason = `re-arm fenced: ${reason}`;
     agent.stoppedAt = agent.stoppedAt ?? this.now();
+    this.rememberStop(agent);
     this.raiseFencedAlert(agent, reason);
     this.recordEvent('supervision.rearm-fenced', agent.agentId, {
       notification_id: notificationId,
       reason,
+      stop_reason: agent.stopReason,
+      restarts: agent.restartRing.length,
     });
     this.log('warn', 'breaker re-arm refused — the stop remains', {
       agent_id: agent.agentId,
       notification_id: notificationId,
       reason,
+    });
+  }
+
+  /** Stop an adopted replacement when an authority fence appears while its
+   * recovered turn is queued or settling. Preserve pendingRecovery so the
+   * same supported control can retry it after the hold is lifted. */
+  private fenceRecoveredHandle(
+    agent: SupervisedAgent,
+    handle: AgentHandle,
+    notificationId: string | null,
+    reason: string,
+  ): void {
+    if (agent.handle !== handle) return;
+    this.clearRecoveryAdmission(agent);
+    agent.handle = null;
+    agent.openTurn = false;
+    agent.openControl = false;
+    agent.compactionWarned = false;
+    agent.openToolCalls.clear();
+    this.fenceRearm(agent, notificationId, reason);
+    void this.registry.disposeHandle(handle).catch((error: unknown) => {
+      this.log('warn', 'dispose of fenced recovery handle failed', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
     });
   }
 
@@ -2520,6 +2596,8 @@ export class Supervisor {
         this.recordEvent('supervision.rearm-fenced', agent.agentId, {
           notification_id: notificationId,
           reason: refusal,
+          stop_reason: agent.stopReason,
+          restarts: agent.restartRing.length,
         });
         return { ok: false, reason: refusal };
       }

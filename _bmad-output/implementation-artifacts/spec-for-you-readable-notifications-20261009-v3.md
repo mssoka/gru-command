@@ -385,6 +385,8 @@ verification-gap follow-ups (cross-surface content equivalence and
 unknown/legacy browser coverage) were explicitly deferred as outside the
 actual text-only zoom proof task.
 
+R2 whole-change Perkins review (target `bb44455891f5e8b8332e676781020a9d480370ef`, diff base `79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37`; verdict MAJOR REWORK NEEDED). The four blockers and separate dark error-card chip contrast warning were confirmed against the frozen source. This correction cycle carries the notification re-arm fence through failed-spawn retries and paced prompt replay; checks active Perkins ownership at each re-arm boundary; checks jobless Silas provider waits before the no-job return; includes asynchronous `supervision.rearm-fenced` outcomes in durable stop reconstruction and mailbox restrictions; and gives state chips an explicit AA-safe ink-on-paper pair. Focused regressions cover retry/backoff, queued replay and retained debt, active-round refusal before and during spawn, Silas slot provider ownership, fresh-supervisor/board reconstruction, mailbox restrictions and both-theme chip contrast. Exact-head scheduled verification and refreshed review remain pending for this candidate.
+
 ## Design Notes
 
 - **Owner-attention registry is the single authority.** Producer intent

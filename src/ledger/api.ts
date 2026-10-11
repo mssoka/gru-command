@@ -3059,7 +3059,7 @@ export class LedgerApi {
 
   latestSupervisionEvent(agentId: string): EventRecord | null {
     const row = this.db.prepare(`SELECT * FROM events WHERE agent_id = ?
-      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
+      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -3087,8 +3087,9 @@ export class LedgerApi {
   /**
    * Durable supervision stop truth for restart hydration (code review
    * 2026-10-04): the latest supervision lifecycle event per agent, kept
-   * only when that latest event is a STOP. A re-arm event clears the stop,
-   * so an acked/re-armed agent never reads stopped after a restart.
+   * only when that latest event is a STOP. A re-arm event clears the stop;
+   * a later re-arm-fenced event restores stop truth, so an accepted re-arm
+   * followed by asynchronous refusal remains stopped after a restart.
    */
   durableSupervisionStops(): Map<
     string,
@@ -3102,11 +3103,11 @@ export class LedgerApi {
              SELECT agent_id, MAX(seq) AS seq
                FROM events
               WHERE agent_id IS NOT NULL
-                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed')
+                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced')
               GROUP BY agent_id
            ) latest ON latest.agent_id = e.agent_id AND latest.seq = e.seq
            JOIN agents a ON a.id = e.agent_id
-          WHERE e.kind IN ('supervision.escalated', 'supervision.breaker')`,
+          WHERE e.kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearm-fenced')`,
       )
       .all() as Array<{ agent_id: string; role: Role; payload: string }>;
     const stops = new Map<string, { role: Role; reason: string | null; restarts: number }>();
@@ -3119,11 +3120,13 @@ export class LedgerApi {
         // of the stop event is the authoritative fact.
       }
       const reason =
-        typeof payload['class'] === 'string'
-          ? payload['class']
-          : typeof payload['reason'] === 'string'
-            ? payload['reason']
-            : null;
+        typeof payload['stop_reason'] === 'string'
+          ? payload['stop_reason']
+          : typeof payload['class'] === 'string'
+            ? payload['class']
+            : typeof payload['reason'] === 'string'
+              ? payload['reason']
+              : null;
       const restarts =
         typeof payload['restarts'] === 'number' && Number.isFinite(payload['restarts'])
           ? payload['restarts']

@@ -3089,6 +3089,10 @@ a.repo-row__name:hover {
 .board-notification__state {
   margin-left: auto;
   flex: none;
+  /* State chips may sit inside an error card; an explicit neutral pair
+   * prevents them inheriting dark --on-state ink onto --card. */
+  background: var(--paper);
+  color: var(--ink);
 }
 
 /* Short metadata only (timestamp · attention channel): the .lbl class
