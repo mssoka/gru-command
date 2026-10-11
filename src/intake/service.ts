@@ -17,6 +17,13 @@ export interface IntakeServiceOptions extends SourcePorts {
   readonly workflow?: () => BundledWorkflowRuntime;
   readonly planner?: IntakePlanner;
 }
+
+/** One synchronous API operation's explicit-root snapshot. Do not retain it
+ * across requests; its methods reuse the same bounded registry validation. */
+export interface IntakeRequestScope {
+  readonly validateIdentity: () => void;
+  readonly read: (requestId: string) => Proposal;
+}
 function invalid(message: string): never { throw new IntakeError('intake_invalid_request', message); }
 function record(value: unknown, label: string, keys: readonly string[]): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) invalid(`${label} must be an object`);
@@ -86,8 +93,8 @@ export class IntakeService {
   private context(
     repoPath: string,
     intakeId: string,
-    existingOnly = false,
-    registered = this.managedRepoPaths(repoPath),
+    existingOnly: boolean,
+    registered: readonly string[],
   ): PreviewArtifactContext {
     const repo = canonicalManagedRepo(repoPath, registered);
     let runtime: BundledWorkflowRuntime;
@@ -111,9 +118,16 @@ export class IntakeService {
     }
   }
 
-  validateIdentity(repoPath: string, intakeId: string): void {
+  createRequestScope(repoPath: string, intakeId: string): IntakeRequestScope {
     const registered = this.managedRepoPaths(repoPath);
-    this.storage(() => this.context(repoPath, intakeId, true, registered), false);
+    return {
+      validateIdentity: () => { this.storage(() => this.context(repoPath, intakeId, true, registered), false); },
+      read: (requestId) => this.readWithRegisteredRepos(repoPath, intakeId, requestId, registered),
+    };
+  }
+
+  validateIdentity(repoPath: string, intakeId: string): void {
+    this.createRequestScope(repoPath, intakeId).validateIdentity();
   }
 
   /** Refinement keeps captured bytes; source refresh is a separate preview. */
@@ -194,8 +208,7 @@ export class IntakeService {
   }
 
   read(repoPath: string, intakeId: string, id: string): Proposal {
-    const registered = this.managedRepoPaths(repoPath);
-    return this.readWithRegisteredRepos(repoPath, intakeId, id, registered);
+    return this.createRequestScope(repoPath, intakeId).read(id);
   }
 
   private readWithRegisteredRepos(
@@ -222,9 +235,9 @@ export class IntakeService {
   }
 
   diff(repoPath: string, intakeId: string, from: string, to: string): Readonly<Record<string, unknown>> {
-    const registered = this.managedRepoPaths(repoPath);
-    const before = this.readWithRegisteredRepos(repoPath, intakeId, from, registered);
-    const after = this.readWithRegisteredRepos(repoPath, intakeId, to, registered);
+    const request = this.createRequestScope(repoPath, intakeId);
+    const before = request.read(from);
+    const after = request.read(to);
     const changes = <T extends { readonly id: string }>(old: readonly T[], current: readonly T[]): readonly unknown[] => {
       const ids = [...new Set([...old, ...current].map((item) => item.id))];
       return ids.flatMap((id) => {

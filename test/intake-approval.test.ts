@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeApprovalService, IntakePartialFailure } from '../src/intake/approval.js';
 import { IntakeService } from '../src/intake/service.js';
+import { createManagedRepoIntakeResolver } from '../src/repos/managed-names.js';
 import { resolvedIntakePlan } from './helpers/intake-plan.js';
 import { PipelineService } from '../src/dispatch/pipeline.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -37,6 +38,52 @@ async function fixture(kind: 'issue' | 'spec' | 'bmad' = 'spec') {
   return { root, repoPath, db, ledger, pipeline, capacity, dispatch, intake, approval, first, proposal, decision, review, accept, request };
 }
 describe('intake durable recovery integrity', () => {
+  it('resolves one managed root for complete review and approval requests', async () => {
+    const h = await fixture();
+    const nextProposal = await h.intake.revise({
+      repoPath: h.repoPath,
+      intakeId: 'feature',
+      requestId: 'r3',
+      previousRequestId: 'r2',
+      revisionId: h.proposal.revisionId,
+      plan: h.proposal.plan,
+    });
+    let resolutions = 0;
+    const resolveManagedRepo = createManagedRepoIntakeResolver(join(h.root, 'workspace'), ['demo']);
+    const guardedIntake = new IntakeService({
+      dataDir: join(h.root, 'data'),
+      workspaceRoot: join(h.root, 'workspace'),
+      uploadsDir: join(h.root, 'data', 'uploads'),
+      managedRepos: (requestedPath) => {
+        resolutions += 1;
+        return resolveManagedRepo(requestedPath);
+      },
+    });
+    const guardedApproval = new IntakeApprovalService({ intake: guardedIntake, ledger: h.ledger, pipeline: h.pipeline });
+    const reviewed = guardedApproval.review({
+      repoPath: h.repoPath,
+      intakeId: 'feature',
+      requestId: nextProposal.requestId,
+      revisionId: nextProposal.revisionId,
+      expectedToken: h.review.token,
+    });
+    expect(reviewed.review?.status).toBe('reviewed');
+    expect(resolutions).toBe(1);
+
+    resolutions = 0;
+    const approved = guardedApproval.approve({
+      repoPath: h.repoPath,
+      intakeId: 'feature',
+      requestId: nextProposal.requestId,
+      revisionId: nextProposal.revisionId,
+      expectedToken: reviewed.review!.token,
+      selected: nextProposal.plan.heists.map(({ id }) => id),
+    });
+    expect(approved.review?.status).toBe('approved');
+    expect(resolutions).toBe(1);
+    await h.pipeline.whenIdle();
+  });
+
   const missingCommittedRow = async (proof: 'job' | 'enqueue event'): Promise<void> => {
     const h = await fixture();
     const accepted = h.approval.approve(h.accept);

@@ -1354,6 +1354,21 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
 
       vi.stubEnv('GIT_CONFIG_PARAMETERS', "'remote.origin.url'='https://github.com/acme/foreign.git'");
       await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
+      const rewriteConfig = join(root, 'rewrite.gitconfig');
+      execFileSync('git', ['config', '--file', rewriteConfig, 'url.https://github.com/acme/foreign.git.insteadOf', 'https://github.com/acme/selected.git']);
+      for (const variable of ['GIT_CONFIG_GLOBAL'] as const) {
+        const redirected = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
+          encoding: 'utf8', env: { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: '1', [variable]: rewriteConfig },
+        }).trim();
+        expect(redirected).toBe('https://github.com/acme/foreign.git');
+        vi.stubEnv('HOME', root);
+        vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+        vi.stubEnv(variable, rewriteConfig);
+        await expectSelectedProviderCalls();
+        vi.unstubAllEnvs();
+      }
     } finally {
       vi.unstubAllEnvs();
       rmSync(root, { recursive: true, force: true });

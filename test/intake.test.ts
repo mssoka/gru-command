@@ -382,9 +382,17 @@ describe('intake review regressions', () => {
     const resolveIntakeRepo = createManagedRepoIntakeResolver(h.workspace, ['stale', 'demo']);
     expect(resolveIntakeRepo(h.repo)).toEqual([h.repo]);
     expect(readFileSync(probeLog, 'utf8')).toBe(`${h.repo}\n`);
-    const guardedService = new IntakeService({ ...h.options, managedRepos: resolveIntakeRepo });
+    vi.unstubAllEnvs();
+    let registryResolutions = 0;
+    const guardedService = new IntakeService({
+      ...h.options,
+      managedRepos: (requestedPath) => {
+        registryResolutions += 1;
+        return resolveIntakeRepo(requestedPath);
+      },
+    });
     const first = await guardedService.preview(h.request);
-    writeFileSync(probeLog, '');
+    registryResolutions = 0;
     await guardedService.revise({
       repoPath: h.repo,
       intakeId: h.request.intakeId,
@@ -393,8 +401,7 @@ describe('intake review regressions', () => {
       revisionId: first.revisionId,
       plan: first.plan,
     });
-    expect(readFileSync(probeLog, 'utf8')).toBe(`${h.repo}\n`);
-    vi.unstubAllEnvs();
+    expect(registryResolutions).toBe(1);
 
     const source = join(h.root, 'worktree-source');
     mkdirSync(source);
