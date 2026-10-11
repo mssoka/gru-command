@@ -82,6 +82,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'harness-routing.test.ts',
     workload: 'spawns two real Vitest collection children as the runtime phase-partition guard',
   },
+  { file: 'intake-approval-packaged.test.ts', workload: 'actual npm archive approval and dispatch over disposable git worktrees' },
   { file: 'install-one-line.test.ts', workload: 'install.sh clone/build/service pipelines' },
   { file: 'install.test.ts', workload: 'install.sh CLI contracts through real subprocesses' },
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },

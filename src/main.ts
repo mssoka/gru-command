@@ -45,6 +45,7 @@ import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, rec
 import { createDispatchServer } from './dispatch/server.js';
 import { PipelineService } from './dispatch/pipeline.js';
 import { IntakeService } from './intake/service.js';
+import { IntakeApprovalService } from './intake/approval.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
@@ -1470,6 +1471,7 @@ async function main(): Promise<number> {
   const dispatchServer = createDispatchServer({
     config,
     intake,
+    intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }),
     dispatch: dispatcher,
     wave,
     ledger,

@@ -101,7 +101,28 @@ export class IntakeService {
     }
   }
 
-  async preview(value: unknown): Promise<Proposal> {
+  validateIdentity(repoPath: string, intakeId: string): void {
+    this.storage(() => this.context(repoPath, intakeId, true), false);
+  }
+
+  /** Refinement keeps captured bytes; source refresh is a separate preview. */
+  async revise(value: unknown): Promise<Proposal> {
+    const raw = record(value, 'revision', ['repoPath', 'intakeId', 'requestId', 'previousRequestId', 'revisionId', 'plan']);
+    canonical(raw);
+    const repoPath = text(raw['repoPath'], 'repoPath');
+    const intakeId = requestId(raw['intakeId'], 'intakeId');
+    const previousRequestId = requestId(raw['previousRequestId'], 'previousRequestId');
+    const previous = this.read(repoPath, intakeId, previousRequestId);
+    if (previous.revisionId !== raw['revisionId']) throw new IntakeError('intake_stale_revision', 'Revision does not bind the exact captured proposal', 409);
+    if (raw['plan'] === undefined) invalid('revision requires an explicit plan');
+    const context = this.storage(() => this.context(repoPath, intakeId, true), false);
+    const original = this.storage(() => parseIntakeRequest(JSON.parse(context.readOperational(`requests/${previousRequestId}/input.json`))), false);
+    return this.previewCaptured({ ...original, requestId: requestId(raw['requestId'], 'requestId'), previousRequestId, plan: raw['plan'] }, previous);
+  }
+
+  async preview(value: unknown): Promise<Proposal> { return this.previewCaptured(value); }
+
+  private async previewCaptured(value: unknown, retained?: Capture): Promise<Proposal> {
     const request = parseIntakeRequest(value);
     const context = this.storage(() => this.context(request.repoPath, request.intakeId));
     const prefix = `requests/${request.requestId}`;
@@ -115,7 +136,7 @@ export class IntakeService {
     // Preserve the explicit request before attempting any external source read.
     write(`${prefix}/input.json`, request);
     if (request.previousRequestId !== undefined) this.read(request.repoPath, request.intakeId, request.previousRequestId);
-    const capture = await captureSources(request.repoPath, request.source, this.options);
+    const capture = retained === undefined ? await captureSources(request.repoPath, request.source, this.options) : { snapshots: retained.snapshots, gaps: retained.gaps, requirements: retained.requirements };
     write(`${prefix}/capture.json`, capture, capture.snapshots);
     let plan: Proposal['plan'];
     try {

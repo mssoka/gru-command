@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import type { ArtifactWorkflow } from '../artifacts/context.js';
-import type { PipelineMilestone } from '../ledger/pipeline.js';
+import type { ArtifactWorkflow } from '../artifacts/types.js';
+import type { PipelineMilestone, PipelinePrerequisite } from '../ledger/pipeline.js';
 
 export class IntakeError extends Error {
   constructor(readonly code: string, message: string, readonly status = 400) {
@@ -103,6 +103,30 @@ export interface Proposal extends Capture {
   readonly revisionId: string;
   readonly workflow: ArtifactWorkflow;
   readonly plan: Plan;
+}
+export interface FrozenIntakeEntry {
+  readonly id: string;
+  readonly requestId: string;
+  readonly repoPath: string;
+  readonly title: string;
+  readonly briefing: string;
+  readonly prerequisites: readonly PipelinePrerequisite[];
+}
+export interface IntakeReviewRecord {
+  readonly repoPath: string;
+  readonly intakeId: string;
+  readonly requestId: string;
+  readonly revisionId: string;
+  readonly previousToken: string | null;
+  readonly token: string;
+  readonly status: 'reviewed' | 'rejected' | 'approved';
+  readonly selected: readonly string[];
+  readonly entries: readonly FrozenIntakeEntry[];
+}
+export interface IntakeReadback {
+  readonly review: IntakeReviewRecord | null;
+  readonly accepted: readonly { readonly heistId: string; readonly entryId: string; readonly state: string }[];
+  readonly remaining: readonly { readonly heistId: string; readonly entryId: string }[];
 }
 export type IntakePlanner = (capture: Capture) => unknown | Promise<unknown>;
 export const digest = (bytes: string | Buffer): string => createHash('sha256').update(bytes).digest('hex');

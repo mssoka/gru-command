@@ -990,6 +990,36 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
+    id: 26,
+    name: 'intake-review-acceptance',
+    sql: `
+      CREATE TABLE intake_reviews (
+        token TEXT PRIMARY KEY,
+        repo_path TEXT NOT NULL,
+        intake_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reviewed','rejected','approved')),
+        record TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX intake_one_approval ON intake_reviews(repo_path, intake_id, revision_id) WHERE status = 'approved';
+      CREATE TABLE intake_review_heads (
+        repo_path TEXT NOT NULL,
+        intake_id TEXT NOT NULL,
+        token TEXT NOT NULL REFERENCES intake_reviews(token),
+        PRIMARY KEY(repo_path, intake_id)
+      );
+    `,
+  },
+  {
+    id: 27,
+    name: 'intake-recovery-query-indexes',
+    sql: `
+      CREATE INDEX idx_intake_reviews_scope ON intake_reviews(repo_path, intake_id, revision_id);
+      CREATE INDEX idx_pipeline_enqueued_entry ON events(json_extract(payload, '$.entry_id'))
+        WHERE kind = 'pipeline.enqueued' AND json_valid(payload);
+    `,
+  },
+  {
     // Owner decisions (owner release 2026-10-11): a needs-owner
     // notification may carry typed decision metadata (question, context,
     // recommendation, reserved class, options) supplied at the write
@@ -998,16 +1028,15 @@ export const MIGRATIONS: readonly Migration[] = [
     // recorded choice). Decided state is deliberately distinct from ack
     // and resolution — recording a decision never proves its follow-on
     // operation succeeded.
-    // LANDING COLLISION (same convention as migrations 10-24): main landed
-    // id 25 first (gru-mailbox), so this never-applied migration took 26.
-    id: 26,
+    // LANDING COLLISION: main landed migrations 26-27, so this never-applied
+    // migration takes id 28; the schema remains contiguous and forward-only.
+    id: 28,
     name: 'notification-owner-decisions',
     sql: `
       ALTER TABLE notifications ADD COLUMN decision_json TEXT;
       ALTER TABLE notifications ADD COLUMN decided_at TEXT;
       ALTER TABLE notifications ADD COLUMN decided_by TEXT;
       ALTER TABLE notifications ADD COLUMN decided_option TEXT;
-
     `,
   },
 ];

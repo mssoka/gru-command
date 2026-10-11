@@ -1,6 +1,8 @@
 import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
 import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
+import type { IntakeReviewRecord } from '../intake/types.js';
+import { canonical as canonicalIntake, digest as intakeDigest, IntakeError } from '../intake/types.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
@@ -7713,6 +7715,75 @@ export class LedgerApi {
       });
       return { record: this.getPipelineEntry(input.id) as PipelineEntryRecord, created: true };
     });
+  }
+
+  /** Append-only review history plus a transactional CAS head. Frozen
+   * approval identities commit before any individual pipeline enqueue. */
+  recordIntakeReview(record: IntakeReviewRecord): void {
+    this.transaction(() => {
+      const head = this.getIntakeReview(record.repoPath, record.intakeId);
+      const replay = this.getIntakeReview(record.repoPath, record.intakeId, record.token);
+      if (replay !== null) {
+        if (canonicalIntake(replay) !== canonicalIntake(record)) throw new IntakeError('intake_acceptance_conflict', 'Review token already binds different bytes', 409);
+        return;
+      }
+      if ((head?.token ?? null) !== record.previousToken) throw new IntakeError('intake_stale_review', 'Review changed or was rejected; read back before deciding', 409);
+      const rejected = this.db.prepare("SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? AND revision_id = ? AND status = 'rejected'").get(record.repoPath, record.intakeId, record.revisionId);
+      if (rejected !== undefined) throw new IntakeError('intake_stale_review', 'Rejected revisions cannot be reopened; create a new revision', 409);
+      if (record.status !== 'reviewed' && (head?.status !== 'reviewed' || head.revisionId !== record.revisionId)) throw new IntakeError('intake_stale_review', 'Only the exact currently reviewed revision can be approved or rejected', 409);
+      if (record.status === 'reviewed' && head?.revisionId === record.revisionId && head.status !== 'reviewed') throw new IntakeError('intake_stale_review', 'Rejected or accepted revisions cannot be reopened; create a new revision', 409);
+      const approved = this.db.prepare("SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? AND revision_id = ? AND status = 'approved'").get(record.repoPath, record.intakeId, record.revisionId);
+      if (approved !== undefined) throw new IntakeError('intake_acceptance_conflict', 'This revision already has an immutable accepted selection; retry its original approval', 409);
+      const serialized = canonicalIntake(record);
+      this.verifyIntakeHistoryBudget(record.repoPath, record.intakeId, Buffer.byteLength(serialized));
+      this.db.prepare('INSERT INTO intake_reviews(token, repo_path, intake_id, revision_id, status, record) VALUES (?, ?, ?, ?, ?, ?)').run(record.token, record.repoPath, record.intakeId, record.revisionId, record.status, serialized);
+      this.db.prepare('INSERT INTO intake_review_heads(repo_path, intake_id, token) VALUES (?, ?, ?) ON CONFLICT(repo_path, intake_id) DO UPDATE SET token = excluded.token').run(record.repoPath, record.intakeId, record.token);
+      this.appendEvent({ kind: `intake.${record.status}`, payload: { intake_id: record.intakeId, revision_id: record.revisionId, token: record.token, selected: record.selected } });
+    });
+  }
+
+  /** Bound total retained verification work before loading/parsing/hashing any
+   * decision. Over-budget history stays intact for restoration/inspection. */
+  private verifyIntakeHistoryBudget(repoPath: string, intakeId: string, additionalBytes = 0): void {
+    const size = this.db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(record AS BLOB))), 0) AS bytes FROM intake_reviews WHERE repo_path = ? AND intake_id = ?').get(repoPath, intakeId) as { count: number; bytes: number };
+    if (size.count + (additionalBytes > 0 ? 1 : 0) > 4096) throw new IntakeError('intake_storage_error', 'Intake history reached its 4096-decision verification bound; create a new intake for further revisions, retaining this history', 500);
+    if (size.bytes + additionalBytes > 8 * 1024 * 1024) throw new IntakeError('intake_storage_error', 'Intake history reached its 8-MiB byte verification bound; create a new intake for further revisions, retaining this history', 500);
+  }
+
+  getIntakeReview(repoPath: string, intakeId: string, token?: string): IntakeReviewRecord | null {
+    this.verifyIntakeHistoryBudget(repoPath, intakeId);
+    const row = token === undefined
+      ? this.db.prepare('SELECT r.* FROM intake_review_heads h LEFT JOIN intake_reviews r ON r.token = h.token WHERE h.repo_path = ? AND h.intake_id = ?').get(repoPath, intakeId)
+      : this.db.prepare('SELECT * FROM intake_reviews WHERE token = ? AND repo_path = ? AND intake_id = ?').get(token, repoPath, intakeId);
+    if (row === undefined) {
+      if (token === undefined && this.db.prepare('SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? LIMIT 1').get(repoPath, intakeId) !== undefined) throw new IntakeError('intake_storage_error', 'Review history exists without its coordination head; restore the intake ledger before deciding', 500);
+      return null;
+    }
+    try {
+      let ancestor: Row | undefined = row as Row;
+      let first: IntakeReviewRecord | undefined;
+      const visited = new Set<string>();
+      // Iterative, bounded ancestry verification: a valid head cannot conceal
+      // a deleted rejection or a damaged predecessor beneath it.
+      while (ancestor !== undefined) {
+        if (visited.size >= 4096) throw new Error('Review ancestry exceeds 4096 decisions');
+        const record = JSON.parse(str(ancestor.record)) as IntakeReviewRecord;
+        const { token: savedToken, ...body } = record;
+        if (visited.has(savedToken)) throw new Error('Cyclic review ancestry');
+        if (savedToken !== intakeDigest(canonicalIntake(body)) || savedToken !== ancestor.token || record.repoPath !== repoPath || record.intakeId !== intakeId || ancestor.repo_path !== repoPath || ancestor.intake_id !== intakeId || record.revisionId !== ancestor.revision_id || record.status !== ancestor.status) throw new Error('Review bytes or binding are damaged');
+        visited.add(savedToken); first ??= record;
+        if (record.previousToken === null) break;
+        if (typeof record.previousToken !== 'string' || !/^[a-f0-9]{64}$/u.test(record.previousToken)) throw new Error('Invalid review predecessor');
+        ancestor = this.db.prepare('SELECT * FROM intake_reviews WHERE token = ? AND repo_path = ? AND intake_id = ?').get(record.previousToken, repoPath, intakeId) as Row | undefined;
+        if (ancestor === undefined) throw new Error('Missing review ancestor; restore the intake ledger');
+      }
+      return first!;
+    } catch (error) { throw new IntakeError('intake_storage_error', `Cannot verify durable intake decision: ${String(error)}`, 500); }
+  }
+
+  /** Indexed durable enqueue witness; no event payload list is loaded. */
+  hasPipelineEnqueueEvidence(id: string): boolean {
+    return this.db.prepare("SELECT 1 FROM events WHERE kind = 'pipeline.enqueued' AND json_valid(payload) AND json_extract(payload, '$.entry_id') = ? LIMIT 1").get(id) !== undefined;
   }
 
   getPipelineEntry(id: string): PipelineEntryRecord | null {
