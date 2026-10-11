@@ -16,6 +16,7 @@ import { DeployDriftTracker } from './board/deploy-drift.js';
 import { defaultPackageRoot, readBuildInfo } from './build-info.js';
 import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
+import { reconcileLegacyOwnerAttention } from './notifications/legacy-owner.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
@@ -698,6 +699,28 @@ async function main(): Promise<number> {
     onNeedsOwner: (notification) => surfaceInChat(notification),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Owner-attention migration (owner release 2026-10-11): unacked
+  // needs-owner rows from before the responsibility chain was enforced are
+  // re-triaged to Gru's machine queue with a recorded note (full detail
+  // preserved). Registered owner kinds keep their place; nothing is acked,
+  // resolved, dropped or executed. Bounded and idempotent.
+  try {
+    const ownerReconcile = reconcileLegacyOwnerAttention({
+      ledger,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    if (ownerReconcile.retriaged > 0 || ownerReconcile.failed > 0) {
+      logger.info('legacy owner attention reconciled', {
+        examined: ownerReconcile.examined,
+        retriaged: ownerReconcile.retriaged,
+        kept: ownerReconcile.kept,
+        failed: ownerReconcile.failed,
+      });
+    }
+  } catch (error) {
+    // Never fail boot on the migration; the next boot retries it.
+    logger.warn('legacy owner attention reconciliation failed — retried next boot', { error: String(error) });
+  }
   // Owner-approved Book of Lessons (owner decision 2026-10-07): the dream
   // proposes, the owner decides in For You, and only Accept writes.
   const lessonProposals = new LessonProposals({
@@ -1081,6 +1104,7 @@ async function main(): Promise<number> {
     bus,
     notifications,
     onNotificationAck: (id) => supervisorLive.onNotificationAcked(id),
+    onNotificationDisposition: (id) => supervisorLive.onNotificationDisposed(id),
     decisionsStatus: () => decisionRuntime.status(),
     onDecisionsRecheck: () => decisionRuntime.recheck(),
     siblingUpgradePaths: ['/ws'],
@@ -1609,6 +1633,12 @@ async function main(): Promise<number> {
       return 1;
     }
   }
+  // Owner-only port-squat notices clear on positive evidence (owner release
+  // 2026-10-11): a successful bind proves the squatter is gone, so these
+  // rows resolve themselves instead of waiting for a human Ack. A failed
+  // bind above already posted (or kept) the notice.
+  notifications.resolveIncidents('port-squat', 'service-boot');
+  notifications.resolveIncidents('roll-port-squat', 'service-boot');
   // Post-roll self-check (phase d): the relaunched build logs uptime+sha
   // once the socket is actually serving.
   if (rollAdoption.marker !== null) {

@@ -3,9 +3,10 @@ import type { LogLevel } from '../logger.js';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { DecisionService } from '../decisions/types.js';
 import { DECISION_SURFACE_EVENT_TRIAGE, eventDecisionRequest, redactedText } from '../decisions/questions.js';
+import { requiresTypedDecision, resolveNotificationRouting } from './attention.js';
+import type { NotificationDecision } from '../ledger/notification-decision.js';
 import {
   LedgerApi,
-  isOwnerHeldNotificationKind,
   type NotificationRecord,
   type NotificationRouting,
   type NotificationSeverity,
@@ -95,6 +96,8 @@ export interface IncidentInput {
   readonly detail?: string | null;
   readonly agentId?: string | null;
   readonly dedupe: 'unacked' | 'active' | 'all';
+  /** Typed owner-decision metadata, required for owner escalations. */
+  readonly decision?: NotificationDecision | null;
 }
 
 export class NotificationCenter {
@@ -127,7 +130,14 @@ export class NotificationCenter {
   /** Direct post — supervisor escalations and product surfaces. An
    * explicit `id` makes the post idempotent: a row that already exists is
    * returned as-is (no second ring), so a crash between posting and saving
-   * the id can never leave an orphan row behind. */
+   * the id can never leave an orphan row behind.
+   *
+   * Owner-attention registry (owner release 2026-10-11): the requested
+   * routing is honored only inside the registry's rules. Owner-required
+   * kinds always ring the owner; a `needs-owner` request for any other
+   * unregistered/machine kind is routed to Gru's machine queue instead
+   * and logged — routine recovery can never quietly occupy FOR YOU, and
+   * an unrecognized stop is triaged by Gru rather than dropped. */
   post(input: {
     id?: string;
     kind: string;
@@ -136,7 +146,23 @@ export class NotificationCenter {
     title: string;
     detail?: string | null;
     agentId?: string | null;
+    decision?: NotificationDecision | null;
   }): NotificationRecord {
+    if (requiresTypedDecision(input.kind) && (input.decision === undefined || input.decision === null)) {
+      throw new Error(
+        `${input.kind} is an owner escalation and requires typed decision metadata ` +
+          '(question, context, reservedClass, whyNotDelegable, options) — an owner chore is never posted as a bare notice',
+      );
+    }
+    const resolved = resolveNotificationRouting(input.kind, input.routing);
+    if (resolved.overridden) {
+      this.log('warn', 'owner attention refused by the attention registry — routed to Gru', {
+        id: input.id ?? null,
+        kind: input.kind,
+        requested: input.routing,
+        effective: resolved.routing,
+      });
+    }
     if (input.id !== undefined) {
       const existing = this.ledger.getNotification(input.id);
       if (existing !== null) return existing;
@@ -144,7 +170,8 @@ export class NotificationCenter {
     const record = this.ledger.recordNotification({
       ...input,
       id: input.id ?? randomUUID(),
-      routing: isOwnerHeldNotificationKind(input.kind) ? 'needs-owner' : input.routing,
+      routing: resolved.routing,
+      decision: input.decision ?? null,
     });
     this.log(input.severity === 'error' ? 'warn' : 'info', 'notification posted', {
       id: record.id,
@@ -170,6 +197,7 @@ export class NotificationCenter {
   openIncident(input: IncidentInput): { readonly record: NotificationRecord; readonly created: boolean } {
     const created = (record: NotificationRecord) => ({ record, created: true });
     const reused = (record: NotificationRecord) => ({ record, created: false });
+    const effective = resolveNotificationRouting(input.kind, input.routing).routing;
     const existing = this.ledger.findNotificationByKind(
       input.kind,
       input.dedupe === 'all' ? 'any' : input.dedupe,
@@ -177,12 +205,13 @@ export class NotificationCenter {
     if (existing !== null) {
       // A routing mismatch must not strand an owner-held stop (gh-97): an
       // UNACKED machine row is not owner-Ack-able (ledger.ackNotification
-      // throws for action-required), so honoring the requested owner routing
+      // throws for action-required), so honoring the effective owner routing
       // means an owner-held row. The legacy row stays machine-held for Gru
       // triage: never migrated, auto-acked, resolved, or grandfathered into
       // FOR YOU. Same-routing hits and previously ACKED rows still reuse the
-      // old ID.
-      if (input.routing === 'needs-owner' && existing.routing !== 'needs-owner' && existing.ackedAt === null) {
+      // old ID. With the attention registry in place, only registered
+      // owner-required/allowed kinds can resolve to `needs-owner` here.
+      if (effective === 'needs-owner' && existing.routing !== 'needs-owner' && existing.ackedAt === null) {
         // Perkins R1/R2: the kind lookup tie-breaks by id (ts DESC, id
         // ASC), so a same-millisecond legacy row can keep WINNING this
         // dedupe after the owner row exists. Reuse the open owner incident
@@ -204,6 +233,11 @@ export class NotificationCenter {
       return reused(existing);
     }
     return created(this.post(input));
+  }
+
+  /** Record the owner's typed decision (see LedgerApi.recordNotificationDecision). */
+  decide(id: string, optionId: string, by: string): NotificationRecord | null {
+    return this.ledger.recordNotificationDecision(id, optionId, by);
   }
 
   /** Refresh an open incident's detail (same id, same ack state). */

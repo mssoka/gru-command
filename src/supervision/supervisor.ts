@@ -488,7 +488,7 @@ export class Supervisor {
   ): Promise<AgentHandle> {
     const existing = this.slotAgent(slot);
     if (existing?.breakerOpen && options?.intent === 'autonomous') {
-      throw new Error(`supervised slot "${slot.id}" owner-held breaker is open; autonomous ensure cannot re-arm it`);
+      throw new Error(`supervised slot "${slot.id}" breaker is open; autonomous ensure cannot re-arm it`);
     }
     if (existing !== null && existing.handle !== null) return existing.handle;
     if (existing !== null && existing.inRestart) {
@@ -526,7 +526,13 @@ export class Supervisor {
           agentId: existing.agentId,
           payload: { by: 'slot-use', slot: slot.id },
         });
-        if (rearming !== null) this.notifications.ack(rearming, 'slot-use');
+        if (rearming !== null) {
+          // Owner release 2026-10-11: the escalation row is MACHINE
+          // attention now; human intent (this slot use) resumed the lane,
+          // so the row resolves by evidence — never acked, never stranded
+          // open behind a recovered agent.
+          this.ledger.resolveNotificationById(rearming, 'slot-use');
+        }
       }
     }
     const ensureGeneration = slot.generation;
@@ -1648,26 +1654,30 @@ export class Supervisor {
             hadOpenTurn: captured.hadOpenTurn,
           },
     } as const;
-    // r1 #2 (phase3): decide MACHINE ownership BEFORE creating any owner
-    // stop. The sink persists the eligible wait first; only a FAILED or
-    // ineligible classification falls back to the conservative needs-owner
-    // stop. Machine-owned stops post MACHINE attention (action-required),
-    // never a needs-owner chime.
-    const postStopNotice = (routing: 'needs-owner' | 'action-required') => {
+    // r1 #2 (phase3) + owner release 2026-10-11: decide MACHINE ownership
+    // BEFORE any attention row. The sink persists the eligible wait first.
+    // Either way the row is MACHINE attention (action-required, wakes Gru):
+    // an eligible wait is owned by the recovery sensor, and an ineligible
+    // or failed classification is a decision beyond Silas — Gru determines
+    // the direction and asks the owner only if a reserved authority/cost
+    // boundary is genuinely involved. Blind restart stays withheld in both
+    // cases; the owner bell is never rung by a provider stop.
+    const postStopNotice = (machineOwned: boolean) => {
       const notification = this.notifications.postIncident({
         kind: `supervision.provider-wall.${agent.agentId}.${failureClass}`,
-        routing,
+        routing: 'action-required',
         severity: 'error',
         title: `Agent ${agent.agentId} stopped: ${failureClass.replaceAll('_', ' ')}`,
-        detail:
-          routing === 'needs-owner'
-            ? 'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.'
-            : 'Machine-owned temporary provider limit: the recovery sensor owns this stop (no owner ACK required).',
+        detail: machineOwned
+          ? 'Machine-owned temporary provider limit: the recovery sensor owns this stop (no owner ACK required).'
+          : 'Blind restart is withheld: this provider stop is not eligible for automatic recovery. ' +
+            'Gru decides the direction (fix the provider condition, wait, or escalate a reserved ' +
+            'authority/cost decision) before anything re-arms.',
         agentId: agent.agentId,
         dedupe: 'unacked',
       });
       agent.breakerNotificationId = notification.id;
-      if (routing === 'action-required') {
+      if (machineOwned) {
         this.providerWalls?.linkProviderWaitIncident?.({ agentId: agent.agentId, incidentId: notification.id });
       }
       return notification;
@@ -1677,16 +1687,16 @@ export class Supervisor {
       void sink
         .ownsProviderWall({ ...observation })
         .then((machineOwned) => {
-          postStopNotice(machineOwned ? 'action-required' : 'needs-owner');
+          postStopNotice(machineOwned);
           this.onProviderWallObserved(observation, machineOwned);
         })
         .catch(() => {
-          // Classification failure: conservative human-controlled stop.
-          postStopNotice('needs-owner');
+          // Classification failure: no unsafe retry — Gru triages.
+          postStopNotice(false);
           this.onProviderWallObserved(observation, false);
         });
     } else {
-      postStopNotice('needs-owner');
+      postStopNotice(false);
       this.onProviderWallObserved(observation, false);
     }
     if (handle !== null) {
@@ -2253,14 +2263,16 @@ export class Supervisor {
     });
     const notification = this.notifications.post({
       kind: 'supervision.breaker',
-      // Re-arm is an ACK with side effects (supervisor.onNotificationAcked),
-      // so a tripped breaker must stay human-facing: FOR YOU + bell.
-      routing: 'needs-owner',
+      // Routine recovery belongs to the machine chain (owner release
+      // 2026-10-11): a crash-loop stop is Gru's decision, not an owner
+      // chore. Gru's guarded disposition on this action-required row
+      // re-arms the restart ladder (supervisor.onNotificationDisposed).
+      routing: 'action-required',
       severity: 'error',
       title: `Crash-loop breaker tripped: agent ${agent.agentId} stopped`,
       detail:
         `${agent.restartRing.length} restarts within ${Math.round(this.cfg.restartWindowMs / 1000)}s. ` +
-        'The agent is STOPPED — ack this notification to re-arm supervision and resume.',
+        'The agent is STOPPED; a Gru disposition on this alert can re-arm the guarded restart ladder once the cause is addressed.',
       agentId: agent.agentId,
     });
     agent.breakerNotificationId = notification.id;
@@ -2282,15 +2294,37 @@ export class Supervisor {
   }
 
   /**
-   * Ack hook: an action-required ack re-arms an OPEN breaker (clears the
-   * ring, fresh window, one restart attempt). Acks for anything else —
-   * or for a slot deliberately released — are pure records.
+   * Ack hook: an ack for an OPEN breaker re-arms it (clears the ring,
+   * fresh window, one restart attempt). Acks for anything else — or for a
+   * slot deliberately released — are pure records. Breaker alerts are
+   * action-required since the owner release (2026-10-11), so this hook is
+   * now the pure-record path; the disposition hook is the live one.
    */
   onNotificationAcked(notificationId: string): void {
+    this.reArmFromNotification(notificationId);
+  }
+
+  /** Disposition hook (owner release 2026-10-11): Gru's machine
+   * disposition on an open breaker alert is the supported re-arm control —
+   * same guarded route as the historical ack, never a privilege bypass. */
+  onNotificationDisposed(notificationId: string): void {
+    this.reArmFromNotification(notificationId);
+  }
+
+  private reArmFromNotification(notificationId: string): void {
     if (this.disposed || !this.cfg.enabled) return; // off = acks are pure records
     for (const agent of this.agents.values()) {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
-      if (!this.recoveryAuthorityCurrent(agent, agent.pendingRecovery)) return;
+      if (!this.recoveryAuthorityCurrent(agent, agent.pendingRecovery)) {
+        // The fence refused: the lane is terminal or another operation
+        // owns it. The stop remains visible; recovery is never applied
+        // across an open hold or a stale authority epoch.
+        this.log('info', 'breaker re-arm refused by the recovery authority fence', {
+          agent_id: agent.agentId,
+          notification_id: notificationId,
+        });
+        return;
+      }
       agent.breakerOpen = false;
       agent.stopReason = null;
       agent.stoppedAt = null;

@@ -25,6 +25,7 @@ import {
   type RoundRecord,
 } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
+import type { NotificationDecision } from '../ledger/notification-decision.js';
 import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import type { EventRecord } from '../ledger/api.js';
 
@@ -200,6 +201,13 @@ export interface NotificationView {
   readonly ackedAt: string | null;
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** Typed owner-decision metadata (owner release 2026-10-11; null on
+   * legacy/machine rows). */
+  readonly decision: NotificationDecision | null;
+  /** A recorded owner decision — distinct from ack and resolution. */
+  readonly decidedAt: string | null;
+  readonly decidedBy: string | null;
+  readonly decidedOption: string | null;
 }
 
 /** Silas ops health (board UX v4, issue #163): the newest wake (sweep or
@@ -1249,6 +1257,10 @@ export class BoardEngine {
         ackedAt: row.ackedAt,
         resolvedAt: row.resolvedAt,
         resolvedBy: row.resolvedBy,
+        decision: row.decision,
+        decidedAt: row.decidedAt,
+        decidedBy: row.decidedBy,
+        decidedOption: row.decidedOption,
       }));
   }
 

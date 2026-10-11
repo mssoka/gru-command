@@ -205,7 +205,7 @@ describe('attention disposition is not settlement; delegated work keeps its debt
     // An owner-routed card may be acked by the owner — the CARD clears,
     // the obligation does NOT.
     const ownerCard = h.notifications.postIncident({
-      kind: 'owner-hold.card.job-att',
+      kind: 'port-squat',
       routing: 'needs-owner',
       severity: 'info',
       title: 'owner hold observed',

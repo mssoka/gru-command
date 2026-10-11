@@ -5,8 +5,9 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
+import { parseNotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -37,6 +38,10 @@ export interface BoardServerOptions {
   /** E7: fired after a successful ack — the supervisor re-arms an open
    * breaker whose notification was acked. */
   readonly onNotificationAck?: (id: string) => void;
+  /** E7 (owner release 2026-10-11): fired after a successful machine
+   * disposition — the supervisor re-arms a stopped lane whose breaker
+   * alert Gru just disposed, through the same guarded path. */
+  readonly onNotificationDisposition?: (id: string) => void;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
@@ -92,6 +97,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
   const transcripts = options.transcripts;
   const notifications = options.notifications;
   const onNotificationAck = options.onNotificationAck ?? (() => {});
+  const onNotificationDisposition = options.onNotificationDisposition ?? (() => {});
   const siblings = new Set(options.siblingUpgradePaths ?? []);
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
@@ -568,15 +574,47 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           if (title === '' || title.length > 500 || detail === '' || detail.length > 4_000) {
             throw new Error('owner escalation title (1-500) and detail (1-4000) must be non-blank');
           }
-          const row = notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail });
+          // Owner escalation means a RESERVED decision (owner release
+          // 2026-10-11): typed decision metadata is required and validated
+          // here, so an operational chore can never be posted to FOR YOU as
+          // a bare acknowledgement notice.
+          const decision = parseNotificationDecision(body['decision']);
+          const row = notifications.post({
+            kind: 'gru.owner-escalation',
+            routing: 'needs-owner',
+            severity: 'error',
+            title,
+            detail,
+            decision,
+          });
           json(res, 201, row);
           return;
         }
-        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack') || path.endsWith('/disposition'))) {
+        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack') || path.endsWith('/disposition') || path.endsWith('/decision'))) {
           if (!authed(req, res)) return;
-          const suffix = path.endsWith('/shown') ? '/shown' : path.endsWith('/disposition') ? '/disposition' : '/ack';
+          const suffix = path.endsWith('/shown')
+            ? '/shown'
+            : path.endsWith('/disposition')
+              ? '/disposition'
+              : path.endsWith('/decision')
+                ? '/decision'
+                : '/ack';
           const id = decodeURIComponent(path.slice('/api/notifications/'.length, -suffix.length));
           const body = (await readBody(req)) as Record<string, unknown>;
+          if (suffix === '/decision') {
+            // Owner decision submission: the server validates the option
+            // against the STORED typed decision and records the choice.
+            // Recording never resolves the row — follow-through stays a
+            // distinct, separately evidenced state.
+            const optionId = strField(body, 'optionId');
+            const row = notifications.decide(id, optionId, optStrField(body, 'by') ?? 'web');
+            if (row === null) {
+              json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+              return;
+            }
+            json(res, 200, row);
+            return;
+          }
           if (suffix === '/shown') {
             // Display receipt (the shown:true doctrine): one per surface,
             // idempotent server-side; the client sends each (id, surface)
@@ -606,11 +644,17 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               });
               return;
             }
+            const beforeResolvedAt = target?.resolvedAt ?? null;
             const row = ledger.disposeMachineNotification(id, detail);
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;
             }
+            // Fire on the FIRST disposition (the state change); a repeat is
+            // an idempotent no-op for listeners too. The supervisor uses
+            // this hook for the guarded breaker re-arm — Gru's supported
+            // operations control, replacing the old owner Ack path.
+            if (beforeResolvedAt === null && row.resolvedAt !== null) onNotificationDisposition(id);
             json(res, 200, row);
             return;
           }
@@ -642,8 +686,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         // Typed mapping: the ledger and transcript layers throw
         // RecordNotFound for missing entities; a missing/unreadable
         // transcript FILE is also a not-found. Everything else is a 400
-        // except a guarded closeout refusal, which is a typed 409.
+        // except guarded refusals, which are typed 409s.
         const refused = error instanceof AdminCloseoutRefusal;
+        if (error instanceof NotificationDecisionRefusal) {
+          json(res, error.code === 'unknown_option' ? 400 : 409, {
+            error: 'decision_refused',
+            code: error.code,
+            detail: message,
+          });
+          return;
+        }
         const notFound =
           !refused &&
           (error instanceof RecordNotFound ||

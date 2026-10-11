@@ -120,7 +120,7 @@ describe('gru awareness — passive injection', () => {
   it('never injects a disposed machine row or acknowledged owner stop', () => {
     const rig = boot();
     const acked = rig.notifications.post({
-      kind: 'supervision.breaker',
+      kind: 'port-squat',
       routing: 'needs-owner',
       severity: 'error',
       title: 'Ack me first',
@@ -143,7 +143,7 @@ describe('gru awareness — passive injection', () => {
 
   it('passive mode carries owner-only stops in every user turn without autonomously waking', () => {
     const rig = boot({ wakeMode: 'never' });
-    const stop = rig.notifications.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Owner re-arm required' });
+    const stop = rig.notifications.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Owner re-arm required' });
     expect(rig.woke).toHaveLength(0);
     const first = rig.awareness.prepare();
     expect(first?.text).toContain('Owner re-arm required');
@@ -157,7 +157,7 @@ describe('gru awareness — passive injection', () => {
   it('retains a machine follow-up in the user block even with more than eight open owner stops', () => {
     const rig = boot({ wakeMode: 'never' });
     for (let i = 0; i < 10; i += 1) {
-      rig.notifications.post({ kind: `owner-${i}`, routing: 'needs-owner', severity: 'error', title: `Owner ${i}` });
+      rig.notifications.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: `Owner ${i}` });
     }
     const machine = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Still needs Gru' });
     rig.awareness.commit(rig.awareness.prepare()!);
@@ -504,18 +504,25 @@ describe('gru awareness — wake policy', () => {
     const dir = tmpDir();
     const passive = boot({ dir });
     const row = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old machine alert' });
-    for (let i = 0; i < 55; i += 1) passive.notifications.post({ kind: 'noise', routing: i % 2 ? 'fyi' : 'needs-owner', severity: 'info', title: `Noise ${i}` });
+    for (let i = 0; i < 55; i += 1) {
+      passive.notifications.post({
+        kind: i % 2 ? 'noise.fyi' : 'port-squat',
+        routing: i % 2 ? 'fyi' : 'needs-owner',
+        severity: 'info',
+        title: `Noise ${i}`,
+      });
+    }
     passive.awareness.commit(passive.awareness.prepare()!);
     const active = boot({ dir, wakeMode: 'action-required' });
     expect(active.woke).toHaveLength(1);
     expect(active.wakeBlocks[0]).toContain(row.id);
   });
 
-  it('all mode includes FYI and needs-owner rows in the turn payload', () => {
+  it('all mode includes FYI and owner rows in the turn payload', () => {
     const rig = boot({ wakeMode: 'all' });
-    for (const routing of ['fyi', 'needs-owner'] as const) {
-      const row = rig.notifications.post({ kind: routing, routing, severity: 'info', title: `Alert ${routing}` });
-      expect(rig.wakeBlocks.at(-1)).toContain(`Alert ${routing}`);
+    for (const entry of [{ kind: 'noise.fyi', routing: 'fyi' }, { kind: 'port-squat', routing: 'needs-owner' }] as const) {
+      const row = rig.notifications.post({ kind: entry.kind, routing: entry.routing, severity: 'info', title: `Alert ${entry.routing}` });
+      expect(rig.wakeBlocks.at(-1)).toContain(`Alert ${entry.routing}`);
       expect(rig.wakeBlocks.at(-1)).toContain(row.id);
     }
   });

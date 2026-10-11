@@ -23,6 +23,7 @@ import {
   type RoundStatus,
   type RoundVerdict,
 } from './states.js';
+import { ownerAttentionFor } from '../notifications/attention.js';
 import {
   AMENDMENT_CONTRACT_MAX_BYTES,
   AMENDMENT_MAX_IDEMPOTENCY_KEY_CHARS,
@@ -39,6 +40,11 @@ import {
   type JobAmendmentRecord,
   type WorkRevisionState,
 } from '../review-inputs/amendments.js';
+import {
+  parseStoredNotificationDecision,
+  serializeNotificationDecision,
+  type NotificationDecision,
+} from './notification-decision.js';
 import {
   canonicalIsoTimestamp,
   categoryKey,
@@ -408,17 +414,11 @@ export function producerResolvedBy(kind: string): string | null {
 }
 
 export function isOwnerHeldNotificationKind(kind: string): boolean {
-  // NOTE (provider-recovery machine-ownership amendment, 2026-09-29): the
-  // `supervision.provider-wall.*` family is deliberately NOT force-held
-  // here. The supervisor decides machine ownership BEFORE posting: an
-  // eligible machine-owned stop posts `action-required` (MACHINE attention
-  // — no owner chime, no ACK required, resolved by the wait lifecycle),
-  // and every ineligible/failed classification posts `needs-owner` as the
-  // conservative fallback (the supervisor passes that routing explicitly).
-  // `lessons.proposal`: a Book of Lessons update the owner alone approves
-  // (owner decision 2026-10-07).
-  return kind.startsWith('decisions.degraded.') ||
-    ['supervision.breaker', 'port-squat', 'roll-port-squat', 'worktree-sweep-paused', 'lessons.proposal'].includes(kind);
+  // Owner-attention registry (owner release 2026-10-11): the authority
+  // for which kinds always occupy the owner surface now lives in
+  // src/notifications/attention.ts. Kept exported for callers and tests
+  // that predate the registry; exact behavior follows the registry.
+  return ownerAttentionFor(kind) === 'owner-required';
 }
 
 export function isNotificationRouting(value: string): value is NotificationRouting {
@@ -447,6 +447,14 @@ export interface NotificationRecord {
   /** System resolution is distinct from a human acknowledgement. */
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** Typed owner-decision metadata (null on legacy/machine rows). */
+  readonly decision: NotificationDecision | null;
+  /** The recorded owner decision — DISTINCT from ack and resolution: it
+   * proves the choice was recorded, never that its follow-on operation
+   * succeeded. */
+  readonly decidedAt: string | null;
+  readonly decidedBy: string | null;
+  readonly decidedOption: string | null;
 }
 
 /** Marker for not-found failures the HTTP surface maps to 404 (typed —
@@ -483,6 +491,26 @@ export class AdminCloseoutRefusal extends Error {
   ) {
     super(message);
     this.name = 'AdminCloseoutRefusal';
+  }
+}
+
+/** Why an owner-decision submission was refused. Every refusal is a
+ * no-effect failure: nothing is written when it is thrown. The HTTP
+ * surface maps `unknown_option` to 400 and the rest to 409. */
+export type NotificationDecisionRefusalCode =
+  | 'not_owner_decision'
+  | 'no_decision'
+  | 'unknown_option'
+  | 'decision_recorded'
+  | 'not_open';
+
+export class NotificationDecisionRefusal extends Error {
+  constructor(
+    readonly code: NotificationDecisionRefusalCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'NotificationDecisionRefusal';
   }
 }
 
@@ -4288,6 +4316,7 @@ export class LedgerApi {
     title: string;
     detail?: string | null;
     agentId?: string | null;
+    decision?: NotificationDecision | null;
   }): NotificationRecord {
     if (input.id === '' || input.title === '') {
       throw new Error('notification id and title must be non-empty');
@@ -4299,8 +4328,8 @@ export class LedgerApi {
       const ts = nowIso();
       this.db
         .prepare(
-          `INSERT INTO notifications (id, ts, kind, routing, severity, title, detail, agent_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO notifications (id, ts, kind, routing, severity, title, detail, agent_id, decision_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.id,
@@ -4311,6 +4340,9 @@ export class LedgerApi {
           input.title,
           input.detail ?? null,
           input.agentId ?? null,
+          input.decision === undefined || input.decision === null
+            ? null
+            : serializeNotificationDecision(input.decision),
         );
       this.appendEvent({
         kind: 'notification.created',
@@ -4576,6 +4608,60 @@ export class LedgerApi {
         kind: 'notification.acked',
         agentId: current.agentId,
         payload: { id, by, routing: current.routing },
+      });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
+  /** Record the owner's typed decision on a needs-owner row. The ONLY
+   * supported effect of a recorded option is the durable decision itself
+   * (plus its audit event): follow-through stays with Gru/Silas and the
+   * row remains visible with `decidedAt` set until its producer resolves
+   * it — recording a decision never resolves, acks or hides the row. */
+  recordNotificationDecision(id: string, optionId: string, by: string): NotificationRecord | null {
+    if (by.trim() === '') throw new Error('decision by must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      if (current.routing !== 'needs-owner') {
+        throw new NotificationDecisionRefusal(
+          'not_owner_decision',
+          `notification "${id}" is ${current.routing}; only owner decisions accept a recorded choice`,
+        );
+      }
+      if (current.decision === null) {
+        throw new NotificationDecisionRefusal(
+          'no_decision',
+          `notification "${id}" carries no typed decision — no option can be recorded`,
+        );
+      }
+      if (current.resolvedAt !== null) {
+        throw new NotificationDecisionRefusal('not_open', `notification "${id}" is already resolved`);
+      }
+      const option = current.decision.options.find((candidate) => candidate.id === optionId);
+      if (option === undefined) {
+        throw new NotificationDecisionRefusal(
+          'unknown_option',
+          `option "${optionId}" is not one of this decision's options`,
+        );
+      }
+      if (current.decidedAt !== null) {
+        // Same option: an idempotent replay (a retried click confirms the
+        // recorded choice). A different option: refuse — a recorded owner
+        // decision is never silently replaced.
+        if (current.decidedOption === optionId) return current;
+        throw new NotificationDecisionRefusal(
+          'decision_recorded',
+          `notification "${id}" already records decision "${current.decidedOption}"; it is not replaced`,
+        );
+      }
+      this.db
+        .prepare('UPDATE notifications SET decided_at = ?, decided_by = ?, decided_option = ? WHERE id = ?')
+        .run(nowIso(), by, optionId, id);
+      this.appendEvent({
+        kind: 'notification.decision',
+        agentId: current.agentId,
+        payload: { id, optionId, by },
       });
       return this.getNotification(id) as NotificationRecord;
     });
@@ -8171,6 +8257,10 @@ export class LedgerApi {
       ackedBy: nstr(row.acked_by),
       resolvedAt: nstr(row.resolved_at),
       resolvedBy: nstr(row.resolved_by),
+      decision: parseStoredNotificationDecision(nstr(row.decision_json)),
+      decidedAt: nstr(row.decided_at),
+      decidedBy: nstr(row.decided_by),
+      decidedOption: nstr(row.decided_option),
     };
   }
 }

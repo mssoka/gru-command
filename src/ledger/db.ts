@@ -978,4 +978,24 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE pending_directives ADD COLUMN work_revision INTEGER;
     `,
   },
+  {
+    // Owner decisions (owner release 2026-10-11): a needs-owner
+    // notification may carry typed decision metadata (question, context,
+    // recommendation, reserved class, options) supplied at the write
+    // boundary, and a recorded owner decision on that row. Additive and
+    // nullable: pre-existing rows keep exact meaning (no decision, no
+    // recorded choice). Decided state is deliberately distinct from ack
+    // and resolution — recording a decision never proves its follow-on
+    // operation succeeded.
+    // LANDING COLLISION (same convention as migrations 10-24): renumber
+    // ONLY this never-applied migration if main lands id 25 first.
+    id: 25,
+    name: 'notification-owner-decisions',
+    sql: `
+      ALTER TABLE notifications ADD COLUMN decision_json TEXT;
+      ALTER TABLE notifications ADD COLUMN decided_at TEXT;
+      ALTER TABLE notifications ADD COLUMN decided_by TEXT;
+      ALTER TABLE notifications ADD COLUMN decided_option TEXT;
+    `,
+  },
 ];

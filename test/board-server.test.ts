@@ -271,16 +271,56 @@ describe('board server — HTTP API', () => {
     for (const token of [null, 'wrong-token']) {
       expect((await postJson(port, path, token, { title: 'Owner call', detail: 'Approve external merge' })).status).toBe(401);
     }
-    for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }]) {
+    for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }, { title: 'Owner call', detail: 'Approve external merge' }]) {
       expect((await postJson(port, path, 'board-test-token', body)).status).toBe(400);
     }
     const before = api.countPendingActionRequiredIncludingReceipts();
-    const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge' });
-    expect(created).toMatchObject({ status: 201, body: { kind: 'gru.owner-escalation', routing: 'needs-owner', title: 'Owner call', ackedAt: null } });
+    const decision = {
+      question: 'Approve the external merge?',
+      context: 'PR256 needs an owner-controlled integration route.',
+      recommendation: 'Approve it.',
+      reservedClass: 'merge',
+      whyNotDelegable: 'All merges remain owner-performed.',
+      options: [
+        { id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' },
+        { id: 'keep', label: 'Keep it parked', consequence: 'Nothing changes.' },
+      ],
+      discussion: false,
+    };
+    const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge', decision });
+    expect(created).toMatchObject({
+      status: 201,
+      body: {
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        title: 'Owner call',
+        ackedAt: null,
+        decidedAt: null,
+        decision: { question: 'Approve the external merge?', reservedClass: 'merge' },
+      },
+    });
     expect(api.countPendingActionRequiredIncludingReceipts()).toBe(before); // never loops into Gru's machine queue
     const row = created.body as { id: string };
     expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
     expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
+    // Decision submission: the server validates the option against the
+    // STORED typed decision, records it idempotently, and never resolves
+    // the row — a decision receipt is not follow-through.
+    const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'approve', by: 'web' });
+    expect(decided).toMatchObject({ status: 200, body: { decidedOption: 'approve', decidedBy: 'web', resolvedAt: null, ackedAt: null } });
+    expect((decided.body as { decidedAt: string | null }).decidedAt).not.toBeNull();
+    const replay = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'approve' });
+    expect(replay.status).toBe(200); // idempotent replay
+    const changed = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'keep' });
+    expect(changed).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'decision_recorded' } });
+    const unknownOption = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'nope' });
+    expect(unknownOption).toMatchObject({ status: 400, body: { error: 'decision_refused', code: 'unknown_option' } });
+    const notOwner = await postJson(port, '/api/notifications/does-not-exist/decision', 'board-test-token', { optionId: 'approve' });
+    expect(notOwner.status).toBe(404);
+    const decisionEvents = api
+      .listEvents({ limit: 100 })
+      .filter((event) => event.kind === 'notification.decision' && (event.payload as { id?: string }).id === row.id);
+    expect(decisionEvents).toHaveLength(1);
   });
 
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {
@@ -859,6 +899,7 @@ describe('board server — WS push', () => {
 describe('board server — empty token config locks every door', () => {
   it('notification shown/ack round-trip (E7): receipts idempotent, ack fires the hook, 404 unknown', async () => {
     const acked: string[] = [];
+    const dispositions: string[] = [];
     const dir = tmpDir();
     const { writeFileSync } = await import('node:fs');
     writeFileSync(
@@ -880,6 +921,7 @@ describe('board server — empty token config locks every door', () => {
       bus,
       notifications,
       onNotificationAck: (id) => acked.push(id),
+      onNotificationDisposition: (id) => dispositions.push(id),
       pushDebounceMs: 10,
     });
     const http: HttpServer = createServer((req, res) => {
@@ -892,12 +934,11 @@ describe('board server — empty token config locks every door', () => {
     const port = (http.address() as AddressInfo).port;
     try {
       const row = notifications.post({
-        kind: 'supervision.breaker',
+        kind: 'port-squat',
         routing: 'needs-owner',
         severity: 'error',
-        title: 'Crash-loop breaker tripped: agent a1 stopped',
-        detail: 'ack to re-arm',
-        agentId: 'a1',
+        title: 'Foreign process holds port 7665 (pid a1)',
+        detail: 'stop it, then restart the service',
       });
       // Auth door on the notification endpoints too.
       const anon = await postJson(port, `/api/notifications/${row.id}/ack`, null, { by: 'web' });
@@ -919,6 +960,13 @@ describe('board server — empty token config locks every door', () => {
       expect(illegal.status).toBe(400);
       expect(api.getNotification(machine.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
       expect(api.countPendingActionRequiredIncludingReceipts()).toBeGreaterThan(0);
+      // Machine disposition fires the disposition hook exactly once (the
+      // supervisor's guarded breaker re-arm rides this in production).
+      const disposedRow = await postJson(port, `/api/notifications/${machine.id}/disposition`, 'ack-token', { detail: 'repair lane opened' });
+      expect(disposedRow).toMatchObject({ status: 200, body: { resolvedBy: 'gru', ackedAt: null } });
+      const disposedAgain = await postJson(port, `/api/notifications/${machine.id}/disposition`, 'ack-token', { detail: 'repeat' });
+      expect(disposedAgain.status).toBe(200);
+      expect(dispositions).toEqual([machine.id]);
       // Owner Ack fires the hook exactly once, idempotently.
       const ack1 = await postJson(port, `/api/notifications/${row.id}/ack`, 'ack-token', { by: 'web' });
       expect(ack1.status).toBe(200);
