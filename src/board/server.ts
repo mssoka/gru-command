@@ -1,3 +1,4 @@
+import { MailboxConflictError } from '../ledger/mailbox.js';
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -17,6 +18,18 @@ import type { BoardEngine } from './engine.js';
 import type { DecisionRuntimeStatus } from '../decisions/runtime.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+class BoardUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super(`board unavailable: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = 'BoardUnavailableError';
+  }
+}
+
+/** Source rejection is a service failure, never a clean empty projection or bad client input. */
+function readEvidence<T>(read: () => T): T {
+  try { return read(); } catch (error) { throw new BoardUnavailableError(error); }
+}
 
 /**
  * Board server (EPICS E6 stories 2–4 surface): the HTTP API of record's
@@ -220,7 +233,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         // --- reads -----------------------------------------------------
         if (req.method === 'GET' && path === '/api/board') {
           if (!authed(req, res)) return;
-          json(res, 200, engine.snapshot());
+          json(res, 200, readEvidence(() => engine.snapshot()));
           return;
         }
         if (req.method === 'GET' && path === '/api/notifications/receipts') {
@@ -334,6 +347,23 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         }
 
         // --- writes (the thin record API; authorship UI is E8) ----------
+        if (req.method === 'GET' && path === '/api/mailbox') {
+          if (!authed(req, res)) return;
+          const query = new URL(req.url ?? path, 'http://localhost').searchParams;
+          // Separate strict source rejection from the page's client-input validation.
+          readEvidence(() => engine.mailbox.snapshot());
+          const limit = query.get('limit');
+          json(res, 200, engine.mailbox.page(query.get('cursor') ?? '', limit === null ? 50 : Number(limit)));
+          return;
+        }
+        if (req.method === 'POST' && path.startsWith('/api/mailbox/') && path.endsWith('/disposition')) {
+          if (!authed(req, res)) return;
+          const id = decodeURIComponent(path.slice('/api/mailbox/'.length, -'/disposition'.length));
+          const body = await readBody(req);
+          readEvidence(() => engine.mailbox.snapshot());
+          json(res, 200, engine.mailbox.disposition(id, body));
+          return;
+        }
         if (req.method === 'POST' && path === '/api/decisions/recheck') {
           if (!authed(req, res)) return;
           if (options.onDecisionsRecheck === undefined) {
@@ -768,7 +798,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         // RecordNotFound for missing entities; a missing/unreadable
         // transcript FILE is also a not-found. Everything else is a 400
         // except guarded refusals, which are typed 409s.
+        if (error instanceof BoardUnavailableError) {
+          log('error', 'board evidence unavailable', { method: req.method, path, error: message });
+          json(res, 503, { error: 'board_unavailable', detail: message });
+          return;
+        }
         const refused = error instanceof AdminCloseoutRefusal;
+        if (error instanceof MailboxConflictError) {
+          json(res, 409, { error: 'mailbox_conflict', detail: message });
+          return;
+        }
         if (error instanceof NotificationDecisionRefusal) {
           json(res, error.code === 'unknown_option' ? 400 : 409, {
             error: 'decision_refused',
@@ -800,7 +839,20 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
   // ------------------------------------------------------------------
 
   function pushSnapshot(): void {
-    const snapshot = engine.snapshot();
+    let snapshot: ReturnType<BoardEngine['snapshot']>;
+    try {
+      snapshot = readEvidence(() => engine.snapshot());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log('error', 'board evidence unavailable', { error: message });
+      for (const client of clients) {
+        if (!client.authed) continue;
+        // Source failure is recoverable; a fatal frame would revoke valid web pairing.
+        send(client.socket, { type: 'error', message, fatal: false });
+        client.socket.close(1011, 'board unavailable');
+      }
+      return;
+    }
     for (const client of clients) {
       if (client.authed) send(client.socket, { type: 'board', snapshot });
     }

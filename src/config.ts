@@ -181,6 +181,8 @@ export interface ChatConfig {
    * provider walls, needs-owner) always wake regardless. false restores
    * pre-#219 behavior. */
   readonly wakeDeferCovered: boolean;
+  /** Code-only durable mailbox recovery cadence; no browser required. */
+  readonly mailboxReconcileIntervalMs: number;
   /** Morning digest gap (ms): the first delivered block after this much
    * quiet time carries a "while you were away" digest (fires, actions,
    * merges, staged PRs) so the chief catches up without the owner
@@ -966,6 +968,7 @@ export function loadConfig(
     wakeMinSeverity: 'info',
     wakeQuietHours: null,
     wakeDeferCovered: true,
+    mailboxReconcileIntervalMs: 300_000,
     morningDigestGapMs: 28_800_000,
   };
   let worktrees: WorktreesConfig | null = null;
@@ -1199,6 +1202,7 @@ export function loadConfig(
         'wake_min_severity',
         'wake_quiet_hours',
         'wake_defer_covered',
+        'mailbox_reconcile_interval_ms',
         'morning_digest_gap_ms',
       ];
       for (const key of Object.keys(table)) {
@@ -1233,6 +1237,9 @@ export function loadConfig(
           table['wake_defer_covered'] !== undefined
             ? requireBool(table['wake_defer_covered'], file, 'chat.wake_defer_covered')
             : chat.wakeDeferCovered,
+        mailboxReconcileIntervalMs: table['mailbox_reconcile_interval_ms'] !== undefined
+          ? requireTimerInterval(requirePositiveInt(table['mailbox_reconcile_interval_ms'], file, 'chat.mailbox_reconcile_interval_ms'), file, 'chat.mailbox_reconcile_interval_ms')
+          : chat.mailboxReconcileIntervalMs,
         morningDigestGapMs:
           table['morning_digest_gap_ms'] !== undefined
             ? requireNonNegativeInt(table['morning_digest_gap_ms'], file, 'chat.morning_digest_gap_ms')

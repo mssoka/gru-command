@@ -850,9 +850,8 @@ test.describe('board (E6, mock feed)', () => {
       await expect(silent.locator('.board-job__stale')).toHaveText('stalled');
       await expect(silent.locator('.board-job__status')).toHaveText('working');
 
-      // Chip and bands agree: the two live machine rows (mock-n4 + mock-n5)
-      // count; the merged lane's leftover is a closed receipt.
-      await expect(page.locator('#board-unacked')).toContainText('2 needs Gru');
+      // Chip and bands agree: only the live machine row (mock-n5) counts.
+      await expect(page.locator('#board-unacked')).toContainText('1 notifications · needs Gru');
       // Scoped acceptance clips (tracked-review A10): the full-page capture
       // is taken under sticky chrome that can occlude the IN FLIGHT band,
       // so the NEEDS GRU band and the waiting row get their own clips — the

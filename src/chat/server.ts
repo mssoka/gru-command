@@ -268,9 +268,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
   /** Fatal native-writer uncertainty after failed compaction retirement.
    * Only process restart or a confirmed late resume may clear it. */
   let recoveryBlockedReason: string | null = null;
-  // A wake is accepted at the durable turn_start frame, not at the end of
+  // Awareness delivery is accepted at the durable turn_start frame, not at the end of
   // a potentially long-running prompt. Only the owning handle may accept it.
-  let acceptWakeTurn: { source: AgentHandle; accept: () => void } | null = null;
+  let acceptAwarenessTurn: { source: AgentHandle; accept: () => void } | null = null;
   const pendingNotices: Array<{ readonly text: string; readonly onPersist?: () => void }> = [];
   /** callId → tool name, for tool_end frames (the contract carries names). */
   const openCalls = new Map<string, string>();
@@ -447,9 +447,9 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       case 'turn_start':
         turnLive = true;
         emitLogged({ type: 'turn', state: 'start' });
-        if (acceptWakeTurn?.source === source) {
-          const { accept } = acceptWakeTurn;
-          acceptWakeTurn = null;
+        if (acceptAwarenessTurn?.source === source) {
+          const { accept } = acceptAwarenessTurn;
+          acceptAwarenessTurn = null;
           accept();
         }
         broadcastContext();
@@ -733,6 +733,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
       controlBarrier !== null ||
       runtimeCompactionBarrier !== null
     ) {
+      options.awareness.noteWakeDeferred?.('busy');
       return;
     }
     wakeRequested = false;
@@ -923,20 +924,26 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
             if (wake) options.awareness?.noteWakeAttempt?.();
             ownedOpenTurn = true;
             turnLive = true; // optimistic: the turn_start event confirms
-            if (wake && injection !== null) {
-              acceptWakeTurn = { source: gru, accept: () => {
-                acceptedWakeInjection = injection;
-                awarenessCommit(injection, 'wake');
-                options.awareness?.noteWakeOutcome?.(true, undefined, injection);
+            let acceptedPassive = false;
+            if (injection !== null) {
+              acceptAwarenessTurn = { source: gru, accept: () => {
+                if (wake) {
+                  acceptedWakeInjection = injection;
+                  awarenessCommit(injection, 'wake');
+                  options.awareness?.noteWakeOutcome?.(true, undefined, injection);
+                } else {
+                  acceptedPassive = true;
+                  awarenessCommit(injection);
+                }
               } };
             }
             try {
               await gru.prompt(prompt, { owner: CHAT_OWNER });
             } finally {
-              if (acceptWakeTurn?.source === gru) acceptWakeTurn = null;
+              if (acceptAwarenessTurn?.source === gru) acceptAwarenessTurn = null;
             }
             turnLive = false;
-            if (!wake && injection !== null) awarenessCommit(injection);
+            if (!wake && injection !== null && !acceptedPassive) awarenessCommit(injection);
           }
         } catch (error) {
           const message = (error as Error).message;

@@ -1,3 +1,5 @@
+import type { MailboxDelivery, MailboxItem } from '../gru-mailbox/types.js';
+import type { GruMailbox } from '../gru-mailbox/service.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -86,6 +88,10 @@ export const AWARENESS_BLOCK_HEADER = '[gru awareness · service context — not
 /** Prompt suffix for a policy-started turn (the block itself is prepended). */
 export const AWARENESS_WAKE_INSTRUCTION =
   'This turn was started by the service wake policy — no user message is waiting. ' +
+  'FOR GRU mailbox items are shared server state. Read GET /api/mailbox for full reason bases, restrictions, receipts and control references. ' +
+  'Record next actions with POST /api/mailbox/{id}/disposition using its exact basis, state, owner, detail, references and dependency/recheckAt for waiting or delegated work. ' +
+  'Mailbox delivery keys are not notification IDs; the notification instructions below apply only to actual notification IDs. ' +
+  'Delivery is only a receipt, never resolution or authority. Reuse actual controls and obligations; do not acknowledge owner stops, merge, restart or infer child completion from a parent. ' +
   'This is machine attention and it is meant to be acted on in-turn: diagnose the item, ' +
   'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
   'stage the rest. When an owner discussion-only escalation (empty options, discussion true) ' +
@@ -135,6 +141,9 @@ export interface AwarenessInjection {
   readonly coveredThroughSeq: number;
   /** Only IDs actually rendered in this bounded block may be claimed. */
   readonly notificationIds?: readonly string[];
+  /** Domain-qualified identities and immutable evidence from the actual rendered rows. */
+  readonly attentionKeys?: readonly string[];
+  readonly mailboxDeliveries?: readonly MailboxDelivery[];
 }
 
 /** The chat server's narrow view of the awareness layer (injection provider
@@ -153,6 +162,8 @@ export interface GruAwarenessPort {
   noteWakeTurnFailure?(detail: string, injection: AwarenessInjection): void;
   /** Native writer recovery is unsafe: surface a durable owner stop and retry. */
   noteWakeBlocked?(reason: string): void;
+  /** Admission can wait on the existing chat lane without opening another controller. */
+  noteWakeDeferred?(reason: 'busy'): void;
 }
 
 export type GruAwarenessLedger = Pick<
@@ -199,6 +210,8 @@ export function escalationDecisionSubject(kind: string, agentJobId?: string | nu
 export interface GruAwarenessOptions {
   /** Chat dir (same home as the frame log); the cursor sidecar lives here. */
   readonly dir: string;
+  readonly mailbox?: GruMailbox;
+  readonly mailboxReconcileIntervalMs?: number;
   readonly ledger: GruAwarenessLedger;
   /** Notification events drive the wake decision. */
   readonly bus?: Pick<EventBus, 'subscribe'>;
@@ -236,6 +249,48 @@ export interface GruAwarenessOptions {
   readonly modeForSurface?: (surface: string) => 'off' | 'shadow' | 'enforce' | null;
 }
 
+interface DeliveryDebt {
+  readonly id: string;
+  readonly ids: readonly string[];
+  readonly at: number;
+  readonly source?: 'chat' | 'wake';
+  readonly deliveries?: readonly MailboxDelivery[];
+  readonly notificationIds?: readonly string[];
+}
+
+// Bare notification IDs are legacy-compatible; synthetic keys are always domain-qualified.
+const MAILBOX_KEY_PREFIX = '\u0000mailbox:';
+const NOTIFICATION_KEY_PREFIX = '\u0000notification:';
+const FAILURE_BASIS_PREFIX = '\u0000mailbox-failure:';
+
+class MailboxDeliveryRecoveryError extends Error {
+  constructor(batchId: string, key: string) {
+    super(`accepted mailbox delivery ${key} in batch ${batchId} lacks reconstructable captured evidence; inspect awareness.json and durable mailbox/wake receipts before repairing this debt`);
+    this.name = 'MailboxDeliveryRecoveryError';
+  }
+}
+
+function validDeliveryDebt(raw: unknown): boolean {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return false;
+  const batch = raw as Record<string, unknown>;
+  const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((id) => typeof id === 'string' && id !== '');
+  const text = (value: unknown): boolean => typeof value === 'string' && value !== '';
+  if (!strings(batch['ids']) || !Number.isSafeInteger(batch['at']) || Number(batch['at']) < 0 ||
+      !(batch['id'] === undefined || text(batch['id'])) ||
+      !(batch['source'] === undefined || batch['source'] === 'chat' || batch['source'] === 'wake') ||
+      !(batch['notificationIds'] === undefined || strings(batch['notificationIds']))) return false;
+  const deliveries = batch['deliveries'];
+  return deliveries === undefined ? batch['source'] !== 'chat' : Array.isArray(deliveries) && deliveries.every((raw) => {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return false;
+    const delivery = raw as Record<string, unknown>;
+    return ['deliveryKey', 'id', 'basis', 'attentionKey'].every((key) => text(delivery[key])) &&
+      (delivery['jobId'] === null || text(delivery['jobId'])) && strings(delivery['notificationIds']) &&
+      Array.isArray(delivery['reasons']) && delivery['reasons'].every((reason) => typeof reason === 'object' && reason !== null && !Array.isArray(reason) &&
+        ['signal', 'label', 'basis'].every((key) => text((reason as Record<string, unknown>)[key]))) &&
+      (batch['ids'] as string[]).includes(MAILBOX_KEY_PREFIX + String(delivery['deliveryKey']));
+  });
+}
+
 interface AwarenessState {
   readonly coveredThroughSeq: number;
   readonly wake?: {
@@ -249,8 +304,9 @@ interface AwarenessState {
      * `id` is the stable batch identity the reconciliation matches the
      * receipt by (issue #219 review: id-set matching can pair a retried
      * turn with the wrong earlier receipt). */
-    readonly unreceipted?: readonly { readonly id?: string; readonly ids: readonly string[]; readonly at: number }[];
-    /** Issue #115: failed accepted-wake attempts per notification ID.
+    readonly unreceipted?: readonly (Omit<DeliveryDebt, 'id'> & { readonly id?: string })[];
+    /** Failed accepted-wake attempts by notification ID or exact mailbox basis.
+     * Unchanged-basis grace incarnations share the bounded retry budget.
      * At WAKE_FAILURE_RETRIES the truthful owner escalation replaces the
      * autonomous path for that incident. */
     readonly wakeFailures?: Readonly<Record<string, number>>;
@@ -436,6 +492,10 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
 export class GruAwareness {
   readonly file: string;
   private readonly ledger: GruAwarenessLedger;
+  private readonly mailbox: GruMailbox | null;
+  private mailboxTimer: ReturnType<typeof setInterval> | null = null;
+  private mailboxEventTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly mailboxIntervalMs: number;
   private readonly limits: AwarenessLimits;
   private readonly wakePolicy: WakePolicy;
   private readonly wakeMode: NotifyWakeMode;
@@ -467,7 +527,7 @@ export class GruAwareness {
   /** Issue #112: delivered wake batches whose ledger receipt failed to
    * append. Never re-prompted; retried on flush, reconciled once on boot.
    * `id` is the stable batch identity reconciliation matches receipts by. */
-  private readonly unreceipted: { readonly id: string; readonly ids: readonly string[]; readonly at: number }[];
+  private readonly unreceipted: DeliveryDebt[];
   /** Issue #115: accepted-turn failure counts per notification ID. */
   private readonly wakeFailures: Map<string, number>;
   /** Issue #219: hold-covered deferrals awaiting their recheck, by
@@ -504,6 +564,10 @@ export class GruAwareness {
   constructor(opts: GruAwarenessOptions) {
     this.file = join(opts.dir, AWARENESS_STATE_NAME);
     this.ledger = opts.ledger;
+    this.mailbox = opts.mailbox ?? null;
+    this.mailboxIntervalMs = opts.mailboxReconcileIntervalMs ?? 300_000;
+    // Node clamps larger intervals to 1 ms, turning recovery into a storm.
+    if (!Number.isSafeInteger(this.mailboxIntervalMs) || this.mailboxIntervalMs < 1 || this.mailboxIntervalMs > 2_147_483_647) throw new Error('mailbox reconcile interval must be an integer from 1 to 2147483647 ms (Node timer ceiling)');
     this.limits = { ...AWARENESS_LIMITS, ...(opts.limits ?? {}) };
     if (!Number.isSafeInteger(this.limits.maxActionNotes) || this.limits.maxActionNotes < 1) {
       throw new Error('awareness maxActionNotes must be a positive integer');
@@ -526,13 +590,23 @@ export class GruAwareness {
     this.lastDeliveredAt = state.digest?.lastDeliveredAt ?? null;
     this.lastOwnerAt = state.digest?.lastOwnerAt !== undefined ? state.digest.lastOwnerAt : this.lastDeliveredAt;
     this.lastOwnerSeq = state.digest?.lastOwnerSeq ?? state.coveredThroughSeq;
-    this.pendingWakeIds = new Set(state.wake?.pending ?? []);
+    const compatibleLegacyRow = (id: string): NotificationRecord | null =>
+      id.startsWith('mailbox:') && this.ledger.getNotification(id) === null ? this.mailbox?.getAttentionRow(id) ?? null : null;
+    const normalizeLegacyKey = (id: string): string => {
+      const row = compatibleLegacyRow(id);
+      return row === null ? id : this.rowKey(row);
+    };
+    this.pendingWakeIds = new Set((state.wake?.pending ?? []).map(normalizeLegacyKey));
     this.unreceipted = (state.wake?.unreceipted ?? []).map((batch, index) => ({
+      ...batch,
       id: batch.id ?? `legacy-${index}`,
-      ids: [...batch.ids],
+      ids: batch.deliveries === undefined ? batch.ids.map(normalizeLegacyKey) : [...batch.ids],
       at: batch.at,
     }));
-    this.wakeFailures = new Map(Object.entries(state.wake?.wakeFailures ?? {}));
+    this.wakeFailures = new Map(Object.entries(state.wake?.wakeFailures ?? {}).map(([id, count]) => {
+      const key = normalizeLegacyKey(id);
+      return [this.failureKey(key), count];
+    }));
     this.wakePolicy = new WakePolicy(
       {
         mode: this.wakeMode,
@@ -540,7 +614,19 @@ export class GruAwareness {
         minIntervalMs: opts.wakeMinIntervalMs ?? 300_000,
         quietHours: opts.wakeQuietHours ?? null,
       },
-      state.wake ?? { woken: [], lastFiredAt: null },
+      state.wake === undefined ? { woken: [], lastFiredAt: null } : {
+        ...state.wake,
+        woken: state.wake.woken.flatMap((id) => {
+          if (!id.startsWith('mailbox:')) return [id];
+          const row = compatibleLegacyRow(id);
+          if (row !== null) {
+            const item = JSON.parse(row.detail!) as MailboxItem;
+            return item.receipt?.attentionKey === item.attentionKey ? [this.rowKey(row)] : [];
+          }
+          // Bare collision claims cannot prove a genuine delivery; durable domain-linked events replay below.
+          return this.mailbox?.getAttentionRow(id) != null ? [] : [id];
+        }),
+      },
     );
     opts.bus?.subscribe((event) => this.onBusEvent(event));
   }
@@ -600,14 +686,7 @@ export class GruAwareness {
     const validUnreceipted =
       unreceipted === undefined ||
       (Array.isArray(unreceipted) &&
-        unreceipted.every(
-          (batch): batch is { readonly ids: string[]; readonly at: number } =>
-            typeof batch === 'object' && batch !== null &&
-            Array.isArray((batch as { ids?: unknown }).ids) &&
-            ((batch as { ids: unknown[] }).ids).every((id) => typeof id === 'string' && id !== '') &&
-            Number.isSafeInteger((batch as { at?: unknown }).at) &&
-            (batch as { at: number }).at >= 0,
-        ));
+        unreceipted.every(validDeliveryDebt));
     const validWakeFailures =
       wakeFailures === undefined ||
       (typeof wakeFailures === 'object' && wakeFailures !== null && !Array.isArray(wakeFailures) &&
@@ -691,7 +770,7 @@ export class GruAwareness {
       lastAttemptAt: version === 2 && typeof lastAttemptAt === 'number' ? lastAttemptAt : null,
       ...(version === 2 && wokenIncidents !== undefined ? { wokenIncidents: wokenIncidents as string[] } : {}),
       ...(pending !== undefined ? { pending: pending as string[] } : {}),
-      ...(unreceipted !== undefined ? { unreceipted: unreceipted as { id?: string; ids: string[]; at: number }[] } : {}),
+      ...(unreceipted !== undefined ? { unreceipted: unreceipted as NonNullable<NonNullable<AwarenessState['wake']>['unreceipted']> } : {}),
       ...(wakeFailures !== undefined ? { wakeFailures: wakeFailures as Record<string, number> } : {}),
       ...(followUp !== undefined ? { followUp: followUp as { id: string; dueAtMs: number }[] } : {}),
     }, ...(digest !== undefined ? { digest } : {}),
@@ -706,11 +785,59 @@ export class GruAwareness {
     this.reconcileWakeReceipts();
     this.seedBacklog();
     this.flushPendingWakes();
+    if (this.mailbox !== null && this.mailboxTimer === null) {
+      this.mailboxTimer = setInterval(() => this.reconcileMailboxAttention(), this.mailboxIntervalMs);
+      this.mailboxTimer.unref?.();
+    }
+  }
+
+  private rowKey(row: NotificationRecord): string {
+    if (this.mailbox?.captureRow(row) != null) return MAILBOX_KEY_PREFIX + row.id;
+    return row.id.startsWith('\u0000') ? NOTIFICATION_KEY_PREFIX + row.id : row.id;
+  }
+
+  private attentionRow(id: string): NotificationRecord | null {
+    if (id.startsWith(MAILBOX_KEY_PREFIX)) return this.mailbox?.getAttentionRow(id.slice(MAILBOX_KEY_PREFIX.length)) ?? null;
+    return this.ledger.getNotification(id.startsWith(NOTIFICATION_KEY_PREFIX) ? id.slice(NOTIFICATION_KEY_PREFIX.length) : id);
+  }
+
+  private failureKey(id: string): string {
+    const row = this.attentionRow(id);
+    const delivery = row === null ? null : this.mailbox?.captureRow(row);
+    return delivery == null ? id : FAILURE_BASIS_PREFIX + JSON.stringify([delivery.id, delivery.basis]);
+  }
+
+  private mailboxWakeEligible(id: string, row: NotificationRecord): boolean {
+    const delivery = this.mailbox?.captureRow(row);
+    if (delivery == null) return this.mailbox === null || row.routing !== 'action-required';
+    const failures = this.wakeFailures.get(this.failureKey(id)) ?? 0;
+    if (failures > WAKE_FAILURE_RETRIES) return false;
+    if (this.unreceipted.some((batch) => batch.ids.includes(id))) return false;
+    const item = JSON.parse(row.detail!) as MailboxItem;
+    return item.state === 'needs-gru' && (item.receipt?.attentionKey !== item.attentionKey || (failures > 0 && this.pendingWakeIds.has(id)));
+  }
+
+  private queueMailboxReconciliation(): void {
+    if (this.mailboxEventTimer !== null) return;
+    this.mailboxEventTimer = setTimeout(() => {
+      this.mailboxEventTimer = null;
+      this.reconcileMailboxAttention();
+    }, 0);
+    this.mailboxEventTimer.unref?.();
+  }
+
+  private reconcileMailboxAttention(): void {
+    if (this.disposed || this.mailbox === null) return;
+    try { this.seedBacklog(); } catch (error) {
+      this.log('error', 'mailbox reconciliation failed', { error: String(error) });
+    }
   }
 
   /** Stop the deferred-wake timer (service shutdown / test teardown). */
   dispose(): void {
     this.disposed = true;
+    if (this.mailboxTimer !== null) clearInterval(this.mailboxTimer);
+    if (this.mailboxEventTimer !== null) clearTimeout(this.mailboxEventTimer);
     this.cancelWakeTimer();
     if (this.deferredTimer !== null) clearTimeout(this.deferredTimer);
     this.deferredTimer = null;
@@ -753,10 +880,10 @@ export class GruAwareness {
       const selectedOwners = owners.rows.slice(0, ownerSlots);
       const machineComposed = machine.live.slice(0, this.limits.maxActionNotes - selectedOwners.length);
       for (const [index, row] of owners.rows.slice(0, this.limits.maxActionNotes).entries()) {
-        ownerCandidates.push({ id: row.id, position: owners.offset + index });
+        ownerCandidates.push({ id: this.rowKey(row), position: owners.offset + index });
       }
       for (const [index, row] of machineComposed.entries()) {
-        machineCandidates.push({ id: row.id, position: machine.offset + index });
+        machineCandidates.push({ id: this.rowKey(row), position: machine.offset + index });
       }
       return {
         live: [...selectedOwners, ...machineComposed,
@@ -807,38 +934,45 @@ export class GruAwareness {
     // Pending IDs are independent of the cursor: a passive delivery may
     // have covered an event before the wake policy was enabled. The active
     // batch is exclusive — never include/claim an unrelated new row in it.
-    const notes: { id: string; line: string }[] = [];
-    const receiptNotes: { id: string; line: string }[] = [];
+    const notes: { id: string; displayId: string; line: string; mailbox: boolean }[] = [];
+    const renderedRows = new Map<string, NotificationRecord>();
+    const receiptNotes: { id: string; displayId: string; line: string; mailbox: boolean }[] = [];
     const seenIds = new Set<string>();
     const addNote = (id: string): void => {
       if (seenIds.has(id) || notes.length >= this.limits.maxActionNotes) return;
       seenIds.add(id);
-      const row = this.ledger.getNotification(id);
+      const row = this.attentionRow(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
       // A stop reclassified while a wake was waiting must never ride a
       // machine-only turn; all mode explicitly opts into owner context.
       if (exclusiveWake && this.wakeMode === 'action-required' && row.routing !== 'action-required') return;
       const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(row.detail)}` : '';
       const icon = row.routing === 'action-required' ? '⚠' : row.routing === 'needs-owner' ? '🔔' : 'ℹ';
-      notes.push({ id, line: `- ${icon} [${id}] title=${JSON.stringify(row.title)}${detail} (routing: ${row.routing})` });
+      renderedRows.set(id, row);
+      if (this.mailbox?.captureRow(row) != null) {
+        const item = JSON.parse(row.detail!) as MailboxItem;
+        notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map((reason) => reason.label), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` })}` });
+        return;
+      }
+      notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(row.title)}${detail} (routing: ${row.routing})` });
     };
     const addReceipt = (id: string): void => {
       if (receiptNotes.length >= this.limits.maxActionNotes) return;
-      const row = this.ledger.getNotification(id);
+      const row = this.attentionRow(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
       const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(row.detail)}` : '';
       receiptNotes.push({
-        id,
-        line: `- 🧾 [${id}] title=${JSON.stringify(row.title)}${detail} (closed receipt — no action required)`,
+        id, displayId: row.id, mailbox: false,
+        line: `- 🧾 [${row.id}] title=${JSON.stringify(row.title)}${detail} (closed receipt — no action required)`,
       });
     };
     if (exclusiveWake) {
       for (const id of this.activeWakeIds ?? []) addNote(id);
     } else {
-      for (const row of openAttention) addNote(row.id);
-      for (const row of attention.receipts) addReceipt(row.id);
+      for (const row of openAttention) addNote(this.rowKey(row));
+      for (const row of attention.receipts) addReceipt(this.rowKey(row));
       for (const id of this.pendingWakeIds) {
-        const row = this.ledger.getNotification(id);
+        const row = this.attentionRow(id);
         if (row !== null && this.isReceiptNotification(row.agentId)) {
           // A stored seed for a row that became a receipt (or predates
           // this rule) is dropped here, never woken.
@@ -848,7 +982,7 @@ export class GruAwareness {
         addNote(id);
       }
     }
-    if (!exclusiveWake && notes.length < this.limits.maxActionNotes) {
+    if (this.mailbox === null && !exclusiveWake && notes.length < this.limits.maxActionNotes) {
       // The event scan covers newly triaged rows as well as the SQL-backed
       // open queue; older events cannot hide unresolved attention.
       const notificationEvents = this.ledger.listEventsAfter(this.cursor, {
@@ -861,11 +995,16 @@ export class GruAwareness {
         .map((event) => textOf(payloadOf(event)['id']))
         .filter((id): id is string => id !== null);
       for (const id of [...eventIds].reverse()) {
-        if (this.isReceiptNotification(this.ledger.getNotification(id)?.agentId ?? null)) continue;
+        if (this.isReceiptNotification(this.attentionRow(id)?.agentId ?? null)) continue;
         addNote(id);
       }
     }
     const rendered = this.render(notes, receiptNotes, digestLines, overflow, morning);
+    for (const note of notes) {
+      if (!note.mailbox || rendered?.ids.includes(note.id)) continue;
+      const row = this.attentionRow(note.id);
+      if (row !== null) this.recordDeferred({ id: row.id, incidentKey: row.kind, routing: row.routing, severity: row.severity }, 'context-budget', null);
+    }
     // Rotation advance (GH-109): move past exactly the composed rows the
     // block rendered (or that closed mid-flight); rows skipped by slot or
     // byte caps stay ahead of the offset and lead the next block. prepare
@@ -879,7 +1018,7 @@ export class GruAwareness {
       this.pendingRotationAdvance = {
         owner: this.advancePastRendered(owners.offset, ownerCandidates, renderedIds),
         machine: machineCandidates.length > 0
-          ? this.advancePastRendered(machine.offset, machineCandidates, renderedIds)
+          ? this.advancePastRendered(machine.offset, machineCandidates, renderedIds, new Set(notes.filter((note) => note.mailbox).map((note) => note.id)))
           : machine.noLiveAdvance,
       };
     }
@@ -890,13 +1029,27 @@ export class GruAwareness {
       });
       return null;
     }
-    return { text: rendered.text, coveredThroughSeq: latest, notificationIds: rendered.ids };
+    const rows = rendered.ids.flatMap((id) => renderedRows.has(id) ? [renderedRows.get(id)!] : []);
+    return { text: rendered.text, coveredThroughSeq: latest,
+      notificationIds: rendered.ids.map((id) => renderedRows.get(id)?.id ?? id),
+      attentionKeys: rendered.ids, mailboxDeliveries: this.mailbox?.captureDelivery(rows) ?? [] };
+
   }
 
   /** Commit a delivered block: advance the event cursor and the passive
    * queue rotation (GH-109). Only a user chat turn advances the independent
    * owner watermark used by the morning digest. */
   commit(injection: AwarenessInjection, source: 'chat' | 'wake' = 'chat'): void {
+    if (source === 'chat' && (injection.mailboxDeliveries?.length ?? 0) > 0) {
+      const batch: DeliveryDebt = { id: randomUUID(), ids: injection.attentionKeys ?? [], at: this.now(),
+        source, deliveries: injection.mailboxDeliveries, notificationIds: [] };
+      if (this.unreceipted.length >= MAX_UNRECEIPTED_BATCHES) throw new Error('Gru accepted delivery receipt debt exceeds the sidecar cap; inspect the ledger');
+      this.unreceipted.push(batch);
+      this.persist(); // Accepted evidence is durable BEFORE attempting ledger writes.
+      if (this.appendDeliveryReceipt(batch, false)) this.unreceipted.splice(this.unreceipted.indexOf(batch), 1);
+      else this.scheduleReceiptRetry();
+      this.prunePending();
+    }
     if (this.pendingRotationAdvance !== null) {
       this.attentionRotation = { ...this.pendingRotationAdvance };
       this.pendingRotationAdvance = null;
@@ -931,16 +1084,17 @@ export class GruAwareness {
     if (this.activeWakeIds === null) return false;
     const stillEligible: string[] = [];
     for (const id of this.activeWakeIds) {
-      const row = this.ledger.getNotification(id);
+      const row = this.attentionRow(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null || this.isReceiptNotification(row.agentId)) {
         continue;
       }
+      if (!this.mailboxWakeEligible(id, row)) continue;
       // The full candidate gate re-runs here minus dedupe (the batch
       // members are claimed by design): a row re-triaged below the
       // severity floor or out of wake routing during the spawn must not
       // ride the prompt (issue #219 review, admission gate).
       const gateSkip = this.wakePolicy.gate({
-        id: row.id,
+        id: this.rowKey(row),
         incidentKey: incidentKeyOf(row),
         routing: row.routing,
         severity: row.severity,
@@ -990,9 +1144,8 @@ export class GruAwareness {
   noteWakeOutcome(ok: boolean, detail?: string, injection?: AwarenessInjection): void {
     if (this.disposed) return;
     const active = this.activeWakeIds ?? [];
-    const delivered = active.filter((id) => injection?.notificationIds?.includes(id));
+    const delivered = active.filter((id) => (injection?.attentionKeys ?? injection?.notificationIds)?.includes(id));
     this.activeWakeIds = null;
-    this.prunePending();
     if (ok && delivered.length > 0) {
       const at = this.now();
       // Park-FIRST protocol (issue #219 review): the batch leaves pending
@@ -1000,24 +1153,21 @@ export class GruAwareness {
       // every crash window is safe — a delivered turn can never re-prompt
       // (the ids are claimed), and a failed append costs only the owed
       // receipt, which the flush retry and boot reconciliation settle.
-      const batch = { id: randomUUID(), ids: delivered, at };
-      for (const id of delivered) {
-        // NOTE: wakeFailures deliberately survives acceptance (issue #115):
-        // acceptance fires at turn START, before the turn body can fail —
-        // clearing here would reset the bounded-retry count every cycle.
-        // The debt dies when the row resolves (onBusEvent), when pruning
-        // drops a closed row, or when the escalation spends it.
-        this.pendingWakeIds.delete(id);
-      }
-      this.claimDeliveredBatch(batch);
+      const captures = (injection?.mailboxDeliveries ?? []).filter((delivery) => delivered.includes(MAILBOX_KEY_PREFIX + delivery.deliveryKey));
+      const notificationIds = [...new Set([
+        ...delivered.filter((id) => !id.startsWith(MAILBOX_KEY_PREFIX)).map((id) => this.attentionRow(id)?.id ?? id),
+        ...captures.flatMap((delivery) => delivery.notificationIds),
+      ])];
+      const batch: DeliveryDebt = { id: randomUUID(), ids: delivered, at, source: 'wake', deliveries: captures, notificationIds };
       if (this.unreceipted.length >= MAX_UNRECEIPTED_BATCHES) {
         throw new Error(
           `gru wake receipt appends keep failing — ${this.unreceipted.length} unreconciled wake batches exceed the sidecar cap; inspect the ledger`,
         );
       }
       this.unreceipted.push(batch);
-      this.persistWakeState();
-      if (this.appendWakeReceipt(batch, false)) {
+      this.claimDeliveredBatch(batch); // Captured identities, never a fresh source read.
+      this.persist(); // Fail loudly if the accepted evidence cannot be parked durably.
+      if (this.appendDeliveryReceipt(batch, false)) {
         this.unreceipted.splice(this.unreceipted.indexOf(batch), 1);
       } else {
         this.log('error', 'gru wake receipt append failed — parked as unreceipted, retrying', {
@@ -1045,12 +1195,25 @@ export class GruAwareness {
       // one unit of decision: the delivered wake batch. Fully isolated:
       // a failure here must never touch the wake path.
       try {
-        this.recordEscalationTriageShadow(delivered);
+        this.recordEscalationTriageShadow(notificationIds);
       } catch (error) {
         this.log('error', 'escalation-triage shadow ask setup failed; wake behavior unchanged', { error: String(error) });
       }
-      this.flushPendingWakes();
+      try {
+        this.prunePending();
+        this.flushPendingWakes();
+      } catch (error) {
+        this.log('error', 'gru accepted wake preserved; current-source reconciliation unavailable', { error: String(error) });
+      }
       return;
+    }
+    this.prunePending();
+    if (this.mailbox !== null) {
+      for (const id of active) {
+        if (!id.startsWith(MAILBOX_KEY_PREFIX) || !this.pendingWakeIds.has(id)) continue;
+        this.pendingWakeIds.delete(id);
+        this.pendingWakeIds.add(id);
+      }
     }
     const reason = detail !== undefined && detail !== '' ? detail : 'no alert context delivered';
     this.wakePolicy.attempted(this.now());
@@ -1074,24 +1237,29 @@ export class GruAwareness {
    * machines — the escalation is a notice, not a breaker). */
   noteWakeTurnFailure(detail: string, injection: AwarenessInjection): void {
     if (this.disposed) return;
-    const ids = injection.notificationIds ?? [];
+    const ids = injection.attentionKeys ?? injection.notificationIds ?? [];
     this.recordWakeFailure(detail, ids);
     const retried: string[] = [];
     const escalated: string[] = [];
     for (const id of ids) {
-      const count = (this.wakeFailures.get(id) ?? 0) + 1;
+      const capture = injection.mailboxDeliveries?.find((delivery) => MAILBOX_KEY_PREFIX + delivery.deliveryKey === id);
+      const failureKey = capture === undefined ? this.failureKey(id) : FAILURE_BASIS_PREFIX + JSON.stringify([capture.id, capture.basis]);
+      const count = (this.wakeFailures.get(failureKey) ?? 0) + 1;
       if (count > WAKE_FAILURE_RETRIES) {
-        this.wakeFailures.delete(id);
+        this.wakeFailures.set(failureKey, count);
         escalated.push(id);
       } else {
-        this.wakeFailures.set(id, count);
+        this.wakeFailures.set(failureKey, count);
         retried.push(id);
       }
     }
+    // Exhausted-only batches also need a durable count: acceptance already
+    // removed their pending IDs, so escalation may perform no other write.
+    this.persistWakeState();
     if (retried.length > 0) {
       for (const id of retried) {
         this.pendingWakeIds.add(id);
-        const row = this.ledger.getNotification(id);
+        const row = this.attentionRow(id);
         this.wakePolicy.forget(id);
         if (row !== null) this.wakePolicy.forgetIncident(incidentKeyOf(row));
       }
@@ -1104,7 +1272,7 @@ export class GruAwareness {
     // group onto one owner stop, never one per notification id.
     const byIncident = new Map<string, string[]>();
     for (const id of escalated) {
-      const row = this.ledger.getNotification(id);
+      const row = this.attentionRow(id);
       const key = row === null ? `\u0000id:${id}` : incidentKeyOf(row);
       const group = byIncident.get(key) ?? [];
       group.push(id);
@@ -1113,18 +1281,30 @@ export class GruAwareness {
     for (const [key, group] of byIncident) this.escalateFailedWake(key, group, detail);
   }
 
+  noteWakeDeferred(reason: 'busy'): void {
+    for (const id of this.activeWakeIds ?? []) {
+      if (!id.startsWith(MAILBOX_KEY_PREFIX)) continue;
+      const row = this.attentionRow(id);
+      if (row !== null) this.recordDeferred({ id, incidentKey: row.kind, routing: row.routing, severity: row.severity }, reason, null);
+    }
+  }
+
   /** Unsafe recovery cannot open a Gru turn. Preserve the pending batch,
    * record the failure and put an explicit needs-owner stop on the bell. */
   noteWakeBlocked(reason: string): void {
     if (this.disposed) return;
     const active = this.activeWakeIds ?? [];
     for (const id of active) {
-      const row = this.ledger.getNotification(id);
+      const row = this.attentionRow(id);
       if (row?.routing !== 'action-required' || row.ackedAt !== null || row.resolvedAt !== null) continue;
-      const escalationId = `gru-wake-blocked:${id}`;
+      // Internal attention domains never enter SQLite TEXT identities. Keep
+      // mailbox escalations disjoint from the legacy genuine-notification IDs.
+      const mailbox = id.startsWith(MAILBOX_KEY_PREFIX);
+      const escalationId = `${mailbox ? 'gru-wake-blocked-mailbox' : 'gru-wake-blocked'}:${row.id}`;
+      const kind = `${mailbox ? 'gru.wake-blocked-mailbox' : 'gru.wake-blocked'}.${row.id}`;
       try {
         const existing = this.ledger.getNotification(escalationId);
-        if (existing !== null && (existing.kind !== `gru.wake-blocked.${id}` || existing.routing !== 'needs-owner')) {
+        if (existing !== null && (existing.kind !== kind || existing.routing !== 'needs-owner')) {
           throw new Error(`Gru blocked-wake ID ${escalationId} is already assigned to another notification`);
         }
         // Open-incident deduplication: while ANY row of this incident's
@@ -1133,16 +1313,16 @@ export class GruAwareness {
         // machine alert would otherwise never re-raise its debt to the
         // bell). UNCAPPED exact-kind lookup: a page window would miss an
         // old open stop behind newer notifications and duplicate it.
-        const incidentKind = `gru.wake-blocked.${id}`;
+        const incidentKind = kind;
         const open = this.ledger.findNotificationByKindAndRouting(incidentKind, 'needs-owner', 'unacked');
         if (open === null) {
           const posted = this.ledger.recordNotification({
             id: existing === null ? escalationId : this.nextEscalationId(escalationId),
-            kind: `gru.wake-blocked.${id}`,
+            kind,
             routing: 'needs-owner',
             severity: 'error',
             title: `Gru wake blocked: ${row.title}`,
-            detail: `Notification ${id} could not reach Gru (${reason}). Restart the service to recover chat safely; the machine alert remains pending for retry.`,
+            detail: `${mailbox ? 'Mailbox delivery' : 'Notification'} ${row.id} could not reach Gru (${reason}). Restart the service to recover chat safely; the machine alert remains pending for retry.`,
           });
           try { this.onFollowUpPosted(posted); } catch (error) {
             this.log('error', 'gru blocked-wake chat notice failed', { notification_id: id, error: String(error) });
@@ -1183,7 +1363,7 @@ export class GruAwareness {
    * is retried until the ledger takes it. */
   private escalateFailedWake(incidentKey: string, ids: readonly string[], detail: string): void {
     const open = ids
-      .map((id) => ({ id, row: this.ledger.getNotification(id) }))
+      .map((id) => ({ id, row: this.attentionRow(id) }))
       .filter(({ row }) => row !== null && row.ackedAt === null && row.resolvedAt === null)
       .map(({ id, row }) => ({ id, row: row as NotificationRecord }));
     if (open.length === 0) return;
@@ -1203,7 +1383,7 @@ export class GruAwareness {
     const kind = `gru.wake-failed-escalation.${sanitized}`;
     const idList = open.map(({ id }) => id).join(', ');
     try {
-      const existing = this.ledger.getNotification(escalationId);
+      const existing = this.attentionRow(escalationId);
       if (existing !== null && (existing.kind !== kind || existing.routing !== 'needs-owner')) {
         throw new Error(`Gru failed-wake escalation id ${escalationId} is already assigned to another notification`);
       }
@@ -1237,7 +1417,7 @@ export class GruAwareness {
         error: String(error),
       });
       for (const { id, row } of open) {
-        this.wakeFailures.delete(id);
+        this.wakeFailures.delete(this.failureKey(id));
         this.pendingWakeIds.add(id);
         this.wakePolicy.forget(id);
         this.wakePolicy.forgetIncident(incidentKeyOf(row));
@@ -1248,28 +1428,45 @@ export class GruAwareness {
     }
   }
 
-  /** Issue #112: append ONE wake receipt. Never throws — the boolean tells
-   * the caller whether the ledger took it. `reconciled` marks a boot-time
+  /** Append accepted mailbox evidence and, for autonomous turns, ONE wake
+   * receipt. Never throws — the boolean tells the caller whether the ledger
+   * took it. `reconciled` marks a boot-time
    * repair so the board can tell the two apart. */
-  private appendWakeReceipt(
-    batch: { readonly id?: string; readonly ids: readonly string[]; readonly at: number },
-    reconciled: boolean,
-  ): boolean {
+  private appendDeliveryReceipt(batch: Omit<DeliveryDebt, 'id'> & { readonly id?: string }, reconciled: boolean): boolean {
     try {
-      this.ledger.appendCustomEvent({
-        kind: 'gru.wake',
-        payload: {
-          notification_ids: batch.ids,
-          count: batch.ids.length,
-          mode: this.wakeMode,
-          ...(batch.id !== undefined ? { wake_id: batch.id } : {}),
-          ...(reconciled ? { reconciled: true } : {}),
-          wake_at: new Date(batch.at).toISOString(),
-        },
-      });
+      const source = batch.source ?? 'wake';
+      let deliveries = batch.deliveries ?? [];
+      if (batch.deliveries !== undefined) {
+        this.mailbox?.receiptCaptured(batch.deliveries, source, batch.id ?? `legacy-${batch.at}`, new Date(batch.at).toISOString());
+      } else if (this.mailbox !== null) {
+        deliveries = batch.ids.flatMap((id) => {
+          const bare = id.startsWith(MAILBOX_KEY_PREFIX) ? id.slice(MAILBOX_KEY_PREFIX.length) : id;
+          if (!id.startsWith(MAILBOX_KEY_PREFIX) && !bare.startsWith('mailbox:')) return [];
+          // A legacy prefix-bearing genuine row needs explicit source-domain linkage; a bare key alone cannot prove it.
+          if (this.ledger.getNotification(bare) !== null) {
+            if (batch.notificationIds?.includes(bare)) return [];
+            throw new MailboxDeliveryRecoveryError(batch.id ?? 'legacy', bare);
+          }
+          const row = this.mailbox!.getAttentionRow(bare);
+          if (row === null) throw new MailboxDeliveryRecoveryError(batch.id ?? 'legacy', bare);
+          return this.mailbox!.captureDelivery([row]);
+        });
+        this.mailbox.receiptCaptured(deliveries, source, batch.id ?? `legacy-${batch.at}`, new Date(batch.at).toISOString());
+      }
+      if (source === 'chat') return true;
+      const mailboxKeys = batch.deliveries?.map((delivery) => delivery.deliveryKey) ?? batch.ids.filter((id) => id.startsWith(MAILBOX_KEY_PREFIX)).map((id) => id.slice(MAILBOX_KEY_PREFIX.length));
+      const notificationIds = batch.notificationIds ?? [...new Set([...batch.ids.filter((id) => !id.startsWith(MAILBOX_KEY_PREFIX)), ...deliveries.flatMap((delivery) => delivery.notificationIds)])];
+      this.ledger.appendCustomEvent({ kind: 'gru.wake', payload: {
+        notification_ids: notificationIds,
+        ...(mailboxKeys.length > 0 ? { mailbox_keys: mailboxKeys, mailbox_count: mailboxKeys.length, notification_count: notificationIds.length } : {}),
+        attention_keys: batch.ids,
+        count: batch.ids.length, mode: this.wakeMode,
+        ...(batch.id !== undefined ? { wake_id: batch.id } : {}),
+        ...(reconciled ? { reconciled: true } : {}), wake_at: new Date(batch.at).toISOString(),
+      } });
       return true;
     } catch (error) {
-      this.log('error', 'gru wake ledger event failed', { error: String(error) });
+      this.log('error', 'gru accepted delivery receipt failed', { error: String(error) });
       return false;
     }
   }
@@ -1293,8 +1490,8 @@ export class GruAwareness {
     if (this.disposed) return;
     let changed = false;
     while (this.unreceipted.length > 0) {
-      const batch = this.unreceipted[0] as { readonly id?: string; readonly ids: readonly string[]; readonly at: number };
-      if (!this.appendWakeReceipt(batch, false)) break;
+      const batch = this.unreceipted[0]!;
+      if (!this.appendDeliveryReceipt(batch, false)) break;
       this.unreceipted.shift();
       this.claimDeliveredBatch(batch);
       changed = true;
@@ -1317,28 +1514,32 @@ export class GruAwareness {
     );
     let changed = false;
     while (this.unreceipted.length > 0) {
-      const batch = this.unreceipted[0] as { readonly id?: string; readonly ids: readonly string[]; readonly at: number };
+      const batch = this.unreceipted[0]!;
       const delivered = batch.id !== undefined && receiptIds.has(batch.id);
-      if (!delivered && !this.appendWakeReceipt(batch, true)) break;
+      if ((batch.source === 'chat' || !delivered) && !this.appendDeliveryReceipt(batch, true)) break;
       this.unreceipted.shift();
       this.claimDeliveredBatch(batch);
       changed = true;
     }
     if (changed) this.persistWakeState();
+    if (this.unreceipted.length > 0) this.scheduleReceiptRetry();
   }
 
   /** Claim a delivered batch in the dedupe state (ids + incident keys).
    * Idempotent — parking re-claims what the receipt success would claim.
    * wakeFailures survives here too (see noteWakeOutcome). */
-  private claimDeliveredBatch(batch: { readonly ids: readonly string[]; readonly at: number }): void {
+  private claimDeliveredBatch(batch: Omit<DeliveryDebt, 'id'>): void {
+    if (batch.source === 'chat') return;
     for (const id of batch.ids) {
       this.pendingWakeIds.delete(id);
     }
-    const keys = batch.ids
-      .map((id) => this.ledger.getNotification(id))
-      .filter((row): row is NotificationRecord => row !== null)
-      .map((row) => incidentKeyOf(row));
-    this.wakePolicy.fired(batch.ids, batch.at, keys);
+    const keys = batch.ids.flatMap((id) => {
+      const capture = batch.deliveries?.find((delivery) => MAILBOX_KEY_PREFIX + delivery.deliveryKey === id);
+      if (capture !== undefined) return [capture.deliveryKey];
+      const row = this.attentionRow(id);
+      return row === null ? [] : [incidentKeyOf(row)];
+    });
+    this.wakePolicy.fired(batch.ids, Math.max(this.wakePolicy.snapshot().lastFiredAt ?? 0, batch.at), keys);
   }
 
   /** The payloads of `gru.wake` events at/after `sinceMs` (issue #112
@@ -1352,9 +1553,11 @@ export class GruAwareness {
       for (const event of page) {
         cursor = event.seq;
         if (event.ts < sinceIso) continue;
-        const ids = payloadOf(event)['notification_ids'];
+        const payload = payloadOf(event);
+        const ids = payload['attention_keys'] ?? (Array.isArray(payload['mailbox_keys']) && Array.isArray(payload['notification_ids'])
+          ? [...payload['notification_ids'], ...payload['mailbox_keys'].map((id) => MAILBOX_KEY_PREFIX + String(id))] : payload['notification_ids']);
         if (Array.isArray(ids) && ids.every((id) => typeof id === 'string' && id !== '')) {
-          receipts.push(payloadOf(event));
+          receipts.push({ ...payloadOf(event), notification_ids: ids });
         }
       }
       if (page.length < 500) break;
@@ -1363,8 +1566,8 @@ export class GruAwareness {
   }
 
   private render(
-    actionNotes: readonly { id: string; line: string }[],
-    receiptNotes: readonly { id: string; line: string }[],
+    actionNotes: readonly { id: string; displayId: string; line: string; mailbox: boolean }[],
+    receiptNotes: readonly { id: string; displayId: string; line: string; mailbox: boolean }[],
     digestLines: readonly string[],
     overflow: boolean,
     morning: readonly string[] | null,
@@ -1374,12 +1577,13 @@ export class GruAwareness {
     let bytes = Buffer.byteLength(AWARENESS_BLOCK_HEADER, 'utf8');
     let truncated = overflow;
     let exhausted = false;
-    const push = (line: string, force = false): boolean => {
+    const push = (line: string, force = false, mailbox = false): boolean => {
       if (exhausted && !force) return false;
-      const sized = clampLine(line, this.limits.maxLineChars);
+      const sized = clampLine(line, mailbox ? Number.MAX_SAFE_INTEGER : this.limits.maxLineChars);
       const size = Buffer.byteLength(sized, 'utf8') + 1; // newline
       if (bytes + size > this.limits.maxBytes) {
         truncated = true;
+        if (mailbox) return false; // another item can still fit; never let one large thread hide the tail
         exhausted = true;
         return false;
       }
@@ -1388,16 +1592,16 @@ export class GruAwareness {
       return true;
     };
 
-    if (actionNotes.length > 0 && push(this.wakeMode === 'all' ? 'Notifications (unacknowledged):' : 'Action required (unacknowledged):')) {
+    if (actionNotes.length > 0 && push(this.mailbox !== null ? 'FOR GRU mailbox (delivery is receipt only; operational authority unchanged):' : this.wakeMode === 'all' ? 'Notifications (unacknowledged):' : 'Action required (unacknowledged):')) {
       for (const note of actionNotes) {
         // Never claim an ID whose identifier was clipped by the line/byte
         // bounds. A truncated title is fine; an invisible ID is not.
-        if (push(note.line) && parts.at(-1)?.includes(`[${note.id}]`)) ids.push(note.id);
+        if (push(note.line, false, note.mailbox) && parts.at(-1)?.includes(`[${note.displayId}]`)) ids.push(note.id);
       }
     }
     if (receiptNotes.length > 0 && push('Closed receipts (no action required; kept for reference):')) {
       for (const note of receiptNotes) {
-        if (push(note.line) && parts.at(-1)?.includes(`[${note.id}]`)) ids.push(note.id);
+        if (push(note.line, false, note.mailbox) && parts.at(-1)?.includes(`[${note.displayId}]`)) ids.push(note.id);
       }
     }
     if (morning !== null) for (const line of morning) push(line);
@@ -1467,6 +1671,12 @@ export class GruAwareness {
     readonly noLiveAdvance: number;
   } {
     const pageSize = this.limits.maxActionNotes;
+    if (this.mailbox !== null) {
+      let offset = this.attentionRotation.machine;
+      let page = this.mailbox.attentionRows(pageSize, offset, true);
+      if (page.length === 0 && offset > 0) { offset = 0; page = this.mailbox.attentionRows(pageSize, 0, true); }
+      return { offset, live: page, receiptRows: [], noLiveAdvance: 0 };
+    }
     // Overfetch so receipts cannot crowd live rows out of the page; each
     // side is then sliced to the block's bounded slots.
     const fetchLimit = Math.max(pageSize * 4, 16);
@@ -1494,22 +1704,24 @@ export class GruAwareness {
    * Rotation advance from what a delivered block actually rendered (GH-109):
    * move to the first composed row the block did NOT render — rows the block
    * closed mid-flight count as consumed — or past the last composed row when
-   * everything rendered. Rows skipped by slot or byte caps therefore lead the
-   * next block; no open row is ever passed over twice, and a block whose
-   * first candidate stayed invisible leaves the offset untouched.
+   * everything rendered. Fully attempted oversized mailbox notes receive an
+   * explicit budget deferral and rotate too, without receiving a coverage
+   * receipt. Slot-skipped rows and ordinary byte-capped notes lead the next
+   * block. The advance becomes durable only when the block is accepted.
    */
   private advancePastRendered(
     offset: number,
     candidates: readonly { readonly id: string; readonly position: number }[],
     renderedIds: ReadonlySet<string>,
+    attemptedMailboxIds: ReadonlySet<string> = new Set(),
   ): number {
     let lastConsumed = -1;
     for (const candidate of candidates) {
-      if (renderedIds.has(candidate.id)) {
+      if (renderedIds.has(candidate.id) || attemptedMailboxIds.has(candidate.id)) {
         lastConsumed = candidate.position;
         continue;
       }
-      const row = this.ledger.getNotification(candidate.id);
+      const row = this.attentionRow(candidate.id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) {
         lastConsumed = candidate.position;
         continue;
@@ -1564,7 +1776,7 @@ export class GruAwareness {
         version: 2,
         ...this.wakePolicy.snapshot(),
         pending: [...this.pendingWakeIds],
-        ...(this.unreceipted.length > 0 ? { unreceipted: this.unreceipted.map((batch) => ({ id: batch.id, ids: [...batch.ids], at: batch.at })) } : {}),
+        ...(this.unreceipted.length > 0 ? { unreceipted: this.unreceipted.map((batch) => ({ ...batch, ids: [...batch.ids] })) } : {}),
         ...(this.wakeFailures.size > 0 ? { wakeFailures: Object.fromEntries(this.wakeFailures) } : {}),
       },
       digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq },
@@ -1591,27 +1803,38 @@ export class GruAwareness {
   private onBusEvent(event: BusEvent): void {
     if (this.disposed) return;
     if (event.kind === 'notification.acked' || event.kind === 'notification.resolved') {
+      if (this.mailbox !== null) this.queueMailboxReconciliation();
       const closedId = textOf(payloadOf(event)['id']);
       if (closedId !== null) {
         const row = this.ledger.getNotification(closedId);
+        const closedKey = row === null ? closedId : this.rowKey(row);
+        this.pendingWakeIds.delete(closedKey);
         // Issue #115: a closed row needs no failure bookkeeping, and its
         // recorded deferrals/escalations must not re-fire stale guards.
         // (Mutate BEFORE the persist so the sidecar never keeps a spent debt.)
-        const hadFailure = this.wakeFailures.delete(closedId);
+        const hadFailure = this.wakeFailures.delete(closedKey);
         for (const [key, entry] of this.deferredRechecks) {
-          if (entry.notificationId === closedId) this.deferredRechecks.delete(key);
+          if (entry.notificationId === closedKey) this.deferredRechecks.delete(key);
         }
-        const wasDelivered = this.wakePolicy.forget(closedId);
+        const wasDelivered = this.wakePolicy.forget(closedKey);
         if (wasDelivered || hadFailure) this.persistWakeState();
         // Close any historical timeout follow-up on explicit Gru disposition.
         if (row?.routing === 'action-required') {
-          const followUp = this.ledger.getNotification(this.followUpId(closedId));
+          const followUp = this.attentionRow(this.followUpId(closedId));
           if (followUp?.kind === this.followUpKind(closedId)) {
             this.ledger.resolveNotificationById(followUp.id, 'gru-disposition');
           }
         }
       }
       return;
+    }
+    if (this.mailbox !== null && /^(job\.|round\.|lens\.|agent\.|notification\.|decision\.|obligation\.|directive\.|silas\.directive-|supervision\.|mailbox\.disposition|github\.)/.test(event.kind)) {
+      this.queueMailboxReconciliation();
+      if (event.kind.startsWith('notification.')) {
+        const id = textOf(payloadOf(event)['id']);
+        const row = id === null ? null : this.ledger.getNotification(id);
+        if (this.wakeMode !== 'all' || row?.routing === 'action-required') return;
+      }
     }
     if (this.wakeMode === 'never') return;
     if (event.kind !== 'notification.created' && event.kind !== 'notification.triaged') return;
@@ -1628,7 +1851,7 @@ export class GruAwareness {
       return;
     }
     this.considerCandidate({
-      id: row.id,
+      id: this.rowKey(row),
       incidentKey: incidentKeyOf(row),
       routing: row.routing,
       severity: row.severity,
@@ -1733,6 +1956,8 @@ export class GruAwareness {
       });
       return { action: 'skip' };
     }
+    const current = this.attentionRow(candidate.id);
+    if (current !== null && !this.mailboxWakeEligible(candidate.id, current)) return { action: 'skip' };
     const decision = this.wakePolicy.decide(candidate, this.now());
     if (decision.action === 'skip') {
       if (decision.reason === 'duplicate-incident') {
@@ -1740,7 +1965,7 @@ export class GruAwareness {
         // provider wall for the same subject is a NEW wake obligation
         // (its predecessor row was resolved to re-arm it). ID dedupe
         // still applies to the same open row.
-        const floorRow = this.ledger.getNotification(candidate.id);
+        const floorRow = this.attentionRow(candidate.id);
         if (floorRow !== null && isHardFloorRow(floorRow)) {
           return { action: 'admit', decision: { action: 'wake' } as WakeDecision };
         }
@@ -1757,7 +1982,7 @@ export class GruAwareness {
       });
       return { action: 'skip' };
     }
-    const row = this.ledger.getNotification(candidate.id);
+    const row = this.attentionRow(candidate.id);
     const covering = row !== null ? this.coverageFor(row) : null;
     if (covering !== null) {
       this.deferCoveredWake(row as NotificationRecord, covering);
@@ -1792,6 +2017,7 @@ export class GruAwareness {
    * when the row may wake — deferral disabled, a hard floor, or no active
    * basis-matched decision covers its (subject, signal). */
   private coverageFor(row: NotificationRecord): DecisionRecord | null {
+    if (this.mailbox?.captureRow(row) != null) return null; // exact-basis mailbox dispositions own admission, wildcard holds remain restrictions
     if (!this.coveredDeferralEnabled) return null;
     if (isHardFloorRow(row)) return null;
     try {
@@ -1832,7 +2058,7 @@ export class GruAwareness {
     this.deferredRechecks.set(incidentKeyOf(row), {
       atMs: Math.max(recheckAtMs, this.now() + 1),
       decisionId: covering.id,
-      notificationId: row.id,
+      notificationId: this.rowKey(row),
     });
     this.log('info', 'gru wake deferred — covered by an active decision', {
       notification_id: row.id,
@@ -1851,7 +2077,7 @@ export class GruAwareness {
    * scan is the durable backstop. */
   private recordDeferred(
     candidate: Pick<WakeCandidate, 'id' | 'incidentKey' | 'routing' | 'severity'>,
-    reason: 'covered' | 'duplicate' | 'failed',
+    reason: 'covered' | 'duplicate' | 'failed' | 'mode' | 'routing' | 'severity' | 'rate' | 'quiet' | 'busy' | 'context-budget',
     decisionId: string | null,
     recheckAt?: string,
   ): void {
@@ -1924,11 +2150,11 @@ export class GruAwareness {
     const due = [...this.deferredRechecks.entries()].filter(([, entry]) => entry.atMs <= now);
     for (const [key, entry] of due) {
       this.deferredRechecks.delete(key);
-      const row = this.ledger.getNotification(entry.notificationId);
+      const row = this.attentionRow(entry.notificationId);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) continue;
       if (this.isReceiptNotification(row.agentId)) continue;
       this.considerCandidate({
-        id: row.id,
+        id: this.rowKey(row),
         incidentKey: incidentKeyOf(row),
         routing: row.routing,
         severity: row.severity,
@@ -1961,21 +2187,23 @@ export class GruAwareness {
       const page = this.ledger.listEventsAfter(cursor, { kinds: ['gru.wake'], limit: 500 });
       for (const event of page) {
         cursor = event.seq;
-        const ids = payloadOf(event)['notification_ids'];
+        const payload = payloadOf(event);
+        const ids = payload['attention_keys'] ?? (Array.isArray(payload['mailbox_keys']) && Array.isArray(payload['notification_ids'])
+          ? [...payload['notification_ids'], ...payload['mailbox_keys'].map((id) => MAILBOX_KEY_PREFIX + String(id))] : payload['notification_ids']);
         if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string' && id !== '')) continue;
         const missing = (ids as string[]).filter((id) => {
           // Issue #115: an id in bounded failed-turn retry is unclaimed ON
           // PURPOSE while it waits in pending — its receipt records the
           // failed turn, the retry still owes an autonomous attempt. A
           // debt WITHOUT a pending id is a recovered turn; claim normally.
-          if (this.wakeFailures.has(id) && this.pendingWakeIds.has(id)) return false;
-          const row = this.ledger.getNotification(id);
+          if (this.wakeFailures.has(this.failureKey(id)) && this.pendingWakeIds.has(id)) return false;
+          const row = this.attentionRow(id);
           return row !== null && row.ackedAt === null && row.resolvedAt === null && !known.has(id);
         });
         if (missing.length === 0) continue;
         for (const id of missing) known.add(id);
         const keys = missing
-          .map((id) => this.ledger.getNotification(id))
+          .map((id) => this.attentionRow(id))
           .filter((row): row is NotificationRecord => row !== null)
           .map((row) => incidentKeyOf(row));
         this.wakePolicy.fired(missing, Math.max(this.wakePolicy.snapshot().lastFiredAt ?? 0, Date.parse(event.ts) || 0), keys);
@@ -1992,18 +2220,37 @@ export class GruAwareness {
    * whose incident is a duplicate or whose subject a decision covers
    * defers exactly as a fresh bus-event candidate would. */
   private seedBacklog(): void {
-    if (this.wakeMode === 'never' || this.disposed) return;
+    if (this.disposed || (this.wakeMode === 'never' && this.mailbox === null)) return;
     let seeded = false;
     // Keep every still-open receipt (no 256-ID eviction), but discard
     // terminal IDs from pre-upgrade state or a missed close event.
     for (const id of this.wakePolicy.snapshot().woken) {
-      const row = this.ledger.getNotification(id);
+      const row = this.attentionRow(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) {
         this.wakePolicy.forget(id);
         seeded = true;
       }
     }
+    const liveFailureKeys = new Set(this.mailbox?.snapshot().items.filter((item) => item.state !== 'resolved')
+      .map((item) => FAILURE_BASIS_PREFIX + JSON.stringify([item.id, item.basis])) ?? []);
+    for (const key of this.wakeFailures.keys()) {
+      const row = key.startsWith(FAILURE_BASIS_PREFIX) ? null : this.attentionRow(key);
+      if (key.startsWith(FAILURE_BASIS_PREFIX) ? !liveFailureKeys.has(key) : row === null || row.ackedAt !== null || row.resolvedAt !== null) {
+        this.wakeFailures.delete(key);
+        seeded = true;
+      }
+    }
     const before = this.pendingWakeIds.size;
+    if (this.mailbox !== null) {
+      for (const row of this.mailbox.admissionRows(MAX_BACKLOG_SEED)) {
+        const candidate = { id: this.rowKey(row), incidentKey: row.kind, routing: row.routing, severity: row.severity };
+        if (this.admitPath(candidate).action === 'admit') this.pendingWakeIds.add(this.rowKey(row));
+        else if (this.wakePolicy.gate(candidate) !== null) this.recordMailboxAdmissionDeferral(candidate);
+      }
+      if (seeded || this.pendingWakeIds.size !== before) this.persistWakeState();
+      this.flushPendingWakes();
+      if (this.wakeMode !== 'all') return;
+    }
     try {
       // Filter in SQL BEFORE LIMIT in machine-only mode and page every
       // matching row. Unrelated owner/FYI rows may outnumber this page.
@@ -2019,15 +2266,16 @@ export class GruAwareness {
           if (this.pendingWakeIds.delete(id)) seeded = true;
         }
         for (const row of live) {
+          if (this.mailbox !== null && row.routing === 'action-required') continue;
           const candidate = {
-            id: row.id,
+            id: this.rowKey(row),
             incidentKey: incidentKeyOf(row),
             routing: row.routing,
             severity: row.severity,
           } as const;
           // ONE coalesced backlog wake (the migration rule): admission
           // gates run per row, the flush happens once after the scan.
-          if (this.admitPath(candidate).action === 'admit') this.pendingWakeIds.add(row.id);
+          if (this.admitPath(candidate).action === 'admit') this.pendingWakeIds.add(this.rowKey(row));
         }
         if (rows.length < MAX_BACKLOG_SEED) break;
       }
@@ -2037,6 +2285,11 @@ export class GruAwareness {
     }
     if (seeded || this.pendingWakeIds.size !== before) this.persistWakeState();
     this.flushPendingWakes();
+  }
+
+  private recordMailboxAdmissionDeferral(candidate: WakeCandidate): void {
+    const reason = this.wakePolicy.gate(candidate);
+    if (reason === 'mode' || reason === 'routing' || reason === 'severity') this.recordDeferred(candidate, reason, null);
   }
 
   /** The ONE receipt rule for every Gru-facing reader (owner decision D1):
@@ -2094,6 +2347,10 @@ export class GruAwareness {
     }
     const decision = this.wakePolicy.scheduleDecision(this.now());
     if (decision.action === 'defer') {
+      for (const id of this.pendingWakeIds) {
+        const row = this.attentionRow(id);
+        if (row !== null && id.startsWith(MAILBOX_KEY_PREFIX)) this.recordDeferred({ id, incidentKey: row.kind, routing: row.routing, severity: row.severity }, decision.reason, null, new Date(decision.retryAtMs).toISOString());
+      }
       this.scheduleWake(decision.retryAtMs, decision.reason);
       return;
     }
@@ -2119,13 +2376,13 @@ export class GruAwareness {
   private prunePending(): void {
     let changed = false;
     for (const id of this.pendingWakeIds) {
-      const row = this.ledger.getNotification(id);
+      const row = this.attentionRow(id);
       const openAndEligible =
-        row !== null && row.ackedAt === null && row.resolvedAt === null &&
+        row !== null && row.ackedAt === null && row.resolvedAt === null && this.mailboxWakeEligible(id, row) &&
         this.wakePolicy.gate({ id, incidentKey: incidentKeyOf(row), routing: row.routing, severity: row.severity }) === null;
       if (openAndEligible && !this.wakePolicy.claimed(id)) continue;
       this.pendingWakeIds.delete(id);
-      this.wakeFailures.delete(id);
+      if (row === null || row.ackedAt !== null || row.resolvedAt !== null) this.wakeFailures.delete(id);
       changed = true;
     }
     if (changed) this.persistWakeState();

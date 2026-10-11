@@ -257,6 +257,8 @@ wake_quiet_hours = ""
 # opening a turn; breakers, provider walls and needs-owner rows always
 # wake. false restores waking for covered incidents.
 wake_defer_covered = true
+# Code-only FOR GRU mailbox recovery; startup/events/ticks use existing wake gates.
+mailbox_reconcile_interval_ms = 300000
 # First delivered block after this much quiet time carries a "while you
 # were away" digest (wakes, actions, merges, staged PRs). 0 disables it.
 morning_digest_gap_ms = 28800000
@@ -470,3 +472,13 @@ built) and the chat socket. `/health` surfaces a summary
 semantics, and the session-store contract, and
 [SUPERVISION.md](./SUPERVISION.md) for the supervision policy the
 `[supervision]` table drives plus the log-rotation knobs.
+
+### Mailbox recovery cadence
+
+`[chat].mailbox_reconcile_interval_ms` is an integer **1–2147483647** in
+milliseconds, default **300000**; larger values are rejected before Node can
+clamp them into a one-millisecond timer. Recovery also runs at startup and on coalesced ledger source
+events. It executes metadata reconciliation only; actual model turns still pass
+all existing Gru admission gates. `notify_wake = "never"` remains passive-only
+and records explicit admission deferrals. Rechecks do not grant owner-stop,
+merge, deployment or restart authority.

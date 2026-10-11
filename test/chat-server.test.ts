@@ -3497,6 +3497,26 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
+  it('G26/G27 receipts passive context at accepted turn start, before a long failing tool settles', async () => {
+    let rejectTurn!: (error: Error) => void;
+    const hold = new Promise<void>((_resolve, reject) => { rejectTurn = reject; });
+    const injection = sampleInjection();
+    const commits: AwarenessInjection[] = [];
+    const harness = await makeHarness({ awareness: { prepare: () => injection, commit: (value) => { commits.push(value); } } });
+    harness.handle.nextHold = hold;
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('inspect mailbox', 'passive');
+      await pollUntil(() => harness.frameLog.hasOpenTurn, 'accepted passive turn');
+      expect(commits).toEqual([injection]);
+      rejectTurn(new Error('tool failed after acceptance'));
+      await done;
+      expect(commits).toEqual([injection]);
+      await client.close();
+    } finally { rejectTurn(new Error('test cleanup')); await harness.close(); }
+  });
+
   it('reports an automatic spawn failure so the awareness policy can retry the same notification', async () => {
     const injection = { ...sampleInjection(), notificationIds: ['machine-id'] };
     const outcomes: { ok: boolean; ids?: readonly string[] }[] = [];
@@ -3522,8 +3542,8 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
-  it('a wake requested mid-turn waits and runs as one trailing turn', async () => {
-    const injection = sampleInjection();
+  it('GH-305 mailbox attention requested mid-turn coalesces into one same-session trailing turn', async () => {
+    const injection = { ...sampleInjection(), text: '[gru awareness] FOR GRU mailbox job:blocked basis=exact state=needs-gru owner=gru', notificationIds: ['mailbox:delivery-key'] };
     let releaseTurn!: () => void;
     const hold = new Promise<void>((resolve) => {
       releaseTurn = resolve;
@@ -3541,6 +3561,8 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
       client.send('busy now', 'm1');
       await pollUntil(() => harness.handle.calls.length === 1, 'user turn live');
       harness.chat.wakeAwareness();
+      harness.chat.wakeAwareness();
+      harness.chat.wakeAwareness();
       // Mid-turn: never steered into the live conversation.
       expect(harness.handle.calls).toHaveLength(1);
       releaseTurn();
@@ -3548,6 +3570,8 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
       await pollUntil(() => harness.handle.calls.length === 2, 'trailing wake turn');
       expect(harness.handle.calls[1]).toMatchObject({ op: 'prompt', owner: 'chat' });
       expect(harness.handle.calls[1]?.text).toContain(AWARENESS_WAKE_INSTRUCTION);
+      expect(harness.handle.calls[1]?.text).toContain('FOR GRU mailbox job:blocked basis=exact state=needs-gru owner=gru');
+      expect(harness.spawnCalls).toHaveLength(1);
       await client.close();
     } finally {
       await harness.close();

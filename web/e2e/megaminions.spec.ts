@@ -1,3 +1,4 @@
+import { withMailboxFixture } from '../src/lib/mailbox-fixture.test-support.js';
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import { isValidSnapshot, parseBoardServerFrame, type BoardSnapshot, type JobView } from '../src/lib/board-protocol.js';
 
@@ -43,7 +44,7 @@ const reviewer = (id: string, title: string, status: string, laneAgeMs: number):
   });
 
 function snapshotOf(jobs: JobView[]): BoardSnapshot {
-  return {
+  return withMailboxFixture({
     repos: [{ name: 'family-proof', jobs }],
     agents: [],
     notifications: [],
@@ -62,7 +63,7 @@ function snapshotOf(jobs: JobView[]): BoardSnapshot {
     unackedActionRequired: 0,
     unackedNeedsOwner: 0,
     wakes: { count: 0, lastAt: null },
-  };
+  });
 }
 
 async function seedBoard(page: Page, snapshot: BoardSnapshot): Promise<Error[]> {

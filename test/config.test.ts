@@ -12,6 +12,10 @@ import {
   resolveSpawnPolicy,
 } from '../src/config.js';
 
+import { GruAwareness } from '../src/chat/awareness.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { LedgerDb } from '../src/ledger/db.js';
+
 const cleanupDirs: string[] = [];
 afterAll(() => {
   for (const dir of cleanupDirs) rmSync(dir, { recursive: true, force: true });
@@ -560,6 +564,7 @@ describe('supervision / logging / chat tables (E7)', () => {
       wakeMinSeverity: 'info',
       wakeQuietHours: null,
       wakeDeferCovered: true,
+      mailboxReconcileIntervalMs: 300_000,
       morningDigestGapMs: 28_800_000,
     });
   });
@@ -608,6 +613,7 @@ describe('supervision / logging / chat tables (E7)', () => {
       wakeMinSeverity: 'error',
       wakeQuietHours: { startMinute: 22 * 60 + 30, endMinute: 7 * 60 + 15 },
       wakeDeferCovered: false,
+      mailboxReconcileIntervalMs: 300_000,
       morningDigestGapMs: 0,
     });
   });
@@ -1093,5 +1099,40 @@ describe('resident config bounds completions (phase 2)', () => {
     expect(() => loadConfig({ GRU_COMMAND_HOME: home })).not.toThrow();
     writeFileSync(file, '[review]\nenabled = true\nmax_concurrent_children = 64\n', 'utf-8');
     expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/max_concurrent_children must be <= 32/);
+  });
+});
+
+
+describe('GH-305 mailbox reconciliation cadence', () => {
+  it('G13 rejects Node timer overflow in config while accepting the exact ceiling', () => {
+    const dir = tmpHome();
+    writeConfig(dir, '[chat]\nmailbox_reconcile_interval_ms = 2147483647\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: dir }).chat.mailboxReconcileIntervalMs).toBe(2_147_483_647);
+    for (const interval of [2_147_483_648, Number.MAX_SAFE_INTEGER]) {
+      writeConfig(dir, `[chat]\nmailbox_reconcile_interval_ms = ${interval}\n`);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: dir })).toThrow(/mailbox_reconcile_interval_ms.*2147483647/);
+    }
+  });
+
+  it('G13 rejects unsafe direct awareness intervals before scheduling', () => {
+    const dir = tmpHome();
+    const db = new LedgerDb(dir);
+    const ledger = new LedgerApi(db.handle);
+    try {
+      for (const interval of [0, -1, 1.5, NaN, Infinity, 2_147_483_648, Number.MAX_SAFE_INTEGER]) {
+        expect(() => new GruAwareness({ dir, ledger, mailboxReconcileIntervalMs: interval })).toThrow(/mailbox reconcile interval/);
+      }
+      const awareness = new GruAwareness({ dir, ledger, mailboxReconcileIntervalMs: 2_147_483_647 });
+      awareness.dispose();
+    } finally { db.close(); }
+  });
+  it('defaults to five minutes and accepts only positive integer intervals', () => {
+    const dir = tmpHome();
+    writeFileSync(join(dir, 'config.toml'), '[chat]\nmailbox_reconcile_interval_ms = 1234\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester').chat.mailboxReconcileIntervalMs).toBe(1234);
+    for (const value of ['0', '-1', '1.5', '"fast"']) {
+      writeFileSync(join(dir, 'config.toml'), `[chat]\nmailbox_reconcile_interval_ms = ${value}\n`);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: dir }, '/home/tester')).toThrow(/mailbox_reconcile_interval_ms/);
+    }
   });
 });

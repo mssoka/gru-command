@@ -3755,3 +3755,6 @@ a.repo-row__name:hover {
     font-size: 15px;
   }
 }
+
+.mailbox-detail { padding: .5rem 1rem; font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
+.mailbox-incident { padding: .75rem; border: 1px solid currentColor; border-radius: .4rem; }
