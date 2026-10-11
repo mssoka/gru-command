@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
 import { Logger } from './logger.js';
@@ -1137,18 +1138,25 @@ async function main(): Promise<number> {
       });
     },
     onSweepPaused: ({ worktree, processes }) => {
+      // Destructive-op confirmation: the sweep waits for an operator to
+      // verify nothing live is rooted there (preserve-before-remove), so it
+      // is needs-owner — never a machine wake. One row per pause, with a
+      // worktree-scoped id so the completed sweep can resolve its own
+      // notice on positive evidence (owner release 2026-10-11); the legacy
+      // exact kind stays registered for rows written before the change.
       notifications.post({
-        kind: 'worktree-sweep-paused',
-        // Destructive-op confirmation: the sweep waits for the OWNER's
-        // ruling (preserve-before-remove), so it is needs-owner — never a
-        // machine wake and never an auto-clear.
+        kind: `worktree-sweep-paused:${worktree.id}:${randomUUID()}`,
         routing: 'needs-owner',
         severity: 'info',
         title: `Worktree sweep paused: live processes in ${worktree.repoName}`,
         detail:
           `${processes.length} process(es) rooted in ${worktree.path} ` +
-          `(pids ${processes.map((p) => p.pid).join(', ')}) — acknowledge to confirm removal`,
+          `(pids ${processes.map((p) => p.pid).join(', ')}) — confirm nothing live is rooted there before completing the sweep`,
       });
+    },
+    onSwept: ({ worktree }) => {
+      // A completed sweep IS the evidence its pause notice asked for.
+      notifications.resolveIncidents(`worktree-sweep-paused:${worktree.id}:`, 'sweep-completed');
     },
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });

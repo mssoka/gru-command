@@ -277,6 +277,136 @@ describe('side-effect permissions across the notification routes', () => {
   });
 });
 
+describe('decision follow-through and cross-route guards', () => {
+  it('resolves a DECIDED owner row with the follow-through record, and refuses an undecided one', () => {
+    const rig = boot();
+    const id = rig.center.post({
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Approve?',
+      detail: 'evidence',
+      decision: decision(),
+    }).id;
+    // Undecided: resolution must never silence the question.
+    expect(() => rig.api.resolveOwnerDecision(id, 'done')).toThrow(NotificationDecisionRefusal);
+    try {
+      rig.api.resolveOwnerDecision(id, 'done');
+      expect.unreachable();
+    } catch (error) {
+      expect((error as NotificationDecisionRefusal).code).toBe('undecided');
+    }
+    expect(rig.api.getNotification(id)).toMatchObject({ resolvedAt: null, decidedAt: null });
+    rig.center.decide(id, 'approve', 'web');
+    const resolved = rig.api.resolveOwnerDecision(id, 'Executed the approved plan');
+    expect(resolved).toMatchObject({ resolvedBy: 'gru', decidedOption: 'approve', ackedAt: null });
+    // Idempotent replay; the decision record survives.
+    expect(rig.api.resolveOwnerDecision(id, 'repeat')).toMatchObject({ decidedOption: 'approve' });
+    const events = rig.api
+      .listEvents({ limit: 100 })
+      .filter((event) => event.kind === 'notification.resolved' && (event.payload as { id?: string }).id === id);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.payload).toMatchObject({ detail: 'Executed the approved plan', owner_decision: 'approve' });
+    // Machine attention keeps its own path.
+    const machine = rig.center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Breaker' });
+    expect(() => rig.api.resolveOwnerDecision(machine.id, 'nope')).toThrow(/use the disposition route/u);
+  });
+
+  it('an ack can never erase a typed owner decision (feed clears stay separate)', () => {
+    const rig = boot();
+    const id = rig.center.post({
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Approve?',
+      detail: 'evidence',
+      decision: decision(),
+    }).id;
+    expect(() => rig.center.ack(id, 'web')).toThrow(/typed owner decision/u);
+    expect(rig.api.getNotification(id)).toMatchObject({ ackedAt: null, resolvedAt: null, decidedAt: null });
+  });
+
+  it('a machine stop deduping onto a surviving legacy owner row re-triages it to Gru instead of stranding it', () => {
+    const rig = boot();
+    // A legacy owner-routed provider wall from before the registry (mimic
+    // the pre-migration state directly: registration happens at boot).
+    const legacy = rig.api.recordNotification({
+      id: 'legacy-owner-wall',
+      kind: 'supervision.provider-wall.a1.authentication_wall',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Legacy owner wall',
+      detail: 'old',
+    });
+    const stop = rig.center.postIncident({
+      kind: 'supervision.provider-wall.a1.authentication_wall',
+      routing: 'action-required',
+      severity: 'error',
+      title: 'Agent stopped',
+      dedupe: 'unacked',
+    });
+    expect(stop.id).toBe(legacy.id);
+    expect(stop.routing).toBe('action-required');
+    expect(stop.detail).toContain('[attention-registry]');
+    expect(rig.api.disposeMachineNotification(legacy.id, 'cause addressed')).toMatchObject({ resolvedBy: 'gru' });
+  });
+
+  it('rejects a non-boolean discussion flag instead of silently rendering option buttons', () => {
+    expect(() => parseNotificationDecision({ ...decision(), discussion: 'yes' })).toThrow(/discussion must be a boolean/u);
+  });
+});
+
+describe('settlement paths for owner-only notices', () => {
+  it('decisions.enforce-gate incidents resolve when a gated call passes (registry-routed owner row)', () => {
+    const rig = boot();
+    const incident = rig.center.postIncident({
+      kind: 'decisions.enforce-gate.triage',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Decision enforce gate blocked for triage',
+      detail: 'missing backtest evidence',
+      dedupe: 'active',
+    });
+    expect(incident.routing).toBe('needs-owner');
+    expect(rig.center.resolveIncidents('decisions.enforce-gate.triage', 'enforce-gate-passed').map((row) => row.id)).toEqual([incident.id]);
+    expect(rig.api.getNotification(incident.id)?.resolvedBy).toBe('enforce-gate-passed');
+  });
+
+  it('worktree-scoped sweep pauses are owner-required, and a completed sweep resolves only that worktree', () => {
+    const rig = boot();
+    const laneA = rig.center.post({
+      kind: 'worktree-sweep-paused:lane-a:pause-1',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Worktree sweep paused: live processes in repo-a',
+      detail: 'lane-a',
+    });
+    const laneB = rig.center.post({
+      kind: 'worktree-sweep-paused:lane-b:pause-1',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Worktree sweep paused: live processes in repo-b',
+      detail: 'lane-b',
+    });
+    expect(laneA.routing).toBe('needs-owner');
+    const resolved = rig.center.resolveIncidents('worktree-sweep-paused:lane-a:', 'sweep-completed');
+    expect(resolved.map((row) => row.id)).toEqual([laneA.id]);
+    expect(rig.api.getNotification(laneB.id)?.resolvedAt).toBeNull();
+  });
+
+  it('a delivered wake resolves blocked/failed wake stops but leaves machine alerts open', () => {
+    const rig = boot();
+    const blocked = rig.center.post({ kind: 'gru.wake-blocked.n1', routing: 'needs-owner', severity: 'error', title: 'Wake blocked' });
+    const failed = rig.center.post({ kind: 'gru.wake-failed-escalation.incident-x', routing: 'needs-owner', severity: 'error', title: 'Wake failed' });
+    const machine = rig.center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Machine alert' });
+    rig.center.resolveIncidents('gru.wake-blocked.', 'chat-recovered');
+    rig.center.resolveIncidents('gru.wake-failed-escalation.', 'chat-recovered');
+    expect(rig.api.getNotification(blocked.id)?.resolvedBy).toBe('chat-recovered');
+    expect(rig.api.getNotification(failed.id)?.resolvedBy).toBe('chat-recovered');
+    expect(rig.api.getNotification(machine.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+  });
+});
+
 describe('legacy owner-attention reconciliation', () => {
   it('re-triages legacy coordination notes and unknown kinds to Gru without dropping the stop', () => {
     const rig = boot();

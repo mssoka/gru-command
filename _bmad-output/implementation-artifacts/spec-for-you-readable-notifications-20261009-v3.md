@@ -5,7 +5,7 @@ created: '2026-10-11'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'f738b9b1594081cdbb4929af7be256454951eb43'
-review_loop_iteration: 0
+review_loop_iteration: 1
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/BOARD.md'
@@ -170,10 +170,75 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
 - Matrix audit: every I/O matrix row is covered by a named test that ran in
   the focused verification output (registry/decision suites, supervisor and
   provider seams, board-server, web unit suites, e2e).
+- Review round 1 (d0470c25) returned 7 blind-hunter, 7 edge-case and 5
+  verification-gap findings; all verified real and patched (see the Review
+  Triage Log). Re-verification after fixes: fast backend 2924 passed; web
+  units 623+ passed; lint/typecheck/build green; the three browser projects
+  (notification-readability + mock + real) 62 passed; theme snapshots
+  regenerated and visually inspected.
 
 ## Spec Change Log
 
 ## Review Triage Log
+
+Round 1 (head d0470c25; blind-hunter / edge-case-hunter / verification-gap
+tracked review jobs). Every finding was verified against the code; all were
+real and are patched in this round. Verdicts:
+
+- Stale browser estate asserting the removed owner-Ack contract
+  (`web/e2e/smoke.spec.ts`, `web/e2e/real-server.spec.ts`, mock fixture) —
+  high; patch. Verified the specs pinned `.board-owner__ack` 'Ack' and the
+  decision-less needs-owner POST (which now 400s). Fixed: smoke/mock moved
+  to a typed decision + machine provider row; real-server round-trips a
+  typed decision, the recorded choice and the disposition follow-through;
+  the decision-less POST is pinned to 400; the browser scope now runs
+  `--project=mock --project=real` too; theme snapshots regenerated and
+  inspected.
+- `roles/gru.md` instructed a bare `{title, detail}` escalation — high;
+  patch. Fixed to the typed decision payload with the decision/disposition
+  endpoints and pinned in `test/roles-gru.test.ts`.
+- A recorded owner decision had no settlement path — high; patch.
+  `POST /api/notifications/:id/disposition` now resolves an already-decided
+  owner row with the follow-through detail; an undecided row is refused
+  (code `undecided`); board-server and notification-decisions tests cover
+  both plus idempotency.
+- Owner notices promised producer resolution that did not exist
+  (enforce-gate / sweep pauses / blocked wakes) — high; patch. Producer
+  resolutions implemented: a passing gated call clears its enforce-gate
+  incident, a completed sweep resolves only that worktree's
+  `worktree-sweep-paused:<id>:<pause>` notice, and a delivered wake clears
+  blocked/failed wake stops; each has a focused test.
+- Ack-era documentation (BOARD/UI/SUPERVISION) and runtime strings
+  (chat breaker message, awareness comment, supervisor re-arm log) — low;
+  patch. Updated to the disposition/decision model.
+- `awareness.test.ts` hard-floor case no longer exercised an owner-routed
+  row (breaker downgraded) — medium; patch. Now posts a registered
+  `port-squat` row and asserts its effective routing.
+- An ack could clear a typed decision row out of FOR YOU — high; patch.
+  The ledger refuses it and the HTTP surface answers 409
+  `decision_required`; both covered.
+- A machine stop deduping onto a surviving legacy owner row could strand
+  the lane — medium; patch. `openIncident` now re-triages such a row to
+  machine attention with a note before reuse; test added.
+- Non-boolean `discussion` was silently coerced — low; patch. Validation
+  now throws; test added.
+- `isOwnerHeldNotificationKind` kept stale semantics with no remaining
+  callers — low; patch. Removed.
+- Ambiguous transport failure claimed "nothing was changed" — medium;
+  patch. Server refusals and unconfirmed transport failures now read
+  distinctly; test covers both.
+- Bell focus could jump to the band's lookalike card — medium; patch.
+  Owner-focus capture/restore is scoped to the band; bell copies keep only
+  their own focus keys; a test pins bell focus across a re-render.
+- Snapshot projection of decision/decided fields untested — patch.
+  `test/board-server.test.ts` asserts the `/api/board` projection carries
+  the question and the recorded state.
+- main.ts boot bindings (disposition hook, port-squat clearance, legacy
+  migration, sweep resolution) had no assembly pin — patch. A source-drift
+  pin in `test/board-engine.test.ts` covers all four.
+- Mock fixture no longer represented the shipped owner surfaces — patch.
+  Updated to the typed decision + machine rows (also resolves the stale
+  smoke assertions above).
 
 ## Design Notes
 

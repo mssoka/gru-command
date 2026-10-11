@@ -645,16 +645,24 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               return;
             }
             const beforeResolvedAt = target?.resolvedAt ?? null;
-            const row = ledger.disposeMachineNotification(id, detail);
+            // A DECIDED owner decision resolves through the same route as
+            // its follow-through record; an UNDECIDED owner row is refused
+            // (resolution never silences an unanswered question), and
+            // machine attention keeps the pure disposition path.
+            const ownerFollowThrough = target !== null && target.routing === 'needs-owner';
+            const row = ownerFollowThrough
+              ? ledger.resolveOwnerDecision(id, detail)
+              : ledger.disposeMachineNotification(id, detail);
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;
             }
-            // Fire on the FIRST disposition (the state change); a repeat is
-            // an idempotent no-op for listeners too. The supervisor uses
-            // this hook for the guarded breaker re-arm — Gru's supported
-            // operations control, replacing the old owner Ack path.
-            if (beforeResolvedAt === null && row.resolvedAt !== null) onNotificationDisposition(id);
+            // Fire on the FIRST machine disposition (the state change); a
+            // repeat is an idempotent no-op for listeners too. The
+            // supervisor uses this hook for the guarded breaker re-arm —
+            // Gru's supported operations control, replacing the old owner
+            // Ack path. Owner follow-through never re-arms anything here.
+            if (!ownerFollowThrough && beforeResolvedAt === null && row.resolvedAt !== null) onNotificationDisposition(id);
             json(res, 200, row);
             return;
           }
@@ -665,6 +673,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             json(res, 409, {
               error: 'decision_required',
               detail: 'lesson proposals are decided with Accept or Reject (POST /api/lessons/proposal/:id/accept|reject)',
+            });
+            return;
+          }
+          if (existing?.routing === 'needs-owner' && existing.decision !== null) {
+            // A typed owner decision is never ack-able: an ack would hide
+            // the question without recording a choice (same doctrine as
+            // lesson proposals; the ledger refuses this as a backstop).
+            json(res, 409, {
+              error: 'decision_required',
+              detail: 'typed owner decisions are recorded with POST /api/notifications/:id/decision; an Ack cannot erase the question',
             });
             return;
           }

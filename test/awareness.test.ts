@@ -569,6 +569,28 @@ describe('gru awareness — wake policy', () => {
     }
   });
 
+  it('a delivered wake resolves blocked/failed wake stops but leaves machine alerts open', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+    const blocked = center.post({ kind: 'gru.wake-blocked.machine-alert', routing: 'needs-owner', severity: 'error', title: 'Gru wake blocked' });
+    const failed = center.post({ kind: 'gru.wake-failed-escalation.incident-x', routing: 'needs-owner', severity: 'error', title: 'Gru wake failed' });
+    const machine = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Machine alert stays open' });
+    awareness.setWakeSink(() => {
+      const injection = awareness.prepare('wake');
+      if (injection === null) return;
+      awareness.commit(injection);
+      awareness.noteWakeOutcome(true, undefined, injection);
+    });
+    center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Wake me' });
+    expect(api.getNotification(blocked.id)?.resolvedBy).toBe('chat-recovered');
+    expect(api.getNotification(failed.id)?.resolvedBy).toBe('chat-recovered');
+    expect(api.getNotification(machine.id)).toMatchObject({ resolvedAt: null, ackedAt: null, routing: 'action-required' });
+  });
+
   it('escalates an undeliverable recovery-blocked wake and retains the machine ID for retry', () => {
     vi.useFakeTimers();
     try {
@@ -1667,13 +1689,15 @@ describe('gru awareness — wake rework (issue #219)', () => {
       rig.notifications.post({ kind: 'supervision.provider-wall.a1.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent a1 stopped: quota wall' });
       expect(rig.woke).toHaveLength(1); // provider wall: hard floor, never deferred
       expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })).toHaveLength(0);
-      // needs-owner routing is a floor too (all mode wakes for it).
+      // needs-owner routing is a floor too (all mode wakes for it, and the
+      // registered owner kind is NOT downgraded to machine attention).
       rig.api.recordDecision({
-        subject: 'incident:supervision.breaker:crash-loop-breaker-tripped',
-        decision: 'hold', covers: ['supervision.breaker'], basisFingerprint: null,
-        reason: 'meaningless hold on a breaker', by: 'owner', clientKey: 'hold-breaker',
+        subject: 'incident:port-squat:foreign-listener',
+        decision: 'hold', covers: ['port-squat'], basisFingerprint: null,
+        reason: 'meaningless hold on an owner notice', by: 'owner', clientKey: 'hold-owner-notice',
       });
-      rig.notifications.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash-loop breaker tripped' });
+      const ownerNotice = rig.notifications.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Foreign process holds the port' });
+      expect(ownerNotice.routing).toBe('needs-owner');
       expect(rig.woke).toHaveLength(2);
     } finally {
       vi.useRealTimers();

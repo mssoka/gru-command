@@ -212,6 +212,20 @@ export class NotificationCenter {
       input.dedupe === 'all' ? 'any' : input.dedupe,
     );
     if (existing !== null) {
+      if (effective !== 'needs-owner' && existing.routing === 'needs-owner' && existing.ackedAt === null) {
+        // A machine stop deduping onto a surviving legacy owner row must
+        // not strand the lane behind an owner-only notice: an owner-forbidden
+        // kind (breaker/provider-wall) is re-triaged to machine attention
+        // with a note, so Gru can act and the guarded re-arm still resolves
+        // through the disposition path. A registered owner kind never
+        // reaches here (effective would be needs-owner).
+        const retriaged = this.ledger.updateNotificationTriage(
+          existing.id,
+          'action-required',
+          [existing.detail, '[attention-registry] machine stop re-triaged this legacy owner row to Gru'].filter((part): part is string => part !== null && part !== '').join('\n\n'),
+        );
+        if (retriaged !== null) return reused(retriaged);
+      }
       // A routing mismatch must not strand an owner-held stop (gh-97): an
       // UNACKED machine row is not owner-Ack-able (ledger.ackNotification
       // throws for action-required), so honoring the effective owner routing

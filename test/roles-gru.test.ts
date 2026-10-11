@@ -28,6 +28,10 @@ describe('gru role definition', () => {
     expect(prompt).toContain('single-writer');
     expect(prompt).toContain('UNTRUSTED DATA');
     expect(prompt).toContain('POST /api/notifications/needs-owner');
+    expect(prompt).toContain('"reservedClass"');
+    expect(prompt).toContain('"whyNotDelegable"');
+    expect(prompt).toContain('POST /api/notifications/:id/decision');
+    expect(prompt).toContain('POST /api/notifications/:id/disposition');
     expect(prompt).toContain('exact-final-head native Perkins READY');
     expect(prompt).toContain('The owner holds every final PR merge, everywhere');
     expect(prompt).toContain('no agent merges a PR');

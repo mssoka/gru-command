@@ -23,7 +23,6 @@ import {
   type RoundStatus,
   type RoundVerdict,
 } from './states.js';
-import { ownerAttentionFor } from '../notifications/attention.js';
 import {
   AMENDMENT_CONTRACT_MAX_BYTES,
   AMENDMENT_MAX_IDEMPOTENCY_KEY_CHARS,
@@ -413,14 +412,6 @@ export function producerResolvedBy(kind: string): string | null {
   return Object.hasOwn(PRODUCER_RESOLVED_KINDS, kind) ? PRODUCER_RESOLVED_KINDS[kind]! : null;
 }
 
-export function isOwnerHeldNotificationKind(kind: string): boolean {
-  // Owner-attention registry (owner release 2026-10-11): the authority
-  // for which kinds always occupy the owner surface now lives in
-  // src/notifications/attention.ts. Kept exported for callers and tests
-  // that predate the registry; exact behavior follows the registry.
-  return ownerAttentionFor(kind) === 'owner-required';
-}
-
 export function isNotificationRouting(value: string): value is NotificationRouting {
   return (NOTIFICATION_ROUTINGS as readonly string[]).includes(value);
 }
@@ -502,7 +493,8 @@ export type NotificationDecisionRefusalCode =
   | 'no_decision'
   | 'unknown_option'
   | 'decision_recorded'
-  | 'not_open';
+  | 'not_open'
+  | 'undecided';
 
 export class NotificationDecisionRefusal extends Error {
   constructor(
@@ -4569,6 +4561,42 @@ export class LedgerApi {
     });
   }
 
+  /** Follow-through resolution for a DECIDED owner decision (owner
+   * release 2026-10-11): after the recorded choice's operation completes,
+   * its owner (Gru/Silas) resolves the row with the action detail. An
+   * UNDECIDED owner row is refused — resolution may never silence a
+   * question the owner has not answered, and no display receipt or age
+   * ever closes one. Distinct from `disposeMachineNotification` (machine
+   * attention) and from `ackNotification` (feed/notice only). */
+  resolveOwnerDecision(id: string, detail: string): NotificationRecord | null {
+    if (detail.trim() === '') throw new Error('owner-decision resolution detail must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      if (current.routing !== 'needs-owner') {
+        throw new NotificationDecisionRefusal(
+          'not_owner_decision',
+          `notification "${id}" is ${current.routing}; use the disposition route for machine attention`,
+        );
+      }
+      if (current.decidedAt === null) {
+        throw new NotificationDecisionRefusal(
+          'undecided',
+          `notification "${id}" has no recorded owner decision — it cannot be resolved by follow-through`,
+        );
+      }
+      if (current.resolvedAt !== null) return current; // idempotent
+      this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
+        .run(nowIso(), 'gru', id);
+      this.appendEvent({
+        kind: 'notification.resolved',
+        agentId: current.agentId,
+        payload: { id, by: 'gru', detail, owner_decision: current.decidedOption },
+      });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
   /** Explicit machine disposition, distinct from the owner's Ack.
    * A successful wake prompt by itself never calls this method. */
   disposeMachineNotification(id: string, detail: string): NotificationRecord | null {
@@ -4599,6 +4627,11 @@ export class LedgerApi {
       if (current === null) return null;
       if (current.routing === 'action-required') {
         throw new Error('action-required notifications require a Gru disposition; Ack cannot clear machine attention');
+      }
+      if (current.routing === 'needs-owner' && current.decision !== null) {
+        throw new Error(
+          'this typed owner decision is recorded with POST /api/notifications/:id/decision; an Ack cannot erase the question',
+        );
       }
       if (current.ackedAt !== null) return current;
       this.db

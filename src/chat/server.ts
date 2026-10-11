@@ -1456,7 +1456,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
           throw new Error('retiring Gru became active during fresh-session spawn');
         }
         if (options.canAdoptFreshGru?.() === false) {
-          throw new Error('supervision breaker is open; acknowledge it before starting a new chat');
+          throw new Error('supervision breaker is open; re-arm it with a Gru disposition (or use the existing chat after the owner clears it) before starting a new chat');
         }
         // This one atomic rename is the activation point: session identity,
         // epoch, and replay floor move together. Old logs/sessions are untouched.

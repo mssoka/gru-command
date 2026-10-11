@@ -113,7 +113,11 @@ export function parseNotificationDecision(value: unknown): NotificationDecision 
   const whyNotDelegable = boundedString(raw['whyNotDelegable'], 'decision.whyNotDelegable', 400, {
     allowNewlines: true,
   });
-  const discussion = raw['discussion'] === true;
+  const discussionRaw = raw['discussion'];
+  if (discussionRaw !== undefined && typeof discussionRaw !== 'boolean') {
+    throw new Error('decision.discussion must be a boolean when present');
+  }
+  const discussion = discussionRaw === true;
   const optionsRaw = raw['options'];
   if (!Array.isArray(optionsRaw)) throw new Error('decision.options must be a list');
   if (optionsRaw.length > 4) throw new Error('decision.options supports at most 4 options');

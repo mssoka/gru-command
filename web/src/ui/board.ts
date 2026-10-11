@@ -331,7 +331,7 @@ export class BoardView {
     // on keeps its place (stable focus keys), so a snapshot update never
     // steals focus or resets a disclosure mid-interaction.
     const focusKey = this.captureFocusKey();
-    const ownerFocus = captureOwnerFocusKey();
+    const ownerFocus = captureOwnerFocusKey(this.ownerMount);
     this.currentSections = null; // one fresh derivation per render
     this.renderOwnerActions(effective);
     this.renderRail(effective);
@@ -341,7 +341,7 @@ export class BoardView {
     this.renderAgents(effective.agents);
     this.repoOverview.render(effective.repoOverview);
     this.renderNotifications(effective);
-    restoreOwnerFocusKey(ownerFocus);
+    restoreOwnerFocusKey(ownerFocus, this.ownerMount);
     this.surfaceNewNotifications(previous, effective.notifications);
   }
 
@@ -1428,7 +1428,7 @@ export class BoardView {
         `worker stopped by supervision` +
         (workerStop.reason === null ? '' : ` (${workerStop.reason.replaceAll('_', ' ')})`) +
         `${workerStop.restarts > 0 ? ` after ${workerStop.restarts} restart${workerStop.restarts === 1 ? '' : 's'}` : ''} — ` +
-        'the lane is not running: resolve the condition, then ack the escalation to re-arm';
+        'the lane is not running: resolve the condition, then Gru dispositions the machine alert to re-arm';
     }
     toggle.append(status);
     head.append(toggle);
@@ -2194,7 +2194,7 @@ export class BoardView {
     if (decision !== null) card.append(el('div', 'board-notification__context', decision.context));
     else if (shortDetail && detail !== null) card.append(el('div', 'board-notification__context', detail));
     if (decision !== null) {
-      card.append(this.decisionBlock(item, decision));
+      card.append(this.decisionBlock(item, decision, bandVisible));
       if (decided) {
         card.append(
           el(
@@ -2210,7 +2210,7 @@ export class BoardView {
       card.append(el('div', 'board-notification__guidance', ownerNoticeGuidance(item.kind)));
     }
     if (detail !== null && !(decision === null && shortDetail)) {
-      card.append(this.detailsDisclosure(item.id, item.kind, detail));
+      card.append(this.detailsDisclosure(item.id, item.kind, detail, bandVisible));
     }
     // A feed row earns a receipt-style "Mark seen" only where an ack has
     // meaning; machine and owner rows never show it.
@@ -2241,14 +2241,16 @@ export class BoardView {
 
   /** Full diagnostics, verbatim — never truncated, never upper-cased and
    * never letter-spaced. Open state survives snapshot pushes. */
-  private detailsDisclosure(notificationId: string, kind: string, detail: string): HTMLElement {
+  private detailsDisclosure(notificationId: string, kind: string, detail: string, bandVisible = false): HTMLElement {
     const details = document.createElement('details');
     details.className = 'board-notification__details';
     details.open = this.openNotificationDetails.has(notificationId);
     const summary = document.createElement('summary');
     summary.textContent = 'Details';
     summary.dataset.focusKey = `notif:${notificationId}:details`;
-    summary.dataset.ownerFocusKey = `notif:${notificationId}:details`;
+    // Owner-band focus addressing only: the bell keeps its own focus key so
+    // the two surfaces' restore passes can never steal each other's focus.
+    if (bandVisible) summary.dataset.ownerFocusKey = `notif:${notificationId}:details`;
     const body = el('div', 'board-notification__detail');
     body.append(el('div', 'board-notification__detail-kind', `kind: ${kind}`), el('div', 'board-notification__detail-text', detail));
     details.append(summary, body);
@@ -2262,7 +2264,7 @@ export class BoardView {
   /** The typed decision block: the question, Gru's recommendation, why it
    * cannot be delegated, and the concrete options with consequences. Every
    * option RECORDS the owner's choice; nothing here executes a fix. */
-  private decisionBlock(item: NotificationView, decision: NotificationDecisionView): HTMLElement {
+  private decisionBlock(item: NotificationView, decision: NotificationDecisionView, bandVisible = false): HTMLElement {
     const block = el('section', 'board-notification__decision');
     block.append(el('div', 'board-notification__question', decision.question));
     if (decision.recommendation !== null) {
@@ -2290,7 +2292,7 @@ export class BoardView {
         const key = `notif:${item.id}:option:${option.id}`;
         button.dataset.actionId = key;
         button.dataset.focusKey = key;
-        button.dataset.ownerFocusKey = key;
+        if (bandVisible) button.dataset.ownerFocusKey = key;
         button.addEventListener('click', () => this.submitDecision(item, option.id, button, optionNode));
         optionNode.append(button, el('div', 'board-notification__option-consequence', option.consequence));
         options.append(optionNode);
@@ -2320,10 +2322,14 @@ export class BoardView {
       .catch((error: unknown) => {
         button.disabled = false;
         button.textContent = label;
+        // A server refusal PROVES nothing was recorded. A transport failure
+        // is ambiguous: the server may have committed the decision before
+        // the reply was lost, so the copy must not claim otherwise (a retry
+        // of the same option is idempotent and confirms the record).
         const message =
-          error instanceof BoardApiError && error.detail !== null
-            ? `Not recorded — ${error.detail}`
-            : 'Not recorded — the request failed, nothing was changed. Try again.';
+          error instanceof BoardApiError
+            ? `Not recorded — ${error.detail ?? 'the server refused the choice'}.`
+            : 'Outcome unconfirmed — the request failed before the server replied. The board will show the recorded state; retrying the same choice is safe.';
         const existing = optionNode.querySelector<HTMLElement>('.board-notification__option-error');
         if (existing === null) {
           const errorNode = el('div', 'board-notification__option-error', message);
@@ -2623,14 +2629,18 @@ interface ProposalRowState {
 
 /** Owner-surface focus (FOR YOU band + bell): stable keys survive the
  * re-render a snapshot push causes, so focus never falls to <body>. */
-function captureOwnerFocusKey(): string | null {
+function captureOwnerFocusKey(root: HTMLElement): string | null {
   const active = document.activeElement;
-  return active instanceof HTMLElement ? active.dataset.ownerFocusKey ?? null : null;
+  if (!(active instanceof HTMLElement) || !root.contains(active)) return null;
+  return active.dataset.ownerFocusKey ?? null;
 }
 
-function restoreOwnerFocusKey(key: string | null): void {
+function restoreOwnerFocusKey(key: string | null, root: HTMLElement): void {
   if (key === null) return;
-  const target = [...document.querySelectorAll<HTMLElement>('[data-owner-focus-key]')].find(
+  // Scoped to the owner band: the bell renders its own copies of the same
+  // cards, and a global lookup would jump focus from the open bell to the
+  // band's lookalike (shared builder, distinct surfaces).
+  const target = [...root.querySelectorAll<HTMLElement>('[data-owner-focus-key]')].find(
     (node) => node.dataset.ownerFocusKey === key,
   );
   if (target !== undefined && document.activeElement !== target) target.focus();

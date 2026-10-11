@@ -253,7 +253,12 @@ describe('board server — HTTP API', () => {
     expect((await postJson(port, path, 'wrong-token', { detail: 'Fixed' })).status).toBe(401);
     expect((await postJson(port, path, 'board-test-token', {})).status).toBe(400);
     expect((await postJson(port, path, 'board-test-token', { detail: '   ' })).status).toBe(400);
-    expect((await postJson(port, `/api/notifications/${owner.id}/disposition`, 'board-test-token', { detail: 'No' })).status).toBe(400);
+    // An UNDECIDED owner stop is refused with a typed 409 (a decided row
+    // resolves through the same route after its follow-through).
+    expect((await postJson(port, `/api/notifications/${owner.id}/disposition`, 'board-test-token', { detail: 'No' }))).toMatchObject({
+      status: 409,
+      body: { error: 'decision_refused', code: 'undecided' },
+    });
     expect(api.getNotification(machine.id)?.resolvedAt).toBeNull();
     const resolved = await postJson(port, path, 'board-test-token', { detail: 'Opened repair lane' });
     expect(resolved).toMatchObject({ status: 200, body: { resolvedBy: 'gru', ackedAt: null } });
@@ -321,6 +326,28 @@ describe('board server — HTTP API', () => {
       .listEvents({ limit: 100 })
       .filter((event) => event.kind === 'notification.decision' && (event.payload as { id?: string }).id === row.id);
     expect(decisionEvents).toHaveLength(1);
+    // The snapshot projection carries the typed decision and its recorded
+    // state to BOTH owner surfaces (the only server→web transport).
+    const board = (await getJson(port, '/api/board', 'board-test-token')).body as {
+      notifications: { id: string; decision?: { question?: string } | null; decidedAt?: string | null; decidedOption?: string | null }[];
+    };
+    const projected = board.notifications.find((entry) => entry.id === row.id);
+    expect(projected?.decision).toMatchObject({ question: 'Approve the external merge?' });
+    expect(projected?.decidedAt).toBeTruthy();
+    expect(projected?.decidedOption).toBe('approve');
+    // An ack can never erase a typed owner question.
+    const ackRefused = await postJson(port, `/api/notifications/${row.id}/ack`, 'board-test-token', { by: 'web' });
+    expect(ackRefused).toMatchObject({ status: 409, body: { error: 'decision_required' } });
+    // Follow-through resolution: a DECIDED row resolves with the action
+    // detail; an UNDECIDED owner row refuses (resolution never silences an
+    // unanswered question).
+    const undecided = await postJson(port, path, 'board-test-token', { title: 'Second call', detail: 'evidence', decision });
+    const undecidedId = (undecided.body as { id: string }).id;
+    const refusedResolve = await postJson(port, `/api/notifications/${undecidedId}/disposition`, 'board-test-token', { detail: 'premature' });
+    expect(refusedResolve).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'undecided' } });
+    const resolved = await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'Executed the approved prep' });
+    expect(resolved).toMatchObject({ status: 200, body: { resolvedBy: 'gru', decidedOption: 'approve', ackedAt: null } });
+    expect(api.getNotification(row.id)).toMatchObject({ resolvedBy: 'gru' });
   });
 
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {

@@ -966,6 +966,21 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     );
   });
 
+  it('the main assembly binds the owner-decision surfaces into their producers (assembly alarm)', () => {
+    // Owner release 2026-10-11: the disposition→re-arm binding, the
+    // port-squat boot clearance, the legacy owner-row migration and the
+    // sweep-completion resolution all live in main.ts closures. Unit tests
+    // on both sides inject the seam, so dropping a production binding
+    // stayed green — this source-drift pin is the repo's established
+    // assembly-alarm shape.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(/onNotificationDisposition:\s*\(id\)\s*=>\s*supervisorLive\.onNotificationDisposed\(id\)/u);
+    expect(mainSource).toMatch(/notifications\.resolveIncidents\('port-squat', 'service-boot'\)/u);
+    expect(mainSource).toMatch(/notifications\.resolveIncidents\('roll-port-squat', 'service-boot'\)/u);
+    expect(mainSource).toMatch(/reconcileLegacyOwnerAttention\(\{/u);
+    expect(mainSource).toMatch(/notifications\.resolveIncidents\(`worktree-sweep-paused:\$\{worktree\.id\}:/u);
+  });
+
   it('bounds the snapshot to the newest receipt window while live rows stay complete (D3)', () => {
     // Owner decision D3: closed receipts stay unacked forever by design, so
     // the unbounded scan must carry live rows only plus a bounded receipt

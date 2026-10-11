@@ -2333,7 +2333,7 @@ export class Supervisor {
       agent.consecutiveFailures = 0;
       agent.state = 'watching';
       this.restoredStops.delete(agent.agentId);
-      this.log('info', 'breaker re-armed by ack — resuming supervision', {
+      this.log('info', 'breaker re-armed by disposition — resuming supervision', {
         agent_id: agent.agentId,
         notification_id: notificationId,
       });

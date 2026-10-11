@@ -761,10 +761,13 @@ owner-decisions-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lin
 
 # Browser evidence (acceptance: long-content fixture readable in dark/light
 # at 390/768/1280, 200% zoom, a 320px container; measured settled contrast;
-# keyboard Details; no side-effect requests). Production web build + the
-# dedicated synthetic-seeded Playwright project; captures land under the
-# gitignored _bmad-output/notification-readability/ root.
-owner-decisions-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=notification-readability"
+# keyboard Details; no side-effect requests) PLUS the updated shared-estate
+# specs the change touches: the mock board smoke suite and the real-service
+# spec (typed decision round-trip, feed Mark seen, owner-notice surfaces).
+# Production web build + the dedicated synthetic-seeded Playwright project;
+# captures land under the gitignored _bmad-output/notification-readability/
+# root.
+owner-decisions-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=notification-readability --project=mock --project=real"
 
 # FAIL-BEFORE evidence (acceptance: meaningful fail-before and pass-after
 # for the pictured typography/wrapping/contrast defect). The FINAL

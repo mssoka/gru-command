@@ -231,8 +231,10 @@ owns un-hanging the turn itself; `timeoutMs` is caller-side relief.
 
 `test/supervisor.test.ts` drives a controllable runtime: a killed stub
 agent climbs the ladder and is restored (resumed from its session file);
-three fast failures trip the breaker exactly once with a needs-owner
-notification; an ack re-arms; in-band errors never restart. The same
+three fast failures trip the breaker exactly once with an
+action-required machine alert; a Gru disposition (or human slot use)
+re-arms through the guarded recovery-authority fence; in-band errors
+never restart. The same
 suite pins the compaction wait policy: an open silent compaction holding
 a real pending-turn snapshot warns at most once per episode and is never
 restarted (same handle retained, no pending-turn take or re-delivery, no

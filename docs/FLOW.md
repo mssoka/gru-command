@@ -907,10 +907,13 @@ consequences). `POST /api/notifications/{id}/decision` records the
 owner's choice durably and idempotently — it never acks or resolves the
 row, and a decision receipt is not proof its follow-on operation ran; the
 row stays visible as "decision recorded — awaiting follow-through" until
-its producer resolves it. Owner-only notices carry no in-app control at
-all; they clear when their producer sees the condition end (a successful
-bind for port squats, recovery for the decision provider, a later
-successful wake, a completed sweep).
+its owner records the follow-through (`POST /api/notifications/{id}/disposition`
+with the action detail; an undecided row is refused). Owner-only notices
+carry no in-app control at all; they clear when their producer sees the
+condition end: a successful bind for port squats, decision-service
+recovery for degraded providers, a passing gated call for enforce-gate
+incidents, a delivered wake for blocked/failed wake stops, and a completed
+sweep for a paused worktree. An ack cannot erase a typed decision (409).
 
 **Morning digest.** The first delivered block after `morning_digest_gap_ms`
 (default 8 h; 0 disables) carries a ledger-derived "while you were away"

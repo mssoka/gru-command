@@ -246,6 +246,10 @@ export interface WorktreeManagerOptions {
     readonly worktree: WorktreeRecord;
     readonly processes: readonly TreeProcess[];
   }) => void;
+  /** Positive evidence that a lane tree is gone and its row is swept:
+   * producer-side resolution for any pause notice about that worktree
+   * (owner release 2026-10-11) — the condition ended, so the notice does. */
+  readonly onSwept?: (input: { readonly worktree: WorktreeRecord }) => void;
   readonly enumerateProcesses?: ProcessEnumerator;
   readonly log?: Log;
 }
@@ -1366,6 +1370,12 @@ export class WorktreeManager {
     }
     this.recordSweepEvent(row, preserved, branchOutcome, freshHead);
     this.log('info', 'worktree swept', { id: row.id, branch: branchOutcome, freshHead });
+    try {
+      this.opts.onSwept?.({ worktree: row });
+    } catch (error) {
+      // The sweep already completed; a notification hiccup must not undo it.
+      this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
+    }
     return { status: 'swept', preserved, branch: branchOutcome, freshHead };
   }
 
@@ -1409,6 +1419,12 @@ export class WorktreeManager {
       });
     }
     return branchOutcome;
+  
+    try {
+      this.opts.onSwept?.({ worktree: row });
+    } catch (error) {
+      this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
+    }
   }
 
   /** Guarded containment-verified disposal for an owner lane's branch.

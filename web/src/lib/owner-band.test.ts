@@ -220,6 +220,7 @@ describe('owner-notice guidance — honest scope per kind, never parsed prose', 
 
   it('sweep confirmations and blocked wakes name the manual step', () => {
     expect(ownerNoticeGuidance('worktree-sweep-paused')).toContain('Confirm nothing live is rooted');
+    expect(ownerNoticeGuidance('worktree-sweep-paused:lane-a:pause-1')).toContain('the notice clears when that worktree is swept');
     expect(ownerNoticeGuidance('gru.wake-blocked.n1')).toContain('Restart the service');
     expect(ownerNoticeGuidance('gru.wake-failed-escalation.job')).toContain('Restart the service');
   });

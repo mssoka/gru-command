@@ -39,11 +39,13 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   'worktree-sweep-paused',
 ];
 
-/** Kinds that are always owner-facing, prefix match (dynamic suffixes). */
+/** Kinds that are always owner-facing, prefix match (dynamic suffixes,
+ * including the worktree-scoped `worktree-sweep-paused:<id>:<pause>` form). */
 const OWNER_REQUIRED_PREFIXES: readonly string[] = [
   'gru.wake-blocked.',
   'gru.wake-failed-escalation.',
   'decisions.enforce-gate.',
+  'worktree-sweep-paused:',
 ];
 
 /** Kinds whose producer decides between owner attention and passive feed. */

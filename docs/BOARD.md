@@ -42,7 +42,7 @@ restart produce the same truth without data edits.
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
 | `POST /api/notifications/:id/ack` | `{by?}` — feed/notice acknowledgement only; refuses machine rows (400). The UI shows it only on FYI rows (`Mark seen`) |
 | `POST /api/notifications/:id/decision` | `{optionId, by?}` — records the owner's choice on a typed `needs-owner` decision (validated against the stored options). A recorded decision is distinct from resolution; duplicates are idempotent and a different option is refused (409) |
-| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops. Disposing an open `supervision.breaker` alert re-arms the stopped lane through the guarded recovery-authority fence |
+| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops. Disposing an open `supervision.breaker` alert re-arms the stopped lane through the guarded recovery-authority fence. On a `needs-owner` row it records FOLLOW-THROUGH for an already-recorded owner decision (an undecided row is refused: resolution never silences an unanswered question) |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -110,16 +110,19 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   board behind); below 900px the rail stacks under the board and the FAB
   opens a bottom sheet.
 - **Dashboard:** a permanent **FOR YOU** owner band sits ABOVE the job
-  bands (owner approval 2026-09-28): the owner's pending obligations —
-  unacked `needs-owner` rows (Ack, with consequence copy that names what
-  the ack does and does NOT do — a quota/breaker ack re-arms the worker
-  but never clears code/test/review holds) plus the server-projected,
-  evidence-bound **ready PRs** (see below). Viewing completes nothing:
-  the header count is owed actions, not unseen rows; the count only
-  moves on an authoritative ack (any device) or confirmed merged/closed
-  state. Rows are deterministic (newest first, stable
-  `owner-ack:{id}`/`owner-pr:{jobId}` ids), focus survives snapshot
-  re-renders, and the older tail hides behind a `+N older pending`
+  bands (owner approval 2026-09-28; decision-inbox release 2026-10-11):
+  the owner's pending obligations — typed owner decisions (question,
+  recommendation, options with consequences; choosing one RECORDS the
+  choice and the row stays "awaiting follow-through" until its producer
+  resolves it), owner notices whose action is outside the app (no fake
+  Ack), lesson proposals, and the server-projected, evidence-bound
+  **ready PRs** (see below). Viewing completes nothing: the header count
+  is owed actions, not unseen rows; a row settles only on recorded
+  follow-through or confirmed merged/closed state. Rows are
+  deterministic (newest first, stable `owner-decision:{id}` /
+  `owner-notice:{id}` / `owner-proposal:{id}` / `owner-pr:{jobId}` action
+  keys), focus survives snapshot re-renders, and the older tail hides
+  behind a `+N older pending`
   expander — the engine already merges EVERY unacked needs-owner row
   into the snapshot, so no pending obligation is lost to the bounded
   feed. The PR action is **OPEN PR** (external https link only) — a

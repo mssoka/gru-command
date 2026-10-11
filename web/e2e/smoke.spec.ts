@@ -575,17 +575,21 @@ test.describe('board (E6, mock feed)', () => {
     const band = page.locator('#board-owner');
     await expect(band).toBeVisible();
     await expect(band.locator('.board-band__label')).toHaveText('FOR YOU');
-    // The combined fixtures owe three owner actions: crash-loop and
-    // provider-wall stops plus one evidence-bound ready PR.
-    await expect(band.locator('.board-band__count')).toHaveText('3 pending');
-    const providerStop = band.locator('.board-owner__row', { hasText: 'Agent mock-minion-quota stopped: quota wall' });
-    await expect(providerStop).toBeVisible();
-    await expect(providerStop.locator('.board-owner__ack')).toHaveText('Ack');
-    // The owner stop carries its Ack control and the honest scope copy.
-    const stop = band.locator('.board-owner__row', { hasText: 'Crash-loop breaker tripped' });
-    await expect(stop).toBeVisible();
-    await expect(stop.locator('.board-owner__ack')).toHaveText('Ack');
-    await expect(stop).toContainText('does NOT clear code/test/review holds');
+    // The combined fixtures owe two owner actions: one typed decision plus
+    // one evidence-bound ready PR. Machine stops never ring the owner band.
+    await expect(band.locator('.board-band__count')).toHaveText('2 pending');
+    const decision = band.locator('.board-owner__row', { hasText: 'Approve the payment retry fix?' });
+    await expect(decision).toBeVisible();
+    await expect(decision.locator('.board-notification__question')).toHaveText('Approve the payment retry fix and re-arm the lane?');
+    await expect(decision.locator('.board-notification__recommendation')).toContainText('Gru recommends');
+    await expect(decision.locator('.board-notification__option-button')).toHaveCount(2);
+    await expect(decision.locator('.board-notification__option-consequence').first()).toContainText('Gru re-arms the lane');
+    // No generic Ack and no routine re-arm control on the owner surface.
+    await expect(decision.locator('.board-owner__ack')).toHaveCount(0);
+    await expect(decision.locator('.board-notification__ack')).toHaveCount(0);
+    await expect(band).not.toContainText('ack this notification');
+    // Machine attention stays out of the owner band (NEEDS GRU owns it).
+    await expect(band).not.toContainText('quota wall');
     // The ready PR row: exact-head reason + OPEN PR as an external link
     // (never an in-app merge button).
     const pr = band.locator('.board-owner__row--pr', { hasText: 'Fix the payment retry loop' });
@@ -598,6 +602,7 @@ test.describe('board (E6, mock feed)', () => {
     await expect(open).toHaveAttribute('target', '_blank');
     // Machine attention stays OUT of the owner band (NEEDS GRU owns it).
     await expect(band).not.toContainText('Review round demo-api-payment-fix-r1 is INCOMPLETE');
+    await expect(band).not.toContainText('Agent mock-minion-quota stopped');
   });
 
   test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
@@ -829,9 +834,10 @@ test.describe('board (E6, mock feed)', () => {
         page.locator('.board-band--needs-you .board-job', { hasText: 'Rotate the staging tokens' }),
       ).toHaveCount(0);
 
-      // The quota-walled lane shows its true state: waiting on the provider,
-      // never a bare "working" and never stalled/COLD.
-      const walled = page.locator('.board-band--in-flight .board-job', { hasText: 'Migrate the search index' });
+      // The quota-walled lane shows its true state: waiting on the provider
+      // with a live machine alert, so it surfaces under FOR GRU (the
+      // needs-you band) — never a bare "working" and never stalled/COLD.
+      const walled = page.locator('.board-band--needs-you .board-job', { hasText: 'Migrate the search index' });
       await expect(walled).toBeVisible();
       await expect(walled).toHaveAttribute('data-worker-state', 'waiting');
       await expect(walled.locator('.board-job__status')).toHaveText('waiting · quota wall');
@@ -844,8 +850,9 @@ test.describe('board (E6, mock feed)', () => {
       await expect(silent.locator('.board-job__stale')).toHaveText('stalled');
       await expect(silent.locator('.board-job__status')).toHaveText('working');
 
-      // Chip and bands agree: only the live machine row (mock-n5) counts.
-      await expect(page.locator('#board-unacked')).toContainText('1 needs Gru');
+      // Chip and bands agree: the two live machine rows (mock-n4 + mock-n5)
+      // count; the merged lane's leftover is a closed receipt.
+      await expect(page.locator('#board-unacked')).toContainText('2 needs Gru');
       // Scoped acceptance clips (tracked-review A10): the full-page capture
       // is taken under sticky chrome that can occlude the IN FLIGHT band,
       // so the NEEDS GRU band and the waiting row get their own clips — the
@@ -1466,7 +1473,7 @@ test.describe('themes', () => {
     // reply wait above covers the chat only (observed RED under load: the
     // capture missed the band while the DOM already had it). Synchronize
     // on the band's authoritative rows before the screenshot.
-    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(3);
+    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(2);
     await expect(
       page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
     ).toBeVisible();

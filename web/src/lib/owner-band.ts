@@ -34,8 +34,8 @@ export function ownerNoticeGuidance(kind: string): string {
   if (kind.startsWith('decisions.degraded.') || kind.startsWith('decisions.enforce-gate.')) {
     return 'Fix the decision-provider credential or configuration, then use Recheck. This notice clears when the decision service recovers.';
   }
-  if (kind === 'worktree-sweep-paused') {
-    return 'Confirm nothing live is rooted in the listed worktree. The sweep stays paused until an operator deliberately completes it; clearing this notice is not possible here.';
+  if (kind === 'worktree-sweep-paused' || kind.startsWith('worktree-sweep-paused:')) {
+    return 'Confirm nothing live is rooted in the listed worktree. The sweep stays paused until an operator deliberately completes it; the notice clears when that worktree is swept.';
   }
   if (kind.startsWith('gru.wake-blocked.') || kind.startsWith('gru.wake-failed-escalation.')) {
     return 'Restart the service to recover chat safely. The machine alert remains pending for retry.';

@@ -75,7 +75,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * durable under the chat dir; wake turns never consume the owner's digest.
  * Content is derived from the ledger only — an acked or resolved notification is
  * never injected; action-required rows are Gru's machine queue while
- * needs-owner rows keep the owner's acknowledgement.
+ * registered needs-owner rows carry owner decisions and notices;
+ * machine recovery rides the disposition path.
  */
 
 export const AWARENESS_STATE_NAME = 'awareness.json';
@@ -166,7 +167,7 @@ export type GruAwarenessLedger = Pick<
   // Decision memory reads (issues #218/#224): present on the real ledger;
   // optional so narrow test fakes stay honest. Absent = triage asks run
   // without the open-decisions/dispositions context.
-> & Partial<Pick<LedgerApi, 'listDecisions'>>;
+> & Partial<Pick<LedgerApi, 'listDecisions' | 'resolveNotificationsByKindPrefix'>>;
 
 /** The escalation notification kinds the triage surface applies to — the
  * Silas-authored family: the ops endpoint's `silas.escalation` and the
@@ -1022,6 +1023,17 @@ export class GruAwareness {
       this.failedRetryAtMs = 0;
       this.log('info', 'gru wake opened', { notification_ids: delivered, count: delivered.length, mode: this.wakeMode });
       this.persistWakeState();
+      // A DELIVERED wake is positive evidence that the chat recovery route
+      // works again: the owner-only blocked/failed wake stops (owner
+      // release 2026-10-11) resolve here instead of waiting for a
+      // display receipt or an Ack. The machine alert itself stays open
+      // until its own disposition.
+      try {
+        this.ledger.resolveNotificationsByKindPrefix?.('gru.wake-blocked.', 'chat-recovered');
+        this.ledger.resolveNotificationsByKindPrefix?.('gru.wake-failed-escalation.', 'chat-recovered');
+      } catch (error) {
+        this.log('error', 'wake-stop resolution failed — rows stay open', { error: String(error) });
+      }
       // Issue #224 escalation-triage shadow ask at the delivery receipt —
       // the exact point the labelled extractor links (the gru.wake
       // notification_ids), so backtest states and production states share

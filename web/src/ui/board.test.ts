@@ -16,6 +16,7 @@ import { memoryStorage } from '../lib/chat-storage.js';
 import { boardKpis, collectJobs } from '../lib/board-kpi.js';
 import { snapshotSections } from '../lib/board-sections.js';
 import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
+import { BoardApiError } from '../lib/board-client.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
 
@@ -2542,10 +2543,23 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(button.disabled).toBe(true);
     await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve'));
     await vi.waitFor(() => expect(button.disabled).toBe(false));
-    // Failed HTTP → nothing recorded; the control returns with the reason.
+    // Ambiguous transport failure → the copy must NOT claim nothing was
+    // recorded (the server may have committed before the reply was lost).
     expect(button.textContent).toBe('Approve the slim contract');
-    expect(band.querySelector('.board-notification__option-error')?.textContent).toContain('Not recorded');
+    expect(band.querySelector('.board-notification__option-error')?.textContent).toContain('Outcome unconfirmed');
     expect(band.querySelector('[data-action-id="notif:decide-me:option:approve"]')).not.toBeNull();
+    // A server refusal PROVES nothing was recorded and shows the reason.
+    const refused = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.reject(new BoardApiError('/decision', 409, 'decision_recorded', 'already records decision "keep"'))),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view3 = new BoardView(() => {}, refused);
+    view3.render(snapshot({ notifications: [stop] }));
+    const band3 = document.getElementById('board-owner')!;
+    band3.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!.click();
+    await vi.waitFor(() => expect(band3.querySelector('.board-notification__option-error')?.textContent).toContain('already records decision'));
+    expect(band3.textContent).toContain('Not recorded');
     // Success → the server's authoritative row applies; the row stays
     // visible as decided — awaiting follow-through, never "completed".
     const decidedRow = { ...stop, decidedAt: '2026-01-01T00:09:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
@@ -3361,6 +3375,25 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(more.textContent).toBe('+3 older pending');
     more.click();
     expect(document.getElementById('board-owner')!.querySelectorAll('.board-owner__row')).toHaveLength(9);
+  });
+
+  it('focus on the open bell copy of a shared decision card survives a re-render (never jumps to the band lookalike)', () => {
+    const view = new BoardView(() => {});
+    const stop = notification('focus-bell', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision(),
+    });
+    view.render(snapshot({ notifications: [stop], unackedNeedsOwner: 1 }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const bellButton = document.querySelector<HTMLButtonElement>('#notification-list [data-action-id="notif:focus-bell:option:approve"]')!;
+    expect(bellButton).not.toBeNull();
+    bellButton.focus();
+    expect(document.activeElement).toBe(bellButton);
+    view.render(snapshot({ notifications: [stop], unackedNeedsOwner: 1 }));
+    const refocused = document.querySelector<HTMLElement>('#notification-list [data-action-id="notif:focus-bell:option:approve"]');
+    expect(document.activeElement).toBe(refocused);
   });
 
   it('a snapshot re-render preserves focus on the same action and fires no toast', () => {
