@@ -25,6 +25,11 @@
  *           credits a body whose heading/scope evidence was erased by a real
  *           publication redaction span as legacy whole clearance, so the
  *           refusal and owner-readiness assertions fail.
+ *   r10   — the reversed-ordering fix at 0a20101: the uncorrected decoder
+ *           credits a historical raw deferred title that survives AFTER the
+ *           redaction span with a forged line-anchored heading/scope line
+ *           (the placeholder precedes the selected region), so the refusal
+ *           and owner-readiness assertions fail.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -50,6 +55,9 @@ export const BASELINE_TITLES = {
   ],
   r9: [
     'redaction-erased disclosure cannot grant historical whole clearance',
+  ],
+  r10: [
+    'a historical deferred-title heading after the redaction span cannot grant whole clearance',
   ],
 };
 
@@ -133,7 +141,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   try {
     const [leg, path] = process.argv.slice(2);
     if (leg === undefined || path === undefined) {
-      throw new Error('usage: assert-perkins-integration-review-baseline.mjs <fast|heavy|r7|r8|r9> REPORT_JSON');
+      throw new Error('usage: assert-perkins-integration-review-baseline.mjs <fast|heavy|r7|r8|r9|r10> REPORT_JSON');
     }
     const titles = assertPerkinsIntegrationBaseline(leg, JSON.parse(readFileSync(path, 'utf8')));
     process.stdout.write(

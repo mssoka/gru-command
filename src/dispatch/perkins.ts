@@ -736,16 +736,23 @@ function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure
   // A region carrying a redaction placeholder can never be trusted for scope
   // credit: a forged heading and scope line planted in the lead-authored
   // report ahead of a span that erased the genuine appendix would otherwise
-  // decode as a genuine disclosure. Redactions confined to the report (before
-  // the heading) leave the region clean, so the legacy/scoped paths below
-  // stay intact for them.
+  // decode as a genuine disclosure.
   if (host.includes(REDACTION_PLACEHOLDER)) return null;
   const scopeLines = host.split('\n').filter((entry) => entry.startsWith('- Review scope: '));
   if (scopeLines.length === 0) {
     // No scope disclosure was ever emitted in this placeholder-free region: a
-    // genuine pre-Stage-5 whole review.
+    // genuine pre-Stage-5 whole review. A redaction confined to the report
+    // (before the heading) keeps this legacy credit.
     return { kind: 'legacy' };
   }
+  // A SCOPED disclosure is only credible when the bytes BEFORE the anchored
+  // heading are erasure-free too. A historical raw deferred title can plant a
+  // line-anchored heading AFTER a span that erased the genuine appendix, so
+  // the placeholder precedes the selected region and the surviving scope
+  // claim would rest on erased bytes alone (R9, reversed ordering). Refuse:
+  // modern rounds derive their scope from the immutable posted review block
+  // instead, and the legacy path above keeps its credit.
+  if (text.slice(0, heading.index).includes(REDACTION_PLACEHOLDER)) return null;
   // The host appendix emits exactly ONE scope line: two or more is ambiguous
   // scope evidence and refuses rather than picking one.
   if (scopeLines.length > 1) return null;
