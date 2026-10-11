@@ -524,6 +524,14 @@ export interface VerdictPosterInput {
    * identity leaves the delivery's posting identity unbound, and restart
    * reconciliation then holds instead of ever certifying absence. */
   readonly onPreparedIdentity?: (actor: string) => void;
+  /** Invoked by the publisher with the authenticated account its
+   * RECONCILIATION lookup actually used, immediately after resolving it and
+   * before any provider read. Restart recovery binds an absence certificate
+   * to THIS identity — never to a later independent probe, which cannot
+   * establish which account the lookup searched as (native R3). Optional:
+   * a publisher that does not report its lookup identity leaves the absence
+   * unprovable, and recovery holds. */
+  readonly onLookupIdentity?: (actor: string) => void;
 }
 
 /** Optional caller context for VerdictPoster.reconcile (bounded shared
@@ -863,6 +871,9 @@ export class GhPrPoster implements VerdictPoster {
   async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
     const { apiPath, observedHead, observedBase } = this.githubPrIdentity(input);
     const authenticatedLogin = this.resolveAuthenticatedLogin(input.host);
+    // Report the account this lookup actually authenticated as, before any
+    // provider read: recovery binds absence to THIS identity (native R3).
+    input.onLookupIdentity?.(authenticatedLogin);
     const reviews: Array<{ id?: unknown; user?: { login?: unknown }; state?: unknown; commit_id?: unknown; body?: unknown }> = [];
     // Undecidable entries (missing or mistyped delivery predicates) poison
     // the ABSENCE certificate only: a usable match is still credited, but a
@@ -1183,6 +1194,7 @@ export class GitLabMrPoster implements VerdictPoster {
   async reconcile(input: VerdictPosterInput): Promise<PostedReviewReceipt | null> {
     const { mrUrl, headers } = await this.gitLabIdentity(input);
     const author = await this.resolveAuthenticatedUser(input.host, headers);
+    input.onLookupIdentity?.(author);
     const authoredMatches: Array<{ id?: unknown; body?: unknown }> = [];
     const foreignMatches: Array<{ id?: unknown; body?: unknown }> = [];
     const foreignAuthors = new Set<string>();
@@ -2699,6 +2711,11 @@ export class WaveRunner {
       return 'held';
     }
     try {
+      // The lookup reports the account it AUTHENTICATED as, before any
+      // provider read (native R3): absence may only be bound to the identity
+      // that actually searched, never to a later independent probe that
+      // cannot establish which account the search ran as.
+      const lookup = { actor: null as string | null };
       const found = await poster.reconcile({
         prUrl: attempt.url,
         host: attempt.host,
@@ -2707,10 +2724,11 @@ export class WaveRunner {
         targetSha: attempt.targetSha,
         baseSha: attempt.baseSha,
         reviewEvent: attempt.reviewEvent,
+        onLookupIdentity: (actor) => { if (lookup.actor === null) lookup.actor = actor; },
       });
       if (found === null) {
-        // An absence may only be certified when the lookup ran as the SAME
-        // account that prepared the write (native R2 F2): an account
+        // An absence may only be certified when the LOOKUP ran as the SAME
+        // account that prepared the write (native R2 F2 / R3): an account
         // rotation between the prepared write and the restart can exclude a
         // surviving review from a fresh lookup, which is not proof that the
         // write failed.
@@ -2718,25 +2736,21 @@ export class WaveRunner {
         const boundIdentity = identityEvent !== null && identityEvent.seq > attemptEvent.seq
           ? parsePublicationIdentityPayload(identityEvent.payload)
           : null;
+        const searchedAs = lookup.actor;
         let identityContinuity: 'same' | 'different' | 'unknown' = 'unknown';
-        if (boundIdentity !== null) {
-          try {
-            const current = typeof poster.authenticatedActor === 'function' ? await poster.authenticatedActor(attempt.host) : '';
-            identityContinuity = typeof current === 'string' && current.trim() !== ''
-              ? (current.toLowerCase() === boundIdentity.actor.toLowerCase() ? 'same' : 'different')
-              : 'unknown';
-          } catch {
-            identityContinuity = 'unknown';
-          }
+        if (boundIdentity !== null && searchedAs !== null && searchedAs.trim() !== '') {
+          identityContinuity = searchedAs.toLowerCase() === boundIdentity.actor.toLowerCase() ? 'same' : 'different';
         }
         if (identityContinuity !== 'same') {
           this.escalate(
             `Perkins publication attempt for round ${round.id} cannot be certified absent`,
             `the provider lookup found no matching publication, but ${boundIdentity === null
               ? 'the attempt carries no durably bound posting identity, so the lookup cannot be proved to have searched as the account that prepared the write'
-              : identityContinuity === 'different'
-                ? `the prepared posting identity "${boundIdentity.actor}" is not the currently authenticated account, so a review by the original account may sit outside the lookup`
-                : `the prepared posting identity "${boundIdentity.actor}" cannot be re-evidenced as continuous right now`}; the frozen-commit outcome stays unresolved and same-head re-publication stays closed`,
+              : searchedAs === null
+                ? `the reconciliation lookup did not report the account it authenticated as, so it cannot be proved to have searched as the prepared identity "${boundIdentity.actor}"`
+                : identityContinuity === 'different'
+                  ? `the reconciliation lookup ran as "${searchedAs}", not the prepared posting identity "${boundIdentity.actor}", so a review by the original account may sit outside the lookup`
+                  : `the prepared posting identity "${boundIdentity.actor}" cannot be re-evidenced as continuous right now`}; the frozen-commit outcome stays unresolved and same-head re-publication stays closed`,
             { jobId: round.jobId, roundId: round.id },
           );
           return 'held';

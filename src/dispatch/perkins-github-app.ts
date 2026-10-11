@@ -816,6 +816,9 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     }
     const { grant, botLogin, owner, repo, prNumber, baseSha } = await this.prepare(input);
     const wantedState = enactedStateFor(input.reviewEvent);
+    // Report the account this lookup authenticated as, before any provider
+    // read: recovery binds absence to THIS identity (native R3).
+    input.onLookupIdentity?.(botLogin);
     const { matched, provablyAbsent, matchedButUnreceiptable, matchedButWrongState } = await this.lookupMatchingReview(grant, owner, repo, prNumber, botLogin, input.targetSha, input.body, wantedState, null, input.signal);
     if (matched !== null) {
       return verifyPostedReceipt(
