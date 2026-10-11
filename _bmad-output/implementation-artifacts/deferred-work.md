@@ -209,3 +209,11 @@ warrants. They are recorded, not dropped:
 - source_spec: `_bmad-output/implementation-artifacts/spec-merge-authority-boundary.md`
   summary: The BMAD-onboarding rehearsal script still describes the fallback as "clear to merge" and Perkins as carrying "autonomous-merge authority".
   evidence: `scripts/rehearsal-bmad-onboarding.mjs:62-66` — repo-internal rehearsal harness (not shipped in the package, not session-reaching). The round-3 concluding review flagged it as a follow-up on untouched code; the shipped boundary (a fallback PASS is not a Perkins READY; no agent merges a PR) already governs real sessions.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The mailbox snapshot validator accepts `kind: "job"` with `jobId: null`; For Gru membership can omit the item while mailbox counts still include it if a malformed server frame reaches the client. Current `projectMailbox` derives kind from the job ID, so this is a pre-existing protocol-validation gap, not a SLIM change.
+  evidence: `web/src/lib/board-protocol.ts:1143` permits nullable IDs; `web/src/lib/board-bands.ts:293-295` filters null-ID jobs; `src/gru-mailbox/projection.ts:49-54` derives `kind` from `jobId`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The mailbox snapshot validator accepts an empty `reasons` array for a non-resolved item, leaving its For Gru detail without a human-readable reason label if a malformed frame reaches the client. The required basis is still displayed, and current projection emits items with reasons; this is pre-existing protocol hardening, not a SLIM change.
+  evidence: `web/src/lib/board-protocol.ts:1144` checks array shape but not non-emptiness; `web/src/ui/board.ts:1555-1559` renders reason labels and basis; `src/gru-mailbox/projection.ts:176-177` appends a job item only when `reasons.length > 0`, while incident reasons derive from notification rows at `src/gru-mailbox/projection.ts:219-235`.

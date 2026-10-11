@@ -142,19 +142,18 @@ function validWakeStamp(stamp: string | null): string | null {
   // into a later month. Validate the supplied date portion before showing an
   // age; the snapshot remains usable and the UI can say the time is unknown.
   const dateParts = /^(\d{4})-(\d{2})-(\d{2})(?:$|[Tt\s])/u.exec(stamp);
-  if (dateParts !== null) {
-    const year = Number(dateParts[1]);
-    const month = Number(dateParts[2]);
-    const day = Number(dateParts[3]);
-    const calendar = new Date(0);
-    calendar.setUTCFullYear(year, month - 1, day);
-    if (
-      calendar.getUTCFullYear() !== year ||
-      calendar.getUTCMonth() !== month - 1 ||
-      calendar.getUTCDate() !== day
-    ) {
-      return null;
-    }
+  if (dateParts === null) return null;
+  const year = Number(dateParts[1]);
+  const month = Number(dateParts[2]);
+  const day = Number(dateParts[3]);
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(year, month - 1, day);
+  if (
+    calendar.getUTCFullYear() !== year ||
+    calendar.getUTCMonth() !== month - 1 ||
+    calendar.getUTCDate() !== day
+  ) {
+    return null;
   }
   return stamp;
 }

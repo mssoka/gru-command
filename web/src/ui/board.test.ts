@@ -731,6 +731,14 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     view.render(impossibleDate);
     expect(wakes?.querySelector('.board-age-split__num')).toBeNull();
     expect(wakes?.querySelector('.board-wakes__unknown')).not.toBeNull();
+    // Date.parse also normalizes this non-canonical date-only form; do not
+    // let it bypass the calendar guard and manufacture a plausible age.
+    expect(Number.isFinite(Date.parse('2026-2-30'))).toBe(true);
+    const nonCanonicalImpossibleDate = snapshot({ wakes: { count: 3, lastAt: '2026-2-30' } });
+    expect(isValidSnapshot(nonCanonicalImpossibleDate)).toBe(true);
+    view.render(nonCanonicalImpossibleDate);
+    expect(wakes?.querySelector('.board-age-split__num')).toBeNull();
+    expect(wakes?.querySelector('.board-wakes__unknown')).not.toBeNull();
     // 0 + no stamp WITH deferred demand: still the honest no-wakes state —
     // no fire time exists, so it is not "unknown"; the deferred tally is a
     // separate fact beside it.

@@ -909,7 +909,7 @@ const HIDDEN_BOUNDARIES: ReadonlyArray<readonly [number, number]> = [
   [999, 1000],
 ];
 
-for (const [width, height] of [[1440, 900], [360, 740]] as const) {
+for (const [width, height] of VIEWPORTS) {
   for (const [h1, h2] of HIDDEN_BOUNDARIES) {
     test(`older-pending hidden count crosses ${h1}→${h2} inside its reserved slot at ${width}×${height}`, async ({ page }) => {
       await page.setViewportSize({ width, height });
