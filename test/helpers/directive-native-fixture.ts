@@ -94,3 +94,29 @@ export function withNativeDirectiveFixture(handle: AgentHandle, file: string, on
     cessationEvidence: () => disposed ? 'ceased' : 'unknown',
   };
 }
+
+/** Capture real original SDK ownership at fixture acceptance, never recovery. */
+export async function bindOriginalRebriefSdkOwner(ledger: LedgerApi, markers: readonly import('../../src/ledger/api.js').PendingRebriefRecord[], input: { cwd: string; dataDir: string; agentId: string; sessionFile?: string }): Promise<void> {
+  const [{ loadConfig }, { PiRuntime }, { SessionStore }, { makeStubModelRuntime, StubScript }] = await Promise.all([
+    import('../../src/config.js'), import('../../src/runtime/pi-adapter.js'), import('../../src/sessions/store.js'), import('./stub-model.js'),
+  ]);
+  const { join } = await import('node:path');
+  const marker = markers.find((row) => row.kind === 'silas.rebrief');
+  if (marker === undefined || marker.workRevision === null) throw new Error('original SDK fixture requires its accepted marker/revision');
+  const home = join(input.dataDir, `original-sdk-${marker.id}`); mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, 'config.toml'), `workspace_root = ${JSON.stringify(input.cwd)}\n[models]\ndefault = "gru-stub/stub-model"\n`);
+  const config = loadConfig({ GRU_COMMAND_HOME: home, GRU_COMMAND_DATA_DIR: home, GRU_COMMAND_WORKSPACE_DIR: input.cwd }, input.cwd);
+  const store = new SessionStore(input.dataDir);
+  const runtime = new PiRuntime({ config, store, agentDir: home, modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['original accepted legacy SDK turn'] }])) });
+  try {
+    const handle = await runtime.spawn('minion', { cwd: input.cwd, agentId: input.agentId, ...(input.sessionFile === undefined ? {} : { resumeFile: input.sessionFile }) });
+    if (handle.sessionFile === null || handle.prepareDirectiveProducer === undefined) throw new Error('original SDK ownership unavailable');
+    ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: handle.id, sessionFile: handle.sessionFile });
+    const identity = { requestId: marker.id, jobId: marker.jobId, payloadHash: marker.payloadHash, workRevision: marker.workRevision,
+      authorityEpoch: ledger.directiveRecoveryEpoch(marker.jobId), contractSha256: ledger.directiveCurrentAuthority(marker.jobId).contractSha256 };
+    handle.prepareDirectiveProducer(identity);
+    await handle.prompt(JSON.stringify({ note: marker.note, briefing: marker.briefing, work_revision: marker.workRevision, phase_id: marker.phaseId }), { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } });
+    await handle.dispose();
+    if (handle.cessationEvidence?.() !== 'ceased') throw new Error('original SDK did not prove physical cessation');
+  } finally { await runtime.dispose(); store.dispose(); }
+}

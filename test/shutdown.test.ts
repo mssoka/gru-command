@@ -280,3 +280,41 @@ describe('graceful shutdown', () => {
     }
   });
 });
+
+it('P33 production directive resource shutdown joins progress before failing registry and cannot skip either stage', async () => {
+  const { disposeDirectiveResources } = await import('../src/dispatch/directive-progress.js');
+  const order: string[] = []; let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const run = disposeDirectiveResources({ dispose: async () => { order.push('progress-stop'); await pending; order.push('progress-joined'); } },
+    { dispose: async () => { order.push('registry'); throw new Error('registry teardown fault'); } }).then(() => null, (error: unknown) => error);
+  await Promise.resolve(); expect(order).toEqual(['progress-stop']); release();
+  expect(await run).toBeInstanceOf(AggregateError); expect(order).toEqual(['progress-stop', 'progress-joined', 'registry']);
+  order.length = 0;
+  const both = await disposeDirectiveResources({ dispose: async () => { order.push('progress'); throw new Error('progress failure'); } },
+    { dispose: async () => { order.push('registry'); throw new Error('registry failure'); } }).then(() => null, (error: unknown) => error);
+  expect(order).toEqual(['progress', 'registry']); expect((both as AggregateError).errors).toHaveLength(2);
+});
+
+it('P33 actual main shutdown joins progress even when shared registry disposal rejects', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'gru-main-progress-fault-')); cleanupDirs.push(home);
+  writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n');
+  const trace = join(home, 'shutdown-order.jsonl'); const hook = join(home, 'fault-hook.mjs');
+  const root = join(import.meta.dirname, '..');
+  writeFileSync(hook, `import { appendFileSync } from 'node:fs';
+import { DirectiveProgressService } from ${JSON.stringify(`file://${join(root, 'dist/dispatch/directive-progress.js')}`)};
+import { RuntimeRegistry } from ${JSON.stringify(`file://${join(root, 'dist/runtime/registry.js')}`)};
+const trace = ${JSON.stringify(trace)}; const original = DirectiveProgressService.prototype.dispose;
+DirectiveProgressService.prototype.dispose = async function() { appendFileSync(trace, 'progress-stop\\n'); await original.call(this); appendFileSync(trace, 'progress-joined\\n'); };
+RuntimeRegistry.prototype.dispose = async function() { appendFileSync(trace, 'registry\\n'); throw new Error('controlled shared registry shutdown refusal'); };
+`);
+  const child = spawn(process.execPath, ['--import', hook, process.env.GH286_RECEIVED_MAIN ?? 'dist/main.js'], {
+    cwd: root, env: { ...process.env, GRU_COMMAND_HOME: home }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = ''; child.stderr.on('data', (bytes: Buffer) => { stderr += bytes.toString('utf8'); });
+  const exited = new Promise<number | null>((resolve) => child.on('exit', resolve));
+  try {
+    await waitForHealthyPort(home, () => stderr); child.kill('SIGTERM'); expect(await exited).toBe(0);
+    expect(readFileSync(trace, 'utf8').trim().split('\n')).toEqual(['progress-stop', 'progress-joined', 'registry']);
+    expect(readLogLines(home).some((line) => String(line.msg).includes('dispose failed'))).toBe(true);
+  } finally { if (child.exitCode === null) child.kill('SIGKILL'); await exited; }
+});

@@ -1,3 +1,4 @@
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import { DirectiveProgressService } from '../src/dispatch/directive-progress.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -1142,7 +1143,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const delivered = h.ledger.appendCustomEvent({
       kind: 'job.delivered',
       jobId: 'job-z',
-      payload: { request_id: 'req-z-next', source: 'silas-directive', sha: laneHead(lane) },
+      payload: { request_id: 'req-z-next', source: 'silas-directive', sha: laneHead(lane), agentId: 'minion-z', work_revision: h.ledger.getDirective('req-z-next')!.workRevision },
     });
     h.ledger.recordDirectiveDelivery({ requestId: 'req-z-next', eventSeq: delivered.seq });
     expect((await digest()).prWithoutReview.map((row) => row.jobId)).toEqual(['job-z']);
@@ -1658,7 +1659,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
       h.ledger.beginDirectiveIntent({ jobId: 'job-settled-owner-race', directive: 'fresh repair', holder: 'silas-ops', requestId: 'req-settled-owner-next' });
       admitNativeDirectiveFixture(h.ledger, 'req-settled-owner-next', 'fresh-settled-minion', join(h.dir, 'fresh-settled-minion.jsonl'));
       const delivered = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-settled-owner-race',
-        payload: { request_id: 'req-settled-owner-next', minion_id: 'fresh-settled-minion', sha: laneHead(lane) } });
+        payload: { request_id: 'req-settled-owner-next', minion_id: 'fresh-settled-minion', agentId: 'fresh-settled-minion', work_revision: h.ledger.getDirective('req-settled-owner-next')!.workRevision, sha: laneHead(lane) } });
       h.ledger.recordDirectiveDelivery({ requestId: 'req-settled-owner-next', eventSeq: delivered.seq });
       return { blockers: [], note: null };
     }, config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
@@ -1843,7 +1844,9 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
     let subjectId = original.requestId; let payloadHash = original.payloadHash;
     if (kind === 'rebriefs') {
       h.ledger.failDirective({ requestId: original.requestId, reason: 'fixture never dispatched' });
-      const marker = h.ledger.beginPendingRebrief({ jobId, note: 'historical unresolved', briefing: 'original approved scope' }).find((row) => row.kind === 'silas.rebrief')!;
+      const originals = h.ledger.beginPendingRebrief({ jobId, note: 'historical unresolved', briefing: 'original approved scope' });
+      await bindOriginalRebriefSdkOwner(h.ledger, originals, { cwd: lane.path, dataDir: h.dir, agentId: 'original-owner-minion' });
+      const marker = h.ledger.listPendingRebriefs({ jobId }).find((row) => row.kind === 'silas.rebrief')!;
       subjectId = marker.id; payloadHash = marker.payloadHash;
     }
     const debt = kind === 'directives' ? h.ledger.openDirectiveRecoveryDebt(subjectId, 'unknown original effects')
@@ -2017,6 +2020,28 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
     expect(h.ledger.latestJobEvent(f.jobId, 'silas.recovery-owner-stop-confirmed')).toBeNull(); expect(h.spawns).toEqual([]);
   });
 
+  it('P28 genuine late completed receipts cannot conceal the still-held transferred owner after the snapshot changes', async () => {
+    const f = await ownerFixture('rebriefs'); const { h } = f;
+    const markers = h.ledger.listPendingRebriefs({ jobId: f.jobId }); const originalHash = h.ledger.rebriefReceiptEvidence(f.subjectId).sha256;
+    for (const marker of markers) h.ledger.appendCustomEvent({ kind: marker.kind, jobId: marker.jobId, payload: { marker_id: marker.id, payload_hash: marker.payloadHash,
+      minion_id: marker.agentId, agentId: marker.agentId, work_revision: marker.workRevision } });
+    expect(h.ledger.rebriefReceiptEvidence(f.subjectId).sha256).not.toBe(originalHash);
+    expect(h.ledger.recoveryOwnerBasis('rebrief', f.subjectId).owned).toBe(false);
+    for (let restart = 0; restart < 2; restart += 1) {
+      const db = new LedgerDb(h.dir); const ledger = new LedgerApi(db.handle);
+      try { expect(() => ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/owner transfer.*new receipts/); expect(ledger.listPendingRebriefs({ jobId: f.jobId })).toEqual(markers); }
+      finally { db.close(); }
+    }
+    const renewed = h.ledger.openRebriefRecoveryDebt(f.subjectId, 'updated immutable facts need explicit owner resolution');
+    expect((await call(h.port, 'POST', `${f.route}/recover`, { ...f.recoveryBody(renewed.generation), decision: { kind: 'owner-decision', obligation_id: f.target.id } }, TOKEN)).status).toBe(200);
+    const permission = await call(h.port, 'POST', `${f.route}/owner-resolution`, await f.actionBody('release-current-facts'), TOKEN); expect(permission.status).toBe(200);
+    const ruling = h.ledger.getEvent(field<number>(permission.json, 'event_seq'))!;
+    expect((await call(h.port, 'POST', `${f.route}/owner-resolution/confirm-stop`, { ...await f.actionBody('release-current-facts'), expected_resolution_fingerprint: (ruling.payload as { fingerprint: string }).fingerprint }, TOKEN)).status).toBe(200);
+    h.ledger.setJobStatus(f.jobId, 'working');
+    expect(h.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true); expect(h.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(false);
+    expect(h.ledger.listJobEventsByKinds(f.jobId, ['silas.rebrief-settled'])).toHaveLength(1); expect(h.spawns).toEqual([]);
+  });
+
   it('incoherent historical generation may only transfer its exact unknown evidence to the real reserved owner stop', async () => {
     const h = await boot(); const repo = makeFixtureRepo('owner-incoherent'); cleanupRepos.push(repo);
     const jobId = 'incoherent-owner-job'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
@@ -2053,7 +2078,7 @@ describe('legacy proven completion without fabricated historical delivery', () =
     const jobId = 'completed-control-job'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
     const originalMarkers = h.ledger.beginPendingRebrief({ jobId, note: 'old completed work', briefing: 'original approved scope',
       handoff: { kind: 'gru-decision', decision: 'original phase completion' } });
-    h.ledger.bindPendingRebriefWorker({ ids: originalMarkers.map((row) => row.id), agentId: 'original-completed-minion', sessionFile: null });
+    await bindOriginalRebriefSdkOwner(h.ledger, originalMarkers, { cwd: lane.path, dataDir: h.dir, agentId: 'original-completed-minion' });
     const markers = h.ledger.listPendingRebriefs({ jobId }); const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
     const original = h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, agentId: 'original-completed-minion',
       payload: { phase_id: marker.phaseId, minion_id: 'original-completed-minion', note: 'real completed original phase; no duplicated revision or historical HEAD' } });
@@ -2096,12 +2121,51 @@ describe('legacy proven completion without fabricated historical delivery', () =
     const current = await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: 'separate-current-inspection', directive: instruction }, TOKEN);
     expect(current.status, JSON.stringify(current.json)).toBe(202);
     for (let i = 0; i < 200 && h.ledger.getDirective('separate-current-inspection')?.state !== 'settled'; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(h.ledger.getDirective('separate-current-inspection')?.state).toBe('settled'); expect(h.ledger.getObligation(debts[0]!.id)?.state).toBe('settled');
+    expect(h.ledger.getDirective('separate-current-inspection')?.state).toBe('settled'); expect(h.ledger.getObligation(debts[0]!.id)?.state).toBe('closed');
+    const gateDuty = h.ledger.listObligations({ jobId: f.jobId }).find((row) => row.incidentKey === `rebrief-current-gates:${f.marker.id}`)!;
+    expect(gateDuty.state).toBe('open'); expect(gateDuty.nextAction).toMatchObject({ kind: 'gru-decision', decision: expect.stringContaining('POST /api/verify') });
+    expect(h.ledger.getObligation(debts[0]!.id)?.settlement).toMatchObject({ kind: 'superseded', byObligationId: gateDuty.id });
+    expect(h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-current-gates-owed')?.payload).toMatchObject({ closure_seq: audit.seq, inspection_request_id: 'separate-current-inspection', obligation_id: gateDuty.id });
     const delivery = h.ledger.latestJobEvent(f.jobId, 'job.delivered')!;
     expect(delivery.payload).toMatchObject({ request_id: 'separate-current-inspection' });
     expect((delivery.payload as Record<string, unknown>)['marker_id']).toBeUndefined();
     expect(h.ledger.getEvent(f.original.seq)?.payload).toEqual(f.original.payload);
     expect(h.ledger.latestJobEvent(f.jobId, 'verification.ready')).toBeNull();
+  });
+
+  it('P32 current gate duty refuses generic evidence and binding laundering while retaining safe transferred ownership across restart', async () => {
+    const f = await completedFixture(); const { h } = f;
+    expect((await call(h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN)).status).toBe(200);
+    const audit = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')!;
+    const instruction = (audit.payload as { inspection_directive: string }).inspection_directive;
+    expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: 'separate-current-inspection', directive: instruction }, TOKEN)).status).toBe(202);
+    await waitFor(() => h.ledger.getDirective('separate-current-inspection')?.state === 'settled', 'actual current inspection delivery');
+    const duty = h.ledger.listObligations({ jobId: f.jobId }).find((row) => row.incidentKey === `rebrief-current-gates:${f.marker.id}`)!;
+    expect(duty, 'inspection must transfer concrete still-open current gate ownership').toBeDefined();
+    const delivery = h.ledger.latestJobEvent(f.jobId, 'job.delivered')!;
+    for (const event of [f.original, delivery]) expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: {
+      kind: 'executed-action', action: 'generic prose cannot complete current gates', evidenceEventSeq: event.seq, evidenceEventKind: event.kind } })).toThrow(/current gate duty/);
+    for (const id of [null, duty.id, f.debt.id]) expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: {
+      kind: 'superseded', byObligationId: id, reason: 'unsafe target' } })).toThrow(/distinct live/);
+    const recipient = h.ledger.recordBlockedObservation(f.jobId, { logicalStep: 'verification', incidentKey: 'explicit-current-gate-action-transfer', observedAtSeq: h.ledger.latestEventSeq(),
+      category: { kind: 'known', category: 'restart-recovery' }, nextAction: duty.nextAction });
+    h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'superseded', byObligationId: recipient.id, reason: 'explicit separate action ownership preserving every still-owed binding' } });
+    for (let restart = 0; restart < 2; restart += 1) {
+      const db = new LedgerDb(h.dir); const ledger = new LedgerApi(db.handle);
+      try {
+        expect(ledger.getObligation(recipient.id)?.nextAction).toEqual(duty.nextAction);
+        expect(() => ledger.settleObligation({ obligationId: recipient.id, settlement: { kind: 'accepted-evidence', gate: 'current applicable gates', evidenceEventSeq: delivery.seq, evidenceEventKind: delivery.kind } })).toThrow(/current gate duty/);
+        expect(() => ledger.recordBlockedObservation(f.jobId, { logicalStep: 'verification', incidentKey: recipient.incidentKey, observedAtSeq: ledger.latestEventSeq() + 1,
+          category: { kind: 'known', category: 'restart-recovery' }, nextAction: { kind: 'gru-decision', decision: 'inspection alone answered every gate' } })).toThrow(/launder/);
+        expect(() => ledger.settleObligation({ obligationId: recipient.id, settlement: { kind: 'job-terminal', jobStatus: 'binned' } })).toThrow(/actual matching terminal/);
+        ledger.recordDirectiveDelivery({ requestId: 'separate-current-inspection', eventSeq: delivery.seq });
+        expect(ledger.listJobEventsByKinds(f.jobId, ['silas.rebrief-current-gates-owed'])).toHaveLength(1);
+        expect(ledger.getObligation(recipient.id)?.state).toBe('open');
+      } finally { db.close(); }
+    }
+    expect(h.ledger.getEvent(f.original.seq)?.payload).toEqual(f.original.payload);
+    h.ledger.setJobStatus(f.jobId, 'binned'); expect(h.ledger.getObligation(recipient.id)?.state).toBe('closed');
+    expect(h.ledger.getObligation(recipient.id)?.settlement).toEqual({ kind: 'job-terminal', jobStatus: 'binned' });
   });
 
   it('completed control closure refuses stale receipt/current scope, foreign proof and live/queued producers without effects', async () => {

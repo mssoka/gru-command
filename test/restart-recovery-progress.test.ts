@@ -1,3 +1,4 @@
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -884,7 +885,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       const start = f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-started');
       expect(start === null).toBe(!afterDurability);
       expect(f.ledger.getDirective(f.intent.requestId)?.dispatchStartedAt !== null).toBe(mode === 'dispatch');
-      expect(f.ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint !== null).toBe(mode === 'checkpoint');
+      expect(f.ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint).toBeNull(); // preparation/publication never entered native continue
       if (start !== null) expect(start.payload).toMatchObject({ request_id: f.intent.requestId, producer_identity: f.identity });
       expect(f.spawns).toHaveLength(1); expect(f.native.prompts).toEqual([]); expect(f.native.continuations).toBe(0);
       expect(readFileSync(f.file, 'utf8')).toBe(prefix);
@@ -1226,14 +1227,14 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
   });
 
-  it('an owner amendment during awaited resume prevents old execution despite a durable claim', async () => {
+  it('an owner amendment during awaited resume prevents old execution before the native checkpoint claim', async () => {
     const f = await fixture(); f.seed(); const gate = deferred<void>(); f.spawnGate(gate.promise);
     const service = new DirectiveProgressService(f.deps); service.reconsider(); await Promise.resolve(); expect(f.spawns).toHaveLength(1);
     expect(f.ledger.addJobAmendment({ jobId: f.intent.jobId, body: 'New approved requirement during spawn.', supersedes: [],
       approval: { by: 'owner', reference: 'GH-286 during-spawn approval' }, effect: 'material', expectedContractSha256: f.identity.contractSha256 }).status).toBe('accepted');
     gate.resolve(); await service.settled();
     expect(f.native.continuations).toBe(0); expect(f.native.prompts).toEqual([]);
-    expect(f.ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint).not.toBeNull();
+    expect(f.ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint).toBeNull();
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
   });
 
@@ -1314,18 +1315,21 @@ describe('restart-recovery-progress — exact native request matrix', () => {
 
   it('historical marker successor is exact-generation guarded and hands off actual authority once', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture no-effect' });
-    const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'legacy', briefing: 'original contract' });
-    const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
+    f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'legacy', briefing: 'original contract' });
+    const markers = f.ledger.listPendingRebriefs();
+    await bindOriginalRebriefSdkOwner(f.ledger, markers, { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
+    const boundMarkers = f.ledger.listPendingRebriefs();
+    const marker = boundMarkers.find((row) => row.kind === 'silas.rebrief')!;
     const debt = f.ledger.openRebriefRecoveryDebt(marker.id, 'unknown native effects');
     const input = { ...f.deps, markerId: marker.id, generation: debt.generation, expectedPayloadHash: marker.payloadHash,
       expectedReceiptEvidenceSha256: f.ledger.rebriefReceiptEvidence(marker.id).sha256,
       expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId), expectedWorkRevision: f.ledger.directiveCurrentAuthority(f.intent.jobId).workRevision, expectedContractSha256: f.ledger.directiveCurrentAuthority(f.intent.jobId).contractSha256, expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), reason: 'inspect preserved artifacts and finish under fresh authority',
       decision: { kind: 'successor' as const, requestId: 'marker-successor', directive: 'finish approved historical contract' } };
     expect(() => recoverInterruptedRebriefFromRoute({ ...input, generation: 999 })).toThrow(/stale/);
-    expect(f.ledger.listPendingRebriefs()).toEqual(markers);
+    expect(f.ledger.listPendingRebriefs()).toEqual(boundMarkers);
     const accepted = recoverInterruptedRebriefFromRoute(input);
     expect(f.ledger.listPendingRebriefs()).toEqual([]);
-    expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.rebrief-retired')?.payload).toMatchObject({ markers });
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.rebrief-retired')?.payload).toMatchObject({ markers: boundMarkers });
     expect(recoverInterruptedRebriefFromRoute(input).idempotent).toBe(true);
     await executeAcceptedDirective(f.deps, accepted.successor!.requestId);
     expect(f.native.prompts).toHaveLength(1); expect(f.ledger.getObligation(debt.id)?.state).toBe('settled');
@@ -1333,7 +1337,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('lone exact legacy delivery stays partial immutable history; fresh evidence-fenced judgment executes only a distinct successor', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture never dispatched' });
     f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'legacy partial delivery', briefing: 'original contract' });
-    f.ledger.bindPendingRebriefWorker({ ids: f.ledger.listPendingRebriefs().map((row) => row.id), agentId: 'logical-minion', sessionFile: f.native.sessionFile });
+    await bindOriginalRebriefSdkOwner(f.ledger, f.ledger.listPendingRebriefs(), { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
     const markers = f.ledger.listPendingRebriefs(); const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
     const delivery = markers.find((row) => row.kind === 'job.delivered')!;
     const receipt = f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: marker.jobId, agentId: 'logical-minion', payload: {
@@ -1368,7 +1372,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('late genuine legacy completion wins over judgment and never retires or executes the original generation', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture never dispatched' });
     f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'late original', briefing: 'contract' });
-    f.ledger.bindPendingRebriefWorker({ ids: f.ledger.listPendingRebriefs().map((row) => row.id), agentId: 'logical-minion', sessionFile: f.native.sessionFile });
+    await bindOriginalRebriefSdkOwner(f.ledger, f.ledger.listPendingRebriefs(), { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
     const markers = f.ledger.listPendingRebriefs(); const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
     const debt = f.ledger.openRebriefRecoveryDebt(marker.id, 'no receipt yet'); const authority = f.ledger.directiveCurrentAuthority(marker.jobId);
     const input = { ...f.deps, markerId: marker.id, generation: debt.generation, expectedPayloadHash: marker.payloadHash,
@@ -1407,4 +1411,206 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
   });
 
+});
+
+it('P27 existing exact original delivery settles bookkeeping after material authority changes without reviving work', async () => {
+  const f = await fixture(); f.seed(); f.native.append({ role: 'assistant', stopReason: 'stop', content: [] });
+  const admitted = inspectDirectiveCheckpoint(f.file, f.identity); if (admitted.state === 'unknown') throw new Error(admitted.reason);
+  f.ledger.bindDirectiveNativeAdmission(admitted.binding);
+  const delivered = f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.intent.jobId, agentId: 'logical-minion', payload: {
+    request_id: f.intent.requestId, work_revision: 0, agentId: 'logical-minion', sha: resolveGitCommit(f.lane.path, 'HEAD') } });
+  f.ledger.addJobAmendment({ jobId: f.intent.jobId, body: 'new approved requirement after original completion', supersedes: [],
+    approval: { by: 'owner', reference: 'P27' }, effect: 'material', expectedContractSha256: f.identity.contractSha256 });
+  f.ledger.setJobStatus(f.intent.jobId, 'parked');
+  const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+  expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'settled', workRevision: 0, deliverySeq: delivered.seq });
+  expect(f.ledger.getJob(f.intent.jobId)?.status).toBe('parked'); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+  expect(f.ledger.getEvent(delivered.seq)?.payload).toEqual(delivered.payload); await service.dispose();
+});
+
+it('P28 actual production recovery escalation closes only its exact ordinary guarded generation and survives restart', async () => {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'original native intent never dispatched' });
+  const original = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'legacy pair', briefing: 'accepted historical contract' });
+  await bindOriginalRebriefSdkOwner(f.ledger, original, { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
+  const markers = f.ledger.listPendingRebriefs(); const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
+  const observed = await reconcilePendingRebriefs(f.deps); await observed.settled;
+  const debt = f.ledger.listObligations({ jobId: marker.jobId }).find((row) => row.incidentKey === `rebrief-recovery:${marker.id}`)!;
+  const action = f.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${marker.jobId}`, 'active')!;
+  expect(action.routing).toBe('action-required'); expect(action.detail).toContain(`/api/silas/rebriefs/${marker.id},`);
+  const owner = f.notifications.postIncident({ kind: 'P28-unrelated-owner', routing: 'needs-owner', severity: 'error', title: 'separate owner stop', detail: 'do not acknowledge', dedupe: 'active' });
+  const unrelated = f.ledger.recordBlockedObservation(marker.jobId, { logicalStep: 'operation', incidentKey: 'unrelated-P28', observedAtSeq: marker.baselineSeq,
+    category: { kind: 'known', category: 'restart-recovery' }, nextAction: { kind: 'gru-decision', decision: 'independent task remains owed' } });
+  for (const row of markers) f.ledger.appendCustomEvent({ kind: row.kind, jobId: row.jobId, agentId: 'logical-minion', payload: {
+    marker_id: row.id, payload_hash: row.payloadHash, agentId: 'logical-minion', minion_id: 'logical-minion', work_revision: row.workRevision } });
+  expect(f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+  expect(f.ledger.getObligation(debt.id)?.state).toBe('settled'); expect(f.ledger.getObligation(unrelated.id)?.state).toBe('open');
+  expect(f.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${marker.jobId}`, 'active')).toBeNull();
+  expect(f.ledger.getNotification(action.id)).toMatchObject({ ackedAt: null, resolvedBy: 'rebrief-recovery-evidence' });
+  const reopenedDb = new LedgerDb(f.dir); const reopened = new LedgerApi(reopenedDb.handle);
+  try {
+    expect(reopened.getObligation(debt.id)?.state).toBe('settled'); expect(reopened.getNotification(action.id)?.resolvedAt).not.toBeNull();
+    expect(reopened.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(false);
+  } finally { reopenedDb.close(); }
+  expect(f.ledger.findNotificationByKind('P28-unrelated-owner', 'active')?.id).toBe(owner.id); expect(action.id).not.toBe(owner.id);
+  expect(f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(false); expect(f.ledger.listJobEventsByKinds(marker.jobId, ['silas.rebrief-settled'])).toHaveLength(1);
+});
+
+it('P29 an idle historical logical minion and absent producer journal never prove physical cessation', async () => {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'not dispatched' });
+  const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'unproven legacy original', briefing: 'original contract' });
+  f.ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: 'logical-minion', sessionFile: f.file });
+  const marker = f.ledger.listPendingRebriefs().find((row) => row.kind === 'silas.rebrief')!;
+  expect(f.ledger.rebriefProgressBlockers(marker.id, f.lane.id)).toContain('original historical native physical cessation remains UNKNOWN');
+  expect(f.ledger.listPendingRebriefs()).toHaveLength(2); expect(f.spawns).toEqual([]);
+});
+
+it('P31 old phase completion may omit revision but a historical delivery may not', async () => {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'not dispatched' });
+  const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'old phase', briefing: 'original contract', handoff: { kind: 'gru-decision', decision: 'finish original phase' } });
+  f.ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: 'logical-minion', sessionFile: f.file });
+  const bound = f.ledger.listPendingRebriefs();
+  for (const marker of bound) f.ledger.appendCustomEvent({ kind: marker.kind, jobId: marker.jobId, agentId: 'logical-minion', payload: {
+    phase_id: marker.phaseId, marker_id: marker.id, payload_hash: marker.payloadHash, agentId: 'logical-minion', minion_id: 'logical-minion' } });
+  expect(f.ledger.pendingRebriefReceipt(bound.find((row) => row.kind === 'silas.rebrief')!)).not.toBeNull();
+  expect(f.ledger.pendingRebriefReceipt(bound.find((row) => row.kind === 'job.delivered')!)).toBeNull();
+  expect(() => f.ledger.clearPendingRebriefsIfCurrentAndSettle(bound)).toThrow(/guarded event job.delivered/); expect(f.ledger.listPendingRebriefs()).toEqual(bound);
+});
+
+it('P35 a positively pre-native HEAD preparation failure leaves the original checkpoint claim unconsumed', async () => {
+  const f = await fixture(); f.seed();
+  const head = resolveGitCommit(f.lane.path, 'HEAD'); const gitDir = join(f.lane.path, '.git'); const gitPointer = readFileSync(gitDir, 'utf8');
+  writeFileSync(gitDir, 'gitdir: /nonexistent/gh286-positively-unavailable\n');
+  const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+  expect(f.ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint).toBeNull(); expect(f.spawns).toEqual([]);
+  writeFileSync(gitDir, gitPointer); expect(resolveGitCommit(f.lane.path, 'HEAD')).toBe(head);
+  service.reconsider(); await service.settled(); expect(f.native.continuations).toBe(1); expect(f.native.prompts).toEqual([]);
+  expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); await service.dispose();
+});
+
+it('P29 exact recorded historical ownership survives current contract changes but missing, conflicting and torn original evidence stays fenced', async () => {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
+  const original = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'original accepted legacy', briefing: 'original contract' });
+  await bindOriginalRebriefSdkOwner(f.ledger, original, { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
+  const marker = f.ledger.listPendingRebriefs().find((row) => row.kind === 'silas.rebrief')!;
+  expect(f.ledger.rebriefProgressBlockers(marker.id, f.lane.id)).toEqual([]);
+  const authority = f.ledger.directiveCurrentAuthority(marker.jobId);
+  f.ledger.addJobAmendment({ jobId: marker.jobId, body: 'separately approved current scope after original physical cessation', supersedes: [],
+    effect: 'material', approval: { by: 'owner', reference: 'P29 current contract' }, expectedContractSha256: authority.contractSha256 });
+  expect(f.ledger.directiveCurrentAuthority(marker.jobId).contractSha256).not.toBe(authority.contractSha256);
+  expect(f.ledger.rebriefProgressBlockers(marker.id, f.lane.id)).toEqual([]);
+  const association = `${f.file}.directives.jsonl`; const saved = readFileSync(association, 'utf8');
+  const last = JSON.parse(saved.trimEnd().split('\n').at(-1)!) as { identity: { contractSha256: string } };
+  writeFileSync(association, saved + JSON.stringify({ ...last, identity: { ...last.identity, contractSha256: 'f'.repeat(64) } }) + '\n');
+  expect(f.ledger.rebriefProgressBlockers(marker.id, f.lane.id).some((message) => message.includes('unreadable'))).toBe(true);
+  writeFileSync(association, saved);
+  const native = readFileSync(f.file, 'utf8'); appendFileSync(f.file, '{"type":"message"');
+  expect(f.ledger.rebriefProgressBlockers(marker.id, f.lane.id).some((message) => message.includes('unreadable'))).toBe(true);
+  writeFileSync(f.file, native);
+  f.ledger.bindPendingRebriefWorker({ ids: original.map((row) => row.id), agentId: 'logical-minion', sessionFile: null });
+  expect(f.ledger.rebriefProgressBlockers(marker.id, f.lane.id)).toContain('original historical native session ownership is unbound/UNKNOWN');
+});
+
+it('P28 genuine ordinary settlement rolls back debt and control together on storage failure and retries committed publication idempotently', async () => {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
+  const accepted = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'late pair', briefing: 'original' });
+  f.ledger.bindPendingRebriefWorker({ ids: accepted.map((row) => row.id), agentId: 'logical-minion', sessionFile: f.file });
+  const markers = f.ledger.listPendingRebriefs();
+  const marker = markers.find((row) => row.kind === 'silas.rebrief')!; const debt = f.ledger.openRebriefRecoveryDebt(marker.id, 'old callback missing');
+  for (const row of markers) f.ledger.appendCustomEvent({ kind: row.kind, jobId: row.jobId, payload: { marker_id: row.id, payload_hash: row.payloadHash, work_revision: row.workRevision, minion_id: 'logical-minion', agentId: 'logical-minion' } });
+  f.db.handle.exec("CREATE TRIGGER refuse_p28_close BEFORE UPDATE ON job_obligations WHEN NEW.state = 'settled' BEGIN SELECT RAISE(FAIL, 'P28 storage closure fault'); END");
+  expect(() => f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/P28 storage/);
+  expect(f.ledger.listPendingRebriefs()).toEqual(markers); expect(f.ledger.getObligation(debt.id)?.state).toBe('open');
+  expect(f.ledger.latestJobEvent(marker.jobId, 'silas.rebrief-settled')).toBeNull(); f.db.handle.exec('DROP TRIGGER refuse_p28_close');
+  const actual = f.bus.publish.bind(f.bus); const failure = vi.spyOn(f.bus, 'publish').mockImplementation((event) => { actual(event); if (event.kind === 'silas.rebrief-settled') throw new Error('P28 committed publication fault'); });
+  expect(() => f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/P28 committed/); failure.mockRestore();
+  expect(f.ledger.listPendingRebriefs()).toEqual([]); expect(f.ledger.getObligation(debt.id)?.state).toBe('settled');
+  expect(f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(false); expect(f.ledger.listJobEventsByKinds(marker.jobId, ['silas.rebrief-settled'])).toHaveLength(1);
+});
+
+it('P28 terminal legacy cancellation closes late routine recovery debt administratively without inventing successful completion', async () => {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
+  const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'old interrupted request', briefing: 'original' });
+  f.ledger.setJobStatus(f.intent.jobId, 'binned'); const debt = f.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'late recovery observation');
+  expect(debt.state).toBe('open');
+  const result = f.ledger.retirePendingRebriefs({ jobId: f.intent.jobId, reason: 'actual terminal job control', candidates: markers });
+  expect(result.retired).toHaveLength(2); expect(f.ledger.getObligation(debt.id)?.state).toBe('settled');
+  expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull(); expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.rebrief')).toBeNull();
+  expect(f.ledger.getObligation(debt.id)?.settlement).toMatchObject({ kind: 'executed-action', action: 'exact terminal legacy control administratively retired, not completed' });
+});
+
+it('P28 suspended and claimed exact routine debt retains its pointer until explicit release, never expiry', async () => {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
+  const original = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'original', briefing: 'original accepted contract' });
+  await bindOriginalRebriefSdkOwner(f.ledger, original, { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
+  const markers = f.ledger.listPendingRebriefs(); const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
+  const debt = f.ledger.openRebriefRecoveryDebt(marker.id, 'old callback missing');
+  for (const row of markers) f.ledger.appendCustomEvent({ kind: row.kind, jobId: row.jobId, payload: { marker_id: row.id, payload_hash: row.payloadHash, work_revision: row.workRevision,
+    minion_id: row.agentId, agentId: row.agentId } });
+  f.ledger.suspendObligation(debt.id, 'explicit original-context hold');
+  expect(() => f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/suspended or claimed/);
+  f.ledger.resumeObligation(debt.id, 'explicit safe original-context release');
+  f.ledger.claimObligation({ obligationId: debt.id, expectedGeneration: debt.generation, requestId: 'original-debt-owner', holder: 'gru', expiresAt: '2000-01-01T00:00:00.000Z' });
+  expect(() => f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/suspended or claimed/);
+  expect(f.ledger.listPendingRebriefs()).toEqual(markers); expect(f.ledger.getObligation(debt.id)?.claim?.requestId).toBe('original-debt-owner');
+  f.ledger.releaseClaim({ obligationId: debt.id, requestId: 'original-debt-owner' });
+  expect(f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true); expect(f.ledger.getObligation(debt.id)?.state).toBe('settled');
+});
+
+it('P35 positively pre-native parent tool preparation failure later continues the same original checkpoint once', async () => {
+  const f = await fixture(); f.seed(); let available = false;
+  const service = new DirectiveProgressService({ ...f.deps, parentTools: () => { if (!available) throw new Error('original parent tools temporarily unavailable before spawn'); return []; } });
+  service.reconsider(); await service.settled(); expect(f.ledger.getDirective(f.intent.requestId)?.recoveryCheckpoint).toBeNull();
+  expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0); available = true;
+  service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+  expect(f.native.continuations).toBe(1); expect(f.native.prompts).toEqual([]); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); await service.dispose();
+});
+
+async function assertLateTerminalRecoveryHold(mode: 'suspended' | 'claimed'): Promise<void> {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
+  const markers = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'old interrupted request', briefing: 'original' });
+  f.ledger.setJobStatus(f.intent.jobId, 'binned');
+  const debt = f.ledger.openRebriefRecoveryDebt(markers[0]!.id, 'late terminal original context');
+  const retire = (ledger: LedgerApi) => ledger.retirePendingRebriefs({ jobId: f.intent.jobId, reason: 'actual terminal administrative cancellation', candidates: markers });
+  if (mode === 'suspended') f.ledger.suspendObligation(debt.id, 'original context remains held');
+  else f.ledger.claimObligation({ obligationId: debt.id, expectedGeneration: debt.generation, requestId: 'late-terminal-holder', holder: 'gru', expiresAt: '2000-01-01T00:00:00.000Z' });
+  for (let i = 0; i < 2; i += 1) {
+    const db = new LedgerDb(f.dir); const ledger = new LedgerApi(db.handle);
+    try {
+      expect(() => retire(ledger)).toThrow(mode === 'suspended' ? /suspended or claimed/ : /suspended or claimed|is held by request late-terminal-holder/);
+      expect(ledger.listPendingRebriefs()).toEqual(markers);
+      expect(ledger.getObligation(debt.id)?.state).toBe(mode === 'suspended' ? 'suspended' : 'open');
+      if (mode === 'claimed') expect(ledger.getObligation(debt.id)?.claim?.requestId).toBe('late-terminal-holder');
+      expect(ledger.latestJobEvent(f.intent.jobId, 'silas.rebrief-retired')).toBeNull();
+    } finally { db.close(); }
+  }
+  if (mode === 'suspended') f.ledger.resumeObligation(debt.id, 'explicit original suspension release');
+  else f.ledger.releaseClaim({ obligationId: debt.id, requestId: 'late-terminal-holder' });
+  expect(retire(f.ledger).retired).toHaveLength(2); expect(f.ledger.getObligation(debt.id)?.state).toBe('settled');
+  expect(retire(f.ledger).retired).toEqual([]); expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['silas.rebrief-retired'])).toHaveLength(1);
+  expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull(); expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.rebrief')).toBeNull();
+}
+it('P28 terminal late suspended recovery debt retains exact pointers across restart until explicit release', () => assertLateTerminalRecoveryHold('suspended'));
+it('P28 terminal late expired claimed recovery debt retains exact pointers across restart until explicit release', () => assertLateTerminalRecoveryHold('claimed'));
+
+it('P28 production job incident from a different rebrief generation remains active when older exact routine debt closes', async () => {
+  const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'never dispatched' });
+  const original = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'old original', briefing: 'old original' });
+  await bindOriginalRebriefSdkOwner(f.ledger, original, { cwd: f.lane.path, dataDir: f.dir, agentId: 'logical-minion', sessionFile: f.file });
+  const markers = f.ledger.listPendingRebriefs(); const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
+  const debt = f.ledger.openRebriefRecoveryDebt(marker.id, 'old original observation');
+  const originalRows = f.db.handle.prepare('SELECT * FROM pending_rebriefs').all() as Record<string, string | number | null>[];
+  // Capture a different generation's card from the real producer, not a hand-written incident.
+  f.ledger.clearPendingRebriefs(markers.map((row) => row.id));
+  const newer = f.ledger.beginPendingRebrief({ jobId: f.intent.jobId, note: 'newer request', briefing: 'newer contract' });
+  await reconcilePendingRebriefs(f.deps);
+  const card = f.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${marker.jobId}`, 'active')!;
+  expect(card.detail).toContain(`/api/silas/rebriefs/${newer.find((row) => row.kind === 'silas.rebrief')!.id},`);
+  // Restore the examined old rows solely to exercise the exact closure boundary
+  // with a production newer-generation reservation; receipt truth remains real ledger events.
+  f.ledger.clearPendingRebriefs(newer.map((row) => row.id));
+  for (const row of originalRows) f.db.handle.prepare(`INSERT INTO pending_rebriefs (${Object.keys(row).join(',')}) VALUES (${Object.keys(row).map(() => '?').join(',')})`).run(...Object.values(row));
+  for (const row of markers) f.ledger.appendCustomEvent({ kind: row.kind, jobId: row.jobId, agentId: row.agentId, payload: {
+    marker_id: row.id, payload_hash: row.payloadHash, minion_id: row.agentId, agentId: row.agentId, work_revision: row.workRevision } });
+  expect(f.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true); expect(f.ledger.getObligation(debt.id)?.state).toBe('settled');
+  expect(f.ledger.getNotification(card.id)).toEqual(card);
 });

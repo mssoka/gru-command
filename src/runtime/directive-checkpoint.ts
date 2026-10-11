@@ -313,11 +313,12 @@ export function recordDirectiveIndependentController(producer: DirectiveProducer
  * persistence. No tool can execute unless its exact intent is durably on disk. */
 export function flushDirectiveToolIntent(file: string, assistantMessage: unknown, toolCall: {
   readonly id: string; readonly name: string; readonly arguments: unknown;
-}): void {
+}, identity: DirectiveTurnIdentity, executionMode: 'sequential' | 'parallel' = 'sequential'): void {
   const native = entries(file);
   let index = native.length - 1;
-  // A sequential batch persists each result before preparing the next call.
-  // Only that invocation's contiguous, tree-linked results may follow it.
+  // Sequential batches persist results between preparations; the pinned SDK
+  // prepares every parallel call before executing any or persisting results.
+  // Only this invocation's contiguous, tree-linked results may follow it.
   while (index >= 0 && native[index]?.type === 'message' && native[index]?.message?.role === 'toolResult') index -= 1;
   const invocation = native[index];
   const content = invocation?.message?.content;
@@ -331,6 +332,7 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
         typeof block.arguments !== 'object' || block.arguments === null || pending.has(block.id)) refuse();
     pending.set(block.id as string, block);
   }
+  const batchSize = pending.size;
   let parent = invocation!.id;
   for (const result of native.slice(index + 1)) {
     const message = result.message;
@@ -340,7 +342,31 @@ export function flushDirectiveToolIntent(file: string, assistantMessage: unknown
     pending.delete(id as string);
     parent = result.id;
   }
+  const binding = inspectDirectiveAdmission(file, identity);
+  const start = native.findIndex((entry) => entry.id === binding.userEntryId);
+  if (start < 1 || start >= index) refuse();
+  let ancestor = binding.userEntryId;
+  const chainPending = new Map<string, string>();
+  const ids = new Set(native.slice(0, start + 1).map((entry) => entry.id));
+  for (const entry of native.slice(start + 1)) {
+    const message = entry.message;
+    if (entry.type !== 'message' || !entry.id || ids.has(entry.id) || entry.parentId !== ancestor || !message) refuse();
+    ids.add(entry.id); ancestor = entry.id;
+    if (message!.role === 'assistant') {
+      if (chainPending.size > 0 || message!.stopReason !== 'toolUse' || !Array.isArray(message!.content)) refuse();
+      for (const block of message!.content as Record<string, unknown>[]) {
+        if (block.type !== 'toolCall') continue;
+        if (typeof block.id !== 'string' || !block.id || typeof block.name !== 'string' || !block.name || typeof block.arguments !== 'object' || block.arguments === null || chainPending.has(block.id)) refuse();
+        chainPending.set(block.id as string, block.name as string);
+      }
+      if (chainPending.size === 0) refuse();
+    } else if (message!.role === 'toolResult') {
+      if (typeof message!.toolCallId !== 'string' || chainPending.get(message!.toolCallId) !== message!.toolName || message!.isError !== false || !Array.isArray(message!.content)) refuse();
+      chainPending.delete(message!.toolCallId as string);
+    } else refuse();
+  }
   const requested = pending.get(toolCall.id);
-  if (requested?.name !== toolCall.name || !isDeepStrictEqual(requested.arguments, toolCall.arguments)) refuse();
+  if ((executionMode === 'parallel' ? pending.size !== batchSize : pending.keys().next().value !== toolCall.id) ||
+      requested?.name !== toolCall.name || !isDeepStrictEqual(requested.arguments, toolCall.arguments)) refuse();
   syncFile(file);
 }

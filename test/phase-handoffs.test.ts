@@ -1,3 +1,4 @@
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -89,12 +90,12 @@ function fakeMinion(
 /** Fixture an admitted, completed ORIGINAL legacy turn before reconciliation.
  * Its explicit receipt owns the historical HEAD/revision; today's lane is
  * deliberately allowed to move before finalization. */
-function seedOriginalRebriefCompletion(ledger: LedgerApi, jobId: string, minionId: string, sha: string) {
+async function seedOriginalRebriefCompletion(ledger: LedgerApi, jobId: string, minionId: string, sha: string, cwd: string) {
   const markers = ledger.listPendingRebriefs({ jobId });
   const marker = markers.find((row) => row.kind === 'silas.rebrief')!;
   expect(marker.phaseId).not.toBeNull();
   expect(marker.workRevision).toBeTypeOf('number');
-  ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: minionId, sessionFile: null });
+  await bindOriginalRebriefSdkOwner(ledger, markers, { cwd, dataDir: tmpDir(), agentId: minionId });
   ledger.bindPhaseHandoffMinion({ phaseId: marker.phaseId!, minionId });
   const bound = ledger.listPendingRebriefs({ jobId }).find((row) => row.id === marker.id)!;
   const receipt = ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId, agentId: minionId, payload: {
@@ -181,7 +182,7 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     expect(observeFollowUpDelivery({ ledger: h.ledger, notifications: h.notifications }, legacy)?.created).toBe(true);
   });
 
-  it('a marked re-brief hands back on blocked AND nonblocked lanes without double publication', () => {
+  it('a marked re-brief hands back on blocked AND nonblocked lanes without double publication', async () => {
     const h = makeHarness();
     const worktrees = new InMemoryWorktreePort(join(tmpDir(), 'wt'));
     const repo = makeFixtureRepo('phase-rebrief-original'); cleanupRepos.push(repo);
@@ -204,7 +205,7 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
     expect(h.ledger.getPhaseHandoff(phaseId!)?.state).toBe('awaiting');
     expect(h.ledger.latestJobEvent('job-ph-rb1', 'silas.rebrief')).toBeNull();
     expect(h.ledger.latestJobEvent('job-ph-rb1', 'job.delivered')).toBeNull();
-    const original = seedOriginalRebriefCompletion(h.ledger, 'job-ph-rb1', 'minion-rb1', repo.head());
+    const original = await seedOriginalRebriefCompletion(h.ledger, 'job-ph-rb1', 'minion-rb1', repo.head(), repo.path);
     repo.commitFile('later-checkout.txt', 'not historical completion');
     const finalized = finalizeRebriefRequest({
       ledger: h.ledger,
@@ -244,7 +245,7 @@ describe('explicit phase-completion handoff (fresh dispatch and same-head rebrie
       briefing: 'b',
       handoff: { kind: 'gru-decision', decision: 'rule on the nonblocked lane' },
     });
-    const original2 = seedOriginalRebriefCompletion(h.ledger, 'job-ph-rb2', 'minion-rb2', repo.head());
+    const original2 = await seedOriginalRebriefCompletion(h.ledger, 'job-ph-rb2', 'minion-rb2', repo.head(), repo.path);
     repo.commitFile('later-checkout.txt', 'still not historical completion');
     const finalized2 = finalizeRebriefRequest({
       ledger: h.ledger,
@@ -459,7 +460,7 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
     expect(fourth.published).toBe(0);
   });
 
-  it('a newer request is never completed by an older receipt; a superseded phase stays closed', () => {
+  it('a newer request is never completed by an older receipt; a superseded phase stays closed', async () => {
     const h = makeHarness();
     const worktrees = new InMemoryWorktreePort(join(tmpDir(), 'wt'));
     seedJob(h.ledger, 'job-ph-sup', 'blocked');
@@ -471,7 +472,7 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
       handoff: { kind: 'gru-decision', decision: 'first' },
     });
     const firstPhaseId = first.find((marker) => marker.phaseId !== null)?.phaseId ?? null;
-    const original = seedOriginalRebriefCompletion(h.ledger, 'job-ph-sup', 'minion-old', repo.head());
+    const original = await seedOriginalRebriefCompletion(h.ledger, 'job-ph-sup', 'minion-old', repo.head(), repo.path);
     const oldDeliveryMarker = h.ledger.listPendingRebriefs({ jobId: 'job-ph-sup' }).find((row) => row.kind === 'job.delivered')!;
     const second = h.ledger.beginPendingRebrief({
       jobId: 'job-ph-sup',
@@ -512,7 +513,7 @@ describe('phase-handoff reconciliation, guards and disposition', () => {
     // Even a genuine old completion cannot prove this replacement's turn.
     const currentBeforeAdmission = h.ledger.listPendingRebriefs({ jobId: 'job-ph-sup' }).find((row) => row.kind === 'silas.rebrief')!;
     expect(h.ledger.pendingRebriefReceipt(currentBeforeAdmission)).toBeNull();
-    const currentOriginal = seedOriginalRebriefCompletion(h.ledger, 'job-ph-sup', 'minion-new', repo.head());
+    const currentOriginal = await seedOriginalRebriefCompletion(h.ledger, 'job-ph-sup', 'minion-new', repo.head(), repo.path);
     repo.commitFile('later-checkout.txt', 'not either historical completion');
     // The newer request's own proven turn finalizes and completes ITS phase.
     const currentFinalize = finalizeRebriefRequest({

@@ -27,7 +27,7 @@ import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
-import { DirectiveProgressService } from './dispatch/directive-progress.js';
+import { disposeDirectiveResources, DirectiveProgressService } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
@@ -473,13 +473,10 @@ async function main(): Promise<number> {
         }
         state.deployDrift?.stop();
         state.repoOverview?.stop();
-        if (state.registry !== undefined) {
-          try {
-            await state.registry.dispose();
-            await state.directiveProgress?.dispose();
-          } catch (error) {
-            logger.error('registry dispose failed', { error: String(error) });
-          }
+        try {
+          await disposeDirectiveResources(state.directiveProgress, state.registry);
+        } catch (error) {
+          logger.error('directive progress/registry dispose failed', { error: String(error) });
         }
         if (state.store !== undefined) {
           try {

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { canonicalRebriefEvidence, type RebriefReceiptEvidence } from './rebrief-evidence.js';
 import type { RecoverySubject, RecoverySubjectKind, RecoveryOwnerTransfer, RecoveryDecisionHistory, RecoveryOwnerActionInput } from './recovery-owner.js';
 import type { DatabaseSync } from 'node:sqlite';
@@ -7,7 +8,7 @@ import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -3773,7 +3774,7 @@ export class LedgerApi {
       params.push(expectedMinion);
     }
     if (expectedRevision !== null) {
-      where.push(phase === null ? "json_extract(payload, '$.work_revision') = ?" :
+      where.push(phase === null || marker.kind === 'job.delivered' ? "json_extract(payload, '$.work_revision') = ?" :
         "(json_type(payload, '$.work_revision') IS NULL OR json_extract(payload, '$.work_revision') = ?)");
       params.push(expectedRevision);
     }
@@ -3887,14 +3888,53 @@ export class LedgerApi {
    * event row commits with the clear; delivery to a given live bus listener
    * afterwards is the bus's own contract (a failing listener drops that
    * event for itself and restart recovery re-arms from `job.delivered`). */
+  private closeOrdinaryRebriefRecovery(markers: readonly PendingRebriefRecord[], eventSeq: number, eventKind: string): void {
+    for (const marker of markers) {
+      if (this.recoveryOwnerBasis('rebrief', marker.id).owned) continue;
+      const debts = this.listObligations({ jobId: marker.jobId }).filter((debt) => debt.incidentKey === `rebrief-recovery:${marker.id}` &&
+        (debt.state === 'open' || debt.state === 'waiting') && debt.nextAction.kind === 'gru-decision');
+      for (const debt of debts) this.settleObligation({ obligationId: debt.id, settlement: { kind: 'executed-action',
+        action: eventKind === 'silas.rebrief-retired' ? 'exact terminal legacy control administratively retired, not completed' : 'exact original guarded receipt pair settled', evidenceEventSeq: eventSeq, evidenceEventKind: eventKind } });
+      const card = this.findNotificationByKindAndRouting(`silas.rebrief-unreconciled.${marker.jobId}`, 'action-required', 'active');
+      // The production incident is job-keyed and deduplicated across generations.
+      // Its producer-issued recovery pointer correlates only the routine card;
+      // it is not authority/effect evidence and never releases an owner hold.
+      const correlated = debts.some((debt) => card?.detail?.includes(`/api/silas/rebriefs/${marker.id}, then POST its /recover with expected_generation ${debt.generation}, expected_payload_hash ${marker.payloadHash},`));
+      if (correlated && card?.routing === 'action-required' && (card.agentId === null || card.agentId === marker.agentId)) this.resolveNotificationById(card.id, 'rebrief-recovery-evidence');
+    }
+  }
+
+  private assertOrdinaryRebriefResolutionReleased(markers: readonly PendingRebriefRecord[]): void {
+    for (const marker of markers) {
+      const basis = this.recoveryOwnerBasis('rebrief', marker.id);
+      const history = this.recoveryDecisionHistory('rebrief', marker.id).at(-1);
+      const transfer = history?.ownerTransfer;
+      if (basis.owned) throw new DirectiveCheckpointError('original legacy resolution remains owned by its transferred owner reservation');
+      if (transfer != null) {
+        const target = this.getObligation(transfer.target.id);
+        const confirmation = target?.settlement?.kind === 'executed-action' ? this.getEvent(target.settlement.evidenceEventSeq) : null;
+        const facts = confirmation?.payload as { transfer_event_seq?: unknown; subject_kind?: unknown; subject_id?: unknown; target?: { id?: unknown; generation?: unknown; planRevision?: unknown } } | undefined;
+        const explicitlyReleased = target?.state === 'settled' && confirmation?.kind === 'silas.recovery-owner-stop-confirmed' && confirmation.jobId === marker.jobId &&
+          facts?.transfer_event_seq === history!.eventSeq && facts.subject_kind === 'rebrief' && facts.subject_id === marker.id && facts.target?.id === target.id &&
+          facts.target.generation === target.generation && facts.target.planRevision === target.planRevision;
+        if (!explicitlyReleased && !isJobTerminal(this.getJob(marker.jobId)!.status)) throw new DirectiveCheckpointError('original legacy owner transfer is unresolved or changed; new receipts are not owner release');
+      }
+      const retained = this.listObligations({ jobId: marker.jobId }).some((debt) => debt.incidentKey === `rebrief-recovery:${marker.id}` &&
+        (debt.state === 'suspended' || (debt.state === 'open' || debt.state === 'waiting') && debt.claim !== null));
+      if (retained) throw new DirectiveCheckpointError('exact original legacy recovery resolution remains suspended or claimed');
+    }
+  }
+
   clearPendingRebriefsIfCurrentAndSettle(expected: readonly PendingRebriefRecord[]): boolean {
     const jobId = expected[0]?.jobId;
     if (jobId === undefined) throw new Error('settling a re-brief generation requires markers');
     return this.transaction(() => {
       if (!this.matchesPendingRebriefGeneration(jobId, expected)) return false;
       this.assertSettleableRebriefGeneration(jobId, expected);
+      this.assertOrdinaryRebriefResolutionReleased(expected);
+      const event = this.appendEvent({ kind: 'silas.rebrief-settled', jobId, payload: { markers: expected } });
+      this.closeOrdinaryRebriefRecovery(expected, event.seq, event.kind);
       this.clearPendingRebriefs(expected.map((marker) => marker.id));
-      this.appendEvent({ kind: 'silas.rebrief-settled', jobId });
       return true;
     });
   }
@@ -3999,9 +4039,8 @@ export class LedgerApi {
           retired.every((row) => guardedEventLanded.get(row.id) === true)) {
         return refused('events-already-landed');
       }
-      const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
-      for (const row of retired) remove.run(row.id);
-      this.appendEvent({
+      this.assertOrdinaryRebriefResolutionReleased(retired);
+      const event = this.appendEvent({
         kind: 'silas.rebrief-retired',
         jobId: input.jobId,
         payload: {
@@ -4021,6 +4060,9 @@ export class LedgerApi {
           skipped_ids: skippedIds,
         },
       });
+      this.closeOrdinaryRebriefRecovery(retired, event.seq, event.kind);
+      const remove = this.db.prepare('DELETE FROM pending_rebriefs WHERE id = ?');
+      for (const row of retired) remove.run(row.id);
       return { retired, skippedIds, refused: null };
     });
   }
@@ -5419,6 +5461,24 @@ export class LedgerApi {
    * rather than being vetoed by it. History is preserved (the row and
    * its events stay); settled/closed are terminal — a recurring incident
    * is a NEW obligation. */
+  /** Follow only this inspection gate duty's durable supersession lineage. */
+  private currentGateDutyAction(obligationId: string): ObligationNextAction | null {
+    const row = this.getObligation(obligationId); if (row === null) return null;
+    const roots = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind = 'silas.rebrief-current-gates-owed' ORDER BY seq").all(row.jobId) as Row[];
+    for (const root of roots) {
+      const payload = JSON.parse(root.payload as string) as { obligation_id: string; next_action: ObligationNextAction };
+      if (typeof payload.obligation_id !== 'string' || payload.next_action?.kind !== 'gru-decision') throw new DirectiveCheckpointError('current gate action lineage is malformed');
+      let cursor: string | null = payload.obligation_id; const seen = new Set<string>();
+      while (cursor !== null) {
+        if (seen.has(cursor)) throw new DirectiveCheckpointError('current gate action transfer lineage is cyclic');
+        seen.add(cursor); if (cursor === obligationId) return payload.next_action;
+        const settlement: ObligationSettlement | undefined = this.getObligation(cursor)?.settlement ?? undefined;
+        cursor = settlement?.kind === 'superseded' ? settlement.byObligationId : null;
+      }
+    }
+    return null;
+  }
+
   settleObligation(input: {
     obligationId: string;
     settlement: ObligationSettlement;
@@ -5427,6 +5487,19 @@ export class LedgerApi {
     return this.transaction(() => {
       const row = this.getObligation(input.obligationId);
       if (row === null) throw new RecordNotFound(`obligation "${input.obligationId}" not found`);
+      const gateDuty = this.currentGateDutyAction(row.id);
+      if (gateDuty !== null) {
+        const disposition = input.settlement;
+        if (disposition.kind === 'job-terminal') {
+          if (!isJobTerminal(this.getJob(row.jobId)?.status as JobStatus) || this.getJob(row.jobId)?.status !== disposition.jobStatus) throw new DirectiveCheckpointError('current gate duty requires actual matching terminal job state');
+        } else if (disposition.kind === 'superseded') {
+          const recipient = disposition.byObligationId === null ? null : this.getObligation(disposition.byObligationId);
+          if (recipient === null || recipient.id === row.id || recipient.jobId !== row.jobId || ['settled', 'closed'].includes(recipient.state) || this.currentGateDutyAction(recipient.id) !== null ||
+              !['gru-decision', 'owner-decision'].includes(recipient.nextAction.kind) || !('decision' in recipient.nextAction) || !('decision' in gateDuty) || recipient.nextAction.decision !== gateDuty.decision) {
+            throw new DirectiveCheckpointError('current gate duty requires a distinct live same-job action transfer preserving exact still-owed bindings');
+          }
+        } else throw new DirectiveCheckpointError('current gate duty cannot be discharged by generic evidence, inspection, historical receipts or prose');
+      }
       const target: ObligationState =
         input.settlement.kind === 'executed-action' || input.settlement.kind === 'accepted-evidence'
           ? 'settled'
@@ -5624,6 +5697,7 @@ export class LedgerApi {
       const superseded: ObligationRecord[] = [];
       const successors: ObligationRecord[] = [];
       for (const row of applicable) {
+        if (this.currentGateDutyAction(row.id) !== null) continue; // already attention-only; its sealed duty survives newer inputs
         // The successor is the same incident's debt re-derived under the
         // newer truth: attention-only (no carried authority), fresh
         // generation, unclaimed. The old row closes LINKED to it — the
@@ -5705,6 +5779,10 @@ export class LedgerApi {
     const resolved = resolveObligation(context, jobId);
     const now = nowIso();
     const active = this.activeIncarnation(jobId, resolved.logicalStep, resolved.incidentKey);
+    if (active !== null) {
+      const gateDuty = this.currentGateDutyAction(active.id);
+      if (gateDuty !== null && !isDeepStrictEqual(active.nextAction, resolved.nextAction)) throw new DirectiveCheckpointError('current gate action plan cannot mutate or launder sealed remaining duty bindings');
+    }
     if (active !== null) {
       return this.coalesceObservation(active, resolved, context, now);
     }
@@ -7619,8 +7697,28 @@ export class LedgerApi {
   rebriefProgressBlockers(markerId: string, laneId: string): readonly string[] {
     const marker = this.listPendingRebriefs().find((row) => row.id === markerId);
     if (marker === undefined) throw new RecordNotFound(`rebrief marker "${markerId}" not found`);
-    return this.directiveRetirementBlockers({ jobId: marker.jobId, requestId: markerId }, laneId)
+    const blockers = this.directiveRetirementBlockers({ jobId: marker.jobId, requestId: markerId }, laneId)
       .filter((blocker) => blocker !== 'unresolved re-brief request(s) own the lane');
+    const peers = this.listPendingRebriefs({ jobId: marker.jobId }).filter((row) => row.payloadHash === marker.payloadHash && row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId);
+    if (marker.agentId === null || marker.sessionFile === null || marker.workRevision === null || peers.some((row) => row.agentId !== marker.agentId || row.sessionFile !== marker.sessionFile)) return [...blockers, 'original historical native session ownership is unbound/UNKNOWN'];
+    try {
+      const header = JSON.parse(readFileSync(marker.sessionFile, 'utf8').split('\n')[0]!) as { type?: unknown; id?: unknown };
+      const owners = inspectDirectiveProducers(marker.sessionFile);
+      const epoch = Number((this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS epoch FROM events WHERE job_id = ? AND seq <= ? AND (${DIRECTIVE_CONTROL_SQL})`).get(marker.jobId, marker.baselineSeq) as Row).epoch);
+      const original = owners.filter(({ producer }) => peers.some((row) => row.id === producer.identity.requestId) && producer.identity.jobId === marker.jobId &&
+        producer.identity.payloadHash === marker.payloadHash && producer.identity.workRevision === marker.workRevision && producer.identity.authorityEpoch === epoch &&
+        producer.agentId === marker.agentId && producer.sessionFile === marker.sessionFile && producer.sessionId === header.id);
+      for (const { producer } of original) {
+        const association = readDirectiveBinding(marker.sessionFile, producer.identity.requestId);
+        if (association === null || !isDeepStrictEqual(association.identity, producer.identity) || association.agentId !== marker.agentId || association.sessionId !== header.id || association.sessionFile !== marker.sessionFile) throw new DirectiveCheckpointError('original historical accepted identity/association is unavailable or changed');
+        inspectDirectiveAdmission(marker.sessionFile, producer.identity);
+        const checkpoint = inspectDirectiveCheckpoint(marker.sessionFile, producer.identity);
+        if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) blockers.push('original historical native effects/checkpoint remain UNKNOWN');
+      }
+      if (header.type !== 'session' || original.length === 0 || owners.some(({ evidence }) => evidence !== 'ceased')) blockers.push('original historical native physical cessation remains UNKNOWN');
+      const last = owners.at(-1); if (last !== undefined) { const lock = directiveProducerLockBlocker(last.producer); if (lock !== null) blockers.push(lock); }
+    } catch (error) { blockers.push(`original historical native ownership unreadable: ${String(error)}`); }
+    return blockers;
   }
 
   consumeRebriefRecoveryDecision(input: {
@@ -7856,6 +7954,7 @@ export class LedgerApi {
       if (payload['request_id'] !== input.requestId) {
         throw new Error(`delivery for "${input.requestId}" cites an event whose payload is not correlated to this request`);
       }
+      if (row.requestKind !== null && (payload['work_revision'] !== row.workRevision || payload['agentId'] !== row.nativeBinding?.agentId)) throw new DirectiveCheckpointError('original delivery revision/minion identity differs from accepted native admission');
       this.db
         .prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
         .run(input.eventSeq, nowIso(), input.requestId);
@@ -7873,9 +7972,14 @@ export class LedgerApi {
         const debt = this.listObligations({ jobId: row.jobId }).find((candidate) => candidate.incidentKey === `rebrief-current-inspection:${facts.marker_id}` &&
           ['open', 'waiting', 'suspended'].includes(candidate.state));
         if (debt !== undefined) {
-          if (debt.state === 'suspended') this.settleObligation({ obligationId: debt.id, settlement: { kind: 'superseded', byObligationId: null,
-            reason: `separately authorized CURRENT inspection ${row.requestId} actually completed in event ${event.seq}; original historical delivery remains absent` } });
-          else this.settleObligation({ obligationId: debt.id, settlement: { kind: 'executed-action', action: 'separately authorized current artifact inspection completed; current verification gates remain independent', evidenceEventSeq: event.seq, evidenceEventKind: event.kind } });
+          const identity = this.directiveTurnIdentity(row.requestId);
+          const duty = this.preserveParkedRecoveryDebt(this.recordBlockedObservation(row.jobId, { logicalStep: 'verification',
+            incidentKey: `rebrief-current-gates:${facts.marker_id}`, category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: event.seq,
+            nextAction: { kind: 'gru-decision', decision: `CURRENT gate actions remain owed after inspection ${row.requestId}, delivery ${event.seq}, original closure ${closure.seq}; accepted identity ${JSON.stringify(identity)}; recorded inspection HEAD ${typeof payload['sha'] === 'string' ? payload['sha'] : 'UNPROVEN/null'}. Use existing POST /api/verify and POST /api/dispatch/review APIs with exact current approved inputs and real applicable verification/review evidence, or a separately explicit guarded safe action transfer. If these inputs are superseded or HEAD unproven, establish fresh current evidence first. Inspection delivery and historical receipts prove neither gates nor READY.` } }));
+          this.appendEvent({ kind: 'silas.rebrief-current-gates-owed', jobId: row.jobId, payload: { marker_id: facts.marker_id, closure_seq: closure.seq,
+            inspection_request_id: row.requestId, delivery_seq: event.seq, identity, sha: typeof payload['sha'] === 'string' ? payload['sha'] : null, obligation_id: duty.id, generation: duty.generation, next_action: duty.nextAction } });
+          this.settleObligation({ obligationId: debt.id, settlement: { kind: 'superseded', byObligationId: duty.id,
+            reason: `actual separately authorized CURRENT inspection ${row.requestId} completed; applicable current verification/review action explicitly remains owned by ${duty.id}` } });
         }
       }
       // Durable action marker: a settlement is machine follow-through and

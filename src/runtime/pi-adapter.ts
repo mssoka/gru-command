@@ -1066,6 +1066,9 @@ export class PiAgentHandle implements AgentHandle {
       const before = session.agent.beforeToolCall;
       session.agent.beforeToolCall = async (input, signal) => {
         const directive = this.liveDirective;
+        const batchMode = (): 'sequential' | 'parallel' => session.agent.toolExecution === 'sequential' || input.assistantMessage.content.some((block) =>
+          block.type === 'toolCall' && session.agent.state.tools.find((tool) => tool.name === block.name)?.executionMode === 'sequential') ? 'sequential' : 'parallel';
+        const executionMode = batchMode();
         const check = (): void => {
           if (directive === undefined) return;
           if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
@@ -1073,7 +1076,8 @@ export class PiAgentHandle implements AgentHandle {
           if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
             throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before tool effect');
           }
-          flushDirectiveToolIntent(this.sessionFile, input.assistantMessage, input.toolCall);
+          if (batchMode() !== executionMode) throw new DirectiveCheckpointError('native directive batch execution mode changed before tool effect');
+          flushDirectiveToolIntent(this.sessionFile, input.assistantMessage, input.toolCall, directive.identity, executionMode);
         };
         try {
           check();
@@ -1171,7 +1175,7 @@ export class PiAgentHandle implements AgentHandle {
 
   inspectDirective = (identity: DirectiveTurnIdentity) => inspectDirectiveCheckpoint(this.sessionFile, identity);
 
-  resumeDirective = async (identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void): Promise<PromptTurnVerdict> => {
+  resumeDirective = async (identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void, claimContinuation?: () => void): Promise<PromptTurnVerdict> => {
     this.assertLive();
     if (this.liveTurn !== null || this.queue.length > 0 || this.isCompacting() || !this.session.isIdle || this.session.agent === undefined) {
       throw new DirectiveCheckpointError('native directive continuation requires an idle, unqueued, supported Pi session');
@@ -1183,7 +1187,7 @@ export class PiAgentHandle implements AgentHandle {
     beforeContinuation();
     this.prepareDirectiveProducer(identity);
     const turn = this.runTurn('', `directive-recovery:${identity.requestId}`, undefined,
-      { identity, beforeAdmission: beforeContinuation, onAdmitted: () => {} }, () => this.session.agent!.continue());
+      { identity, beforeAdmission: beforeContinuation, onAdmitted: () => {} }, () => { beforeContinuation(); claimContinuation?.(); return this.session.agent!.continue(); });
     await turn.done;
     return turn.verdict();
   };

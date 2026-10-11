@@ -1,3 +1,4 @@
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -236,7 +237,7 @@ function merge(h: Harness, jobId: string): void {
 function seedCorrelatedReceipt(h: Harness, jobId: string, kind: 'silas.rebrief' | 'job.delivered',
   minionId = 'worker-1', extra: Readonly<Record<string, unknown>> = {}) {
   const markers = h.ledger.listPendingRebriefs({ jobId });
-  h.ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: minionId, sessionFile: null });
+  h.ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: minionId, sessionFile: markers.find((row) => row.kind === 'silas.rebrief')?.sessionFile ?? null });
   const marker = h.ledger.listPendingRebriefs({ jobId }).find((row) => row.kind === kind)!;
   return h.ledger.appendCustomEvent({ kind, jobId, agentId: minionId, payload: {
     ...(kind === 'silas.rebrief' ? { minion_id: minionId, note: 'n', sha: h.lanePath === null ? undefined : resolveGitCommit(h.lanePath, 'HEAD') } : { agentId: minionId, source: 'silas-rebrief', sha: 'settled-head' }),
@@ -697,6 +698,7 @@ describe('re-brief restart safety (durable markers)', () => {
     const h = makeHarness();
     const jobId = 'delivery-only-settlement-fault-job';
     await seedPendingRebrief({ h, jobId });
+    await bindOriginalRebriefSdkOwner(h.ledger, h.ledger.listPendingRebriefs({ jobId }), { cwd: h.lanePath!, dataDir: h.dir, agentId: 'worker-1' });
     seedCorrelatedReceipt(h, jobId, 'silas.rebrief');
     let busSettlements = 0;
     h.bus.subscribe((event) => { if (event.jobId === jobId && event.kind === 'silas.rebrief-settled') busSettlements += 1; });
@@ -729,6 +731,7 @@ describe('re-brief restart safety (durable markers)', () => {
     const h = makeHarness();
     const jobId = 'delivery-only-job';
     await seedPendingRebrief({ h, jobId });
+    await bindOriginalRebriefSdkOwner(h.ledger, h.ledger.listPendingRebriefs({ jobId }), { cwd: h.lanePath!, dataDir: h.dir, agentId: 'worker-1' });
     // The turn settled and `silas.rebrief` posted; the crash hit before the
     // delivery record.
     seedCorrelatedReceipt(h, jobId, 'silas.rebrief');
@@ -1100,6 +1103,7 @@ describe('terminal re-brief retirement', () => {
     const h = makeHarness();
     const jobId = 'superseded-on-delivery-publication';
     await seedPendingRebrief({ h, jobId });
+    await bindOriginalRebriefSdkOwner(h.ledger, h.ledger.listPendingRebriefs({ jobId }), { cwd: h.lanePath!, dataDir: h.dir, agentId: 'worker' });
     seedCorrelatedReceipt(h, jobId, 'silas.rebrief', 'worker');
     const markers = h.ledger.listPendingRebriefs({ jobId });
     h.bus.subscribe((event) => {

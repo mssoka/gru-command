@@ -78,8 +78,8 @@ function recordCleanup(deps: DirectiveProgressDeps, identity: DirectiveTurnIdent
   owned.delete(key); // only after genuine cessation AND committed publication
 }
 
-function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity, handle?: AgentHandle, producerStartSeq?: number, producer?: DirectiveProducer): void {
-  check(deps, identity);
+function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity, handle?: AgentHandle, producerStartSeq?: number, producer?: DirectiveProducer, historicalReceipt = false): void {
+  if (!historicalReceipt) check(deps, identity);
   const lane = deps.worktrees.listWorktrees({ jobId: identity.jobId }).find((lane) => lane.kind === 'job' && lane.status !== 'swept');
   const target = deps.ledger.getDirective(identity.requestId)?.nativeTarget;
   const ownSpawningAgentId = handle?.health().state === 'idle' && (target == null || (target.agentId === handle.id && target.sessionFile === handle.sessionFile)) ? handle.id : undefined;
@@ -227,7 +227,8 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
   if (row.nativeTarget !== null) row = deps.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(row.nativeTarget.sessionFile, identity));
   const landed = deps.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
   if (landed !== null && row.state === 'admitted') {
-    checkAdmissionFences(deps, identity);
+    if (deps.ledger.recoveryOwnerBasis('directive', row.requestId).owned) throw new DirectiveCheckpointError('original receipt remains owned by its explicitly transferred owner reservation');
+    checkAdmissionFences(deps, identity, undefined, undefined, undefined, true);
     deps.ledger.recordDirectiveDelivery({ requestId: row.requestId, eventSeq: landed.seq });
     return true;
   }
@@ -360,6 +361,7 @@ export class DirectiveProgressService {
     if (settleNativeDirective(deps, identity)) return;
     check(deps, identity);
     row = deps.ledger.getDirective(requestId)!;
+    if (row.recoveryCheckpoint !== null) throw new DirectiveCheckpointError('original checkpoint claim was already consumed; never prepare or replay it');
     const proof = inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, identity);
     if (proof.state !== 'resumable') throw new DirectiveCheckpointError(proof.state === 'unknown' ? proof.reason : proof.error ?? 'native error/abort is incomplete');
     const lanes = deps.worktrees.listWorktrees({ jobId: row.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
@@ -398,7 +400,6 @@ export class DirectiveProgressService {
     try {
       if (deps.workerGate !== undefined) lease = await deps.workerGate.acquireWorkerTurn({ id: row.jobId, jobId: row.jobId, label: `checkpoint recovery → ${requestId}`, signal: deps.signal });
       assertProducerFences();
-      deps.ledger.claimDirectiveCheckpoint(identity, proof.checkpointId);
       const head = resolveGitCommit(lane.path, 'HEAD');
       const tools = deps.parentTools?.(proof.binding.agentId) ?? [];
       const predecessor = inspectDirectiveProducers(proof.binding.sessionFile, identity).at(-1);
@@ -413,7 +414,10 @@ export class DirectiveProgressService {
       producerStartSeq = deps.ledger.startDirectiveProducer(identity, producer);
       if (handle.id !== proof.binding.agentId || handle.sessionFile !== proof.binding.sessionFile || handle.resumeDirective === undefined) throw new DirectiveCheckpointError('runtime did not preserve exact native/logical session continuation capability');
       if (resolveGitCommit(lane.path, 'HEAD') !== head) throw new DirectiveCheckpointError('lane changed during checkpoint spawn');
-      const verdict = await handle.resumeDirective(identity, proof.checkpointId, assertProducerFences);
+      const verdict = await handle.resumeDirective(identity, proof.checkpointId, assertProducerFences, () => {
+        assertProducerFences();
+        deps.ledger.claimDirectiveCheckpoint(identity, proof.checkpointId);
+      });
       assertProducerFences();
       if (!verdict.ok) throw new DirectiveCheckpointError(verdict.error ?? 'native continuation failed');
       completed = true;
@@ -434,4 +438,13 @@ export class DirectiveProgressService {
 
   async settled(): Promise<void> { await Promise.resolve(); await Promise.all(this.active.values()); }
   async dispose(): Promise<void> { this.disposed = true; this.stop.abort(); await this.settled(); }
+}
+
+/** Progress owns asynchronous cleanup against the shared registry/storage.
+ * Join it first; a failed stage must not skip the other teardown. */
+export async function disposeDirectiveResources(progress: Pick<DirectiveProgressService, 'dispose'> | undefined, registry: { dispose(): Promise<void> } | undefined): Promise<void> {
+  const failures: unknown[] = [];
+  try { await progress?.dispose(); } catch (error) { failures.push(error); }
+  try { await registry?.dispose(); } catch (error) { failures.push(error); }
+  if (failures.length > 0) throw new AggregateError(failures, `directive progress/registry shutdown failed: ${failures.map(String).join('; ')}`);
 }

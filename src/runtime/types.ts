@@ -385,7 +385,7 @@ export interface AgentHandle {
   /** Adapter-owned safe native continuation: never replays a user prompt. */
   prepareDirectiveProducer?(identity: DirectiveTurnIdentity): DirectiveProducer;
   inspectDirective?(identity: DirectiveTurnIdentity): DirectiveCheckpoint;
-  resumeDirective?(identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void): Promise<PromptTurnVerdict>;
+  resumeDirective?(identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void, claimContinuation?: () => void): Promise<PromptTurnVerdict>;
   /**
    * Interrupt/redirect the live turn. Native on pi; runtimes declaring
    * steer 'queued' get the fallback wrapper's queue-until-idle behavior.

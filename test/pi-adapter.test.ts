@@ -3515,12 +3515,12 @@ it('directive native multi-tool invocation persists each sequential result and r
       const bytes = readFileSync(handle.sessionFile!, 'utf8');
       const tail = JSON.parse(bytes.trimEnd().split('\n').at(-1)!) as { message: { role: string; toolCallId: string } };
       expect(tail.message).toMatchObject({ role: 'toolResult', toolCallId: 'native-batch-first' });
-      expect(() => flushDirectiveToolIntent(handle.sessionFile!, { ...input.assistantMessage, timestamp: input.assistantMessage.timestamp + 1 }, input.toolCall)).toThrow(/invocation/);
-      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, { ...input.toolCall, arguments: { command: 'unpersisted effect' } })).toThrow(/invocation/);
-      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, { ...input.toolCall, id: 'foreign-call' })).toThrow(/invocation/);
+      expect(() => flushDirectiveToolIntent(handle.sessionFile!, { ...input.assistantMessage, timestamp: input.assistantMessage.timestamp + 1 }, input.toolCall, identity)).toThrow(/invocation/);
+      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, { ...input.toolCall, arguments: { command: 'unpersisted effect' } }, identity)).toThrow(/invocation/);
+      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, { ...input.toolCall, id: 'foreign-call' }, identity)).toThrow(/invocation/);
       const completed = input.assistantMessage.content.find((block) => block.type === 'toolCall' && block.id === 'native-batch-first');
       if (completed?.type !== 'toolCall') throw new Error('native first batch call missing');
-      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, completed)).toThrow(/invocation/);
+      expect(() => flushDirectiveToolIntent(handle.sessionFile!, input.assistantMessage, completed, identity)).toThrow(/invocation/);
       expect(readFileSync(handle.sessionFile!, 'utf8')).toBe(bytes);
       checkedSecond = true;
     }
@@ -3808,7 +3808,7 @@ async function directiveRecoveryLedgerFixture(label: string, materialRevision = 
     identity: ledger.directiveTurnIdentity(request.requestId) };
 }
 
-async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void, materialRevision = false) {
+async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void, materialRevision = false, useDefaultToolExecution = false) {
   const fx = await fixture(turns);
   const scene = await directiveRecoveryLedgerFixture('guarded-sdk-tools', materialRevision);
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
@@ -3825,7 +3825,7 @@ async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configur
       scene.ledger.setAgentState(handle.id, handle.health().state);
       const session = (handle as unknown as { readonly session: unknown }).session;
       if (!(session instanceof AgentSession)) throw new Error('guard regression requires the actual pinned SDK');
-      sessions.push(session); session.agent.toolExecution = 'sequential';
+      sessions.push(session); if (!useDefaultToolExecution) session.agent.toolExecution = 'sequential';
       vi.spyOn(session, 'prompt'); vi.spyOn(session.agent, 'continue');
       const before = session.agent.beforeToolCall!;
       session.agent.beforeToolCall = async (input, signal) => {
@@ -4322,3 +4322,83 @@ it('real SDK system mutation before native effects remains refused through final
 it('real SDK tools mutation before native effects remains refused through final stop and restart', () => assertProductionSdkFence(false, 'manifest-tools'));
 it('real SDK system mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-role-hook'));
 it('real SDK model mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-model-hook'));
+
+async function assertSdkBoundToolAncestry(fault: 'foreign-user' | 'branch' | 'missing-result', resume: boolean) {
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  let mutation = false;
+  const f = await sdkDirectiveExecutionFixture(guardedSdkTools, (session) => {
+    session.agent.toolExecution = 'sequential';
+    const runner = (session as unknown as { _extensionRunner: { hasHandlers(type: string): boolean; emitToolCall(input: { toolCallId: string }): Promise<undefined> } })._extensionRunner;
+    const prior = runner.hasHandlers.bind(runner); vi.spyOn(runner, 'hasHandlers').mockImplementation((type) => type === 'tool_call' || prior(type));
+    vi.spyOn(runner, 'emitToolCall').mockImplementation(async ({ toolCallId }) => {
+      if (mutation || toolCallId !== (fault === 'missing-result' ? 'guarded-second' : 'guarded-first')) return undefined;
+      await Promise.resolve(); mutation = true;
+      const file = session.sessionFile!; const entries = readFileSync(file, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { id: string; type: string; parentId?: string; message?: { role: string } });
+      if (fault === 'missing-result') entries.splice(entries.findIndex((entry) => entry.message?.role === 'toolResult'), 1);
+      else {
+        const index = entries.map((entry) => entry.message?.role).lastIndexOf('assistant'); const invocation = entries[index]!;
+        if (fault === 'branch') invocation.parentId = entries[0]!.id;
+        else {
+          const foreign = { type: 'message', id: 'foreign-native-user', parentId: invocation.parentId, message: { role: 'user', content: [{ type: 'text', text: 'unaccepted native steer' }] } };
+          entries.splice(index, 0, foreign); invocation.parentId = foreign.id;
+        }
+      }
+      writeFileSync(file, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n'); return undefined;
+    });
+  });
+  let service: InstanceType<typeof DirectiveProgressService> | null = null;
+  try {
+    if (resume) { await seedSdkUserCheckpoint(f); service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); }
+    else await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    expect(mutation).toBe(true); const effect = join(f.scene.lane.path, 'guarded-effects.txt');
+    expect(existsSync(effect) ? readFileSync(effect, 'utf8') : '').toBe(fault === 'missing-result' ? 'first\n' : '');
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(row.state).toBe('admitted'); expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toBeNull();
+    expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toContain('guard-refused');
+    service ??= new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); expect(f.scene.ledger.getDirective(row.requestId)?.state).toBe('admitted');
+  } finally { await service?.dispose(); await f.cleanup(); }
+}
+it('P30 shared real SDK foreign native user after awaited prior hook cannot own directive effects', () => assertSdkBoundToolAncestry('foreign-user', false));
+it('P30 resumed original SDK foreign native user cannot steal the accepted effect ancestry', () => assertSdkBoundToolAncestry('foreign-user', true));
+it('P30 shared real SDK branched invocation with identical tool arguments is refused before effects', () => assertSdkBoundToolAncestry('branch', false));
+it('P30 resumed real SDK missing earlier sequential native result preserves first effect and refuses second', () => assertSdkBoundToolAncestry('missing-result', true));
+
+it('P30 default pinned SDK parallel-safe read batch preserves exact accepted ancestry and completes both real tools', async () => {
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const entered: string[] = []; let release!: () => void;
+  const both = new Promise<void>((resolve) => { release = resolve; });
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCalls: [
+      { id: 'parallel-first', name: 'read', args: { path: 'parallel-first.txt' } },
+      { id: 'parallel-second', name: 'read', args: { path: 'parallel-second.txt' } },
+    ] },
+    { deltas: ['both independently allowed original reads completed'] },
+  ], (session) => {
+    expect(session.agent.toolExecution).toBe('parallel'); // actual SDK default, never configured
+    const read = session.agent.state.tools.find((tool) => tool.name === 'read')!;
+    expect(read.executionMode).not.toBe('sequential');
+    const execute = read.execute.bind(read);
+    vi.spyOn(read, 'execute').mockImplementation(async (...args) => {
+      entered.push(args[0]); if (entered.length === 2) release();
+      await both; return execute(...args);
+    });
+    // Let the failing received guard finish cleanly rather than time out:
+    // it emits the denied second preparation before either read executes.
+    session.subscribe((event) => { if (event.type === 'tool_execution_end' && event.toolCallId === 'parallel-second' && event.isError) release(); });
+  }, false, true);
+  try {
+    writeFileSync(join(f.scene.lane.path, 'parallel-first.txt'), 'first independent input');
+    writeFileSync(join(f.scene.lane.path, 'parallel-second.txt'), 'second independent input');
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    expect(entered).toEqual(['parallel-first', 'parallel-second']);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(row.state).toBe('settled'); expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+    const native = readFileSync(row.nativeTarget!.sessionFile, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { message?: { role?: string; toolCallId?: string; isError?: boolean } });
+    expect(native.filter((entry) => entry.message?.role === 'toolResult').map((entry) => [entry.message?.toolCallId, entry.message?.isError])).toEqual([
+      ['parallel-first', false], ['parallel-second', false],
+    ]);
+    expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).not.toContain('guard-refused');
+    const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); await service.dispose();
+    expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
+  } finally { release(); await f.cleanup(); }
+});
