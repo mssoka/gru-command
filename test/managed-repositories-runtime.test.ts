@@ -13,6 +13,7 @@ import type { RepoRef } from '../src/dispatch/github-poll.js';
 import {
   createManagedRepoOverviewTracker,
 } from '../src/repos/runtime.js';
+import { resolveManagedRepoPathSync } from '../src/repos/managed-names.js';
 import {
   defaultRemoteResolver,
   type ActionsAvailability,
@@ -216,6 +217,8 @@ describe('managed repository config-to-runtime wiring', () => {
     ].join('\n');
     writeFileSync(configPathFor(instance), configText);
     const config = loadConfig({ GRU_COMMAND_HOME: instance });
+    expect(resolveManagedRepoPathSync(workspace, 'alpha.').kind).toBe('unavailable');
+    expect(resolveManagedRepoPathSync(workspace, 'alpha ').kind).toBe('unavailable');
     const api = new ProviderSpy();
     const resolvedPaths: string[] = [];
     const tracker = createManagedRepoOverviewTracker(config, {

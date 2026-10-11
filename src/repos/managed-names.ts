@@ -1,7 +1,7 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, sep, win32 } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, sep, win32 } from 'node:path';
 
 export type ManagedRepoPath =
   | { readonly kind: 'available'; readonly path: string }
@@ -87,10 +87,12 @@ function isGitWorktreeRootSync(project: string): boolean {
  * A managed repository is one exact direct-child directory name, never a
  * path, traversal, glob or alternate-platform absolute path. Keep the
  * ordinary names already accepted by installer discovery (including
- * spaces and Unicode); reject only ambiguous/path-forming values.
+ * spaces and Unicode); reject ambiguous/path-forming values and names that
+ * filesystems may normalize (trailing dot/space).
  */
 export function managedRepoNameError(name: string): string | null {
   if (name.trim() === '') return 'must not be empty';
+  if (name.endsWith('.') || name.endsWith(' ')) return 'must not end with a dot or space';
   if (name === '.' || name === '..' || name.startsWith('.')) {
     return 'must be a plain directory name under workspace_root';
   }
@@ -135,7 +137,8 @@ export async function resolveManagedRepoPath(
       rel === '..' ||
       rel.startsWith(`..${sep}`) ||
       isAbsolute(rel) ||
-      dirname(project) !== workspace
+      dirname(project) !== workspace ||
+      basename(project) !== name
     ) {
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
@@ -178,7 +181,8 @@ export function resolveManagedRepoPathSync(
       rel === '..' ||
       rel.startsWith(`..${sep}`) ||
       isAbsolute(rel) ||
-      dirname(project) !== workspace
+      dirname(project) !== workspace ||
+      basename(project) !== name
     ) {
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }

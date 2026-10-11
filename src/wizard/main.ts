@@ -47,6 +47,7 @@ import {
   writeConfigText,
 } from './steps.js';
 import { validateRepositorySetup } from './repository-setup.js';
+import { resolveManagedRepoPathSync } from '../repos/managed-names.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -638,15 +639,7 @@ async function main(argv: readonly string[]): Promise<number> {
     const previouslySelected = prior?.managedRepos.includes(repo) === true;
     let unavailable = false;
     if (previouslySelected) {
-      try {
-        const candidate = join(workspaceAbs, repo);
-        unavailable =
-          !existsSync(candidate) ||
-          lstatSync(candidate).isSymbolicLink() ||
-          !existsSync(join(candidate, '.git'));
-      } catch {
-        unavailable = true;
-      }
+      unavailable = resolveManagedRepoPathSync(workspaceAbs, repo).kind === 'unavailable';
     }
     if (unavailable) {
       stdout.write(

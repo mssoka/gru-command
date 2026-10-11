@@ -481,7 +481,8 @@ describe('wizard CLI surface', () => {
     expect(first.status, first.stderr).toBe(0);
     expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', 'gamma']);
 
-    rmSync(join(workspace, 'gamma'), { recursive: true, force: true });
+    rmSync(join(workspace, 'gamma', '.git'), { recursive: true, force: true });
+    writeFileSync(join(workspace, 'gamma', '.git'), 'gitdir: ../missing-worktree\n');
     const repeated = run({}, true);
     expect(repeated.status, repeated.stderr).toBe(0);
     expect(repeated.stdout).toContain('Previously selected repository gamma is currently unavailable; keeping it in managed_repos.');
