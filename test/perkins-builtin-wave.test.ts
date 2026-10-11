@@ -16,12 +16,13 @@ import {
   hostDisclosureAppendix,
   redactReviewForPublication,
   settledExecutionFactsLine,
+  verifyPostedReceipt,
   type EscalationContext,
   type FallbackGateOutcome,
   type VerdictPoster,
   type WaveOutcome,
 } from '../src/dispatch/perkins.js';
-import { PerkinsAppPrPoster, type AppFetch, type AppFetchInit } from '../src/dispatch/perkins-github-app.js';
+import { PerkinsAppPrPoster, type AppFetch, type AppFetchInit, type AppFetchResponse } from '../src/dispatch/perkins-github-app.js';
 import {
   PUBLICATION_ABSENT_EVENT,
   PUBLICATION_ATTEMPT_EVENT,
@@ -4218,6 +4219,25 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     };
   }
 
+  it('refuses a GitHub receipt with no commit binding at the host boundary (formal GitHub)', () => {
+    const bodySha256 = createHash('sha256').update('review body\n', 'utf8').digest('hex');
+    const receipt = {
+      reviewId: '9001', actor: 'gru-bot', event: 'APPROVED', commitId: null,
+      headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), bodySha256,
+    };
+    expect(() => verifyPostedReceipt(receipt, {
+      targetSha: receipt.headSha, bodySha256, event: receipt.event, providerKind: 'github',
+    })).toThrow(/missing the reviewed commit binding/);
+    // GitLab notes are not server-side commit-bound; the host's confirmed
+    // head probe remains their binding and a null commit id stays valid.
+    expect(verifyPostedReceipt({ ...receipt, event: 'note' }, {
+      targetSha: receipt.headSha, bodySha256, event: 'note', providerKind: 'gitlab',
+    })).toMatchObject({ commitId: null, event: 'note' });
+    expect(() => verifyPostedReceipt({ ...receipt, commitId: receipt.headSha }, {
+      targetSha: receipt.headSha, bodySha256, event: receipt.event, providerKind: 'unknown',
+    })).toThrow(/unknown provider/);
+  });
+
   it('refuses a poster receipt that is not bound to the reviewed head or body (B2/B5)', async () => {
     for (const forge of [
       { headSha: 'f'.repeat(40) },
@@ -5867,6 +5887,62 @@ describe('GitLab SHA-bound merge-request delivery', () => {
       await expect(echoed.post({ prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'review body\n', targetSha: head, baseSha: base , reviewEvent: 'COMMENT' }))
         .rejects.toThrow(/receipt body does not match/);
     } finally {
+      cleanup();
+    }
+  });
+
+  it('aborts an in-flight GitLab note request when the round is cancelled', async () => {
+    const { repoPath, cleanup } = fixture();
+    const timeoutController = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeoutController.signal);
+    try {
+      const controller = new AbortController();
+      const calls: Array<{ url: string; init?: AppFetchInit }> = [];
+      let noteSignal: AbortSignal | undefined;
+      let cancellationPropagated = false;
+      let startNoteRequest: (() => void) | undefined;
+      const noteStarted = new Promise<void>((resolve) => { startNoteRequest = resolve; });
+      const fetchImpl: AppFetch = async (url, init) => {
+        calls.push({ url, init });
+        if (url.endsWith('/user')) {
+          return { ok: true, status: 200, text: async () => JSON.stringify({ username: 'gru-bot' }) };
+        }
+        if (url.endsWith('/notes')) {
+          noteSignal = init?.signal;
+          startNoteRequest?.();
+          return new Promise<AppFetchResponse>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal === undefined) {
+              reject(new Error('the note request did not receive an abort signal'));
+              return;
+            }
+            const onAbort = (): void => reject(new Error('request aborted'));
+            if (signal.aborted) onAbort();
+            else signal.addEventListener('abort', onAbort, { once: true });
+          });
+        }
+        return { ok: true, status: 200, text: async () => JSON.stringify({ sha: head, diff_refs: { base_sha: base } }) };
+      };
+      const poster = new GitLabMrPoster({ token: 'glpat-token', fetchImpl });
+      const pending = poster.post({
+        prUrl: mrUrl, host: 'gitlab.example.test', repoPath, body: 'cancel me',
+        targetSha: head, baseSha: base, reviewEvent: 'COMMENT', signal: controller.signal,
+      });
+
+      await noteStarted;
+      expect(noteSignal).toBeDefined();
+      controller.abort();
+      cancellationPropagated = noteSignal?.aborted === true;
+      // Also release a deliberately broken timeout-only request so a failing
+      // regression cannot leave the fake fetch pending for the real 30 s cap.
+      timeoutController.abort();
+      await expect(pending).rejects.toThrow(/GitLab note delivery failed: request aborted/u);
+      expect(cancellationPropagated).toBe(true);
+      expect(calls.map(({ url }) => url)).toHaveLength(3);
+      expect(calls[2]?.url).toContain('/notes');
+    } finally {
+      timeoutController.abort();
+      timeoutSpy.mockRestore();
       cleanup();
     }
   });

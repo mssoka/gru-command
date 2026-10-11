@@ -791,7 +791,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     try {
       return verifyPostedReceipt(
         this.receiptFromReview(review, botLogin, input.targetSha, headSha, baseSha, input.body, wantedState),
-        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState },
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState, providerKind: 'github' },
       );
     } catch (error) {
       if (error instanceof PerkinsAppError) {
@@ -833,7 +833,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     if (matched !== null) {
       return verifyPostedReceipt(
         this.receiptFromReview(matched, botLogin, input.targetSha, input.targetSha, baseSha, input.body, wantedState),
-        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState },
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedState, providerKind: 'github' },
       );
     }
     if (matchedButWrongState !== null) {
@@ -1295,7 +1295,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     if (walked.matched !== null) {
       return verifyPostedReceipt(
         this.receiptFromReview(walked.matched, botLogin, targetSha, targetSha, baseSha, body, wantedState),
-        { targetSha, bodySha256: receiptDigest(body), event: wantedState },
+        { targetSha, bodySha256: receiptDigest(body), event: wantedState, providerKind: 'github' },
       );
     }
     if (walked.matchedButWrongState !== null) {

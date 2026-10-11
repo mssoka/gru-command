@@ -703,20 +703,32 @@ export function parsePostedEventPayload(payload: unknown): PostedEventPayload | 
 }
 
 /** Host-side binding of a provider receipt before anything is recorded as
- * delivered: the receipt must name the reviewed commit, carry the digest of
- * the exact published body, identify the provider review/actor/event, and
- * enact the EXACT state the delivery intended. A zero-exit post whose
+ * delivered: the receipt must name the reviewed head, carry the digest of the
+ * exact published body, identify the provider review/actor/event, enact the
+ * EXACT state the delivery intended, and for GitHub name the reviewed commit.
+ * A zero-exit post whose
  * response fails any of this is NOT a delivery — a wrong-state COMMENTED
  * receipt never fulfills an intended approval/change request, and an
  * unexpected formal state never fulfills another intent. */
 export function verifyPostedReceipt(
   receipt: PostedReviewReceipt,
-  expected: { readonly targetSha: string; readonly bodySha256: string; readonly event: string },
+  expected: {
+    readonly targetSha: string;
+    readonly bodySha256: string;
+    readonly event: string;
+    readonly providerKind: PublicationProviderKind;
+  },
 ): PostedReviewReceipt {
+  if (expected.providerKind === 'unknown') {
+    throw new Error('provider receipt cannot be verified for an unknown provider — delivery not recorded');
+  }
   if (receipt.headSha !== expected.targetSha) {
     throw new Error(
       `provider receipt head ${receipt.headSha || 'unknown'} does not match the reviewed commit ${expected.targetSha} — delivery not recorded`,
     );
+  }
+  if (expected.providerKind === 'github' && receipt.commitId === null) {
+    throw new Error('GitHub provider receipt is missing the reviewed commit binding — delivery not recorded');
   }
   if (receipt.commitId !== null && receipt.commitId !== expected.targetSha) {
     throw new Error(
@@ -859,7 +871,7 @@ export class GhPrPoster implements VerdictPoster {
     }
     return verifyPostedReceipt(
       { reviewId, actor, event, commitId, headSha: observedHead, baseSha: observedBase, bodySha256: receiptDigest(echoedBody) },
-      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedEvent },
+      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedEvent, providerKind: 'github' },
     );
   }
 
@@ -986,7 +998,7 @@ export class GhPrPoster implements VerdictPoster {
           baseSha: observedBase,
           bodySha256: receiptDigest(input.body),
         },
-        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedEvent },
+        { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: wantedEvent, providerKind: 'github' },
       );
     }
     if (sawUnusableId) throw new Error('provider receipt is missing a review id — delivery not recorded');
@@ -1224,7 +1236,7 @@ export class GitLabMrPoster implements VerdictPoster {
         headSha: confirmed.headSha, baseSha: confirmed.baseSha,
         bodySha256: receiptDigest(echoedBody),
       },
-      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: 'note' },
+      { targetSha: input.targetSha, bodySha256: receiptDigest(input.body), event: 'note', providerKind: 'gitlab' },
     );
   }
 
@@ -2827,9 +2839,11 @@ export class WaveRunner {
         );
         return 'clear';
       }
-      const wantedEnacted = wantedEnactedStateFor(publicationProviderKindFor(attempt.url), attempt.reviewEvent);
+      const providerKind = publicationProviderKindFor(attempt.url);
+      const wantedEnacted = wantedEnactedStateFor(providerKind, attempt.reviewEvent);
       const verified = verifyPostedReceipt(found, {
-        targetSha: attempt.targetSha, bodySha256: attempt.publicationSha256, event: wantedEnacted,
+        targetSha: attempt.targetSha, bodySha256: attempt.publicationSha256,
+        event: wantedEnacted, providerKind,
       });
       const receiptEvidence: PublicationReceiptEvidencePayload = {
         ...attempt, receipt: verified, credited: false, reason: 'recovered-uncredited-after-restart',
@@ -5728,7 +5742,7 @@ export class WaveRunner {
             signal,
             onPreparedIdentity: bindPreparedIdentity,
           }),
-          { targetSha: review.targetSha, bodySha256: publicationSha256, event: wantedEnacted },
+          { targetSha: review.targetSha, bodySha256: publicationSha256, event: wantedEnacted, providerKind },
         );
         // The proven receipt is retained IMMEDIATELY, before the finality
         // checks: movement or cancellation must never discard the only
@@ -5781,7 +5795,9 @@ export class WaveRunner {
             }, { reason: 'post-failure' });
             reconciledDelivery = found === null
               ? null
-              : verifyPostedReceipt(found, { targetSha: review.targetSha, bodySha256: publicationSha256, event: wantedEnacted });
+              : verifyPostedReceipt(found, {
+                targetSha: review.targetSha, bodySha256: publicationSha256, event: wantedEnacted, providerKind,
+              });
             if (reconciledDelivery !== null) {
               // Retain the proven receipt IMMEDIATELY, before the finality
               // checks below: a movement/abort refusal keeps it as truthful
