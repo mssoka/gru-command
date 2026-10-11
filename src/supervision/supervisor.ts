@@ -611,7 +611,8 @@ export class Supervisor {
       live.stoppedAt = inheritedBreaker?.stoppedAt ?? null;
       live.breakerNotificationId =
         inheritedBreaker?.breakerNotificationId ?? live.breakerNotificationId;
-      live.pendingRearmFenceAlert = inheritedBreaker?.pendingRearmFenceAlert ?? live.pendingRearmFenceAlert;
+      live.pendingRearmFenceAlert =
+        inheritedBreaker?.pendingRearmFenceAlert ?? live.pendingRearmFenceAlert ?? null;
     }
 
     for (const agent of retired) {
@@ -911,9 +912,11 @@ export class Supervisor {
     this.detectWake(now);
     for (const agent of this.agents.values()) {
       // A fenced stop whose fresh control failed to post must never wait for
-      // an unrelated event: retry the bind on every tick.
-      if (agent.pendingRearmFenceAlert !== null) {
-        this.raiseFencedAlert(agent, agent.pendingRearmFenceAlert.reason);
+      // an unrelated event: retry the bind on every tick. Nullish-safe: one
+      // bad carry value must never abort a whole tick pass.
+      const pendingFence = agent.pendingRearmFenceAlert;
+      if (pendingFence !== null && pendingFence !== undefined) {
+        this.raiseFencedAlert(agent, pendingFence.reason);
       }
       if (agent.handle === null || agent.state !== 'watching' || agent.breakerOpen) continue;
       // An automatic rate-limit retry waiting out its backoff owns recovery:
@@ -2000,7 +2003,7 @@ export class Supervisor {
     adopted.stopReason = old.breakerOpen ? old.stopReason : null;
     adopted.stoppedAt = old.breakerOpen ? old.stoppedAt : null;
     adopted.breakerNotificationId = old.breakerNotificationId;
-    adopted.pendingRearmFenceAlert = old.pendingRearmFenceAlert;
+    adopted.pendingRearmFenceAlert = old.pendingRearmFenceAlert ?? null;
     // A turn interrupted by an earlier failed rung (or by the breaker
     // stop) still awaits resume on the next live handle.
     adopted.pendingRecovery = old.pendingRecovery;
@@ -2418,7 +2421,9 @@ export class Supervisor {
       agent.pendingRearmFenceAlert = null;
       return;
     }
-    if (agent.pendingRearmFenceAlert === null) agent.pendingRearmFenceAlert = { reason };
+    if (agent.pendingRearmFenceAlert === null || agent.pendingRearmFenceAlert === undefined) {
+      agent.pendingRearmFenceAlert = { reason };
+    }
     let bound: ReturnType<LedgerApi['getNotification']> = null;
     if (agent.breakerNotificationId !== null) {
       try {

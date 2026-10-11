@@ -342,6 +342,49 @@ function hang(handle: FakeHandle): void {
   handle.emit({ type: 'turn_start' });
 }
 
+/** A hand-built dead slot-bound record with an OPEN breaker: the defensive
+ * merge shape `ensureSlot` otherwise cannot produce (the reachable ensure
+ * flows clear a picked open breaker before any spawn). The
+ * `pendingRearmFenceAlert` field is intentionally optional so callers can
+ * pin BOTH the carry (value present) and the normalization (field omitted). */
+function staleOpenSlotRecord(
+  slot: unknown,
+  slotGeneration: number,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    agentId: 'stale-open-stop',
+    role: 'gru',
+    slot,
+    slotGeneration,
+    handle: null,
+    sessionFile: null,
+    state: 'stopped',
+    openTurn: false,
+    openControl: false,
+    compactionWarned: false,
+    openToolCalls: new Map(),
+    pendingRecovery: null,
+    lastEventAt: 0,
+    lastFileBytes: null,
+    restartRing: [],
+    consecutiveFailures: 0,
+    breakerOpen: true,
+    stopReason: 'quota_wall',
+    stoppedAt: 0,
+    breakerNotificationId: null,
+    inRestart: false,
+    backoffTimer: null,
+    activityGeneration: 0,
+    decisionPending: false,
+    failureTerminalPending: false,
+    queuedRecovery: null,
+    rateLimitRetry: null,
+    recoveryAdmission: null,
+    ...overrides,
+  };
+}
+
 describe('supervisor — watchdog + restart ladder', () => {
   let h: Harness;
   beforeAll(() => {
@@ -1852,36 +1895,12 @@ describe('supervisor — Perkins r1 fixes', () => {
       agents: Map<string, Record<string, unknown>>;
     };
     const internalSlot = internals.slots.get('gru-open-retire')!;
-    internals.agents.set('stale-open-stop', {
-      agentId: 'stale-open-stop',
-      role: 'gru',
-      slot: internalSlot,
-      slotGeneration: internalSlot.generation - 1,
-      handle: null,
-      sessionFile: null,
-      state: 'stopped',
-      openTurn: false,
-      openControl: false,
-      compactionWarned: false,
-      openToolCalls: new Map(),
-      pendingRecovery: null,
-      lastEventAt: 0,
-      lastFileBytes: null,
-      restartRing: [],
-      consecutiveFailures: 0,
-      breakerOpen: true,
-      stopReason: 'quota_wall',
-      breakerNotificationId: null,
-      pendingRearmFenceAlert: { reason: 'stale fence pending' },
-      inRestart: false,
-      backoffTimer: null,
-      activityGeneration: 0,
-      decisionPending: false,
-      failureTerminalPending: false,
-      queuedRecovery: null,
-      rateLimitRetry: null,
-      recoveryAdmission: null,
-    });
+    internals.agents.set(
+      'stale-open-stop',
+      staleOpenSlotRecord(internalSlot, internalSlot.generation - 1, {
+        pendingRearmFenceAlert: { reason: 'stale fence pending' },
+      }),
+    );
     // The current record dies outside a restart rung; ensure() spawns the
     // replacement and retires BOTH dead records, merging the open one.
     await h.registry.disposeHandle(first);
@@ -1898,6 +1917,30 @@ describe('supervisor — Perkins r1 fixes', () => {
       | { pendingRearmFenceAlert?: { reason?: string } | null }
       | undefined;
     expect(live?.pendingRearmFenceAlert?.reason).toBe('stale fence pending');
+    h.dispose();
+  });
+
+  it('a stale record that OMITS the retry field normalizes to null (no undefined reaches the tick)', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-open-normalize',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    const internals = h.supervisor as unknown as {
+      slots: Map<string, { generation: number }>;
+      agents: Map<string, Record<string, unknown>>;
+    };
+    const internalSlot = internals.slots.get('gru-open-normalize')!;
+    // The field is OMITTED on purpose: without the ?? null normalization
+    // the merge plants `undefined`, which would abort a tick pass.
+    internals.agents.set('stale-open-stop', staleOpenSlotRecord(internalSlot, internalSlot.generation - 1));
+    await h.registry.disposeHandle(first);
+    const replacement = (await slot.ensure({})) as FakeHandle;
+    const live = internals.agents.get(replacement.id) as { pendingRearmFenceAlert?: unknown } | undefined;
+    expect(live?.pendingRearmFenceAlert).toBeNull();
+    h.advance(0); // a full tick pass survives the merged record
     h.dispose();
   });
 
