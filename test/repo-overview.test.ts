@@ -1098,9 +1098,9 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       // The default resolver's failure paths through the REAL seam:
       expect(row(view, 'no-origin').linkReason).toBe('no usable origin remote');
       expect(row(view, 'gitlab-repo').linkReason).toBe('non-GitHub remote');
-      // A corrupt/unreadable repository is a READ failure, not evidence
-      // the user never configured an origin.
-      expect(row(view, 'broken').linkReason).toBe('origin remote could not be read yet');
+      // A stale worktree pointer is unavailable, never an origin-read failure
+      // that could preserve or classify a remote identity.
+      expect(row(view, 'broken').linkReason).toBe('selected repository is unavailable under workspace_root');
       expect(api.calls.every((call) => call.endsWith('acme/alpha'))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1321,7 +1321,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     }
   });
 
-  it('keeps inherited Git routing from selecting an unconfigured origin for provider calls', async () => {
+  it('keeps inherited Git routing and command-scope config from selecting an unconfigured origin for provider calls', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-git-routing-'));
     const selected = join(root, 'selected');
     const foreign = join(root, 'foreign');
@@ -1330,20 +1330,30 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       execFileSync('git', ['-C', selected, 'remote', 'add', 'origin', 'https://github.com/acme/selected.git']);
       execFileSync('git', ['init', '-q', foreign]);
       execFileSync('git', ['-C', foreign, 'remote', 'add', 'origin', 'https://github.com/acme/foreign.git']);
+      const expectSelectedProviderCalls = async (): Promise<void> => {
+        const api = new FakeApi();
+        const tracker = new ManagedRepoOverviewTracker({
+          workspaceRoot: root,
+          managedRepos: ['selected'],
+          api,
+          intervalMs: 0,
+        });
+        const view = await tracker.refresh();
+        expect(row(view, 'selected').fullName).toBe('acme/selected');
+        expect(api.calls).toContain('fetchRepo:acme/selected');
+        expect(api.calls.some((call) => call.endsWith(':acme/foreign'))).toBe(false);
+      };
+
       vi.stubEnv('GIT_DIR', join(foreign, '.git'));
       vi.stubEnv('GIT_WORK_TREE', selected);
+      vi.stubEnv('GIT_CONFIG_COUNT', '1');
+      vi.stubEnv('GIT_CONFIG_KEY_0', 'remote.origin.url');
+      vi.stubEnv('GIT_CONFIG_VALUE_0', 'https://github.com/acme/foreign.git');
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
 
-      const api = new FakeApi();
-      const tracker = new ManagedRepoOverviewTracker({
-        workspaceRoot: root,
-        managedRepos: ['selected'],
-        api,
-        intervalMs: 0,
-      });
-      const view = await tracker.refresh();
-      expect(row(view, 'selected').fullName).toBe('acme/selected');
-      expect(api.calls).toContain('fetchRepo:acme/selected');
-      expect(api.calls.some((call) => call.endsWith(':acme/foreign'))).toBe(false);
+      vi.stubEnv('GIT_CONFIG_PARAMETERS', "'remote.origin.url'='https://github.com/acme/foreign.git'");
+      await expectSelectedProviderCalls();
     } finally {
       vi.unstubAllEnvs();
       rmSync(root, { recursive: true, force: true });

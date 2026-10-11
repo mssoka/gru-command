@@ -20,13 +20,18 @@ const GIT_ROUTING_ENV = new Set([
   'GIT_PREFIX',
   'GIT_CEILING_DIRECTORIES',
   'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+  'GIT_CONFIG_PARAMETERS',
 ]);
 
-/** Keep owner Git configuration, but prevent inherited routing from replacing
- * the selected project's actual .git identity. */
+function isGitProbeEnvironmentVariable(name: string): boolean {
+  return !GIT_ROUTING_ENV.has(name) && !/^GIT_CONFIG_(?:COUNT|(?:KEY|VALUE)_\d+)$/u.test(name);
+}
+
+/** Keep owner Git config files authoritative, but prevent inherited routing or
+ * command-scope overrides from replacing the selected project's Git identity. */
 export function gitProbeEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(
-    Object.entries(process.env).filter(([name]) => !GIT_ROUTING_ENV.has(name)),
+    Object.entries(process.env).filter(([name]) => isGitProbeEnvironmentVariable(name)),
   );
 }
 

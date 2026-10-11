@@ -382,6 +382,18 @@ describe('intake review regressions', () => {
     const resolveIntakeRepo = createManagedRepoIntakeResolver(h.workspace, ['stale', 'demo']);
     expect(resolveIntakeRepo(h.repo)).toEqual([h.repo]);
     expect(readFileSync(probeLog, 'utf8')).toBe(`${h.repo}\n`);
+    const guardedService = new IntakeService({ ...h.options, managedRepos: resolveIntakeRepo });
+    const first = await guardedService.preview(h.request);
+    writeFileSync(probeLog, '');
+    await guardedService.revise({
+      repoPath: h.repo,
+      intakeId: h.request.intakeId,
+      requestId: 'r2',
+      previousRequestId: h.request.requestId,
+      revisionId: first.revisionId,
+      plan: first.plan,
+    });
+    expect(readFileSync(probeLog, 'utf8')).toBe(`${h.repo}\n`);
     vi.unstubAllEnvs();
 
     const source = join(h.root, 'worktree-source');

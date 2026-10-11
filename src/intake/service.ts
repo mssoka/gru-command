@@ -77,10 +77,18 @@ export function parseIntakeRequest(value: unknown): IntakeRequest {
 export class IntakeService {
   constructor(private readonly options: IntakeServiceOptions) {}
 
-  private context(repoPath: string, intakeId: string, existingOnly = false): PreviewArtifactContext {
-    const registered = this.options.managedRepos === undefined
+  private managedRepoPaths(repoPath: string): readonly string[] {
+    return this.options.managedRepos === undefined
       ? discoverManagedRepos(this.options.workspaceRoot).map((name) => join(this.options.workspaceRoot, name))
       : this.options.managedRepos(repoPath);
+  }
+
+  private context(
+    repoPath: string,
+    intakeId: string,
+    existingOnly = false,
+    registered = this.managedRepoPaths(repoPath),
+  ): PreviewArtifactContext {
     const repo = canonicalManagedRepo(repoPath, registered);
     let runtime: BundledWorkflowRuntime;
     try { runtime = (this.options.workflow ?? loadBundledWorkflowRuntime)(); } catch (error) {
@@ -104,7 +112,8 @@ export class IntakeService {
   }
 
   validateIdentity(repoPath: string, intakeId: string): void {
-    this.storage(() => this.context(repoPath, intakeId, true), false);
+    const registered = this.managedRepoPaths(repoPath);
+    this.storage(() => this.context(repoPath, intakeId, true, registered), false);
   }
 
   /** Refinement keeps captured bytes; source refresh is a separate preview. */
@@ -114,19 +123,25 @@ export class IntakeService {
     const repoPath = text(raw['repoPath'], 'repoPath');
     const intakeId = requestId(raw['intakeId'], 'intakeId');
     const previousRequestId = requestId(raw['previousRequestId'], 'previousRequestId');
-    const previous = this.read(repoPath, intakeId, previousRequestId);
+    const registered = this.managedRepoPaths(repoPath);
+    const previous = this.readWithRegisteredRepos(repoPath, intakeId, previousRequestId, registered);
     if (previous.revisionId !== raw['revisionId']) throw new IntakeError('intake_stale_revision', 'Revision does not bind the exact captured proposal', 409);
     if (raw['plan'] === undefined) invalid('revision requires an explicit plan');
-    const context = this.storage(() => this.context(repoPath, intakeId, true), false);
+    const context = this.storage(() => this.context(repoPath, intakeId, true, registered), false);
     const original = this.storage(() => parseIntakeRequest(JSON.parse(context.readOperational(`requests/${previousRequestId}/input.json`))), false);
-    return this.previewCaptured({ ...original, requestId: requestId(raw['requestId'], 'requestId'), previousRequestId, plan: raw['plan'] }, previous);
+    return this.previewCaptured({ ...original, requestId: requestId(raw['requestId'], 'requestId'), previousRequestId, plan: raw['plan'] }, previous, registered);
   }
 
   async preview(value: unknown): Promise<Proposal> { return this.previewCaptured(value); }
 
-  private async previewCaptured(value: unknown, retained?: Capture): Promise<Proposal> {
+  private async previewCaptured(
+    value: unknown,
+    retained?: Capture,
+    registered?: readonly string[],
+  ): Promise<Proposal> {
     const request = parseIntakeRequest(value);
-    const context = this.storage(() => this.context(request.repoPath, request.intakeId));
+    const requestRegistry = registered ?? this.managedRepoPaths(request.repoPath);
+    const context = this.storage(() => this.context(request.repoPath, request.intakeId, false, requestRegistry));
     const prefix = `requests/${request.requestId}`;
     const write = (path: string, value: unknown, sources: Proposal['snapshots'] = [], contents = canonical(value)): void => {
       this.storage(() => context.writeOperational({ path, contents, sources: sources.map(({ kind, locator, revision, sha256 }) => ({ kind, locator, revision, sha256 })) }));
@@ -137,7 +152,9 @@ export class IntakeService {
     };
     // Preserve the explicit request before attempting any external source read.
     write(`${prefix}/input.json`, request);
-    if (request.previousRequestId !== undefined) this.read(request.repoPath, request.intakeId, request.previousRequestId);
+    if (request.previousRequestId !== undefined) {
+      this.readWithRegisteredRepos(request.repoPath, request.intakeId, request.previousRequestId, requestRegistry);
+    }
     const capture = retained === undefined ? await captureSources(request.repoPath, request.source, this.options) : { snapshots: retained.snapshots, gaps: retained.gaps, requirements: retained.requirements };
     write(`${prefix}/capture.json`, capture, capture.snapshots);
     let plan: Proposal['plan'];
@@ -177,7 +194,17 @@ export class IntakeService {
   }
 
   read(repoPath: string, intakeId: string, id: string): Proposal {
-    const context = this.storage(() => this.context(repoPath, intakeId, true), false);
+    const registered = this.managedRepoPaths(repoPath);
+    return this.readWithRegisteredRepos(repoPath, intakeId, id, registered);
+  }
+
+  private readWithRegisteredRepos(
+    repoPath: string,
+    intakeId: string,
+    id: string,
+    registered: readonly string[],
+  ): Proposal {
+    const context = this.storage(() => this.context(repoPath, intakeId, true, registered), false);
     const prefix = `requests/${requestId(id, 'requestId')}`;
     if (!this.storage(() => context.hasOperational(`${prefix}/proposal.json`), false)) throw new IntakeError('intake_not_found', 'no completed preview for this explicit repository/intake/request identity', 404);
     const proposal = this.storage(() => JSON.parse(context.readOperational(`${prefix}/proposal.json`)) as Proposal, false);
@@ -195,8 +222,9 @@ export class IntakeService {
   }
 
   diff(repoPath: string, intakeId: string, from: string, to: string): Readonly<Record<string, unknown>> {
-    const before = this.read(repoPath, intakeId, from);
-    const after = this.read(repoPath, intakeId, to);
+    const registered = this.managedRepoPaths(repoPath);
+    const before = this.readWithRegisteredRepos(repoPath, intakeId, from, registered);
+    const after = this.readWithRegisteredRepos(repoPath, intakeId, to, registered);
     const changes = <T extends { readonly id: string }>(old: readonly T[], current: readonly T[]): readonly unknown[] => {
       const ids = [...new Set([...old, ...current].map((item) => item.id))];
       return ids.flatMap((id) => {
