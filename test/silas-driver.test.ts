@@ -56,7 +56,7 @@ import { GhPrPoster, WaveRunner } from '../src/dispatch/perkins.js';
 import type { WorktreePort } from '../src/dispatch/worktree-port.js';
 import type { AgentSpawner } from '../src/dispatch/service.js';
 import { createHash } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import type { AgentCapabilities, AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
@@ -1425,6 +1425,7 @@ describe('silas digest (the four actionable states)', () => {
           : '[]';
         writeFileSync(binary, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(list)});\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  ${mode === 'rotated' ? `if (!existsSync(${JSON.stringify(userState)})) { writeFileSync(${JSON.stringify(userState)}, 'b'); process.stdout.write('account-b'); } else { process.stdout.write('account-a'); }` : "process.stdout.write('account-a');"}\n} else {\n  process.stdout.write(${JSON.stringify(`${sha}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
         const escalations: string[] = [];
+        chmodSync(binary, 0o755);
         const wave = new WaveRunner({
           ledger: h.ledger, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
           reviewArtifactRoot: artifacts, spawner: vi.fn() as unknown as AgentSpawner,
