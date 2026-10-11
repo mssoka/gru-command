@@ -166,6 +166,9 @@ export interface ShadowDecisionRecord {
   readonly routes: unknown;
   /** The deterministic baseline answers — what actually happened. */
   readonly deterministic_answers: unknown;
+  /** The deterministic baseline routes. Absent on rows recorded before
+   * 2026-10-11; the yield report rebuilds those from the answers. */
+  readonly deterministic_routes: unknown;
   readonly latency_ms: number;
   readonly cost: number | null;
   readonly provenance_source: 'jev' | 'deterministic';
@@ -173,9 +176,13 @@ export interface ShadowDecisionRecord {
    * predating this field have unknown causes — never infer timeout from 0 ms. */
   readonly fallback_reason: DecisionFailureReason | null;
   readonly request_diagnostics: DecisionRequestDiagnostics | null;
-  /** True when the provider's routes would have differed from the
-   * deterministic baseline's routes on at least one question. */
-  readonly disagrees: boolean;
+  /** True when the surface's consumer would have acted differently on the
+   * provider's outcome than on the baseline's (`shadowEffectDisagreement`);
+   * null when no consumer effect is defined for the surface or the outcome
+   * does not carry the questions that effect reads. Rows recorded
+   * before 2026-10-11 carry an older band-only flag, so the yield report
+   * recomputes from the recorded answers and routes and never reads it. */
+  readonly disagrees: boolean | null;
 }
 
 export interface DecisionRequest<Q extends QuestionSet> {

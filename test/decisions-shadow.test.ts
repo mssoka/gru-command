@@ -15,14 +15,26 @@ import {
   backtestRecordPath,
   EnforceGateError,
 } from '../src/decisions/enforce.js';
-import { eventDecisionRequest } from '../src/decisions/questions.js';
+import { eventDecisionRequest, supervisionDecisionRequest } from '../src/decisions/questions.js';
 import { DecisionRuntime, SHADOW_MISS_DEGRADE_THRESHOLD } from '../src/decisions/runtime.js';
 import { backtestRecordFromReport, saveBacktestRecord, type BacktestReport } from '../src/decisions/backtest.js';
 import { EventBus, type BusEvent } from '../src/events/bus.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { NotificationCenter } from '../src/notifications/center.js';
-import type { ShadowDecisionRecord } from '../src/decisions/types.js';
+import { buildShadowRecord } from '../src/decisions/shadow.js';
+import { decisionRoute, deterministicOutcome } from '../src/decisions/service.js';
+import { requestFromCase, surfaceCaseSpec } from '../src/decisions/cases/registry.js';
+import type {
+  Answer,
+  AnswersFor,
+  ChoiceAnswer,
+  DecisionOutcome,
+  DecisionRequest,
+  QuestionSet,
+  RiskClass,
+  ShadowDecisionRecord,
+} from '../src/decisions/types.js';
 
 const cleanups: string[] = [];
 afterEach(() => {
@@ -476,5 +488,108 @@ describe('shadow misses are evidence, not incidents (2026-10-06 owner page)', ()
     expect(authRuntime.status()).toMatchObject({ status: 'degraded', reason: 'auth_rejected' });
     expect(auth.postIncident.mock.calls[0]![0]).toMatchObject({ kind: 'decisions.degraded.auth_rejected', routing: 'needs-owner' });
     authRuntime.dispose();
+  });
+});
+
+describe('shadow record disagreement is what the consumer would do (2026-10-11)', () => {
+  const thresholds = DEFAULT_DECISIONS_CONFIG.thresholds;
+
+  // Routes come from the real banding, exactly as the provider service
+  // would assign them for these answers.
+  function jevOutcome<Q extends QuestionSet>(request: DecisionRequest<Q>, answers: AnswersFor<Q>): DecisionOutcome<Q> {
+    const routes = Object.fromEntries(Object.keys(request.questions).map((id) => [
+      id,
+      decisionRoute((answers as Record<string, Answer>)[id]!, (request.risks as Record<string, RiskClass>)[id]!, thresholds),
+    ])) as DecisionOutcome<Q>['routes'];
+    return {
+      answers,
+      routes,
+      provenance: { source: 'jev', fallbackReason: null, model: 'laya-421m-test', latencyMs: 10, usage: null, profile: 'local' },
+    };
+  }
+
+  function recordFor<Q extends QuestionSet>(surface: string, request: DecisionRequest<Q>, answers: AnswersFor<Q>): ShadowDecisionRecord {
+    return buildShadowRecord({
+      surface,
+      provider: 'local',
+      request,
+      providerOutcome: jevOutcome(request, answers),
+      deterministicOutcome: deterministicOutcome(request, thresholds, 'shadow_mode'),
+    });
+  }
+
+  const pathOf = (record: ShadowDecisionRecord, id: string): string =>
+    (record.routes as Record<string, { path: string }>)[id]!.path;
+
+  it('event triage disagrees only when the notification would be promoted to action-required', () => {
+    const request = eventRequest();
+    const { fallback } = request;
+    // Class and severity differ in the act band, but needs_action stays in
+    // the fallback band: the notification stays FYI; only its detail text
+    // would change.
+    const detailOnly = recordFor('event_triage', request, {
+      needs_action: { type: 'noul', noul: 0.2 },
+      event_class: { ...fallback.event_class, choice: 'operator_attention', confidence: 0.9 },
+      severity: { ...fallback.severity, score: 1.1, confidence: 0.9 },
+    });
+    expect(pathOf(detailOnly, 'event_class')).toBe('act');
+    expect(pathOf(detailOnly, 'needs_action')).toBe('fallback');
+    expect(detailOnly.disagrees).toBe(false);
+    // A confirm-band needs_action (0.6 on operational) routes it UP.
+    const promoted = recordFor('event_triage', request, { ...fallback, needs_action: { type: 'noul', noul: 0.6 } });
+    expect(pathOf(promoted, 'needs_action')).toBe('confirm');
+    expect(promoted.disagrees).toBe(true);
+    // The baseline routes travel with the record.
+    expect((promoted.deterministic_routes as Record<string, { path: string }>)['event_class']!.path).toBe('act');
+  });
+
+  it('supervision disagrees only when the supervisor would stop instead of restart, or for another reason', () => {
+    // The ladder restarts a network failure: baseline restart_advised 1 (act).
+    const request = supervisionDecisionRequest({ reason: 'socket hang up: network unreachable', agentId: 'm1', role: 'minion', restartCount: 0, breakerLimit: 3 });
+    const { fallback } = request;
+    expect(fallback.failure_class.choice).toBe('network_failure');
+    const record = (failureClass: string, classConfidence: number, restart: number, severityScore = fallback.severity.score) =>
+      recordFor('supervision_guidance', request, {
+        failure_class: { ...fallback.failure_class, choice: failureClass as typeof fallback.failure_class.choice, confidence: classConfidence },
+        restart_advised: { type: 'noul', noul: restart },
+        severity: { ...fallback.severity, score: severityScore },
+      });
+    // Agrees a restart helps, below the act band: the human gate owns it.
+    const confirmGated = record('network_failure', 0.9, 0.6);
+    expect(pathOf(confirmGated, 'restart_advised')).toBe('confirm');
+    expect(confirmGated.disagrees).toBe(true);
+    // Uncertain restart advice (fallback band) restarts via the ladder, and
+    // a different non-wall class changes nothing the supervisor does.
+    const ladder = record('unknown', 0.9, 0.3);
+    expect(pathOf(ladder, 'restart_advised')).toBe('fallback');
+    expect(ladder.disagrees).toBe(false);
+    // The supervisor never reads the severity answer.
+    expect(record('network_failure', 0.9, 0.9, 2).disagrees).toBe(false);
+    // A model-classified wall stops the agent the ladder would restart.
+    expect(record('quota_wall', 0.9, 0.1).disagrees).toBe(true);
+  });
+
+  it('escalation triage and same-blocker disagree only when their case-spec action differs', () => {
+    // Baseline: every escalation needs a ruling (wake Gru) at confidence 1.
+    const escalation = requestFromCase(surfaceCaseSpec('escalation_triage'), 'escalation state');
+    const baselineTriage = escalation.fallback['triage'] as ChoiceAnswer;
+    const triage = (choice: string, confidence: number) => recordFor('escalation_triage', escalation, {
+      ...escalation.fallback,
+      triage: { ...baselineTriage, choice, confidence },
+    } as AnswersFor<QuestionSet>);
+    // Agrees less confidently (confirm band on operational): still a ruling.
+    const lessConfident = triage('needs_ruling', 0.6);
+    expect(pathOf(lessConfident, 'triage')).toBe('confirm');
+    expect(lessConfident.disagrees).toBe(false);
+    // Another ruling class is the same action.
+    expect(triage('needs_owner', 0.9).disagrees).toBe(false);
+    // Covered by an open item: no ruling owed.
+    expect(triage('covered_by_open_item', 0.9).disagrees).toBe(true);
+    // Baseline: different fingerprints are different defects (act on it).
+    const sameBlocker = requestFromCase(surfaceCaseSpec('same_blocker'), 'blocker pair');
+    const sameDefect = (noul: number) =>
+      recordFor('same_blocker', sameBlocker, { same_defect: { type: 'noul', noul } } as AnswersFor<QuestionSet>);
+    expect(sameDefect(0.6).disagrees).toBe(true);
+    expect(sameDefect(0.45).disagrees).toBe(false);
   });
 });

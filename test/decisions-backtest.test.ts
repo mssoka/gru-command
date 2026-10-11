@@ -385,25 +385,115 @@ describe('backtest engine (issue #223)', () => {
 // ------------------------------------------------------------------
 
 describe('yield report shadow measures (issue #223)', () => {
+  // Rows shaped like production `decisions.shadow` payloads. `disagrees`
+  // carries what an older recorder stored; the report must ignore it and
+  // count only asks on which the consumer would have acted differently.
+  const ts = (seq: number): string => `2026-10-01T00:00:${String(seq).padStart(2, '0')}.000Z`;
+  const route = (path: 'act' | 'confirm' | 'fallback', riskClass: string) =>
+    ({ path, metric: 0.5, metricKind: 'confidence', requiresConfirm: path === 'confirm', riskClass });
+  const choice = (value: string, confidence: number) =>
+    ({ type: 'choice', choice: value, probabilities: { [value]: confidence }, confidence });
+  const shadowRow = (seq: number, payload: Record<string, unknown>): LedgerEventRecord =>
+    ({ seq, ts: ts(seq), kind: 'decisions.shadow', jobId: null, payload });
+
+  const EVENT_BASELINE = {
+    needs_action: { type: 'noul', noul: 0 },
+    event_class: choice('routine_fyi', 1),
+    severity: { type: 'score', score: 0, probabilities: { '0': 1 }, confidence: 1 },
+  };
+  const EVENT_BASELINE_ROUTES = {
+    needs_action: route('fallback', 'operational'),
+    event_class: route('act', 'read_only'),
+    severity: route('act', 'read_only'),
+  };
+  function eventRow(seq: number, fields: {
+    readonly source: 'jev' | 'deterministic';
+    readonly needsAction: readonly [number, 'act' | 'confirm' | 'fallback'];
+    readonly eventClass: string;
+    readonly storedDisagrees: boolean;
+    readonly latencyMs: number;
+  }): LedgerEventRecord {
+    const answered = fields.source === 'jev';
+    return shadowRow(seq, {
+      surface: 'event_triage', provider: 'local', provenance_source: fields.source,
+      answers: answered
+        ? { needs_action: { type: 'noul', noul: fields.needsAction[0] }, event_class: choice(fields.eventClass, 0.9), severity: EVENT_BASELINE.severity }
+        : EVENT_BASELINE,
+      routes: answered
+        ? { needs_action: route(fields.needsAction[1], 'operational'), event_class: route('act', 'read_only'), severity: route('act', 'read_only') }
+        : EVENT_BASELINE_ROUTES,
+      deterministic_answers: EVENT_BASELINE,
+      deterministic_routes: EVENT_BASELINE_ROUTES,
+      disagrees: fields.storedDisagrees,
+      latency_ms: fields.latencyMs,
+      cost: answered ? 0.001 : null,
+    });
+  }
+
+  // A network failure the ladder restarts (baseline restart_advised 1).
+  const SUPERVISION_BASELINE = {
+    failure_class: choice('network_failure', 1),
+    restart_advised: { type: 'noul', noul: 1 },
+    severity: { type: 'score', score: 1, probabilities: { '1': 1 }, confidence: 1 },
+  };
+  // Recorded before 2026-10-11: no `deterministic_routes`, so the report
+  // rebuilds them from the baseline answers at the default thresholds.
+  function legacySupervisionRow(seq: number, restart: readonly [number, 'act' | 'confirm' | 'fallback']): LedgerEventRecord {
+    return shadowRow(seq, {
+      surface: 'supervision_guidance', provider: 'openrouter-jev', provenance_source: 'jev',
+      answers: { ...SUPERVISION_BASELINE, restart_advised: { type: 'noul', noul: restart[0] } },
+      routes: { failure_class: route('act', 'operational'), restart_advised: route(restart[1], 'operational'), severity: route('act', 'read_only') },
+      deterministic_answers: SUPERVISION_BASELINE,
+      disagrees: false,
+      latency_ms: 400,
+      cost: 0.001,
+    });
+  }
+
   const events: LedgerEventRecord[] = [
-    { seq: 1, ts: '2026-10-01T00:00:01.000Z', kind: 'decisions.shadow', jobId: null, payload: { surface: 'event_triage', provider: 'local', disagrees: true, provenance_source: 'jev', latency_ms: 100, cost: 0.001 } },
-    { seq: 2, ts: '2026-10-01T00:00:02.000Z', kind: 'decisions.shadow', jobId: null, payload: { surface: 'event_triage', provider: 'local', disagrees: false, provenance_source: 'jev', latency_ms: 300, cost: 0.001 } },
-    { seq: 3, ts: '2026-10-01T00:00:03.000Z', kind: 'decisions.shadow', jobId: null, payload: { surface: 'supervision_guidance', provider: 'openrouter-jev', disagrees: false, provenance_source: 'deterministic', latency_ms: 5, cost: null } },
-    { seq: 4, ts: '2026-10-01T00:00:04.000Z', kind: 'gru.wake', jobId: null, payload: { notification_ids: [], count: 0 } },
+    // Class differs in the act band, needs_action stays fallback: still FYI.
+    eventRow(1, { source: 'jev', needsAction: [0.2, 'fallback'], eventClass: 'operator_attention', storedDisagrees: true, latencyMs: 100 }),
+    // needs_action clears the fallback band: promoted to action-required.
+    eventRow(2, { source: 'jev', needsAction: [0.6, 'confirm'], eventClass: 'routine_fyi', storedDisagrees: false, latencyMs: 300 }),
+    eventRow(3, { source: 'jev', needsAction: [0.1, 'fallback'], eventClass: 'routine_fyi', storedDisagrees: true, latencyMs: 200 }),
+    // Provider miss: the baseline itself, kept out of the share and latency.
+    eventRow(4, { source: 'deterministic', needsAction: [0, 'fallback'], eventClass: 'routine_fyi', storedDisagrees: false, latencyMs: 0 }),
+    // Restart advised below the act band: the supervisor stops for a human.
+    legacySupervisionRow(5, [0.6, 'confirm']),
+    // Uncertain advice: the ladder restarts exactly as the baseline does.
+    legacySupervisionRow(6, [0.3, 'fallback']),
+    // No consumer effect defined: listed, but disagreement is unmeasured.
+    shadowRow(7, { surface: 'custom_surface', provider: 'local', provenance_source: 'jev', answers: {}, routes: {}, deterministic_answers: {}, latency_ms: 50, cost: null }),
+    // Every ask missed: nothing answered, so nothing to measure.
+    shadowRow(8, { surface: 'same_blocker', provider: 'openrouter-jev', provenance_source: 'deterministic', latency_ms: 2500, cost: null }),
+    { seq: 9, ts: ts(9), kind: 'gru.wake', jobId: null, payload: { notification_ids: [], count: 0 } },
   ];
 
-  it('aggregates disagreement rates per surface and provider', () => {
+  it('counts asks the consumer would act on differently, over answered asks, with misses kept apart', () => {
     const measures = computeDecisionShadowMeasures(events);
-    expect(measures.records).toBe(3);
+    expect(measures).toMatchObject({ records: 8, skipped: 0 });
     const triage = measures.bySurfaceProvider.find((row) => row.surface === 'event_triage')!;
-    expect(triage).toMatchObject({ provider: 'local', records: 2, disagreements: 1, disagreementShare: 0.5, providerMisses: 0 });
-    expect(triage.latencyP50Ms).toBe(100);
-    expect(triage.latencyP95Ms).toBe(300);
+    expect(triage).toMatchObject({
+      provider: 'local', records: 4, answered: 3, providerMisses: 1,
+      disagreements: 1, disagreementShare: 1 / 3, latencyP50Ms: 200, latencyP95Ms: 300,
+    });
+    expect(triage.costUsd).toBeCloseTo(0.003);
     const supervision = measures.bySurfaceProvider.find((row) => row.surface === 'supervision_guidance')!;
-    expect(supervision).toMatchObject({ records: 1, disagreements: 0, providerMisses: 1 });
+    expect(supervision).toMatchObject({ records: 2, answered: 2, providerMisses: 0, disagreements: 1, disagreementShare: 0.5 });
   });
 
-  it('flows through buildYieldReport and the text renderer, skipping torn rows', () => {
+  it('reports unmeasured values as null rather than observed zeros', () => {
+    const measures = computeDecisionShadowMeasures(events);
+    const custom = measures.bySurfaceProvider.find((row) => row.surface === 'custom_surface')!;
+    expect(custom).toMatchObject({ answered: 1, disagreements: null, disagreementShare: null, latencyP50Ms: 50 });
+    const missedOnly = measures.bySurfaceProvider.find((row) => row.surface === 'same_blocker')!;
+    expect(missedOnly).toMatchObject({
+      records: 1, answered: 0, providerMisses: 1,
+      disagreements: 0, disagreementShare: null, latencyP50Ms: null, latencyP95Ms: null,
+    });
+  });
+
+  it('flows through buildYieldReport and the text renderer, counting torn rows as skipped', () => {
     const report = buildYieldReport({
       since: '2026-10-01T00:00:00.000Z',
       until: '2026-10-02T00:00:00.000Z',
@@ -411,13 +501,44 @@ describe('yield report shadow measures (issue #223)', () => {
       parseSkips: { unparsableLines: 0, unattributedCompactions: 0 },
       turns: [],
       sweepSignatures: [],
-      ledger: { since: '2026-10-01T00:00:00.000Z', until: '2026-10-02T00:00:00.000Z', events: [...events, { seq: 5, ts: '2026-10-01T00:00:05.000Z', kind: 'decisions.shadow', jobId: null, payload: 'torn' }], notifications: [], jobs: [] },
+      ledger: {
+        since: '2026-10-01T00:00:00.000Z',
+        until: '2026-10-02T00:00:00.000Z',
+        events: [
+          ...events,
+          shadowRow(10, 'torn' as unknown as Record<string, unknown>),
+          // An answered row whose answers cannot be read is skipped too.
+          shadowRow(11, { surface: 'event_triage', provider: 'local', provenance_source: 'jev', disagrees: true, latency_ms: 50 }),
+          // Truncated: a readable answer, but not the questions the
+          // consumer reads. Skipped, never a crash of the whole report.
+          shadowRow(12, {
+            surface: 'event_triage', provider: 'local', provenance_source: 'jev',
+            answers: { event_class: choice('routine_fyi', 0.9) }, routes: { event_class: route('act', 'read_only') },
+            deterministic_answers: { event_class: EVENT_BASELINE.event_class }, deterministic_routes: { event_class: EVENT_BASELINE_ROUTES.event_class },
+            latency_ms: 50,
+          }),
+          // Wrong answer type for the question: skipped, not measured.
+          shadowRow(13, {
+            surface: 'supervision_guidance', provider: 'openrouter-jev', provenance_source: 'jev',
+            answers: { ...SUPERVISION_BASELINE, failure_class: { type: 'noul', noul: 0.9 } },
+            routes: { failure_class: route('act', 'operational'), restart_advised: route('act', 'operational'), severity: route('act', 'read_only') },
+            deterministic_answers: SUPERVISION_BASELINE,
+            latency_ms: 50,
+          }),
+        ],
+        notifications: [],
+        jobs: [],
+      },
     });
-    expect(report.decisionsShadow.records).toBe(3);
+    expect(report.decisionsShadow).toMatchObject({ records: 8, skipped: 4 });
     const text = renderTextReport(report);
     expect(text).toContain('Decisions (shadow');
-    expect(text).toContain('event_triage / local');
-    expect(text).toContain('50.0%');
+    expect(text).toContain(
+      'event_triage / local: records 4, answered 3, provider misses 1, would act differently 1 of 3 answered (33.3%), cost $0.00, answered latency p50 200ms / p95 300ms',
+    );
+    expect(text).toContain('custom_surface / local: records 1, answered 1, provider misses 0, would act differently n/a (no consumer effect defined)');
+    expect(text).toContain('same_blocker / openrouter-jev: records 1, answered 0, provider misses 1, would act differently 0 of 0 answered (n/a), cost $0.00, answered latency n/a');
+    expect(text).toContain('4 unreadable shadow row(s) skipped');
   });
 });
 

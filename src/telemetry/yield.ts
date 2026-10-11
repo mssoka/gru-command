@@ -12,6 +12,10 @@
  */
 
 import { AWARENESS_BLOCK_HEADER } from '../chat/awareness.js';
+import { DEFAULT_DECISIONS_CONFIG } from '../config.js';
+import { hasShadowEffect, shadowEffectDisagreement } from '../decisions/effects.js';
+import { decisionRoute } from '../decisions/service.js';
+import { RISK_CLASSES, type Answer, type DecisionRoute, type RiskClass, type ThresholdsConfig } from '../decisions/types.js';
 import { BOB_CONSOLIDATION_PROMPT } from '../dispatch/bob-scheduler.js';
 import { TERMINAL_JOB_STATUSES } from '../ledger/states.js';
 
@@ -592,71 +596,145 @@ export interface LedgerMeasures {
   readonly decisionsShadow: DecisionShadowMeasures;
 }
 
-/** Shadow-decision measures (issue #223, reported per #214): disagreement
- * rates per surface and provider — the share of shadow asks where the
- * provider's would-be routing differed from the deterministic baseline —
- * plus provider misses (fallbacks), cost and latency. Counts and rates
- * only; a shadow record never carries request state. */
+/** Shadow-decision measures (issue #223, reported per #214) per surface
+ * and provider. A disagreement is an answered ask on which the surface's
+ * consumer would have acted differently than on the deterministic
+ * baseline (`shadowEffectDisagreement`). Provider misses serve the
+ * baseline itself, so they are counted on their own and kept out of the
+ * share and the latency quantiles (a miss may still carry the elapsed
+ * time of a failed request, e.g. a timeout). Counts and rates only; a
+ * shadow record never carries request state. */
 export interface DecisionShadowMeasures {
   readonly records: number;
+  /** `decisions.shadow` rows too damaged to measure. */
+  readonly skipped: number;
   readonly bySurfaceProvider: readonly {
     readonly surface: string;
     readonly provider: string;
     readonly records: number;
-    readonly disagreements: number;
-    readonly disagreementShare: number;
+    /** Asks the provider answered: `records` minus `providerMisses`. */
+    readonly answered: number;
     readonly providerMisses: number;
+    /** Answered asks on which the consumer would have acted differently;
+     * null when no consumer effect is defined for the surface. */
+    readonly disagreements: number | null;
+    /** `disagreements / answered`; null when unmeasured or nothing was answered. */
+    readonly disagreementShare: number | null;
     readonly costUsd: number;
-    readonly latencyP50Ms: number;
-    readonly latencyP95Ms: number;
+    /** Over answered asks only; null when nothing was answered. */
+    readonly latencyP50Ms: number | null;
+    readonly latencyP95Ms: number | null;
   }[];
 }
 
-/** Aggregate decisions.shadow ledger events (#223). Pure. Malformed
- * records are skipped, not fatal — a torn row must not blind the whole
- * report. */
-export function computeDecisionShadowMeasures(events: readonly LedgerEventRecord[]): DecisionShadowMeasures {
-  const groups = new Map<string, { surface: string; provider: string; records: number; disagreements: number; misses: number; cost: number; latencies: number[] }>();
+/** Baseline routes for a row recorded before 2026-10-11, which lacks
+ * `deterministic_routes`: band each baseline answer with the question's
+ * risk class (carried on the provider's route) at `thresholds`. Null when
+ * the row cannot supply them. */
+function legacyBaselineRoutes(row: Readonly<Record<string, unknown>>, thresholds: ThresholdsConfig): Record<string, DecisionRoute> | null {
+  const answers = row['deterministic_answers'];
+  const providerRoutes = row['routes'];
+  if (typeof answers !== 'object' || answers === null || Array.isArray(answers)) return null;
+  if (typeof providerRoutes !== 'object' || providerRoutes === null || Array.isArray(providerRoutes)) return null;
+  const routes: Record<string, DecisionRoute> = {};
+  for (const [id, answer] of Object.entries(answers as Record<string, unknown>)) {
+    const riskClass = ((providerRoutes as Record<string, unknown>)[id] as { riskClass?: unknown } | undefined)?.riskClass;
+    if (!RISK_CLASSES.includes(riskClass as RiskClass)) return null;
+    try {
+      routes[id] = decisionRoute(answer as Answer, riskClass as RiskClass, thresholds);
+    } catch {
+      return null;
+    }
+  }
+  return routes;
+}
+
+/** Aggregate decisions.shadow ledger events (#223). Pure. Malformed rows
+ * are counted in `skipped`, not fatal — a torn row must not blind the
+ * whole report. Disagreement is recomputed from each row's answers and
+ * routes; the stored `disagrees` flag is never read because rows recorded
+ * before 2026-10-11 carry an older band-only definition. Those rows also
+ * lack `deterministic_routes`, which are rebuilt at `legacyThresholds`. */
+export function computeDecisionShadowMeasures(
+  events: readonly LedgerEventRecord[],
+  legacyThresholds: ThresholdsConfig = DEFAULT_DECISIONS_CONFIG.thresholds,
+): DecisionShadowMeasures {
+  const groups = new Map<string, { surface: string; provider: string; records: number; answered: number; disagreements: number; misses: number; cost: number; latencies: number[] }>();
   let total = 0;
+  let skipped = 0;
   for (const event of events) {
     if (event.kind !== 'decisions.shadow') continue;
     const payload = event.payload;
-    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) continue;
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+      skipped += 1;
+      continue;
+    }
     const row = payload as Record<string, unknown>;
-    if (typeof row['surface'] !== 'string' || typeof row['provider'] !== 'string') continue;
+    const surface = row['surface'];
+    const provider = row['provider'];
+    const answered = row['provenance_source'] === 'jev';
+    if (typeof surface !== 'string' || typeof provider !== 'string' || (!answered && row['provenance_source'] !== 'deterministic')) {
+      skipped += 1;
+      continue;
+    }
+    let disagrees = false;
+    if (answered && hasShadowEffect(surface)) {
+      const measured = shadowEffectDisagreement({
+        surface,
+        baselineAnswers: row['deterministic_answers'],
+        baselineRoutes: row['deterministic_routes'] ?? legacyBaselineRoutes(row, legacyThresholds),
+        providerAnswers: row['answers'],
+        providerRoutes: row['routes'],
+        providerSource: row['provenance_source'],
+      });
+      if (measured === null) {
+        skipped += 1;
+        continue;
+      }
+      disagrees = measured;
+    }
     total += 1;
-    const key = `${row['surface']}\0${row['provider']}`;
+    const key = `${surface}\0${provider}`;
     const bucket = groups.get(key) ?? {
-      surface: row['surface'], provider: row['provider'],
-      records: 0, disagreements: 0, misses: 0, cost: 0, latencies: [],
+      surface, provider,
+      records: 0, answered: 0, disagreements: 0, misses: 0, cost: 0, latencies: [],
     };
     bucket.records += 1;
-    if (row['disagrees'] === true) bucket.disagreements += 1;
-    if (row['provenance_source'] === 'deterministic') bucket.misses += 1;
+    if (answered) {
+      bucket.answered += 1;
+      if (disagrees) bucket.disagreements += 1;
+      if (typeof row['latency_ms'] === 'number' && Number.isFinite(row['latency_ms'])) bucket.latencies.push(row['latency_ms']);
+    } else {
+      bucket.misses += 1;
+    }
     if (typeof row['cost'] === 'number' && Number.isFinite(row['cost'])) bucket.cost += row['cost'];
-    if (typeof row['latency_ms'] === 'number' && Number.isFinite(row['latency_ms'])) bucket.latencies.push(row['latency_ms']);
     groups.set(key, bucket);
   }
-  const quantile = (values: readonly number[], q: number): number => {
-    if (values.length === 0) return 0;
+  const quantile = (values: readonly number[], q: number): number | null => {
+    if (values.length === 0) return null;
     const sorted = [...values].sort((a, b) => a - b);
     const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
     return sorted[index]!;
   };
   return {
     records: total,
+    skipped,
     bySurfaceProvider: [...groups.values()]
-      .map((bucket) => ({
-        surface: bucket.surface,
-        provider: bucket.provider,
-        records: bucket.records,
-        disagreements: bucket.disagreements,
-        disagreementShare: bucket.records === 0 ? 0 : bucket.disagreements / bucket.records,
-        providerMisses: bucket.misses,
-        costUsd: bucket.cost,
-        latencyP50Ms: quantile(bucket.latencies, 0.5),
-        latencyP95Ms: quantile(bucket.latencies, 0.95),
-      }))
+      .map((bucket) => {
+        const disagreements = hasShadowEffect(bucket.surface) ? bucket.disagreements : null;
+        return {
+          surface: bucket.surface,
+          provider: bucket.provider,
+          records: bucket.records,
+          answered: bucket.answered,
+          providerMisses: bucket.misses,
+          disagreements,
+          disagreementShare: disagreements === null || bucket.answered === 0 ? null : disagreements / bucket.answered,
+          costUsd: bucket.cost,
+          latencyP50Ms: quantile(bucket.latencies, 0.5),
+          latencyP95Ms: quantile(bucket.latencies, 0.95),
+        };
+      })
       .sort((a, b) => b.records - a.records || a.surface.localeCompare(b.surface) || a.provider.localeCompare(b.provider)),
   };
 }
@@ -1078,9 +1156,18 @@ export function renderTextReport(report: YieldReport): string {
     push(`  no shadow records in window (records ${fmtNum(report.decisionsShadow.records)})`);
   }
   for (const row of report.decisionsShadow.bySurfaceProvider) {
+    const actsDifferently = row.disagreements === null
+      ? 'would act differently n/a (no consumer effect defined)'
+      : `would act differently ${fmtNum(row.disagreements)} of ${fmtNum(row.answered)} answered (${fmtPct(row.disagreementShare)})`;
+    const latency = row.latencyP50Ms === null || row.latencyP95Ms === null
+      ? 'answered latency n/a'
+      : `answered latency p50 ${fmtNum(row.latencyP50Ms)}ms / p95 ${fmtNum(row.latencyP95Ms)}ms`;
     push(
-      `  ${row.surface} / ${row.provider}: records ${fmtNum(row.records)}, disagreements ${fmtNum(row.disagreements)} (${fmtPct(row.disagreementShare)}), provider misses ${fmtNum(row.providerMisses)}, cost ${fmtUsd(row.costUsd)}, latency p50 ${fmtNum(row.latencyP50Ms)}ms / p95 ${fmtNum(row.latencyP95Ms)}ms`,
+      `  ${row.surface} / ${row.provider}: records ${fmtNum(row.records)}, answered ${fmtNum(row.answered)}, provider misses ${fmtNum(row.providerMisses)}, ${actsDifferently}, cost ${fmtUsd(row.costUsd)}, ${latency}`,
     );
+  }
+  if (report.decisionsShadow.skipped > 0) {
+    push(`  ${fmtNum(report.decisionsShadow.skipped)} unreadable shadow row(s) skipped`);
   }
   push('');
   push('M0 — heists');
