@@ -117,6 +117,7 @@ const TEXT_PAIRS: readonly (readonly [string, string])[] = [
   ['ink', 'accent-soft'], // ack button (v6.1 themed fill)
   ['ink', 'danger-soft'], // error toast (v6.1 themed fill)
   ['muted', 'paper-soft'], // notice line (v6.1 themed fill)
+  ['danger', 'card'], // notification option-submit error line
 ];
 
 describe('palette contrast (v5)', () => {
@@ -130,6 +131,32 @@ describe('palette contrast (v5)', () => {
         const ratio = contrast(vars, foreground, background);
         return { pair: `${foreground} on ${background}`, ratio };
       }).filter(({ ratio }) => ratio < 4.5);
+      expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
+    });
+  }
+
+  for (const [theme, selector] of [
+    ['light', ':root'],
+    ['dark', '.dark'],
+  ] as const) {
+    it(`the readable card surfaces resolve to AA pairs in the ${theme} theme`, () => {
+      const vars = themeVars(selector);
+      // The card face and its Details block read ink-on-card; secondary
+      // lines (recommendation, why, consequence, guidance) read
+      // muted-on-card; an error row's children are forced to on-state so
+      // they never inherit the faint label color on the alert surface.
+      const errorMetaToken = colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__meta');
+      expect(errorMetaToken).toBe('on-state');
+      const pairs: readonly (readonly [string, string])[] = [
+        ['ink', 'card'],
+        ['muted', 'card'],
+        ['on-state', 'alert'],
+        ['ink', 'accent-soft'],
+        ['danger', 'card'],
+      ];
+      const failures = pairs
+        .map(([foreground, background]) => ({ pair: `${foreground} on ${background}`, ratio: contrast(vars, foreground, background) }))
+        .filter(({ ratio }) => ratio < 4.5);
       expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
     });
   }
@@ -151,8 +178,10 @@ describe('palette contrast (v5)', () => {
       // because faint-on-alert composes below AA). Every value is read from
       // the real CSS, so a future dimming change fails here.
       const rowAlpha = opacityIn(COMPONENTS_CSS, '.board-notification--receipt') ?? 1;
-      const metaSelector =
-        '.board-notification--error.board-notification--receipt .board-notification__meta';
+      // The error row's children all carry the readable on-state ink
+      // (owner release 2026-10-11 widened the old receipt-only override to
+      // EVERY error-row child line, so live error rows clear AA too).
+      const metaSelector = '.board-notification--error .board-notification__meta';
       const metaAlpha =
         opacityIn(COMPONENTS_CSS, metaSelector) ??
         opacityIn(COMPONENTS_CSS, '.board-notification__meta') ??

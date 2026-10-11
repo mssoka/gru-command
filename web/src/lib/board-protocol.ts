@@ -148,6 +148,45 @@ export interface AgentView {
   } | null;
 }
 
+export interface NotificationDecisionOptionView {
+  readonly id: string;
+  readonly label: string;
+  readonly consequence: string;
+}
+
+/** Typed owner-decision metadata (owner release 2026-10-11). The browser
+ * renders these as data — it never derives questions, options or actions
+ * from notification prose, and it never invents an action. */
+export interface NotificationDecisionView {
+  readonly question: string;
+  readonly context: string;
+  readonly recommendation: string | null;
+  readonly reservedClass: string;
+  readonly whyNotDelegable: string;
+  readonly options: readonly NotificationDecisionOptionView[];
+  readonly discussion: boolean;
+}
+
+export function isNotificationDecisionView(value: unknown): value is NotificationDecisionView {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.question === 'string' &&
+    typeof value.context === 'string' &&
+    (value.recommendation === null || typeof value.recommendation === 'string') &&
+    typeof value.reservedClass === 'string' &&
+    typeof value.whyNotDelegable === 'string' &&
+    typeof value.discussion === 'boolean' &&
+    Array.isArray(value.options) &&
+    value.options.every(
+      (option) =>
+        isRecord(option) &&
+        typeof option.id === 'string' &&
+        typeof option.label === 'string' &&
+        typeof option.consequence === 'string',
+    )
+  );
+}
+
 export interface NotificationView {
   readonly id: string;
   readonly ts: string;
@@ -161,6 +200,11 @@ export interface NotificationView {
   readonly ackedAt: string | null;
   readonly resolvedAt: string | null;
   readonly resolvedBy: string | null;
+  /** Optional on pre-upgrade servers; strictly typed when present. */
+  readonly decision?: NotificationDecisionView | null;
+  readonly decidedAt?: string | null;
+  readonly decidedBy?: string | null;
+  readonly decidedOption?: string | null;
 }
 
 export interface DecisionStatusView {
@@ -174,6 +218,31 @@ export interface DecisionStatusView {
   readonly checkedAt: string | null;
   readonly incarnation: string;
   readonly generation: number;
+}
+
+export function isNotificationView(value: unknown): value is NotificationView {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.ts === 'string' &&
+    typeof value.kind === 'string' &&
+    (value.severity === 'info' || value.severity === 'error') &&
+    (value.routing === 'fyi' || value.routing === 'action-required' || value.routing === 'needs-owner') &&
+    typeof value.title === 'string' &&
+    (value.detail === null || typeof value.detail === 'string') &&
+    (value.agentId === null || typeof value.agentId === 'string') &&
+    (value.shownAt === null || typeof value.shownAt === 'string') &&
+    (value.ackedAt === null || typeof value.ackedAt === 'string') &&
+    (value.resolvedAt === null || typeof value.resolvedAt === 'string') &&
+    (value.resolvedBy === null || typeof value.resolvedBy === 'string') &&
+    // Owner-decision fields are optional (pre-upgrade servers) but strictly
+    // typed when present: a junk decision must never render as a readable
+    // question or an executable option.
+    (value.decision === undefined || value.decision === null || isNotificationDecisionView(value.decision)) &&
+    (value.decidedAt === undefined || value.decidedAt === null || typeof value.decidedAt === 'string') &&
+    (value.decidedBy === undefined || value.decidedBy === null || typeof value.decidedBy === 'string') &&
+    (value.decidedOption === undefined || value.decidedOption === null || typeof value.decidedOption === 'string')
+  );
 }
 
 /** Deploy drift (board UX v4): the running service build vs origin/main.
@@ -1223,24 +1292,7 @@ export function isValidSnapshot(value: unknown): value is BoardSnapshot {
             (typeof agent.supervision.lastEventAt === 'string' &&
               Number.isFinite(Date.parse(agent.supervision.lastEventAt)))))),
   );
-  const notificationsOk = value.notifications.every(
-    (notification) =>
-      isRecord(notification) &&
-      typeof notification.id === 'string' &&
-      typeof notification.ts === 'string' &&
-      typeof notification.kind === 'string' &&
-      (notification.severity === 'info' || notification.severity === 'error') &&
-      (notification.routing === 'fyi' ||
-        notification.routing === 'action-required' ||
-        notification.routing === 'needs-owner') &&
-      typeof notification.title === 'string' &&
-      (notification.detail === null || typeof notification.detail === 'string') &&
-      (notification.agentId === null || typeof notification.agentId === 'string') &&
-      (notification.shownAt === null || typeof notification.shownAt === 'string') &&
-      (notification.ackedAt === null || typeof notification.ackedAt === 'string') &&
-      (notification.resolvedAt === null || typeof notification.resolvedAt === 'string') &&
-      (notification.resolvedBy === null || typeof notification.resolvedBy === 'string'),
-  );
+  const notificationsOk = value.notifications.every((notification) => isNotificationView(notification));
   if (!agentsOk || !notificationsOk) return false;
   return value.repos.every(
     (repo) =>

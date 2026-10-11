@@ -3,7 +3,8 @@ import type { BoardSnapshot, NotificationView, OwnerPrView } from './board-proto
 import {
   LESSONS_PROPOSAL_CONSEQUENCE,
   OWNER_WINDOW_SIZE,
-  ackConsequence,
+  decidedOptionLabel,
+  ownerNoticeGuidance,
   ownerPendingCount,
   ownerRows,
   ownerWindow,
@@ -79,7 +80,48 @@ describe('owner-band row model', () => {
         ],
       }),
     );
-    expect(rows.map((row) => row.actionId)).toEqual(['owner-ack:owner', 'owner-ack:seen-ack']);
+    expect(rows.map((row) => row.actionId)).toEqual(['owner-notice:owner', 'owner-notice:seen-ack']);
+  });
+
+  it('a typed owner decision is a decision row and a decided row stays visible until settled', () => {
+    const decision = {
+      question: 'Approve the slim contract?',
+      context: 'PR256 needs an owner-controlled integration route.',
+      recommendation: 'Approve.',
+      reservedClass: 'scope-design',
+      whyNotDelegable: 'It changes the agreed scope.',
+      options: [
+        { id: 'approve', label: 'Approve the slim contract', consequence: 'Gru commissions the lane.' },
+        { id: 'keep', label: 'Keep the current approach', consequence: 'Nothing moves.' },
+      ],
+      discussion: false,
+    };
+    const rows = ownerRows(
+      snapshot({
+        notifications: [
+          notification('dec', { routing: 'needs-owner', kind: 'gru.owner-escalation', decision }),
+          notification('decided', {
+            routing: 'needs-owner',
+            kind: 'gru.owner-escalation',
+            decision,
+            decidedAt: '2026-09-28T00:00:40.000Z',
+            decidedBy: 'web',
+            decidedOption: 'approve',
+          }),
+          notification('legacy', { routing: 'needs-owner', kind: 'port-squat' }),
+        ],
+      }),
+    );
+    expect(rows.map((row) => `${row.kind}:${row.actionId}`)).toEqual([
+      'decision:owner-decision:dec',
+      'decision:owner-decision:decided',
+      'notice:owner-notice:legacy',
+    ]);
+    const decided = rows[1]!;
+    expect(decided.kind === 'decision' ? decided.notification.decidedOption : null).toBe('approve');
+    expect(decidedOptionLabel(decision, 'approve')).toBe('Approve the slim contract');
+    expect(decidedOptionLabel(decision, null)).toBe('decision recorded');
+    expect(decidedOptionLabel(decision, 'gone')).toBe('gone');
   });
 
   it('a Book of Lessons proposal is a decision row with Accept/Reject copy — never an Ack row (owner decision 2026-10-07)', () => {
@@ -97,7 +139,7 @@ describe('owner-band row model', () => {
         ],
       }),
     );
-    expect(rows.map((row) => `${row.kind}:${row.actionId}`)).toEqual(['proposal:owner-proposal:p1', 'ack:owner-ack:stop']);
+    expect(rows.map((row) => `${row.kind}:${row.actionId}`)).toEqual(['proposal:owner-proposal:p1', 'notice:owner-notice:stop']);
     const proposal = rows[0]!;
     expect(proposal.kind === 'proposal' ? proposal.consequence : null).toBe(LESSONS_PROPOSAL_CONSEQUENCE);
     expect(LESSONS_PROPOSAL_CONSEQUENCE).toContain('Accept writes these changes into the Book of Lessons');
@@ -113,7 +155,7 @@ describe('owner-band row model', () => {
     );
     expect(rows.map((row) => row.actionId)).toEqual([
       'owner-pr:job-a', // 00:05 checkedAt — newest
-      'owner-ack:older', // 00:00 ack
+      'owner-notice:older', // 00:00 notice
       'owner-pr:job-b', // yesterday
     ]);
   });
@@ -125,7 +167,7 @@ describe('owner-band row model', () => {
         ownerPrs: [pr('a-job', { checkedAt: '2026-09-28T00:00:00.000Z' })],
       }),
     );
-    expect(rows.map((row) => row.actionId)).toEqual(['owner-ack:z-row', 'owner-pr:a-job']);
+    expect(rows.map((row) => row.actionId)).toEqual(['owner-notice:z-row', 'owner-pr:a-job']);
   });
 
   it('ownerPendingCount counts owed actions, never unseen rows (shownAt does not reduce it)', () => {
@@ -139,10 +181,10 @@ describe('owner-band row model', () => {
     expect(ownerPendingCount(snap)).toBe(3);
   });
 
-  it('absent ownerPrs (pre-upgrade server) degrades to ack rows only — no invented ready rows', () => {
+  it('absent ownerPrs (pre-upgrade server) degrades to notice rows only — no invented ready rows', () => {
     const rows = ownerRows(snapshot({ notifications: [notification('owner', { routing: 'needs-owner' })] }));
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.kind).toBe('ack');
+    expect(rows[0]!.kind).toBe('notice');
   });
 
   it('the expander window keeps every obligation reachable and never hides more than the tail', () => {
@@ -162,27 +204,28 @@ describe('owner-band row model', () => {
   });
 });
 
-describe('ack consequence copy — honest scope per kind, never parsed prose', () => {
-  it('quota walls and breakers: ack re-arms the worker and does NOT clear holds', () => {
-    const line = ackConsequence('supervision.provider-wall.agent-1.quota_exceeded');
-    expect(line).toContain('re-arms this worker');
-    expect(line).toContain('does NOT clear code/test/review holds');
-    expect(ackConsequence('supervision.breaker')).toBe(line);
+describe('owner-notice guidance — honest scope per kind, never parsed prose', () => {
+  it('port squats name the manual external step and the evidence that clears it', () => {
+    expect(ownerNoticeGuidance('port-squat')).toContain('Stop the foreign process yourself');
+    expect(ownerNoticeGuidance('port-squat')).toContain('clears on a successful bind');
+    expect(ownerNoticeGuidance('roll-port-squat')).toContain('Stop the foreign process yourself');
   });
 
-  it('degraded decisions: the ack is a sighting record, not a fix', () => {
-    expect(ackConsequence('decisions.degraded.timeout')).toContain('stays degraded');
+  it('degraded decisions name the real remediation, not an ack', () => {
+    const line = ownerNoticeGuidance('decisions.degraded.timeout');
+    expect(line).toContain('Fix the decision-provider credential');
+    expect(line).toContain('clears when the decision service recovers');
+    expect(ownerNoticeGuidance('decisions.enforce-gate.triage')).toBe(line);
   });
 
-  it('sweep confirmations and port squats name the manual step', () => {
-    expect(ackConsequence('worktree-sweep-paused')).toContain('removal');
-    expect(ackConsequence('port-squat')).toContain('Stop the foreign process');
-    expect(ackConsequence('roll-port-squat')).toContain('Stop the foreign process');
+  it('sweep confirmations and blocked wakes name the manual step', () => {
+    expect(ownerNoticeGuidance('worktree-sweep-paused')).toContain('Confirm nothing live is rooted');
+    expect(ownerNoticeGuidance('gru.wake-blocked.n1')).toContain('Restart the service');
+    expect(ownerNoticeGuidance('gru.wake-failed-escalation.job')).toContain('Restart the service');
   });
 
-  it('unknown kinds get the generic honest line (no fabricated semantics)', () => {
-    expect(ackConsequence('gru.owner-escalation')).toContain('does not by itself prove');
-    expect(ackConsequence('something.brand.new')).toContain('does not by itself prove');
+  it('unknown kinds get the generic honest line (no fabricated semantics, no fake control)', () => {
+    expect(ownerNoticeGuidance('something.brand.new')).toContain('No in-app action is supported');
   });
 });
 

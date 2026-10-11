@@ -82,13 +82,29 @@ import {
   type RoundSummary,
 } from '../lib/board-signals.js';
 import {
+  decidedOptionLabel,
+  ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
   safePrUrl,
-  type OwnerAckRow,
+  type OwnerDecisionRow,
+  type OwnerNoticeRow,
   type OwnerPrRow,
   type OwnerProposalRow,
 } from '../lib/owner-band.js';
+import type { NotificationDecisionView } from '../lib/board-protocol.js';
+
+/** Detail text shown verbatim on the card face when it is short and
+ * single-paragraph; anything longer lives behind the Details disclosure
+ * in full. A mechanical length rule — never a semantic summary. */
+const DETAIL_FACE_LIMIT = 160;
+
+/** Attention-channel labels — the band a row lives in. */
+const ROUTING_LABEL: Readonly<Record<NotificationView['routing'], string>> = {
+  fyi: 'FEED',
+  'action-required': 'NEEDS GRU',
+  'needs-owner': 'FOR YOU',
+};
 
 /** Truthful lens progress for whole-PR rounds: show what actually ran —
  * including lenses that ran and failed — and name unused lenses instead of
@@ -196,6 +212,12 @@ export class BoardView {
   } | null = null;
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
+  /** Open Details disclosures, keyed by notification id — a snapshot push
+   * never collapses what the operator opened. */
+  private readonly openNotificationDetails = new Set<string>();
+  /** Authoritative rows returned by a decision submission, applied until
+   * the next snapshot carries the same state. */
+  private readonly decisionOverrides = new Map<string, NotificationView>();
   private receiptsNextOffset = 0;
   private receiptsLoading = false;
   private receiptsExhausted = false;
@@ -297,10 +319,13 @@ export class BoardView {
   }
 
   render(snapshot: BoardSnapshot): void {
+    // Decision submissions apply until the authoritative snapshot carries
+    // the same state; every sub-render receives the effective view.
+    const effective = this.withDecisionOverrides(snapshot);
     const previous = this.snapshot;
-    this.snapshot = snapshot;
+    this.snapshot = effective;
     const pendingProposals = new Set(
-      ownerRows(snapshot).filter((row) => row.kind === 'proposal').map((row) => row.notification.id),
+      ownerRows(effective).filter((row) => row.kind === 'proposal').map((row) => row.notification.id),
     );
     for (const id of this.proposalStates.keys()) if (!pendingProposals.has(id)) this.proposalStates.delete(id);
     // Focus preservation across live pushes: the control the operator was
@@ -309,16 +334,36 @@ export class BoardView {
     const focusKey = this.captureFocusKey();
     const ownerFocus = captureOwnerFocusKey();
     this.currentSections = null; // one fresh derivation per render
-    this.renderOwnerActions(snapshot);
-    this.renderRail(snapshot);
-    this.renderNav(snapshot);
-    this.renderJobs(snapshot);
+    this.renderOwnerActions(effective);
+    this.renderRail(effective);
+    this.renderNav(effective);
+    this.renderJobs(effective);
     this.restoreFocusKey(focusKey);
-    this.renderAgents(snapshot.agents);
-    this.repoOverview.render(snapshot.repoOverview);
-    this.renderNotifications(snapshot);
+    this.renderAgents(effective.agents);
+    this.repoOverview.render(effective.repoOverview);
+    this.renderNotifications(effective);
     restoreOwnerFocusKey(ownerFocus);
-    this.surfaceNewNotifications(previous, snapshot.notifications);
+    this.surfaceNewNotifications(previous, effective.notifications);
+  }
+
+  /** Apply decision submissions until the next authoritative snapshot
+   * carries the same state — the server's reply IS authoritative, and the
+   * snapshot replaces it as soon as it arrives. */
+  private withDecisionOverrides(snapshot: BoardSnapshot): BoardSnapshot {
+    if (this.decisionOverrides.size === 0) return snapshot;
+    const byId = new Map(snapshot.notifications.map((row) => [row.id, row]));
+    let changed = false;
+    for (const [id, override] of [...this.decisionOverrides]) {
+      const current = byId.get(id);
+      if (current === undefined) continue; // keep until the row is seen again
+      if (current.decidedAt !== null && current.decidedAt !== undefined) {
+        this.decisionOverrides.delete(id); // the snapshot now carries it
+        continue;
+      }
+      byId.set(id, override);
+      changed = true;
+    }
+    return changed ? { ...snapshot, notifications: [...byId.values()] } : snapshot;
   }
 
   // ------------------------------------------------------------------
@@ -470,7 +515,7 @@ export class BoardView {
     const active = document.activeElement;
     const focusId =
       active instanceof HTMLElement && mount.contains(active)
-        ? active.dataset.actionId ?? null
+        ? active.dataset.ownerFocusKey ?? active.dataset.actionId ?? null
         : null;
     const bandVisible = !mount.hidden && mount.closest('[hidden]') === null;
     mount.replaceChildren();
@@ -496,8 +541,10 @@ export class BoardView {
       const window = ownerWindow(rows, this.ownerExpanded);
       const list = el('div', 'board-band__rows board-owner__rows');
       for (const row of window.rows) {
-        if (row.kind === 'ack') {
-          list.append(this.ownerAckRow(row, bandVisible));
+        if (row.kind === 'decision') {
+          list.append(this.ownerDecisionRow(row, bandVisible));
+        } else if (row.kind === 'notice') {
+          list.append(this.ownerNoticeRow(row, bandVisible));
         } else if (row.kind === 'proposal') {
           list.append(this.ownerProposalRow(row, bandVisible));
         } else {
@@ -519,58 +566,34 @@ export class BoardView {
     if (focusId !== null) this.refocusAction(focusId);
   }
 
-  private refocusAction(actionId: string): void {
-    for (const node of this.ownerMount.querySelectorAll<HTMLElement>('[data-action-id]')) {
-      if (node.dataset.actionId === actionId) {
+  private refocusAction(focusKey: string): void {
+    for (const node of this.ownerMount.querySelectorAll<HTMLElement>('[data-action-id],[data-owner-focus-key]')) {
+      if (node.dataset.actionId === focusKey || node.dataset.ownerFocusKey === focusKey) {
         node.focus();
         return;
       }
     }
+    // The focused control may have changed state (an option just recorded):
+    // land on its card so focus stays inside the item the operator acted on.
+    const id = focusKey.split(':')[1] ?? null;
+    if (id !== null) this.focusNotification(id);
   }
 
-  /** One pending ack obligation: what it is, why it is owed, what the
-   * Ack does AND does not do. The control stays pending on any HTTP
-   * ambiguity — only the authoritative snapshot closes the row. */
-  private ownerAckRow(row: OwnerAckRow, bandVisible: boolean): HTMLElement {
-    const item = row.notification;
-    // The interactive control carries the action id (focus/addressing
-    // target); the wrapper stays anonymous so a query always lands on
-    // the control, never a lookalike parent.
-    const node = el('article', `board-owner__row board-owner__row--${item.severity}`);
-    node.append(
-      el('div', 'board-owner__title', `🔔 ${item.title}`),
-      el(
-        'div',
-        'board-owner__meta lbl',
-        `${formatTs(item.ts)} · owner ack owed${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
-      ),
-      el('div', 'lbl board-owner__consequence', row.consequence),
-    );
-    const ack = document.createElement('button');
-    ack.type = 'button';
-    ack.className = 'board-owner__ack';
-    ack.textContent = 'Ack';
-    ack.dataset.actionId = row.actionId;
-    ack.addEventListener('click', () => {
-      ack.disabled = true;
-      ack.textContent = 'acking…';
-      void this.boardClient
-        ?.ackNotification(item.id)
-        .then(() => {
-          /* Success is NOT completion — the row closes only when the
-           * authoritative snapshot carries ackedAt (any device). */
-        })
-        .catch(() => {
-          // Ambiguous/failed HTTP: the obligation stands. Restore the
-          // control; the next snapshot reconciles one authoritative truth.
-          ack.disabled = false;
-          ack.textContent = 'Ack';
-        });
-    });
-    node.append(ack);
-    // Display receipt for what the band actually displayed (shown:true
-    // doctrine) — a receipt is proof of display, never of completion.
-    if (bandVisible) this.sendShown(item, 'web-board');
+  /** One pending owner decision or owner-only notice (owner release
+   * 2026-10-11): the SHARED readable card, wrapped for band layout. A
+   * decision's option buttons record the choice; a notice carries no
+   * in-app control (its action is outside the app) and no generic Ack. */
+  private ownerDecisionRow(row: OwnerDecisionRow, bandVisible: boolean): HTMLElement {
+    const node = el('article', `board-owner__row board-owner__row--${row.notification.severity} board-owner__row--decision`);
+    node.dataset.notificationId = row.notification.id;
+    node.append(this.notificationCard(row.notification, false, bandVisible));
+    return node;
+  }
+
+  private ownerNoticeRow(row: OwnerNoticeRow, bandVisible: boolean): HTMLElement {
+    const node = el('article', `board-owner__row board-owner__row--${row.notification.severity} board-owner__row--notice`);
+    node.dataset.notificationId = row.notification.id;
+    node.append(this.notificationCard(row.notification, false, bandVisible));
     return node;
   }
 
@@ -1990,6 +2013,13 @@ export class BoardView {
   private renderNotifications(snapshot: BoardSnapshot): void {
     const notifications = snapshot.notifications;
     const list = mustGet('notification-list');
+    // Focus preservation across live pushes; a control that no longer
+    // renders (a recorded option) falls back to its card.
+    const active = document.activeElement;
+    const listFocusKey =
+      active instanceof HTMLElement && list.contains(active)
+        ? active.dataset.focusKey ?? active.dataset.ownerFocusKey ?? null
+        : null;
     list.replaceChildren();
     this.updateBadge(notifications);
     this.notificationBell.hidden = false;
@@ -2029,8 +2059,8 @@ export class BoardView {
     } else {
       for (const row of ownerRowsForBell) {
         forYou.append(
-          row.kind === 'ack'
-            ? this.notificationRow(row.notification)
+          row.kind === 'decision' || row.kind === 'notice'
+            ? this.notificationCard(row.notification)
             : row.kind === 'proposal'
               ? this.ownerProposalPointer(row)
               : this.ownerPrRow(row),
@@ -2060,6 +2090,18 @@ export class BoardView {
         list.append(more);
       }
     }
+    if (listFocusKey !== null) this.restoreListFocus(list, listFocusKey);
+  }
+
+  private restoreListFocus(list: HTMLElement, key: string): void {
+    for (const node of list.querySelectorAll<HTMLElement>('[data-focus-key],[data-owner-focus-key]')) {
+      if (node.dataset.focusKey === key || node.dataset.ownerFocusKey === key) {
+        node.focus();
+        return;
+      }
+    }
+    const id = key.split(':')[1] ?? null;
+    if (id !== null) this.focusNotification(id);
   }
 
   /** D3: fetch the next page of closed receipts and merge it into FEED.
@@ -2100,63 +2142,203 @@ export class BoardView {
     if (rows.length === 0) {
       if (empty !== null) section.append(el('div', 'board-notification-section__empty lbl', empty));
     } else {
-      for (const item of rows) section.append(this.notificationRow(item, receipts.has(item.id)));
+      for (const item of rows) section.append(this.notificationCard(item, receipts.has(item.id)));
     }
     list.append(section);
   }
 
-  private notificationRow(item: NotificationView, closedReceipt = false): HTMLElement {    const row = el(
-      'div',
-      `board-notification board-notification--${item.severity}${closedReceipt ? ' board-notification--receipt' : ''}`,
+  /** ONE readable notification card (owner release 2026-10-11), shared
+   * by the board's FOR YOU band and the bell. The face is scannable —
+   * icon, title, a short metadata label, typed context/decision — and the
+   * full diagnostic text stays available verbatim behind Details. Controls
+   * match supported server behavior: option buttons submit a typed
+   * decision, `Mark seen` is a feed receipt, and machine or owner-notice
+   * rows carry no control at all. */
+  private notificationCard(item: NotificationView, closedReceipt = false, bandVisible = false): HTMLElement {
+    const receipt = closedReceipt;
+    const decided = item.decidedAt !== null && item.decidedAt !== undefined;
+    const card = el(
+      'article',
+      `board-notification board-notification--${item.severity}${receipt ? ' board-notification--receipt' : ''}${decided ? ' board-notification--decided' : ''}`,
     );
-    if (closedReceipt) row.dataset.receipt = 'closed';
-    const icon = item.routing === 'needs-owner' ? '🔔' : item.routing === 'action-required' ? '🛠' : item.severity === 'error' ? '🚨' : 'ℹ️';
-    const suffix = closedReceipt
-      ? ' · closed receipt'
+    card.dataset.notificationId = item.id;
+    card.dataset.focusTarget = 'card';
+    card.tabIndex = -1;
+    if (receipt) card.dataset.receipt = 'closed';
+    const icon =
+      item.routing === 'needs-owner' ? '🔔' : item.routing === 'action-required' ? '🛠' : item.severity === 'error' ? '🚨' : 'ℹ️';
+    const head = el('header', 'board-notification__head');
+    head.append(
+      el('span', 'board-notification__icon', icon),
+      el('div', 'board-notification__title', item.title),
+    );
+    const state = receipt
+      ? 'closed receipt'
       : item.resolvedAt !== null
-        ? ' · resolved'
-        : item.ackedAt !== null
-          ? ' ✓'
-          : '';
-    row.append(
-      el('div', 'board-notification__title', `${icon} ${item.title}${suffix}`),
-      el(
-        'div',
-        'board-notification__meta lbl',
-        `${formatTs(item.ts)} · ${item.routing}${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
-      ),
-    );
-    // Only an owner stop or FYI row has a human Ack/Mark seen control.
-    // Gru records a machine disposition through the authenticated API
-    // after acting; a human click must not silently clear NEEDS GRU.
-    // A closed receipt is machine-attention history: same rule, no Ack.
-    // A lesson proposal closes only through Accept/Reject (its own row);
-    // the server refuses a plain ack for it.
-    if (
-      item.routing !== 'action-required' &&
-      item.kind !== LESSONS_PROPOSAL_KIND &&
-      item.ackedAt === null &&
-      item.resolvedAt === null
-    ) {
-      const ack = document.createElement('button');
-      ack.type = 'button';
-      ack.className = 'board-notification__ack';
-      ack.textContent = item.routing === 'fyi' ? 'Mark seen' : 'Ack';
-      ack.addEventListener('click', () => {
+        ? 'resolved'
+        : decided
+          ? 'decision recorded'
+          : item.ackedAt !== null
+            ? 'seen'
+            : null;
+    if (state !== null) head.append(el('span', 'pp-chip board-notification__state', state));
+    card.append(head);
+    // Metadata stays a SHORT label line: timestamp + attention channel —
+    // never prose, never the long detail.
+    card.append(el('div', 'board-notification__meta lbl', `${formatTs(item.ts)} · ${ROUTING_LABEL[item.routing]}`));
+    const detail = item.detail === null || item.detail === '' ? null : item.detail;
+    const decision = item.decision ?? null;
+    const shortDetail = detail !== null && detail.length <= DETAIL_FACE_LIMIT && !detail.includes('\n');
+    if (decision !== null) card.append(el('div', 'board-notification__context', decision.context));
+    else if (shortDetail && detail !== null) card.append(el('div', 'board-notification__context', detail));
+    if (decision !== null) {
+      card.append(this.decisionBlock(item, decision));
+      if (decided) {
+        card.append(
+          el(
+            'div',
+            'board-notification__decided',
+            `Decision recorded: “${decidedOptionLabel(decision, item.decidedOption)}” — awaiting follow-through.`,
+          ),
+        );
+      }
+    } else if (item.routing === 'needs-owner' && !receipt && item.resolvedAt === null) {
+      // Owner-only notice: the action is outside the app; say so plainly
+      // and offer no fake control.
+      card.append(el('div', 'board-notification__guidance', ownerNoticeGuidance(item.kind)));
+    }
+    if (detail !== null && !(decision === null && shortDetail)) {
+      card.append(this.detailsDisclosure(item.id, item.kind, detail));
+    }
+    // A feed row earns a receipt-style "Mark seen" only where an ack has
+    // meaning; machine and owner rows never show it.
+    if (item.routing === 'fyi' && !receipt && item.ackedAt === null && item.resolvedAt === null) {
+      const seen = document.createElement('button');
+      seen.type = 'button';
+      seen.className = 'board-notification__ack';
+      seen.textContent = 'Mark seen';
+      seen.dataset.actionId = `fyi-seen:${item.id}`;
+      seen.dataset.focusKey = `notif:${item.id}:seen`;
+      seen.addEventListener('click', () => {
+        seen.disabled = true;
         void this.boardClient
           ?.ackNotification(item.id)
           .then(() => {
             this.seenOwnerIds.add(item.id);
-            ack.textContent = '✓';
-            ack.disabled = true;
+            seen.textContent = '✓';
           })
           .catch(() => {
-            /* the row re-renders on the next snapshot push */
+            seen.disabled = false;
           });
       });
-      row.append(ack);
+      card.append(seen);
     }
-    return row;
+    if (bandVisible) this.sendShown(item, 'web-board');
+    return card;
+  }
+
+  /** Full diagnostics, verbatim — never truncated, never upper-cased and
+   * never letter-spaced. Open state survives snapshot pushes. */
+  private detailsDisclosure(notificationId: string, kind: string, detail: string): HTMLElement {
+    const details = document.createElement('details');
+    details.className = 'board-notification__details';
+    details.open = this.openNotificationDetails.has(notificationId);
+    const summary = document.createElement('summary');
+    summary.textContent = 'Details';
+    summary.dataset.focusKey = `notif:${notificationId}:details`;
+    const body = el('div', 'board-notification__detail');
+    body.append(el('div', 'board-notification__detail-kind', `kind: ${kind}`), el('div', 'board-notification__detail-text', detail));
+    details.append(summary, body);
+    details.addEventListener('toggle', () => {
+      if (details.open) this.openNotificationDetails.add(notificationId);
+      else this.openNotificationDetails.delete(notificationId);
+    });
+    return details;
+  }
+
+  /** The typed decision block: the question, Gru's recommendation, why it
+   * cannot be delegated, and the concrete options with consequences. Every
+   * option RECORDS the owner's choice; nothing here executes a fix. */
+  private decisionBlock(item: NotificationView, decision: NotificationDecisionView): HTMLElement {
+    const block = el('section', 'board-notification__decision');
+    block.append(el('div', 'board-notification__question', decision.question));
+    if (decision.recommendation !== null) {
+      block.append(el('div', 'board-notification__recommendation', `Gru recommends: ${decision.recommendation}`));
+    }
+    block.append(el('div', 'board-notification__why', `Why this needs you: ${decision.whyNotDelegable}`));
+    const decided = item.decidedAt !== null && item.decidedAt !== undefined;
+    const open = !decided && item.resolvedAt === null && item.ackedAt === null;
+    if (open && decision.discussion && decision.options.length === 0) {
+      block.append(
+        el(
+          'div',
+          'board-notification__discuss',
+          'This decision needs discussion with Gru first — open chat, and the decision stays pending until it is recorded.',
+        ),
+      );
+    } else if (open) {
+      const options = el('div', 'board-notification__options');
+      for (const option of decision.options) {
+        const optionNode = el('div', 'board-notification__option');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'board-notification__option-button';
+        button.textContent = option.label;
+        const key = `notif:${item.id}:option:${option.id}`;
+        button.dataset.actionId = key;
+        button.dataset.focusKey = key;
+        button.dataset.ownerFocusKey = key;
+        button.addEventListener('click', () => this.submitDecision(item, option.id, button, optionNode));
+        optionNode.append(button, el('div', 'board-notification__option-consequence', option.consequence));
+        options.append(optionNode);
+      }
+      block.append(options);
+    }
+    return block;
+  }
+
+  /** Submit an owner decision to the server. On success the server's row
+   * (authoritative) is applied until the next snapshot; on refusal the
+   * card stays pending with the server's reason shown — nothing was
+   * recorded, and a retry is the same idempotent request. */
+  private submitDecision(item: NotificationView, optionId: string, button: HTMLButtonElement, optionNode: HTMLElement): void {
+    const client = this.boardClient;
+    if (client === null || button.disabled) return;
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'recording…';
+    void client
+      .decideNotification(item.id, optionId)
+      .then((row) => {
+        this.decisionOverrides.set(item.id, row);
+        if (this.snapshot !== null) this.render(this.snapshot);
+        this.focusNotification(item.id);
+      })
+      .catch((error: unknown) => {
+        button.disabled = false;
+        button.textContent = label;
+        const message =
+          error instanceof BoardApiError && error.detail !== null
+            ? `Not recorded — ${error.detail}`
+            : 'Not recorded — the request failed, nothing was changed. Try again.';
+        const existing = optionNode.querySelector<HTMLElement>('.board-notification__option-error');
+        if (existing === null) {
+          const errorNode = el('div', 'board-notification__option-error', message);
+          errorNode.setAttribute('role', 'alert');
+          optionNode.append(errorNode);
+        } else {
+          existing.textContent = message;
+        }
+      });
+  }
+
+  /** Sane focus after a state-changing submit: land on the item's card
+   * when the control that had focus no longer renders. */
+  private focusNotification(notificationId: string): void {
+    const target = [...document.querySelectorAll<HTMLElement>('[data-focus-target="card"]')].find(
+      (node) => node.dataset.notificationId === notificationId,
+    );
+    target?.focus();
   }
 
   /**

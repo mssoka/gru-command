@@ -8,6 +8,7 @@
 
 import {
   BOARD_WS_PATH,
+  isNotificationView,
   isValidDecisionStatus,
   isValidLessonProposal,
   isValidLessonProposalDecision,
@@ -490,9 +491,22 @@ export class BoardClient {
     return body;
   }
 
-  /** E7: human ack (action-required clearance; re-arms an open breaker). */
+  /** E7: human ack (feed/notice clearance; machine rows refuse). */
   async ackNotification(id: string): Promise<void> {
     await this.postApi(`/api/notifications/${encodeURIComponent(id)}/ack`, { by: 'web' });
+  }
+
+  /** Record the owner's typed decision (owner release 2026-10-11). The
+   * server validates the option against the STORED decision; the returned
+   * row carries the authoritative decided state. Recording a decision is
+   * not completion — the row stays until its producer resolves it. */
+  async decideNotification(id: string, optionId: string): Promise<NotificationView> {
+    const { body } = await this.postApiWithStatus(`/api/notifications/${encodeURIComponent(id)}/decision`, {
+      optionId,
+      by: 'web',
+    });
+    if (!isNotificationView(body)) throw new Error('decision reply is malformed');
+    return body;
   }
 
   private async postApi(path: string, body: unknown): Promise<unknown> {

@@ -37,6 +37,22 @@ function notification(id: string, overrides: Partial<NotificationView> = {}): No
   };
 }
 
+function ownerDecision(overrides: Partial<import('../lib/board-protocol.js').NotificationDecisionView> = {}) {
+  return {
+    question: 'Approve the slim contract?',
+    context: 'PR256 needs an owner-controlled integration route.',
+    recommendation: 'Approve the slim contract.',
+    reservedClass: 'scope-design',
+    whyNotDelegable: 'It changes the agreed product scope.',
+    options: [
+      { id: 'approve', label: 'Approve the slim contract', consequence: 'Gru commissions the slim lane.' },
+      { id: 'keep', label: 'Keep the current approach', consequence: 'The lane stays parked.' },
+    ],
+    discussion: false,
+    ...overrides,
+  };
+}
+
 function agent(id: string, overrides: Partial<AgentView> = {}): AgentView {
   return {
     id,
@@ -386,13 +402,13 @@ describe('board view resolved-notification rendering', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
     view.setToastHandler(toast);
-    const first = notification('first', { routing: 'needs-owner' });
+    const first = notification('first', { routing: 'fyi' });
     view.render(snapshot({ notifications: [first] }));
-    expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
+    expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1); // Mark seen on a feed row
 
     const resolved = { ...first, resolvedAt: '2026-01-01T00:01:00.000Z', resolvedBy: 'runtime' };
     view.render(snapshot({ notifications: [resolved] }));
-    expect(document.querySelector('.board-notification__title')?.textContent).toContain('resolved');
+    expect(document.querySelector('.board-notification__state')?.textContent).toBe('resolved');
     expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(0);
     expect(document.querySelector<HTMLElement>('#notification-bell')?.dataset.unread).toBe('0');
     expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('0');
@@ -409,17 +425,30 @@ describe('board view resolved-notification rendering', () => {
     );
     expect(toast).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'active' }));
-    expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
+    // Owner rows and resolved rows carry no generic Ack.
+    expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(0);
   });
 
-  it('an informational owner stop remains in the bell until seen and is ackable; machine rows have no manual Ack', () => {
+  it('an informational owner notice stays in the bell with no Ack; machine rows have no manual Ack; feed rows can be marked seen', () => {
     const view = new BoardView(() => {});
-    view.render(snapshot({ notifications: [notification('owner-stop', { routing: 'needs-owner', severity: 'info' }), notification('machine')] }));
+    view.render(
+      snapshot({
+        notifications: [
+          notification('owner-stop', { routing: 'needs-owner', kind: 'port-squat', severity: 'info' }),
+          notification('machine'),
+          notification('feed', { routing: 'fyi' }),
+        ],
+      }),
+    );
     expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('1');
     const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
     expect(sections[0]?.querySelector('.board-notification__title')?.textContent).toContain('owner-stop');
-    expect(sections[0]?.querySelector('.board-notification__ack')).not.toBeNull();
+    // Owner notices carry their manual-step guidance and NO generic Ack.
+    expect(sections[0]?.querySelector('.board-notification__guidance')?.textContent).toContain('Stop the foreign process yourself');
+    expect(sections[0]?.querySelector('.board-notification__ack')).toBeNull();
     expect(sections[1]?.querySelector('.board-notification__ack')).toBeNull();
+    // The feed row's explicit receipt control remains.
+    expect(sections[2]?.querySelector('.board-notification__ack')?.textContent).toBe('Mark seen');
   });
 
   it('places pre-disposition acknowledged machine rows in FEED, not an unresolvable NEEDS GRU queue', () => {
@@ -2449,7 +2478,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(
       snapshot({
         notifications: [
-          notification('owner-stop', { routing: 'needs-owner', kind: 'supervision.breaker', severity: 'info' }),
+          notification('owner-stop', { routing: 'needs-owner', kind: 'gru.owner-escalation', severity: 'info', decision: ownerDecision() }),
           notification('machine', { routing: 'action-required' }),
         ],
         unackedActionRequired: 1,
@@ -2461,7 +2490,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.querySelector('.board-band__label')?.textContent).toBe('FOR YOU');
     expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
     const actionIds = [...band.querySelectorAll('[data-action-id]')].map((node) => (node as HTMLElement).dataset.actionId);
-    expect(actionIds).toEqual(['owner-ack:owner-stop']);
+    expect(actionIds).toEqual(['notif:owner-stop:option:approve', 'notif:owner-stop:option:keep']);
+    expect(band.textContent).toContain('Approve the slim contract?');
     // The machine row is in the bell panel's NEEDS GRU section, never in the band.
     expect(document.getElementById('notification-list')?.textContent).toContain('Notice machine');
     expect(band.textContent).not.toContain('Notice machine');
@@ -2492,37 +2522,108 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('0 pending');
   });
 
-  it('ack click: optimistic pending state, stays pending on failure (control reverts), closes only on the authoritative snapshot', async () => {
-    const client = stubClient(new Error('network ambiguity'));
-    const view = new BoardView(() => {}, client);
-    const stop = notification('ack-me', { routing: 'needs-owner', kind: 'supervision.provider-wall.a1.quota_exceeded' });
+  it('decision click: optimistic pending state, stays pending on failure (control reverts), settles only on the authoritative reply', async () => {
+    const stop = notification('decide-me', { routing: 'needs-owner', kind: 'gru.owner-escalation', decision: ownerDecision() });
+    const failing = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.reject(new Error('network ambiguity'))),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, failing);
     view.render(snapshot({ notifications: [stop] }));
     const band = document.getElementById('board-owner')!;
-    const button = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:ack-me"]')!;
-    // Honest consequence copy rides the row (quota ack scope).
-    expect(band.textContent).toContain('does NOT clear code/test/review holds');
+    const button = band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!;
+    // The decision face names the question, the recommendation and the why.
+    expect(band.textContent).toContain('Approve the slim contract?');
+    expect(band.textContent).toContain('Gru recommends');
+    expect(band.textContent).toContain('Why this needs you');
     button.click();
-    expect(button.textContent).toBe('acking…');
+    expect(button.textContent).toBe('recording…');
     expect(button.disabled).toBe(true);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(client.ackNotification).toHaveBeenCalledWith('ack-me');
-    // Failed HTTP → the obligation stands and the control returns.
-    expect(button.textContent).toBe('Ack');
-    expect(button.disabled).toBe(false);
-    view.render(snapshot({ notifications: [stop] }));
-    expect(band.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
-    // Success → STILL pending until the authoritative snapshot lands.
-    const okClient = stubClient();
-    const view2 = new BoardView(() => {}, okClient);
+    await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve'));
+    await vi.waitFor(() => expect(button.disabled).toBe(false));
+    // Failed HTTP → nothing recorded; the control returns with the reason.
+    expect(button.textContent).toBe('Approve the slim contract');
+    expect(band.querySelector('.board-notification__option-error')?.textContent).toContain('Not recorded');
+    expect(band.querySelector('[data-action-id="notif:decide-me:option:approve"]')).not.toBeNull();
+    // Success → the server's authoritative row applies; the row stays
+    // visible as decided — awaiting follow-through, never "completed".
+    const decidedRow = { ...stop, decidedAt: '2026-01-01T00:09:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const ok = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decidedRow)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view2 = new BoardView(() => {}, ok);
     view2.render(snapshot({ notifications: [stop] }));
-    const button2 = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__ack')!;
-    button2.click();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
-    view2.render(snapshot({ notifications: [{ ...stop, ackedAt: '2026-01-01T00:09:00.000Z' }] }));
-    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).toBeNull();
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!.click();
+    await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+    expect(document.getElementById('board-owner')!.textContent).toContain('awaiting follow-through');
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="notif:decide-me:option:approve"]')).toBeNull();
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+  });
+
+  it('a decided row reloaded from the snapshot renders decided with no controls, and Details survives re-renders', () => {
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    const stop = notification('decided-row', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'Full evidence line retained behind Details.',
+      decision: ownerDecision(),
+      decidedAt: '2026-01-01T00:09:00.000Z',
+      decidedBy: 'web',
+      decidedOption: 'approve',
+    });
+    view.render(snapshot({ notifications: [stop] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.textContent).toContain('Decision recorded: “Approve the slim contract” — awaiting follow-through.');
+    expect(band.querySelector('[data-action-id^="notif:decided-row:option:"]')).toBeNull();
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(client.decideNotification).not.toHaveBeenCalled();
+    // Reload (fresh render of the same authoritative row): still decided.
+    view.render(snapshot({ notifications: [stop] }));
+    expect(band.textContent).toContain('Decision recorded');
+    // Details: opening is a view action, never a decision; the open state
+    // survives the next snapshot push.
+    const details = band.querySelector<HTMLDetailsElement>('.board-notification__details')!;
+    expect(details).not.toBeNull();
+    details.open = true;
+    details.dispatchEvent(new Event('toggle'));
+    view.render(snapshot({ notifications: [stop] }));
+    expect(document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-notification__details')?.open).toBe(true);
+    expect(client.decideNotification).not.toHaveBeenCalled();
+    expect(client.ackNotification).not.toHaveBeenCalled();
+  });
+
+  it('a long diagnostic card keeps mixed case on its face and the full text behind Details', () => {
+    const view = new BoardView(() => {});
+    const longDetail =
+      `Decisions for job job-1234567890abcdef are blocked: the SHA ` +
+      `a40e6a963f8c2b1d4e5f60718293a4b5c6d7e8f9 does not match the recorded head, ` +
+      `and /Users/example/.gru-command/captures/ops-sweep-20261009T000000Z/manifest.json is missing. ` +
+      'No replay was attempted; the lane stays stopped until the cause is addressed.';
+    view.render(
+      snapshot({
+        notifications: [notification('long', { routing: 'action-required', kind: 'supervision.provider-wall.a1.auth', detail: longDetail })],
+      }),
+    );
+    const card = document.querySelector<HTMLElement>('[data-notification-id="long"]')!;
+    // The face does NOT show the wall of prose; the full text is inside Details.
+    expect(card.querySelector('.board-notification__context')).toBeNull();
+    const detailText = card.querySelector('.board-notification__detail-text')?.textContent;
+    expect(detailText).toBe(longDetail);
+    expect(card.querySelector('.board-notification__detail-kind')?.textContent).toBe('kind: supervision.provider-wall.a1.auth');
+    expect(card.querySelector('.board-notification__meta')?.textContent).not.toContain('blocked');
+    // A short detail renders verbatim on the face (metadata stays separate).
+    view.render(snapshot({ notifications: [notification('short', { routing: 'fyi', detail: 'Automatic recovery watching the route.' })] }));
+    const shortCard = document.querySelector<HTMLElement>('[data-notification-id="short"]')!;
+    expect(shortCard.querySelector('.board-notification__context')?.textContent).toBe('Automatic recovery watching the route.');
+    expect(shortCard.querySelector('.board-notification__details')).toBeNull();
   });
 
   // ---- Book of Lessons proposals (owner decision 2026-10-07) ----
@@ -3224,18 +3325,18 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
     view.setToastHandler(toast);
-    const stop = notification('focus-me', { routing: 'needs-owner' });
+    const stop = notification('focus-me', { routing: 'needs-owner', kind: 'gru.owner-escalation', decision: ownerDecision() });
     view.render(snapshot({ notifications: [stop] }));
-    const button = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:focus-me"]')!;
+    const button = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="notif:focus-me:option:approve"]')!;
     button.focus();
     expect(document.activeElement).toBe(button);
     // A refresh of the SAME data re-renders the band: no new arrival, so
     // no toast — and the focused control keeps its place.
     view.render(snapshot({ notifications: [stop] }));
     expect(toast).not.toHaveBeenCalled();
-    const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="owner-ack:focus-me"]');
+    const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="notif:focus-me:option:approve"]');
     expect(document.activeElement).toBe(refocused);
-    expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
+    expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('notif:focus-me:option:approve');
   });
 
   it('g10: an owner row already acked on another device arrives with no toast and no web-toast receipt', () => {
@@ -3293,7 +3394,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
 
       const band = document.getElementById('board-owner')!;
       expect(band.querySelector('.board-band__count')?.textContent, status).toBe('2 pending');
-      expect(band.querySelector('[data-action-id="owner-ack:owner-stop"]')).not.toBeNull();
+      expect(band.querySelector('[data-notification-id="owner-stop"]')).not.toBeNull();
+      expect(band.querySelector('.board-notification__guidance')).not.toBeNull();
       expect(band.querySelector('[data-action-id="owner-pr:ready"]')).not.toBeNull();
       const sections = [...document.querySelectorAll('.board-notification-section')];
       const section = (label: string) => sections.find((node) =>
