@@ -5,7 +5,7 @@ created: '2026-10-11'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'f738b9b1594081cdbb4929af7be256454951eb43'
-review_loop_iteration: 3
+review_loop_iteration: 4
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/BOARD.md'
@@ -176,6 +176,12 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
   units 623+ passed; lint/typecheck/build green; the three browser projects
   (notification-readability + mock + real) 62 passed; theme snapshots
   regenerated and visually inspected.
+- 2026-10-11 R12 proof correction: the notification-only fixture restores
+  helper-owned inline font sizes and snapshots all text baselines before
+  changing them; it checks independent pre/post sizes for FOR YOU, expanded
+  diagnostics and bell-list content, including relative-size text and fresh
+  nodes after snapshot replacement. Root/body, viewport, DPR, composer and
+  panel geometry are pinned; no product styles were changed.
 
 ## Spec Change Log
 
@@ -317,6 +323,17 @@ the round-2 hunks) and several follow-ups; fixed in one batch:
   Code Map typo.
 - The real-server compact epoch race stays deferred (pre-existing,
   reproduced at the pristine base; recorded in deferred-work).
+
+R12 actual text-only zoom reports (review target 8e1e20f48b56bed52880560386efb1668cf86530; complete change 46615b80f6cabd96d5b3cfe22d71f3d627fdcd08..8e1e20f48b56bed52880560386efb1668cf86530). The three genuine reports were acted under the existing commissioner; their report and phase obligations are settled, and these entries do not re-dispatch or re-disposition them. Each finding was verified against the reviewed code and routed to patch:
+
+- `high` — edge-cases: the document-wide parent-first loop can record a relative-size descendant after its ancestor was doubled, then double it again. The reviewed helper did this; current helper restores its inline overrides and measures all notification-text baselines before scaling, with an independent 1.08em probe (patch).
+- `high` — edge-cases: scaling every element includes `html`, so `rem`-based layout such as the 10rem composer cap can grow. The reviewed helper iterated `*`; current helper scopes changes to notification text and asserts unchanged root/body/composer metrics (patch).
+- `high` — blind-hunter: the same reachable relative-size descendant can exceed the required factor while the reviewed title oracle passes. The current test directly measures a relative probe before and after on initial and rebuilt content (patch).
+- `high` — blind-hunter: `probeBase` and `probeAfter` came from the mutating pass, allowing a wrong base to validate itself. Current tests take independent font-size samples before applying the helper and again after a snapshot rebuild (patch).
+- `high` — blind-hunter: expanded diagnostic and bell-list text were not required to double. Current tests independently measure the owner detail and notification-list title/details at desktop and 320px panel width (patch).
+- `high` — verification-gap: the global relative-size descendant can be over-scaled while fixed-size title checks pass. The current notification-only mechanism and relative probe assert exact doubling on initial and rebuilt content (patch).
+- `high` — verification-gap: the original exact-factor check used its own pass’s baseline. Current assertions use separately captured pre-pass and rebuilt-DOM baselines (patch).
+- `high` — verification-gap: panel text could remain unzoomed while the owner card oracle passed. Current tests assert exact pre/post sizes in `#notification-list`, including the 320px panel condition (patch).
 
 ## Design Notes
 
