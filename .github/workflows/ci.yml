@@ -45,6 +45,18 @@ jobs:
       # This repo's `npm test` re-runs lint/typecheck/build as its own
       # definition of green, then the backend + web suites. Keeping the
       # stages above as separate steps makes a failure legible at a glance;
-      # this last step is the authoritative full gate.
+      # this step is the authoritative backend/web gate. The scoped browser
+      # acceptance below also gates the shipped intake integration.
       - name: Full test suite
         run: npm test
+
+      - name: Build paired browser shell
+        run: npm run build:web
+
+      - name: Install scoped intake browser prerequisite
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Paired-shell intake acceptance
+        working-directory: web
+        run: npx playwright test --project=intake

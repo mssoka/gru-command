@@ -43,6 +43,8 @@ export type BoardConnectionState =
 export interface BoardClientEvents {
   connection(state: BoardConnectionState): void;
   snapshot(snapshot: BoardSnapshot): void;
+  /** Current membership is unavailable; retained rows/counts are last-known only. */
+  unavailable?(message: string): void;
   /** Fatal (bad token) — pairing must redo. */
   fatal(message: string): void;
 }
@@ -264,12 +266,10 @@ export class BoardClient {
       // ANY parsed frame proves the socket is alive — pings included.
       this.lastFrameAt = Date.now();
       if (this.state === 'stale') this.setState('reconnecting');
-      if (frame.type === 'auth_ok') {
+      if (frame.type === 'auth_ok') return; // Authentication is not a fresh snapshot.
+      if (frame.type === 'board') {
         this.attempts = 0;
         this.setState('open');
-        return;
-      }
-      if (frame.type === 'board') {
         this.snapshotEpoch += 1;
         this.events.snapshot(frame.snapshot);
         return;
@@ -278,6 +278,10 @@ export class BoardClient {
       if (frame.fatal) {
         this.stop();
         this.events.fatal(frame.message);
+      } else {
+        this.snapshotEpoch += 1; // A pre-error HTTP answer cannot clear this failure.
+        this.events.unavailable?.(frame.message);
+        this.setState('offline');
       }
     };
     ws.onclose = () => {
@@ -408,6 +412,8 @@ export class BoardClient {
       // is covered by the newer one.
       if (this.stopped || request !== this.fetchSeq) return;
       if (error instanceof BoardApiError && error.status === 401) return;
+      if (epoch !== this.snapshotEpoch) return; // New pushed evidence supersedes this old failure.
+      this.events.unavailable?.(error instanceof Error ? error.message : String(error));
       this.refreshOwed = true;
       if (!this.trailingRefetch) this.startTrailingRefetch();
     }

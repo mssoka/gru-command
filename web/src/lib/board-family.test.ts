@@ -1,3 +1,4 @@
+import { withMailboxFixture } from './mailbox-fixture.test-support.js';
 import { describe, expect, it } from 'vitest';
 import { bucketSnapshot } from './board-bands.js';
 import { familyStatusBreakdown, isLiveMegaminion, jobFamilies } from './board-family.js';
@@ -29,11 +30,11 @@ function snapshotOf(
   jobs: readonly JobView[],
   extra: { agents?: readonly unknown[]; notifications?: readonly unknown[] } = {},
 ): BoardSnapshot {
-  return {
+  return withMailboxFixture({
     repos: [{ name: 'demo', jobs }],
     agents: extra.agents ?? [],
     notifications: extra.notifications ?? [],
-  } as unknown as BoardSnapshot;
+  } as unknown as BoardSnapshot);
 }
 
 /** The screenshot this feature answers: two implementation heists, one

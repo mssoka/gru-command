@@ -2,14 +2,14 @@ import { RUNTIME_IDS, resolveSpawnPolicy, type Role, type RuntimeId } from '../c
 import type { LogLevel } from '../logger.js';
 import type { GrowthReport, SessionStore } from '../sessions/store.js';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { PiRuntime } from './pi-adapter.js';
+import { PiRuntime, normalizeSessionPath } from './pi-adapter.js';
 import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
-import type { AgentHandle, AgentRuntime, ManagedSkillSet, RuntimeEvent, SpawnOptions } from './types.js';
+import type { AgentHandle, AgentRuntime, ManagedSkillSet, ManagedWorkflowSession, RuntimeEvent, SpawnOptions } from './types.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
-import { createBmadRuntimeBinder } from '../bmad/runtime.js';
-import { join } from 'node:path';
+import { createWorkflowSessionBinder } from '../workflows/session.js';
+import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
@@ -102,17 +102,22 @@ export interface RuntimeRegistryOptions {
    * real binder; omitted = no managed runtime (unit tests).
    */
   readonly bmadRuntime?: (cwd: string) => ManagedSkillSet;
+  /** Production GC-owned selection with an explicit registered assignment. */
+  readonly workflowRuntime?: (options: SpawnOptions) => ManagedWorkflowSession;
 }
 
-/**
- * The service's registry options (main.ts): the base options plus the
- * issue #283 binder that gives build-workflow sessions the GC-managed BMAD
- * runtime of their job lane, materialized under `<dataDir>/bmad-runtime`.
- */
+/** New jobs use GC-owned resources; retained historical bindings keep their bytes.
+ * The caller supplies ledger/registry authority, never a directory-name guess. */
 export function serviceRegistryOptions(
-  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & { readonly config: { readonly dataDir: string } },
+  base: Pick<RuntimeRegistryOptions, 'config' | 'store' | 'log'> & {
+    readonly config: { readonly dataDir: string };
+    readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
+    readonly workflowBuildFor?: (lane: WorktreeLane) => boolean;
+    readonly workflowAgentFor?: (options: SpawnOptions) => string | undefined;
+  },
 ): RuntimeRegistryOptions {
-  return { ...base, bmadRuntime: createBmadRuntimeBinder(join(base.config.dataDir, 'bmad-runtime')) };
+  const { workflowLaneFor, workflowBuildFor, workflowAgentFor, ...options } = base;
+  return { ...options, workflowRuntime: createWorkflowSessionBinder(base.config.dataDir, workflowLaneFor, undefined, workflowBuildFor, workflowAgentFor) };
 }
 
 /**
@@ -632,11 +637,23 @@ export class RuntimeRegistry {
         : {},
     );
     const thinkingLevel = applyThinkingFallback(adapter, policy.thinkingLevel, this.log);
-    const managedSkills = this.managedSkillsFor(role, options);
+    // Assignment lookup must see the same canonical URI/tilde path that both
+    // adapters lock/open, otherwise a legitimate recorded resume looks unowned.
+    const workflowOptions = options.resumeFile === undefined ? options
+      : { ...options, resumeFile: normalizeSessionPath(options.resumeFile) };
+    const workflowSession = this.opts.workflowRuntime !== undefined && ROLE_DEFINITIONS[role].managedBmadRuntime &&
+      (options.reviewLead ?? options.isolatedReview) === undefined
+      ? this.opts.workflowRuntime(workflowOptions) : undefined;
+    const managedSkills = workflowSession !== undefined ? workflowSession.managedSkills : this.managedSkillsFor(role, options);
+    const cwd = workflowSession?.cwd ?? options.cwd;
+    if (managedSkills !== undefined) this.log('info', 'managed workflow bound', {
+      role, cwd, runtime: managedSkills.runtimeId, content_sha256: managedSkills.contentSha256,
+      artifact_root: managedSkills.workflow?.context.artifactRoot ?? null,
+    });
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
-      ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
-      ...(options.agentId !== undefined ? { agentId: options.agentId } : {}),
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...((workflowSession?.agentId ?? options.agentId) !== undefined ? { agentId: workflowSession?.agentId ?? options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),

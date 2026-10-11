@@ -120,6 +120,11 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
+      name: 'intake',
+      testMatch: 'intake.spec.ts',
+      use: { baseURL: `http://localhost:${REAL_PORT}` },
+    },
+    {
       name: 'real',
       testMatch: 'real-server.spec.ts',
       use: { baseURL: `http://localhost:${REAL_PORT}` },

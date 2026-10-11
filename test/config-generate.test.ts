@@ -405,6 +405,15 @@ describe('config-generate CLI', () => {
     expect(doc).toContain(renderConfigDocBlock());
   });
 
+  it('the rendered config reference describes the conflict cascade as the fyi mechanical tier', () => {
+    // The GitHub poll routes `github.pr-conflict` as fyi (mechanical tier,
+    // Silas coordinates the integration). The generated reference must not
+    // keep telling operators it is an action-required wake.
+    const block = renderConfigDocBlock();
+    expect(block).toContain('conflict cascades an fyi notification');
+    expect(block).not.toContain('conflict cascades an action-required notification');
+  });
+
   it('refuses overwrite without --force and creates a timestamped 0600 backup with force', () => {
     const root = tempDir('gru-command-config-force-');
     const instance = join(root, 'instance');

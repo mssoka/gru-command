@@ -1,11 +1,13 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
+import { renderRecordedVerification } from '../src/verify/evidence.js';
 import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
 
 const cleanupDirs: string[] = [];
@@ -40,6 +42,187 @@ describe('job deliverable kind (E19 durable-write guard)', () => {
   });
 });
 
+
+describe('completed verification history pagination (j-1594)', () => {
+  function seeded(): { api: LedgerApi; db: LedgerDb; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-vhist-'));
+    const db = new LedgerDb(dir);
+    return { api: new LedgerApi(db.handle), db, dir };
+  }
+
+  it('pages the COMPLETE history newest-first with no finite lifetime ceiling', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 208; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'vhist', payload: { run_id: `run-${index}` } });
+      }
+      api.appendCustomEvent({ kind: 'job.note', jobId: 'vhist', payload: { note: 'not a run' } });
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'other', payload: { run_id: 'other-run' } });
+      const rows = [...api.iterateJobVerificationCompleted('vhist', 200)];
+      // Every completed run of THIS job, exactly once, in descending seq.
+      expect(rows).toHaveLength(208);
+      expect(rows.every((row) => row.kind === 'verification.completed' && row.jobId === 'vhist')).toBe(true);
+      const seqs = rows.map((row) => row.seq);
+      expect(seqs).toEqual([...seqs].sort((left, right) => right - left));
+      expect(new Set(seqs).size).toBe(208);
+      expect((rows[0]!.payload as { run_id: string }).run_id).toBe('run-207');
+      expect((rows.at(-1)!.payload as { run_id: string }).run_id).toBe('run-0');
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('is lazy — the caller stops the read after exactly one page', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 5; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'lazy', payload: { run_id: `run-${index}` } });
+      }
+      // Observe the actual page reads: the watermark lookup plus one page —
+      // a second page must not be fetched when the caller stops after one
+      // row. (A pre-buffering implementation would read every page here.)
+      const prepare = vi.spyOn(db.handle, 'prepare');
+      const iterator = api.iterateJobVerificationCompleted('lazy', 2);
+      const first = iterator.next();
+      expect(first.done).toBe(false);
+      expect(prepare).toHaveBeenCalledTimes(2);
+      iterator.return(undefined);
+      expect(prepare).toHaveBeenCalledTimes(2);
+      expect(iterator.next().done).toBe(true);
+      prepare.mockRestore();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reads every page to exhaustion, including exact-full-page and single-row boundaries', () => {
+    const { api, db, dir } = seeded();
+    try {
+      const read = (jobId: string, pageSize: number): number[] =>
+        [...api.iterateJobVerificationCompleted(jobId, pageSize)].map((row) => row.seq);
+      // A total that is an exact multiple of pageSize terminates on the
+      // empty next page, not a short page; an exact-full single page (total
+      // === pageSize) must also terminate there instead of looping.
+      for (let index = 0; index < 4; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'exact', payload: { run_id: `run-${index}` } });
+      }
+      const exactAtTwo = read('exact', 2);
+      const expectedOrder = [...exactAtTwo].sort((left, right) => right - left);
+      expect(exactAtTwo).toEqual(expectedOrder);
+      expect(new Set(exactAtTwo).size).toBe(4);
+      // An exact-full single page (total === pageSize) terminates on the
+      // empty next page; the read still fetches that page (watermark +
+      // page + empty page = 3 statements), so a lost termination guard
+      // shows up as an extra fetch rather than an event-loop hang.
+      const exactPrepare = vi.spyOn(db.handle, 'prepare');
+      expect(read('exact', 4)).toEqual(expectedOrder);
+      expect(exactPrepare).toHaveBeenCalledTimes(3);
+      exactPrepare.mockRestore();
+      // pageSize 1 exercises the per-row cursor advance; the selected
+      // sequence is independent of the page size.
+      expect(read('exact', 1)).toEqual(expectedOrder);
+      // Single-row history (whether or not the page is full).
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'single', payload: { run_id: 'only' } });
+      expect(read('single', 1)).toHaveLength(1);
+      expect(read('single', 200)).toHaveLength(1);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws during iteration when a later page read fails — a partial read never looks empty', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'broken', payload: { run_id: `run-${index}` } });
+      }
+      const iterator = api.iterateJobVerificationCompleted('broken', 1);
+      expect(iterator.next().done).toBe(false); // page one read
+      // Simulate storage failure after the first page was yielded.
+      db.handle.exec('DROP TABLE events');
+      expect(() => iterator.next()).toThrow(/no such table: events/u);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('finds a binding run at the page boundary over the real paged read', () => {
+    const { api, db, dir } = seeded();
+    try {
+      const TARGET = 'a'.repeat(40);
+      const OTHER = 'f'.repeat(40);
+      const run = (sha: string, runId: string): Record<string, unknown> => ({
+        sha, scope: 'full', command: 'npm test', ok: true, exit_code: 0,
+        run_id: runId, output_bytes: 1, output_sha256: 'b'.repeat(64),
+      });
+      // The binding run is appended FIRST, then `newer` nonbinding runs, so
+      // it sits at row (newer + 1) of a newest-first history.
+      const seed = (jobId: string, newer: number): number => {
+        const binding = api.appendCustomEvent({
+          kind: 'verification.completed', jobId, payload: run(TARGET, `${jobId}-bind`),
+        });
+        for (let index = 0; index < newer; index += 1) {
+          api.appendCustomEvent({ kind: 'verification.completed', jobId, payload: run(OTHER, `${jobId}-noise-${index}`) });
+        }
+        return binding.seq;
+      };
+      const bind200 = seed('boundary-200', 199); // 200th newest = LAST row of page 1
+      const bind201 = seed('boundary-201', 200); // 201st newest = FIRST row of page 2
+      const select = (jobId: string, pageSize?: number): number | null => {
+        const iterator = pageSize === undefined
+          ? api.iterateJobVerificationCompleted(jobId)
+          : api.iterateJobVerificationCompleted(jobId, pageSize);
+        return [...iterator].find((event) => renderRecordedVerification(event, TARGET) !== null)?.seq ?? null;
+      };
+      expect(select('boundary-200', 200)).toBe(bind200);
+      expect(select('boundary-201', 200)).toBe(bind201);
+      // The DEFAULT page size is bounded and pages: 201 rows read as the
+      // watermark plus two pages (an unbounded default would fetch one).
+      const prepare = vi.spyOn(db.handle, 'prepare');
+      expect(select('boundary-201')).toBe(bind201);
+      expect(prepare).toHaveBeenCalledTimes(3);
+      prepare.mockRestore();
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds a stable watermark: a run appended after the first page is not yielded', () => {
+    const { api, db, dir } = seeded();
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        api.appendCustomEvent({ kind: 'verification.completed', jobId: 'wm', payload: { run_id: `before-${index}` } });
+      }
+      const iterator = api.iterateJobVerificationCompleted('wm', 2);
+      expect(iterator.next().done).toBe(false); // watermark captured here
+      const late = api.appendCustomEvent({ kind: 'verification.completed', jobId: 'wm', payload: { run_id: 'after' } });
+      const rest = [...iterator];
+      expect(rest.map((row) => (row.payload as { run_id: string }).run_id)).toEqual(['before-1', 'before-0']);
+      expect(rest.some((row) => row.seq === late.seq)).toBe(false);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('yields nothing for a job with no completed run and refuses a non-positive page size', () => {
+    const { api, db, dir } = seeded();
+    try {
+      api.appendCustomEvent({ kind: 'job.note', jobId: 'empty', payload: { note: 'x' } });
+      expect([...api.iterateJobVerificationCompleted('empty')]).toEqual([]);
+      expect(() => [...api.iterateJobVerificationCompleted('empty', 0)]).toThrow(/pageSize must be a positive integer/u);
+      expect(() => [...api.iterateJobVerificationCompleted('empty', 1.5)]).toThrow(/pageSize must be a positive integer/u);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('ledger api — the record of state', () => {
   let api: LedgerApi;
@@ -1997,4 +2180,83 @@ describe('administrative closeout of a parked PR-backed job', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+
+describe('GH-305 additive mailbox metadata authority', () => {
+  it('rejects stale and unsupported dispositions transactionally, and persists receipts without changing obligations', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'mail-ledger', repo: 'r', title: 'mailbox' });
+      api.setJobStatus('mail-ledger', 'blocked');
+      const item = api.reconcileMailbox()[0]!;
+      const obligations = api.listObligationsDetailed({ jobId: 'mail-ledger' }).readable;
+      const watermark = api.latestEventSeq();
+      expect(() => api.recordMailboxDisposition(item.id, { state: 'resolved', basis: 'old', owner: 'gru', detail: 'read', references: [] })).toThrow(/basis/);
+      expect(() => api.recordMailboxDisposition(item.id, { state: 'resolved', basis: item.basis, owner: 'gru', detail: 'read', references: [] })).toThrow(/resolution requires/);
+      expect(api.latestEventSeq()).toBe(watermark);
+      api.recordMailboxReceipt(item.id, item.basis, 'wake', 'turn-start-receipt');
+      expect(api.reconcileMailbox()[0]?.state).toBe('needs-gru');
+      expect(api.getJob('mail-ledger')?.status).toBe('blocked');
+      expect(api.listObligationsDetailed({ jobId: 'mail-ledger' }).readable).toEqual(obligations);
+    } finally { db.close(); }
+    const reopened = new LedgerDb(dir);
+    try { expect(new LedgerApi(reopened.handle).listMailboxItems()[0]?.receipt?.deliveryId).toBe('turn-start-receipt'); }
+    finally { reopened.close(); }
+  });
+  it('G06/G27 recovers a captured historical receipt after restart without suppressing a newer same-basis incarnation', () => {
+    const dir = tmpDir();
+    const originalAt = '2026-10-11T00:20:01.000Z';
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    let serialized: string;
+    try {
+      api.addJob({ id: 'captured', repo: 'r', title: 'captured' });
+      api.setJobStatus('captured', 'blocked');
+      const mailbox = new GruMailbox(api, () => Date.parse(originalAt));
+      const captured = mailbox.captureDelivery(mailbox.attentionRows());
+      serialized = JSON.stringify(captured);
+      mailbox.receiptCaptured(captured, 'wake', 'original', originalAt);
+    } finally { db.close(); }
+    const reopened = new LedgerDb(dir);
+    try {
+      const recovered = new LedgerApi(reopened.handle);
+      const mailbox = new GruMailbox(recovered, () => Date.parse(originalAt) + 300000);
+      const captured = JSON.parse(serialized!);
+      const current = mailbox.attentionPage(8)[0]!;
+      expect(current.basis).toBe(captured[0].basis);
+      expect(current.attentionKey).not.toBe(captured[0].attentionKey);
+      mailbox.receiptCaptured(captured, 'chat', 'parked-passive', originalAt);
+      expect(mailbox.attentionPage(8)).toHaveLength(1);
+      const historical = recovered.listEvents({ limit: 20 }).filter((event) => event.kind === 'mailbox.received');
+      expect(historical).toHaveLength(2);
+      expect(historical[0]?.payload).toMatchObject({ receipt: { receivedAt: originalAt, attentionKey: captured[0].attentionKey } });
+      const watermark = recovered.latestEventSeq();
+      mailbox.receiptCaptured(captured, 'chat', 'parked-passive', originalAt);
+      expect(recovered.latestEventSeq()).toBe(watermark);
+      expect(() => mailbox.receiptCaptured(captured, 'chat', 'parked-passive', '2026-10-11T00:21:01.000Z')).toThrow(/original delivery time/);
+      expect(recovered.latestEventSeq()).toBe(watermark);
+      expect(mailbox.snapshot().items[0]?.receipt?.deliveryId).toBe('original');
+    } finally { reopened.close(); }
+  });
+
+  it('G03 invalidates source cache for eventless source writes through a second ledger connection', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    const otherDb = new LedgerDb(dir);
+    try {
+      api.addJob({ id: 'external-write', repo: 'r', title: 'j' });
+      api.registerAgent({ id: 'worker', role: 'minion', jobId: 'external-write' });
+      api.setAgentState('worker', 'error');
+      expect(api.reconcileMailbox()[0]?.state).toBe('needs-gru');
+      const watermark = api.latestEventSeq();
+      new LedgerApi(otherDb.handle).registerAgent({ id: 'worker', role: 'perkins' });
+      expect(api.latestEventSeq()).toBe(watermark);
+      expect(api.reconcileMailbox().filter((item) => item.state !== 'resolved')).toHaveLength(0);
+    } finally { otherDb.close(); db.close(); }
+  });
+
 });

@@ -143,6 +143,26 @@ export class ChatView {
   private readonly uploading = new Map<number, string>();
   private nextUploadId = 0;
   private attach: AttachSurface | null = null;
+  private attachEpoch = 0;
+  private intakeFilePick: ((chip: AttachmentChip, uploaded: boolean) => void) | null = null;
+  private intakeRepoPick: ((path: string) => void) | null = null;
+  private intakeRepoPath: string | null = null;
+  private intakeRemaining = 8;
+  private intakeBatch: ((pending: boolean, error?: string) => void) | undefined;
+  private deviceChooser: { readonly epoch: number; readonly generation: number; readonly pick: ((chip: AttachmentChip, uploaded: boolean) => void) | null; readonly remaining: number; readonly batch: ((pending: boolean, error?: string) => void) | undefined } | null = null;
+  private readonly intakeUploading = new Set<number>();
+
+  pickIntakeFile(callback: (chip: AttachmentChip, uploaded: boolean) => void, repoPath?: string, remaining = 8, batch?: (pending: boolean, error?: string) => void): void {
+    this.closePicker();
+    this.intakeRepoPath = repoPath ?? null; this.intakeRemaining = remaining; this.intakeBatch = batch;
+    this.intakeFilePick = callback;
+    void this.openPicker('');
+  }
+  pickIntakeRepository(callback: (path: string) => void): void {
+    this.closePicker();
+    this.intakeRepoPick = callback;
+    void this.openPicker('');
+  }
   private pickerAt = '';
   /** Latest browse request/close generation; stale responses never repaint. */
   private browseGeneration = 0;
@@ -222,7 +242,7 @@ export class ChatView {
       if (text === '' && this.pending.length === 0) return;
       // Review r1: uploads still in flight must not silently miss the
       // send — hold the gesture until they land (or fail).
-      if (this.uploading.size > 0) {
+      if (this.uploading.size > this.intakeUploading.size) {
         this.ephemeralNote('an upload is still on its way — one moment…');
         return;
       }
@@ -569,6 +589,8 @@ export class ChatView {
 
   /** Bind (or rebind) the resolution surface — main.ts calls per pair. */
   bindAttach(surface: AttachSurface | null): void {
+    this.attachEpoch += 1;
+    this.closePicker();
     this.attach = surface;
     this.attachButton.disabled = surface === null;
     this.attachButton.title = surface === null ? 'Attach (pairing required)' : 'Attach files';
@@ -576,12 +598,45 @@ export class ChatView {
   }
 
   private wireAttachFlow(): void {
-    this.attachButton.addEventListener('click', () => this.openPicker(''));
+    this.attachButton.addEventListener('click', () => { this.closePicker(); void this.openPicker(''); });
     this.fileInput.addEventListener('change', () => {
       const files = [...this.fileInput.files ?? []];
       this.fileInput.value = ''; // allow re-picking the same file
-      for (const file of files) void this.takeDeviceFile(file);
+      const chooser = this.deviceChooser; this.deviceChooser = null;
+      if (chooser === null || chooser.epoch !== this.attachEpoch || chooser.generation !== this.browseGeneration || this.intakeRepoPick !== null || this.fileInput.disabled) return;
+      const { pick, remaining, batch } = chooser;
+      if (files.length === 0) return;
+      if (pick !== null && files.length > remaining) {
+        const error = 'Intake document cap reached (8). Retry a complete selection within the remaining document slots.';
+        batch?.(false, error); this.ephemeralNote(error); this.closePicker(); return;
+      }
+      if (pick === null) for (const file of files) void this.takeDeviceFile(file);
+      else {
+        const epoch = chooser.epoch;
+        batch?.(true);
+        // Upload concurrently, but publish intake documents in chooser order:
+        // the first selected file is the primary source, not the fastest upload.
+        void Promise.all(files.map(async (file) => {
+          let chip: AttachmentChip | undefined;
+          await this.takeDeviceFile(file, (uploaded) => { chip = uploaded; });
+          return chip;
+        })).then((chips) => {
+          // Once captured, this batch belongs to its original consumer. Opening
+          // the independent chat picker must not silently discard its sources;
+          // the intake callback still guards its own source/pairing generation.
+          if (epoch !== this.attachEpoch) return;
+          if (chips.some((chip) => chip === undefined)) {
+            const error = 'Intake documents were not selected: an upload failed. Retry the complete selection.';
+            batch?.(false, error); this.ephemeralNote(error); return;
+          }
+          batch?.(false);
+          for (const chip of chips) if (chip !== undefined) pick(chip, true);
+        });
+      }
+      this.closePicker();
     });
+
+    this.fileInput.addEventListener('cancel', () => { this.deviceChooser = null; });
 
     mustGet<HTMLButtonElement>('attach-picker-close').addEventListener('click', () =>
       this.closePicker(),
@@ -590,6 +645,11 @@ export class ChatView {
       void this.openPicker(this.pickerAt === '' ? '' : (this.picker.dataset.parent ?? ''));
     });
     mustGet<HTMLButtonElement>('attach-picker-device').addEventListener('click', () => {
+      if (this.intakeRepoPick !== null || this.fileInput.disabled) return;
+      if (this.deviceChooser !== null) { this.ephemeralNote('Finish or cancel the previous device chooser before opening another.'); return; }
+      // Capture the actual consumer before opening the OS chooser. A late
+      // change event may not adopt a newly paired/picked attachment surface.
+      this.deviceChooser = { epoch: this.attachEpoch, generation: this.browseGeneration, pick: this.intakeFilePick, remaining: this.intakeRemaining, batch: this.intakeBatch };
       this.fileInput.click();
     });
     document.addEventListener('keydown', (event) => {
@@ -614,6 +674,9 @@ export class ChatView {
   private async openPicker(path: string): Promise<void> {
     if (this.attach === null) return;
     const generation = ++this.browseGeneration;
+    const device = mustGet<HTMLButtonElement>('attach-picker-device');
+    device.disabled = this.intakeRepoPick !== null; device.hidden = this.intakeRepoPick !== null;
+    this.fileInput.disabled = this.intakeRepoPick !== null;
     this.picker.hidden = false;
     this.attachButton.setAttribute('aria-expanded', 'true');
     this.pickerError.hidden = true;
@@ -637,6 +700,12 @@ export class ChatView {
   private renderBrowse(result: BrowseResult): void {
     const list = this.pickerList;
     list.replaceChildren();
+    if (this.intakeRepoPick !== null && result.path !== '') {
+      const choose = el('button', 'pp-btn', 'Use this repository');
+      choose.type = 'button';
+      choose.addEventListener('click', () => { this.intakeRepoPick?.(`${result.root}/${result.path}`); this.closePicker(); });
+      list.append(choose);
+    }
     if (result.entries.length === 0) {
       list.append(el('div', 'attach-picker__empty', 'nothing pickable here'));
     }
@@ -648,20 +717,17 @@ export class ChatView {
       const icon = el('span', 'attach-row__icon', entry.kind === 'dir' ? '📁' : entry.image ? '🖼️' : '📄');
       const label = el('span', 'attach-row__name', entry.name);
       row.append(icon, label);
-      if (!entry.pickable) {
+      const outsideRepository = this.intakeFilePick !== null && this.intakeRepoPath !== null && entry.kind === 'file' && !`${result.root}/${joinRel(result.path, entry.name)}`.startsWith(`${this.intakeRepoPath}/`);
+      if (!entry.pickable || outsideRepository || this.intakeRepoPick !== null && entry.kind === 'file') {
         row.disabled = true;
-        row.title = 'Unavailable: target is outside the workspace';
+        row.title = outsideRepository ? 'Unavailable: outside the selected intake repository; choose a repository document or upload from this device' : 'Unavailable: target is outside the workspace';
       } else if (entry.kind === 'dir') {
         row.addEventListener('click', () => void this.openPicker(joinRel(result.path, entry.name)));
       } else {
         row.addEventListener('click', () => {
-          this.addChip({
-            // ABSOLUTE path: the agent reads the file at this path
-            // (ruling 19(c) — the pick is a reference, never a copy).
-            path: `${result.root}/${joinRel(result.path, entry.name)}`,
-            name: entry.name,
-            kind: entry.image ? 'image' : 'file',
-          });
+          const chip: AttachmentChip = { path: `${result.root}/${joinRel(result.path, entry.name)}`, name: entry.name, kind: entry.image ? 'image' : 'file' };
+          if (this.intakeFilePick !== null) this.intakeFilePick(chip, false);
+          else this.addChip(chip);
           this.closePicker();
         });
       }
@@ -681,28 +747,39 @@ export class ChatView {
   private closePicker(): void {
     this.browseGeneration += 1;
     this.picker.hidden = true;
+    this.intakeFilePick = null;
+    this.intakeBatch = undefined;
+    this.intakeRepoPick = null;
+    this.intakeRepoPath = null;
     this.attachButton.setAttribute('aria-expanded', 'false');
   }
 
   /** Device files (phone camera/gallery, desktop picks): bytes → uploads. */
-  private async takeDeviceFile(file: File): Promise<void> {
+  private async takeDeviceFile(file: File, pick: ((chip: AttachmentChip, uploaded: boolean) => void) | null = null): Promise<void> {
     if (this.attach === null) return;
-    if (this.pending.length + this.uploading.size >= MAX_ATTACHMENTS_PER_MESSAGE) {
+    const epoch = this.attachEpoch;
+    const occupied = pick === null ? this.pending.length + this.uploading.size - this.intakeUploading.size : this.intakeUploading.size;
+    if (occupied >= MAX_ATTACHMENTS_PER_MESSAGE) {
       this.ephemeralNote(`attachment cap reached (${MAX_ATTACHMENTS_PER_MESSAGE})`);
       return;
     }
     const uploadId = ++this.nextUploadId;
     this.uploading.set(uploadId, file.name);
+    if (pick !== null) this.intakeUploading.add(uploadId);
     this.renderChips();
     try {
       const uploaded = await this.attach.upload(file);
-      this.addChip({ path: uploaded.path, name: uploaded.name, kind: imageKindFor(uploaded.name) });
+      if (epoch !== this.attachEpoch) return;
+      const chip = { path: uploaded.path, name: uploaded.name, kind: imageKindFor(uploaded.name) };
+      if (pick !== null) pick(chip, true);
+      else this.addChip(chip);
     } catch (error) {
+      if (epoch !== this.attachEpoch) return;
       this.ephemeralNote(
         `could not attach ${file.name}: ${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {
-      this.uploading.delete(uploadId);
+      this.uploading.delete(uploadId); this.intakeUploading.delete(uploadId);
       this.renderChips();
     }
   }
@@ -734,7 +811,8 @@ export class ChatView {
 
   private renderChips(): void {
     this.chipsRow.replaceChildren();
-    for (const name of this.uploading.values()) {
+    for (const [id, name] of this.uploading) {
+      if (this.intakeUploading.has(id)) continue;
       const chip = el('span', 'attach-chip attach-chip--busy', `⏳ ${name}`);
       this.chipsRow.append(chip);
     }

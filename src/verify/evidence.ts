@@ -87,6 +87,25 @@ export function renderRecordedVerification(
 }
 
 /**
+ * The newest completed verification event, in ledger sequence order, that
+ * binds `targetSha` — the first event whose rendering under
+ * `renderRecordedVerification` is non-null. `events` streams newest-first
+ * and is consumed lazily: the scan stops at the first bound run, so a long
+ * history is never walked past the evidence it proves. Null means the
+ * stream was exhausted with no binding run — complete absence, never
+ * truncation. (j-1594 correction of gh-169 R8-2.)
+ */
+export function selectNewestBoundVerification(
+  events: Iterable<Pick<EventRecord, 'ts' | 'payload'>>,
+  targetSha: string,
+): Pick<EventRecord, 'ts' | 'payload'> | null {
+  for (const event of events) {
+    if (renderRecordedVerification(event, targetSha) !== null) return event;
+  }
+  return null;
+}
+
+/**
  * Append the evidence block to a spec context when one binds, staying
  * inside the frozen spec bound. A BOUND block that cannot fit renders an
  * explicit bounded omission notice when that notice fits, and refuses the

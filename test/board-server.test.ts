@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { WebSocket, type RawData } from 'ws';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { WebSocket, WebSocketServer, type RawData } from 'ws';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { createBoardServer } from '../src/board/server.js';
@@ -41,6 +41,7 @@ async function boot(
   api: LedgerApi;
   bus: EventBus;
   board: ReturnType<typeof createBoardServer>;
+  engine: BoardEngine;
   close: () => Promise<void>;
 }> {
   const dir = tmpDir();
@@ -98,6 +99,7 @@ async function boot(
     api,
     bus,
     board,
+    engine,
     async close() {
       decisions.dispose();
       await board.dispose();
@@ -153,6 +155,27 @@ class BoardClient {
     this.socket.close();
     return this.closed;
   }
+
+  terminate(): Promise<number> {
+    this.socket.terminate();
+    return this.closed;
+  }
+}
+
+/** Capture the actual server peer to assert auth callback containment synchronously:
+ * an escaped exception must fail an assertion, not strand ws's receiver teardown. */
+async function openBoardPeer(client: BoardClient): Promise<WebSocket> {
+  let peer: WebSocket | undefined;
+  const emit = WebSocketServer.prototype.emit;
+  const observer = vi.spyOn(WebSocketServer.prototype, 'emit').mockImplementation(function (this: WebSocketServer, event, ...args) {
+    if (event === 'connection') peer = args[0] as WebSocket;
+    return Reflect.apply(emit, this, [event, ...args]) as boolean;
+  });
+  try {
+    await client.open();
+    if (peer === undefined) throw new Error('board server peer was not connected');
+    return peer;
+  } finally { observer.mockRestore(); }
 }
 
 async function getJson(port: number, path: string, token: string | null): Promise<{ status: number; body: unknown }> {
@@ -185,6 +208,72 @@ describe('board server — HTTP API', () => {
 
   beforeAll(async () => {
     harness = await boot('board-test-token');
+  });
+
+  it('G24 authenticated disposition succeeds and GET reads back durable ownership without changing job authority', async () => {
+    const isolated = await boot('disposition-token');
+    try {
+      isolated.api.addJob({ id: 'disposition-job', repo: 'r', title: 'waiting for owner' });
+      isolated.api.setJobStatus('disposition-job', 'blocked');
+      const initial = await getJson(isolated.port, '/api/mailbox', 'disposition-token');
+      const item = (initial.body as { items: { id: string; basis: string }[] }).items[0]!;
+      const decision = isolated.api.recordDecision({ subject: item.id, decision: 'hold', covers: ['blocked'], reason: 'owner must authorize continuation', by: 'owner' });
+      const input = { basis: item.basis, state: 'waiting', owner: 'owner', detail: 'do not restart', dependency: 'owner authorization', recheckAt: new Date(Date.now() + 60_000).toISOString(), references: [{ kind: 'decision', id: decision.id }] };
+      const notificationsBefore = isolated.api.listNotifications();
+      const written = await postJson(isolated.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'disposition-token', input);
+      expect(written.status).toBe(200);
+      expect(written.body).toMatchObject({ id: item.id, basis: item.basis, state: 'waiting', owner: 'owner', disposition: input, receipt: null });
+      const page = await getJson(isolated.port, '/api/mailbox', 'disposition-token');
+      expect(page.status).toBe(200);
+      expect((page.body as { items: unknown[] }).items).toEqual([written.body]);
+      const board = await getJson(isolated.port, '/api/board', 'disposition-token');
+      expect((board.body as { mailbox: { items: unknown[] } }).mailbox.items).toEqual([written.body]);
+      expect(isolated.api.getJob('disposition-job')?.status).toBe('blocked');
+      expect(isolated.api.listNotifications()).toEqual(notificationsBefore);
+    } finally { await isolated.close(); }
+  });
+
+  it('G09 malformed source evidence returns observable unavailability from /api/board', () => assertSourceUnavailable('/api/board'));
+  it('G09 malformed source evidence returns observable unavailability from /api/mailbox', () => assertSourceUnavailable('/api/mailbox'));
+  it('F03 malformed object fields make /api/board unavailable rather than clear', () => assertSourceUnavailable('/api/board', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  it('F03 malformed object fields make /api/mailbox unavailable rather than clear', () => assertSourceUnavailable('/api/mailbox', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  async function assertSourceUnavailable(path: string, payload: unknown = []): Promise<void> {
+    const isolated = await boot('malformed-token');
+    try {
+      isolated.api.addJob({ id: 'malformed-job', repo: 'r', title: 'malformed evidence' });
+      isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-job', payload });
+      expect(() => isolated.engine.mailbox.snapshot()).toThrow(/malformed PR evidence/);
+      expect((await getJson(isolated.port, path, null)).status).toBe(401);
+      const result = await getJson(isolated.port, path, 'malformed-token');
+      expect(result.status).toBe(503);
+      expect(result.body).toMatchObject({ error: 'board_unavailable', detail: expect.stringContaining('malformed PR evidence') });
+      expect(result.body).not.toHaveProperty('mailbox');
+      const write = await postJson(isolated.port, '/api/mailbox/job%3Amalformed-job/disposition', 'malformed-token', {});
+      expect(write.status).toBe(503);
+      expect(write.body).toMatchObject({ error: 'board_unavailable' });
+      expect(isolated.api.getJob('malformed-job')?.status).toBe('dispatched');
+    } finally { await isolated.close(); }
+  }
+
+  it('GH-305 mailbox HTTP shares board identities, pages durably, and fences stale/invalid writes behind auth', async () => {
+    const isolated = await boot('mailbox-test-token');
+    try {
+      isolated.api.addJob({ id: 'mail-http', repo: 'r', title: 'mailbox HTTP' });
+      isolated.api.setJobStatus('mail-http', 'blocked');
+      expect((await getJson(isolated.port, '/api/mailbox', null)).status).toBe(401);
+      const page = await getJson(isolated.port, '/api/mailbox?limit=1', 'mailbox-test-token');
+      expect(page.status).toBe(200);
+      const item = (page.body as { items: { id: string; basis: string }[] }).items[0]!;
+      const board = await getJson(isolated.port, '/api/board', 'mailbox-test-token');
+      expect((board.body as { mailbox: { items: unknown[] } }).mailbox.items).toEqual((page.body as { items: unknown[] }).items);
+      expect((await getJson(isolated.port, '/api/mailbox?limit=0', 'mailbox-test-token')).status).toBe(400);
+      const path = `/api/mailbox/${encodeURIComponent(item.id)}/disposition`;
+      const input = { basis: 'stale', state: 'waiting', owner: 'owner', detail: 'needs owner ruling', references: [] };
+      expect((await postJson(isolated.port, path, null, input)).status).toBe(401);
+      expect((await postJson(isolated.port, path, 'mailbox-test-token', input)).status).toBe(409);
+      expect((await postJson(isolated.port, path, 'mailbox-test-token', { ...input, basis: item.basis })).status).toBe(400);
+      expect(isolated.api.getJob('mail-http')?.status).toBe('blocked');
+    } finally { await isolated.close(); }
   });
 
   it('GET /api/board: 401 without token, 401 with a bad token, snapshot with a valid one', async () => {
@@ -741,6 +830,78 @@ describe('board server — WS push', () => {
 
   beforeAll(async () => {
     harness = await boot('ws-board-token');
+  });
+
+  it('G09 contains malformed evidence during auth snapshot push', () => assertSnapshotUnavailable('auth'));
+  it('G09 contains malformed evidence during event snapshot push', () => assertSnapshotUnavailable('event'));
+  it('F03 object-shaped malformed evidence is contained during auth snapshot push', () => assertSnapshotUnavailable('auth', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  it('F03 object-shaped malformed evidence is contained during event snapshot push', () => assertSnapshotUnavailable('event', { pr_url: null, pr_open: 'true', mergeable_state: null, sha: null }));
+  async function assertSnapshotUnavailable(boundary: 'auth' | 'event', payload: unknown = []): Promise<void> {
+    const isolated = await boot('malformed-ws-token', { heartbeatMs: 0 });
+    const client = new BoardClient(isolated.port);
+    try {
+      const addJob = () => isolated.api.addJob({ id: 'malformed-ws-job', repo: 'r', title: 'invalid evidence' });
+      const corrupt = () => isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-ws-job', payload });
+      const peer = await openBoardPeer(client);
+      if (boundary === 'auth') {
+        addJob(); corrupt();
+        expect(() => peer.emit('message', Buffer.from(JSON.stringify({ type: 'auth', token: 'malformed-ws-token' })))).not.toThrow();
+      } else {
+        client.send({ type: 'auth', token: 'malformed-ws-token' });
+        await client.waitFor((frame) => frame.type === 'board', 'initial valid snapshot');
+        addJob();
+        await client.waitFor(() => client.frames.some((frame) => frame.type === 'board' &&
+          (frame.snapshot as { repos: { jobs: { id: string }[] }[] }).repos.some((repo) => repo.jobs.some((job) => job.id === 'malformed-ws-job'))), 'job source push');
+        corrupt();
+      }
+      const previousBoards = client.frames.filter((frame) => frame.type === 'board').length;
+      await client.waitFor((frame) => frame.type === 'error', 'unavailable snapshot').catch(() => {});
+      expect(client.frames.find((frame) => frame.type === 'error')).toMatchObject({ type: 'error', fatal: false, message: expect.stringContaining('board unavailable') });
+      expect(client.frames.filter((frame) => frame.type === 'board')).toHaveLength(previousBoards);
+      expect(await client.closed).toBe(1011);
+      expect(() => isolated.engine.mailbox.snapshot()).toThrow(/malformed PR evidence/);
+      expect((await getJson(isolated.port, '/api/board', 'malformed-ws-token')).status).toBe(503);
+      const prUrl = 'https://github.com/org/repo/pull/305';
+      isolated.api.setJobPr('malformed-ws-job', prUrl);
+      isolated.api.appendCustomEvent({ kind: 'github.branch-state', jobId: 'malformed-ws-job', payload: branchStatePayload(
+        { jobId: 'malformed-ws-job', repo: { host: 'github.com', owner: 'org', repo: 'repo' }, branch: 'mailbox', prNumber: 305, prUrl },
+        { sha: 'recovered-head', merged: false, prNumber: 305, prUrl, prOpen: true, mergeableState: 'dirty', mergeCommitSha: null, ci: null },
+      ) });
+      const recovered = new BoardClient(isolated.port);
+      try {
+        await recovered.open();
+        recovered.send({ type: 'auth', token: 'malformed-ws-token' });
+        await recovered.waitFor((frame) => frame.type === 'board', 'same-token recovered snapshot');
+        const frame = recovered.frames.find((frame) => frame.type === 'board')!;
+        expect(frame.snapshot).toMatchObject({ mailbox: { counts: { threads: 1, needsGru: 1 }, items: [{ jobId: 'malformed-ws-job', state: 'needs-gru' }] } });
+        expect(recovered.frames.some((frame) => frame.type === 'error')).toBe(false);
+        expect((await getJson(isolated.port, '/api/board', 'malformed-ws-token')).status).toBe(200);
+      } finally { await recovered.close(); }
+    } finally { await client.terminate(); await isolated.close(); }
+  }
+
+  it('G09 contains unexpected runtime snapshot errors at auth without fabricating board data', async () => {
+    const isolated = await boot('runtime-ws-token', { heartbeatMs: 0 });
+    const client = new BoardClient(isolated.port);
+    const snapshot = vi.spyOn(isolated.engine, 'snapshot').mockImplementation(() => { throw new Error('snapshot source unavailable'); });
+    try {
+      const peer = await openBoardPeer(client);
+      expect(() => peer.emit('message', Buffer.from(JSON.stringify({ type: 'auth', token: 'runtime-ws-token' })))).not.toThrow();
+      await client.waitFor((frame) => frame.type === 'error', 'runtime error').catch(() => {});
+      expect(client.frames.find((frame) => frame.type === 'error')).toMatchObject({ fatal: false, message: expect.stringContaining('snapshot source unavailable') });
+      expect(client.frames.some((frame) => frame.type === 'board')).toBe(false);
+      expect(await client.closed).toBe(1011);
+      expect((await getJson(isolated.port, '/api/board', 'runtime-ws-token')).status).toBe(503);
+      snapshot.mockRestore();
+      const recovered = new BoardClient(isolated.port);
+      try {
+        await recovered.open();
+        recovered.send({ type: 'auth', token: 'runtime-ws-token' });
+        await recovered.waitFor((frame) => frame.type === 'board', 'runtime recovery with same token');
+        expect(recovered.frames.some((frame) => frame.type === 'error')).toBe(false);
+        expect((await getJson(isolated.port, '/api/board', 'runtime-ws-token')).status).toBe(200);
+      } finally { await recovered.close(); }
+    } finally { snapshot.mockRestore(); await client.terminate(); await isolated.close(); }
   });
 
   it('auth → auth_ok → immediate snapshot; changes push fresh snapshots', async () => {

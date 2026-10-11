@@ -317,7 +317,13 @@ completed scheduler verification run bound to the frozen target freezes an
 `UNAVAILABLE — NO BOUND VERIFICATION RUN` section beside the spec (the same
 ledger-backed, untrusted-evidence framing as a real run) — never silence. A
 spec with no room for that disclosure refuses the freeze. Explicit no-spec
-rounds keep their mode and are exempt from the section check.
+rounds keep their mode and are exempt from the section check. The host
+searches the job's COMPLETE `verification.completed` history newest-first in
+bounded pages (no finite per-job lifetime window): the newest run binding
+the frozen target governs, and the explicit absence section is rendered only
+after that search exhausts the history. A read that fails mid-history aborts
+the freeze loudly (no spawn) instead of rendering UNAVAILABLE — unreadable
+evidence is never fabricated absence.
 
 **Published reports carry the frozen CI state.** The host appendix of a
 published review states the frozen CI evidence distinctly — `GREEN`,
@@ -340,5 +346,5 @@ or amendments to an existing PR:
 3. For PR165-style renamed-skill corrections, append the approved amendment
    with its real provenance reference, then freeze a new round.
 4. Existing pending source/control records are never replaced; re-arm only
-   through the supported endpoints above. Merges, restarts and deployments
-   stay owner-held.
+   through the supported endpoints above. Final PR merges, restarts and
+   deployments stay owner-held.

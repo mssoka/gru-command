@@ -50,6 +50,86 @@ function settleLane(ledger: LedgerApi, jobId: string): void {
   ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'fixture-settled' } });
 }
 
+/** A syntactically complete `verification.completed` payload carrying every
+ * receipt binding `renderRecordedVerification` requires. */
+function completedRunPayload(
+  sha: string,
+  runId: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    sha,
+    scope: 'full',
+    command: 'npm test',
+    ok: true,
+    exit_code: 0,
+    duration_ms: 1000,
+    workers: 2,
+    run_id: runId,
+    output_bytes: 4096,
+    output_sha256: createHash('sha256').update(runId).digest('hex'),
+    ...overrides,
+  };
+}
+
+/** Complete persisted `verification.completed` rows for the named jobs — the
+ * read-only before/after proof that host selection neither adds, deletes,
+ * reorders nor rewrites historical verification records (j-1594 acceptance 4).
+ * Read through a kind-scoped list (never the iterator under test) with a
+ * limit above any fixture history, so truncation cannot fake equality. */
+function persistedVerificationRows(ledger: LedgerApi, jobIds: readonly string[]): Record<string, unknown> {
+  const rows: Record<string, unknown> = {};
+  for (const jobId of jobIds) {
+    rows[jobId] = ledger.listJobEventsByKinds(jobId, ['verification.completed'], { limit: 1000 });
+  }
+  return rows;
+}
+
+/** A delivered job lane whose target is a fresh commit on its own branch —
+ * the fixture shape the recorded-verification wave pins use. The caller
+ * appends the synthetic verification history through the returned ledger. */
+async function verificationHistoryLane(id: string, prefix: string, prNumber: number): Promise<{
+  readonly ledger: LedgerApi;
+  readonly job: ReturnType<LedgerApi['addJob']>;
+  readonly target: string;
+  readonly branch: string;
+  readonly artifacts: string;
+  readonly sessions: string;
+  readonly port: GitReviewPort;
+}> {
+  const repo = makeFixtureRepo(`${prefix}-repo`);
+  repos.push(repo);
+  const branch = `feature/${prefix}`;
+  repo.git(['checkout', '-b', branch]);
+  const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+  const root = mkdtempSync(join(tmpdir(), `${prefix}-port-`));
+  const artifacts = mkdtempSync(join(tmpdir(), `${prefix}-artifacts-`));
+  const sessions = mkdtempSync(join(tmpdir(), `${prefix}-sessions-`));
+  dirs.push(root, artifacts, sessions);
+  const db = new LedgerDb(mkdtempSync(join(tmpdir(), `${prefix}-db-`)));
+  dbs.push(db);
+  const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+  const port = new GitReviewPort(root, branch, target);
+  await port.createJobWorktree({ repoPath: repo.path, jobId: id });
+  const job = ledger.addJob({ id, repo: 'fixture', title: prefix, baseBranch: 'main', briefing: 'review' });
+  ledger.setJobStatus(job.id, 'working');
+  settleLane(ledger, job.id);
+  ledger.setJobPr(job.id, `https://git.example.invalid/acme/fixture/pull/${prNumber}`);
+  attachOrigin(repo, branch, root);
+  return { ledger, job, target, branch, artifacts, sessions, port };
+}
+
+function waveFor(lane: Awaited<ReturnType<typeof verificationHistoryLane>>): WaveRunner {
+  const underlying = makeSpawner(lane.sessions, []);
+  return new WaveRunner({
+    ledger: lane.ledger,
+    worktrees: lane.port,
+    spawner: (role, options) => underlying(role, options),
+    reviewArtifactRoot: lane.artifacts,
+    prHeadProbe: localHeadProbe(lane.branch),
+  });
+}
+
 
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { WorktreeBaseSource } from '../src/ledger/api.js';
@@ -1825,6 +1905,157 @@ describe('WaveRunner built-in Perkins production path', () => {
     const frozenSpec = readFileSync(join(artifacts, round.id, 'spec-context.md'), 'utf8');
     expect(frozenSpec).toContain('result: PASS (exit 0)');
     expect(frozenSpec).toContain('run_id: run-bvw-1');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+  });
+
+  it('reviews a job with 208 completed verification runs: the newest binding run freezes without a lifetime-window exception (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-208', 'perkins-long-history-208', 70);
+    const { ledger, job, target } = lane;
+    // 207 completed runs for OTHER shas, then the binding run as the NEWEST.
+    // The old lifetime ceiling threw on the total before any search happened.
+    for (let index = 0; index < 207; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('f'.repeat(40), `run-noise-${index}`),
+      });
+    }
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-newest'),
+    });
+    // Another job's completed history is kind/job-scoped noise here.
+    for (let index = 0; index < 210; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: 'job-other',
+        payload: completedRunPayload(target, `run-other-${index}`),
+      });
+    }
+    expect(ledger.listJobEventsByKinds(job.id, ['verification.completed'], { limit: 1000 })).toHaveLength(208);
+    // BEFORE: every persisted verification row of BOTH jobs (the reviewed
+    // lane and the other job's unrelated history).
+    const verificationBefore = persistedVerificationRows(ledger, [job.id, 'job-other']);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // AFTER: host selection is read-only — the complete persisted history of
+    // both jobs is identical row-for-row (same seqs, order, payloads and
+    // outcomes). An added, deleted or rewritten receipt (including an OLDER
+    // one) fails here, while ordinary round/status bookkeeping — different
+    // event kinds — cannot mask it.
+    expect(persistedVerificationRows(ledger, [job.id, 'job-other'])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('result: PASS (exit 0)');
+    expect(frozenSpec).toContain('run_id: run-binding-newest');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+    // Exactly ONE verification section, and the round really bound the
+    // target — not a vacuous "the exception text is absent" check.
+    expect(frozenSpec.match(/--- HOST-RECORDED VERIFICATION \(ledger-backed/gu)).toHaveLength(1);
+    expect(round.targetRef).toBe(target);
+  });
+
+  it('finds a binding run behind more than 200 newer nonqualifying completed runs (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-old', 'perkins-long-history-old', 71);
+    const { ledger, job, target } = lane;
+    // The binding run is the OLDEST; the newest-first scan must page past the
+    // first page (200 rows) of newer other-sha runs to reach it.
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-old'),
+    });
+    for (let index = 0; index < 205; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('e'.repeat(40), `run-newer-${index}`),
+      });
+    }
+    const verificationBefore = persistedVerificationRows(ledger, [job.id]);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // Paging past two pages to the oldest row rewrote nothing.
+    expect(persistedVerificationRows(ledger, [job.id])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('run_id: run-binding-old');
+    expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
+  });
+
+  it('renders the explicit UNAVAILABLE section only after a complete long-history selection finds no binding run (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-none', 'perkins-long-history-none', 72);
+    const { ledger, job } = lane;
+    for (let index = 0; index < 205; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('d'.repeat(40), `run-absent-${index}`),
+      });
+    }
+    // A second job's unrelated completed history must survive an exhausted
+    // absence proof untouched, too.
+    for (let index = 0; index < 3; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: 'job-other-absent',
+        payload: completedRunPayload('c'.repeat(40), `run-absent-other-${index}`),
+      });
+    }
+    const verificationBefore = persistedVerificationRows(ledger, [job.id, 'job-other-absent']);
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    // Exhausted absence is still read-only: no record was added to fill the
+    // gap, none deleted to shorten the search, none rewritten to look absent.
+    expect(persistedVerificationRows(ledger, [job.id, 'job-other-absent'])).toEqual(verificationBefore);
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('state: UNAVAILABLE — NO BOUND VERIFICATION RUN');
+    expect(frozenSpec).not.toContain('result: PASS');
+  });
+
+  it('a verification-history read failure during iteration aborts the freeze loudly and never fabricates absence or a pass (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-fail', 'perkins-long-history-fail', 73);
+    const { ledger, job, target } = lane;
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-binding-ok'),
+    });
+    // The real read is a generator: it cannot fail at the call expression —
+    // a storage failure surfaces while the selector iterates. Yield one
+    // non-binding run, then fail on the next pull.
+    const noise = ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload('f'.repeat(40), 'run-noise-before-failure'),
+    });
+    vi.spyOn(ledger, 'iterateJobVerificationCompleted').mockImplementation(function* failingRead() {
+      yield noise;
+      throw new Error('simulated mid-iteration verification-history read failure');
+    });
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).rejects.toThrow(/simulated mid-iteration verification-history read failure/u);
+    const round = ledger.listRounds(job.id)[0]!;
+    expect(round.status).toBe('aborted');
+    // Round-scoped receipt read — never a global newest-N window.
+    expect(ledger.latestRoundEvent(round.id, 'round.review-no-spawn')).not.toBeNull();
+    expect(ledger.listAgents().filter((agent) => agent.roundId === round.id)).toEqual([]);
+    expect(ledger.latestJobEvent(job.id, 'round.verdict')).toBeNull();
+  });
+
+  it('freezes a baseline-red binding run as its honest recorded FAIL with its scope, never relabeled PASS (j-1594)', async () => {
+    const lane = await verificationHistoryLane('job-lh-red', 'perkins-long-history-red', 74);
+    const { ledger, job, target } = lane;
+    ledger.appendCustomEvent({
+      kind: 'verification.completed', jobId: job.id,
+      payload: completedRunPayload(target, 'run-red', { ok: false, exit_code: 1, scope: 'fast' }),
+    });
+    for (let index = 0; index < 203; index += 1) {
+      ledger.appendCustomEvent({
+        kind: 'verification.completed', jobId: job.id,
+        payload: completedRunPayload('c'.repeat(40), `run-red-noise-${index}`),
+      });
+    }
+    const wave = waveFor(lane);
+    await expect(wave.runRound({ jobId: job.id })).resolves.toBeTruthy();
+    const round = ledger.listRounds(job.id)[0]!;
+    const frozenSpec = readFileSync(join(lane.artifacts, round.id, 'spec-context.md'), 'utf8');
+    expect(frozenSpec).toContain('run_id: run-red');
+    expect(frozenSpec).toContain('result: FAIL (exit 1)');
+    expect(frozenSpec).toContain('scope: fast');
     expect(frozenSpec).not.toContain('NO BOUND VERIFICATION RUN');
   });
 
@@ -5380,7 +5611,8 @@ describe('bmad-review fallback gate (user amendment 2026-09-20, fork-3)', () => 
       expect(outcome.skillInstalled).toBe(false);
       expect(outcome.clearToMerge).toBe(false);
       expect(reviewed).toBe(0);
-      expect(outcome.note).toContain('install the bmad-review skill into ~/.agents/skills or the pi agent skills directory');
+      expect(outcome.note).toContain('restore the job\'s exact retained GC workflow package/context');
+      expect(outcome.note).toContain('never install or borrow an ambient BMAD skill');
       expect(outcome.note).toContain('[review] enabled = true');
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -5793,6 +6025,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
   async function makeProductionGateHarness(options: {
     findingToWrite: readonly Record<string, string>[];
     skillContent?: string;
+    resolveReviewResources?: (jobId: string) => { readonly skillPath: string; readonly artifactRoot: string };
     workerGate?: PacingGate;
     /** Provider pacing: the bounded retry settlement to report for a
      * delivered fallback-review turn. Absent = no interlock. */
@@ -5800,6 +6033,10 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Make the fallback turn reject after writing its report (a transport
      * rejection whose automatic retry may still recover the delivery). */
     failPrompt?: boolean;
+    inBandError?: boolean;
+    missingReportTool?: boolean;
+    conflictingReport?: boolean;
+    onPrompt?: () => void;
     /** Hold every fallback minion turn open until the test releases it, so a
      * transport wait slice can expire while the review is genuinely live. */
     promptHold?: { readonly release: Promise<void> };
@@ -5814,6 +6051,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     repo: FixtureRepo;
     skillPath: string;
     prompts: string[];
+    systemPrompts: string[];
     spawnCwds: string[];
     escalations: string[];
     disposed: string[];
@@ -5837,11 +6075,13 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     mkdirSync(dirname(skillPath), { recursive: true });
     writeFileSync(skillPath, options.skillContent ?? '---\nname: bmad-review\n---\nreview skill bytes', 'utf8');
     const prompts: string[] = [];
+    const systemPrompts: string[] = [];
     const spawnCwds: string[] = [];
     const escalations: string[] = [];
     const disposed: string[] = [];
     const spawner: AgentSpawner = async (role, spawnOptions = {}) => {
       spawnCwds.push(spawnOptions.cwd ?? '');
+      systemPrompts.push(spawnOptions.isolatedReview?.systemPrompt ?? '');
       const file = join(sessions, `prod-${spawnCwds.length}.jsonl`);
       writeFileSync(file, '', 'utf8');
       return {
@@ -5849,21 +6089,26 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         id: `prod-minion-${spawnCwds.length}`,
         sessionFile: file,
         capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
-        reviewIsolation: undefined,
+        reviewIsolation: true,
+        reviewTools: options.missingReportTool === true ? [] : spawnOptions.isolatedReview?.nativeTools?.map((tool) => tool.name),
         async prompt(text: string) {
           prompts.push(text);
-          // The minion writes the findings JSON to the requested report file
-          const reportMatch = /Write your findings as ONE JSON array to exactly this file: (.+)$/mu.exec(text);
-          if (reportMatch !== null) {
-            writeFileSync(reportMatch[1]!, JSON.stringify(options.findingToWrite), 'utf8');
+          // Exercise the host closure, never grant the fake model file writes.
+          const submit = spawnOptions.isolatedReview!.nativeTools![0]!;
+          await submit.execute({ findings: options.findingToWrite });
+          if (options.conflictingReport === true) {
+            try { await submit.execute({ findings: [{ title: 'Late blocker', category: 'correctness', location: 'src/prod.ts:1', evidence: 'prod = 1', detail: 'A corrected report must not be ignored.' }] }); }
+            catch { /* Model ignores the native tool error and replies DONE. */ }
           }
+          options.onPrompt?.();
           if (options.promptHold !== undefined) await options.promptHold.release;
           if (options.failPrompt === true) throw new Error('429 too many requests');
         },
         async steer() {},
         async followUp() {},
         subscribe() { return () => {}; },
-        health() { return { state: 'idle', lastActivity: null, sessionFile: file }; },
+        health() { return { state: options.inBandError === true ? 'error' : 'idle', lastActivity: null, sessionFile: file,
+          ...(options.inBandError === true ? { error: 'review turn failed in-band after submitting' } : {}) }; },
         async dispose() { disposed.push(`prod-minion-${spawnCwds.length}`); },
       };
     };
@@ -5881,12 +6126,209 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       // NO runFallbackReview — the production default runs
       fallbackGate: {
         skillPath,
+        ...(options.resolveReviewResources !== undefined ? { resolveReviewResources: options.resolveReviewResources } : {}),
         fixDirectiveSink: async () => ({ delivered: true, minionId: 'prod-1' }),
       },
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
-    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, spawnCwds, escalations, disposed };
+    return { wave, job, ledger, port, root, artifacts, sessions, repo, skillPath, prompts, systemPrompts, spawnCwds, escalations, disposed };
   }
+
+  it('production resource resolver wins over ambient skill fixtures and sends reports to the owned job root without native clearance', async () => {
+    const { makeWorkflowLane } = await import('./helpers/workflow-lane.js');
+    const { createWorkflowSessionBinder, ownedFallbackReviewResources } = await import('../src/workflows/session.js');
+    const f = makeWorkflowLane('job-prod-gate'); dirs.push(f.root);
+    const bound = createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path });
+    const resources = ownedFallbackReviewResources(bound, f.dataDir);
+    const ids: string[] = [];
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: (jobId) => { ids.push(jobId); return resources; } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(ids).toEqual([h.job.id]);
+    expect(outcome.skillInstalled).toBe(true);
+    expect(outcome.clearToMerge).toBe(true);
+    expect(outcome.reportFiles[0]).toContain(join(resources.artifactRoot, 'fallback-gate'));
+    expect(h.prompts[0]).toContain(resources.skillPath);
+    expect(h.prompts[0]).not.toContain(h.skillPath);
+    expect(h.prompts[0]).toContain('never discover or invoke project/global BMAD');
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    expect(h.escalations.join('\n')).toContain('not a Perkins READY');
+  });
+
+  it('uses verified helper bytes captured at resolution even when its later pathname is corrupted', async () => {
+    const { makeWorkflowLane } = await import('./helpers/workflow-lane.js');
+    const { createWorkflowSessionBinder, ownedFallbackReviewResources } = await import('../src/workflows/session.js');
+    const f = makeWorkflowLane('job-prod-gate'); dirs.push(f.root);
+    const bound = createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path });
+    const resources = ownedFallbackReviewResources(bound, f.dataDir);
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: () => {
+      chmodSync(resources.skillPath, 0o600); writeFileSync(resources.skillPath, 'UNVERIFIED HELPER OVERRIDE');
+      return resources;
+    } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
+    expect(h.systemPrompts[0]).toContain(resources.skillContent);
+    expect(h.systemPrompts[0]).not.toContain('UNVERIFIED HELPER OVERRIDE');
+  });
+
+  it('ignores inherited Git routing variables and reviews only the assigned working tree', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    const foreign = join(h.root, 'foreign-worktree');
+    h.repo.git(['worktree', 'add', '-q', '-b', 'feature/foreign-env', foreign, 'main']);
+    writeFileSync(join(foreign, 'foreign.ts'), 'export const foreignEnvironment = true;\n');
+    const gitDir = h.repo.git(['rev-parse', '--absolute-git-dir']);
+    const keys = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'] as const;
+    const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.GIT_DIR = gitDir; process.env.GIT_WORK_TREE = foreign;
+      process.env.GIT_INDEX_FILE = join(h.root, 'foreign-index');
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(true);
+      expect(h.prompts[0]).toContain('export const prod = 1;');
+      expect(h.prompts[0]).not.toContain('foreignEnvironment');
+    } finally {
+      for (const key of keys) { if (before[key] === undefined) delete process.env[key]; else process.env[key] = before[key]; }
+    }
+  });
+
+  it('missing/corrupt owned fallback resources record an actionable blocked result, never borrowed ambient skill bytes', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], resolveReviewResources: () => { throw new Error('retained owned helper corrupt: restore exact package'); } });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.skillInstalled).toBe(false);
+    expect(outcome.note).toContain('retained owned helper corrupt');
+    expect(h.prompts).toEqual([]);
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+    expect(h.ledger.listEvents().some((event) => event.kind === 'job.fallback-review' && event.jobId === h.job.id)).toBe(true);
+  });
+
+  it('blocks oversized complete diffs before spawning rather than passing a truncated prefix', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    h.repo.commitFile('large.md', `start\n${'x'.repeat(600 * 1024)}\ntail-defect\n`);
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('no truncated review can pass');
+    expect(h.spawnCwds).toEqual([]);
+    expect(h.prompts).toEqual([]);
+    expect(h.ledger.listRounds(h.job.id)).toEqual([]);
+  });
+
+  it('records exact base/HEAD and complete diff digest including uncommitted bytes', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 2;\n');
+    const baseRef = h.repo.git(['rev-parse', 'main']); const headRef = h.repo.head();
+    const diff = execFileSync('git', ['-C', h.repo.path, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--binary', '--full-index', baseRef], { encoding: 'utf8' });
+    const diffSha256 = createHash('sha256').update(diff).digest('hex');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
+    expect(h.prompts[0]).toContain(`canonical base: ${baseRef}; checkout HEAD: ${headRef}; complete working diff SHA-256: ${diffSha256}`);
+    expect(h.prompts[0]).toContain(diff);
+    const triaged = h.ledger.listEvents({ limit: 100 }).find((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'triaged');
+    expect(triaged?.payload).toMatchObject({ baseRef, headRef, diffSha256, completeDiff: true });
+  });
+
+  it('aborts if working bytes or HEAD move during a fallback turn without a ledger event', async () => {
+    for (const change of ['working-bytes', 'head-only']) {
+      let mutate = () => {};
+      const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+      mutate = () => {
+        if (change === 'working-bytes') writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 3;\n');
+        else h.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '--allow-empty', '-qm', 'head moved without content change']);
+      };
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('working diff or HEAD changed');
+      expect(h.ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    }
+  });
+
+  it('invalidates binary mutations even when their abbreviated Git blob identities collide', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    const path = join(h.repo.path, 'binary.bin');
+    const first = Buffer.from('\0' + '00006161'); const second = Buffer.from('\0' + '00031931');
+    writeFileSync(path, Buffer.from('\0base')); h.repo.git(['add', 'binary.bin']); h.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-qm', 'binary baseline']);
+    // Both candidate payloads stay uncommitted, so Git's object database
+    // cannot widen their same-prefix abbreviated identities to disambiguate.
+    writeFileSync(path, first);
+    const shortBefore = h.repo.git(['diff', 'main', '--']);
+    mutate = () => {
+      writeFileSync(path, second);
+      // Deterministic SHA-1-prefix collision: old/default diff text is identical.
+      expect(h.repo.git(['diff', 'main', '--'])).toBe(shortBefore);
+    };
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+    expect(h.prompts[0]).toContain('GIT binary patch');
+  });
+
+  it('never lets configured textconv hide working-byte movement from the complete input identity', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    h.repo.git(['update-ref', 'refs/heads/main', 'HEAD']);
+    h.repo.git(['config', 'diff.hidden.textconv', `node -e 'process.stdout.write("constant\\n")'`]);
+    h.repo.commitFile('.gitattributes', 'src/prod.ts diff=hidden\n');
+    const convertedBefore = h.repo.git(['diff', 'main', '--']);
+    mutate = () => {
+      writeFileSync(join(h.repo.path, 'src/prod.ts'), 'export const prod = 4;\n');
+      expect(h.repo.git(['diff', 'main', '--'])).toBe(convertedBefore);
+    };
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+  });
+
+  it('never passes a submitted empty report when the fulfilled turn settled in-band error', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], inBandError: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('fallback reviewer turn did not successfully complete');
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => event.kind === 'job.fallback-review' && (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+  });
+
+  it('blocks when intent-to-add preparation fails instead of claiming an incomplete diff is complete', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'untracked.ts'), 'export const missed = true;\n');
+    const lock = h.repo.git(['rev-parse', '--path-format=absolute', '--git-path', 'index.lock']);
+    writeFileSync(lock, 'held by another writer');
+    try {
+      const outcome = await h.wave.runRound({ jobId: h.job.id });
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('cannot prepare the complete fallback working diff');
+      expect(h.prompts).toEqual([]);
+      expect(h.spawnCwds).toEqual([]);
+    } finally { rmSync(lock); }
+  });
+
+  it('blocks contradictory findings even when the model ignores the report-tool error', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], conflictingReport: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('conflicting findings submissions');
+    expect(readFileSync(outcome.reportFiles[0]!, 'utf8').trim()).toBe('[]');
+  });
+
+  it('blocks a fallback runtime that did not actually expose its scoped report tool', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [], missingReportTool: true });
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('required host-bound findings tool');
+    expect(h.prompts).toEqual([]);
+    expect(h.disposed).toHaveLength(1);
+  });
 
   it('spawns a minion with the skill prompt, parses findings, and reports clear-to-merge on clean', async () => {
     const h = await makeProductionGateHarness({ findingToWrite: [] });
@@ -6029,11 +6471,12 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     const wave = new WaveRunner({
       ledger,
       worktrees: port,
-      spawner: async (role) => {
+      spawner: async (role, options = {}) => {
         const file = join(sessions, 'prod-nres.jsonl');
         writeFileSync(file, '', 'utf8');
         return {
           role, id: 'prod-nres', sessionFile: file,
+          reviewTools: options.isolatedReview?.nativeTools?.map((tool) => tool.name),
           capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
           async prompt(text: string) { promptText = text; /* deliberately does NOT write the report */ },
           async steer() {}, async followUp() {},
@@ -8334,32 +8777,34 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       return { fire: calls[0]![0] as () => void, ms: calls[0]![1] as number };
     };
     try {
+      // Freeze Date only: real Git/rollback latency must not be included
+      // in the production retry delay. Timers and async polling stay real.
+      vi.setSystemTime(Date.now());
+      expect(vi.isFakeTimers()).toBe(false);
       let mark = timers.mock.calls.length;
       let refusedAt = Date.now();
       await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
       const first = armed(mark);
-      expect(first.ms).toBeGreaterThan(59_000);
-      expect(first.ms).toBeLessThanOrEqual(60_000);
+      expect(first.ms).toBe(60_000);
       const due1 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[0] as { dueAt: string }).dueAt);
-      expect(due1 - refusedAt).toBeGreaterThanOrEqual(59_000);
-      expect(due1 - refusedAt).toBeLessThanOrEqual(61_000);
+      expect(due1 - refusedAt).toBe(60_000);
       await new Promise((resolve) => setTimeout(resolve, 200));
       expect(f.ledger.listRounds(f.jobId)).toHaveLength(1); // no early dispatch
       // The minute is up: fire it (standing in for the clock).
       mark = timers.mock.calls.length;
+      vi.setSystemTime(due1);
       refusedAt = Date.now();
       first.fire();
       await until(() => kinds(f.ledger, f.jobId, 'round.admission-retry-scheduled').length === 2);
       await until(() => timers.mock.calls.slice(mark).some(([, ms]) => typeof ms === 'number' && ms > 30_000));
       const second = armed(mark);
-      expect(second.ms).toBeGreaterThan(299_000);
-      expect(second.ms).toBeLessThanOrEqual(300_000);
+      expect(second.ms).toBe(300_000);
       const due2 = Date.parse((payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled')[1] as { dueAt: string }).dueAt);
-      expect(due2 - refusedAt).toBeGreaterThanOrEqual(299_000);
-      expect(due2 - refusedAt).toBeLessThanOrEqual(305_000);
+      expect(due2 - refusedAt).toBe(300_000);
       expect(f.ledger.listRounds(f.jobId)).toHaveLength(2);
     } finally {
       timers.mockRestore();
+      vi.useRealTimers();
       f.restorePath();
       await wave.shutdown();
     }

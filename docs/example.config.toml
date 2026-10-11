@@ -119,6 +119,8 @@ wake_quiet_hours = ""
 # Issue #219 kill switch: an incident covered by an active decision (#218)
 # defers its wake to the decision's recheck; hard floors always wake.
 wake_defer_covered = true
+# Code-only shared mailbox recovery; positive interval, no browser dependency.
+mailbox_reconcile_interval_ms = 300000
 # First block after this quiet gap carries the "while you were away" digest.
 morning_digest_gap_ms = 28800000
 
