@@ -97,7 +97,10 @@ function classifyPlaywright(report, substrs) {
   const identified = [];
   const unidentified = [];
   for (const r of results) {
-    if (substrs.some((s) => `${r.title}\n${r.message}`.includes(s))) identified.push(r);
+    // A test title describes what it intended to prove, not why it failed.
+    // Only the actual failure message can establish feature absence; otherwise
+    // a setup failure in a test named for the strip could look like a RED.
+    if (substrs.some((s) => r.message.includes(s))) identified.push(r);
     else unidentified.push(r);
   }
   if (identified.length === 0) {
@@ -157,16 +160,21 @@ function classifyVitest(report, requireFile, requireFileSubstrs = []) {
   if (failed === 0) {
     return { code: 2, out: '', err: `FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${passed}/${total} passed)` };
   }
-  // Per-test cause accounting across the whole overlay: assertion failures
-  // are behavioral; any other failure mode is counted separately and is
-  // never claimed as feature-absence evidence.
+  // Per-test cause accounting across the overlay. When a named instrument
+  // defines the behavioral claim, assertions from its companion suites are
+  // context only: a pre-existing unrelated assertion must never be counted
+  // as feature-absence evidence.
+  const namedInstrument = requireFile === null ? null : suites.find((suite) => String(suite.name).includes(requireFile));
   let assertions = 0;
+  let excludedAssertions = 0;
   let otherFailures = 0;
   for (const suite of suites) {
     for (const a of suite.assertionResults ?? []) {
       if (a.status !== 'failed') continue;
-      if ((a.failureMessages ?? []).some((m) => /AssertionError/.test(m))) assertions += 1;
-      else otherFailures += 1;
+      if ((a.failureMessages ?? []).some((m) => /AssertionError/.test(m))) {
+        if (requireFile !== null && suite !== namedInstrument) excludedAssertions += 1;
+        else assertions += 1;
+      } else otherFailures += 1;
     }
   }
   if (requireFile !== null) {
@@ -238,6 +246,9 @@ function classifyVitest(report, requireFile, requireFileSubstrs = []) {
     out:
       `BASELINE RED CLASSIFIED: setup clean (report parsed, ${total} tests collected, no load errors); ` +
       `${assertions} feature-absence assertion failure(s), ${passed} base-behavior pass(es)` +
+      (excludedAssertions > 0
+        ? `; ${excludedAssertions} companion-suite assertion failure(s) excluded from the claim`
+        : '') +
       (otherFailures > 0
         ? `; ${otherFailures} non-assertion failure(s) reported but NOT claimed as behavioral assertions`
         : '') +

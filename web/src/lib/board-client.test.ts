@@ -282,6 +282,36 @@ describe('board client', () => {
     }
   });
 
+  it('preserves a received HTTP 401 on a tracked owner POST when fatal stop aborts its controller', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const fetchImpl = vi.fn(
+        async () =>
+          ({
+            ok: false,
+            status: 401,
+            // The pairing ends on the known status; its body is irrelevant and may stall.
+            json: () => new Promise(() => {}),
+          }) as unknown as Response,
+      ) as unknown as typeof fetch;
+      const fatal = vi.fn();
+      const tracked = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal },
+      );
+      await expect(tracked.decideLessonProposal('prop-1', 'accept')).rejects.toMatchObject({
+        path: '/api/lessons/proposal/prop-1/accept',
+        status: 401,
+        code: null,
+      });
+      expect(fatal).toHaveBeenCalledWith('unauthorized (board api)');
+      expect(vi.mocked(fetchImpl)).toHaveBeenCalledTimes(1);
+      tracked.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a signal-less GET (transcript/receipt) is bounded by the deadline and cancelled by stop()', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {

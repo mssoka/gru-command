@@ -2,16 +2,17 @@
 import { withMailboxFixture } from '../lib/mailbox-fixture.test-support.js';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type {
-  AgentView,
-  BoardSnapshot,
-  BuildView,
-  JobView,
-  NotificationView,
-  RoundView,
-  SelfHealView,
-  SilasView,
-  VerifyQueueView,
+import {
+  isValidSnapshot,
+  type AgentView,
+  type BoardSnapshot,
+  type BuildView,
+  type JobView,
+  type NotificationView,
+  type RoundView,
+  type SelfHealView,
+  type SilasView,
+  type VerifyQueueView,
 } from '../lib/board-protocol.js';
 import { memoryStorage } from '../lib/chat-storage.js';
 import { boardKpis, collectJobs } from '../lib/board-kpi.js';
@@ -722,6 +723,14 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     view.render(snapshot({ wakes: { count: 3, lastAt: 'not-a-timestamp' } }));
     expect(wakes?.textContent).toContain('last wake unknown');
     expect(wakes?.title).toContain('last wake time unknown');
+    // A calendar-impossible ISO date is still accepted as an optional
+    // timestamp by the snapshot boundary; do not let Date.parse normalize
+    // Feb 30 to March 2 and display a plausible, false wake age.
+    const impossibleDate = snapshot({ wakes: { count: 3, lastAt: '2026-02-30T00:00:00.000Z' } });
+    expect(isValidSnapshot(impossibleDate)).toBe(true);
+    view.render(impossibleDate);
+    expect(wakes?.querySelector('.board-age-split__num')).toBeNull();
+    expect(wakes?.querySelector('.board-wakes__unknown')).not.toBeNull();
     // 0 + no stamp WITH deferred demand: still the honest no-wakes state —
     // no fire time exists, so it is not "unknown"; the deferred tally is a
     // separate fact beside it.
@@ -3075,6 +3084,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const pointer = bell.querySelector('.board-owner__row--pointer')!;
     expect(pointer.textContent).toContain('Book of Lessons: 2 lesson changes proposed');
     expect(pointer.textContent).toContain('waiting for you in For You — review the changes and decide there');
+    expect(pointer.classList.contains('board-owner__row--panel')).toBe(true);
     expect(bell.querySelector('.board-owner__accept, .board-owner__reject, .board-owner__review')).toBeNull();
     pointer.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
     expect(document.getElementById('notification-panel')!.hidden).toBe(true);
@@ -3100,6 +3110,44 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     await flush();
     expect(client.getLessonProposal).not.toHaveBeenCalled();
     expect(client.decideLessonProposal).not.toHaveBeenCalled();
+  });
+
+  it('expanding older pending focuses a newly revealed lesson-proposal disclosure', () => {
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    const older = { ...proposalNotice, ts: '2026-01-01T00:00:00.000Z' };
+    const newer = Array.from({ length: 6 }, (_, i) =>
+      notification(`newer-${i}`, { routing: 'needs-owner', ts: `2026-01-02T00:0${i}:00.000Z` }),
+    );
+    view.render(snapshot({ notifications: [older, ...newer] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('[data-proposal-id="lp-1"]')).toBeNull();
+    band.querySelector<HTMLButtonElement>('.board-band__more')!.click();
+    const review = band.querySelector<HTMLSummaryElement>('[data-proposal-id="lp-1"] .board-owner__review > summary');
+    expect(review?.dataset.actionId).toBe('owner-proposal:lp-1');
+    expect(review?.dataset.control).toBe('disclose');
+    expect(document.activeElement).toBe(review);
+    expect(client.getLessonProposal).not.toHaveBeenCalled();
+    expect(client.decideLessonProposal).not.toHaveBeenCalled();
+  });
+
+  it('falls back to an enabled proposal disclosure when its in-flight decision buttons are disabled', async () => {
+    const pendingDecision = new Promise<unknown>(() => {});
+    const client = proposalClient(() => pendingDecision);
+    const view = new BoardView(() => {}, client);
+    const departing = notification('gone', { routing: 'needs-owner' });
+    view.render(snapshot({ notifications: [proposalNotice, departing] }));
+    const band = document.getElementById('board-owner')!;
+    band.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(true);
+    const departingDisclosure = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:gone"][data-control="disclose"]')!;
+    departingDisclosure.focus();
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    const review = band.querySelector<HTMLSummaryElement>('[data-proposal-id="lp-1"] .board-owner__review > summary');
+    expect(document.activeElement).toBe(review);
+    expect(document.activeElement).not.toBe(document.body);
+    expect(band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(true);
   });
 
   it('a finished decision asks for the authoritative snapshot at once — no waiting on a silent socket', async () => {

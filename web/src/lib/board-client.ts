@@ -560,10 +560,18 @@ export class BoardClient {
     const doFetch = this.fetchImpl;
     const request = new AbortController();
     this.requestControllers.add(request);
+    // A 401 is definitive once headers arrive; fatal stop() aborts this
+    // controller too, so preserve the received HTTP status in the race.
+    let received401 = false;
     const expired = new Promise<never>((_, reject) => {
       request.signal.addEventListener(
         'abort',
-        () => reject(new BoardApiError(path, 0, 'timeout', 'no answer before the deadline — outcome unconfirmed')),
+        () =>
+          reject(
+            received401
+              ? new BoardApiError(path, 401, null, null)
+              : new BoardApiError(path, 0, 'timeout', 'no answer before the deadline — outcome unconfirmed'),
+          ),
         { once: true },
       );
     });
@@ -585,6 +593,7 @@ export class BoardClient {
             body: JSON.stringify(body),
             signal: request.signal,
           });
+          received401 = res.status === 401;
           if (!res.ok) return this.refused(path, res);
           return { status: res.status, body: await res.json() };
         })(),

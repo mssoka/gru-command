@@ -367,8 +367,26 @@ async function harness(page: Page, initial: BoardSnapshot): Promise<Send> {
   // running, so reconnect/backoff stays genuinely exercisable and no case
   // needs sleeps, tolerance, or inflated timeouts.
   await page.clock.setFixedTime(new Date(FROZEN_NOW));
+  const pageErrors: Error[] = [];
+  page.on('pageerror', (error) => pageErrors.push(error));
   await pair(page);
-  await expect(page.locator('#chip-rail .strip-groups .strip-group')).toHaveCount(3);
+  // Prove the base board rendered independently of the strip before asking
+  // for strip-only surfaces; the recorded base already owns this section.
+  await expect(page.locator('#board-section-in-flight')).toBeVisible();
+  try {
+    await expect(page.locator('#chip-rail .strip-groups .strip-group')).toHaveCount(3);
+  } catch (error) {
+    // A runtime/render failure after the shell is visible is setup failure,
+    // not evidence that the feature is absent. Keep the message free of the
+    // strip selectors so the baseline classifier cannot call it behavioral.
+    if (pageErrors.length > 0) {
+      throw new Error(`browser setup/runtime failure before strip assertion (${pageErrors.length} unhandled page error(s))`);
+    }
+    throw error;
+  }
+  if (pageErrors.length > 0) {
+    throw new Error(`browser setup/runtime failure before strip assertion (${pageErrors.length} unhandled page error(s))`);
+  }
   const sendFn = async (snapshot: BoardSnapshot): Promise<void> => {
     assertValid(snapshot, 'ws frame state');
     current = snapshot; // reconnect HTTP refetch serves the LATEST state

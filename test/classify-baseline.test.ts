@@ -95,6 +95,21 @@ describe('baseline classifier — vitest (unit) branch', () => {
     expect(result.out).toMatch(/1 non-assertion failure\(s\) reported but NOT claimed as behavioral assertions/u);
   });
 
+  it('does not claim companion-suite assertions as feature absence when an instrument is named', () => {
+    const result = classifyBaseline(
+      vitestReport([
+        ...instrument,
+        { name: 'board.test.ts', status: 'failed', message: '', assertionResults: [
+          assertion('unrelated wake timestamp', 'failed', ['AssertionError: impossible calendar date was shown as a wake age']),
+        ] },
+      ]),
+      { requireFile: 'slim-strip.baseline.test.ts' },
+    );
+    expect(result.code).toBe(1);
+    expect(result.out).toMatch(/1 feature-absence assertion failure\(s\)/u);
+    expect(result.out).toMatch(/1 companion-suite assertion failure\(s\) excluded from the claim/u);
+  });
+
   it('exits 2 (claim broken) when the baseline passes, and when the instrument did not fail', () => {
     expect(classifyBaseline(vitestReport([{ name: 'x.test.ts', status: 'passed', message: '', assertionResults: [assertion('ok', 'passed')] }])).code).toBe(2);
     const instrumentPassed = classifyBaseline(
@@ -184,6 +199,17 @@ describe('baseline classifier — Playwright (browser) branch', () => {
       playwrightReport([
         { title: 'rail carries the strip pairs', message: "locator('.strip-status') expected 1" },
         { title: 'navigation', message: 'Timeout 30000ms exceeded waiting for load state' },
+      ]),
+      { playwright: true, substrs },
+    );
+    expect(result.code).toBe(3);
+    expect(result.err).toMatch(/name NO slim surface/u);
+  });
+
+  it('does not infer feature absence from a test title when its failure is setup/runtime', () => {
+    const result = classifyBaseline(
+      playwrightReport([
+        { title: 'strip-groups should render', message: 'browser setup/runtime failure before feature assertions' },
       ]),
       { playwright: true, substrs },
     );

@@ -134,6 +134,31 @@ const STRIP_GROUP_TONE: Readonly<Record<string, string>> = {
   CREW: 'done',
 };
 
+function validWakeStamp(stamp: string | null): string | null {
+  if (stamp === null || stamp === '') return null;
+  const parsed = Date.parse(stamp);
+  if (!Number.isFinite(parsed)) return null;
+  // Date.parse normalizes impossible ISO calendar days (for example Feb 30)
+  // into a later month. Validate the supplied date portion before showing an
+  // age; the snapshot remains usable and the UI can say the time is unknown.
+  const dateParts = /^(\d{4})-(\d{2})-(\d{2})(?:$|[Tt\s])/u.exec(stamp);
+  if (dateParts !== null) {
+    const year = Number(dateParts[1]);
+    const month = Number(dateParts[2]);
+    const day = Number(dateParts[3]);
+    const calendar = new Date(0);
+    calendar.setUTCFullYear(year, month - 1, day);
+    if (
+      calendar.getUTCFullYear() !== year ||
+      calendar.getUTCMonth() !== month - 1 ||
+      calendar.getUTCDate() !== day
+    ) {
+      return null;
+    }
+  }
+  return stamp;
+}
+
 export interface TranscriptOpenRequest {
   readonly file: string;
   readonly label: string;
@@ -587,11 +612,11 @@ export class BoardView {
 
   /** Focus target inside the owner band when the previously focused
    * control is gone: the older-pending control when it still exists, else
-   * the first remaining control, else the band heading (programmatically
-   * focusable) — never <body>. */
+   * the first enabled remaining control, else the band heading
+   * (programmatically focusable) — never <body>. */
   private focusBandFallback(): void {
     (this.ownerMount.querySelector<HTMLElement>('.board-band__more') ??
-      this.ownerMount.querySelector<HTMLElement>('[data-action-id]') ??
+      this.ownerMount.querySelector<HTMLElement>('[data-action-id]:not(:disabled)') ??
       this.ownerMount.querySelector<HTMLElement>('.board-band__head'))?.focus();
   }
 
@@ -741,6 +766,8 @@ export class BoardView {
     review.className = 'board-owner__review';
     const summary = document.createElement('summary');
     summary.textContent = 'Review changes';
+    summary.dataset.actionId = row.actionId;
+    summary.dataset.control = 'disclose';
     summary.dataset.ownerFocusKey = `${focusBase}:review`;
     const body = el('div', 'board-owner__review-body lbl');
     if (current.review !== null) body.replaceChildren(renderProposalReview(current.review, current.nested, focusBase));
@@ -890,7 +917,7 @@ export class BoardView {
    * the For You band, so the two can never disagree. */
   private ownerProposalPointer(row: OwnerProposalRow): HTMLElement {
     const item = row.notification;
-    const node = el('article', 'board-owner__row board-owner__row--pointer');
+    const node = el('article', 'board-owner__row board-owner__row--pointer board-owner__row--panel');
     node.append(
       el('div', 'board-owner__title', `📖 ${item.title}`),
       el('div', 'board-owner__meta lbl', `${formatTs(item.ts)} · waiting for you in For You — review the changes and decide there`),
@@ -1158,8 +1185,7 @@ export class BoardView {
     const deferred = wakes.deferred;
     const deferredCount = deferred?.count ?? 0;
     const stamp = wakes.lastAt;
-    const parsed =
-      stamp !== null && stamp !== '' && !Number.isNaN(Date.parse(stamp)) ? stamp : null;
+    const parsed = validWakeStamp(stamp);
     // 0 + no/invalid stamp is the honest no-wakes state even when avoidances
     // are tallied alongside it: no wake ever fired, so the fire time is not
     // "unknown" — the deferred demand is an additional, separate fact.

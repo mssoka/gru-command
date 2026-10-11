@@ -777,6 +777,12 @@ repo-overview-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint 
 # approved Option A reference.
 repo-overview-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=repo-overview"
 
+# Synthetic regression for the integrated Lesson Proposal surface: the bell
+# pointer keeps its existing panel flow, proposal detail wraps, and the
+# 360/375/390px decision controls remain reachable. No owner decisions are
+# sent; screenshots and mocks are isolated to this Playwright project.
+lesson-proposal-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=lesson-proposal e2e/lesson-proposal.spec.ts"
+
 # Fails-before evidence (feature-specific, native round-1 qualification):
 # the FINAL behavioral test bytes for the existing suites the change
 # extends are overlaid onto an isolated git-archive snapshot of the base

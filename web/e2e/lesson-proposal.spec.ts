@@ -21,6 +21,7 @@ const MOCK_TOKEN = process.env.GRU_MOCK_TOKEN ?? 'dev-token';
 const T0 = '2026-10-07T00:00:00.000Z';
 const NOTICE_ID = 'lessons-proposal:prop-phone';
 const LONG = 'an-unbreakable-journal-handle-'.repeat(4);
+const LONG_DETAIL = 'x'.repeat(256);
 
 const NOTICE: NotificationView = {
   id: NOTICE_ID,
@@ -29,7 +30,7 @@ const NOTICE: NotificationView = {
   routing: 'needs-owner',
   severity: 'info',
   title: 'Book of Lessons: 3 lesson changes proposed',
-  detail: 'distilled from 4 journal entries',
+  detail: LONG_DETAIL,
   agentId: null,
   shownAt: null,
   ackedAt: null,
@@ -158,6 +159,7 @@ for (const width of [360, 375, 390]) {
 
     const row = page.locator('#board-owner .board-owner__row--proposal');
     await expect(row).toBeVisible();
+    await expect(row.locator('.board-owner__meta')).toHaveCSS('overflow-wrap', 'anywhere');
     await row.locator('.board-owner__review > summary').click();
     await expect(row.locator('.board-owner__review-text').first()).toContainText('Close the live shell');
 
@@ -212,3 +214,52 @@ for (const width of [360, 375, 390]) {
     expect(pageErrors).toEqual([]);
   });
 }
+
+test('desktop bell pointer keeps panel flow and the long proposal detail wraps', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const { pageErrors, decisions } = await seed(page);
+  await page.goto('/');
+  await expect(page.locator('#pairing-view')).toBeVisible();
+  await page.locator('#pair-token').fill(MOCK_TOKEN);
+  await page.locator('#pair-submit').click();
+  await expect(page.locator('#board-view')).toBeVisible();
+
+  const detail = page.locator('#board-owner .board-owner__row--proposal > .board-owner__meta');
+  await expect(detail).toBeVisible();
+  const detailLayout = await detail.evaluate((node) => ({
+    overflowWrap: getComputedStyle(node).overflowWrap,
+    width: node.clientWidth,
+    scrollWidth: node.scrollWidth,
+  }));
+  expect(detailLayout.overflowWrap).toBe('anywhere');
+  expect(detailLayout.width).toBeGreaterThan(0);
+  expect(detailLayout.scrollWidth).toBeLessThanOrEqual(detailLayout.width);
+
+  await page.locator('#notification-bell').click();
+  const pointer = page.locator('#notification-list .board-owner__row--pointer');
+  await expect(pointer).toBeVisible();
+  const layout = await pointer.evaluate((node) => {
+    const box = (selector: string): Box => {
+      const rect = node.querySelector(selector)!.getBoundingClientRect();
+      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width };
+    };
+    const go = node.querySelector<HTMLElement>('.board-owner__goto')!;
+    const title = box('.board-owner__title');
+    const meta = box('.board-owner__meta');
+    return {
+      display: getComputedStyle(node).display,
+      flexWrap: getComputedStyle(node).flexWrap,
+      title,
+      meta,
+      go: box('.board-owner__goto'),
+      goMarginLeft: getComputedStyle(go).marginLeft,
+    };
+  });
+  expect(layout.display).toBe('flex');
+  expect(layout.flexWrap).toBe('wrap');
+  expect(layout.meta.top).toBeGreaterThanOrEqual(layout.title.bottom - 1);
+  expect(layout.go.top).toBeGreaterThanOrEqual(layout.meta.bottom - 1);
+  expect(layout.goMarginLeft).toBe('auto');
+  expect(decisions).toEqual([]);
+  expect(pageErrors).toEqual([]);
+});

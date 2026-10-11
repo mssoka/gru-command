@@ -2136,6 +2136,16 @@ body {
   filter: brightness(1.05);
 }
 
+.board-owner__meta {
+  grid-area: meta;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.board-owner__row--pointer .board-owner__goto {
+  margin-left: auto;
+}
+
 /* Bell panel keeps its prior full presentation (not the compact face):
    inline flow, evidence as text, OPEN PR on the right. */
 .board-owner__row--panel {
