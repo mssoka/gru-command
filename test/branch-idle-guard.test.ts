@@ -1,3 +1,4 @@
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -936,7 +937,8 @@ describe('branch-idle guard', () => {
    * is delegated to finalization or observation. */
   function seedOriginalReceipt(ledger: LedgerApi, jobId: string, kind: 'silas.rebrief' | 'job.delivered', minionId: string, sha: string) {
     const markers = ledger.listPendingRebriefs({ jobId });
-    ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: minionId, sessionFile: null });
+    ledger.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: minionId,
+      sessionFile: markers.find((row) => row.kind === 'silas.rebrief')?.sessionFile ?? null });
     const marker = ledger.listPendingRebriefs({ jobId }).find((row) => row.kind === kind)!;
     const receipt = ledger.appendCustomEvent({ kind, jobId, agentId: minionId, payload: {
       ...(kind === 'silas.rebrief' ? { minion_id: minionId, note: marker.note } : { agentId: minionId, source: 'silas-rebrief' }),
@@ -944,6 +946,17 @@ describe('branch-idle guard', () => {
     } });
     expect(ledger.pendingRebriefReceipt(marker)).toEqual(receipt);
     return receipt;
+  }
+
+  /** Lost-delivery positives own a real, actually disposed original SDK turn.
+   * Capture it before the original completion receipt, never in recovery. */
+  async function seedOriginalSdkCompletion(h: Harness, jobId: string, minionId: string, sha: string) {
+    const lane = h.worktrees.listWorktrees({ jobId }).find((row) => row.kind === 'job');
+    if (lane === undefined) throw new Error(`original completion fixture requires the job lane for ${jobId}`);
+    await bindOriginalRebriefSdkOwner(h.ledger, h.ledger.listPendingRebriefs({ jobId }), {
+      cwd: lane.path, dataDir: dirname(h.artifactRoot), agentId: minionId,
+    });
+    return seedOriginalReceipt(h.ledger, jobId, 'silas.rebrief', minionId, sha);
   }
 
   it('genuine finalization with a fresh settled delivery releases the target for digest and admission', async () => {
@@ -967,7 +980,7 @@ describe('branch-idle guard', () => {
 
       // Historical finalization reconstructs only this genuine original
       // completion's lost delivery, then clears its exact markers.
-      const original = seedOriginalReceipt(h.ledger, 'rebrief-finalize', 'silas.rebrief', 'minion-fresh',
+      const original = await seedOriginalSdkCompletion(h, 'rebrief-finalize', 'minion-fresh',
         execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
       const finalized = finalizeRebriefRequest({
         ledger: h.ledger,
@@ -1097,7 +1110,7 @@ describe('branch-idle guard', () => {
       const queued = await postReview(h, { job_id: 'finalizer-replay', by: 'minion' });
       expect(queued.json).toMatchObject({ route: 'queued' });
       h.ledger.beginPendingRebrief({ jobId: 'finalizer-replay', note: 'n', briefing: 'b' });
-      seedOriginalReceipt(h.ledger, 'finalizer-replay', 'silas.rebrief', 'minion-fresh',
+      await seedOriginalSdkCompletion(h, 'finalizer-replay', 'minion-fresh',
         execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
       const startedPromise = joinJobEvent(h, 'finalizer-replay', 'job.review-handoff-started');
       const finalized = finalizeRebriefRequest({
@@ -1137,7 +1150,7 @@ describe('branch-idle guard', () => {
       const queued = await postReview(h, { job_id: jobId, by: 'minion' });
       expect(queued.json).toMatchObject({ route: 'queued' });
       h.ledger.beginPendingRebrief({ jobId, note: 'n', briefing: 'b' });
-      const original = seedOriginalReceipt(h.ledger, jobId, 'silas.rebrief', 'minion-fresh',
+      const original = await seedOriginalSdkCompletion(h, jobId, 'minion-fresh',
         execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
       const boundMarkers = h.ledger.listPendingRebriefs({ jobId });
 
@@ -1262,7 +1275,7 @@ describe('branch-idle guard', () => {
       h.ledger.setJobStatus(jobId, 'delivered');
       h.ledger.beginPendingRebrief({ jobId, note: 'recover', briefing: 'b' });
       const sha = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-      const original = seedOriginalReceipt(h.ledger, jobId, 'silas.rebrief', 'restored', sha);
+      const original = await seedOriginalSdkCompletion(h, jobId, 'restored', sha);
       if (path === 'already-landed') seedOriginalReceipt(h.ledger, jobId, 'job.delivered', 'restored', sha);
       const startedPromise = joinJobEvent(h, jobId, 'job.review-handoff-started');
       const report = await reconcilePendingRebriefs({
