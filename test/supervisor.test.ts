@@ -1872,6 +1872,7 @@ describe('supervisor — Perkins r1 fixes', () => {
       breakerOpen: true,
       stopReason: 'quota_wall',
       breakerNotificationId: null,
+      pendingRearmFenceAlert: { reason: 'stale fence pending' },
       inRestart: false,
       backoffTimer: null,
       activityGeneration: 0,
@@ -1890,6 +1891,13 @@ describe('supervisor — Perkins r1 fixes', () => {
       breakerOpen: true,
       stopReason: 'quota_wall',
     });
+    // The merge carries the fenced-rearm retry debt with the stop: dropping
+    // the carry would strand the retirement with an unbound stop (the
+    // fail-before assertion for the R7 carry line).
+    const live = internals.agents.get(replacement.id) as
+      | { pendingRearmFenceAlert?: { reason?: string } | null }
+      | undefined;
+    expect(live?.pendingRearmFenceAlert?.reason).toBe('stale fence pending');
     h.dispose();
   });
 

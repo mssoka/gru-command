@@ -611,6 +611,7 @@ export class Supervisor {
       live.stoppedAt = inheritedBreaker?.stoppedAt ?? null;
       live.breakerNotificationId =
         inheritedBreaker?.breakerNotificationId ?? live.breakerNotificationId;
+      live.pendingRearmFenceAlert = inheritedBreaker?.pendingRearmFenceAlert ?? live.pendingRearmFenceAlert;
     }
 
     for (const agent of retired) {
@@ -673,7 +674,7 @@ export class Supervisor {
           live.stopReason = agent.stopReason;
           live.stoppedAt = agent.stoppedAt;
           live.breakerNotificationId = agent.breakerNotificationId;
-          live.pendingRearmFenceAlert = agent.pendingRearmFenceAlert;
+          live.pendingRearmFenceAlert = agent.pendingRearmFenceAlert ?? null;
           live.state = 'stopped';
         }
       }
