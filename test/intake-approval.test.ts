@@ -373,10 +373,18 @@ it('refuses bounded large multi-heist standalone provenance before authority or 
   const reviewed = h.approval.review(d).review!;
   const constructed = new Set<string>();
   const instrumented = { ...p, plan: { ...p.plan, heists: p.plan.heists.map((heist) => ({ ...heist, get title() { constructed.add(heist.id); return heist.title; } })) } };
-  const read = vi.spyOn(h.intake, 'read').mockReturnValue(instrumented);
-  expect(() => h.approval.approve({ ...d, expectedToken: reviewed.token, selected: p.plan.heists.map(({ id }) => id) })).toThrowError(expect.objectContaining({ code: 'intake_output_bounds' }));
-  expect(constructed.size).toBeGreaterThan(0); expect(constructed.size).toBeLessThan(p.plan.heists.length);
-  read.mockRestore();
+  const createRequestScope = vi.spyOn(h.intake, 'createRequestScope');
+  const originalScope = h.intake.createRequestScope.bind(h.intake);
+  createRequestScope.mockImplementation((repoPath, intakeId) => {
+    const request = originalScope(repoPath, intakeId);
+    return { ...request, read: (requestId) => requestId === p.requestId ? instrumented : request.read(requestId) };
+  });
+  try {
+    expect(() => h.approval.approve({ ...d, expectedToken: reviewed.token, selected: p.plan.heists.map(({ id }) => id) })).toThrowError(expect.objectContaining({ code: 'intake_output_bounds' }));
+    expect(constructed.size).toBeGreaterThan(0); expect(constructed.size).toBeLessThan(p.plan.heists.length);
+  } finally {
+    createRequestScope.mockRestore();
+  }
   expect(h.approval.read(h.repoPath, 'feature').review).toEqual(reviewed);
   expect(h.ledger.listPipelineEntries()).toEqual([]); expect(h.dispatch).not.toHaveBeenCalled();
 });

@@ -12,6 +12,7 @@ import {
   type GhCommandRunner,
   type RepoRef,
 } from '../src/dispatch/github-poll.js';
+import { gitProbeEnvironment } from '../src/repos/managed-names.js';
 import {
   GhRepoOverviewApi,
   ManagedRepoOverviewTracker,
@@ -1369,6 +1370,24 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
         await expectSelectedProviderCalls();
         vi.unstubAllEnvs();
       }
+
+      const xdgConfigRoot = join(root, 'xdg');
+      mkdirSync(join(xdgConfigRoot, 'git'), { recursive: true });
+      const xdgConfig = join(xdgConfigRoot, 'git', 'config');
+      execFileSync('git', ['config', '--file', xdgConfig, 'url.https://github.com/acme/foreign.git.insteadOf', 'https://github.com/acme/selected.git']);
+      const redirectedXdg = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
+        encoding: 'utf8', env: { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: '1', XDG_CONFIG_HOME: xdgConfigRoot },
+      }).trim();
+      expect(redirectedXdg).toBe('https://github.com/acme/foreign.git');
+      vi.stubEnv('HOME', root);
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      vi.stubEnv('XDG_CONFIG_HOME', xdgConfigRoot);
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      expect(gitProbeEnvironment()).not.toHaveProperty('GIT_CONFIG_NOSYSTEM');
+      vi.unstubAllEnvs();
     } finally {
       vi.unstubAllEnvs();
       rmSync(root, { recursive: true, force: true });
