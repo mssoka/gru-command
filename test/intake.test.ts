@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeService, INTAKE_HELPER, type IntakeServiceOptions } from '../src/intake/service.js';
 import { conservativePlan, validatePlan } from '../src/intake/planner.js';
 import { captureSources } from '../src/intake/sources.js';
-import { managedRepoPathsForIntake } from '../src/repos/managed-names.js';
+import { managedRepoPathsForIntake, resolveManagedRepoPath } from '../src/repos/managed-names.js';
 import { canonical, boundedCanonical, INTAKE_MAX_JSON_NESTING, digest, type IntakeRequest, type Plan, type Proposal } from '../src/intake/types.js';
 import { loadBundledWorkflowRuntime, writeWorkflowManifest } from '../src/workflows/runtime.js';
 import { parseWorkflowManifest, WORKFLOW_MANIFEST } from '../src/workflows/manifest.js';
@@ -359,12 +359,16 @@ describe('intake review regressions', () => {
     expect(await selected.preview(h.request)).toMatchObject({ repoPath: h.repo });
   });
 
-  it('rejects stale Git markers but accepts a valid worktree pointer file', () => {
+  it('rejects stale Git markers under inherited routing and accepts a valid worktree pointer file', async () => {
     const h = fixture();
     const stale = join(h.workspace, 'stale');
     mkdirSync(stale);
     writeFileSync(join(stale, '.git'), 'gitdir: missing');
+    vi.stubEnv('GIT_DIR', join(h.repo, '.git'));
+    vi.stubEnv('GIT_WORK_TREE', stale);
     expect(managedRepoPathsForIntake(h.workspace, ['stale'])).toEqual([]);
+    await expect(resolveManagedRepoPath(h.workspace, 'stale')).resolves.toMatchObject({ kind: 'unavailable' });
+    vi.unstubAllEnvs();
 
     const source = join(h.root, 'worktree-source');
     mkdirSync(source);

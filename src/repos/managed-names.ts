@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, sep, win32 } from 'node:path';
@@ -8,11 +8,57 @@ export type ManagedRepoPath =
   | { readonly kind: 'unavailable'; readonly reason: string };
 
 const UNAVAILABLE_REASON = 'selected repository is unavailable under workspace_root';
+const GIT_ROUTING_ENV = new Set([
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_COMMON_DIR',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_NAMESPACE',
+  'GIT_IMPLICIT_WORK_TREE',
+  'GIT_PREFIX',
+  'GIT_CEILING_DIRECTORIES',
+  'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+]);
+
+/** Keep owner Git configuration, but prevent inherited routing from replacing
+ * the selected project's actual .git identity. */
+function gitProbeEnvironment(): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !GIT_ROUTING_ENV.has(name)),
+  );
+}
+
+async function isGitWorktreeRoot(project: string): Promise<boolean> {
+  try {
+    const stdout = await new Promise<string>((resolveOutput, reject) => {
+      execFile(
+        'git',
+        ['-C', project, 'rev-parse', '--show-toplevel'],
+        {
+          encoding: 'utf8',
+          env: gitProbeEnvironment(),
+          maxBuffer: 16_384,
+          timeout: 2_000,
+        },
+        (error, output) => {
+          if (error !== null) reject(error);
+          else resolveOutput(typeof output === 'string' ? output : output.toString('utf8'));
+        },
+      );
+    });
+    return (await realpath(stdout.trim())) === project;
+  } catch {
+    return false;
+  }
+}
 
 function isGitWorktreeRootSync(project: string): boolean {
   try {
     const reportedRoot = execFileSync('git', ['-C', project, 'rev-parse', '--show-toplevel'], {
       encoding: 'utf8',
+      env: gitProbeEnvironment(),
       maxBuffer: 16_384,
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 2_000,
@@ -81,7 +127,11 @@ export async function resolveManagedRepoPath(
     }
 
     const gitMarker = await lstat(join(project, '.git'));
-    if (gitMarker.isSymbolicLink() || (!gitMarker.isDirectory() && !gitMarker.isFile())) {
+    if (
+      gitMarker.isSymbolicLink() ||
+      (!gitMarker.isDirectory() && !gitMarker.isFile()) ||
+      !(await isGitWorktreeRoot(project))
+    ) {
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
     return { kind: 'available', path: project };
