@@ -202,10 +202,11 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // 32 of 35 sites carry the bounded context; the three null rows are the
-    // sanctioned residuals (shutdown deadline, live-process pause, sweep
-    // error) that stay deliberately context-free and live (A7 rejection
-    // stands; a worktree id is never coerced into a round identity).
+    // Of the 35 pre-existing wave sites, 32 carry bounded context; the
+    // three null rows are sanctioned residuals (shutdown deadline,
+    // live-process pause, sweep error) that stay context-free and live (A7
+    // rejection stands; a worktree id is never coerced into a round identity).
+    // All added publication-recovery sites carry their round-bound context.
     const expected: readonly (readonly [string, string | null])[] = [
       ['`Queued review handoff for job ${job.id} needs reconciliation`', '{ jobId: job.id }'],
       ['`Queued review handoff failed for job ${job.id}`', '{ jobId: job.id }'],
@@ -221,6 +222,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Perkins publication for round ${round.id} could not be re-bound at restart and stays held`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} is malformed`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication for round ${round.id} was proven at the provider but never credited`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication absence for round ${round.id} is not bound to its intent`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} could not be reconciled after restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
@@ -264,10 +266,10 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    // 35 pre-existing wave call sites + the 12 durable-publication-recovery
+    // 35 pre-existing wave call sites + the 13 durable-publication-recovery
     // escalations added by the PR #289 native correction cycle, its
     // amendments and the native R2 byte/identity fences.
-    expect(sites).toHaveLength(47);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(44);
+    expect(sites).toHaveLength(48);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(45);
   });
 });
