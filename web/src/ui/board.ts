@@ -2335,8 +2335,6 @@ export class BoardView {
       });
   }
 
-  /** Sane focus after a state-changing submit: land on the item's card
-   * when the control that had focus no longer renders. */
   /** Persist every currently-open notification Details before a rebuild. */
   private captureOpenDetails(root: HTMLElement): void {
     for (const details of root.querySelectorAll<HTMLDetailsElement>('.board-notification__details')) {
@@ -2347,6 +2345,8 @@ export class BoardView {
     }
   }
 
+  /** Sane focus after a state-changing submit: land on the item's card
+   * when the control that had focus no longer renders. */
   private focusNotification(notificationId: string): void {
     const target = [...document.querySelectorAll<HTMLElement>('[data-focus-target="card"]')].find(
       (node) => node.dataset.notificationId === notificationId,

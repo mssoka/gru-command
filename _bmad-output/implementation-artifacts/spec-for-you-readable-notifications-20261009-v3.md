@@ -117,15 +117,15 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `src/ledger/db.ts` + `src/ledger/api.ts` + `src/ledger/notification-decision.ts` — decision columns, strict typed decision, decision recording (idempotent), row mapping.
-- [ ] `src/notifications/attention.ts` + `src/notifications/center.ts` — registry enforcement, decision-required escalation, Gh-97 path follows effective routing.
-- [ ] `src/board/server.ts` + `src/board/engine.ts` — escalation validation, decision endpoint, projection; disposition hook.
-- [ ] `src/supervision/supervisor.ts` + `src/main.ts` — breaker/provider-wall machine routing, guarded re-arm on disposition, legacy reconciliation, squat-notice resolution.
-- [ ] `web/src/lib/board-protocol.ts` + `board-client.ts` + `owner-band.ts` — protocol, client, row model.
-- [ ] `web/src/ui/board.ts` + `web/src/styles/components.css` — shared readable card, decision controls, Details disclosure, focus/disclosure preservation, contrast.
-- [ ] `web/e2e/notification-readability.spec.ts` + `web/playwright.config.ts` — fixed fixture browser regressions and captures.
-- [ ] Backend/web unit suites updated + new focused tests.
-- [ ] `.gru-command/worktree.toml` verify scopes; docs updates.
+- [x] `src/ledger/db.ts` + `src/ledger/api.ts` + `src/ledger/notification-decision.ts` — decision columns, strict typed decision, decision recording (idempotent), row mapping.
+- [x] `src/notifications/attention.ts` + `src/notifications/center.ts` — registry enforcement, decision-required escalation, Gh-97 path follows effective routing.
+- [x] `src/board/server.ts` + `src/board/engine.ts` — escalation validation, decision endpoint, projection; disposition hook.
+- [x] `src/supervision/supervisor.ts` + `src/main.ts` — breaker/provider-wall machine routing, guarded re-arm on disposition, legacy reconciliation, squat-notice resolution.
+- [x] `web/src/lib/board-protocol.ts` + `board-client.ts` + `owner-band.ts` — protocol, client, row model.
+- [x] `web/src/ui/board.ts` + `web/src/styles/components.css` — shared readable card, decision controls, Details disclosure, focus/disclosure preservation, contrast.
+- [x] `web/e2e/notification-readability.spec.ts` + `web/playwright.config.ts` — fixed fixture browser regressions and captures.
+- [x] Backend/web unit suites updated + new focused tests.
+- [x] `.gru-command/worktree.toml` verify scopes; docs updates.
 
 **Acceptance Criteria:**
 - Given a routine recoverable minion stop, when detected, then the machine queue owns supported recovery/re-arm and no FOR YOU row or owner bell is created.
@@ -151,7 +151,25 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
 
 ## Implementation Notes
 
-- 2026-10-11: spec authored in-lane from the released v3 briefing + live code investigation at base f738b9b1. Waiting on implementation notes as work lands.
+- 2026-10-11: spec authored in-lane from the released v3 briefing + live
+  code investigation at base f738b9b1.
+- Server: owner-attention registry enforced in NotificationCenter (owner
+  force/deny, typed decision required for `gru.owner-escalation`,
+  unknown→Gru), migration 25 + record-only decision endpoint, breaker and
+  provider-wall stops moved to machine attention with the guarded
+  disposition re-arm, boot reconciliation of legacy owner rows, port-squat
+  notices resolved on a successful bind.
+- Web: one shared card for band + bell (mixed-case title/context, short
+  metadata label, typed decision block, Details disclosure, focus/open
+  preservation), decision submission with overlay/error states, AA contrast
+  on live/error/receipt surfaces.
+- Verification run in-lane: focused backend 320 passed; web units 623
+  passed; lint/typecheck/build green; `notification-readability` Playwright
+  project 6/6 with captures inspected; fail-before oracle 3/3 AssertionError
+  RED on the isolated f738b9b1 snapshot and GREEN at head.
+- Matrix audit: every I/O matrix row is covered by a named test that ran in
+  the focused verification output (registry/decision suites, supervisor and
+  provider seams, board-server, web unit suites, e2e).
 
 ## Spec Change Log
 
