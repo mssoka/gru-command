@@ -515,9 +515,13 @@ export class BoardView {
     const active = document.activeElement;
     const focusId =
       active instanceof HTMLElement && mount.contains(active)
-        ? active.dataset.ownerFocusKey ?? active.dataset.actionId ?? null
+        ? active.dataset.ownerFocusKey ?? active.dataset.focusKey ?? active.dataset.actionId ?? null
         : null;
     const bandVisible = !mount.hidden && mount.closest('[hidden]') === null;
+    // Sync the open-Details state from the live DOM BEFORE the rebuild: the
+    // browser's toggle event timing must never collapse what the operator
+    // opened on the next snapshot push.
+    this.captureOpenDetails(mount);
     mount.replaceChildren();
     const head = el('h2', 'board-band__head');
     head.id = 'board-owner-head';
@@ -585,14 +589,12 @@ export class BoardView {
    * in-app control (its action is outside the app) and no generic Ack. */
   private ownerDecisionRow(row: OwnerDecisionRow, bandVisible: boolean): HTMLElement {
     const node = el('article', `board-owner__row board-owner__row--${row.notification.severity} board-owner__row--decision`);
-    node.dataset.notificationId = row.notification.id;
     node.append(this.notificationCard(row.notification, false, bandVisible));
     return node;
   }
 
   private ownerNoticeRow(row: OwnerNoticeRow, bandVisible: boolean): HTMLElement {
     const node = el('article', `board-owner__row board-owner__row--${row.notification.severity} board-owner__row--notice`);
-    node.dataset.notificationId = row.notification.id;
     node.append(this.notificationCard(row.notification, false, bandVisible));
     return node;
   }
@@ -2020,6 +2022,7 @@ export class BoardView {
       active instanceof HTMLElement && list.contains(active)
         ? active.dataset.focusKey ?? active.dataset.ownerFocusKey ?? null
         : null;
+    this.captureOpenDetails(list);
     list.replaceChildren();
     this.updateBadge(notifications);
     this.notificationBell.hidden = false;
@@ -2246,6 +2249,7 @@ export class BoardView {
     const summary = document.createElement('summary');
     summary.textContent = 'Details';
     summary.dataset.focusKey = `notif:${notificationId}:details`;
+    summary.dataset.ownerFocusKey = `notif:${notificationId}:details`;
     const body = el('div', 'board-notification__detail');
     body.append(el('div', 'board-notification__detail-kind', `kind: ${kind}`), el('div', 'board-notification__detail-text', detail));
     details.append(summary, body);
@@ -2334,6 +2338,16 @@ export class BoardView {
 
   /** Sane focus after a state-changing submit: land on the item's card
    * when the control that had focus no longer renders. */
+  /** Persist every currently-open notification Details before a rebuild. */
+  private captureOpenDetails(root: HTMLElement): void {
+    for (const details of root.querySelectorAll<HTMLDetailsElement>('.board-notification__details')) {
+      const id = details.closest<HTMLElement>('[data-notification-id]')?.dataset.notificationId;
+      if (id === undefined) continue;
+      if (details.open) this.openNotificationDetails.add(id);
+      else this.openNotificationDetails.delete(id);
+    }
+  }
+
   private focusNotification(notificationId: string): void {
     const target = [...document.querySelectorAll<HTMLElement>('[data-focus-target="card"]')].find(
       (node) => node.dataset.notificationId === notificationId,

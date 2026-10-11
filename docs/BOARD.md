@@ -40,8 +40,9 @@ restart produce the same truth without data edits.
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
-| `POST /api/notifications/:id/ack` | `{by?}` — owner/FYI ack; refuses machine rows (400), and owner ack re-arms an open breaker |
-| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops |
+| `POST /api/notifications/:id/ack` | `{by?}` — feed/notice acknowledgement only; refuses machine rows (400). The UI shows it only on FYI rows (`Mark seen`) |
+| `POST /api/notifications/:id/decision` | `{optionId, by?}` — records the owner's choice on a typed `needs-owner` decision (validated against the stored options). A recorded decision is distinct from resolution; duplicates are idempotent and a different option is refused (409) |
+| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops. Disposing an open `supervision.breaker` alert re-arms the stopped lane through the guarded recovery-authority fence |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -219,26 +220,36 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   independent scroll; the module follows the CREW tab and disappears with
   it on TRANSCRIPTS. Reads and disclosures are display-only — nothing
   here acks, executes or changes GitHub state.
-- **Notification center (E7; routing split 2026-09-23; section truth
-  2026-09-29):** the bell panel renders the durable notification log in
-  three bands — FOR YOU (all pending needs-owner rows, even older than the
-  bounded latest feed: owner-only decisions and stops whose ack re-arms
-  supervision), NEEDS GRU (all pending machine rows, including those older
-  than the recent feed; it wakes Gru once and refuses human Ack. Rows bound
-  to a terminal merged/done/binned lane are CLOSED RECEIPTS: they render
-  under FEED, never as live queue entries, and the live unacked chip does
-  not count them), and FEED (FYI rows plus closed receipts). The bell
+- **Notification center (E7; routing split 2026-09-23; owner-attention
+  registry 2026-10-11; section truth 2026-09-29):** the bell panel
+  renders the durable notification log in three bands — FOR YOU (pending
+  typed decisions, owner notices, proposals and ready PRs, even older
+  than the bounded latest feed), NEEDS GRU (all pending machine rows,
+  including those older than the recent feed; it wakes Gru once and
+  refuses human Ack. Rows bound to a terminal merged/done/binned lane are
+  CLOSED RECEIPTS: they render under FEED, never as live queue entries,
+  and the live unacked chip does not count them), and FEED (FYI rows
+  plus closed receipts). Route assignment is enforced server-side: only
+  registered owner-reserved kinds can reach FOR YOU; a `needs-owner`
+  request from any unregistered or machine kind is routed to Gru
+  (action-required) and logged, and an unknown stop is triaged by Gru
+  rather than dropped. Routine recovery (crash-loop breakers,
+  provider-wall stops, re-brief/directive reconciliation) stays machine
+  attention. Every card is the same readable shared component in both
+  surfaces: mixed-case prose, a short metadata label, typed decision
+  blocks and a Details disclosure holding the full diagnostics. The bell
   is the alert/history surface: it shares the SAME authoritative owner
-  projection as the board's permanent FOR YOU band — pending acks AND
-  ready PRs, so the two surfaces never disagree about what the owner
-  owes (the badge and toasts still count needs-owner notifications
-  only); opening it never completes an obligation. A machine
+  projection as the board's permanent FOR YOU band, so the two surfaces
+  never disagree about what the owner owes (the badge and toasts still
+  count needs-owner notifications only); opening it never completes an
+  obligation. A machine
   alert left unresolved 30 minutes after delivery opens a separate
   owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
-  per surface (a display receipt is not an acknowledgement); acking an
-  owner row clears it where an ack has meaning (a breaker row re-arms
-  supervision). Informational owner stops earn the same unread badge as
+  per surface (a display receipt is not an acknowledgement). Owner
+  decisions are recorded through the decision endpoint; owner notices
+  carry no in-app control and clear when their producer resolves them on
+  evidence. Informational owner stops earn the same unread badge as
   errors. The
   wake tracker chip counts durable Gru wakes (`gru.wake` events). Live
   needs-owner arrivals toast (plus a browser notification when permission

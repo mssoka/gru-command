@@ -195,6 +195,15 @@ export class NotificationCenter {
    * an open row of the kind was reused) — so a producer counting a streak
    * never has to infer it from the row's content. */
   openIncident(input: IncidentInput): { readonly record: NotificationRecord; readonly created: boolean } {
+    // The typed-decision requirement holds on the DEDUPE path too: an
+    // owner escalation can never reuse an old row to avoid stating the
+    // reserved question it is asking.
+    if (requiresTypedDecision(input.kind) && (input.decision === undefined || input.decision === null)) {
+      throw new Error(
+        `${input.kind} is an owner escalation and requires typed decision metadata ` +
+          '(question, context, reservedClass, whyNotDelegable, options) — an owner chore is never posted as a bare notice',
+      );
+    }
     const created = (record: NotificationRecord) => ({ record, created: true });
     const reused = (record: NotificationRecord) => ({ record, created: false });
     const effective = resolveNotificationRouting(input.kind, input.routing).routing;

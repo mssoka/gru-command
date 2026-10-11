@@ -2600,6 +2600,48 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.ackNotification).not.toHaveBeenCalled();
   });
 
+  it('board band and bell render the SAME decision question, recommendation and options', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [notification('parity', { routing: 'needs-owner', kind: 'gru.owner-escalation', detail: 'evidence', decision: ownerDecision() })],
+        unackedNeedsOwner: 1,
+      }),
+    );
+    const band = document.getElementById('board-owner')!;
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const panel = document.getElementById('notification-list')!;
+    for (const text of ['Approve the slim contract?', 'Gru recommends: Approve the slim contract.', 'Why this needs you: It changes the agreed product scope.']) {
+      expect(band.textContent, `band: ${text}`).toContain(text);
+      expect(panel.textContent, `bell: ${text}`).toContain(text);
+    }
+    expect(band.querySelectorAll('.board-notification__option-button')).toHaveLength(2);
+    expect(panel.querySelectorAll('.board-notification__option-button')).toHaveLength(2);
+    // The bell's copy shares the same authoritative question — never a
+    // second interpretation.
+    expect(panel.textContent).not.toContain('Ack');
+  });
+
+  it('a discussion-only decision offers the chat route and no invented option buttons', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [
+          notification('discuss', {
+            routing: 'needs-owner',
+            kind: 'gru.owner-escalation',
+            detail: 'evidence',
+            decision: ownerDecision({ options: [], discussion: true }),
+          }),
+        ],
+      }),
+    );
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-notification__discuss')?.textContent).toContain('needs discussion with Gru');
+    expect(band.querySelectorAll('.board-notification__option-button')).toHaveLength(0);
+    expect(band.querySelector('.board-notification__ack')).toBeNull();
+  });
+
   it('a long diagnostic card keeps mixed case on its face and the full text behind Details', () => {
     const view = new BoardView(() => {});
     const longDetail =

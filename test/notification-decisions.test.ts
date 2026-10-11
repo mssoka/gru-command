@@ -238,6 +238,45 @@ describe('recordNotificationDecision — the side-effect boundary', () => {
   });
 });
 
+describe('side-effect permissions across the notification routes', () => {
+  it('an owner escalation cannot be deduped past the typed-decision requirement', () => {
+    const rig = boot();
+    expect(() =>
+      rig.center.openIncident({
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Coordination note',
+        detail: 'ops work',
+        dedupe: 'unacked',
+      }),
+    ).toThrow(/typed decision metadata/);
+    expect(rig.api.listNotifications({ limit: 10 })).toHaveLength(0);
+  });
+
+  it('a machine disposition never clears an owner decision; an ack never clears machine attention', () => {
+    const rig = boot();
+    const owner = rig.center.post({
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Approve?',
+      detail: 'evidence',
+      decision: decision(),
+    });
+    expect(() => rig.api.disposeMachineNotification(owner.id, 'not applicable')).toThrow(
+      /only action-required notifications/u,
+    );
+    expect(rig.api.getNotification(owner.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+    const machine = rig.center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Breaker' });
+    expect(machine.routing).toBe('action-required');
+    expect(() => rig.center.ack(machine.id, 'operator')).toThrow(/action-required notifications require a Gru disposition/u);
+    const proposal = rig.center.post({ kind: 'lessons.proposal', routing: 'fyi', severity: 'info', title: 'Proposal' });
+    expect(proposal.routing).toBe('needs-owner');
+    expect(() => rig.center.ack(proposal.id, 'operator')).not.toThrow(); // ack is a record; the lessons endpoint owns the decision
+  });
+});
+
 describe('legacy owner-attention reconciliation', () => {
   it('re-triages legacy coordination notes and unknown kinds to Gru without dropping the stop', () => {
     const rig = boot();

@@ -744,3 +744,40 @@ merge-authority-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lin
 # snapshot directory and ignored pointer file are preserved for
 # inspection, and the base itself is never checked out or mutated.
 merge-authority-baseline = 'set -e; base=dffa10af37691238d5f3cbb7dd03696d43e4ff01; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-merge-authority.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; for f in test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts test/github-poll.test.ts; do git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; printf "merge-authority-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/merge-authority-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts test/github-poll.test.ts; a=$?; set -e; echo "merge-authority-baseline vitest exit=$a EXPECTED-NONZERO"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-merge-authority-baseline.mjs" "$d/results.json"; echo "EXPECTED-NONZERO: named boundary assertions RED against the pre-change base dffa10af"; exit 1'
+
+# Owner-release v3 (job for-you-readable-notifications-20261009-v3, owner
+# release 2026-10-11): the Silas→Gru→owner attention registry, typed owner
+# decisions with the record-only side-effect boundary, the shared readable
+# notification card, and the fail-before baseline for the pictured
+# typography/wrapping/contrast defect. Focused backend suites plus the
+# focused web suites in one plain installed Vitest invocation per leg;
+# approved RPC patch prerequisite first; exits never masked.
+owner-decisions-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/notification-decisions.test.ts test/notifications.test.ts test/supervisor.test.ts test/provider-recovery-seam.test.ts test/obligations-handback.test.ts test/phase-handoffs.test.ts test/awareness.test.ts test/board-server.test.ts test/board-engine.test.ts test/assert-notification-card-baseline.test.ts test/suite-shape.test.ts && cd web && ../node_modules/.bin/vitest run src/lib/owner-band.test.ts src/lib/board-protocol.test.ts src/lib/palette-contrast.test.ts src/ui/board.test.ts src/ui/notification-card.test.ts src/ui/board-merged-attention.test.ts src/ui/owner-chime.test.ts"
+
+# Static product checks for the same change: lint, the backend compiler and
+# the full build (pinned Perkins resource verifier included) plus the web
+# compiler; approved RPC patch first, never the npm chain.
+owner-decisions-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+
+# Browser evidence (acceptance: long-content fixture readable in dark/light
+# at 390/768/1280, 200% zoom, a 320px container; measured settled contrast;
+# keyboard Details; no side-effect requests). Production web build + the
+# dedicated synthetic-seeded Playwright project; captures land under the
+# gitignored _bmad-output/notification-readability/ root.
+owner-decisions-browser = "node tools/patch-vitest-rpc-timeout.mjs && cd web && node ../node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node node_modules/vite/bin/vite.js build && node ../node_modules/@playwright/test/cli.js test --project=notification-readability"
+
+# FAIL-BEFORE evidence (acceptance: meaningful fail-before and pass-after
+# for the pictured typography/wrapping/contrast defect). The FINAL
+# notification-card.test.ts bytes are overlaid onto an isolated git-archive
+# snapshot of the dispatch base f738b9b1 (root+web node_modules symlinked —
+# no download/install; approved RPC patch prerequisite; unchanged web
+# config/budgets). The base renders the diagnostic prose inside the faint
+# uppercase .lbl meta line with no Details disclosure and a generic Ack, so
+# the named assertions RED by behavioral assertion. The Vitest JSON report
+# is classified by tools/assert-notification-card-baseline.mjs, which exits
+# 2 (FAILS-BEFORE CLAIM BROKEN) on a collection/setup/import failure, a
+# named assertion that did not fail, or an unreadable report; unlisted
+# failures are excluded context. The vitest exit is echoed intact and never
+# masked into a PASS; the snapshot directory and ignored pointer file are
+# preserved for inspection, and the base itself is never checked out.
+owner-decisions-baseline = 'set -e; base=f738b9b1594081cdbb4929af7be256454951eb43; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-notification-card.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; cp web/src/ui/notification-card.test.ts "$d/web/src/ui/notification-card.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; ln -s "$root/web/node_modules" "$d/web/node_modules"; printf "owner-decisions-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/owner-decisions-baseline.last-snapshot.txt"; cd "$d/web"; set +e; ../node_modules/.bin/vitest run src/ui/notification-card.test.ts --reporter=json --outputFile="$d/results.json"; a=$?; set -e; echo "owner-decisions-baseline vitest exit=$a EXPECTED-NONZERO: pre-change base lacks the readable card"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; cd "$root"; node tools/assert-notification-card-baseline.mjs "$d/results.json"; echo "EXPECTED RED: named readability assertions failed by assertion against the pre-change base"; exit 1'
