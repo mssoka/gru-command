@@ -3407,12 +3407,12 @@ describe('supervision decision surface identity (issue #222)', () => {
   });
 });
 describe('supervisor — guarded re-arm fences (R1: parking and live producers)', () => {
-  function directlyStoppedTurn(jobId: string, agentId: string): {
+  function directlyStoppedTurn(jobId: string, agentId: string, workerGate?: PacingGate): {
     readonly rig: Harness;
     readonly handle: FakeHandle;
     readonly stop: NotificationRecord;
   } {
-    const rig = boot(undefined, { restartBackoffMs: 1_000 });
+    const rig = boot(undefined, { restartBackoffMs: 1_000, ...(workerGate === undefined ? {} : { workerGate }) });
     rig.api.addJob({ id: jobId, repo: 'fixture', title: 'stopped lane' });
     rig.api.setJobStatus(jobId, 'working');
     rig.api.registerAgent({ id: agentId, role: 'minion', jobId });
@@ -3569,7 +3569,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       holderReleased = true;
       holder.release();
     };
-    const { rig, stop } = directlyStoppedTurn('replay-park-job', 'replay-park-agent');
+    const { rig, stop } = directlyStoppedTurn('replay-park-job', 'replay-park-agent', gate);
     const firstReplacement: { current: FakeHandle | null } = { current: null };
     try {
       rig.registry.spawnImpl = async (role, options) => {
