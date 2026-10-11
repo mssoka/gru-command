@@ -7507,15 +7507,24 @@ export class LedgerApi {
       if (record.status === 'reviewed' && head?.revisionId === record.revisionId && head.status !== 'reviewed') throw new IntakeError('intake_stale_review', 'Rejected or accepted revisions cannot be reopened; create a new revision', 409);
       const approved = this.db.prepare("SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? AND revision_id = ? AND status = 'approved'").get(record.repoPath, record.intakeId, record.revisionId);
       if (approved !== undefined) throw new IntakeError('intake_acceptance_conflict', 'This revision already has an immutable accepted selection; retry its original approval', 409);
-      const historySize = this.db.prepare('SELECT COUNT(*) AS count FROM intake_reviews WHERE repo_path = ? AND intake_id = ?').get(record.repoPath, record.intakeId) as { count: number };
-      if (historySize.count >= 4096) throw new IntakeError('intake_storage_error', 'Intake history reached its 4096-decision verification bound; create a new intake for further revisions, retaining this history', 500);
-      this.db.prepare('INSERT INTO intake_reviews(token, repo_path, intake_id, revision_id, status, record) VALUES (?, ?, ?, ?, ?, ?)').run(record.token, record.repoPath, record.intakeId, record.revisionId, record.status, canonicalIntake(record));
+      const serialized = canonicalIntake(record);
+      this.verifyIntakeHistoryBudget(record.repoPath, record.intakeId, Buffer.byteLength(serialized));
+      this.db.prepare('INSERT INTO intake_reviews(token, repo_path, intake_id, revision_id, status, record) VALUES (?, ?, ?, ?, ?, ?)').run(record.token, record.repoPath, record.intakeId, record.revisionId, record.status, serialized);
       this.db.prepare('INSERT INTO intake_review_heads(repo_path, intake_id, token) VALUES (?, ?, ?) ON CONFLICT(repo_path, intake_id) DO UPDATE SET token = excluded.token').run(record.repoPath, record.intakeId, record.token);
       this.appendEvent({ kind: `intake.${record.status}`, payload: { intake_id: record.intakeId, revision_id: record.revisionId, token: record.token, selected: record.selected } });
     });
   }
 
+  /** Bound total retained verification work before loading/parsing/hashing any
+   * decision. Over-budget history stays intact for restoration/inspection. */
+  private verifyIntakeHistoryBudget(repoPath: string, intakeId: string, additionalBytes = 0): void {
+    const size = this.db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(record AS BLOB))), 0) AS bytes FROM intake_reviews WHERE repo_path = ? AND intake_id = ?').get(repoPath, intakeId) as { count: number; bytes: number };
+    if (size.count + (additionalBytes > 0 ? 1 : 0) > 4096) throw new IntakeError('intake_storage_error', 'Intake history reached its 4096-decision verification bound; create a new intake for further revisions, retaining this history', 500);
+    if (size.bytes + additionalBytes > 8 * 1024 * 1024) throw new IntakeError('intake_storage_error', 'Intake history reached its 8-MiB byte verification bound; create a new intake for further revisions, retaining this history', 500);
+  }
+
   getIntakeReview(repoPath: string, intakeId: string, token?: string): IntakeReviewRecord | null {
+    this.verifyIntakeHistoryBudget(repoPath, intakeId);
     const row = token === undefined
       ? this.db.prepare('SELECT r.* FROM intake_review_heads h LEFT JOIN intake_reviews r ON r.token = h.token WHERE h.repo_path = ? AND h.intake_id = ?').get(repoPath, intakeId)
       : this.db.prepare('SELECT * FROM intake_reviews WHERE token = ? AND repo_path = ? AND intake_id = ?').get(token, repoPath, intakeId);

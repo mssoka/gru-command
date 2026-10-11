@@ -148,11 +148,13 @@ export class ChatView {
   private intakeRepoPick: ((path: string) => void) | null = null;
   private intakeRepoPath: string | null = null;
   private intakeRemaining = 8;
+  private intakeBatch: ((pending: boolean) => void) | undefined;
+  private deviceChooser: { readonly epoch: number; readonly generation: number; readonly pick: ((chip: AttachmentChip, uploaded: boolean) => void) | null; readonly remaining: number; readonly batch: ((pending: boolean) => void) | undefined } | null = null;
   private readonly intakeUploading = new Set<number>();
 
-  pickIntakeFile(callback: (chip: AttachmentChip, uploaded: boolean) => void, repoPath?: string, remaining = 8): void {
+  pickIntakeFile(callback: (chip: AttachmentChip, uploaded: boolean) => void, repoPath?: string, remaining = 8, batch?: (pending: boolean) => void): void {
     this.closePicker();
-    this.intakeRepoPath = repoPath ?? null; this.intakeRemaining = remaining;
+    this.intakeRepoPath = repoPath ?? null; this.intakeRemaining = remaining; this.intakeBatch = batch;
     this.intakeFilePick = callback;
     void this.openPicker('');
   }
@@ -600,14 +602,16 @@ export class ChatView {
     this.fileInput.addEventListener('change', () => {
       const files = [...this.fileInput.files ?? []];
       this.fileInput.value = ''; // allow re-picking the same file
-      if (this.intakeRepoPick !== null || this.fileInput.disabled) return;
-      const pick = this.intakeFilePick;
-      if (pick !== null && files.length > this.intakeRemaining) {
+      const chooser = this.deviceChooser; this.deviceChooser = null;
+      if (chooser === null || chooser.epoch !== this.attachEpoch || chooser.generation !== this.browseGeneration || this.intakeRepoPick !== null || this.fileInput.disabled) return;
+      const { pick, remaining, batch } = chooser;
+      if (pick !== null && files.length > remaining) {
         this.ephemeralNote('Intake document cap reached (8). Retry a complete selection within the remaining document slots.'); this.closePicker(); return;
       }
       if (pick === null) for (const file of files) void this.takeDeviceFile(file);
       else {
-        const epoch = this.attachEpoch;
+        const epoch = chooser.epoch;
+        batch?.(true);
         // Upload concurrently, but publish intake documents in chooser order:
         // the first selected file is the primary source, not the fastest upload.
         void Promise.all(files.map(async (file) => {
@@ -615,6 +619,10 @@ export class ChatView {
           await this.takeDeviceFile(file, (uploaded) => { chip = uploaded; });
           return chip;
         })).then((chips) => {
+          batch?.(false);
+          // Once captured, this batch belongs to its original consumer. Opening
+          // the independent chat picker must not silently discard its sources;
+          // the intake callback still guards its own source/pairing generation.
           if (epoch !== this.attachEpoch) return;
           if (chips.some((chip) => chip === undefined)) {
             this.ephemeralNote('Intake documents were not selected: an upload failed. Retry the complete selection.');
@@ -626,6 +634,8 @@ export class ChatView {
       this.closePicker();
     });
 
+    this.fileInput.addEventListener('cancel', () => { this.deviceChooser = null; });
+
     mustGet<HTMLButtonElement>('attach-picker-close').addEventListener('click', () =>
       this.closePicker(),
     );
@@ -634,6 +644,10 @@ export class ChatView {
     });
     mustGet<HTMLButtonElement>('attach-picker-device').addEventListener('click', () => {
       if (this.intakeRepoPick !== null || this.fileInput.disabled) return;
+      if (this.deviceChooser !== null) { this.ephemeralNote('Finish or cancel the previous device chooser before opening another.'); return; }
+      // Capture the actual consumer before opening the OS chooser. A late
+      // change event may not adopt a newly paired/picked attachment surface.
+      this.deviceChooser = { epoch: this.attachEpoch, generation: this.browseGeneration, pick: this.intakeFilePick, remaining: this.intakeRemaining, batch: this.intakeBatch };
       this.fileInput.click();
     });
     document.addEventListener('keydown', (event) => {
@@ -732,6 +746,7 @@ export class ChatView {
     this.browseGeneration += 1;
     this.picker.hidden = true;
     this.intakeFilePick = null;
+    this.intakeBatch = undefined;
     this.intakeRepoPick = null;
     this.intakeRepoPath = null;
     this.attachButton.setAttribute('aria-expanded', 'false');

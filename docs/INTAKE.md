@@ -236,15 +236,22 @@ repository; device documents use the managed upload store. The first selected
 document is primary, regardless of upload completion order; subsequent documents
 are explicit supporting inputs. An incomplete upload batch is refused visibly,
 not silently narrowed. Intake's eight-document limit is independent of ready chat
-attachments.
-No links are crawled, and no BMAD installation/configuration is consulted.
+attachments. Preview and intake decisions wait for the complete in-flight batch.
+Changing repositories clears previously selected documents. Device chooser results
+remain bound to the picker/pairing that opened them, never a later chat/intake target.
+Once a selection is captured, opening the ordinary chat picker does not discard
+its in-flight intake batch. No links are crawled, and no BMAD installation/configuration is consulted.
 
 **Preview sources** shows repository, exact source/version/hash, goal, scope,
 exclusions, acceptance, verification, dependencies and unresolved questions.
 The plan JSON is editable: retain requirement IDs and exact source traces while
 writing concrete statements. **Save new revision** creates immutable captured
-refinement. Clearing default question arrays alone cannot make a plan executable.
-Unresolved source gaps, unmapped requirements and questions refuse approval.
+refinement. **Compare previous revision** reads the existing immutable diff in
+this disclosure before review/approval. Clearing default questions or cosmetically
+changing known default case/terminal punctuation cannot make a plan executable.
+Concrete clarification statements remain allowed; syntax is not semantic proof.
+Known source gaps, unmapped requirements and plan/selected-heist questions disable
+new approval with instructions to refine and review again; the server enforces them.
 
 Click **Review this revision**, select the complete heists and their prerequisite
 closure, then **Approve selected work**. Selection never implies approval.
@@ -275,7 +282,13 @@ Browser mount/reconnect/readback never approve automatically. Tab recovery store
 proposal/pending-revision identities and original explicit approval identities,
 review tokens and selected heist IDs; private source/briefing content remains in
 GC storage. A lost revision response is recovered by reading the original pending
-request, not by creating a replacement revision. Unpairing clears this tab recovery.
+request, not by creating a replacement revision. Until that pending identity is
+recovered, Save/Preview cannot replace it; **Abandon pending revision** explicitly
+releases only this tab's pending identity without posting replacement work.
+Recovery writes validate the reader's full identity/selection limits and 2-MiB
+serialized bound before effects; the tab retains at most 128 original approvals.
+Unavailable durable browser storage fails intake visibly closed; chat's existing
+safe storage fallback is unchanged. Unpairing clears this tab recovery.
 
 Accepted contracts never change after later previews or source edits. Previously
 accepted history remains readable, including when a newer revision is reviewed.
@@ -285,10 +298,17 @@ retry buttons reuse the original token and selection without replacing the newer
 draft. If a response was lost before its receipt arrived, the original approval
 remains unconfirmed until readback or an explicit identical retry succeeds.
 Each failed historical receipt is reported without preventing independent healthy
-receipt/draft reads. Invalid tab recovery data produces a named actionable error
+receipt/draft reads. The current draft reads independently; historical receipts
+render progressively with at most four concurrent receipt reads, including across
+superseded recovery/pairing generations. Invalid tab recovery data produces a named actionable error
 without breaking chat or sending approval. Damage to proposal receipts, decision
 records or their predecessor chain fails loudly; restore exact original private bytes,
-never synthesize an accepted plan. Execution retains GC-owned routing and private
+never synthesize an accepted plan. Verification is bounded to 4,096 decisions and
+8 MiB of retained decision bytes per intake, checked before parsing/hashing an
+over-budget history. Further appends refuse with `intake_storage_error`; use a new
+intake, retaining the original history. Accepted readback verifies every immutable
+pipeline field/fingerprint, including default priority/scopes; owner holds and
+lifecycle transitions remain valid. Execution retains GC-owned routing and private
 operational artifacts; approved repository knowledge belongs only to the assigned
 worktree's `gru-output/`. This feature never rewrites sources, upstream status,
 old jobs, historical workflow bindings, Perkins policy or the Book of Lessons.

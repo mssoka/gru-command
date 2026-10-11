@@ -18,6 +18,7 @@ export class IntakeClient {
   reject(request: ReviewDecision): Promise<IntakeReadback> { return this.post('/reject', request); }
   approve(request: ReviewDecision & { readonly selected: readonly string[] }): Promise<IntakeReadback> { return this.post('/approve', request); }
   read(repoPath: string, intakeId: string, requestId: string): Promise<Proposal> { return this.request(`/${encodeURIComponent(intakeId)}/requests/${encodeURIComponent(requestId)}?${new URLSearchParams({ repoPath })}`); }
+  diff(repoPath: string, intakeId: string, from: string, to: string): Promise<unknown> { return this.request(`/${encodeURIComponent(intakeId)}/diff?${new URLSearchParams({ repoPath, from, to })}`); }
   readback(repoPath: string, intakeId: string, token?: string): Promise<IntakeReadback> { return this.request(`/${encodeURIComponent(intakeId)}/review?${new URLSearchParams({ repoPath, ...(token === undefined ? {} : { token }) })}`); }
   private post<T>(path: string, body: unknown): Promise<T> { return this.request(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); }
   private async request<T>(path: string, init?: RequestInit): Promise<T> {

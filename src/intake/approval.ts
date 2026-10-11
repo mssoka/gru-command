@@ -38,7 +38,7 @@ function concrete(proposal: Proposal, selected: readonly string[]): void {
   if (proposal.gaps.length || proposal.plan.questions.length || proposal.plan.unmapped.length) throw new IntakeError('intake_incomplete_plan', 'Resolve all source gaps, questions and unmapped requirements before approval', 409);
   const defaults = conservativePlan(proposal).heists[0];
   const statements = (heist: Proposal['plan']['heists'][number]): readonly Statement[] => [heist.goal, ...heist.scope, ...heist.exclusions, ...heist.acceptance, ...heist.verification, heist.splitMergeRationale];
-  const placeholder = (text: string): string => text.trim().replace(/\s+/gu, ' ');
+  const placeholder = (text: string): string => text.trim().replace(/\s+/gu, ' ').toLowerCase().replace(/[\p{P}\s]+$/gu, '');
   const unresolved = new Set(defaults === undefined ? [] : statements(defaults).map(({ text }) => placeholder(text)));
   const byId = new Map(proposal.plan.heists.map((heist) => [heist.id, heist]));
   for (const id of selected) {
@@ -74,7 +74,11 @@ export class IntakeApprovalService {
       const identity = { heistId: review.selected[index]!, entryId: entry.id };
       if (row === null) remaining.push(identity);
       else {
-        if (row.briefing !== entry.briefing || row.requestId !== entry.requestId || row.repoPath !== entry.repoPath || row.title !== entry.title || canonical(row.prerequisites) !== canonical(entry.prerequisites)) throw new IntakeError('intake_acceptance_conflict', `Pipeline entry ${entry.id} no longer matches frozen acceptance`, 409);
+        const repo = entry.repoPath.split('/').filter(Boolean).pop() ?? entry.repoPath;
+        // The original enqueue fingerprint includes a null initial hold. Owner
+        // holds and lifecycle fields may subsequently change; they are not frozen.
+        const payloadHash = digest(JSON.stringify({ id: entry.id, repo_path: entry.repoPath, repo, title: entry.title, briefing: entry.briefing, priority: 5, prerequisites: entry.prerequisites, exclusive_scopes: [], hold_reason: null }));
+        if (row.id !== entry.id || row.repo !== repo || row.briefingHash !== digest(entry.briefing) || row.payloadHash !== payloadHash || row.priority !== 5 || row.exclusiveScopes.length !== 0 || row.briefing !== entry.briefing || row.requestId !== entry.requestId || row.repoPath !== entry.repoPath || row.title !== entry.title || canonical(row.prerequisites) !== canonical(entry.prerequisites)) throw new IntakeError('intake_acceptance_conflict', `Pipeline entry ${entry.id} no longer matches frozen acceptance`, 409);
         accepted.push({ ...identity, state: row.state });
       }
     }

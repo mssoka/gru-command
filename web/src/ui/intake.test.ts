@@ -10,8 +10,8 @@ const partial: IntakeReadback = { review: { ...reviewed.review!, previousToken: 
 afterEach(() => { document.body.replaceChildren(); sessionStorage.clear(); vi.unstubAllGlobals(); });
 function fixture() {
   const root = document.createElement('div'); document.body.append(root);
-  const picker = { pickIntakeFile: vi.fn((callback: (chip: AttachmentChip, uploaded: boolean) => void) => callback({ path: '/workspace/app/spec.md', name: 'spec.md', kind: 'file' }, false)), pickIntakeRepository: vi.fn((callback: (path: string) => void) => callback('/workspace/app')) };
-  const client = { preview: vi.fn(async (_request: Parameters<IntakeClient['preview']>[0]) => proposal), revise: vi.fn(async (_request: Parameters<IntakeClient['revise']>[0]) => ({ ...proposal, requestId: 'r2', revisionId: 'f'.repeat(64) })), review: vi.fn(async (_request: Parameters<IntakeClient['review']>[0]) => reviewed), reject: vi.fn(async (_request: Parameters<IntakeClient['reject']>[0]) => ({ ...reviewed, review: { ...reviewed.review!, status: 'rejected' as const } })), approve: vi.fn(async (_request: Parameters<IntakeClient['approve']>[0]): Promise<IntakeReadback> => ({ ...partial, accepted: [{ heistId: 'one', entryId: 'accepted-one', state: 'waiting' }], remaining: [] })), read: vi.fn(async (_repo: string, _intake: string, _request: string) => proposal), readback: vi.fn(async (_repo: string, _intake: string, _token?: string): Promise<IntakeReadback> => ({ review: null, accepted: [], remaining: [] })) };
+  const picker = { pickIntakeFile: vi.fn((callback: (chip: AttachmentChip, uploaded: boolean) => void, _repo?: string, _remaining?: number, _batch?: (pending: boolean) => void) => callback({ path: '/workspace/app/spec.md', name: 'spec.md', kind: 'file' }, false)), pickIntakeRepository: vi.fn((callback: (path: string) => void) => callback('/workspace/app')) };
+  const client = { diff: vi.fn(async () => ({ from: 'a', to: 'b', changes: ['Acceptance changed'] })), preview: vi.fn(async (_request: Parameters<IntakeClient['preview']>[0]) => proposal), revise: vi.fn(async (_request: Parameters<IntakeClient['revise']>[0]) => ({ ...proposal, requestId: 'r2', revisionId: 'f'.repeat(64) })), review: vi.fn(async (_request: Parameters<IntakeClient['review']>[0]) => reviewed), reject: vi.fn(async (_request: Parameters<IntakeClient['reject']>[0]) => ({ ...reviewed, review: { ...reviewed.review!, status: 'rejected' as const } })), approve: vi.fn(async (_request: Parameters<IntakeClient['approve']>[0]): Promise<IntakeReadback> => ({ ...partial, accepted: [{ heistId: 'one', entryId: 'accepted-one', state: 'waiting' }], remaining: [] })), read: vi.fn(async (_repo: string, _intake: string, _request: string) => proposal), readback: vi.fn(async (_repo: string, _intake: string, _token?: string): Promise<IntakeReadback> => ({ review: null, accepted: [], remaining: [] })) };
   const view = new IntakeView(root, picker, sessionStorage); view.bind(client as unknown as IntakeClient);
   const button = (label: string) => [...root.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent === label)!;
   const click = async (label: string) => { button(label).click(); await vi.waitFor(() => expect(root.textContent).not.toContain('Loading intake…')); };
@@ -177,7 +177,7 @@ it('retains the previous proposal recovery identity on definite revision validat
 it('locks edits and source controls during held revision and approval responses, including programmatic stale inputs', async () => {
   const h = fixture(); await h.preview();
   const editor = h.root.querySelector<HTMLTextAreaElement>('textarea')!;
-  const plan = { ...proposal.plan, questions: ['Saved bytes'] };
+  const plan = { ...proposal.plan, heists: proposal.plan.heists.map((heist) => ({ ...heist, goal: statement('Saved bytes') })) };
   editor.value = JSON.stringify(plan); editor.dispatchEvent(new Event('input'));
   let release!: (p: Proposal) => void;
   h.client.revise.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
@@ -322,7 +322,7 @@ it('retains valid legacy identity-only recovery and passes chosen repository/doc
   h.view.bind(h.client as unknown as IntakeClient);
   await vi.waitFor(() => expect(h.root.textContent).toContain('Scope: Native capture'));
   await h.click('Browse / upload documents');
-  expect(h.picker.pickIntakeFile).toHaveBeenCalledWith(expect.any(Function), proposal.repoPath, 8);
+  expect(h.picker.pickIntakeFile).toHaveBeenCalledWith(expect.any(Function), proposal.repoPath, 8, expect.any(Function));
   expect(h.client.approve).not.toHaveBeenCalled();
 });
 
@@ -355,4 +355,135 @@ it('finishes observational recovery of approval receipts without a current draft
   expect(h.root.textContent).toContain('one → accepted-one');
   expect(h.client.read).not.toHaveBeenCalled();
   expect(h.client.approve).not.toHaveBeenCalled();
+});
+
+it('clears old repository documents and invalidates old file callbacks on repository change', async () => {
+  const h = fixture(); await h.preview();
+  let old!: (chip: AttachmentChip, uploaded: boolean) => void;
+  h.picker.pickIntakeFile.mockImplementationOnce((cb) => { old = cb; });
+  await h.click('Browse / upload documents');
+  h.picker.pickIntakeRepository.mockImplementationOnce((cb) => cb('/workspace/other'));
+  await h.click('Choose repository');
+  old({ path: '/workspace/app/stale.md', name: 'stale.md', kind: 'file' }, false);
+  expect(h.root.querySelector('.intake-documents')!.textContent).toBe('');
+  await h.click('Preview sources'); expect(h.client.preview).toHaveBeenCalledTimes(1);
+  expect(h.root.textContent).toContain('Choose the primary source document');
+});
+
+it('blocks narrowed previews until the complete in-flight document batch finishes', async () => {
+  const h = fixture(); await h.preview();
+  let publish!: (chip: AttachmentChip, uploaded: boolean) => void;
+  let batch!: (pending: boolean) => void;
+  h.picker.pickIntakeFile.mockImplementationOnce((cb, _repo, _remaining, pending) => { publish = cb; batch = pending!; });
+  await h.click('Browse / upload documents');
+  expect(batch).toBeTypeOf('function'); batch(true);
+  expect(h.button('Browse / upload documents').disabled).toBe(true); expect(h.button('Choose repository').disabled).toBe(true);
+  h.button('Browse / upload documents').click(); expect(h.picker.pickIntakeFile).toHaveBeenCalledTimes(2);
+  const kind = h.root.querySelector('select')!; kind.value = 'issue'; kind.dispatchEvent(new Event('change')); expect(kind.value).toBe('spec');
+  h.button('Preview sources').click(); await Promise.resolve();
+  expect(h.client.preview).toHaveBeenCalledTimes(1);
+  publish({ path: '/uploads/support.md', name: 'support.md', kind: 'file' }, true); batch(false);
+  await h.click('Preview sources');
+  expect(h.client.preview.mock.calls[1]![0].source).toMatchObject({ supporting: [{ uploadPath: '/uploads/support.md' }] });
+});
+
+it('blocks replacement Save and Preview while an ambiguous revision is pending and permits explicit abandonment', async () => {
+  const h = fixture(); await h.preview();
+  const editor = h.root.querySelector('textarea')!; editor.value = JSON.stringify({ ...proposal.plan, questions: ['original'] }); editor.dispatchEvent(new Event('input'));
+  h.client.revise.mockRejectedValueOnce(new IntakeClientError('intake_unreachable', 'Lost response')); await h.click('Save new revision');
+  const saved = sessionStorage.getItem('gru-intake-recovery');
+  editor.value = JSON.stringify({ ...proposal.plan, questions: ['replacement'] }); editor.dispatchEvent(new Event('input'));
+  h.button('Save new revision').click(); h.button('Preview sources').click(); await Promise.resolve();
+  expect(h.client.revise).toHaveBeenCalledTimes(1); expect(h.client.preview).toHaveBeenCalledTimes(1); expect(sessionStorage.getItem('gru-intake-recovery')).toBe(saved);
+  expect(h.root.textContent).toContain('Abandon pending revision');
+  await h.click('Abandon pending revision');
+  expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).pendingRevision).toBeNull();
+  expect(h.client.revise).toHaveBeenCalledTimes(1);
+});
+
+it.each(['intake_output_bounds', 'intake_replay_conflict', 'intake_aggregate_bounds', 'intake_source_bounds'])('restores previous identity on definite revision refusal %s', async (code) => {
+  const h = fixture(); await h.preview();
+  const editor = h.root.querySelector('textarea')!; editor.value = JSON.stringify({ ...proposal.plan, questions: ['invalid'] }); editor.dispatchEvent(new Event('input'));
+  h.client.revise.mockRejectedValueOnce(new IntakeClientError(code, 'Definite refusal')); await h.click('Save new revision');
+  expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!)).toMatchObject({ draft: { requestId: 'r1' }, pendingRevision: null });
+});
+
+it('atomically refuses serialized over-budget recovery before sending approval or changing identities', async () => {
+  const h = fixture();
+  const selected = Array.from({ length: 3900 }, (_, i) => `${i}-${'x'.repeat(120)}`);
+  const approvals = Array.from({ length: 4 }, (_, i) => ({ request: { repoPath: proposal.repoPath, intakeId: `large-${i}`, requestId: 'r1', revisionId: i.toString(16).padStart(64, '0'), expectedToken: null, selected } }));
+  sessionStorage.setItem('gru-intake-recovery', JSON.stringify({ draft: { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: 'r1' }, pendingRevision: null, approvals }));
+  h.view.bind(h.client as unknown as IntakeClient); await vi.waitFor(() => expect(h.button('Choose repository').disabled).toBe(false));
+  const p = { ...proposal, plan: { ...proposal.plan, heists: selected.map((id) => ({ ...proposal.plan.heists[0]!, id })) } };
+  h.client.preview.mockResolvedValueOnce(p); await h.preview(); await h.click('Review this revision');
+  const selection = h.view as unknown as { selected: Set<string>; renderActions(): void };
+  selected.forEach((id) => selection.selected.add(id)); selection.renderActions();
+  const before = sessionStorage.getItem('gru-intake-recovery'); await h.click('Approve selected work');
+  expect(h.client.approve).not.toHaveBeenCalled(); expect(sessionStorage.getItem('gru-intake-recovery')).toBe(before);
+  expect(h.root.textContent).toContain('intake_recovery_storage_error');
+  expect(JSON.parse(sessionStorage.getItem('gru-intake-recovery')!).approvals).toEqual(approvals);
+}, 30_000);
+
+it('reads healthy current draft independently of slow receipts with bounded progressive recovery', async () => {
+  const h = fixture();
+  const approvals = Array.from({ length: 6 }, (_, i) => ({ request: { repoPath: proposal.repoPath, intakeId: `slow-${i}`, requestId: 'r1', revisionId: i.toString(16).padStart(64, '0'), expectedToken: null, selected: ['one'] }, token: i.toString(16).padStart(64, '0') }));
+  sessionStorage.setItem('gru-intake-recovery', JSON.stringify({ draft: { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: 'r1' }, pendingRevision: null, approvals }));
+  const release: ((r: IntakeReadback) => void)[] = [];
+  h.client.readback.mockImplementation((_repo, _intake, token) => token === undefined ? Promise.resolve(reviewed) : new Promise((resolve) => release.push(resolve)));
+  h.view.bind(h.client as unknown as IntakeClient);
+  await vi.waitFor(() => expect(h.root.textContent).toContain('Scope: Native capture'));
+  expect(h.button('Choose repository').disabled).toBe(false); expect(release).toHaveLength(4);
+  release[0]!({ ...partial, review: { ...partial.review!, intakeId: 'slow-0', revisionId: approvals[0]!.request.revisionId, token: approvals[0]!.token } });
+  await vi.waitFor(() => expect(h.root.querySelector('.intake-approval-recovery')!.textContent).toContain('one → accepted-one'));
+  expect(release).toHaveLength(5); h.view.bind(null);
+  release[1]!(partial); await Promise.resolve(); expect(h.root.textContent).not.toContain('one → accepted-one'); expect(h.client.approve).not.toHaveBeenCalled();
+});
+
+it.each(['gaps', 'unmapped', 'plan-question', 'heist-question'])('disables new approval for known %s and shows corrective instructions', async (blocker) => {
+  const h = fixture(); const p = { ...proposal, gaps: blocker === 'gaps' ? [{ code: 'missing', locator: 'source', question: 'Source missing' }] : [], plan: { ...proposal.plan, unmapped: blocker === 'unmapped' ? [{ requirementId: 'requirement', question: 'Requirement missing' }] : [], questions: blocker === 'plan-question' ? ['Plan missing'] : [], heists: proposal.plan.heists.map((heist) => ({ ...heist, unresolvedQuestions: blocker === 'heist-question' ? ['Heist missing'] : [] })) } } as Proposal;
+  h.client.preview.mockResolvedValueOnce(p); await h.preview(); await h.click('Review this revision');
+  const box = h.root.querySelector<HTMLInputElement>('input[type="checkbox"]')!; box.checked = true; box.dispatchEvent(new Event('change'));
+  expect(h.button('Approve selected work').disabled).toBe(true); expect(h.root.textContent).toContain('Resolve source gaps, unmapped requirements and unanswered questions'); expect(h.client.approve).not.toHaveBeenCalled();
+});
+
+it('exposes immutable previous revision comparison in this intake disclosure', async () => {
+  const h = fixture(); h.client.preview.mockResolvedValueOnce({ ...proposal, previousRequestId: 'prior' }); await h.preview();
+  await h.click('Compare previous revision');
+  expect(h.client.diff).toHaveBeenCalledWith(proposal.repoPath, proposal.intakeId, 'prior', 'r1'); expect(h.root.textContent).toContain('Acceptance changed'); expect(h.client.approve).not.toHaveBeenCalled();
+});
+
+it('fails intake visibly closed when durable browser storage is unavailable before effects', async () => {
+  const h = fixture(); const unavailable = { getItem: () => { throw new Error('Unavailable'); }, setItem: () => { throw new Error('Unavailable'); }, removeItem: vi.fn() };
+  const view = new IntakeView(h.root, h.picker, unavailable); view.bind(h.client as unknown as IntakeClient);
+  const buttons = [...h.root.querySelectorAll<HTMLButtonElement>('button')].filter((b) => b.textContent === 'Preview sources'); buttons.at(-1)!.click();
+  await Promise.resolve(); expect(h.client.preview).not.toHaveBeenCalled(); expect(h.root.textContent).toContain('intake_recovery_storage_error');
+});
+
+it('validates all reader field limits before replacing a persisted draft or preview effects', async () => {
+  const h = fixture(); await h.preview();
+  const original = sessionStorage.getItem('gru-intake-recovery');
+  h.picker.pickIntakeRepository.mockImplementationOnce((cb) => cb(`/${'r'.repeat(4096)}`)); await h.click('Choose repository');
+  const kind = h.root.querySelector('select')!; kind.value = 'issue'; kind.dispatchEvent(new Event('change'));
+  await h.click('Preview sources'); expect(h.client.preview).toHaveBeenCalledTimes(1); expect(sessionStorage.getItem('gru-intake-recovery')).toBe(original); expect(h.root.textContent).toContain('intake_recovery_storage_error');
+});
+
+it('retains original draft and pending metadata when durable storage write fails before revision POST', async () => {
+  const h = fixture(); await h.preview(); const saved = sessionStorage.getItem('gru-intake-recovery');
+  const editor = h.root.querySelector('textarea')!; editor.value = JSON.stringify({ ...proposal.plan, questions: ['new'] }); editor.dispatchEvent(new Event('input'));
+  const write = vi.spyOn(sessionStorage, 'setItem').mockImplementation(() => { throw new Error('Quota exhausted'); });
+  await h.click('Save new revision'); expect(h.client.revise).not.toHaveBeenCalled(); expect(sessionStorage.getItem('gru-intake-recovery')).toBe(saved); expect(h.root.textContent).toContain('intake_recovery_storage_error'); write.mockRestore();
+  await h.click('Save new revision'); expect(h.client.revise).toHaveBeenCalledOnce();
+});
+
+it('keeps historical receipt concurrency bounded across overlapping recoveries and pairing generations', async () => {
+  const h = fixture();
+  const approvals = Array.from({ length: 8 }, (_, i) => ({ request: { repoPath: proposal.repoPath, intakeId: `history-${i}`, requestId: 'r1', revisionId: i.toString(16).padStart(64, '0'), expectedToken: null, selected: ['one'] }, token: i.toString(16).padStart(64, '0') }));
+  sessionStorage.setItem('gru-intake-recovery', JSON.stringify({ draft: { repoPath: proposal.repoPath, intakeId: proposal.intakeId, requestId: 'r1' }, pendingRevision: null, approvals }));
+  const release: ((r: IntakeReadback) => void)[] = [];
+  h.client.readback.mockImplementation((_repo, _intake, token) => token === undefined ? Promise.resolve(reviewed) : new Promise((resolve) => release.push(resolve)));
+  h.view.bind(h.client as unknown as IntakeClient); await vi.waitFor(() => expect(h.button('Choose repository').disabled).toBe(false)); expect(release).toHaveLength(4);
+  await h.click('Read back / recover'); expect(release).toHaveLength(4);
+  h.view.bind(h.client as unknown as IntakeClient); await vi.waitFor(() => expect(h.button('Choose repository').disabled).toBe(false)); expect(release).toHaveLength(4);
+  release[0]!(partial); await vi.waitFor(() => expect(release).toHaveLength(5));
+  h.view.bind(null); release.slice(1).forEach((done) => done(partial)); await Promise.resolve(); expect(h.root.textContent).not.toContain('one → accepted-one');
 });

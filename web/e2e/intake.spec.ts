@@ -205,3 +205,32 @@ test('device chooser uploads captured intake bytes without a ready chat attachme
   expect(captured.executable).toBe(false);
   await expect(page.locator('#chat-chips .attach-chip:not(.attach-chip--busy)')).toHaveCount(0);
 });
+
+test('intake fails closed with unavailable session storage while chat keeps its safe fallback', async ({ page }) => {
+  await page.addInitScript(() => { Object.defineProperty(window, 'sessionStorage', { get: () => { throw new Error('Storage unavailable'); } }); });
+  await pair(page);
+  await expect(page.locator('.intake-status')).toContainText('intake_recovery_storage_error');
+  await expect(page.getByRole('button', { name: 'Preview sources', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Choose repository', exact: true })).toBeDisabled();
+  const posts: string[] = []; page.on('request', (request) => { if (request.method() === 'POST' && request.url().includes('/api/intake/')) posts.push(request.url()); });
+  await page.locator('.intake > summary').click(); await page.locator('#chat-input').fill('chat safe fallback remains available'); await page.locator('#chat-send').click();
+  await expect(page.locator('.msg--user').last()).toContainText('chat safe fallback remains available'); expect(posts).toEqual([]);
+});
+
+test('supporting device batch blocks preview until its complete captured selection arrives', async ({ page }) => {
+  await pair(page); await selectRepo(page); await page.getByLabel('Intake source', { exact: true }).selectOption('spec'); await pickDocument(page, 'spec.md');
+  let release!: () => void;
+  await page.route('**/api/attach/uploads', async (route) => { await new Promise<void>((resolve) => { release = resolve; }); await route.continue(); });
+  await page.getByRole('button', { name: 'Browse / upload documents', exact: true }).click();
+  const chooser = page.waitForEvent('filechooser'); await page.locator('#attach-picker-device').click();
+  await (await chooser).setFiles({ name: 'support.md', mimeType: 'text/markdown', buffer: Buffer.from('Explicit supporting captured bytes.\n') });
+  await expect.poll(() => typeof release).toBe('function');
+  await expect(page.getByRole('button', { name: 'Preview sources', exact: true })).toBeDisabled();
+  await expect(page.locator('.intake-status')).toContainText('complete document upload batch');
+  release(); await expect(page.getByRole('button', { name: 'Remove support.md', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Preview sources', exact: true })).toBeEnabled();
+  const response = page.waitForResponse((response) => response.url().endsWith('/api/intake/preview') && response.ok());
+  await page.getByRole('button', { name: 'Preview sources', exact: true }).click(); const captured = await (await response).json() as Proposal;
+  expect(captured.snapshots).toHaveLength(2); expect(captured.snapshots[0]!.raw).toBe('Implement exact native capture.\n'); expect(captured.snapshots[1]!.raw).toBe('Explicit supporting captured bytes.\n');
+  await expect(page.locator('#chat-chips .attach-chip:not(.attach-chip--busy)')).toHaveCount(0);
+});

@@ -32,3 +32,9 @@ it('classifies disconnect after headers during body consumption without automati
   await expect(client().readback('/repo', 'id')).rejects.toMatchObject({ code: 'intake_unreachable', message: expect.stringContaining('Read back') });
   expect(fetcher).toHaveBeenCalledTimes(1);
 });
+
+it('reads immutable revision diff with exact encoded identities and no authority POST', async () => {
+  const fetcher = vi.fn(async () => new Response(JSON.stringify({ changes: [] }), { status: 200 })); vi.stubGlobal('fetch', fetcher);
+  await client().diff('/repo path', 'intake', 'r1', 'r2');
+  expect(fetcher).toHaveBeenCalledOnce(); expect(fetcher).toHaveBeenCalledWith('http://example.test/api/intake/intake/diff?repoPath=%2Frepo+path&from=r1&to=r2', expect.objectContaining({ headers: { authorization: 'Bearer paired' } }));
+});

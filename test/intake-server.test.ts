@@ -365,3 +365,22 @@ it('forwards historical decision tokens after a newer review and retries the ori
   expect(h.ledger.listPipelineEntries()).toHaveLength(2);
   expect((await h.api('GET', path)).body).toEqual(reviewedB.body);
 });
+
+it('refuses concrete unreviewed B with reviewed A current token and leaves zero entries and A head', async () => {
+  const h = await boot();
+  const first = (await h.api('POST', '/api/intake/preview', h.request)).body as unknown as Proposal;
+  const a = (await h.api('POST', '/api/intake/revision', { repoPath: h.repo, intakeId: first.intakeId, requestId: 'reviewed-a', previousRequestId: first.requestId, revisionId: first.revisionId, plan: resolvedIntakePlan(first) })).body as unknown as Proposal;
+  const decision = { repoPath: h.repo, intakeId: a.intakeId, requestId: a.requestId, revisionId: a.revisionId, expectedToken: null };
+  const reviewed = await h.api('POST', '/api/intake/review', decision);
+  const b = (await h.api('POST', '/api/intake/revision', { repoPath: h.repo, intakeId: a.intakeId, requestId: 'unreviewed-b', previousRequestId: a.requestId, revisionId: a.revisionId, plan: a.plan })).body as unknown as Proposal;
+  expect(await h.api('POST', '/api/intake/approve', { ...decision, requestId: b.requestId, revisionId: b.revisionId, expectedToken: (reviewed.body.review as { token: string }).token, selected: ['heist-1'] })).toMatchObject({ status: 409, body: { error: 'intake_stale_review' } });
+  expect((await h.api('GET', `/api/intake/${a.intakeId}/review?${query(h.repo)}`)).body).toEqual(reviewed.body);
+  expect(h.ledger.listPipelineEntries()).toEqual([]); expect(h.dispatch).not.toHaveBeenCalled();
+});
+
+it('declares existing scoped paired-shell intake acceptance in CI', () => {
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  expect(ci).toContain('run: npm run build:web');
+  expect(ci).toContain('run: npx playwright install --with-deps chromium');
+  expect(ci).toMatch(/working-directory: web\s+run: npx playwright test --project=intake/u);
+});

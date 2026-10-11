@@ -9,6 +9,7 @@ import { resolvedIntakePlan } from './helpers/intake-plan.js';
 import { PipelineService } from '../src/dispatch/pipeline.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { canonical, digest, type IntakeReviewRecord } from '../src/intake/types.js';
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
@@ -297,4 +298,85 @@ it('refuses current/historical recovery and original retry of a drifted accepted
   h.db.handle.prepare('UPDATE pipeline_entries SET briefing = ? WHERE id = ?').run('different accepted bytes', accepted.accepted[0]!.entryId);
   for (const operation of [() => h.approval.read(h.repoPath, 'feature'), () => h.approval.read(h.repoPath, 'feature', accepted.review!.token), () => h.approval.approve(h.accept)]) expect(operation).toThrowError(expect.objectContaining({ code: 'intake_acceptance_conflict' }));
   expect(h.ledger.listPipelineEntries()).toHaveLength(1); expect(h.dispatch).not.toHaveBeenCalled();
+});
+
+it('refuses case and terminal punctuation mutations of known conservative defaults', async () => {
+  const h = await fixture();
+  const mutate = <T extends { readonly text: string }>(s: T): T => ({ ...s, text: `${s.text.toUpperCase()}...?!` });
+  const plan = { ...h.first.plan, questions: [], heists: h.first.plan.heists.map((heist) => ({ ...heist, unresolvedQuestions: [], goal: mutate(heist.goal), scope: heist.scope.map(mutate), exclusions: heist.exclusions.map(mutate), acceptance: heist.acceptance.map(mutate), verification: heist.verification.map(mutate), splitMergeRationale: mutate(heist.splitMergeRationale) })) };
+  const p = await h.intake.revise({ repoPath: h.repoPath, intakeId: 'feature', requestId: 'cosmetic', previousRequestId: h.first.requestId, revisionId: h.first.revisionId, plan });
+  const d = { ...h.decision, requestId: p.requestId, revisionId: p.revisionId, expectedToken: h.review.token };
+  const reviewed = h.approval.review(d).review!;
+  expect(() => h.approval.approve({ ...d, expectedToken: reviewed.token, selected: ['heist-1'] })).toThrowError(expect.objectContaining({ code: 'intake_incomplete_plan' }));
+  expect(h.approval.read(h.repoPath, 'feature').review).toEqual(reviewed);
+  expect(h.ledger.listPipelineEntries()).toEqual([]);
+});
+
+it('verifies every immutable acceptance field without freezing owner holds or lifecycle', async () => {
+  const h = await fixture(); const accepted = h.approval.approve(h.accept);
+  const id = accepted.accepted[0]!.entryId;
+  h.db.handle.prepare("UPDATE pipeline_entries SET hold_reason = 'Owner pause', state = 'cancelled' WHERE id = ?").run(id);
+  expect(h.approval.read(h.repoPath, 'feature').accepted[0]!.state).toBe('cancelled');
+  expect(h.approval.approve(h.accept).accepted[0]!.state).toBe('cancelled');
+  const mutations = [['priority', 9, 5], ['exclusive_scopes', '["private-lock"]', '[]'], ['repo', 'foreign', 'demo'], ['briefing_hash', 'bad', h.ledger.getPipelineEntry(id)!.briefingHash], ['payload_hash', 'bad', h.ledger.getPipelineEntry(id)!.payloadHash]] as const;
+  for (const [field, changed, original] of mutations) {
+    h.db.handle.prepare(`UPDATE pipeline_entries SET ${field} = ? WHERE id = ?`).run(changed, id);
+    for (const operation of [() => h.approval.read(h.repoPath, 'feature'), () => h.approval.read(h.repoPath, 'feature', accepted.review!.token), () => h.approval.approve(h.accept)]) expect(operation).toThrowError(expect.objectContaining({ code: 'intake_acceptance_conflict' }));
+    h.db.handle.prepare(`UPDATE pipeline_entries SET ${field} = ? WHERE id = ?`).run(original, id);
+  }
+  expect(h.ledger.listPipelineEntries()).toHaveLength(1);
+});
+
+it('refuses aggregate over-budget history before parsing any record and retains history', async () => {
+  const h = await fixture();
+  const huge = 'x'.repeat(1024 * 1024);
+  const insert = h.db.handle.prepare('INSERT INTO intake_reviews(token, repo_path, intake_id, revision_id, status, record) VALUES (?, ?, ?, ?, ?, ?)');
+  for (let index = 0; index < 9; index += 1) insert.run(index.toString(16).padStart(64, '0'), h.repoPath, 'feature', h.proposal.revisionId, 'reviewed', huge);
+  const parse = vi.spyOn(JSON, 'parse');
+  for (const operation of [() => h.ledger.getIntakeReview(h.repoPath, 'feature'), () => h.ledger.getIntakeReview(h.repoPath, 'feature', h.review.token), () => h.ledger.recordIntakeReview(h.review)]) expect(operation).toThrowError(expect.objectContaining({ code: 'intake_storage_error', message: expect.stringContaining('byte verification bound') }));
+  expect(parse).not.toHaveBeenCalled(); parse.mockRestore();
+  expect(h.db.handle.prepare('SELECT COUNT(*) AS count FROM intake_reviews').get()).toEqual({ count: 10 });
+  expect(h.ledger.listPipelineEntries()).toEqual([]);
+});
+
+it('refuses selected-heist questions as the only unresolved material with unchanged head', async () => {
+  const h = await fixture();
+  const p = await h.intake.revise({ repoPath: h.repoPath, intakeId: 'feature', revisionId: h.proposal.revisionId, requestId: 'heist-question', previousRequestId: h.proposal.requestId, plan: { ...h.proposal.plan, heists: h.proposal.plan.heists.map((heist) => ({ ...heist, unresolvedQuestions: ['Which HTTP status is required?'] })) } });
+  expect(p.gaps).toEqual([]); expect(p.plan.questions).toEqual([]); expect(p.plan.unmapped).toEqual([]);
+  const d = { ...h.decision, requestId: p.requestId, revisionId: p.revisionId, expectedToken: h.review.token };
+  const reviewed = h.approval.review(d).review!;
+  expect(() => h.approval.approve({ ...d, expectedToken: reviewed.token, selected: ['heist-1'] })).toThrowError(expect.objectContaining({ code: 'intake_incomplete_plan' }));
+  expect(h.approval.read(h.repoPath, 'feature').review).toEqual(reviewed); expect(h.ledger.listPipelineEntries()).toEqual([]);
+});
+
+it('refuses over-budget decision work before parsing and retains every historical row', async () => {
+  const h = await fixture();
+  const insert = h.db.handle.prepare('INSERT INTO intake_reviews(token, repo_path, intake_id, revision_id, status, record) VALUES (?, ?, ?, ?, ?, ?)');
+  for (let i = 0; i < 4096; i += 1) insert.run(i.toString(16).padStart(64, '0'), h.repoPath, 'feature', h.proposal.revisionId, 'reviewed', '{}');
+  const parse = vi.spyOn(JSON, 'parse');
+  expect(() => h.ledger.getIntakeReview(h.repoPath, 'feature')).toThrowError(expect.objectContaining({ code: 'intake_storage_error', message: expect.stringContaining('4096-decision verification bound') }));
+  expect(parse).not.toHaveBeenCalled(); parse.mockRestore();
+  expect(h.db.handle.prepare('SELECT COUNT(*) AS count FROM intake_reviews').get()).toEqual({ count: 4097 }); expect(h.ledger.listPipelineEntries()).toEqual([]);
+});
+
+it('refuses a prospective aggregate history overflow atomically while the existing chain stays readable', async () => {
+  const h = await fixture();
+  let head = h.review;
+  const freeze = (body: Omit<IntakeReviewRecord, 'token'>): IntakeReviewRecord => ({ ...body, token: digest(canonical(body)) });
+  for (let i = 0; i < 7; i += 1) {
+    const { token: _token, ...previous } = head;
+    const reviewed = freeze({ ...previous, status: 'reviewed', requestId: `large-${i}`, revisionId: digest(`large-${i}`), previousToken: head.token, selected: [], entries: [] });
+    h.ledger.recordIntakeReview(reviewed);
+    const { token: _reviewedToken, ...reviewedBody } = reviewed;
+    head = freeze({ ...reviewedBody, previousToken: reviewed.token, status: 'approved', selected: ['one'], entries: [{ id: `large-${i}`, requestId: `large-${i}`, repoPath: h.repoPath, title: 'Bounded history', briefing: 'x'.repeat(1024 * 1024), prerequisites: [] }] });
+    h.ledger.recordIntakeReview(head);
+  }
+  const { token: _token, ...previous } = head;
+  const reviewed = freeze({ ...previous, status: 'reviewed', requestId: 'overflow', revisionId: digest('overflow'), previousToken: head.token, selected: [], entries: [] });
+  h.ledger.recordIntakeReview(reviewed);
+  const { token: _reviewedToken, ...body } = reviewed;
+  const overflow = freeze({ ...body, status: 'approved', previousToken: reviewed.token, selected: ['one'], entries: [{ id: 'overflow', requestId: 'overflow', repoPath: h.repoPath, title: 'Overflow', briefing: 'x'.repeat(1536 * 1024), prerequisites: [] }] });
+  const before = h.db.handle.prepare('SELECT COUNT(*) AS count FROM intake_reviews').get();
+  expect(() => h.ledger.recordIntakeReview(overflow)).toThrowError(expect.objectContaining({ code: 'intake_storage_error', message: expect.stringContaining('byte verification bound') }));
+  expect(h.ledger.getIntakeReview(h.repoPath, 'feature')).toEqual(reviewed); expect(h.db.handle.prepare('SELECT COUNT(*) AS count FROM intake_reviews').get()).toEqual(before); expect(h.ledger.listPipelineEntries()).toEqual([]);
 });

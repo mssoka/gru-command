@@ -342,6 +342,7 @@ describe('composer attach consumer paths', () => {
     const second = new File(['two'], 'same.png', { type: 'image/png' });
     const fileInput = document.getElementById('chat-attach-file') as HTMLInputElement;
     Object.defineProperty(fileInput, 'files', { configurable: true, value: [first, second] });
+    document.getElementById('chat-attach')!.click(); document.getElementById('attach-picker-device')!.click();
     fileInput.dispatchEvent(new Event('change'));
     expect(resolvers).toHaveLength(2);
     expect(document.querySelectorAll('.attach-chip--busy')).toHaveLength(2);
@@ -491,7 +492,7 @@ it('publishes intake device uploads in chooser order despite reversed completion
   const picked = vi.fn(); view.pickIntakeFile(picked);
   const input = document.getElementById('chat-attach-file') as HTMLInputElement;
   Object.defineProperty(input, 'files', { configurable: true, value: [new File(['primary'], 'primary.md'), new File(['support'], 'support.md')] });
-  input.dispatchEvent(new Event('change'));
+  document.getElementById('attach-picker-device')!.click(); input.dispatchEvent(new Event('change'));
   resolves.get('support.md')!({ path: '/uploads/support.md', name: 'support.md', bytes: 7 });
   await settle(); expect(picked).not.toHaveBeenCalled();
   resolves.get('primary.md')!({ path: '/uploads/primary.md', name: 'primary.md', bytes: 7 });
@@ -509,7 +510,7 @@ it.each(['primary.md', 'support.md'])('refuses an incomplete intake upload selec
   const picked = vi.fn(); view.pickIntakeFile(picked);
   const input = document.getElementById('chat-attach-file') as HTMLInputElement;
   Object.defineProperty(input, 'files', { configurable: true, value: [new File(['primary'], 'primary.md'), new File(['support'], 'support.md')] });
-  input.dispatchEvent(new Event('change'));
+  document.getElementById('attach-picker-device')!.click(); input.dispatchEvent(new Event('change'));
   await vi.waitFor(() => expect(document.querySelectorAll('.attach-chip--busy')).toHaveLength(0));
   await settle();
   expect(picked).not.toHaveBeenCalled();
@@ -545,9 +546,9 @@ it('repository picker forbids device and stale file-input uploads, then restores
   document.getElementById('attach-picker-close')!.click(); input.dispatchEvent(new Event('change'));
   expect(click).not.toHaveBeenCalled(); expect(upload).not.toHaveBeenCalled(); expect(repository).not.toHaveBeenCalled();
   expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(0);
-  document.getElementById('chat-attach')!.click(); await settle(); input.dispatchEvent(new Event('change')); await settle();
+  document.getElementById('chat-attach')!.click(); await settle(); device.click(); input.dispatchEvent(new Event('change')); await settle();
   expect(upload).toHaveBeenCalledOnce();
-  view.pickIntakeFile(documentPick, '/workspace/app'); await settle(); input.dispatchEvent(new Event('change'));
+  view.pickIntakeFile(documentPick, '/workspace/app'); await settle(); device.click(); input.dispatchEvent(new Event('change'));
   await vi.waitFor(() => expect(documentPick).toHaveBeenCalledOnce());
   expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(1);
 });
@@ -556,14 +557,59 @@ it('admits eight ordered intake documents independently of a ready composer chip
   const view = new ChatView(() => true), upload = vi.fn(async (file: File) => ({ path: `/uploads/${file.name}`, name: file.name, bytes: file.size }));
   view.bindAttach(surface({ upload }));
   const input = document.getElementById('chat-attach-file') as HTMLInputElement;
-  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['chat'], 'chat.md')] }); input.dispatchEvent(new Event('change')); await settle();
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['chat'], 'chat.md')] }); document.getElementById('chat-attach')!.click(); document.getElementById('attach-picker-device')!.click(); input.dispatchEvent(new Event('change')); await settle();
   expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(1);
   const picked = vi.fn(); view.pickIntakeFile(picked, '/workspace/app', 8); await settle();
   const files = Array.from({ length: 8 }, (_, index) => new File(['intake'], `document-${index}.md`));
-  Object.defineProperty(input, 'files', { configurable: true, value: files }); input.dispatchEvent(new Event('change'));
+  Object.defineProperty(input, 'files', { configurable: true, value: files }); document.getElementById('attach-picker-device')!.click(); input.dispatchEvent(new Event('change'));
   await vi.waitFor(() => expect(picked).toHaveBeenCalledTimes(8));
   expect(picked.mock.calls.map(([chip]) => chip.name)).toEqual(files.map(({ name }) => name));
   expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(1);
-  view.pickIntakeFile(picked, '/workspace/app', 0); await settle(); input.dispatchEvent(new Event('change'));
+  view.pickIntakeFile(picked, '/workspace/app', 0); await settle(); document.getElementById('attach-picker-device')!.click(); input.dispatchEvent(new Event('change'));
   await settle(); expect(upload).toHaveBeenCalledTimes(9); expect(picked).toHaveBeenCalledTimes(8);
+});
+
+it.each(['pairing', 'repository', 'intake', 'chat'])('rejects late device chooser change across %s target changes', async (target) => {
+  const view = new ChatView(() => true), upload = vi.fn(async (file: File) => ({ path: `/uploads/${file.name}`, name: file.name, bytes: file.size }));
+  view.bindAttach(surface({ upload }));
+  const old = vi.fn(), current = vi.fn(); view.pickIntakeFile(old, '/workspace/app'); await settle();
+  document.getElementById('attach-picker-device')!.click();
+  if (target === 'pairing') view.bindAttach(surface({ upload }));
+  if (target === 'repository') view.pickIntakeRepository(current);
+  if (target === 'intake') view.pickIntakeFile(current, '/workspace/other');
+  if (target === 'chat') document.getElementById('chat-attach')!.click();
+  const input = document.getElementById('chat-attach-file') as HTMLInputElement;
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['stale'], 'stale.md')] }); input.dispatchEvent(new Event('change')); await settle();
+  expect(upload).not.toHaveBeenCalled(); expect(old).not.toHaveBeenCalled(); expect(current).not.toHaveBeenCalled(); expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(0);
+});
+
+it('retains a captured intake upload batch while the ordinary chat picker remains usable', async () => {
+  const view = new ChatView(() => true);
+  const releases = new Map<string, (file: UploadedFile) => void>();
+  view.bindAttach(surface({ upload: (file) => new Promise((resolve) => { releases.set(file.name, resolve); }) }));
+  const picked = vi.fn(), batch = vi.fn();
+  view.pickIntakeFile(picked, '/workspace/app', 8, batch); await settle();
+  const input = document.getElementById('chat-attach-file') as HTMLInputElement;
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['primary'], 'primary.md'), new File(['support'], 'support.md')] });
+  document.getElementById('attach-picker-device')!.click(); input.dispatchEvent(new Event('change'));
+  expect(batch).toHaveBeenLastCalledWith(true);
+  document.getElementById('chat-attach')!.click(); await settle();
+  expect(document.getElementById('attach-picker')!.hidden).toBe(false);
+  releases.get('support.md')!({ path: '/uploads/support.md', name: 'support.md', bytes: 7 });
+  releases.get('primary.md')!({ path: '/uploads/primary.md', name: 'primary.md', bytes: 7 });
+  await vi.waitFor(() => expect(picked).toHaveBeenCalledTimes(2));
+  expect(picked.mock.calls.map(([chip]) => chip.name)).toEqual(['primary.md', 'support.md']);
+  expect(batch).toHaveBeenLastCalledWith(false);
+  expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(0);
+});
+
+it('does not replace an outstanding chooser target and accepts a fresh chooser after explicit OS cancellation', async () => {
+  const view = new ChatView(() => true), upload = vi.fn(async (file: File) => ({ path: `/uploads/${file.name}`, name: file.name, bytes: file.size })); view.bindAttach(surface({ upload }));
+  const old = vi.fn(), current = vi.fn(); view.pickIntakeFile(old); await settle();
+  const device = document.getElementById('attach-picker-device')!; device.click(); view.pickIntakeFile(current); await settle(); device.click();
+  const input = document.getElementById('chat-attach-file') as HTMLInputElement;
+  Object.defineProperty(input, 'files', { configurable: true, value: [new File(['bytes'], 'source.md')] }); input.dispatchEvent(new Event('change')); await settle();
+  expect(upload).not.toHaveBeenCalled(); expect(old).not.toHaveBeenCalled(); expect(current).not.toHaveBeenCalled();
+  device.click(); input.dispatchEvent(new Event('cancel')); device.click(); input.dispatchEvent(new Event('change'));
+  await vi.waitFor(() => expect(current).toHaveBeenCalledOnce()); expect(upload).toHaveBeenCalledOnce();
 });

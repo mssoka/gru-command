@@ -255,7 +255,11 @@ function startChat(token: string): void {
     browse: (path) => attachClient.browse(path),
     upload: async (file) => attachClient.upload(file.name, await readFileBytes(file)),
   });
-  intakeView ??= new IntakeView(mustGet('intake-mount'), chatView, chatStorage);
+  intakeView ??= new IntakeView(mustGet('intake-mount'), chatView, {
+    getItem: (key) => window.sessionStorage.getItem(key),
+    setItem: (key, value) => window.sessionStorage.setItem(key, value),
+    removeItem: (key) => window.sessionStorage.removeItem(key),
+  });
   if (intakeToken !== null && intakeToken !== token) intakeView.clearRecovery();
   intakeToken = token;
   intakeView.bind(new IntakeClient({ token, host: location.host, secure }));
