@@ -36,7 +36,7 @@ export const EXPECTED_FORMAL_EVENT_ASSERTIONS = Object.freeze({
     'GitHub SHA-bound Perkins delivery never certifies absence when the frozen head carries a body-identical review in the wrong state (formal GitHub)',
     'formal GitHub verdict publication from native judgments publishes a real approval, a real change request, keeps a final-pass-debt READY a comment, and clears the change request with a later eligible READY (formal GitHub)',
     'formal GitHub verdict publication from native judgments refuses a publisher receipt that did not enact the intended formal state, and never retries it (formal GitHub)',
-    'refuses a GitHub receipt with no commit binding at the host boundary (formal GitHub)',
+    'WaveRunner delivery receipts, reconciliation, prior selection, and disclosure refuses a GitHub receipt with no commit binding at the host boundary (formal GitHub)',
   ]),
 });
 
