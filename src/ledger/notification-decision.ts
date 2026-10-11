@@ -59,7 +59,17 @@ export interface NotificationDecision {
 }
 
 const OPTION_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
-const CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+/** Reject C0 controls (except tab/LF) and DEL without a raw control range
+ * literal in the source. */
+function hasControlChars(value: string): boolean {
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code === 0x7f) return true;
+    if (code < 0x20 && code !== 0x09 && code !== 0x0a) return true;
+  }
+  return false;
+}
 
 function boundedString(
   value: unknown,
@@ -68,7 +78,7 @@ function boundedString(
   opts: { readonly allowNewlines?: boolean } = {},
 ): string {
   if (typeof value !== 'string') throw new Error(`${what} must be a string`);
-  if (CONTROL_CHARS.test(value)) throw new Error(`${what} must not contain control characters`);
+  if (hasControlChars(value)) throw new Error(`${what} must not contain control characters`);
   if (opts.allowNewlines !== true && value.includes('\n')) throw new Error(`${what} must be a single line`);
   const trimmed = value.trim();
   if (trimmed === '') throw new Error(`${what} must not be blank`);

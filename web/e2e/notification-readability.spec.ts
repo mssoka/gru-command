@@ -8,7 +8,6 @@ import {
   type BoardSnapshot,
   type JobView,
   type NotificationView,
-  type OwnerPrView,
 } from '../src/lib/board-protocol.js';
 
 /**
@@ -492,16 +491,19 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       await card.locator('.board-notification__details summary').click();
       await expect(card.locator('.board-notification__detail-text')).toContainText(LONG_PATH);
       const option = card.locator('[data-action-id$=":option:approve"]');
-      await option.scrollIntoViewIfNeeded();
+      // Bring the control to the middle of the viewport (away from the
+      // sticky chrome) and prove it is genuinely reachable: its center is
+      // the topmost hit target, and a trial click passes actionability.
+      await option.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+      await settled(page);
       await expect(option).toBeVisible();
-      // The control is genuinely reachable: its center is the topmost hit
-      // target (no fixed overlay covers the option button).
       const hit = await option.evaluate((element) => {
         const rect = element.getBoundingClientRect();
         const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
         return topmost !== null && (topmost === element || element.contains(topmost));
       });
       expect(hit).toBe(true);
+      await option.click({ trial: true });
       await captureViewport(page, 'zoom-200-decision', '200% zoom emulation: decision card with Details open');
     } finally {
       await context.close();

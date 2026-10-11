@@ -33,7 +33,6 @@ import {
   jobStatusTone,
   lensChipState,
   lensChipTone,
-  LESSONS_PROPOSAL_KIND,
   type AgentView,
   type BoardSnapshot,
   type JobView,
