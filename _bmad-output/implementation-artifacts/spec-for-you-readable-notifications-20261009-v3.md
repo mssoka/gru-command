@@ -192,13 +192,22 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
   `8d98be911a23df52a1abc786722157df3913308f`. The migration collision was
   resolved by retaining main's migrations 26–27 and assigning the
   never-applied owner-decision migration ID 28. The exact-head `full`
-  scope passed; the browser scope passed 65/66, with the mock theme
-  snapshot at `web/e2e/smoke.spec.ts:1470` still unresolved. The expected
-  main snapshot shows three legacy FOR YOU rows while the current smoke
-  test expects two rows with the typed decision card; the targeted snapshot
-  repair is pending.
+  scope passed; the browser scope completed 66 tests (65 passed, 1 failed)
+  at the mock theme snapshot in `web/e2e/smoke.spec.ts:1470`. The main
+  snapshot showed three legacy FOR YOU rows while the branch's smoke test
+  expects two rows with the typed decision card. The merge kept main's PNG
+  despite that test change. The captured screen matches the test contract;
+  only the light/dark theme snapshots were refreshed by the targeted test
+  (1 passed) and visually inspected. Final scheduled browser verification
+  remains pending.
 
 ## Spec Change Log
+
+- 2026-10-11 R13: added fresh-DOM 2× assertions for the rebuilt owner and
+  bell decision diagnostics. The mock theme snapshots were refreshed after
+  tracing the integrated-head mismatch to main's stale three-row images;
+  the targeted theme test passed and the light/dark results were inspected.
+  Exact-head scheduled full/browser verification remains pending.
 
 ## Review Triage Log
 
@@ -358,8 +367,9 @@ omitted the fresh owner Details diagnostic and the bell decision Details
 diagnostic. Both findings were acted on: add replacement probes and
 independently measure each fresh-node baseline before asserting 2× after
 reapplication. No product CSS changed. Verification-gap also surfaced the
-65/66 browser result; the stale main smoke snapshot remains an open
-verification issue outside the R13 test hunk.
+single browser failure. Investigation traced it to main's stale theme
+snapshots; only those two images were refreshed and the focused test
+passed. Exact-head scheduled browser verification remains pending.
 
 ## Design Notes
 
