@@ -214,7 +214,7 @@ describe('baseline classifier — Playwright (browser) branch', () => {
       { playwright: true, substrs },
     );
     expect(result.code).toBe(3);
-    expect(result.err).toMatch(/name NO slim surface/u);
+    expect(result.err).toMatch(/browser setup\/runtime failure before feature assertions/u);
   });
 
   it('reads a timedOut/unexpected result message instead of mapping it to an empty string', () => {

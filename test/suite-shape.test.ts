@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
  */
 const PINS: Record<string, number> = {
   'assert-binned-baseline.test.ts': 3,
-  'classify-baseline.test.ts': 16,
+  'classify-baseline.test.ts': 18,
   'assert-merge-authority-baseline.test.ts': 8,
   'assert-repo-overview-baseline.test.ts': 4,
   'assert-verify-keepalive-baseline.test.ts': 7,
