@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
@@ -18,10 +19,11 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
-import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
 import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { BoardEngine } from '../src/board/engine.js';
+import { VerificationScheduler } from '../src/verify/scheduler.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { reconcilePendingDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import { findBusyLanes, laneIsBusy } from '../src/dispatch/branch-idle.js';
@@ -80,7 +82,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; workerGate?: PacingGate;
+async function boot(opts: { completeReview?: boolean; wrapLedger?: (ledger: LedgerApi) => LedgerApi; workerGate?: PacingGate;
   pendingProducerBlockers?: (jobId: string) => readonly string[] } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-retirement-'));
   cleanupDirs.push(dir);
@@ -94,6 +96,16 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
   const ledger = opts.wrapLedger === undefined ? rawLedger : opts.wrapLedger(rawLedger);
   const notifications = new NotificationCenter({ ledger, bus });
   const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  if (opts.completeReview === true) {
+    const recordLane = (lane: WorktreeLane): WorktreeLane => {
+      ledger.registerWorktree({ id: lane.id, kind: lane.kind, repoPath: lane.repoPath, repoName: lane.repoName,
+        path: lane.path, branch: lane.branch, sha: lane.sha, jobId: lane.jobId, roundId: lane.roundId });
+      return lane;
+    };
+    const jobLane = worktrees.createJobWorktree.bind(worktrees); const reviewLane = worktrees.createReviewWorktree.bind(worktrees);
+    vi.spyOn(worktrees, 'createJobWorktree').mockImplementation(async (input) => recordLane(await jobLane(input)));
+    vi.spyOn(worktrees, 'createReviewWorktree').mockImplementation(async (input) => recordLane(await reviewLane(input)));
+  }
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const reviewSessions = join(dir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
@@ -102,7 +114,17 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
   const liveHandles = new Map<string, AgentHandle>();
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
-    if (role === 'perkins') return hybrid.spawner(role, options);
+    if (role === 'perkins') {
+      const handle = await hybrid.spawner(role, options);
+      if (opts.completeReview !== true) return handle;
+      return { ...handle,
+        async prompt(...args: Parameters<AgentHandle['prompt']>) {
+          await handle.prompt(...args);
+          if (ledger.getAgent(handle.id) !== null) ledger.setAgentState(handle.id, 'idle');
+        },
+        async dispose() { await handle.dispose(); if (ledger.getAgent(handle.id) !== null) ledger.setAgentState(handle.id, 'disposed'); },
+      };
+    }
     const id = options?.agentId ?? `agent-${spawns.length}`;
     const sessionFile = options?.resumeFile ?? join(dir, 'native-sessions', `${id}.jsonl`);
     let state: AgentState = 'idle';
@@ -148,20 +170,24 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
     spawner,
     bus,
     poster: {
-      async post(input: { readonly targetSha: string; readonly body: string }) {
+      async post(input: { readonly targetSha: string; readonly body: string; readonly baseSha: string }) {
         return {
           reviewId: '9001',
           actor: 'gru-bot',
           event: 'COMMENTED',
           commitId: input.targetSha,
           headSha: input.targetSha,
-          baseSha: 'stub-base',
-          bodySha256: 'stub-body',
+          baseSha: opts.completeReview === true ? input.baseSha : 'stub-base',
+          bodySha256: opts.completeReview === true ? createHash('sha256').update(input.body, 'utf8').digest('hex') : 'stub-body',
         };
       },
     },
     reviewArtifactRoot: join(dir, 'reviews'),
-    prHeadProbe: originHeadProbe(),
+    ...(opts.completeReview === true ? {
+      reviewPreflight: async () => ({ ok: true as const, failures: [], reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' } }),
+      reviewRuntimeIdentity: () => ({ id: 'pi', version: 'test-runtime-v1' }),
+    } : {}),
+    prHeadProbe: opts.completeReview === true ? async ({ repoPath, branchRef }) => ({ headRefName: branchRef, headSha: resolveGitCommit(repoPath, branchRef) }) : originHeadProbe(),
   });
   const registry: DirectiveRegistry = {
     getHandle: (id: string) => liveHandles.get(id) ?? null,
@@ -2073,9 +2099,17 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
 });
 
 describe('legacy proven completion without fabricated historical delivery', () => {
-  async function completedFixture() {
-    const h = await boot(); const repo = makeFixtureRepo('completed-control-http'); cleanupRepos.push(repo);
+  async function completedFixture(full = false) {
+    const h = await boot({ completeReview: full }); const repo = makeFixtureRepo('completed-control-http'); cleanupRepos.push(repo);
+    if (full) { attachBareOrigin(repo); repo.git(['push', 'origin', 'main']); }
     const jobId = 'completed-control-job'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
+    if (full) {
+      h.ledger.setJobPr(jobId, 'https://github.com/example/fixture/pull/1');
+      mkdirSync(join(lane.path, '.gru-command'), { recursive: true });
+      writeFileSync(join(lane.path, '.gru-command', 'worktree.toml'), '[verify]\nfull = "test ! -f .P37-fail && printf verified"\n');
+      execFileSync('git', ['-C', lane.path, 'add', '.gru-command/worktree.toml']);
+      execFileSync('git', ['-C', lane.path, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'declare genuine full fixture gate'], { stdio: 'ignore' });
+    }
     const originalMarkers = h.ledger.beginPendingRebrief({ jobId, note: 'old completed work', briefing: 'original approved scope',
       handoff: { kind: 'gru-decision', decision: 'original phase completion' } });
     await bindOriginalRebriefSdkOwner(h.ledger, originalMarkers, { cwd: lane.path, dataDir: h.dir, agentId: 'original-completed-minion' });
@@ -2099,6 +2133,104 @@ describe('legacy proven completion without fabricated historical delivery', () =
       decision: { kind: 'reconcile-completed', inspection_request_id: 'separate-current-inspection' } });
     return { h, lane, jobId, markers, marker, original, debt, route, body };
   }
+
+  async function verifiedCurrentGateFixture() {
+    const f = await completedFixture(true); const { h } = f;
+    expect((await call(h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN)).status).toBe(200);
+    const closure = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')!;
+    expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: 'separate-current-inspection', directive: (closure.payload as { inspection_directive: string }).inspection_directive }, TOKEN)).status).toBe(202);
+    await waitFor(() => h.ledger.getDirective('separate-current-inspection')?.state === 'settled', 'P37 real inspection');
+    const root = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-current-gates-owed')!;
+    const duty = h.ledger.getObligation((root.payload as { obligation_id: string }).obligation_id)!;
+    execFileSync('git', ['-C', f.lane.path, 'push', 'origin', f.lane.branch!], { stdio: 'ignore' });
+    const scheduler = new VerificationScheduler({ storageDir: join(h.dir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, record: (event) => { h.ledger.appendCustomEvent(event); } });
+    try {
+      const outcome = await scheduler.submit({ jobId: f.jobId, scope: 'full', command: 'test ! -f .P37-fail && printf verified', cwd: f.lane.path, requestId: 'P37-original-full' }, () => {});
+      expect(outcome.ok).toBe(true); expect(outcome.trackedDirty).toBe(false);
+      const begun = await h.wave.beginRound({ jobId: f.jobId, targetRef: f.lane.branch! }); const result = await begun.run;
+      expect(result, JSON.stringify(h.ledger.listJobEventsByKinds(f.jobId, ['round.error', 'round.status', 'round.perkins-review']))).toMatchObject({ verdict: 'approved' });
+      const evidence = h.ledger.latestRoundEvent(begun.round.id, 'round.perkins-review')!;
+      expect(evidence.payload).toMatchObject({ canonicalVerdict: 'READY TO MERGE', complete: true, reviewScope: 'whole' });
+      return { f, h, root, duty, scheduler, evidence };
+    } catch (error) { await scheduler.dispose(); throw error; }
+  }
+
+  it('P37 unknown newer pending and aborted round remains fenced without fabricated ownership cleanup', async () => {
+    const { f, h, root, duty, scheduler, evidence } = await verifiedCurrentGateFixture();
+    try {
+      const disposition = { kind: 'accepted-evidence' as const, gate: 'older genuine complete gates', evidenceEventKind: evidence.kind, evidenceEventSeq: evidence.seq };
+      const pending = h.ledger.addRound({ jobId: f.jobId, lenses: [], targetRef: f.lane.branch! });
+      expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: disposition })).toThrow(/producer ownership/);
+      h.ledger.setRoundStatus(pending.id, 'aborted');
+      expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: disposition })).toThrow(/newest/);
+      await expect(h.wave.beginRound({ jobId: f.jobId, targetRef: f.lane.branch! })).rejects.toThrow(/no trusted no-spawn proof|ownership is unknown/);
+      expect(h.ledger.latestRoundEvent(pending.id, 'round.perkins-review')).toBeNull();
+      expect(h.ledger.getObligation(duty.id)?.state).toBe('open'); expect(h.ledger.getEvent(root.seq)).toEqual(root);
+      const db = new LedgerDb(h.dir); const reopened = new LedgerApi(db.handle);
+      try { expect(() => reopened.settleObligation({ obligationId: duty.id, settlement: disposition })).toThrow(/newest/); expect(reopened.getObligation(duty.id)?.state).toBe('open'); }
+      finally { db.close(); }
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('P37 actual declared full scheduler and newest complete whole review settle exact protected duty without rewriting its root', async () => {
+    const { f, h, root, duty, scheduler, evidence } = await verifiedCurrentGateFixture();
+    try {
+      const originalPayload = evidence.payload as Record<string, unknown>;
+      for (const change of [{ canonicalVerdict: 'NEEDS CHANGES' }, { blockers: 1 }, { complete: false }, { headMoved: true },
+        { reviewScope: 'delta' }, { finalPassRequired: true }, { targetSha: 'a'.repeat(40) }]) {
+        h.db.handle.prepare('UPDATE events SET payload = ? WHERE seq = ?').run(JSON.stringify({ ...originalPayload, ...change }), evidence.seq);
+        expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'accepted-evidence', gate: 'adversarial incomplete current review', evidenceEventSeq: evidence.seq, evidenceEventKind: evidence.kind } })).toThrow(/current gate duty/);
+      }
+      h.db.handle.prepare('UPDATE events SET payload = ? WHERE seq = ?').run(JSON.stringify(originalPayload), evidence.seq);
+      const readme = join(f.lane.path, 'README.md'); const savedReadme = readFileSync(readme);
+      writeFileSync(readme, 'different tracked current bytes');
+      expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'accepted-evidence', gate: 'dirty candidate', evidenceEventSeq: evidence.seq, evidenceEventKind: evidence.kind } })).toThrow(/dirty/);
+      writeFileSync(readme, savedReadme);
+      const disposition = { kind: 'accepted-evidence' as const, evidenceEventSeq: evidence.seq, evidenceEventKind: evidence.kind, gate: 'genuine current local full and actual whole review' };
+      const claimed = h.ledger.claimObligation({ obligationId: duty.id, requestId: 'P37-owner-claim', holder: 'owner', expiresAt: '2099-01-01T00:00:00.000Z', expectedGeneration: duty.generation });
+      expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: disposition, requestId: 'P37-owner-claim' })).toThrow(/claimed/);
+      expect(h.ledger.getObligation(duty.id)?.claim).toEqual(claimed.claim); h.ledger.releaseClaim({ obligationId: duty.id, requestId: 'P37-owner-claim' });
+      h.ledger.suspendObligation(duty.id, 'real owner hold');
+      expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: disposition })).toThrow();
+      h.ledger.resumeObligation(duty.id, 'explicit actual owner hold release');
+      const recipient = h.ledger.recordBlockedObservation(f.jobId, { logicalStep: 'verification', incidentKey: 'P37-exact-transfer', observedAtSeq: root.seq,
+        category: { kind: 'known', category: 'restart-recovery' }, nextAction: { kind: 'gru-decision', decision: (duty.nextAction as { decision: string }).decision } });
+      h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'superseded', byObligationId: recipient.id, reason: 'preserve original current gate bindings' } });
+      expect(() => h.ledger.recordBlockedObservation(f.jobId, { logicalStep: 'verification', incidentKey: recipient.incidentKey, observedAtSeq: h.ledger.latestEventSeq() + 1,
+        category: { kind: 'known', category: 'restart-recovery' }, nextAction: { kind: 'owner-decision', decision: 'replace original sealed current duty with unbound owner prose' } })).toThrow(/launder/);
+      const fresh = new VerificationScheduler({ storageDir: join(h.dir, 'verify-again'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, record: (event) => { h.ledger.appendCustomEvent(event); } });
+      try {
+        writeFileSync(join(f.lane.path, '.P37-fail'), 'fail exact declared full');
+        expect((await fresh.submit({ jobId: f.jobId, requestId: 'P37-newest-failure', scope: 'full', command: 'test ! -f .P37-fail && printf verified', cwd: f.lane.path })).ok).toBe(false);
+        rmSync(join(f.lane.path, '.P37-fail'));
+        expect(() => h.ledger.settleObligation({ obligationId: recipient.id, settlement: disposition })).toThrow(/current gate duty/);
+      } finally { await fresh.dispose(); }
+      const currentAuthority = h.ledger.directiveCurrentAuthority(f.jobId);
+      h.ledger.addJobAmendment({ jobId: f.jobId, body: 'administrative clarification, not new implementation', effect: 'administrative', supersedes: [], approval: { by: 'owner', reference: 'P37-admin' }, expectedContractSha256: currentAuthority.contractSha256 });
+      expect(() => h.ledger.settleObligation({ obligationId: recipient.id, settlement: disposition })).toThrow(/current gate duty/);
+      const finalScheduler = new VerificationScheduler({ storageDir: join(h.dir, 'verify-admin'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 }, record: (event) => { h.ledger.appendCustomEvent(event); } });
+      try {
+        expect((await finalScheduler.submit({ jobId: f.jobId, requestId: 'P37-current-admin-full', scope: 'full', command: 'test ! -f .P37-fail && printf verified', cwd: f.lane.path })).ok).toBe(true);
+        const later = await h.wave.beginRound({ jobId: f.jobId, targetRef: f.lane.branch! }); expect((await later.run).verdict).toBe('approved');
+        const newest = h.ledger.latestRoundEvent(h.ledger.listRounds(f.jobId).at(-1)!.id, 'round.perkins-review')!;
+        expect(newest.payload).toMatchObject({ reviewScope: 'whole', complete: true });
+        const db = new LedgerDb(h.dir); const reopened = new LedgerApi(db.handle);
+        try { expect(reopened.settleObligation({ obligationId: recipient.id, settlement: { ...disposition, evidenceEventSeq: newest.seq } }).state).toBe('settled'); }
+        finally { db.close(); }
+      } finally { await finalScheduler.dispose(); }
+      expect(h.ledger.getEvent(root.seq)).toEqual(root); expect(h.ledger.latestJobEvent(f.jobId, 'verification.ready')).toBeNull();
+      const historicCandidate = h.ledger.latestCandidateDelivery(f.jobId)!;
+      const completedSettlement = h.ledger.getObligation(recipient.id)!.settlement!;
+      h.ledger.addJobAmendment({ jobId: f.jobId, body: 'new material scope still requires independently delivered current revision', effect: 'material', supersedes: [], approval: { by: 'owner', reference: 'P37-material' }, expectedContractSha256: h.ledger.directiveCurrentAuthority(f.jobId).contractSha256 });
+      expect(() => h.ledger.settleObligation({ obligationId: recipient.id, settlement: completedSettlement })).toThrow(/current native candidate/);
+      expect(h.ledger.workRevisionState(f.jobId)).toEqual({ required: 2, delivered: 0 });
+      const unknown = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: null, work_revision: 2, candidate_delivery_proven: false } });
+      expect(h.ledger.latestCandidateDelivery(f.jobId)?.seq).toBe(unknown.seq);
+      expect(() => h.ledger.settleObligation({ obligationId: recipient.id, settlement: completedSettlement })).toThrow(/current native candidate/);
+      expect(h.ledger.getObligation(recipient.id)?.state).toBe('settled');
+      expect(h.ledger.getEvent(historicCandidate.seq)).toEqual(historicCandidate);
+    } finally { await scheduler.dispose(); }
+  });
 
   it('exact non-executing closure leaves owned executable current inspection, immutable absent historical facts and replay-safe audit', async () => {
     const f = await completedFixture(); const { h } = f;
@@ -2166,6 +2298,51 @@ describe('legacy proven completion without fabricated historical delivery', () =
     expect(h.ledger.getEvent(f.original.seq)?.payload).toEqual(f.original.payload);
     h.ledger.setJobStatus(f.jobId, 'binned'); expect(h.ledger.getObligation(recipient.id)?.state).toBe('closed');
     expect(h.ledger.getObligation(recipient.id)?.settlement).toEqual({ kind: 'job-terminal', jobStatus: 'binned' });
+  });
+
+  it('P38 authenticated rebrief readback retains inspection history and follows exact live gate owner through restart and terminal closure', async () => {
+    const f = await completedFixture(); const { h } = f;
+    expect((await call(h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN)).status).toBe(200);
+    const audit = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')!;
+    const instruction = (audit.payload as { inspection_directive: string }).inspection_directive;
+    expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: 'separate-current-inspection', directive: instruction }, TOKEN)).status).toBe(202);
+    await waitFor(() => h.ledger.getDirective('separate-current-inspection')?.state === 'settled', 'P38 current inspection');
+    const duty = h.ledger.listObligations({ jobId: f.jobId }).find((row) => row.incidentKey === `rebrief-current-gates:${f.marker.id}`)!;
+    const originalGate = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-current-gates-owed')!;
+    for (let noise = 0; noise < 205; noise += 1) h.ledger.appendCustomEvent({ kind: 'silas.rebrief-current-gates-owed', jobId: f.jobId,
+      payload: { marker_id: `P38-unrelated-${noise}`, obligation_id: `P38-unrelated-debt-${noise}`, next_action: { kind: 'gru-decision', decision: 'unrelated later action' } } });
+    const recipient = h.ledger.recordBlockedObservation(f.jobId, { logicalStep: 'verification', incidentKey: 'P38-explicit-owner', observedAtSeq: h.ledger.latestEventSeq(),
+      category: { kind: 'known', category: 'owner-hold' }, nextAction: { kind: 'owner-decision', decision: (duty.nextAction as { decision: string }).decision } });
+    h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'superseded', byObligationId: recipient.id, reason: 'exact binding-preserving owner transfer' } });
+    h.ledger.suspendObligation(recipient.id, 'owner hold is real and must stay visible');
+    const response = await call(h.port, 'GET', f.route, undefined, TOKEN);
+    expect(response.status).toBe(200);
+    const json = response.json as Record<string, unknown>;
+    const lineages = json['current_action_obligation_lineages'] as { gateEvents: { payload: unknown }[]; obligations: { id: string }[]; currentObligation: { id: string; state: string; nextAction: unknown } }[];
+    expect(lineages).toHaveLength(1); expect(lineages[0]!.obligations).toHaveLength(3);
+    expect(lineages[0]!.gateEvents).toHaveLength(1); expect(lineages[0]!.gateEvents[0]!.payload).toEqual(originalGate.payload);
+    expect(lineages[0]!.currentObligation).toMatchObject({ id: recipient.id, state: 'suspended', nextAction: recipient.nextAction });
+    expect(json['current_inspection_obligations']).toHaveLength(1);
+    for (let restart = 0; restart < 2; restart += 1) {
+      const db = new LedgerDb(h.dir); const ledger = new LedgerApi(db.handle);
+      try {
+        const lineage = ledger.rebriefCurrentActionObligationLineages(f.marker.id)[0]!;
+        expect(lineage.currentObligation).toMatchObject({ id: recipient.id, state: 'suspended' }); expect(lineage.gateEvents[0]?.payload).toEqual(originalGate.payload);
+      }
+      finally { db.close(); }
+    }
+    h.ledger.setJobStatus(f.jobId, 'binned');
+    const terminal = (await call(h.port, 'GET', f.route, undefined, TOKEN)).json as Record<string, unknown>;
+    expect(terminal['current_action_obligation_lineages']).toEqual(h.ledger.rebriefCurrentActionObligationLineages(f.marker.id));
+    expect(h.ledger.getObligation(recipient.id)?.state).toBe('closed');
+    const original = h.ledger.getObligation(duty.id)!.settlement;
+    for (const id of ['missing-P38-successor', duty.id]) {
+      h.db.handle.prepare('UPDATE job_obligations SET settlement = ? WHERE id = ?').run(JSON.stringify({ kind: 'superseded', byObligationId: id, reason: 'corrupt durable lineage' }), duty.id);
+      expect(() => h.ledger.rebriefCurrentActionObligationLineages(f.marker.id)).toThrow(/missing or foreign|cyclic/);
+      const refused = await call(h.port, 'GET', f.route, undefined, TOKEN);
+      expect(refused.status).toBe(400); expect(JSON.stringify(refused.json)).toMatch(/lineage/);
+    }
+    h.db.handle.prepare('UPDATE job_obligations SET settlement = ? WHERE id = ?').run(JSON.stringify(original), duty.id);
   });
 
   it('completed control closure refuses stale receipt/current scope, foreign proof and live/queued producers without effects', async () => {

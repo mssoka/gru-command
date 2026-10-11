@@ -120,11 +120,11 @@ class FallbackHandle implements AgentHandle {
       return inner.prepareDirectiveProducer!(identity);
     };
     if (inner.inspectDirective !== undefined) this.inspectDirective = (identity) => inner.inspectDirective!(identity);
-    if (inner.resumeDirective !== undefined) this.resumeDirective = async (identity, checkpointId, beforeContinuation) => {
+    if (inner.resumeDirective !== undefined) this.resumeDirective = async (identity, checkpointId, beforeContinuation, claimContinuation) => {
       this.assertLive();
       if (this.busy || this.queue.length > 0) throw new Error('directive continuation requires an idle, unqueued session');
       this.inFlight = true;
-      try { return await inner.resumeDirective!(identity, checkpointId, beforeContinuation); }
+      try { return await inner.resumeDirective!(identity, checkpointId, beforeContinuation, claimContinuation); }
       finally { this.inFlight = false; void this.pump(); }
     };
     if (inner.getContextUsage !== undefined) {

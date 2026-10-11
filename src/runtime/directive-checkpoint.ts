@@ -224,7 +224,7 @@ function producerReceipts(file: string): readonly ProducerReceipt[] {
   for (const receipt of rows) {
     const { state, producer } = receipt;
     if (state === 'completed' && (typeof receipt.checkpointId !== 'string' || !receipt.checkpointId ||
-        !(receipt.head === null || typeof receipt.head === 'string' && /^[a-f0-9]{40,64}$/.test(receipt.head)))) {
+        !(receipt.head === null || typeof receipt.head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(receipt.head)))) {
       throw new DirectiveCheckpointError('malformed native completion HEAD receipt');
     }
     validateDirectiveIdentity(producer.identity);
@@ -272,7 +272,7 @@ export function recordDirectiveToolRefusal(producer: DirectiveProducer, toolCall
 }
 
 export function recordDirectiveCompletion(producer: DirectiveProducer, checkpointId: string, head: string | null): void {
-  if (!(head === null || /^[a-f0-9]{40,64}$/.test(head))) throw new DirectiveCheckpointError('native completion HEAD malformed');
+  if (!(head === null || typeof head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head))) throw new DirectiveCheckpointError('native completion HEAD malformed');
   const proof = inspectDirectiveCheckpoint(producer.sessionFile, producer.identity);
   if (proof.state !== 'terminal' || !proof.ok || proof.checkpointId !== checkpointId || proof.binding.agentId !== producer.agentId || proof.binding.sessionId !== producer.sessionId) {
     throw new DirectiveCheckpointError('native completion does not bind the original successful checkpoint/producer');

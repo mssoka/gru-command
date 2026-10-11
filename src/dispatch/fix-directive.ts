@@ -471,6 +471,7 @@ export function recordFollowUpDelivery(input: {
   let sha: string | null = null;
   let note: string | null = null;
   if (input.nativeCompletion !== undefined) {
+    if (!(input.nativeCompletion.sha === null || typeof input.nativeCompletion.sha === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.nativeCompletion.sha))) throw new Error('original native completion HEAD must be an exact 40/64 hex object ID or null');
     sha = input.nativeCompletion.sha;
     if (sha === null) note = 'original native completion HEAD unproven; current candidate delivery/verification/review remain owed';
   } else if (lane !== undefined) {

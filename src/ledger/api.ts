@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { readFileSync } from 'node:fs';
+import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
+import { readGitState } from '../verify/scheduler.js';
+import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
 import { canonicalRebriefEvidence, type RebriefReceiptEvidence } from './rebrief-evidence.js';
 import type { RecoverySubject, RecoverySubjectKind, RecoveryOwnerTransfer, RecoveryDecisionHistory, RecoveryOwnerActionInput } from './recovery-owner.js';
 import type { DatabaseSync } from 'node:sqlite';
@@ -8,7 +11,7 @@ import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -2336,7 +2339,24 @@ export class LedgerApi {
    * may freeze only when delivered >= required. */
   workRevisionState(jobId: string): WorkRevisionState {
     const required = requiredWorkRevision(this.listJobAmendments(jobId));
-    return { required, delivered: deliveredWorkRevision(this.latestJobEvent(jobId, 'job.delivered')) };
+    return { required, delivered: deliveredWorkRevision(this.latestCandidateDelivery(jobId)) };
+  }
+
+  latestCandidateDelivery(jobId: string): EventRecord | null {
+    const row = this.db.prepare(`SELECT d.* FROM events d WHERE d.job_id = ? AND d.kind = 'job.delivered' AND NOT (
+      COALESCE(json_extract(d.payload, '$.historical_bookkeeping_only'), 0) = 1 AND EXISTS (SELECT 1 FROM events r
+        WHERE r.job_id = d.job_id AND r.kind = 'silas.directive-current-gates-owed' AND r.seq > d.seq
+          AND json_extract(r.payload, '$.root_kind') = 'original-native-completion' AND json_extract(r.payload, '$.delivery_seq') = d.seq
+          AND json_extract(r.payload, '$.request_id') = json_extract(d.payload, '$.request_id')
+          AND json_extract(r.payload, '$.identity') = json_extract(d.payload, '$.native_completion.identity')
+          AND json_extract(r.payload, '$.sha') IS json_extract(d.payload, '$.sha')
+          AND EXISTS (SELECT 1 FROM pending_directives p JOIN job_obligations o ON o.id = json_extract(r.payload, '$.obligation_id')
+            WHERE p.request_id = json_extract(r.payload, '$.request_id') AND p.job_id = d.job_id AND p.delivery_seq = d.seq AND p.state = 'settled'
+              AND p.native_binding = json_extract(d.payload, '$.native_completion.binding') AND p.payload_hash = json_extract(r.payload, '$.identity.payloadHash')
+              AND p.contract_sha256 = json_extract(r.payload, '$.identity.contractSha256') AND p.work_revision = json_extract(r.payload, '$.identity.workRevision')
+              AND o.job_id = d.job_id AND o.incident_key = 'directive-current-gates:' || p.request_id AND o.generation = json_extract(r.payload, '$.generation')
+              AND o.first_origin_seq = d.seq AND o.next_action = json_extract(r.payload, '$.next_action')))) ORDER BY d.seq DESC LIMIT 1`).get(jobId) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
   }
 
   /** Owner decision 2026-10-09 (option A): a CORRECTIVE delivery — the
@@ -2349,7 +2369,7 @@ export class LedgerApi {
    * (null when the delivery could not resolve its head: any later pass on
    * the job counts). */
   correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null {
-    const newest = this.latestJobEvent(jobId, 'job.delivered');
+    const newest = this.latestCandidateDelivery(jobId);
     if (newest === null) return null;
     const native = (typeof newest.payload === 'object' && newest.payload !== null ? newest.payload : {}) as { candidate_delivery_proven?: unknown; work_revision?: unknown };
     if (native.candidate_delivery_proven === false) {
@@ -5464,7 +5484,7 @@ export class LedgerApi {
   /** Follow only this inspection gate duty's durable supersession lineage. */
   private currentGateDutyAction(obligationId: string): ObligationNextAction | null {
     const row = this.getObligation(obligationId); if (row === null) return null;
-    const roots = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind = 'silas.rebrief-current-gates-owed' ORDER BY seq").all(row.jobId) as Row[];
+    const roots = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind IN ('silas.rebrief-current-gates-owed', 'silas.directive-current-gates-owed') ORDER BY seq").all(row.jobId) as Row[];
     for (const root of roots) {
       const payload = JSON.parse(root.payload as string) as { obligation_id: string; next_action: ObligationNextAction };
       if (typeof payload.obligation_id !== 'string' || payload.next_action?.kind !== 'gru-decision') throw new DirectiveCheckpointError('current gate action lineage is malformed');
@@ -5477,6 +5497,85 @@ export class LedgerApi {
       }
     }
     return null;
+  }
+
+  /** Bounded completion of this protected recovery duty, never a universal receipt. */
+  private assertCurrentGateDutyCompleted(row: ObligationRecord, action: ObligationNextAction, evidenceSeq: number): void {
+    const refuse = (message: string): never => { throw new DirectiveCheckpointError(`current gate duty ${message}`); };
+    if (this.getEvent(evidenceSeq)?.kind !== 'round.perkins-review') refuse('cannot be discharged by generic evidence, inspection, historical receipts or prose');
+    this.assertRecoveryJobPermission(row.jobId);
+    if (row.state === 'suspended' || row.claim !== null) refuse('retains suspended or claimed ownership');
+    const roots = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind IN ('silas.rebrief-current-gates-owed', 'silas.directive-current-gates-owed') ORDER BY seq").all(row.jobId) as Row[];
+    const root = roots.map((record) => this.eventFromRow(record)).find((event) => isDeepStrictEqual((event.payload as { next_action?: unknown }).next_action, action));
+    if (root === undefined || root.seq >= evidenceSeq) refuse('requires exact original action before evidence');
+    const origin = root!.payload as { identity: DirectiveTurnIdentity; delivery_seq: number; sha: string | null };
+    validateDirectiveIdentity(origin.identity);
+    const original = this.getDirective(origin.identity.requestId);
+    const delivery = this.getEvent(origin.delivery_seq);
+    if (original?.nativeTarget === null || original?.nativeTarget === undefined || original.nativeBinding === null || delivery?.jobId !== row.jobId || delivery.kind !== 'job.delivered' || !isDeepStrictEqual(this.directiveTurnIdentity(original.requestId), origin.identity)) refuse('original accepted delivery binding is unavailable');
+    const delivered = delivery!.payload as { native_completion?: { identity?: unknown; binding?: unknown }; sha?: unknown };
+    if (delivered.sha !== origin.sha || !isDeepStrictEqual(delivered.native_completion?.identity, origin.identity) || !isDeepStrictEqual(delivered.native_completion?.binding, original!.nativeBinding)) refuse('original delivery provenance changed');
+    const originalProof = inspectDirectiveCheckpoint(original!.nativeTarget!.sessionFile, origin.identity);
+    const originalCompletion = originalProof.state === 'terminal' && originalProof.ok ? readDirectiveCompletion(original!.nativeTarget!.sessionFile, origin.identity, originalProof.checkpointId) : null;
+    const physical = inspectDirectiveProducers(original!.nativeTarget!.sessionFile, origin.identity);
+    if (originalCompletion === null || originalCompletion.head !== origin.sha || !(originalProof.state === 'terminal' && isDeepStrictEqual(originalProof.binding, original!.nativeBinding)) || physical.length === 0 || physical.some(({ evidence }) => evidence !== 'ceased') || physical.some(({ producer }) => directiveProducerLockBlocker(producer) !== null)) refuse('original proof or physical ownership remains UNKNOWN');
+    const candidate = this.latestCandidateDelivery(row.jobId);
+    const facts = candidate?.payload as { sha?: unknown; work_revision?: unknown; candidate_delivery_proven?: unknown; native_completion?: { identity?: DirectiveTurnIdentity; binding?: unknown } } | undefined;
+    const identity = facts?.native_completion?.identity;
+    const current = identity === undefined ? null : this.getDirective(identity.requestId);
+    const required = requiredWorkRevision(this.listJobAmendments(row.jobId));
+    if (candidate === null || typeof facts?.sha !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(facts.sha) || facts.candidate_delivery_proven !== true || facts.work_revision !== required || identity === undefined || current?.deliverySeq !== candidate.seq || current.nativeTarget === null || !isDeepStrictEqual(this.directiveTurnIdentity(current.requestId), identity) || !isDeepStrictEqual(current.nativeBinding, facts.native_completion?.binding)) refuse('requires positively established current native candidate');
+    if (candidate!.seq !== delivery!.seq) {
+      const starts = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'silas.directive-producer-ceased' AND json_extract(payload, '$.request_id') = ? ORDER BY seq").all(row.jobId, original!.requestId) as Row[];
+      const originalCeased = starts.map((event) => this.eventFromRow(event)).find((event) => {
+        const fields = event.payload as { producer_start_seq?: number; producer_identity?: unknown; native_producer?: unknown };
+        const start = fields.producer_start_seq === undefined ? null : this.getEvent(fields.producer_start_seq);
+        return start?.kind === 'silas.directive-producer-started' && start.jobId === row.jobId && start.seq < event.seq &&
+          isDeepStrictEqual(fields.producer_identity, origin.identity) && isDeepStrictEqual(fields.native_producer, originalCompletion!.producer) &&
+          isDeepStrictEqual((start.payload as { native_producer?: unknown }).native_producer, originalCompletion!.producer);
+      });
+      const anchor = Math.min(root!.seq, originalCeased?.seq ?? root!.seq);
+      if (current!.baselineSeq < anchor || current!.admissionSeq === null || current!.admissionSeq <= anchor) refuse('current native acceptance does not establish original-to-current causal chronology');
+    }
+    const currentProof = inspectDirectiveCheckpoint(current!.nativeTarget!.sessionFile, identity!);
+    const currentCompletion = currentProof.state === 'terminal' && currentProof.ok ? readDirectiveCompletion(current!.nativeTarget!.sessionFile, identity!, currentProof.checkpointId) : null;
+    if (currentCompletion?.head !== facts!.sha || !(currentProof.state === 'terminal' && isDeepStrictEqual(currentProof.binding, current!.nativeBinding))) refuse('current candidate original completion is unproven');
+    const currentPhysical = inspectDirectiveProducers(current!.nativeTarget!.sessionFile, identity!);
+    if (currentPhysical.length === 0 || currentPhysical.some(({ evidence, producer }) => evidence !== 'ceased' || directiveProducerLockBlocker(producer) !== null)) refuse('current candidate physical ownership remains UNKNOWN');
+    const lanes = this.listWorktrees({ jobId: row.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+    if (lanes.length !== 1) refuse('requires exact current candidate lane');
+    const lane = lanes[0]!;
+    const blockers = this.directiveRetirementBlockers(original!, lane.id);
+    if (blockers.length > 0) refuse(`producer ownership remains: ${blockers.join('; ')}`);
+    const declared = loadWorktreeManifest(lane.path);
+    if (declared === null) refuse('requires host declared full verification scope');
+    const command = resolveVerifyCommand(declared!, 'full');
+    const git = readGitState(lane.path);
+    if (git.sha !== facts!.sha || git.trackedDirty) refuse('current candidate HEAD moved or tracked tree is dirty');
+    const attempts = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'verification.requested' AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
+    if (attempts === undefined) refuse('requires declared full scheduler attempt');
+    const requested = this.eventFromRow(attempts!); const request = requested.payload as Record<string, unknown>;
+    const amendedAt = this.latestJobEvent(row.jobId, 'job.amendment-accepted')?.seq ?? 0;
+    if (requested.seq <= Math.max(root!.seq, amendedAt) || request['command'] !== command || request['cwd'] !== lane.path || request['head'] !== facts!.sha || typeof request['request_id'] !== 'string' || typeof request['run_id'] !== 'string') refuse('newest full scheduler request has stale or foreign bindings');
+    const latestFull = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind IN ('verification.requested', 'verification.started', 'verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout') AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
+    if (latestFull === undefined || (JSON.parse(str(latestFull.payload)) as { run_id?: unknown }).run_id !== request['run_id']) refuse('newer relevant full attempt is failed or UNKNOWN');
+    const lifecycle = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind LIKE 'verification.%' AND json_extract(payload, '$.run_id') = ? ORDER BY seq").all(row.jobId, request['run_id'] as string) as Row[];
+    const events = lifecycle.map((event) => this.eventFromRow(event));
+    const starts = events.filter((event) => event.kind === 'verification.started');
+    const terminals = events.filter((event) => ['verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout'].includes(event.kind));
+    const terminal = terminals[0]; const start = starts[0]; const run = terminal?.payload as Record<string, unknown> | undefined;
+    const started = start?.payload as Record<string, unknown> | undefined;
+    if (starts.length !== 1 || terminals.length !== 1 || terminal?.kind !== 'verification.completed' || start!.seq <= requested.seq || terminal.seq <= start!.seq || terminal.seq >= evidenceSeq || !Number.isSafeInteger(started?.['pid']) || Number(started?.['pid']) <= 0 || started?.['command'] !== command || started['cwd'] !== lane.path || started['sha'] !== facts!.sha || run?.['command'] !== command || run['scope'] !== 'full' || run['cwd'] !== lane.path || run['sha'] !== facts!.sha || run['tracked_dirty'] !== false || run['ok'] !== true || run['exit_code'] !== 0 || run['signal'] !== null || run['error'] !== null || run['timed_out'] !== false || !Number.isSafeInteger(run['output_bytes']) || Number(run['output_bytes']) < 0 || typeof run['output_sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(run['output_sha256'])) refuse('newest full scheduler start/terminal/output capture is incomplete, failed or UNKNOWN');
+    const round = this.listRounds(row.jobId).at(-1);
+    const review = this.getEvent(evidenceSeq);
+    const reviewed = review?.payload as Record<string, unknown> | undefined;
+    if (round === undefined || round.status !== 'verdict-posted' || round.verdict !== 'approved' || review?.roundId !== round.id || review.jobId !== row.jobId || review.kind !== 'round.perkins-review' || this.latestRoundEvent(round.id, 'round.perkins-review')?.seq !== review.seq || reviewed?.['canonicalVerdict'] !== 'READY TO MERGE' || reviewed['blockers'] !== 0 || reviewed['complete'] !== true || reviewed['headMoved'] !== false || reviewed['reviewScope'] !== 'whole' || reviewed['finalPassRequired'] === true || reviewed['targetSha'] !== facts!.sha || typeof reviewed['artifactDirectory'] !== 'string') refuse('requires newest actual complete approved whole-change review');
+    const bytes = readReviewCheckpointBytes(reviewed!['artifactDirectory'] as string, 'manifest.json', FROZEN_MANIFEST_MAX_BYTES);
+    const manifest = JSON.parse(bytes.toString('utf8')) as FrozenReviewInputs;
+    const receipt = this.latestRoundEvent(round!.id, 'round.freeze-manifest');
+    const acceptance = this.effectiveContract(row.jobId);
+    const reviewLanes = this.listWorktrees({ jobId: row.jobId }).filter((worktree) => worktree.kind === 'review' && worktree.roundId === round!.id);
+    if (receipt === null || receipt.seq >= review!.seq || (receipt.payload as { sha256?: unknown }).sha256 !== createHash('sha256').update(bytes).digest('hex') || manifest.roundId !== round!.id || reviewLanes.length !== 1 || manifest.repoPath !== reviewLanes[0]!.path || manifest.targetSha !== facts!.sha || manifest.schemaVersion !== 2 || manifest.recoveryIdentity === null || manifest.recoveryIdentity.jobId !== row.jobId || acceptance === null || !isDeepStrictEqual(manifest.acceptance, { version: acceptance.version, baseSha256: acceptance.baseSha256, contractSha256: acceptance.contractSha256, amendmentIds: acceptance.amendmentIds })) refuse('frozen current acceptance/provenance is missing or changed');
   }
 
   settleObligation(input: {
@@ -5498,6 +5597,8 @@ export class LedgerApi {
               !['gru-decision', 'owner-decision'].includes(recipient.nextAction.kind) || !('decision' in recipient.nextAction) || !('decision' in gateDuty) || recipient.nextAction.decision !== gateDuty.decision) {
             throw new DirectiveCheckpointError('current gate duty requires a distinct live same-job action transfer preserving exact still-owed bindings');
           }
+        } else if (disposition.kind === 'executed-action' || disposition.kind === 'accepted-evidence') {
+          this.assertCurrentGateDutyCompleted(row, gateDuty, disposition.evidenceEventSeq);
         } else throw new DirectiveCheckpointError('current gate duty cannot be discharged by generic evidence, inspection, historical receipts or prose');
       }
       const target: ObligationState =
@@ -7409,6 +7510,36 @@ export class LedgerApi {
     });
   }
 
+  rebriefCurrentActionObligationLineages(markerId: string): readonly {
+    readonly decisionEvent: EventRecord;
+    readonly gateEvents: readonly EventRecord[];
+    readonly obligations: readonly ObligationRecord[];
+    readonly currentObligation: ObligationRecord;
+  }[] {
+    return this.recoveryDecisionHistory('rebrief', markerId).filter((history) => history.currentInspectionObligationId !== null).map((history) => {
+      const decisionEvent = this.getEvent(history.eventSeq);
+      if (decisionEvent === null || decisionEvent.jobId === null) throw new DirectiveCheckpointError('current action lineage original decision is unavailable');
+      const root = this.getObligation(history.currentInspectionObligationId!);
+      if (root === null || root.jobId !== decisionEvent.jobId || root.incidentKey !== `rebrief-current-inspection:${markerId}`) throw new DirectiveCheckpointError('current action lineage inspection root is missing or foreign');
+      const obligations: ObligationRecord[] = []; const seen = new Set<string>(); let cursor = root;
+      while (true) {
+        if (seen.has(cursor.id)) throw new DirectiveCheckpointError('current action obligation lineage is cyclic');
+        seen.add(cursor.id); obligations.push(cursor);
+        if (cursor.settlement?.kind !== 'superseded') break;
+        if (cursor.settlement.byObligationId === null) throw new DirectiveCheckpointError('current action obligation lineage loses its owed successor');
+        const next = this.getObligation(cursor.settlement.byObligationId);
+        if (next === null || next.jobId !== root.jobId) throw new DirectiveCheckpointError('current action obligation lineage successor is missing or foreign');
+        const protectedAction = this.currentGateDutyAction(next.id);
+        if (protectedAction === null || !('decision' in protectedAction) || !('decision' in next.nextAction) || next.nextAction.decision !== protectedAction.decision) throw new DirectiveCheckpointError('current action obligation lineage successor bindings changed or are unproven');
+        cursor = next;
+      }
+      const gateRows = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'silas.rebrief-current-gates-owed' AND json_extract(payload, '$.marker_id') = ? ORDER BY seq").all(root.jobId, markerId) as Row[];
+      const gateEvents = gateRows.map((row) => this.eventFromRow(row)).filter((event) =>
+        obligations.some((row) => row.id === (event.payload as { obligation_id?: unknown }).obligation_id));
+      return { decisionEvent, gateEvents, obligations, currentObligation: cursor };
+    });
+  }
+
   recoverySubject(kind: RecoverySubjectKind, subjectId: string): RecoverySubject {
     let jobId: string;
     let snapshot: unknown;
@@ -7923,6 +8054,51 @@ export class LedgerApi {
         .prepare("UPDATE pending_directives SET state = 'admitted', admission_seq = ?, admission_minion = ?, updated_at = ? WHERE request_id = ?")
         .run(input.eventSeq, input.minionId, nowIso(), input.requestId);
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
+    });
+  }
+
+  recordHistoricalNativeDirectiveCompletion(identity: DirectiveTurnIdentity, laneId: string): DirectiveRequestRecord {
+    return this.transaction(() => {
+      const row = this.getDirective(identity.requestId);
+      if (row === null || !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), identity) || row.nativeTarget === null || row.nativeBinding === null || row.state !== 'admitted') throw new DirectiveCheckpointError('historical completion requires exact original admitted native request');
+      const job = this.getJob(row.jobId);
+      const authority = this.directiveCurrentAuthority(row.jobId);
+      if (job === null || job.status !== 'parked' && authority.workRevision === identity.workRevision && authority.contractSha256 === identity.contractSha256 && authority.authorityEpoch === identity.authorityEpoch) throw new DirectiveCheckpointError('historical-only completion requires positively changed or parked current authority');
+      if (this.recoveryOwnerBasis('directive', row.requestId).owned || this.recoveryDecisionHistory('directive', row.requestId).some((history) => history.ownerTransfer !== null)) throw new DirectiveCheckpointError('historical completion cannot release original transferred owner context');
+      if (this.hasOpenDirectiveRecoveryHold(row.jobId) || this.listObligations({ jobId: row.jobId }).some((debt) => ['open', 'waiting', 'suspended'].includes(debt.state) && debt.nextAction.kind === 'owner-decision') ||
+          this.db.prepare("SELECT 1 FROM notifications n JOIN agents a ON a.id = n.agent_id WHERE a.job_id = ? AND n.routing = 'needs-owner' AND n.acked_at IS NULL AND n.resolved_at IS NULL").get(row.jobId) !== undefined) throw new DirectiveCheckpointError('historical completion retains original owner stop');
+      const held = this.listObligations({ jobId: row.jobId }).some((debt) => debt.incidentKey === `directive-recovery:${row.requestId}` && (debt.state === 'suspended' || debt.claim !== null));
+      if (held) throw new DirectiveCheckpointError('historical completion retains suspended or claimed original recovery context');
+      const ownReservations = new Set([`directive ${row.requestId}`, `directive recovery ${row.requestId}`, `rebrief ${row.requestId}`]);
+      const reservations = this.listJobAdmissions(row.jobId).filter((kind) => !ownReservations.has(kind));
+      const blockers = this.directiveRetirementBlockers(row, laneId).filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
+      if (blockers.length + reservations.length > 0) throw new DirectiveCheckpointError(`historical completion producer fences: ${[...blockers, ...reservations].join('; ')}`);
+      const proof = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, identity);
+      if (proof.state !== 'terminal' || !proof.ok || !isDeepStrictEqual(proof.binding, row.nativeBinding)) throw new DirectiveCheckpointError('historical completion requires exact original successful native ancestry');
+      const completion = readDirectiveCompletion(row.nativeTarget.sessionFile, identity, proof.checkpointId);
+      if (completion === null) throw new DirectiveCheckpointError('original native completion HEAD receipt is unavailable; absence is not proof');
+      const physical = inspectDirectiveProducers(row.nativeTarget.sessionFile);
+      if (!physical.some(({ producer }) => isDeepStrictEqual(producer, completion.producer)) || physical.some(({ evidence }) => evidence === 'unknown')) throw new DirectiveCheckpointError('historical completion original physical receipt is unbound or UNKNOWN');
+      for (const { producer } of physical) {
+        const association = readDirectiveBinding(row.nativeTarget.sessionFile, producer.identity.requestId);
+        const checkpoint = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, producer.identity);
+        if (association === null || !isDeepStrictEqual(association.identity, producer.identity) || association.agentId !== producer.agentId || association.sessionId !== producer.sessionId || association.sessionFile !== producer.sessionFile || producer.agentId !== proof.binding.agentId || producer.sessionId !== proof.binding.sessionId || checkpoint.state !== 'terminal' || !checkpoint.ok) throw new DirectiveCheckpointError('historical completion older or foreign native incarnation remains unbound/UNKNOWN');
+      }
+      const phase = this.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+      if (row.requestKind === 'rebrief' && this.latestJobEventByRequestId(row.jobId, 'silas.rebrief', row.requestId) === null) this.appendEvent({ kind: 'silas.rebrief', jobId: row.jobId, payload: {
+        request_id: row.requestId, minion_id: proof.binding.agentId, note: (JSON.parse(row.payload) as { directive: string }).directive,
+        ...(phase === null ? {} : { phase_id: phase.phaseId }), ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
+        ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+      } });
+      const delivery = this.appendEvent({ kind: 'job.delivered', jobId: row.jobId, agentId: proof.binding.agentId,
+        payload: { request_id: row.requestId, agentId: proof.binding.agentId, source: row.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive', sha: completion.head,
+          work_revision: identity.workRevision, candidate_delivery_proven: false, historical_bookkeeping_only: true, ...(phase === null ? {} : { phase_id: phase.phaseId }),
+          native_completion: { identity, checkpoint_id: proof.checkpointId, binding: proof.binding, receipt: completion, physical_cessation: physical } } });
+      const duty = this.preserveParkedRecoveryDebt(this.recordBlockedObservation(row.jobId, { logicalStep: 'verification', incidentKey: `directive-current-gates:${row.requestId}`,
+        observedAtSeq: delivery.seq, category: { kind: 'known', category: 'restart-recovery' }, nextAction: { kind: 'gru-decision', decision: `Original native request ${row.requestId} completed accepted identity ${JSON.stringify(identity)} at recorded HEAD ${completion.head ?? 'UNPROVEN/null'}, historical delivery ${delivery.seq}. Current approved inputs ${JSON.stringify(authority)} still require a genuine current candidate and existing POST /api/verify declared full gate plus POST /api/dispatch/review actual complete whole-change review. Historical completion is neither current delivery authority nor PASS/READY.` } }));
+      this.appendEvent({ kind: 'silas.directive-current-gates-owed', jobId: row.jobId, payload: { root_kind: 'original-native-completion', request_id: row.requestId,
+        identity, delivery_seq: delivery.seq, sha: completion.head, native_completion: delivery.payload, obligation_id: duty.id, generation: duty.generation, next_action: duty.nextAction } });
+      return this.recordDirectiveDelivery({ requestId: row.requestId, eventSeq: delivery.seq });
     });
   }
 

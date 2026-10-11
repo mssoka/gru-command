@@ -604,7 +604,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         const reason = typeof proof?.payload === 'object' && proof.payload !== null
           ? (proof.payload as { reason?: unknown }).reason : null;
         const newestRound = options.ledger.listRounds(jobId).at(-1);
-        const delivered = options.ledger.latestJobEvent(jobId, 'job.delivered');
+        const delivered = options.ledger.latestCandidateDelivery(jobId);
         const sha = delivered === null ? null : deliveredTargetSha(delivered);
         if (round?.jobId !== jobId || round.status !== 'aborted' ||
             newestRound?.id !== sourceRoundId || sha === null || sha !== round.targetRef ||
@@ -1327,6 +1327,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         recovery_decision_events: options.ledger.recoveryDecisionHistory('rebrief', markerId).map((history) => options.ledger.getEvent(history.eventSeq)),
         current_inspection_obligations: options.ledger.recoveryDecisionHistory('rebrief', markerId)
           .filter((history) => history.currentInspectionObligationId !== null).map((history) => options.ledger.getObligation(history.currentInspectionObligationId!)),
+        current_action_obligation_lineages: options.ledger.rebriefCurrentActionObligationLineages(markerId),
         receipt_evidence: marker === undefined ? null : options.ledger.rebriefReceiptEvidence(markerId),
         receipt_evidence_sha256: marker === undefined ? null : options.ledger.rebriefReceiptEvidence(markerId).sha256,
         current_approved_authority: marker === undefined ? null : options.ledger.directiveCurrentAuthority(marker.jobId),

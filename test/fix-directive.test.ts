@@ -292,6 +292,23 @@ function minionRecord(id: string, jobId: string | null, sessionFile: string | nu
   };
 }
 
+it('P40 supplied native delivery boundary refuses malformed or coerced HEAD before delivery and report effects', () => {
+  const appendCustomEvent = vi.fn<LedgerApi['appendCustomEvent']>().mockReturnValue({ seq: 1 } as ReturnType<LedgerApi['appendCustomEvent']>);
+  const getJob = vi.fn(() => null); const openReportObligation = vi.fn();
+  const ledger = { appendCustomEvent, getJob, openReportObligation };
+  const worktrees = new InMemoryWorktreePort(join(tmpdir(), 'P40-no-lane-sampling'));
+  const deliver = (sha: string | null) => recordFollowUpDelivery({ ledger, worktrees, jobId: 'P40-original', agentId: 'original-minion', source: 'silas-directive', workRevision: 1,
+    nativeCompletion: { sha, provenance: { original: 'immutable original receipt' } } });
+  for (const sha of ['a'.repeat(41), 'b'.repeat(48), 'c'.repeat(63), { toString: () => 'a'.repeat(40) } as unknown as string]) {
+    expect(() => deliver(sha)).toThrow(/exact 40\/64/);
+    expect(appendCustomEvent).not.toHaveBeenCalled(); expect(getJob).not.toHaveBeenCalled(); expect(openReportObligation).not.toHaveBeenCalled();
+  }
+  for (const sha of ['a'.repeat(40), 'b'.repeat(64), null]) {
+    expect(deliver(sha).sha).toBe(sha);
+    expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha, candidate_delivery_proven: sha !== null }) }));
+  }
+});
+
 describe('recordFollowUpDelivery (the loop-closing signal)', () => {
   it('records job.delivered with the lane head the settled turn produced', async () => {
     const repo = makeFixtureRepo('fixture-followup-delivery');

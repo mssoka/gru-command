@@ -326,6 +326,11 @@ interface PersistedState {
  */
 type TerminalIdentityState = 'completed' | 'admission-failed' | 'interrupted';
 
+class VerificationSpawnFailedError extends Error {
+  readonly code = 'spawn_failed';
+  constructor(detail: string) { super(detail); this.name = 'VerificationSpawnFailedError'; }
+}
+
 interface TerminalIdentity {
   readonly request_id: string;
   readonly run_id: string;
@@ -337,7 +342,8 @@ interface TerminalIdentity {
   readonly head: string | null;
   readonly started: boolean;
   readonly completed_at: number;
-  readonly reason?: 'scheduler_disposed';
+  readonly reason?: 'scheduler_disposed' | 'spawn_failed';
+  readonly error?: string;
   readonly request_ids?: readonly string[];
 }
 
@@ -503,7 +509,8 @@ function parseTerminalIdentity(value: unknown): TerminalIdentity | null {
     head,
     started,
     completed_at: completedAt,
-    ...(record['reason'] === 'scheduler_disposed' && state === 'admission-failed' && !started ? { reason: 'scheduler_disposed' as const,
+    ...((record['reason'] === 'scheduler_disposed' || record['reason'] === 'spawn_failed') && state === 'admission-failed' && !started ? { reason: record['reason'],
+      ...(typeof record['error'] === 'string' ? { error: record['error'] } : {}),
       ...(Array.isArray(record['request_ids']) && record['request_ids'].every((id) => typeof id === 'string' && VERIFICATION_REQUEST_ID_PATTERN.test(id)) && record['request_ids'].includes(requestId)
         ? { request_ids: record['request_ids'] as string[] } : {}) } : {}),
   };
@@ -648,6 +655,7 @@ export class VerificationScheduler {
   private disposed = false;
   private readonly noStartSettled = new Set<string>();
   private readonly pendingNoStart = new Map<string, VerificationRecord>();
+  private readonly publishingNoStart = new Set<string>();
 
   constructor(opts: VerificationSchedulerOptions) {
     this.opts = opts;
@@ -742,19 +750,19 @@ export class VerificationScheduler {
     // The append-only identity index survives a failed scheduler-state write.
     // Only explicit current no-start provenance can recover this refusal.
     for (const identity of this.requestIndex.values()) {
-      if (identity.reason !== 'scheduler_disposed') continue;
+      if (identity.reason !== 'scheduler_disposed' && identity.reason !== 'spawn_failed') continue;
       this.pendingNoStart.set(identity.run_id, { kind: 'verification.no-start', jobId: identity.job_id, payload: {
-        run_id: identity.run_id, request_ids: identity.request_ids ?? [...this.requestIndex.values()].filter((row) => row.run_id === identity.run_id && row.reason === 'scheduler_disposed').map((row) => row.request_id),
-        scope: identity.scope, command: identity.command, cwd: identity.cwd, head: identity.head, started: false, reason: identity.reason,
+        run_id: identity.run_id, request_ids: identity.request_ids ?? [...this.requestIndex.values()].filter((row) => row.run_id === identity.run_id && row.reason === identity.reason).map((row) => row.request_id),
+        scope: identity.scope, command: identity.command, cwd: identity.cwd, head: identity.head, started: false, reason: identity.reason, error: identity.error ?? null,
       } });
     }
     // Older supported state files have the full refusal even before the
     // append-only format gained its explicit reason field.
     for (const history of this.requestHistory.values()) {
-      if (history.error?.code !== 'scheduler_disposed' || history.started || this.pendingNoStart.has(history.runId)) continue;
+      if (!['scheduler_disposed', 'spawn_failed'].includes(history.error?.code ?? '') || history.state !== 'admission-failed' || history.outcome !== null || history.started || this.pendingNoStart.has(history.runId)) continue;
       this.pendingNoStart.set(history.runId, { kind: 'verification.no-start', jobId: history.spec.jobId, payload: {
-        run_id: history.runId, request_ids: [...this.requestHistory].filter(([, row]) => row.runId === history.runId && !row.started && row.error?.code === 'scheduler_disposed').map(([id]) => id), scope: history.spec.scope, command: history.spec.command,
-        cwd: history.spec.cwd, head: history.head, started: false, reason: 'scheduler_disposed',
+        run_id: history.runId, request_ids: [...this.requestHistory].filter(([, row]) => row.runId === history.runId && row.state === 'admission-failed' && row.outcome === null && !row.started && row.error?.code === history.error!.code && row.spec.jobId === history.spec.jobId && row.spec.scope === history.spec.scope && row.spec.command === history.spec.command && row.spec.cwd === history.spec.cwd && row.head === history.head).map(([id]) => id), scope: history.spec.scope, command: history.spec.command,
+        cwd: history.spec.cwd, head: history.head, started: false, reason: history.error!.code, error: history.error!.detail,
       } });
     }
     this.retryNoStart();
@@ -1021,6 +1029,7 @@ export class VerificationScheduler {
           });
           return history.outcome;
         }
+        if (history.error?.code === 'spawn_failed') { this.retryNoStart(); throw new VerificationSpawnFailedError(history.error.detail); }
         if (history.error?.code === 'scheduler_disposed') {
           this.retryNoStart();
           throw new VerificationDisposedError();
@@ -1052,6 +1061,7 @@ export class VerificationScheduler {
       const known = this.requestIndex.get(requestId);
       if (known !== undefined) {
         if (known.reason === 'scheduler_disposed') { this.retryNoStart(); throw new VerificationDisposedError(); }
+        if (known.reason === 'spawn_failed') { this.retryNoStart(); throw new VerificationSpawnFailedError(known.error ?? 'original native shell spawn failed without a child'); }
         if (known.state === 'admission-failed') {
           this.requestIndex.delete(requestId);
         } else {
@@ -1172,7 +1182,7 @@ export class VerificationScheduler {
           head: known.head,
           trackedDirty: null,
           started: known.started,
-          ...(known.reason === 'scheduler_disposed' ? { error: { code: 'scheduler_disposed', detail: new VerificationDisposedError().message } } : {}),
+          ...(known.reason === 'scheduler_disposed' ? { error: { code: 'scheduler_disposed', detail: new VerificationDisposedError().message } } : known.reason === 'spawn_failed' ? { error: { code: 'spawn_failed', detail: known.error ?? 'original native shell spawn failed without a child' } } : {}),
         };
       }
       // An explicit unknown request identity never borrows another
@@ -1452,7 +1462,7 @@ export class VerificationScheduler {
       attempt.resolve(outcome);
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
-      if (failure instanceof VerificationDisposedError && !attempt.started) this.settleNoStart(attempt);
+      if ((failure instanceof VerificationDisposedError || failure instanceof VerificationSpawnFailedError) && !attempt.started) this.settleNoStart(attempt, failure);
       else this.rememberHistory(attempt, {
         state: failure instanceof VerificationLockTimeoutError ? 'admission-failed' : null,
         outcome: null,
@@ -1471,19 +1481,23 @@ export class VerificationScheduler {
     }
   }
 
-  private settleNoStart(attempt: Attempt): void {
+  private settleNoStart(attempt: Attempt, failure: VerificationDisposedError | VerificationSpawnFailedError = new VerificationDisposedError()): void {
     if (attempt.started || this.slots.get(attempt.runId)?.child != null || this.noStartSettled.has(attempt.runId)) return;
+    if (this.pendingNoStart.has(attempt.runId)) { this.retryNoStart(); return; }
     this.pendingNoStart.set(attempt.runId, { kind: 'verification.no-start', jobId: attempt.spec.jobId, payload: {
       run_id: attempt.runId, request_ids: [...attempt.requestIds], scope: attempt.spec.scope, command: attempt.spec.command,
-      cwd: attempt.spec.cwd, head: attempt.head, started: false, reason: 'scheduler_disposed',
+      cwd: attempt.spec.cwd, head: attempt.head, started: false, reason: failure.code, error: failure.message,
     } });
     this.retryNoStart();
   }
 
   private retryNoStart(): void {
     for (const [runId, record] of this.pendingNoStart) {
+      if (this.publishingNoStart.has(runId)) continue;
+      this.publishingNoStart.add(runId);
       try {
-        const error = new VerificationDisposedError();
+        const reason = record.payload['reason'] === 'spawn_failed' ? 'spawn_failed' : 'scheduler_disposed';
+        const error = reason === 'spawn_failed' ? new VerificationSpawnFailedError(String(record.payload['error'] ?? 'original native shell spawn failed without a child')) : new VerificationDisposedError();
         for (const requestId of record.payload['request_ids'] as string[]) {
           const history: RequestHistoryEntry = { runId, state: 'admission-failed', started: false, outcome: null,
             completedAt: this.now(), head: record.payload['head'] as string | null,
@@ -1492,10 +1506,14 @@ export class VerificationScheduler {
           // Memory refusal is not a durable receipt. Persist exact provenance
           // first, retain it on failure, then acknowledge ledger publication.
           this.requestHistory.set(requestId, history);
-          if (this.requestIndex.get(requestId)?.reason !== 'scheduler_disposed') {
+        }
+        this.persistBestEffort(); // preserve the entire positively observed attached refusal before any partial journal write
+        for (const requestId of record.payload['request_ids'] as string[]) {
+          const history = this.requestHistory.get(requestId)!;
+          if (this.requestIndex.get(requestId)?.reason !== reason) {
             this.appendTerminalIdentity({ request_id: requestId, run_id: runId, state: 'admission-failed', job_id: record.jobId,
               scope: history.spec.scope, command: history.spec.command, cwd: history.spec.cwd, head: history.head,
-              started: false, completed_at: history.completedAt, reason: 'scheduler_disposed', request_ids: record.payload['request_ids'] as string[] }, true);
+              started: false, completed_at: history.completedAt, reason, error: error.message, request_ids: record.payload['request_ids'] as string[] }, true);
           }
         }
         this.persistBestEffort();
@@ -1504,7 +1522,7 @@ export class VerificationScheduler {
         this.pendingNoStart.delete(runId);
       } catch (error) {
         this.log('error', 'verification no-start persistence/publication failed; original identity retained for retry', { run: runId, error: String(error) });
-      }
+      } finally { this.publishingNoStart.delete(runId); }
     }
   }
 
@@ -1742,12 +1760,28 @@ export class VerificationScheduler {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    let exitCode: number | null = null;
+    let signal: string | null = null;
+    let runError: Error | null = null;
+    const exited = new Promise<void>((resolveExit) => {
+      child.once('error', (error: Error) => { runError = error; resolveExit(); });
+      child.once('exit', (code: number | null, exitSignal: NodeJS.Signals | null) => { exitCode = code; signal = exitSignal; resolveExit(); });
+    });
     slot.pid = child.pid ?? null;
     slot.child = child;
     // Native child existence, not a client started-frame callback, fences
     // reentrant shutdown from manufacturing a no-start receipt.
     const attempt = [...this.attempts.values()].find((owner) => owner.runId === lease.runId);
-    if (attempt !== undefined) attempt.started = true;
+    if (attempt !== undefined && child.pid !== undefined) attempt.started = true;
+    const spawnResult = await new Promise<Error | null>((resolveSpawn) => {
+      child.once('spawn', () => resolveSpawn(null));
+      child.once('error', (error: Error) => resolveSpawn(error));
+    });
+    if (spawnResult !== null) {
+      if (child.pid === undefined) { slot.child = null; slot.pid = null; throw new VerificationSpawnFailedError(spawnResult.message); }
+      throw spawnResult;
+    }
+    if (child.pid === undefined) throw new Error('native spawn event has no bound PID; verification ownership is UNKNOWN');
     this.callbackSafe('onSpawn', () =>
       this.opts.onSpawn?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
     );
@@ -1781,8 +1815,6 @@ export class VerificationScheduler {
       queuedMs,
     });
 
-    let exitCode: number | null = null;
-    let signal: string | null = null;
     let timedOut = false;
     const hash = createHash('sha256');
     let outputBytes = 0;
@@ -1800,25 +1832,12 @@ export class VerificationScheduler {
         }
       }
     };
-    let runError: Error | null = null;
     const streamsDone = Promise.all([
       consume(child.stdout, 'stdout'),
       consume(child.stderr, 'stderr'),
     ]).catch((error: unknown) => {
       runError ??= error instanceof Error ? error : new Error(String(error));
     });
-    const exited = new Promise<void>((resolveExit) => {
-      child.once('error', (error: Error) => {
-        runError = error;
-        resolveExit();
-      });
-      child.once('exit', (code: number | null, exitSignal: NodeJS.Signals | null) => {
-        exitCode = code;
-        signal = exitSignal;
-        resolveExit();
-      });
-    });
-
     const timeoutTimer = setTimeout(() => {
       timedOut = true;
       signalGroup(child, 'SIGTERM');

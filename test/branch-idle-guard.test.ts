@@ -494,6 +494,7 @@ describe('branch-idle guard', () => {
         jobRecord('setup-restored-open', 'working'),
         jobRecord('setup-restored-forged', 'working'),
       ],
+      latestCandidateDelivery: (jobId: string): EventRecord | null => (events.get(jobId) ?? []).filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (jobId: string): readonly EventRecord[] =>
@@ -570,6 +571,7 @@ describe('branch-idle guard', () => {
     ];
     const paged = {
       listJobs: () => [jobRecord('paged', 'in-review')],
+      latestCandidateDelivery: (): EventRecord | null => pagedHistory.filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (_jobId: string, kind: string): EventRecord | null =>
         pagedHistory.filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (_jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[] =>
@@ -594,6 +596,7 @@ describe('branch-idle guard', () => {
     ];
     const capped = {
       listJobs: () => [jobRecord('capped', 'in-review')],
+      latestCandidateDelivery: (): EventRecord | null => cappedHistory.filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (_jobId: string, kind: string): EventRecord | null =>
         cappedHistory.filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (_jobId: string, opts?: { readonly limit?: number }): readonly EventRecord[] =>
@@ -840,6 +843,7 @@ describe('branch-idle guard', () => {
         jobRecord('binned-pending', 'binned'),
         jobRecord('settled', 'delivered'),
       ],
+      latestCandidateDelivery: (jobId: string): EventRecord | null => (events.get(jobId) ?? []).filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (jobId: string): readonly EventRecord[] =>
@@ -1512,6 +1516,7 @@ describe('branch-idle guard', () => {
     ]);
     const ledger = {
       listJobs: () => [jobRecord('marker-owner', 'delivered'), jobRecord('plain-lane', 'delivered')],
+      latestCandidateDelivery: (jobId: string): EventRecord | null => (events.get(jobId) ?? []).filter((event) => event.kind === 'job.delivered').at(-1) ?? null,
       latestJobEvent: (jobId: string, kind: string): EventRecord | null =>
         (events.get(jobId) ?? []).filter((event) => event.kind === kind).at(-1) ?? null,
       listJobEvents: (jobId: string): readonly EventRecord[] =>

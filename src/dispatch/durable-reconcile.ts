@@ -222,7 +222,7 @@ export function reconcileReportClosures(
       try {
         let active = deps.ledger.findReportObligation(job.id);
         if (active === null || (active.state !== 'open' && active.state !== 'waiting' && active.state !== 'suspended')) {
-          const delivered = deps.ledger.latestJobEvent(job.id, 'job.delivered');
+          const delivered = deps.ledger.latestCandidateDelivery(job.id);
           if (delivered === null) {
             failed += 1;
             deps.log?.('error', 'delivered report job has no delivery event — cannot open its obligation', { job: job.id });

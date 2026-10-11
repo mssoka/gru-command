@@ -211,7 +211,7 @@ function reconcileNativeProducer(deps: DirectiveProgressDeps, identity: Directiv
   if (start === null) return;
   const ceased = deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-ceased', identity.requestId);
   if ((ceased?.payload as { producer_start_seq?: unknown } | undefined)?.producer_start_seq === start.seq) return;
-  checkAdmissionFences(deps, identity, undefined, start.seq);
+  checkAdmissionFences(deps, identity, undefined, start.seq, undefined, true);
   deps.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: identity.jobId, payload: {
     request_id: identity.requestId, agent_id: owner.producer.agentId, session_file: owner.producer.sessionFile,
     producer_start_seq: start.seq, producer_identity: identity, native_producer: owner.producer, evidence: owner.evidence,
@@ -239,6 +239,14 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
   if (binding?.userEntryId != null) deps.ledger.bindDirectiveNativeAdmission(binding);
   if (proof.state !== 'terminal' || !proof.ok) return false;
   const completion = readDirectiveCompletion(row.nativeTarget.sessionFile, identity, proof.checkpointId);
+  const current = deps.ledger.directiveCurrentAuthority(identity.jobId);
+  if (deps.ledger.getJob(identity.jobId)?.status === 'parked' || current.workRevision !== identity.workRevision || current.contractSha256 !== identity.contractSha256 || current.authorityEpoch !== identity.authorityEpoch) {
+    if (deps.signal.aborted) throw new DirectiveCheckpointError('service stopping — historical bookkeeping cancelled');
+    checkAdmissionFences(deps, identity, undefined, undefined, undefined, true);
+    const lane = deps.worktrees.listWorktrees({ jobId: identity.jobId }).find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+    deps.ledger.recordHistoricalNativeDirectiveCompletion(identity, lane?.id ?? '');
+    return true;
+  }
   check(deps, identity);
   checkAdmissionFences(deps, identity);
   // Preserve the exact accepted revision; completion proves no newer input.

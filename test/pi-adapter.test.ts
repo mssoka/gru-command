@@ -3786,7 +3786,7 @@ it('restart recovery rejects synchronous SDK disposal success as proof while the
 
 /** A real persisted ledger/lane for SDK ownership regressions, not a native
  * handoff fixture. It supplies no positive original-producer proof. */
-async function directiveRecoveryLedgerFixture(label: string, materialRevision = false) {
+async function directiveRecoveryLedgerFixture(label: string, materialRevision = false, rebrief = false) {
   const { LedgerDb } = await import('../src/ledger/db.js');
   const { LedgerApi } = await import('../src/ledger/api.js');
   const { EventBus } = await import('../src/events/bus.js');
@@ -3802,15 +3802,19 @@ async function directiveRecoveryLedgerFixture(label: string, materialRevision = 
   ledger.setJobStatus('sdk-original-job', 'working');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'sdk-original-job' });
   if (materialRevision) expect(ledger.addJobAmendment({ jobId: 'sdk-original-job', body: 'Approved original material scope.', supersedes: [], approval: { by: 'owner', reference: 'GH-286 completion fixture' }, effect: 'material', expectedContractSha256: ledger.directiveCurrentAuthority('sdk-original-job').contractSha256 }).status).toBe('accepted');
-  const request = ledger.beginDirectiveIntent({ jobId: 'sdk-original-job', requestId: 'sdk-original-request',
-    directive: 'perform original approved work only once', holder: 'gru' }).record;
+  let sourceRoundId: string | undefined;
+  if (rebrief) { const source = ledger.addRound({ jobId: 'sdk-original-job', lenses: [] }); ledger.setRoundStatus(source.id, 'aborted'); sourceRoundId = source.id; }
+  const request = rebrief ? ledger.beginRebriefIntent({ jobId: 'sdk-original-job', requestId: 'sdk-original-request',
+    note: 'perform original approved work only once', holder: 'gru', sourceContext: { ruleId: 'accepted-original-rule', sourceRoundId },
+    handoff: { kind: 'gru-decision', decision: 'retain exact original phase completion context' } }).record :
+    ledger.beginDirectiveIntent({ jobId: 'sdk-original-job', requestId: 'sdk-original-request', directive: 'perform original approved work only once', holder: 'gru' }).record;
   return { dir, repo, db, bus, ledger, notifications, worktrees, lane, request,
     identity: ledger.directiveTurnIdentity(request.requestId) };
 }
 
-async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void, materialRevision = false, useDefaultToolExecution = false) {
+async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void, materialRevision = false, useDefaultToolExecution = false, rebrief = false) {
   const fx = await fixture(turns);
-  const scene = await directiveRecoveryLedgerFixture('guarded-sdk-tools', materialRevision);
+  const scene = await directiveRecoveryLedgerFixture('guarded-sdk-tools', materialRevision, rebrief);
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
   const registry = new RuntimeRegistry({ config: fx.config, store: fx.store,
     pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime } });
@@ -4402,3 +4406,194 @@ it('P30 default pinned SDK parallel-safe read batch preserves exact accepted anc
     expect(f.scene.ledger.listJobEventsByKinds(row.jobId, ['job.delivered'])).toHaveLength(1);
   } finally { release(); await f.cleanup(); }
 });
+
+async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'owner-stop' | 'foreign' | 'older-unknown' | 'current-lock' | 'live-producer' | 'reservation' | 'multiple' | 'rebrief' | 'rebrief-missing') {
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  let release!: () => void; const hold = new Promise<void>((resolve) => { release = resolve; });
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['genuine past original completion'], hold }], undefined, false, false, mode === 'rebrief' || mode === 'rebrief-missing'); const stop = new AbortController();
+  const actual = f.scene.ledger.appendCustomEventIfCurrentDirective.bind(f.scene.ledger);
+  const loss = vi.spyOn(f.scene.ledger, 'appendCustomEventIfCurrentDirective').mockImplementation((fields, identity) => { if (fields.kind === 'job.delivered' || mode === 'rebrief-missing' && fields.kind === 'silas.rebrief') { stop.abort(); throw new Error('original delivery callback lost during shutdown'); } return actual(fields, identity); });
+  let moved = false; let service: InstanceType<typeof DirectiveProgressService> | undefined; let reservation: (() => void) | undefined;
+  try {
+    const running = executeAcceptedDirective({ ...f.deps, signal: stop.signal }, f.scene.request.requestId);
+    await waitFor(() => f.fx.script.calls.length === 1, 'P39 original actual SDK acceptance');
+    if (mode === 'null') { renameSync(f.scene.lane.path, `${f.scene.lane.path}.missing`); moved = true; }
+    release(); await running; loss.mockRestore();
+    if (moved) { renameSync(`${f.scene.lane.path}.missing`, f.scene.lane.path); moved = false; }
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!; const originalIdentity = f.scene.ledger.directiveTurnIdentity(row.requestId);
+    expect(row.state).toBe('admitted');
+    if (mode === 'multiple') {
+      const owner = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: row.nativeTarget!.agentId, resumeFile: row.nativeTarget!.sessionFile });
+      expect(owner.prepareDirectiveProducer).toBeTypeOf('function'); owner.prepareDirectiveProducer!(originalIdentity);
+      await f.registry.disposeHandle(owner);
+      const { inspectDirectiveProducers } = await import('../src/runtime/directive-checkpoint.js');
+      expect(inspectDirectiveProducers(row.nativeTarget!.sessionFile, originalIdentity)).toHaveLength(2);
+    }
+    const originalRebrief = f.scene.ledger.latestJobEventByRequestId(row.jobId, 'silas.rebrief', row.requestId);
+    if (mode === 'rebrief') expect(originalRebrief?.payload).toMatchObject({ rule_id: row.sourceContext!.ruleId, source_round_id: row.sourceContext!.sourceRoundId });
+    if (mode === 'rebrief-missing') expect(originalRebrief).toBeNull();
+    const originalPhase = f.scene.ledger.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
+    if (mode === 'parked') f.scene.ledger.setJobStatus(row.jobId, 'parked');
+    else f.scene.ledger.addJobAmendment({ jobId: row.jobId, body: 'changed approved current input', effect: 'administrative', supersedes: [], approval: { by: 'owner', reference: 'P39-boundaries' }, expectedContractSha256: originalIdentity.contractSha256 });
+    if (mode === 'held' || mode === 'owner-stop') { const debt = f.scene.ledger.recordBlockedObservation(row.jobId, { logicalStep: 'operation', incidentKey: mode === 'held' ? `directive-recovery:${row.requestId}` : 'P39-owner-stop', observedAtSeq: f.scene.ledger.latestEventSeq(), category: { kind: 'known', category: 'restart-recovery' }, nextAction: mode === 'held' ? { kind: 'gru-decision', decision: 'retain suspended original context' } : { kind: 'owner-decision', decision: 'real original owner stop stays held' } }); if (mode === 'held') f.scene.ledger.suspendObligation(debt.id, 'explicit original hold'); }
+    if (mode === 'current-lock') writeFileSync(`${row.nativeTarget!.sessionFile}.lock`, JSON.stringify({ host: 'foreign', pid: process.pid, bootId: 'foreign' }));
+    if (mode === 'foreign' || mode === 'older-unknown') { const path = `${row.nativeTarget!.sessionFile}.producers.jsonl`; const records = readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; producer: Record<string, unknown> }); const start = records.find((record) => record.state === 'started')!; writeFileSync(path, readFileSync(path, 'utf8') + JSON.stringify({ ...start, producer: { ...start.producer, incarnation: 'P39-unproven-incarnation', ...(mode === 'foreign' ? { agentId: 'foreign-minion' } : { host: 'unproven-host' }) } }) + '\n'); }
+    if (mode === 'live-producer') { f.scene.ledger.registerAgent({ id: 'P39-other-live', role: 'minion', jobId: row.jobId, sessionFile: null }); f.scene.ledger.setAgentState('P39-other-live', 'streaming'); }
+    if (mode === 'reservation') reservation = f.scene.ledger.beginJobAdmission(row.jobId, 'independent reserved producer');
+    const job = f.scene.ledger.getJob(row.jobId)!; const bytes = readFileSync(row.nativeTarget!.sessionFile, 'utf8');
+    const spawn = vi.spyOn(f.registry, 'spawn'); spawn.mockClear();
+    service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+    const positive = mode === 'parked' || mode === 'null' || mode === 'multiple' || mode === 'rebrief' || mode === 'rebrief-missing';
+    expect(f.scene.ledger.getDirective(row.requestId)?.state).toBe(positive ? 'settled' : 'admitted'); expect(spawn).not.toHaveBeenCalled(); expect(f.scene.ledger.getJob(row.jobId)).toEqual(job); expect(readFileSync(row.nativeTarget!.sessionFile, 'utf8')).toBe(bytes);
+    const delivery = f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
+    if (positive) { expect(delivery?.payload).toMatchObject({ historical_bookkeeping_only: true, candidate_delivery_proven: false, native_completion: { identity: originalIdentity } }); if (mode === 'null') expect((delivery!.payload as { sha: unknown }).sha).toBeNull(); expect(f.scene.ledger.workRevisionState(row.jobId).delivered).toBe(0); expect(f.scene.ledger.latestJobEvent(row.jobId, 'silas.directive-current-gates-owed')).not.toBeNull(); }
+    else expect(delivery).toBeNull();
+    if (mode === 'rebrief' || mode === 'rebrief-missing') {
+      const receipt = f.scene.ledger.latestJobEventByRequestId(row.jobId, 'silas.rebrief', row.requestId)!;
+      expect(receipt.payload).toMatchObject({ request_id: row.requestId, minion_id: row.nativeTarget!.agentId, phase_id: originalPhase!.phaseId, rule_id: row.sourceContext!.ruleId, source_round_id: row.sourceContext!.sourceRoundId });
+      if (mode === 'rebrief') expect(receipt).toEqual(originalRebrief);
+      expect(f.scene.ledger.getDirective(row.requestId)?.sourceContext).toEqual(row.sourceContext); expect(f.scene.ledger.listPendingRebriefs({ jobId: row.jobId })).toEqual([]);
+      expect((delivery!.payload as { phase_id: string }).phase_id).toBe(originalPhase!.phaseId);
+      expect(f.scene.ledger.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId })).toEqual(originalPhase);
+    }
+    const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js'); const db = new LedgerDb(f.scene.dir); try { const ledger = new LedgerApi(db.handle); expect(ledger.getDirective(row.requestId)?.state).toBe(positive ? 'settled' : 'admitted'); expect(ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toEqual(delivery); } finally { db.close(); }
+  } finally { release(); loss.mockRestore(); reservation?.(); if (moved) renameSync(`${f.scene.lane.path}.missing`, f.scene.lane.path); await service?.dispose(); await f.cleanup(); }
+}
+
+it('P39 actual original SDK historical completion preserves parked boundary through restart without native replay', () => assertHistoricalSdkBoundary('parked'));
+it('P39 actual original SDK historical completion preserves null boundary through restart without native replay', () => assertHistoricalSdkBoundary('null'));
+it('P39 actual original SDK historical completion preserves held boundary through restart without native replay', () => assertHistoricalSdkBoundary('held'));
+it('P39 actual original SDK historical completion preserves owner-stop boundary through restart without native replay', () => assertHistoricalSdkBoundary('owner-stop'));
+it('P39 actual original SDK historical completion preserves foreign boundary through restart without native replay', () => assertHistoricalSdkBoundary('foreign'));
+it('P39 actual original SDK historical completion preserves older-unknown boundary through restart without native replay', () => assertHistoricalSdkBoundary('older-unknown'));
+it('P39 actual original SDK historical completion preserves current-lock boundary through restart without native replay', () => assertHistoricalSdkBoundary('current-lock'));
+it('P39 actual original SDK historical completion preserves live-producer boundary through restart without native replay', () => assertHistoricalSdkBoundary('live-producer'));
+it('P39 actual original SDK historical completion preserves reservation boundary through restart without native replay', () => assertHistoricalSdkBoundary('reservation'));
+it('P39 genuinely resumed and disposed second SDK incarnation preserves original completion without replay', () => assertHistoricalSdkBoundary('multiple'));
+it('P39 actual accepted SDK rebrief retains real original receipt and source-context pointers through historical bookkeeping', () => assertHistoricalSdkBoundary('rebrief'));
+it('P39 missing original SDK rebrief receipt is restored with exact accepted source-context and phase pointers without release', () => assertHistoricalSdkBoundary('rebrief-missing'));
+
+it('P39 guarded single-flight then genuinely newer SDK candidate preserves historical replay and ordinary unknown-HEAD fence', async () => {
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['original native completed before shutdown'] }, { deltas: ['genuine later current native completion'] }]);
+  const stop = new AbortController(); const originalAppend = f.scene.ledger.appendCustomEventIfCurrentDirective.bind(f.scene.ledger);
+  const loss = vi.spyOn(f.scene.ledger, 'appendCustomEventIfCurrentDirective').mockImplementation((fields, identity) => { if (fields.kind === 'job.delivered') { stop.abort(); throw new Error('old ledger delivery lost after native completion'); } return originalAppend(fields, identity); });
+  let service: InstanceType<typeof DirectiveProgressService> | undefined;
+  try {
+    await executeAcceptedDirective({ ...f.deps, signal: stop.signal }, f.scene.request.requestId); loss.mockRestore();
+    const original = f.scene.ledger.getDirective(f.scene.request.requestId)!; const before = readFileSync(original.nativeTarget!.sessionFile, 'utf8');
+    expect(() => f.scene.ledger.beginDirectiveIntent({ jobId: original.jobId, requestId: 'cannot-bypass-live-original', directive: 'new current work', holder: 'gru' })).toThrow(/already live/);
+    expect(f.fx.script.calls).toHaveLength(1); expect(readFileSync(original.nativeTarget!.sessionFile, 'utf8')).toBe(before);
+    f.scene.ledger.addJobAmendment({ jobId: original.jobId, body: 'new material accepted current scope', effect: 'material', supersedes: [], approval: { by: 'owner', reference: 'P39-current' }, expectedContractSha256: original.contractSha256! });
+    service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+    const historic = f.scene.ledger.getDirective(original.requestId)!; expect(historic.state).toBe('settled');
+    const root = f.scene.ledger.latestJobEvent(original.jobId, 'silas.directive-current-gates-owed')!;
+    const current = f.scene.ledger.beginRebriefIntent({ jobId: original.jobId, requestId: 'genuine-current-native', note: 'perform newly accepted current material scope', holder: 'gru' }).record;
+    await executeAcceptedDirective(f.deps, current.requestId);
+    const accepted = f.scene.ledger.getDirective(current.requestId)!; expect(accepted.state).toBe('settled'); expect(accepted.admissionSeq!).toBeGreaterThan(root.seq);
+    const candidate = f.scene.ledger.latestCandidateDelivery(original.jobId)!; expect(candidate.seq).toBe(accepted.deliverySeq); expect(candidate.payload).toMatchObject({ work_revision: 1, candidate_delivery_proven: true, native_completion: { identity: f.scene.ledger.directiveTurnIdentity(current.requestId) } });
+    for (let replay = 0; replay < 2; replay += 1) { f.scene.ledger.recordDirectiveDelivery({ requestId: original.requestId, eventSeq: historic.deliverySeq! }); service.reconsider(); await service.settled(); expect(f.scene.ledger.latestCandidateDelivery(original.jobId)).toEqual(candidate); expect(f.scene.ledger.workRevisionState(original.jobId)).toEqual({ required: 1, delivered: 1 }); expect(f.scene.ledger.getEvent(root.seq)).toEqual(root); }
+    expect(f.fx.script.calls).toHaveLength(2); expect(readFileSync(original.nativeTarget!.sessionFile, 'utf8')).toBe(before);
+    const unknown = f.scene.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: original.jobId, payload: { work_revision: 1, sha: null, candidate_delivery_proven: false } });
+    expect(f.scene.ledger.latestCandidateDelivery(original.jobId)?.seq).toBe(unknown.seq); expect(f.scene.ledger.workRevisionState(original.jobId).delivered).toBe(0);
+    const callerFlag = f.scene.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: original.jobId, payload: { request_id: original.requestId, work_revision: 1, sha: null, candidate_delivery_proven: false, historical_bookkeeping_only: true } });
+    expect(f.scene.ledger.latestCandidateDelivery(original.jobId)?.seq).toBe(callerFlag.seq);
+    expect(f.scene.ledger.correctiveVerificationDebt(original.jobId)).toEqual({ revision: 1, head: null });
+  } finally { loss.mockRestore(); await service?.dispose(); await f.cleanup(); }
+});
+
+it('P39 genuine original SDK completion after amendment records historical-only progress without replacing a newer candidate', async () => {
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['genuine original native completion before amendment'] }]);
+  const actual = f.scene.ledger.appendCustomEventIfCurrentDirective.bind(f.scene.ledger);
+  const loss = vi.spyOn(f.scene.ledger, 'appendCustomEventIfCurrentDirective').mockImplementation((fields, identity) => {
+    if (fields.kind === 'job.delivered') throw new Error('P39 original delivery callback lost before ledger commit'); return actual(fields, identity);
+  });
+  let service: InstanceType<typeof DirectiveProgressService> | undefined;
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId); loss.mockRestore();
+    const identity = f.scene.identity; const original = f.scene.ledger.getDirective(identity.requestId)!;
+    expect(original.state).toBe('admitted');
+    f.scene.ledger.addJobAmendment({ jobId: identity.jobId, body: 'genuinely changed owner accepted scope', supersedes: [], approval: { by: 'owner', reference: 'P39' }, effect: 'material', expectedContractSha256: identity.contractSha256 });
+    const newer = f.scene.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: identity.jobId, payload: { agentId: 'different-current-minion', sha: 'd'.repeat(40), work_revision: 1 } });
+    const job = f.scene.ledger.getJob(identity.jobId)!; const spawn = vi.spyOn(f.registry, 'spawn'); spawn.mockClear();
+    service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+    expect(f.scene.ledger.getDirective(identity.requestId)?.state).toBe('settled'); expect(spawn).not.toHaveBeenCalled();
+    expect(f.scene.ledger.getJob(identity.jobId)).toEqual(job); expect(f.scene.ledger.latestCandidateDelivery(identity.jobId)?.seq).toBe(newer.seq);
+    expect(f.scene.ledger.workRevisionState(identity.jobId)).toEqual({ required: 1, delivered: 1 });
+    const delivery = f.scene.ledger.latestJobEventByRequestId(identity.jobId, 'job.delivered', identity.requestId)!;
+    expect(delivery.payload).toMatchObject({ historical_bookkeeping_only: true, candidate_delivery_proven: false, work_revision: 0, native_completion: { identity } });
+    const root = f.scene.ledger.latestJobEvent(identity.jobId, 'silas.directive-current-gates-owed')!;
+    const duty = f.scene.ledger.getObligation((root.payload as { obligation_id: string }).obligation_id)!;
+    expect(duty.state).toBe('open'); expect(root.payload).toMatchObject({ root_kind: 'original-native-completion', request_id: identity.requestId, delivery_seq: delivery.seq, identity });
+    expect(() => f.scene.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'executed-action', action: 'old completion is not current gates', evidenceEventSeq: delivery.seq, evidenceEventKind: delivery.kind } })).toThrow(/current gate duty/);
+    service.reconsider(); await service.settled(); expect(f.scene.ledger.listJobEventsByKinds(identity.jobId, ['silas.directive-current-gates-owed'])).toHaveLength(1);
+    const unknown = f.scene.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: identity.jobId, payload: { sha: null, work_revision: 1, candidate_delivery_proven: false } });
+    expect(f.scene.ledger.latestCandidateDelivery(identity.jobId)?.seq).toBe(unknown.seq); expect(f.scene.ledger.workRevisionState(identity.jobId).delivered).toBe(0);
+  } finally { loss.mockRestore(); await service?.dispose(); await f.cleanup(); }
+});
+
+it('P36 actual production fallback wrapper forwards native claim refusal and then claims the same SDK continuation exactly once', async () => {
+  const { withFallbacks } = await import('../src/runtime/fallbacks.js');
+  const { DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['original checkpoint genuinely finished through wrapper'] }]);
+  let service: InstanceType<typeof DirectiveProgressService> | undefined;
+  try {
+    await seedSdkUserCheckpoint(f);
+    const spawn = f.registry.spawn.bind(f.registry);
+    vi.spyOn(f.registry, 'spawn').mockImplementation(async (role, options) => {
+      const handle = await spawn(role, options);
+      const fallback = withFallbacks({ id: 'pi', capabilities: { ...handle.capabilities, steer: 'queued' },
+        spawn: async () => handle, health: () => f.fx.runtime.health(), dispose: async () => {} });
+      return fallback.spawn(role, options);
+    });
+    const claim = vi.spyOn(f.scene.ledger, 'claimDirectiveCheckpoint').mockImplementation(() => { throw new Error('P36 durable native claim refused'); });
+    service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled();
+    expect(claim).toHaveBeenCalledTimes(1); expect(f.sessions.at(-1)!.agent.continue).not.toHaveBeenCalled();
+    expect(f.scene.ledger.getDirective(f.scene.request.requestId)?.recoveryCheckpoint).toBeNull();
+    claim.mockRestore(); const actualClaim = vi.spyOn(f.scene.ledger, 'claimDirectiveCheckpoint');
+    service.reconsider(); await service.settled();
+    expect(actualClaim).toHaveBeenCalledTimes(1); expect(f.sessions.at(-1)!.agent.continue).toHaveBeenCalledTimes(1);
+    expect(f.sessions.every((session) => vi.mocked(session.prompt).mock.calls.length === 0)).toBe(true);
+    expect(f.scene.ledger.getDirective(f.scene.request.requestId)?.state).toBe('settled');
+    service.reconsider(); await service.settled(); expect(actualClaim).toHaveBeenCalledTimes(1);
+  } finally { await service?.dispose(); await f.cleanup(); }
+});
+
+async function assertNativeCompletionHeadLengths(boundary: 'writer' | 'reader'): Promise<void> {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { readDirectiveCompletion, recordDirectiveCompletion, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['real original native completion'] }]);
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    const proof = inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.identity);
+    if (proof.state !== 'terminal') throw new Error('P40 requires real SDK terminal completion');
+    const receipt = readDirectiveCompletion(row.nativeTarget!.sessionFile, f.scene.identity, proof.checkpointId)!;
+    const journal = `${row.nativeTarget!.sessionFile}.producers.jsonl`; const original = readFileSync(journal, 'utf8');
+    for (const length of [41, 48, 63]) {
+      const entries = original.trimEnd().split('\n').map((line) => JSON.parse(line) as { state: string; head?: string | null });
+      if (boundary === 'writer') {
+        const before = entries.filter((entry) => entry.state !== 'completed').map((entry) => JSON.stringify(entry)).join('\n') + '\n';
+        writeFileSync(journal, before);
+        expect(() => recordDirectiveCompletion(receipt.producer, proof.checkpointId, 'a'.repeat(length))).toThrow(/HEAD malformed/);
+        expect(readFileSync(journal, 'utf8')).toBe(before);
+      } else {
+        for (const entry of entries) if (entry.state === 'completed') entry.head = 'a'.repeat(length);
+        writeFileSync(journal, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+        expect(() => readDirectiveCompletion(row.nativeTarget!.sessionFile, f.scene.identity, proof.checkpointId)).toThrow(/malformed native completion HEAD/);
+      }
+      writeFileSync(journal, original);
+    }
+    for (const head of ['a'.repeat(40), 'b'.repeat(64), null]) {
+      const entries = original.trimEnd().split('\n').map((line) => JSON.parse(line) as { state: string; head?: string | null });
+      for (const entry of entries) if (entry.state === 'completed') entry.head = head;
+      writeFileSync(journal, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+      expect(readDirectiveCompletion(row.nativeTarget!.sessionFile, f.scene.identity, proof.checkpointId)?.head).toBe(head);
+      expect(() => recordDirectiveCompletion(receipt.producer, proof.checkpointId, head)).not.toThrow();
+      writeFileSync(journal, original);
+    }
+  } finally { await f.cleanup(); }
+}
+it('P40 original native completion writer rejects intermediate Git ID lengths and preserves exact SHA1 SHA256 null', () => assertNativeCompletionHeadLengths('writer'));
+it('P40 durable native completion reader rejects intermediate Git ID lengths and preserves exact SHA1 SHA256 null', () => assertNativeCompletionHeadLengths('reader'));
