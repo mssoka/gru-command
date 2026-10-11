@@ -468,32 +468,54 @@ async function clickBell(page: Page): Promise<void> {
 }
 
 /** Real TEXT-ONLY zoom for Chromium, which exposes no native text-only
- * mode: snapshot every element's computed font size and set it to EXACTLY
- * 2x inline — no root/page zoom, no viewport or deviceScaleFactor change,
- * so layout/container widths stay fixed while the rendered glyphs double
- * and text wraps the way Firefox's "zoom text only" makes it. Elements are
- * marked so a later re-application (needed after the SPA rebuilds DOM) only
- * scales NEW nodes and never compounds; the returned samples let tests
- * assert the mechanism itself rather than infer it from a title or image. */
+ * mode: every element's ORIGINAL computed font size is recorded once as a
+ * `data-text-zoom-base` attribute and always rendered as exactly base x2
+ * inline — no root/page zoom, no viewport or deviceScaleFactor change, so
+ * layout/container widths stay fixed while the rendered glyphs double and
+ * text wraps the way Firefox's "zoom text only" makes it. Re-application
+ * (needed after the SPA rebuilds DOM) derives fresh nodes' bases from the
+ * scaled ancestor they inherited from, so it is idempotent and can never
+ * compound; the returned base/after samples let tests assert the exact
+ * factor rather than infer it from a title or image. A missing probe
+ * fails loud — the mechanism is never certified against `body` by default. */
 async function applyTextOnlyZoom(
   page: Page,
   factor = 2,
   probeSelector = '[data-notification-id="decision-1"] .board-notification__title',
-): Promise<{ scaled: number; probeBefore: number; probeAfter: number }> {
+): Promise<{ scaled: number; probeBase: number; probeAfter: number }> {
   return page.evaluate(
     ({ scale, selector }) => {
-      const mark = 'textZoomApplied';
-      const probe = document.querySelector<HTMLElement>(selector) ?? document.body;
-      const fresh = [...document.querySelectorAll<HTMLElement>('*')]
-        .filter((element) => element.dataset[mark] !== String(scale))
-        .map((element) => [element, Number.parseFloat(getComputedStyle(element).fontSize)] as const)
-        .filter(([, size]) => Number.isFinite(size) && size > 0);
-      const probeBefore = Number.parseFloat(getComputedStyle(probe).fontSize);
-      for (const [element, size] of fresh) {
-        element.style.fontSize = `${size * scale}px`;
-        element.dataset[mark] = String(scale);
+      const probe = document.querySelector<HTMLElement>(selector);
+      if (probe === null) throw new Error(`text-only zoom probe not found: ${selector}`);
+      let scaled = 0;
+      for (const element of [...document.querySelectorAll<HTMLElement>('*')]) {
+        const computed = Number.parseFloat(getComputedStyle(element).fontSize);
+        if (!Number.isFinite(computed) || computed <= 0) continue;
+        let base = Number.parseFloat(element.dataset.textZoomBase ?? '');
+        if (!Number.isFinite(base) || base <= 0) {
+          base = computed;
+          const parent = element.parentElement;
+          if (parent !== null) {
+            const parentBase = Number.parseFloat(parent.dataset.textZoomBase ?? '');
+            // A FRESH node that inherited a scaled ancestor carries the
+            // inflated size: recover its unzoomed base from that ancestor.
+            if (Number.isFinite(parentBase) && parentBase > 0 && Math.abs(computed - parentBase * scale) < 0.01) {
+              base = parentBase;
+            }
+          }
+          element.dataset.textZoomBase = String(base);
+        }
+        const wanted = base * scale;
+        if (Math.abs(computed - wanted) > 0.01) {
+          element.style.fontSize = `${wanted}px`;
+          scaled += 1;
+        }
       }
-      return { scaled: fresh.length, probeBefore, probeAfter: Number.parseFloat(getComputedStyle(probe).fontSize) };
+      return {
+        scaled,
+        probeBase: Number.parseFloat(probe.dataset.textZoomBase ?? ''),
+        probeAfter: Number.parseFloat(getComputedStyle(probe).fontSize),
+      };
     },
     { scale: factor, selector: probeSelector },
   );
@@ -762,8 +784,22 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         // else — no page/root zoom, no viewport or DPR change.
         const zoom = await applyTextOnlyZoom(page);
         expect(zoom.scaled).toBeGreaterThan(200);
-        expect(zoom.probeBefore).toBeGreaterThan(0);
-        expect(zoom.probeAfter).toBeGreaterThanOrEqual(zoom.probeBefore * 2 - 0.5);
+        expect(zoom.probeBase).toBeGreaterThan(0);
+        // EXACT factor, both bounds: under- and over-scaling both fail.
+        expect(zoom.probeAfter).toBeCloseTo(zoom.probeBase * 2, 1);
+        // Named notification text classes land on their exact doubled px
+        // values (metadata label 11px -> 22px; option button 12px -> 24px).
+        expect(
+          await page
+            .locator('#board-owner [data-notification-id="decision-1"] .board-notification__meta')
+            .evaluate((element) => getComputedStyle(element).fontSize),
+        ).toBe('22px');
+        expect(
+          await page
+            .locator('#board-owner [data-notification-id="decision-1"] .board-notification__option-button')
+            .first()
+            .evaluate((element) => getComputedStyle(element).fontSize),
+        ).toBe('24px');
         expect(await page.evaluate(() => document.documentElement.style.zoom)).toBe('');
         const after = await page.evaluate(() => ({
           viewport: window.innerWidth,
@@ -809,10 +845,39 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         const summary = card.locator('.board-notification__details summary');
         await summary.focus();
         expect(await summary.evaluate((element) => (element.parentElement as HTMLDetailsElement).open)).toBe(true);
+        const titleZoomed = await page
+          .locator('#board-owner [data-notification-id="decision-1"] .board-notification__title')
+          .evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize));
+        // Wait deterministically for the pushed snapshot to REBUILD the band
+        // (a late frame must never flake the run): the probe attribute only
+        // survives on the pre-push node.
+        await page.evaluate(() => {
+          document
+            .querySelector<HTMLElement>('#board-owner [data-notification-id="decision-1"] .board-notification__title')!
+            .setAttribute('data-rebuild-probe', 'before');
+        });
         seed.push(withDiscussion);
-        await settled(page);
+        await expect
+          .poll(() =>
+            page.evaluate(
+              () =>
+                document
+                  .querySelector('#board-owner [data-notification-id="decision-1"] .board-notification__title')
+                  ?.getAttribute('data-rebuild-probe') ?? null,
+            ),
+          )
+          .toBeNull();
         const reapplied = await applyTextOnlyZoom(page);
+        // The rebuilt nodes were re-scaled from their recovered bases, and
+        // the rebuilt title lands on the SAME doubled size as before the
+        // push — no compounding, no de-scaling.
         expect(reapplied.scaled).toBeGreaterThan(0);
+        expect(reapplied.probeBase).toBeGreaterThan(0);
+        expect(reapplied.probeAfter).toBeCloseTo(reapplied.probeBase * 2, 1);
+        const titleRezoomed = await page
+          .locator('#board-owner [data-notification-id="decision-1"] .board-notification__title')
+          .evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize));
+        expect(titleRezoomed).toBeCloseTo(titleZoomed, 1);
         const summaryAfter = page.locator('#board-owner [data-notification-id="decision-1"] .board-notification__details summary');
         expect(await summaryAfter.evaluate((element) => (element.parentElement as HTMLDetailsElement).open)).toBe(true);
         await expect(summaryAfter).toBeFocused();
@@ -828,6 +893,13 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         await expect(
           page.locator('#notification-list [data-notification-id="discuss-1"] .board-notification__discuss-text'),
         ).toBeVisible();
+        // The error card's expanded evidence is OPEN when measured (the
+        // closed-disclosure state is not the state claimed here).
+        await page.locator('#notification-list [data-notification-id="machine-1"] .board-notification__details summary').click();
+        await expect(
+          page.locator('#notification-list [data-notification-id="machine-1"] .board-notification__detail-text'),
+        ).toContainText(LONG_SHA);
+        await settled(page);
         const pairs: readonly (readonly [string, string])[] = [
           ['#notification-list [data-notification-id="machine-1"] .board-notification__title', 'machine (error) title'],
           ['#notification-list [data-notification-id="machine-1"] .board-notification__detail-text', 'machine (error) expanded evidence'],
@@ -839,6 +911,13 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           if (ratio < 4.5) failures.push({ pair: `${label} (${theme})`, ratio });
         }
         expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
+        // Non-overlap reaches the CONTAINERS, and the page itself does not
+        // acquire horizontal scroll under the real text zoom.
+        for (const container of ['#board-owner', '#notification-list']) {
+          const bounds = await overflows(page, container);
+          expect(bounds.scrollWidth, `${container} @1280 ${theme} text-only`).toBeLessThanOrEqual(bounds.clientWidth + 1);
+        }
+        expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
         await captureViewport(page, `${theme}-text-only-zoom-200-desktop`, `${theme}: actual 200% text-only zoom, decision Details + discussion card`);
       } finally {
         await page.close();
@@ -860,18 +939,22 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           await settled(page);
           expect(seed.pageErrors).toEqual([]);
           const zoom = await applyTextOnlyZoom(page);
-          expect(zoom.probeAfter).toBeGreaterThanOrEqual(zoom.probeBefore * 2 - 0.5);
+          expect(zoom.probeBase).toBeGreaterThan(0);
+          expect(zoom.probeAfter).toBeCloseTo(zoom.probeBase * 2, 1);
           const card = page.locator('#board-owner [data-notification-id="decision-1"]');
+          await expect(card).toBeVisible();
           await card.locator('.board-notification__details summary').click();
           await expect(card.locator('.board-notification__detail-text')).toContainText(LONG_PATH);
           await settled(page);
           for (const selector of [
             '#board-owner [data-notification-id="decision-1"]',
             '#board-owner [data-notification-id="decision-1"] .board-notification__detail-text',
+            '#board-owner',
           ]) {
             const box = await overflows(page, selector);
             expect(box.scrollWidth, `${selector} @${width} ${theme} text-only`).toBeLessThanOrEqual(box.clientWidth + 1);
           }
+          expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
           const detailBox = await card.locator('.board-notification__detail-text').boundingBox();
           expect(detailBox?.width ?? 0, `expanded width @${width} ${theme} text-only`).toBeGreaterThan(0);
           expect(detailBox?.height ?? 0, `expanded height @${width} ${theme} text-only`).toBeGreaterThan(0);
@@ -902,16 +985,25 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         await settled(page);
         expect(seed.pageErrors).toEqual([]);
         const zoom = await applyTextOnlyZoom(page);
-        expect(zoom.probeAfter).toBeGreaterThanOrEqual(zoom.probeBefore * 2 - 0.5);
+        expect(zoom.probeBase).toBeGreaterThan(0);
+        expect(zoom.probeAfter).toBeCloseTo(zoom.probeBase * 2, 1);
         await page.locator('#notification-list [data-notification-id="machine-1"] .board-notification__details summary').click();
         await expect(
           page.locator('#notification-list [data-notification-id="machine-1"] .board-notification__detail-text'),
         ).toContainText(LONG_SHA);
         await settled(page);
+        // Every measured card must be PROVEN present first: a missing card
+        // can no longer satisfy the overflow comparison vacuously.
         for (const id of ['decision-1', 'machine-1', 'feed-resolved']) {
+          const panelCardLocator = page.locator(`#notification-list [data-notification-id="${id}"]`);
+          await panelCardLocator.scrollIntoViewIfNeeded();
+          await expect(panelCardLocator).toBeVisible();
           const panelCard = await overflows(page, `#notification-list [data-notification-id="${id}"]`);
           expect(panelCard.scrollWidth, `${id} @320 panel ${theme} text-only`).toBeLessThanOrEqual(panelCard.clientWidth + 1);
         }
+        const panelBounds = await overflows(page, '#notification-list');
+        expect(panelBounds.scrollWidth, `panel @320 ${theme} text-only`).toBeLessThanOrEqual(panelBounds.clientWidth + 1);
+        expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
         const expandedBox = await page
           .locator('#notification-list [data-notification-id="machine-1"] .board-notification__detail-text')
           .boundingBox();
