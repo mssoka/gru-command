@@ -17,6 +17,7 @@ import {
   bandedJob,
   bucketJobs,
   jobRecency,
+  mailboxJobs,
   liveWorkerStampsByJob,
   snapshotFamilies,
   stoppedWorkersByJob,
@@ -92,6 +93,8 @@ export interface BoardSections {
   /** Full pipeline entry list in server order; empty when unwired. */
   readonly pipelineEntries: readonly PipelineEntryView[];
   readonly pipelineAvailable: boolean;
+  readonly mailbox: BoardSnapshot['mailbox'];
+  readonly mailboxAvailable: boolean;
 }
 
 export function boardSections(
@@ -108,6 +111,7 @@ export function boardSections(
 ): BoardSections {
   const bucketOpts: BucketOptions = {
     now,
+    mailboxJobs: mailboxJobs(snapshot),
     unackedByJob: unackedByJob(snapshot),
     ...(opts.stoppedWorkers !== undefined ? { stoppedWorkers: opts.stoppedWorkers } : {}),
     ...(opts.liveWorkerStamps !== undefined ? { liveWorkerStamps: opts.liveWorkerStamps } : {}),
@@ -135,12 +139,14 @@ export function boardSections(
       pipeline: pipeline?.pending ?? 0,
       // The section's own authoritative count is the machine band it
       // contains (the global unacked tracker stays a separate chip).
-      'for-gru': byBand.get('needs-you')?.length ?? 0,
+      'for-gru': (snapshot.mailbox?.counts.threads ?? 0) + (snapshot.mailbox?.counts.incidents ?? 0),
       settled: byBand.get('settled')?.length ?? 0,
       cold: byBand.get('cold')?.length ?? 0,
     },
     pipelineEntries: pipeline?.entries ?? [],
     pipelineAvailable: pipeline !== null,
+    mailbox: snapshot.mailbox,
+    mailboxAvailable: snapshot.mailbox !== undefined && snapshot.mailbox !== null,
   };
 }
 
@@ -157,14 +163,14 @@ export function snapshotSections(snapshot: BoardSnapshot, now = Date.now()): Boa
 
 /** The sticky shortcut strip's rows — labelled, uncapped counts, one per
  * section in the approved order. */
-export function sectionNav(counts: SectionCounts, pipelineAvailable = true): readonly SectionNavRow[] {
+export function sectionNav(counts: SectionCounts, pipelineAvailable = true, mailboxAvailable = true): readonly SectionNavRow[] {
   return SECTION_ORDER.map((id) => ({
     id,
     label: SECTION_LABELS[id],
     count: counts[id],
     targetId: SECTION_TARGET_IDS[id],
     href: `#${SECTION_TARGET_IDS[id]}`,
-    counted: id !== 'pipeline' || pipelineAvailable,
+    counted: id === 'pipeline' ? pipelineAvailable : id === 'for-gru' ? mailboxAvailable : true,
   }));
 }
 
