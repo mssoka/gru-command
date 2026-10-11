@@ -1018,6 +1018,8 @@ async function main(): Promise<number> {
     dir: chatDir,
     ledger,
     bus,
+    mailbox: engine.mailbox,
+    mailboxReconcileIntervalMs: config.chat.mailboxReconcileIntervalMs,
     wakeMode: config.chat.notifyWake,
     wakeMinIntervalMs: config.chat.wakeMinIntervalMs,
     wakeMinSeverity: config.chat.wakeMinSeverity,

@@ -1,3 +1,4 @@
+import { withMailboxFixture } from './mailbox-fixture.test-support.js';
 import { describe, expect, it } from 'vitest';
 import type { BoardSnapshot, JobView, PipelineEntryView } from './board-protocol.js';
 import {
@@ -51,7 +52,7 @@ function pipelineEntry(id: string, overrides: Partial<PipelineEntryView> = {}): 
 }
 
 function snapshot(options: { jobs?: readonly JobView[]; pipeline?: BoardSnapshot['pipeline'] } = {}): BoardSnapshot {
-  return {
+  return withMailboxFixture({
     repos: [{ name: 'demo', jobs: options.jobs ?? [] }],
     agents: [],
     notifications: [],
@@ -71,7 +72,7 @@ function snapshot(options: { jobs?: readonly JobView[]; pipeline?: BoardSnapshot
     unackedNeedsOwner: 0,
     wakes: { count: 0, lastAt: null },
     ...(options.pipeline !== undefined ? { pipeline: options.pipeline } : {}),
-  };
+  });
 }
 
 describe('board sections — approved order and counts', () => {

@@ -980,6 +980,17 @@ export const MIGRATIONS: readonly Migration[] = [
   },
   {
     id: 25,
+    name: 'gru-mailbox',
+    sql: `
+      CREATE TABLE gru_mailbox (
+        id TEXT PRIMARY KEY,
+        item TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    id: 26,
     name: 'intake-review-acceptance',
     sql: `
       CREATE TABLE intake_reviews (
@@ -1000,7 +1011,7 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
-    id: 26,
+    id: 27,
     name: 'intake-recovery-query-indexes',
     sql: `
       CREATE INDEX idx_intake_reviews_scope ON intake_reviews(repo_path, intake_id, revision_id);

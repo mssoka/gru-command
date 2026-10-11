@@ -3516,3 +3516,6 @@ a.repo-row__name:hover {
 .intake-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .intake-selection { display: flex; align-items: center; gap: 6px; }
 .intake-status { overflow-wrap: anywhere; }
+
+.mailbox-detail { padding: .5rem 1rem; font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
+.mailbox-incident { padding: .75rem; border: 1px solid currentColor; border-radius: .4rem; }

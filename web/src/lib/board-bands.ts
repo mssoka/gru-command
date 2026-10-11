@@ -2,11 +2,9 @@
  * Attention-bucketed job ordering (board UX v4): the board answers WHAT
  * TO DO NEXT, not what happened last. Bands, in order:
  *
- *   1 NEEDS GRU  — unacked action-required, blocked/error, PR conflicting,
- *                  aborted review, failed lenses in the newest round —
- *                  review-history causes apply only to work that is
- *                  still open: a concluded merged/done/binned job earns NO
- *                  NEEDS GRU causes at all (closed receipt)
+ *   1 FOR GRU   — server mailbox job membership only (including its
+ *                  waiting/delegated follow-up); absent = unavailable,
+ *                  never browser-inferred eligibility.
  *   2 IN FLIGHT  — dispatched, fresh working, in-review
  *   3 SETTLED    — delivered, merged today
  *   4 COLD       — stalled working (30 min, Silas's default threshold),
@@ -19,13 +17,11 @@
 import {
   agentActivityOf,
   agentRuntimeOf,
-  isJobConcluded,
   type AgentView,
   type BoardSnapshot,
   type JobView,
 } from './board-protocol.js';
 import { isLiveMegaminion, jobFamilies, type JobFamilies } from './board-family.js';
-import { derivedPrState } from './board-kpi.js';
 import { isSameLocalDay } from './board-time.js';
 
 export type BandId = 'needs-you' | 'in-flight' | 'settled' | 'cold';
@@ -56,8 +52,10 @@ export interface BandedJob {
 
 export interface BucketOptions {
   readonly now?: number;
+  /** Only the server mailbox supplies FOR GRU membership. */
+  readonly mailboxJobs?: ReadonlyMap<string, readonly string[]>;
   readonly stalledAfterMs?: number;
-  /** Unacked action-required counts per job id (from board-signals). */
+  /** Notification-unit counts only; never FOR GRU membership authority. */
   readonly unackedByJob?: ReadonlyMap<string, number>;
   /** Supervision-stopped worker views per job id (from the snapshot's
    * agent rows) — a stopped lane is waiting, never silent-stalled. */
@@ -284,39 +282,23 @@ export function isStalledWorking(job: JobView, opts: BucketOptions = {}): boolea
   return (opts.now ?? Date.now()) - then > threshold;
 }
 
-/** Every reason a job earns Band 1 (exported for focused tests). A
- * terminal job (merged/done/binned) is a closed receipt: neither stale
- * review
- * history nor leftover current-state rows may promote it back into NEEDS
- * GRU (section-truth ruling 2026-09-29; the earlier 2026-09-26 guard
- * suppressed only review history and still let current-state causes
- * promote a concluded lane). Terminal-bound machine rows are attributed
- * as receipts upstream (unackedByJob), so no live cause remains. */
-export function needsYouReasons(job: JobView, unacked: number): readonly string[] {
-  if (isJobConcluded(job.status)) return [];
-  const reasons: string[] = [];
-  if (unacked > 0) reasons.push('action-required');
-  if (job.status === 'blocked' || job.status === 'error') reasons.push(job.status);
-  if (derivedPrState(job) === 'conflicting') reasons.push('PR conflicting');
-  const round = job.rounds.at(-1) ?? null;
-  if (round !== null) {
-    if (round.status === 'aborted') reasons.push('round aborted');
-    else if (round.status !== 'verdict-posted' && round.lenses.some((lens) => lens.state === 'error')) {
-      reasons.push('lens failed');
-    }
-  }
-  return reasons;
+/** Server-owned reasons; absent mailbox is unavailable, never inferred eligibility. */
+export function needsYouReasons(job: JobView, _unacked: number, mailboxJobs?: BucketOptions['mailboxJobs']): readonly string[] {
+  return mailboxJobs?.get(job.id) ?? [];
+}
+export function jobNeedsYou(job: JobView, _unacked: number, mailboxJobs?: BucketOptions['mailboxJobs']): boolean {
+  return mailboxJobs?.has(job.id) === true;
 }
 
-export function jobNeedsYou(job: JobView, unacked: number): boolean {
-  return needsYouReasons(job, unacked).length > 0;
+export function mailboxJobs(snapshot: BoardSnapshot): ReadonlyMap<string, readonly string[]> {
+  return new Map((snapshot.mailbox?.items ?? []).filter((item) => item.kind === 'job' && item.jobId !== null && item.state !== 'resolved')
+    .map((item) => [item.jobId!, item.reasons.map((reason) => reason.label)]));
 }
 
 /** Deterministic band for one job. */
 export function bandForJob(job: JobView, opts: BucketOptions = {}): BandId {
-  const unacked = opts.unackedByJob?.get(job.id) ?? 0;
   // Cascade promoter: any NEEDS-YOU cause outranks everything else.
-  if (jobNeedsYou(job, unacked)) return 'needs-you';
+  if (jobNeedsYou(job, 0, opts.mailboxJobs)) return 'needs-you';
   switch (job.status) {
     case 'dispatched':
     case 'in-review':
@@ -373,11 +355,12 @@ export function bandedJob(job: JobView, opts: BucketOptions = {}): BandedJob {
  *     cold or machine-queue parent sits behind a preview window or a
  *     collapsed disclosure, and running work must never hide there. */
 export function snapshotFamilies(snapshot: BoardSnapshot, opts: BucketOptions = {}): JobFamilies {
+  const sharedOpts = { ...opts, mailboxJobs: opts.mailboxJobs ?? mailboxJobs(snapshot) };
   return jobFamilies(
     snapshot.repos.flatMap((repo) => repo.jobs),
     (job, parent) =>
-      jobNeedsYou(job, opts.unackedByJob?.get(job.id) ?? 0) ||
-      (isLiveMegaminion(job) && bandForJob(parent, opts) !== 'in-flight'),
+      jobNeedsYou(job, 0, sharedOpts.mailboxJobs) ||
+      (isLiveMegaminion(job) && bandForJob(parent, sharedOpts) !== 'in-flight'),
   );
 }
 
@@ -385,7 +368,8 @@ export function snapshotFamilies(snapshot: BoardSnapshot, opts: BucketOptions = 
  * can land in different bands; the UI re-groups by repo inside each
  * band). Nested megaminions ride their parent heist, never a band. */
 export function bucketSnapshot(snapshot: BoardSnapshot, opts: BucketOptions = {}): readonly BandedJobs[] {
-  return bucketJobs(snapshotFamilies(snapshot, opts).topLevel, opts);
+  const sharedOpts = { ...opts, mailboxJobs: opts.mailboxJobs ?? mailboxJobs(snapshot) };
+  return bucketJobs(snapshotFamilies(snapshot, sharedOpts).topLevel, sharedOpts);
 }
 
 /** Board UX v5: the SETTLED band is a rolling window — the latest N

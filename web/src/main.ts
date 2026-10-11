@@ -355,8 +355,14 @@ function startBoard(token: string): void {
         renderConnectionDot(state);
         commandBar.setBoardState(state);
       },
+      unavailable: (message) => {
+        if (boardClient !== current) return;
+        boardView?.markUnavailable(message);
+        showBanner('board-unavailable', 'work', `Board unavailable — rows and counts are last-known. ${message}`);
+      },
       snapshot: (snapshot) => {
         if (boardClient !== current) return;
+        clearBanner('board-unavailable');
         boardView?.render(snapshot);
         commandBar.setSnapshot(snapshot);
         // The first snapshot discloses the chip rail — the chrome just

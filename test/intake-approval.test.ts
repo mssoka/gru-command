@@ -60,10 +60,10 @@ describe('intake durable recovery integrity', () => {
   it('refuses a missing committed pipeline row proven by job without recreating it', () => missingCommittedRow('job'));
   it('refuses a missing committed pipeline row proven by enqueue event without recreating it', () => missingCommittedRow('enqueue event'));
 
-  it('upgrades retained v25 history and uses intake/committed-enqueue indexes without rewriting records', async () => {
+  it('upgrades retained v26 history and uses intake/committed-enqueue indexes without rewriting records', async () => {
     const h = await fixture();
     const dir = join(h.root, 'old-ledger');
-    const old = new LedgerDb(dir, { migrations: MIGRATIONS.filter(({ id }) => id <= 25) });
+    const old = new LedgerDb(dir, { migrations: MIGRATIONS.slice(0, MIGRATIONS.findIndex(({ name }) => name === 'intake-recovery-query-indexes')) });
     const oldApi = new LedgerApi(old.handle);
     oldApi.recordIntakeReview(h.review);
     oldApi.enqueuePipelineEntry({ id: 'legacy-accepted', repoPath: h.repoPath, title: 'Legacy accepted', briefing: 'Immutable legacy bytes' });
