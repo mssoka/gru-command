@@ -22,7 +22,7 @@ const LONG_DIAGNOSTIC =
   'Decisions for job job-1234567890abcdef are blocked: the frozen head ' +
   'a40e6a963f8c2b1d4e5f60718293a4b5c6d7e8f9 no longer matches the recorded branch state ' +
   '(capture 2bbd77ac-9851-3b7e-480c-ef21963caf54), and the reconciliation manifest at ' +
-  '/Users/example/.gru-command/captures/ops-sweep-20261009T000000Z/reconcile/PR285-interrupted-original-capture-provenance/manifest.json ' +
+  '/home/tester/.gru-command/captures/ops-sweep-20261009T000000Z/reconcile/PR285-interrupted-original-capture-provenance/manifest.json ' +
   'is missing. No replay, new directive or false restart was attempted.';
 
 function mountBoardDom(): void {
@@ -115,7 +115,7 @@ describe('readable notification card — fixed long-content contract', () => {
     expect(card.querySelector('.board-notification__detail-text')?.textContent).toBe(LONG_DIAGNOSTIC);
     // The short metadata label never carries the diagnostic prose.
     expect(card.querySelector('.board-notification__meta')?.textContent).not.toContain('job-1234567890abcdef');
-    expect(card.querySelector('.board-notification__meta')?.textContent).not.toContain('/Users/example/');
+    expect(card.querySelector('.board-notification__meta')?.textContent).not.toContain('/home/tester/');
   });
 
   it('renders typed owner decision options with consequences and no generic Ack', () => {

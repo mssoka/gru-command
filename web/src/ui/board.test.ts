@@ -2661,7 +2661,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const longDetail =
       `Decisions for job job-1234567890abcdef are blocked: the SHA ` +
       `a40e6a963f8c2b1d4e5f60718293a4b5c6d7e8f9 does not match the recorded head, ` +
-      `and /Users/example/.gru-command/captures/ops-sweep-20261009T000000Z/manifest.json is missing. ` +
+      `and /home/tester/.gru-command/captures/ops-sweep-20261009T000000Z/manifest.json is missing. ` +
       'No replay was attempted; the lane stays stopped until the cause is addressed.';
     view.render(
       snapshot({

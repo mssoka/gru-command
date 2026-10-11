@@ -91,7 +91,7 @@ async function captureViewport(page: Page, name: string, state: string): Promise
 const T0 = '2026-10-11T00:00:00.000Z';
 const LONG_SHA = 'a40e6a963f8c2b1d4e5f60718293a4b5c6d7e8f9';
 const LONG_UUID = '2bbd77ac-9851-3b7e-480c-ef21963caf54';
-const LONG_PATH = '/Users/example/.gru-command/captures/ops-sweep-20261009T000000Z/reconcile/PR285-interrupted-original-capture-provenance/manifest.json';
+const LONG_PATH = '/home/tester/.gru-command/captures/ops-sweep-20261009T000000Z/reconcile/PR285-interrupted-original-capture-provenance/manifest.json';
 
 const LONG_DIAGNOSTIC =
   `Decisions for job job-1234567890abcdef are blocked: the frozen head ${LONG_SHA} no longer ` +
