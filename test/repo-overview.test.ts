@@ -172,8 +172,10 @@ function harness(options: {
   };
   state.tracker = new ManagedRepoOverviewTracker({
     workspaceRoot: '/ws',
+    managedRepos: names,
     api,
     scanRepos: () => state.names,
+    resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
     resolveRemote: async (repoPath) => {
       const name = repoPath.split('/').pop() as string;
       const gate = state.resolveGates.get(name);
@@ -1064,7 +1066,7 @@ describe('managed repo overview tracker — review-round guarantees', () => {
     expect(result.value[1]?.updatedAt).toBe('2026-10-07T10:05:00.000Z');
   });
 
-  it('drives the production default registry scan and origin resolver over a real workspace', async () => {
+  it('drives the configured registry and origin resolver over a real workspace without enrolling siblings', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-defaults-'));
     try {
       execFileSync('git', ['init', '-q', join(root, 'alpha')]);
@@ -1074,12 +1076,19 @@ describe('managed repo overview tracker — review-round guarantees', () => {
       execFileSync('git', ['-C', join(root, 'gitlab-repo'), 'remote', 'add', 'origin', 'https://gitlab.com/acme/gl.git']);
       mkdirSync(join(root, 'broken'));
       writeFileSync(join(root, 'broken', '.git'), 'gitdir: /nonexistent/gru-repo-overview-test\n');
+      execFileSync('git', ['init', '-q', join(root, 'unselected')]);
       mkdirSync(join(root, 'plain'));
       const api = new FakeApi().set('alpha', { openPrs: 1, openIssues: 2, workflows: { kind: 'ok', value: 0 } });
-      const tracker = new ManagedRepoOverviewTracker({ workspaceRoot: root, api, now: () => T0, sleep: async () => {} });
+      const tracker = new ManagedRepoOverviewTracker({
+        workspaceRoot: root,
+        managedRepos: ['alpha', 'broken', 'gitlab-repo', 'no-origin'],
+        api,
+        now: () => T0,
+        sleep: async () => {},
+      });
       const view = await tracker.refresh();
-      // The production default scan discovers only real `.git` entries.
       expect(view?.rows.map((entry) => entry.key)).toEqual(['alpha', 'broken', 'gitlab-repo', 'no-origin']);
+      expect(view?.rows.some((entry) => entry.key === 'unselected')).toBe(false);
       const entry = row(view, 'alpha');
       expect(entry.linked).toBe(true);
       expect(entry.fullName).toBe('acme/alpha');
@@ -1204,8 +1213,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       const api = new FakeApi().set('alpha', { openPrs: 1 });
       const tracker = new ManagedRepoOverviewTracker({
         workspaceRoot: '/ws',
+        managedRepos: ['alpha'],
         api,
         scanRepos: () => ['alpha'],
+        resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
         resolveRemote: () => githubRef('alpha'),
         intervalMs: 25,
         now: () => T0,
@@ -1351,8 +1362,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const attempted: string[] = [];
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
+      managedRepos: ['alpha', 'beta', 'gamma'],
       api,
       scanRepos: () => ['alpha', 'beta', 'gamma'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
       resolveRemote: async (repoPath) => {
         attempted.push(repoPath.split('/').pop() as string);
         clock.ms += REPO_OVERVIEW_RESOLVE_BUDGET_MS + 1;
@@ -1407,8 +1420,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const clock = { ms: T0 };
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
       api,
       scanRepos: () => ['alpha'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
       resolveRemote: () => githubRef('alpha'),
       intervalMs: 0,
       now: () => clock.ms,
@@ -1453,8 +1468,10 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const sleeps: number[] = [];
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
+      managedRepos: ['alpha', 'beta'],
       api,
       scanRepos: () => ['alpha', 'beta'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
       resolveRemote: (repoPath) => githubRef(repoPath.split('/').pop() as string),
       now: () => 0,
       sleep: async (ms) => {
@@ -1661,8 +1678,10 @@ describe('managed repo overview tracker — run timestamp semantics', () => {
     // older run has the later start time (never PASSED in its place).
     const tracker = new ManagedRepoOverviewTracker({
       workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
       api: adapter,
       scanRepos: () => ['alpha'],
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
       resolveRemote: () => githubRef('alpha'),
       now: () => T0,
       sleep: async () => {},

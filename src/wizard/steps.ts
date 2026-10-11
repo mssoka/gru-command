@@ -29,9 +29,8 @@ export { tomlString, discoverManagedRepos };
  * QR payload, and backup-first config writing. `main.ts` owns prompts,
  * service registration, and the first-boot smoke.
  *
- * `discoverManagedRepos` is the ONE canonical registry rule (shared with
- * the runtime repository overview, `src/repos/discovery.ts`): depth-1
- * entries under the configured workspace root carrying a `.git`.
+ * `discoverManagedRepos` supplies installer candidates only. Runtime
+ * management comes exclusively from the persisted `managed_repos` list.
  */
 
 /** Render the same complete configuration used by config-generate. When
@@ -47,6 +46,7 @@ export function generateConfigToml(options: {
     {
       instanceDir: options.instanceDir,
       workspaceRoot: answers.workspaceRoot,
+      managedRepos: answers.repos,
       host: answers.host,
       port: answers.port,
       token: answers.token,
@@ -221,6 +221,7 @@ export function seedAnswersFromConfig(
       !explicit.has('workspace_root') && answers.workspaceRoot === PROMPT_DEFAULTS.workspaceRoot
         ? prior.workspaceRoot
         : answers.workspaceRoot,
+    repos: !explicit.has('repos') && answers.repos.length === 0 ? prior.managedRepos : answers.repos,
     runtime:
       !explicit.has('runtime') && answers.runtime === PROMPT_DEFAULTS.runtime
         ? prior.runtimes.default

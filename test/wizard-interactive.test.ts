@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { loadConfig } from '../src/config.js';
+import { configPathFor, loadConfig } from '../src/config.js';
+import { parseAnswers } from '../src/wizard/answers.js';
+import { writeInstanceConfig } from '../src/wizard/steps.js';
 
 /** Real PTY front-door coverage. BMAD provisioning/retry prompts are retired (#295). */
 const repoRoot = join(import.meta.dirname, '..');
@@ -53,8 +55,8 @@ function ptyWizard(steps: readonly Step[], env: NodeJS.ProcessEnv, flags: readon
 function expectAvailable(): boolean {
   try { execFileSync('which', ['expect'], { stdio: 'ignore' }); return true; } catch { return false; }
 }
-const WS_PROMPT = 'Workspace root (holds ONLY your managed repos)';
-const REPOS_PROMPT = 'Repos to validate — comma-separated numbers or names';
+const WS_PROMPT = 'Workspace root (shared project directory; may contain unmanaged projects)';
+const REPOS_PROMPT = 'Repos to manage — comma-separated numbers or names';
 const RUNTIME_PROMPT = 'Default runtime — ';
 const MODEL_PROMPT = 'Model reference';
 const THINKING_PROMPT = 'Thinking level';
@@ -86,8 +88,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps(''),
     ], { GRU_COMMAND_HOME: instance });
     expect(status, output).toBe(0);
-    expect(output).toContain('Repositories selected for setup validation: repo-a, repo-b');
-    expect(output).toContain('Linked repo entries excluded from setup validation: repo-link');
+    expect(output).toContain('Managed repositories selected: repo-a, repo-b');
+    expect(output).toContain('Linked repo entries excluded from installer choices: repo-link');
     expect(output).toContain('Smoke green');
     expect(output).toContain('Setup complete');
     expect(output).not.toContain('BMAD in ');
@@ -99,6 +101,32 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     const config = readFileSync(join(instance, 'config.toml'), 'utf-8');
     expect(config).toContain('port = 0');
     expect(config).toContain(`workspace_root = "${workspace}"`);
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
+  }, 90_000);
+
+  it('interactive reruns preserve the prior subset on Enter and persist an explicit changed choice', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-managed-rerun-');
+    const prior = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['repo-a'] }));
+    writeInstanceConfig({ instanceDir: instance, answers: prior });
+
+    const preserved = ptyWizard(
+      [{ expect: WS_PROMPT, send: '' }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps('n')],
+      { GRU_COMMAND_HOME: instance },
+      ['--force'],
+    );
+    expect(preserved.status, preserved.output).toBe(0);
+    expect(preserved.output).toContain('Managed repositories selected: repo-a');
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a']);
+
+    const changed = ptyWizard(
+      [{ expect: WS_PROMPT, send: '' }, { expect: REPOS_PROMPT, send: '2' }, ...finishSteps('n')],
+      { GRU_COMMAND_HOME: instance },
+      ['--force'],
+    );
+    expect(changed.status, changed.output).toBe(0);
+    expect(changed.output).toContain('Managed repositories selected: repo-b');
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-b']);
   }, 90_000);
 
   it('an all-linked workspace can complete setup without selecting entries validation must reject', () => {
@@ -111,8 +139,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, ...finishSteps(),
     ], { GRU_COMMAND_HOME: instance });
     expect(status, output).toBe(0);
-    expect(output).toContain('Linked repo entries excluded from setup validation: repo-link');
-    expect(output).toContain('Repositories selected for setup validation: (none)');
+    expect(output).toContain('Linked repo entries excluded from installer choices: repo-link');
+    expect(output).toContain('Managed repositories selected: (none)');
     expect(output).not.toContain(REPOS_PROMPT);
     expect(readFileSync(join(outside, 'repo-a', '.git/config'), 'utf-8')).toBe(before);
     expect(existsSync(join(outside, 'repo-a', '_bmad'))).toBe(false);
@@ -151,7 +179,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: TOKEN_PROMPT, send: '' }, { expect: REGISTER_PROMPT, send: 'n' }, { expect: SMOKE_PROMPT, send: 'n' },
     ], { GRU_COMMAND_HOME: tempDir('gru-command-pty-retry-') });
     expect(status, output).toBe(0);
-    for (const text of ['workspace_root must be an absolute path', 'not a discovered repo', 'valid runtimes:', 'answers.host must be', 'port must be an integer', 'Setup complete']) {
+    for (const text of ['workspace_root must be an absolute path', 'not an available Git repository candidate', 'valid runtimes:', 'answers.host must be', 'port must be an integer', 'Setup complete']) {
       expect(output).toContain(text);
     }
   }, 90_000);
@@ -162,8 +190,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '1' }, ...finishSteps(),
     ], { GRU_COMMAND_HOME: tempDir('gru-command-pty-index-') });
     expect(status, output).toBe(0);
-    expect(output).toContain('Repositories selected for setup validation: repo-a');
-    expect(output).not.toContain('Repositories selected for setup validation: repo-a, repo-b');
+    expect(output).toContain('Managed repositories selected: repo-a');
+    expect(output).not.toContain('Managed repositories selected: repo-a, repo-b');
   }, 90_000);
 
   it('managed-repo multi-pick by NAME preserves the answered order', () => {
@@ -172,7 +200,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: 'repo-b, repo-a' }, ...finishSteps(),
     ], { GRU_COMMAND_HOME: tempDir('gru-command-pty-name-') });
     expect(status, output).toBe(0);
-    expect(output).toContain('Repositories selected for setup validation: repo-b, repo-a');
+    expect(output).toContain('Managed repositories selected: repo-b, repo-a');
   }, 90_000);
 
   it('bind host rejects y/n tokens and re-prompts; 0.0.0.0 lands in the config', () => {

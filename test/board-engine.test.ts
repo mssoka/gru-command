@@ -1030,7 +1030,12 @@ describe('board engine — managed repository overview wiring', () => {
     // engine unit tests inject their own producer, so dropping the
     // production tracker stayed green without this pin.
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
-    expect(mainSource).toMatch(/new ManagedRepoOverviewTracker\(\{[\s\S]*?workspaceRoot:\s*config\.workspaceRoot/);
+    expect(mainSource).toMatch(/createManagedRepoOverviewTracker\(config,/);
+    expect(mainSource).toContain(
+      'managedRepos: () => config.managedRepos.map((name) => join(config.workspaceRoot, name))',
+    );
+    const runtimeSource = readFileSync(join(import.meta.dirname, '..', 'src', 'repos', 'runtime.ts'), 'utf8');
+    expect(runtimeSource).toMatch(/managedRepos:\s*config\.managedRepos/);
     expect(mainSource).toMatch(/repoOverview:\s*\(\)\s*=>\s*repoOverview\.view\(\)/);
     expect(mainSource).toMatch(/repoOverview\.start\(\)/);
     expect(mainSource).toMatch(/state\.repoOverview\?\.stop\(\)/);

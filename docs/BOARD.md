@@ -194,9 +194,11 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   `silas.wake`) — visible in the event stream like every other
   transition.
 - **Managed repository overview (owner-approved compact rows A):** below
-  the CREW list, one read-only module per configured managed repository
-  (the workspace root's depth-1 `.git` registry — the same rule the setup
-  wizard uses). Each compact row shows the repository identity (an https
+  the CREW list, one read-only module per explicit name in root-level
+  `managed_repos` (relative to `workspace_root`). The shared workspace root
+  may contain unrelated repositories; installer discovery offers candidates
+  but never enrolls siblings at runtime. An absent/empty list produces an
+  empty overview with setup guidance. Each compact row shows the repository identity (an https
   link only when the origin remote proves a safe GitHub identity,
   otherwise an explicit not-linked reason), exact repo-wide open-PR and
   open-issue counts (issues EXCLUDING PRs, via GitHub's aggregate search;

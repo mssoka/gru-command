@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
 import { parseQuietHours } from './chat/wake-policy.js';
 import { DEFAULT_INPUT_PRICE_PER_MTOK, validateProviderProfile } from './decisions/profile.js';
+import { managedRepoNameError } from './repos/managed-names.js';
 import type { SurfaceMode } from './decisions/types.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
@@ -569,6 +570,8 @@ export const DEFAULT_DECISIONS_CONFIG: DecisionsConfig = {
 
 export interface GruCommandConfig {
   readonly workspaceRoot: string;
+  /** Explicit direct-child repository names; absent in older files means none. */
+  readonly managedRepos: readonly string[];
   readonly dataDir: string;
   readonly server: ServerConfig;
   readonly auth: AuthConfig;
@@ -695,6 +698,7 @@ export function expandTilde(path: string, home: string = homedir()): string {
 
 const TOP_LEVEL_KEYS = [
   'workspace_root',
+  'managed_repos',
   'data_dir',
   'server',
   'auth',
@@ -943,6 +947,7 @@ export function loadConfig(
 
   const defaultWorkspaceRoot = join(home, 'code');
   let workspaceRoot = defaultWorkspaceRoot;
+  let managedRepos: readonly string[] = [];
   let dataDir = instanceDir;
   let server: ServerConfig = { host: '127.0.0.1', port: DEFAULT_INSTANCE_PORT };
   let auth: AuthConfig = { token: '' };
@@ -1020,6 +1025,27 @@ export function loadConfig(
         requireString(raw['workspace_root'], file, 'workspace_root'),
         home,
       );
+    }
+    if (raw['managed_repos'] !== undefined) {
+      const value = raw['managed_repos'];
+      if (!Array.isArray(value)) {
+        throw new ConfigError('managed_repos must be an array of repository names', file, 'managed_repos');
+      }
+      const names = value.map((entry, index) => {
+        const field = `managed_repos[${index}]`;
+        if (typeof entry !== 'string') {
+          throw new ConfigError(`${field} must be a string`, file, field);
+        }
+        const problem = managedRepoNameError(entry);
+        if (problem !== null) {
+          throw new ConfigError(`${field} ${problem} (got: ${entry})`, file, field);
+        }
+        return entry;
+      });
+      if (new Set(names).size !== names.length) {
+        throw new ConfigError('managed_repos must not contain duplicate repository names', file, 'managed_repos');
+      }
+      managedRepos = names;
     }
     if (raw['data_dir'] !== undefined) {
       dataDir = expandTilde(requireString(raw['data_dir'], file, 'data_dir'), home);
@@ -1569,6 +1595,7 @@ export function loadConfig(
 
   return {
     workspaceRoot: resolve(workspaceRoot),
+    managedRepos,
     dataDir: resolve(dataDir),
     server,
     auth,

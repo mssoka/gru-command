@@ -62,6 +62,7 @@ describe('config defaults', () => {
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     expect(config.sourceFile).toBeNull();
     expect(config.workspaceRoot).toBe('/home/tester/code');
+    expect(config.managedRepos).toEqual([]);
     expect(config.dataDir).toBe(home);
     expect(config.server).toEqual({ host: '127.0.0.1', port: 7665 });
     expect(config.auth).toEqual({ token: '' });
@@ -157,6 +158,7 @@ describe('config round-trip', () => {
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     expect(config.sourceFile).toBe(configPathFor(home));
     expect(config.workspaceRoot).toBe('/home/tester/projects');
+    expect(config.managedRepos).toEqual([]);
     expect(config.dataDir).toBe('/home/tester/.gru-command');
     expect(config.server).toEqual({ host: '127.0.0.1', port: 7700 });
     expect(config.auth).toEqual({ token: 'pairing-token-example' });
@@ -170,6 +172,15 @@ describe('config round-trip', () => {
       roles: { gru: 'provider/model-b' },
     });
     expect(config.thinking).toEqual({ default: 'default', roles: {} });
+  });
+
+  it('loads an explicit managed subset without requiring the selected paths to exist yet', () => {
+    const home = tmpHome();
+    writeConfig(home, 'managed_repos = ["alpha", "project with spaces"]\n');
+    expect(loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester').managedRepos).toEqual([
+      'alpha',
+      'project with spaces',
+    ]);
   });
 
   it('a reloaded identical file yields an identical config', () => {
@@ -224,6 +235,21 @@ describe('config fail-loud validation', () => {
     const home = tmpHome();
     writeConfig(home, 'workspace_root = 42');
     expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(/workspace_root must be a string/);
+  });
+
+  it('rejects malformed, unsafe and duplicate managed_repos values with field context', () => {
+    const cases: readonly [string, RegExp][] = [
+      ['managed_repos = "alpha"', /managed_repos must be an array/],
+      ['managed_repos = [1]', /managed_repos\[0\] must be a string/],
+      ['managed_repos = ["../escape"]', /managed_repos\[0\].*plain directory name/],
+      ['managed_repos = ["*"]', /managed_repos\[0\].*wildcard/],
+      ['managed_repos = ["alpha", "alpha"]', /must not contain duplicate/],
+    ];
+    for (const [toml, pattern] of cases) {
+      const home = tmpHome();
+      writeConfig(home, toml);
+      expect(() => loadConfig({ GRU_COMMAND_HOME: home })).toThrow(pattern);
+    }
   });
 
   it('rejects empty strings for required paths', () => {

@@ -1,5 +1,4 @@
 import { execFile } from 'node:child_process';
-import { join } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import {
   GhApiError,
@@ -12,7 +11,7 @@ import {
   type RepoRef,
 } from '../dispatch/github-poll.js';
 import { isGitHubRemote, parseRepoRemote } from '../dispatch/review-path.js';
-import { discoverManagedReposAsync } from './discovery.js';
+import { resolveManagedRepoPath, type ManagedRepoPath } from './managed-names.js';
 
 /**
  * Managed repository overview (owner-approved compact rows A): a
@@ -21,11 +20,10 @@ import { discoverManagedReposAsync } from './discovery.js';
  * (issues excluding PRs) and the newest Actions run on its discovered
  * default branch, with honest freshness.
  *
- * The registry is the configured workspace root plus the SAME depth-1
- * `.git` discovery rule the setup wizard uses (`src/repos/discovery.ts`)
- * — no hard-coded names, no arbitrary scans. Every row is derived from a
- * repository that actually exists there; a missing/non-GitHub/malformed
- * origin remote stays honestly not-linked and spends no GitHub call.
+ * The registry is the exact root-level `managed_repos` list loaded from
+ * config — never workspace discovery. Each name resolves to its direct
+ * project root; unavailable selections remain honestly visible and spend
+ * no GitHub call. Unselected siblings are never resolved or polled.
  *
  * GitHub reads are server-side through the authenticated `gh` seam,
  * bounded by a per-refresh call budget and a rotating cursor so a large
@@ -689,12 +687,15 @@ function emptySourceState(): RepoSourceState {
 }
 
 export interface ManagedRepoOverviewOptions {
-  /** Configured workspace root holding the managed repositories. */
+  /** Configured workspace root containing selected project directories. */
   readonly workspaceRoot: string;
+  /** Explicit config names only; an empty or absent list means no repos. */
+  readonly managedRepos: readonly string[];
   readonly api: RepoOverviewApiPort;
-  /** Test seams; default: canonical discovery + origin-remote resolver.
-   * Both may be async; the tracker awaits them. */
+  /** Test seams. Production membership is always `managedRepos`; no
+   * directory discovery fallback exists. */
   readonly scanRepos?: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
+  readonly resolveRepoPath?: (workspaceRoot: string, name: string) => Promise<ManagedRepoPath> | ManagedRepoPath;
   readonly resolveRemote?: RemoteResolver;
   /** Refresh cadence; default {@link REPO_OVERVIEW_REFRESH_MS}. */
   readonly intervalMs?: number;
@@ -725,6 +726,7 @@ interface ObserveOutcome {
 export class ManagedRepoOverviewTracker {
   private readonly opts: ManagedRepoOverviewOptions;
   private readonly scanRepos: (workspaceRoot: string) => readonly string[] | Promise<readonly string[]>;
+  private readonly resolveRepoPath: (workspaceRoot: string, name: string) => Promise<ManagedRepoPath> | ManagedRepoPath;
   private readonly resolveRemote: RemoteResolver;
   private readonly intervalMs: number;
   private readonly staleAfterMs: number;
@@ -751,7 +753,8 @@ export class ManagedRepoOverviewTracker {
 
   constructor(opts: ManagedRepoOverviewOptions) {
     this.opts = opts;
-    this.scanRepos = opts.scanRepos ?? (() => discoverManagedReposAsync(opts.workspaceRoot));
+    this.scanRepos = opts.scanRepos ?? (() => opts.managedRepos);
+    this.resolveRepoPath = opts.resolveRepoPath ?? resolveManagedRepoPath;
     this.resolveRemote = opts.resolveRemote ?? defaultRemoteResolver;
     this.intervalMs = opts.intervalMs ?? REPO_OVERVIEW_REFRESH_MS;
     // A disabled timer (intervalMs 0) must not collapse the freshness
@@ -839,6 +842,8 @@ export class ManagedRepoOverviewTracker {
 
   private async runRefresh(): Promise<RepoOverviewView | null> {
     const repos = [...new Set(await this.scanRepos(this.opts.workspaceRoot))].sort();
+    const seenProjectPaths = new Set<string>();
+    const duplicateNames = new Set<string>();
     // Classification is built into a LOCAL map and published only once
     // every remote has been resolved: `view()` (called by board pushes and
     // heartbeats DURING this refresh) must never observe a half-classified
@@ -888,9 +893,32 @@ export class ManagedRepoOverviewTracker {
         unreadable();
         continue;
       }
+      let selectedPath: ManagedRepoPath;
+      try {
+        selectedPath = await this.resolveRepoPath(this.opts.workspaceRoot, name);
+      } catch {
+        selectedPath = {
+          kind: 'unavailable',
+          reason: 'selected repository is unavailable under workspace_root',
+        };
+      }
+      if (selectedPath.kind === 'unavailable') {
+        const unavailable = emptySourceState();
+        unavailable.linkReason = selectedPath.reason;
+        unavailable.lastAttemptAt = new Date(this.now()).toISOString();
+        nextStates.set(name, unavailable);
+        attemptedResolutions += 1;
+        continue;
+      }
+      if (seenProjectPaths.has(selectedPath.path)) {
+        duplicateNames.add(name);
+        attemptedResolutions += 1;
+        continue;
+      }
+      seenProjectPaths.add(selectedPath.path);
       let resolved: RepoRef | null;
       try {
-        resolved = await this.resolveRemote(join(this.opts.workspaceRoot, name));
+        resolved = await this.resolveRemote(selectedPath.path);
         attemptedResolutions += 1;
       } catch (error) {
         attemptedResolutions += 1;
@@ -926,7 +954,7 @@ export class ManagedRepoOverviewTracker {
       }
     }
     this.classifyCursor = repos.length === 0 ? 0 : (classifyStart + attemptedResolutions) % repos.length;
-    this.registry = repos.filter((name) => nextStates.has(name));
+    this.registry = repos.filter((name) => nextStates.has(name) && !duplicateNames.has(name));
     this.states.clear();
     for (const [name, state] of nextStates) this.states.set(name, state);
     // Resume at the discarded repository when one is pending (and still

@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { DEFAULT_INSTANCE_PORT, expandTilde, ROLES, RUNTIME_IDS, type Role, type RuntimeId } from '../config.js';
+import { managedRepoNameError } from '../repos/managed-names.js';
 
 /**
  * Setup wizard answers (E9): the non-interactive contract. Every field is
@@ -16,8 +17,7 @@ import { DEFAULT_INSTANCE_PORT, expandTilde, ROLES, RUNTIME_IDS, type Role, type
 export interface WizardAnswers {
   /** Raw workspace-root string as answered (`~`-form preserved in output). */
   readonly workspaceRoot: string;
-  /** Repo names selected for setup validation (not a management whitelist —
-   * the config schema has no repos key; the board discovers repos live). */
+  /** Exact selected managed repository names relative to workspace_root. */
   readonly repos: readonly string[];
   readonly runtime: RuntimeId;
   /** Model reference; "default" = the runtime's own (SPEC ruling 16). */
@@ -242,10 +242,9 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
       if (typeof name !== 'string' || name.trim() === '') {
         throw new AnswersError('answers.repos entries must be non-empty strings');
       }
-      if (name.includes('/') || name === '.' || name === '..' || name.startsWith('.')) {
-        throw new AnswersError(
-          `answers.repos entries must be plain directory names under the workspace root — got: ${name}`,
-        );
+      const problem = managedRepoNameError(name);
+      if (problem !== null) {
+        throw new AnswersError(`answers.repos entries ${problem} — got: ${name}`);
       }
       return name;
     });
