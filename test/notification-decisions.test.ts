@@ -460,6 +460,25 @@ describe('updateNotificationDecisionOptions — the supported discussion bridge'
     expect(codeOf(() => rig.api.updateNotificationDecisionOptions(typed.id, options, 'gru'))).toBe('not_discussion');
     expect(() => rig.api.updateNotificationDecisionOptions(typed.id, [], 'gru')).toThrow(/at least one option/u);
     expect(() => rig.api.updateNotificationDecisionOptions(typed.id, options, '  ')).toThrow(/by must be non-empty/u);
+    // The writer deep-validates the option SHAPE at its own boundary: a
+    // malformed set would otherwise persist as silently-dropped corruption.
+    expect(() =>
+      rig.api.updateNotificationDecisionOptions(
+        typed.id,
+        [{ id: 'BAD', label: 'x', consequence: 'c' }],
+        'gru',
+      ),
+    ).toThrow(/lowercase slug/u);
+    expect(() =>
+      rig.api.updateNotificationDecisionOptions(
+        typed.id,
+        [
+          { id: 'dup', label: 'One', consequence: 'c' },
+          { id: 'dup', label: 'Two', consequence: 'c' },
+        ],
+        'gru',
+      ),
+    ).toThrow(/duplicated/u);
     const machine = rig.center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Breaker' });
     expect(codeOf(() => rig.api.updateNotificationDecisionOptions(machine.id, options, 'gru'))).toBe('not_owner_decision');
     const notice = rig.center.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Squat' });

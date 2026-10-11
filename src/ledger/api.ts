@@ -40,6 +40,7 @@ import {
   type WorkRevisionState,
 } from '../review-inputs/amendments.js';
 import {
+  parseDecisionOptions,
   parseStoredNotificationDecision,
   serializeNotificationDecision,
   type NotificationDecision,
@@ -4742,7 +4743,11 @@ export class LedgerApi {
     by: string,
   ): NotificationRecord | null {
     if (by.trim() === '') throw new Error('decision-options by must be non-empty');
-    if (options.length === 0) throw new Error('decision-options requires at least one option');
+    // Deep-validate at THIS write boundary too: a malformed option set would
+    // serialize happily and later read back as silently-dropped corruption
+    // (the stored-decision parser reads corrupt JSON as "no decision").
+    const validated = parseDecisionOptions(options);
+    if (validated.length === 0) throw new Error('decision-options requires at least one option');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
@@ -4773,14 +4778,14 @@ export class LedgerApi {
           `notification "${id}" is not a discussion decision — its producer-authored options are not replaced`,
         );
       }
-      const next: NotificationDecision = { ...current.decision, options: [...options] };
+      const next: NotificationDecision = { ...current.decision, options: [...validated] };
       this.db
         .prepare('UPDATE notifications SET decision_json = ? WHERE id = ?')
         .run(serializeNotificationDecision(next), id);
       this.appendEvent({
         kind: 'notification.decision-options',
         agentId: current.agentId,
-        payload: { id, by, option_ids: options.map((option) => option.id) },
+        payload: { id, by, option_ids: validated.map((option) => option.id) },
       });
       return this.getNotification(id) as NotificationRecord;
     });
