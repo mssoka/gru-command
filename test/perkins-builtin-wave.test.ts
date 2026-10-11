@@ -6516,7 +6516,13 @@ describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R
     const { poster, repoPath } = makeDouble({
       reviewPages: [[{ id: 8000, user: { login: 'someone-else' }, state: 'COMMENTED', commit_id: head, body }]],
     });
-    await expect(poster.reconcile!(input(repoPath))).resolves.toBeNull();
+    // Never credited — and, since native R5 F2, never read as absence
+    // either: the identity probe and the POST are separate processes, so a
+    // head/body-identical review in the required state under ANOTHER actor
+    // is unresolved evidence that this intent's delivery may exist. A null
+    // here would license a second same-head publication over a review that
+    // may already be the intended one.
+    await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(/by account someone-else/u);
   });
 
   it('finds a correctly bound authored match beyond page one (R4)', async () => {
