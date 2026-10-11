@@ -3508,6 +3508,18 @@ describe('formal GitHub verdict publication', () => {
       .rejects.toThrow(/no provider-proved matching App review|unresolved/u);
   });
 
+  it('reconciles a change request against provider proof of the CHANGES_REQUESTED state (formal GitHub)', async () => {
+    const changeRequestedFixture = bundleFixture();
+    const changeRequested = posterWith(changeRequestedFixture, [
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED'), botReview('CHANGES_REQUESTED')] }) },
+    ]);
+    await expect(changeRequested.poster.reconcile({
+      ...PR_INPUT,
+      repoPath: repoPathOf(changeRequestedFixture),
+      reviewEvent: 'REQUEST_CHANGES',
+    })).resolves.toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' });
+  });
+
   it('keeps the GitLab note contract and refuses a formal intent a note cannot enact (formal GitHub)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'perkins-gl-formal-'));
     try {

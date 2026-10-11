@@ -664,7 +664,10 @@ verification-history-static = "node tools/patch-vitest-rpc-timeout.mjs && npm ru
 # base whose listJobVerificationCompleted threw above 200 completed runs)
 # with node_modules linked by symlink — no download/install, no branch or
 # worktree mutation — under the unchanged heavy config/budgets and the
-# approved RPC patch prerequisite. Only the discriminating 208-run host case
+# approved RPC patch prerequisite. The final wave test imports the additive
+# publication-evidence module, so overlay that final source file too because
+# this archive predates it; import/setup failures remain rejected, not RED.
+# Only the discriminating 208-run host case
 # is selected: on the pre-fix base its `resolves` assertion REDs because the
 # freeze rejects with the recorded window error. A bare nonzero exit is NOT
 # accepted: a Vitest JSON report is written and classified by
@@ -674,7 +677,7 @@ verification-history-static = "node tools/patch-vitest-rpc-timeout.mjs && npm ru
 # vitest exit is echoed intact and never
 # masked into a PASS; the snapshot directory and the ignored pointer file are
 # preserved for inspection.
-verification-history-baseline = 'set -e; base=90f91d5d06602dccede0fdfa8bf5ab6f44e3acdd; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-verification-history.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "verification-history-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/verification-history-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "reviews a job with 208 completed verification runs"; a=$?; set -e; echo "verification-history-baseline vitest exit=$a EXPECTED-NONZERO: pre-fix base refuses the 208-run history with the recorded window assertion"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-verification-history-baseline.mjs" "$d/results.json"; echo "EXPECTED-NONZERO: behavioral assertion RED vs the pre-fix base"; exit 1'
+verification-history-baseline = 'set -e; base=90f91d5d06602dccede0fdfa8bf5ab6f44e3acdd; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-verification-history.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; git show "$headrev":test/perkins-builtin-wave.test.ts > "$d/test/perkins-builtin-wave.test.ts"; git show "$headrev":src/dispatch/publication-evidence.ts > "$d/src/dispatch/publication-evidence.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "verification-history-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/verification-history-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "reviews a job with 208 completed verification runs"; a=$?; set -e; echo "verification-history-baseline vitest exit=$a EXPECTED-NONZERO: pre-fix base refuses the 208-run history with the recorded window assertion"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-verification-history-baseline.mjs" "$d/results.json"; echo "EXPECTED-NONZERO: behavioral assertion RED vs the pre-fix base"; exit 1'
 # Managed repository overview (owner-approved compact rows A, job
 # managed-repo-overview-compact-rows-20261007; j-1251/j-1259): the registry/
 # tracker/port unit matrix, the board snapshot integration and the web
