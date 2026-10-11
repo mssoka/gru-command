@@ -865,15 +865,18 @@ export class ManagedRepoOverviewTracker {
     // prefix of slow-failing origins also rotates away and can never pin
     // the cursor to the same index every pass.
     let attemptedResolutions = 0;
+    const unresolvedThisRefresh = new Set<string>();
     for (const name of classifyOrder) {
       const previous = this.states.get(name);
       const base = previous ?? emptySourceState();
       const unreadable = (): void => {
+        unresolvedThisRefresh.add(name);
         // A read failure (or the resolution budget) is not evidence the
         // remote changed: keep the previous classification and cached
-        // observation when one exists. A never-classified entry is still
-        // PUBLISHED with the explicit read-failure reason — every managed
-        // repo appears, and the row never claims a guessed identity.
+        // observation when one exists, but do not poll its cached identity
+        // without revalidating the selected root during this refresh. A
+        // never-classified entry is still published with the explicit
+        // read-failure reason — every managed repo appears without guessing identity.
         if (previous !== undefined) {
           nextStates.set(name, previous);
           return;
@@ -967,7 +970,7 @@ export class ManagedRepoOverviewTracker {
     const order = [...repos.slice(start), ...repos.slice(0, start)];
     const fetchable = order.filter((name) => {
       const state = this.states.get(name);
-      return state !== undefined && state.ref !== null;
+      return state !== undefined && state.ref !== null && !unresolvedThisRefresh.has(name);
     });
     // Every registry row now has a classified identity (linked or an
     // explicit reason), so rows are renderable from here on — even if the

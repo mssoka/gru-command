@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { gitProbeEnvironment } from '../repos/managed-names.js';
 import type { ClaudeReviewSnapshot } from '../runtime/claude-review-settings.js';
 import { existsSync, lstatSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import type { IsolatedReviewPolicy } from '../runtime/types.js';
@@ -119,7 +120,7 @@ export function parseRepoRemote(url: string): RepoRemote | null {
 
 export function repoRemote(repoPath: string, gitBinary = 'git', env?: NodeJS.ProcessEnv): RepoRemote | null {
   const origin = spawnSync(gitBinary, ['-C', repoPath, 'remote', 'get-url', 'origin'], {
-    encoding: 'utf-8', timeout: 10_000, ...(env === undefined ? {} : { env }),
+    encoding: 'utf-8', timeout: 10_000, env: env ?? gitProbeEnvironment(),
   });
   if (origin.error !== undefined || origin.status !== 0) return null;
   return parseRepoRemote((origin.stdout ?? '').trim());

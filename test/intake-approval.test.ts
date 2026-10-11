@@ -373,8 +373,8 @@ it('refuses bounded large multi-heist standalone provenance before authority or 
   const reviewed = h.approval.review(d).review!;
   const constructed = new Set<string>();
   const instrumented = { ...p, plan: { ...p.plan, heists: p.plan.heists.map((heist) => ({ ...heist, get title() { constructed.add(heist.id); return heist.title; } })) } };
-  const createRequestScope = vi.spyOn(h.intake, 'createRequestScope');
   const originalScope = h.intake.createRequestScope.bind(h.intake);
+  const createRequestScope = vi.spyOn(h.intake, 'createRequestScope');
   createRequestScope.mockImplementation((repoPath, intakeId) => {
     const request = originalScope(repoPath, intakeId);
     return { ...request, read: (requestId) => requestId === p.requestId ? instrumented : request.read(requestId) };

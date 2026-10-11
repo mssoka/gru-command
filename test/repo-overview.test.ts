@@ -12,6 +12,7 @@ import {
   type GhCommandRunner,
   type RepoRef,
 } from '../src/dispatch/github-poll.js';
+import { repoRemote } from '../src/dispatch/review-path.js';
 import { gitProbeEnvironment } from '../src/repos/managed-names.js';
 import {
   GhRepoOverviewApi,
@@ -132,6 +133,7 @@ interface Harness {
   readonly refs: Map<string, RepoRef | null>;
   /** Per-repo gates that postpone (or fail) remote resolution. */
   readonly resolveGates: Map<string, Promise<void>>;
+  readonly unavailableNames: Set<string>;
   resolveError: boolean;
   resolveDelayMs: number;
   readonly clock: { ms: number };
@@ -164,6 +166,7 @@ function harness(options: {
     names,
     refs,
     resolveGates: new Map<string, Promise<void>>(),
+    unavailableNames: new Set<string>(),
     resolveError: false,
     resolveDelayMs: 0,
     clock,
@@ -176,7 +179,9 @@ function harness(options: {
     managedRepos: names,
     api,
     scanRepos: () => state.names,
-    resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
+    resolveRepoPath: (_workspaceRoot, name) => state.unavailableNames.has(name)
+      ? { kind: 'unavailable', reason: 'selected repository is unavailable under workspace_root' }
+      : { kind: 'available', path: `/ws/${name}` },
     resolveRemote: async (repoPath) => {
       const name = repoPath.split('/').pop() as string;
       const gate = state.resolveGates.get(name);
@@ -1271,6 +1276,22 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(h.api.calls).toEqual([]);
   });
 
+  it('does not poll a cached identity when its selected root was skipped by the resolution budget', async () => {
+    const h = harness({ names: ['alpha', 'beta', 'gamma'] });
+    await h.tracker.refresh();
+    expect(row(h.tracker.view(), 'gamma').linked).toBe(true);
+
+    h.api.calls.length = 0;
+    h.unavailableNames.add('gamma');
+    h.resolveDelayMs = REPO_OVERVIEW_RESOLVE_BUDGET_MS + 10_000;
+    const view = await h.tracker.refresh();
+
+    // The resolver budget expires on the first attempted root; gamma is
+    // never revalidated and must not be polled using its cached origin.
+    expect(row(view, 'gamma').linked).toBe(true);
+    expect(h.api.calls.some((call) => call.endsWith(':acme/gamma'))).toBe(false);
+  });
+
   it('keeps every managed repo visible with a read-failure reason when resolution fails', async () => {
     const h = harness({ names: ['alpha', 'beta'] });
     h.resolveError = true;
@@ -1332,6 +1353,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       execFileSync('git', ['init', '-q', foreign]);
       execFileSync('git', ['-C', foreign, 'remote', 'add', 'origin', 'https://github.com/acme/foreign.git']);
       const expectSelectedProviderCalls = async (): Promise<void> => {
+        expect(repoRemote(selected)).toEqual({ host: 'github.com', owner: 'acme', repo: 'selected' });
         const api = new FakeApi();
         const tracker = new ManagedRepoOverviewTracker({
           workspaceRoot: root,
@@ -1354,6 +1376,18 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       vi.unstubAllEnvs();
 
       vi.stubEnv('GIT_CONFIG_PARAMETERS', "'remote.origin.url'='https://github.com/acme/foreign.git'");
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
+      const homeRoot = join(root, 'home');
+      mkdirSync(homeRoot);
+      execFileSync('git', ['config', '--file', join(homeRoot, '.gitconfig'), 'url.https://github.com/acme/foreign.git.insteadOf', 'https://github.com/acme/selected.git']);
+      const redirectedHome = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
+        encoding: 'utf8', env: { ...process.env, HOME: homeRoot },
+      }).trim();
+      expect(redirectedHome).toBe('https://github.com/acme/foreign.git');
+      vi.stubEnv('HOME', homeRoot);
+      expect(gitProbeEnvironment()).not.toHaveProperty('HOME');
       await expectSelectedProviderCalls();
       vi.unstubAllEnvs();
 

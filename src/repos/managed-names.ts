@@ -25,14 +25,18 @@ const GIT_ROUTING_ENV = new Set([
   'GIT_CONFIG_SYSTEM',
   'GIT_CONFIG_NOSYSTEM',
   'XDG_CONFIG_HOME',
+  'HOME',
+  'USERPROFILE',
+  'HOMEDRIVE',
+  'HOMEPATH',
 ]);
 
 function isGitProbeEnvironmentVariable(name: string): boolean {
   return !GIT_ROUTING_ENV.has(name) && !/^GIT_CONFIG_(?:COUNT|(?:KEY|VALUE)_\d+)$/u.test(name);
 }
 
-/** Keep the normal owner Git config authoritative, but ignore inherited
- * routing, config-path and command-scope overrides for selected-root probes. */
+/** Keep the OS account's normal Git config authoritative, but ignore
+ * inherited routing, config-path and command-scope overrides for probes. */
 export function gitProbeEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(
     Object.entries(process.env).filter(([name]) => isGitProbeEnvironmentVariable(name)),
