@@ -800,9 +800,14 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         const metaSelector = `${cardSelector} .board-notification__meta`;
         const optionSelector = `${cardSelector} [data-action-id$=":option:approve"]`;
         const detailSelector = `${cardSelector} .board-notification__detail-text`;
-        const panelDecisionTitleSelector = '#notification-list [data-notification-id="decision-1"] .board-notification__title';
-        const panelDecisionDetailSelector = '#notification-list [data-notification-id="decision-1"] .board-notification__detail-text';
-        const panelMachineDetailSelector = '#notification-list [data-notification-id="machine-1"] .board-notification__detail-text';
+        const panelDecisionTitleSelector =
+          '#notification-list [data-notification-id="decision-1"] .board-notification__title';
+        const panelDecisionSummarySelector =
+          '#notification-list [data-notification-id="decision-1"] .board-notification__details summary';
+        const panelDecisionDetailSelector =
+          '#notification-list [data-notification-id="decision-1"] .board-notification__detail-text';
+        const panelMachineDetailSelector =
+          '#notification-list [data-notification-id="machine-1"] .board-notification__detail-text';
         const relativeProbeSelector = '[data-text-zoom-relative-probe="true"]';
         const card = page.locator(cardSelector);
         const detail = page.locator(detailSelector);
@@ -953,6 +958,22 @@ test.describe('notification readability — fixed long-content fixtures', () => 
         ]);
         seed.push(withDiscussion);
         await expect.poll(() => page.locator('[data-rebuild-probe="before"]').count()).toBe(0);
+        const summaryAfter = page.locator(
+          '#board-owner [data-notification-id="decision-1"] .board-notification__details summary',
+        );
+        expect(await summaryAfter.evaluate((element) => (element.parentElement as HTMLDetailsElement).open)).toBe(true);
+        await expect(summaryAfter).toBeFocused();
+        await expect(page.locator(detailSelector)).toBeVisible();
+        await page.locator('#notification-bell').click();
+        await expect(page.locator('#notification-panel')).toBeVisible();
+        const panelDecisionSummaryAfter = page.locator(panelDecisionSummarySelector);
+        await expect(panelDecisionSummaryAfter).toBeVisible();
+        expect(
+          await panelDecisionSummaryAfter.evaluate((element) => (element.parentElement as HTMLDetailsElement).open),
+        ).toBe(true);
+        const rebuiltPanelDetail = page.locator(panelDecisionDetailSelector);
+        await expect(rebuiltPanelDetail).toBeVisible();
+        await expect(rebuiltPanelDetail).toContainText(LONG_PATH);
         await page.locator(detailSelector).evaluate((element) => {
           const probe = document.createElement('span');
           probe.dataset.textZoomRelativeProbe = 'true';
@@ -969,23 +990,28 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           relative: await computedFontSize(page, relativeProbeSelector),
         };
         const reapplied = await applyTextOnlyZoom(page);
-        // Every copied decision diagnostic is measured from the fresh DOM
-        // before reapplication; neither relative children nor inherited text
-        // can compound.
+        // Both expanded decision diagnostics are visible and measured from
+        // the fresh DOM before reapplication; relative children cannot
+        // compound.
         expect(reapplied.scaled).toBeGreaterThan(0);
         expect(reapplied.probeBase).toBeCloseTo(rebuiltFonts.title, 1);
         expect(reapplied.probeAfter).toBeCloseTo(rebuiltFonts.title * 2, 1);
         expect(await computedFontSize(page, detailSelector)).toBeCloseTo(rebuiltFonts.detail * 2, 1);
         expect(await computedFontSize(page, panelDecisionTitleSelector)).toBeCloseTo(rebuiltFonts.panelTitle * 2, 1);
+        await expect(rebuiltPanelDetail).toBeVisible();
+        await expect(rebuiltPanelDetail).toContainText(LONG_PATH);
+        expect(
+          await panelDecisionSummaryAfter.evaluate((element) => (element.parentElement as HTMLDetailsElement).open),
+        ).toBe(true);
         expect(await computedFontSize(page, panelDecisionDetailSelector)).toBeCloseTo(rebuiltFonts.panelDecisionDetail * 2, 1);
         expect(await computedFontSize(page, panelMachineDetailSelector)).toBeCloseTo(rebuiltFonts.panelDetail * 2, 1);
         expect(await computedFontSize(page, relativeProbeSelector)).toBeCloseTo(rebuiltFonts.relative * 2, 1);
         await page.locator(relativeProbeSelector).evaluate((element) => element.remove());
         const titleRezoomed = await computedFontSize(page, titleSelector);
         expect(titleRezoomed).toBeCloseTo(titleZoomed, 1);
-        const summaryAfter = page.locator('#board-owner [data-notification-id="decision-1"] .board-notification__details summary');
         expect(await summaryAfter.evaluate((element) => (element.parentElement as HTMLDetailsElement).open)).toBe(true);
-        await expect(summaryAfter).toBeFocused();
+        await page.locator('#notification-bell').click();
+        await expect(page.locator('#notification-panel')).toBeHidden();
 
         // Owner-only proposal boundaries stay shown and untouched.
         const proposal = page.locator('#board-owner [data-proposal-id="proposal-1"]');

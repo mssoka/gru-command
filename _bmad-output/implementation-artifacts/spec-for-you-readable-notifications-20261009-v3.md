@@ -198,8 +198,8 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
   expects two rows with the typed decision card. The merge kept main's PNG
   despite that test change. The captured screen matches the test contract;
   only the light/dark theme snapshots were refreshed by the targeted test
-  (1 passed) and visually inspected. Final scheduled browser verification
-  remains pending.
+  (1 passed) and visually inspected. The 65/66 receipt remains preserved
+  as historical evidence; final-head scopes are recorded separately.
 
 ## Spec Change Log
 
@@ -207,7 +207,8 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
   bell decision diagnostics. The mock theme snapshots were refreshed after
   tracing the integrated-head mismatch to main's stale three-row images;
   the targeted theme test passed and the light/dark results were inspected.
-  Exact-head scheduled full/browser verification remains pending.
+  That targeted test is not a substitute for separate exact-head full/browser
+  capture receipts.
 
 ## Review Triage Log
 
@@ -369,7 +370,20 @@ independently measure each fresh-node baseline before asserting 2× after
 reapplication. No product CSS changed. Verification-gap also surfaced the
 single browser failure. Investigation traced it to main's stale theme
 snapshots; only those two images were refreshed and the focused test
-passed. Exact-head scheduled browser verification remains pending.
+passed. The failed capture remains historical; final-head evidence is kept
+separately.
+
+R14 confirmation (candidate `ffb65f1da5d22eb975c11f36e68c6e5b992a9334`).
+The blind-hunter reported no actionable findings. Edge-cases and
+verification-gap found that the rebuilt bell decision Details text was
+measured while the panel was hidden, allowing a hidden node to satisfy the
+computed-font assertion. The test now verifies the owner disclosure remains
+open/focused, reopens the bell panel after the snapshot push, verifies its
+decision disclosure remains open and the diagnostic text is visible, then
+measures and asserts the 2× result. No product CSS changed. Two additional
+verification-gap follow-ups (cross-surface content equivalence and
+unknown/legacy browser coverage) were explicitly deferred as outside the
+actual text-only zoom proof task.
 
 ## Design Notes
 
