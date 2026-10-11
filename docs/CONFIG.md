@@ -116,8 +116,11 @@ example line activates that override.
 # and a one-line purpose comment. Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # Edit values in place, then restart only your Gru Command service.
 
-# Root: the directory containing only managed project repositories.
+# Shared project directory; it may also contain repositories Gru Command does not manage.
 workspace_root = "~/code"
+# Explicit project directory names relative to workspace_root; only these are managed.
+# An empty list manages none. Add names here deliberately, then restart the service.
+managed_repos = ["project-a", "project-c"]
 # Root: per-instance state. ~-anchored so a restored config re-anchors to
 # the NEW machine's home — an absolute machine-specific path would
 # redirect all state to the old machine on restore. Explicit
