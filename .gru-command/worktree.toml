@@ -770,3 +770,8 @@ formal-verdicts-r3-baseline = "sh tools/formal-verdicts-r3-baseline.sh"
 # uncorrected whole-review head 4014ca03; both named cases are classified by
 # exact behavioral AssertionErrors.
 formal-verdicts-r5-baseline = "sh tools/formal-verdicts-r5-baseline.sh"
+
+# Native R6 (foreign submitted-state) fail-before proof: the final real-gh
+# restart/admission regression is overlaid onto an immutable archive of Bdc;
+# the classifier requires the named false-absence assertion RED, not setup.
+formal-verdicts-r6-baseline = "sh tools/formal-verdicts-r6-baseline.sh"

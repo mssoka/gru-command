@@ -307,7 +307,10 @@ judgment — notably a delta READY still owing its final pass — as a
 commit-bound comment. The delivery receipt must prove the state the
 provider ACTUALLY enacted on the frozen head, so a wrong-state receipt
 never records a formal decision; GitLab notes stay non-formal by
-contract. GitHub
+contract. During ambiguous `gh` recovery, an exact frozen-head/publication-
+body review from a different known account in any submitted state other than
+`PENDING` (including `DISMISSED`) remains unresolved: it is never credited to
+the lookup account and never proves absence. GitHub
 **publication** authenticates through the `gh` CLI when no Perkins App
 bundle is installed; with a bundle, github.com publication is App-authored
 while the review preflight still probes remotes through `gh` (see

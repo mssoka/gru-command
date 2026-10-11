@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -12,12 +12,12 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { loadConfig, DEFAULT_SILAS_CONFIG } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
-import { WaveRunner } from '../src/dispatch/perkins.js';
+import { GhPrPoster, WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
-import { PUBLICATION_ATTEMPT_EVENT, PUBLICATION_IDENTITY_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT } from '../src/dispatch/publication-evidence.js';
+import { PUBLICATION_ABSENT_EVENT, PUBLICATION_ATTEMPT_EVENT, PUBLICATION_IDENTITY_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT, pendingPublicationAttempt } from '../src/dispatch/publication-evidence.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
@@ -68,6 +68,7 @@ interface ServerHarness {
   disposedHandles: string[];
   notifications: NotificationCenter;
   worktrees: InMemoryWorktreePort;
+  reviewArtifactRoot: string;
   close: () => Promise<void>;
 }
 async function boot(opts: {
@@ -76,6 +77,8 @@ async function boot(opts: {
   fallbackGate?: ConstructorParameters<typeof WaveRunner>[0]['fallbackGate'];
   /** false = boot without the silas ops surface (endpoints answer 503). */
   silasOps?: boolean;
+  /** Poster seam for provider-recovery tests; defaults to the ordinary safe fixture poster. */
+  poster?: ConstructorParameters<typeof WaveRunner>[0]['poster'];
   /** Wired digest computation for GET /api/silas/digest (issue #217). */
   silasDigest?: () => Promise<import('../src/dispatch/silas-driver.js').SilasOpsDigest>;
   /** Gate selected minion turns before they settle (in-flight assertions). */
@@ -168,13 +171,14 @@ async function boot(opts: {
   const minionTurnTexts: string[] = [];
   const liveHandles = new Map<string, AgentHandle>();
   const disposedHandles: string[] = [];
+  const reviewArtifactRoot = join(dir, 'reviews');
   const wave = new WaveRunner({
     ledger,
     worktrees,
     spawner,
     bus,
-    poster: { async post(input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) { return { reviewId: '9001', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
-    reviewArtifactRoot: join(dir, 'reviews'),
+    poster: opts.poster ?? { async post(input: { readonly targetSha: string; readonly body: string; readonly reviewEvent?: string }) { return { reviewId: '9001', actor: 'gru-bot', event: enactedFor(input.reviewEvent), commitId: input.targetSha, headSha: input.targetSha, baseSha: 'stub-base', bodySha256: createHash('sha256').update(input.body, 'utf8').digest('hex') }; } },
+    reviewArtifactRoot,
     prHeadProbe: originHeadProbe(),
     ...(opts.reviewPreflight !== undefined ? { reviewPreflight: opts.reviewPreflight } : {}),
     ...(opts.fallbackGate !== undefined ? { fallbackGate: opts.fallbackGate } : {}),
@@ -224,6 +228,7 @@ async function boot(opts: {
     disposedHandles,
     notifications,
     worktrees,
+    reviewArtifactRoot,
     close: async () => {
       await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
       await wave.shutdown();
@@ -1241,6 +1246,137 @@ describe('dispatch server (E8)', () => {
       expect(h.ledger.listRounds('clean-abort-r5-held')).toHaveLength(1);
     } finally { await h.close(); }
   }, 90_000);
+
+  it('keeps a foreign DISMISSED review unresolved through real recovery, digest, and dispatch admission (native R6 F1)', async () => {
+    const ghRoot = mkdtempSync(join(tmpdir(), 'dispatch-r6-gh-'));
+    cleanupDirs.push(ghRoot);
+    const providerReviewPath = join(ghRoot, 'provider-review.json');
+    const callLogPath = join(ghRoot, 'calls.jsonl');
+    const binary = join(ghRoot, 'gh-double.mjs');
+    const poster = new GhPrPoster(binary);
+    const h = await boot({ poster });
+    const repo = makeFixtureRepo('fixture-clean-abort-r6-dismissed');
+    cleanupRepos.push(repo);
+    const githubPrUrl = 'https://github.com/acme/fixture/pull/77';
+    try {
+      // Delivery pushes remain wholly local while repoRemote sees the exact
+      // GitHub identity the deterministic gh double serves.
+      const localPushOrigin = attachBareOrigin(repo);
+      repo.git(['remote', 'set-url', 'origin', 'https://github.com/acme/fixture.git']);
+      repo.git(['remote', 'set-url', '--push', 'origin', localPushOrigin]);
+      const jobId = 'clean-abort-r6-dismissed';
+      expect((await call(h.port, 'POST', '/api/dispatch', {
+        job_id: jobId, repo_path: repo.path, title: jobId, briefing: 'b',
+      }, TOKEN)).status).toBe(202);
+      await waitForDelivery(h, jobId);
+      expect((await call(h.port, 'POST', '/api/dispatch/pr', { job_id: jobId, url: githubPrUrl }, TOKEN)).status).toBe(200);
+      const delivered = h.ledger.latestJobEvent(jobId, 'job.delivered');
+      const targetSha = (delivered?.payload as { sha?: unknown } | undefined)?.sha;
+      expect(typeof targetSha).toBe('string');
+      const frozenHead = targetSha as string;
+      expect(delivered?.payload).toMatchObject({ sha: frozenHead, source: 'dispatch' });
+
+      const round = h.ledger.addRound({ jobId, targetRef: frozenHead, lenses: ['blind'] });
+      h.ledger.setRoundStatus(round.id, 'live');
+      await h.worktrees.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: frozenHead, jobId });
+      expect(h.ledger.listRoundSpecialistStarts(round.id)).toEqual([]); // no writer existed to outlive cessation
+      const roundDir = join(h.reviewArtifactRoot, round.id);
+      mkdirSync(roundDir, { recursive: true });
+      const publicationBody = '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
+      const publicationFile = join(roundDir, 'perkins-report.publication.md');
+      writeFileSync(publicationFile, publicationBody, 'utf8');
+      writeFileSync(join(roundDir, 'manifest.json'), JSON.stringify({ repoPath: repo.path }), 'utf8');
+      const publicationSha256 = createHash('sha256').update(publicationBody, 'utf8').digest('hex');
+      const attemptPayload = {
+        verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: githubPrUrl, host: 'github.com',
+        targetSha: frozenHead, baseSha: '2'.repeat(40), publicationFile, publicationSha256, reviewEvent: 'APPROVE',
+      };
+      h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId: round.id, payload: attemptPayload });
+
+      writeFileSync(binary, String.raw`#!/usr/bin/env node
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+const input = readFileSync(0, 'utf8');
+const argv = process.argv.slice(2);
+appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify({ argv, input }) + '\n');
+if (argv.includes('--method') && argv.includes('POST')) {
+  const posted = JSON.parse(input);
+  writeFileSync(${JSON.stringify(providerReviewPath)}, JSON.stringify({ id: 9601, user: { login: 'account-b' }, state: 'APPROVED', commit_id: posted.commit_id, body: posted.body }));
+  process.stderr.write('simulated response loss after provider commit');
+  process.exit(1);
+} else if (argv.some((entry) => entry.includes('/reviews?'))) {
+  const review = existsSync(${JSON.stringify(providerReviewPath)}) ? JSON.parse(readFileSync(${JSON.stringify(providerReviewPath)}, 'utf8')) : null;
+  process.stdout.write(JSON.stringify(review === null ? [] : [review]));
+} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {
+  process.stdout.write('account-a');
+} else {
+  process.stdout.write(${JSON.stringify(`${frozenHead}\t${'3'.repeat(40)}\n`)});
+}
+`, 'utf8');
+      chmodSync(binary, 0o755);
+      await expect(poster.post({
+        prUrl: githubPrUrl, host: 'github.com', repoPath: repo.path,
+        body: publicationBody, targetSha: frozenHead, baseSha: '2'.repeat(40), reviewEvent: 'APPROVE',
+        onPreparedIdentity: (actor) => h.ledger.appendCustomEvent({
+          kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id,
+          payload: { actor, host: 'github.com', targetSha: frozenHead },
+        }),
+      })).rejects.toThrow(/review delivery exited 1/u);
+      expect(h.ledger.latestRoundEvent(round.id, PUBLICATION_IDENTITY_EVENT)?.payload)
+        .toMatchObject({ actor: 'account-a', host: 'github.com', targetSha: frozenHead });
+      const committed = JSON.parse(readFileSync(providerReviewPath, 'utf8')) as {
+        id: number; user: { login: string }; state: string; commit_id: string; body: string;
+      };
+      expect(committed).toMatchObject({ user: { login: 'account-b' }, state: 'APPROVED', commit_id: frozenHead, body: publicationBody });
+      // The provider then dismisses that exact same-head/body submission; the
+      // state transition does not mean the POST failed to land.
+      writeFileSync(providerReviewPath, JSON.stringify({ ...committed, state: 'DISMISSED' }), 'utf8');
+      const dismissed = JSON.parse(readFileSync(providerReviewPath, 'utf8')) as typeof committed;
+      expect(dismissed).toMatchObject({ user: { login: 'account-b' }, state: 'DISMISSED', commit_id: frozenHead, body: publicationBody });
+
+      // The actual restart recovery runs through the real GhPrPoster as A.
+      // The deterministic PR identity probe keeps the frozen head unchanged.
+      await h.wave.recoverInterruptedRounds();
+      expect(h.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
+      expect(pendingPublicationAttempt(h.ledger, round.id)?.kind).toBe('unresolved-attempt');
+      expect(h.ledger.getRound(round.id)?.status).toBe('aborted');
+      expect(h.ledger.latestRoundEvent(round.id, 'round.perkins-incomplete')?.payload).toMatchObject({ reason: 'service_restart' });
+      expect(h.ledger.latestRoundEvent(round.id, 'round.posted')).toBeNull();
+
+      // A clean-abort sibling with the same real delivered-head proof is the
+      // positive control: the digest offers it when no publication attempt
+      // exists, while the recovered target stays fenced by the unresolved one.
+      const controlJobId = 'clean-abort-r6-control';
+      h.ledger.addJob({ id: controlJobId, repo: 'fixture', title: 'clean abort control', baseBranch: 'main', briefing: 'review' });
+      h.ledger.setJobStatus(controlJobId, 'delivered');
+      h.ledger.setJobPr(controlJobId, githubPrUrl);
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: controlJobId, payload: { sha: frozenHead, source: 'dispatch' } });
+      const controlRound = h.ledger.addRound({ jobId: controlJobId, lenses: ['blind'], targetRef: frozenHead });
+      h.ledger.abortReviewSetupWithoutSpawn(controlRound.id);
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId: controlJobId, roundId: controlRound.id, payload: { reason: 'service_restart' } });
+      const digest = await computeSilasDigest({
+        ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep',
+      });
+      expect(digest.prWithoutReview.find((row) => row.jobId === controlJobId)?.cleanAbort)
+        .toEqual({ roundId: controlRound.id, ruleId: 'clean-abort-service-restart' });
+      expect(digest.prWithoutReview.some((row) => row.jobId === jobId)).toBe(false);
+
+      const refused = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: jobId, by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: round.id,
+      }, TOKEN);
+      expect(refused).toMatchObject({
+        status: 400,
+        json: { error: 'bad_request', detail: expect.stringMatching(/publication attempt|reconcile it before re-arming/u) },
+      });
+      expect(h.ledger.latestJobEvent(jobId, 'silas.review-triggered')).toBeNull();
+      expect(h.ledger.listRounds(jobId)).toHaveLength(1);
+      const calls = readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { argv: string[] });
+      expect(calls.filter((entry) => entry.argv.includes('--method') && entry.argv.includes('POST'))).toHaveLength(1);
+      expect(calls.some((entry) => entry.argv.some((arg) => arg.includes('/reviews?')))).toBe(true);
+    } finally {
+      await h.close();
+    }
+  }, 120_000);
 
   it('binds a clean-abort re-arm to the proved delivered head, never a moved live PR head', async () => {
     const h = await boot();

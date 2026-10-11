@@ -6512,17 +6512,24 @@ describe('repair pass 3: GitHub receipt identity, state, and pagination (R4/R5/R
     await expect(poster.post(input(repoPath))).rejects.toThrow(/not the authenticated posting account/);
   });
 
-  it('does not reconcile a copied review from another author even on the right commit (R5)', async () => {
-    const { poster, repoPath } = makeDouble({
-      reviewPages: [[{ id: 8000, user: { login: 'someone-else' }, state: 'COMMENTED', commit_id: head, body }]],
+  it('keeps exact head/body foreign reviews unresolved in every submitted state but ignores drafts and unrelated reviews (native R6)', async () => {
+    for (const [index, state] of ['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED'].entries()) {
+      const { poster, repoPath } = makeDouble({
+        reviewPages: [[{ id: 8000 + index, user: { login: 'someone-else' }, state, commit_id: head, body }]],
+      });
+      // A foreign exact publication is unresolved no matter which submitted
+      // state it currently carries; state transitions do not prove it never
+      // landed and it is never credited to the lookup account.
+      await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(new RegExp(`state ${state}.*someone-else`, 'u'));
+    }
+    const pending = makeDouble({
+      reviewPages: [[{ id: 8010, user: { login: 'someone-else' }, state: 'PENDING', commit_id: head, body }]],
     });
-    // Never credited — and, since native R5 F2, never read as absence
-    // either: the identity probe and the POST are separate processes, so a
-    // head/body-identical review in the required state under ANOTHER actor
-    // is unresolved evidence that this intent's delivery may exist. A null
-    // here would license a second same-head publication over a review that
-    // may already be the intended one.
-    await expect(poster.reconcile!(input(repoPath))).rejects.toThrow(/by account someone-else/u);
+    await expect(pending.poster.reconcile!(input(pending.repoPath))).resolves.toBeNull();
+    const unrelated = makeDouble({
+      reviewPages: [[{ id: 8011, user: { login: 'someone-else' }, state: 'DISMISSED', commit_id: 'f'.repeat(40), body }]],
+    });
+    await expect(unrelated.poster.reconcile!(input(unrelated.repoPath))).resolves.toBeNull();
   });
 
   it('finds a correctly bound authored match beyond page one (R4)', async () => {
@@ -9676,9 +9683,9 @@ describe('formal GitHub publication durability and restart reconciliation', () =
 
   it('binds restart absence to the identity the lookup actually used (native R3)', async () => {
     // Prepared as account A; the restart's real reconciliation authenticates
-    // as B and filters A's surviving review away; credentials return to A
-    // afterwards. Absence must stay bound to the LOOKUP identity (B), so no
-    // absence certificate and no automatic same-head publication result.
+    // as B and receives a covered empty list. The fake would return A to a
+    // later identity probe, so absence must stay bound to the LOOKUP identity
+    // (B), with no absence certificate or automatic same-head result.
     const fix = durabilityFixture('r3-lookup-identity');
     const jobId = 'job-r3-lookup-identity';
     try { fix.repo.git(['remote', 'add', 'origin', 'https://github.com/acme/fixture.git']); }
@@ -9688,14 +9695,13 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/77');
     const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
     fix.ledger.setRoundStatus(round.id, 'live');
-    const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target);
+    seedAttempt(fix, jobId, round.id, fix.target);
     fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'account-a', host: 'github.com', targetSha: fix.target } });
-    const committedBody = readFileSync(attemptPayload.publicationFile, 'utf8');
     const ghRoot = mkdtempSync(join(tmpdir(), 'perkins-gh-r3-lookup-'));
     dirs.push(ghRoot);
     const binary = join(ghRoot, 'gh-double.mjs');
     const userState = join(ghRoot, 'user-state');
-    writeFileSync(binary, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 9400, user: { login: 'account-a' }, state: 'COMMENTED', commit_id: ${JSON.stringify(fix.target)}, body: ${JSON.stringify(committedBody)} }]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  if (!existsSync(${JSON.stringify(userState)})) { writeFileSync(${JSON.stringify(userState)}, 'b'); process.stdout.write('account-b'); } else { process.stdout.write('account-a'); }\n} else {\n  process.stdout.write(${JSON.stringify(`${fix.target}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write('[]');\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  if (!existsSync(${JSON.stringify(userState)})) { writeFileSync(${JSON.stringify(userState)}, 'b'); process.stdout.write('account-b'); } else { process.stdout.write('account-a'); }\n} else {\n  process.stdout.write(${JSON.stringify(`${fix.target}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
     chmodSync(binary, 0o755);
     const escalations: string[] = [];
     const wave = new WaveRunner({

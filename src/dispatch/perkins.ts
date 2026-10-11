@@ -934,6 +934,24 @@ export class GhPrPoster implements VerdictPoster {
     observedBase: string,
   ): PostedReviewReceipt | null {
     const wantedEvent = enactedStateFor(input.reviewEvent);
+    // Any submitted exact-publication review by a DIFFERENT account is
+    // unresolved evidence, regardless of its current state. A review may be
+    // committed as B after the prepared A identity probe, then dismissed
+    // before A's restart lookup; DISMISSED still cannot prove the POST never
+    // landed (native R6 F1). PENDING is an unsubmitted draft and is excluded.
+    const foreignSubmission = reviews.find((review): boolean =>
+      typeof review.state === 'string' && review.state !== 'PENDING' &&
+      review.commit_id === input.targetSha &&
+      typeof review.body === 'string' && receiptDigest(review.body) === receiptDigest(input.body) &&
+      typeof review.user?.login === 'string' && review.user.login.trim() !== '' &&
+      review.user.login.toLowerCase() !== authenticatedLogin.toLowerCase());
+    if (foreignSubmission !== undefined) {
+      const actor = typeof foreignSubmission.user?.login === 'string' ? foreignSubmission.user.login.slice(0, 128) : '(none)';
+      const state = typeof foreignSubmission.state === 'string' ? foreignSubmission.state.slice(0, 64) : '(none)';
+      throw new Error(
+        `provider review for the frozen head and body was submitted in state ${state} by account ${actor}, not the reconciled account ${authenticatedLogin} — the intended delivery is not proved; delivery stays unresolved, never absence`,
+      );
+    }
     // Reviews matching this publication's author, frozen head and body —
     // the state split below decides credit vs wrong-state evidence.
     const samePublication = (review: { user?: { login?: unknown }; commit_id?: unknown; body?: unknown }): boolean =>
