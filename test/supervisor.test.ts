@@ -3457,6 +3457,95 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
     }
   });
 
+  it('a failed fenced-alert post is retried on the next tick until the stop has a live control', async () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'retry-alert-job', repo: 'fixture', title: 'retry-alert lane' });
+      h.api.setJobStatus('retry-alert-job', 'working');
+      h.api.registerAgent({ id: 'retry-alert-agent', role: 'minion', jobId: 'retry-alert-job' });
+      const handle = new FakeHandle('minion', 'retry-alert-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<
+          string,
+          {
+            breakerOpen: boolean;
+            breakerNotificationId: string | null;
+            pendingRearmFenceAlert: { reason: string } | null;
+          }
+        >;
+        fenceRearm(agent: unknown, notificationId: string | null, reason: string): void;
+        tick(): void;
+      };
+      const agent = internals.agents.get('retry-alert-agent')!;
+      const originalPost = h.center.post.bind(h.center);
+      let failPost = true;
+      h.center.post = ((input: Parameters<NotificationCenter['post']>[0]) => {
+        if (failPost && input.kind === 'supervision.rearm-fenced') throw new Error('ledger hiccup');
+        return originalPost(input);
+      }) as typeof h.center.post;
+      internals.fenceRearm(agent, null, 'fixture hold');
+      // The stop is visible, the fresh control FAILED to post, and the
+      // pending retry is remembered — no control exists yet.
+      expect(h.supervisor.viewFor('retry-alert-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(agent.pendingRearmFenceAlert?.reason).toContain('fixture hold');
+      expect(h.api.listNotifications({ limit: 50 }).some((row) => row.kind === 'supervision.rearm-fenced')).toBe(false);
+      // The ledger recovers: the next tick binds a live control.
+      failPost = false;
+      internals.tick();
+      const posted = h.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(posted).toMatchObject({ routing: 'action-required', resolvedAt: null });
+      expect(agent.breakerNotificationId).toBe(posted!.id);
+      expect(agent.pendingRearmFenceAlert).toBeNull();
+      // The control is real: its disposition re-arms the lane.
+      h.registry.spawnImpl = async (role) => new FakeHandle(role, 'retry-alert-resumed', null);
+      expect(h.supervisor.onNotificationDisposed(posted!.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(h.supervisor.viewFor('retry-alert-resumed')?.state).toBe('watching'));
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('an unreadable bound control is treated as gone: a fresh alert is raised and bound', () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'unreadable-job', repo: 'fixture', title: 'unreadable lane' });
+      h.api.setJobStatus('unreadable-job', 'working');
+      h.api.registerAgent({ id: 'unreadable-agent', role: 'minion', jobId: 'unreadable-job' });
+      const handle = new FakeHandle('minion', 'unreadable-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, { breakerOpen: boolean; breakerNotificationId: string | null }>;
+        raiseFencedAlert(agent: unknown, reason: string): void;
+      };
+      h.api.recordNotification({
+        id: 'stale-bound-row',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Old control',
+        detail: 'open',
+      });
+      const agent = internals.agents.get('unreadable-agent')!;
+      agent.breakerOpen = true;
+      agent.breakerNotificationId = 'stale-bound-row';
+      const originalGet = h.api.getNotification.bind(h.api);
+      h.api.getNotification = ((id: string) => {
+        if (id === 'stale-bound-row') throw new Error('ledger read failed');
+        return originalGet(id);
+      }) as typeof h.api.getNotification;
+      internals.raiseFencedAlert(agent, 'binding unreadable');
+      h.api.getNotification = originalGet;
+      const posted = h.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(posted).toMatchObject({ resolvedAt: null });
+      expect(agent.breakerNotificationId).toBe(posted!.id);
+    } finally {
+      h.dispose();
+    }
+  });
+
   it('a ledger failure during the re-arm commit is contained and leaves a live fenced control', async () => {
     const h = boot();
     h.supervisor.start();

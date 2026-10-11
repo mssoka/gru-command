@@ -626,7 +626,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // agreed options to an existing discussion-only decision so the
             // owner's eventual choice records through the typed path. The
             // ledger refuses every other row shape (not_discussion,
-            // decision_recorded, not_open, not_owner_decision).
+            // decision_recorded, not_open, no_decision, not_owner_decision).
             const options = parseDecisionOptions((body as Record<string, unknown>)['options']);
             const by = optStrField(body, 'by') ?? 'gru';
             try {

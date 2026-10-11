@@ -3438,8 +3438,12 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const narrow = css.slice(narrowStart, css.indexOf('\n}\n', narrowStart));
     expect(compact(/\.board-owner__row\s*\{([^}]*)\}/u.exec(narrow)?.[1])).toContain("'context'");
     expect(compact(/\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(narrow)?.[1])).toContain("'context'");
-    // The themed Go-to control follows the narrow alignment group too.
-    expect(narrow).toContain('.board-owner__goto,');
+    // The themed Go-to control follows the narrow alignment group too:
+    // resolve the RULE BODY (not a substring), so the pin fails if the
+    // declaration or the membership goes away (and never on comma order).
+    const narrowGotoRule = /([^{}]*\.board-owner__goto[^{}]*)\{([^}]*)\}/u.exec(narrow);
+    expect(narrowGotoRule?.[1]).toContain('.board-owner__goto');
+    expect(compact(narrowGotoRule?.[2])).toContain('justify-self: start;');
     // The bell pointer's Go-to control is not the one unstyled button.
     const gotoRule = /\.board-owner__goto\s*\{([^}]*)\}/u.exec(css)?.[1] ?? '';
     expect(gotoRule).toContain('grid-area: action;');

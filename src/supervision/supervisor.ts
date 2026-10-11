@@ -672,6 +672,7 @@ export class Supervisor {
           live.stopReason = agent.stopReason;
           live.stoppedAt = agent.stoppedAt;
           live.breakerNotificationId = agent.breakerNotificationId;
+          live.pendingRearmFenceAlert = agent.pendingRearmFenceAlert;
           live.state = 'stopped';
         }
       }
