@@ -208,7 +208,9 @@ for (const width of [360, 375, 390]) {
     // Accept and Reject: on screen and the topmost element at their centres.
     for (const selector of ['.board-owner__accept', '.board-owner__reject']) {
       const button = row.locator(selector);
-      await button.scrollIntoViewIfNeeded();
+      // Minimal nearest placement can leave a fixed chat FAB over the action;
+      // center it before the strict on-screen/hit-target check.
+      await button.evaluate((node) => node.scrollIntoView({ block: 'center', inline: 'nearest' }));
       await expect(button).toBeEnabled();
       const hit = await button.evaluate((node) => {
         const rect = node.getBoundingClientRect();
