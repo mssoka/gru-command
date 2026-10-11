@@ -1347,6 +1347,7 @@ if (argv.includes('--method') && argv.includes('POST')) {
       // exists, while the recovered target stays fenced by the unresolved one.
       const controlJobId = 'clean-abort-r6-control';
       h.ledger.addJob({ id: controlJobId, repo: 'fixture', title: 'clean abort control', baseBranch: 'main', briefing: 'review' });
+      h.ledger.setJobStatus(controlJobId, 'working');
       h.ledger.setJobStatus(controlJobId, 'delivered');
       h.ledger.setJobPr(controlJobId, githubPrUrl);
       h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: controlJobId, payload: { sha: frozenHead, source: 'dispatch' } });
