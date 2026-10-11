@@ -1827,6 +1827,22 @@ describe('Perkins lane-B r2: the sweep-tail catch leg is PINNED (fires on a real
   });
 });
 
+  it('the swept-row heal re-fires onSwept when the repo directory is gone too (owner release 2026-10-11)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-heal-norepo');
+    ledgerJob(h, 'job-heal-norepo', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-heal-norepo' });
+    repo.git(['worktree', 'remove', '--force', row.path]);
+    h.ledger.setWorktreeStatus('job-heal-norepo', 'swept');
+    // The other half of the same crash window: the REPO directory is gone
+    // too, so the ordinary pristine-home check must still fire the
+    // producer-resolution callback (the scoped pause notice settles).
+    rmSync(repo.path, { recursive: true, force: true });
+    const result = await h.manager.release({ worktreeId: 'job-heal-norepo' });
+    expect(result.status).toBe('swept');
+    expect(h.swept).toContain('job-heal-norepo');
+  });
+
 describe('Perkins lane-B r2/r3: crash-window reconciliation (row stranded over a removed tree)', () => {
   it('DISCRIMINATOR: a CONTAINED lane reconciles swept WITH its branch deleted — no debris, no wedge', async () => {
     const h = harness();

@@ -979,6 +979,9 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(mainSource).toMatch(/notifications\.resolveExactKind\('roll-port-squat', 'service-boot'\)/u);
     expect(mainSource).toMatch(/reconcileLegacyOwnerAttention\(\{/u);
     expect(mainSource).toMatch(/notifications\.resolveIncidents\(`worktree-sweep-paused:\$\{worktree\.id\}:/u);
+    // Both sides of the coupling: the posted kind template must carry the
+    // same `worktree-sweep-paused:<id>:<pause>` shape the resolver strips.
+    expect(mainSource).toMatch(/kind: `worktree-sweep-paused:\$\{worktree\.id\}:\$\{randomUUID\(\)\}`/u);
   });
 
   it('bounds the snapshot to the newest receipt window while live rows stay complete (D3)', () => {

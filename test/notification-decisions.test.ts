@@ -169,6 +169,47 @@ describe('typed decision validation', () => {
   });
 });
 
+describe('write-boundary decision validation (center, not just the helper)', () => {
+  it('rejects a malformed decision through post and openIncident with no row stored', () => {
+    const rig = boot();
+    const malformed = { ...decision(), reservedClass: 'anything' } as unknown as NotificationDecision;
+    expect(() =>
+      rig.center.post({
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Bad escalation',
+        detail: 'evidence',
+        decision: malformed,
+      }),
+    ).toThrow(/reservedClass must be one of/);
+    expect(() =>
+      rig.center.openIncident({
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Bad escalation',
+        detail: 'evidence',
+        dedupe: 'unacked',
+        decision: malformed,
+      }),
+    ).toThrow(/reservedClass must be one of/);
+    // A non-boolean discussion is the other malformed shape the boundary
+    // must refuse before anything durable exists.
+    expect(() =>
+      rig.center.post({
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Bad escalation',
+        detail: 'evidence',
+        decision: { ...decision(), discussion: 'yes' } as unknown as NotificationDecision,
+      }),
+    ).toThrow(/discussion must be a boolean/);
+    expect(rig.api.listNotifications({ limit: 10 })).toHaveLength(0);
+  });
+});
+
 describe('recordNotificationDecision — the side-effect boundary', () => {
   function seedDecision(rig: ReturnType<typeof boot>): string {
     return rig.center.post({
