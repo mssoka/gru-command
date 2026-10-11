@@ -191,3 +191,18 @@
   "the classified heavy wave and whole-review files" (now also recovery) —
   comment-only nit; fold into the next edit that touches that line rather
   than moving the verified CI-green head.
+
+
+## R9-fix round (head 881d5500 -> closure round, 2026-10-11) — decisions and follow-ups
+
+- The former "genuine lead-only-redaction" positive control is RETIRED and
+  flipped to a refusal: both R9-fix review lenses proved the report-only
+  redaction body is textually indistinguishable from the heading-only
+  reversed-ordering attack (the placeholder replaces the whole matched span).
+  Closure: `publishedScopeDisclosure` refuses scope authentication for ANY
+  redaction trace in the digest-verified bytes; erasure-free legacy/scoped
+  bodies and the modern immutable review-block path keep their credit.
+- Present-convergence and scoped+report-redaction coverage added per the
+  verification lens (F2/F3), pinned as refusals.
+- R9-deferred warnings (empty-finding baseline auth, ordinary delta digest
+  coupling, retry annotation blocker count) remain native-deferred, untouched.

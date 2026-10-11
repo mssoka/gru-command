@@ -710,8 +710,8 @@ const HOST_APPENDIX_HEADING = '## Execution and findings (host-recorded facts)';
  * appendix scope disclosure AND no trace of publication-redaction erasure (a
  * genuine pre-Stage-5 whole review); `scoped` names the disclosed scope plus
  * whether the appendix still discloses an owed final whole-change pass; null
- * is a missing body, an unrecognized disclosure, or missing evidence whose
- * absence is consistent with a redaction span — none of which can corroborate
+ * is a missing body, a body carrying ANY publication-redaction trace, or an
+ * unrecognized/ambiguous disclosure — none of which can corroborate
  * retention (refuse, never guess). */
 type PublishedScopeDisclosure =
   | { readonly kind: 'legacy' }
@@ -719,40 +719,25 @@ type PublishedScopeDisclosure =
 
 function publishedScopeDisclosure(text: string | null): PublishedScopeDisclosure | null {
   if (text === null) return null;
+  // ANY redaction trace in the digest-verified bytes refuses scope
+  // authentication, whatever the region: the placeholder replaces the entire
+  // matched span, so an erasure whose boundaries lie before, inside or after
+  // the appendix can never be told apart from a forged heading/title that
+  // survived a span consuming the genuine scope and debt markers (R9/R10;
+  // both the heading-first and heading-after orderings). Erasure-free
+  // pre-disclosure bodies keep their legacy credit below, and modern rounds
+  // derive their scope from the immutable posted review block.
+  if (text.includes(REDACTION_PLACEHOLDER)) return null;
   // Structural recognition: only a LINE-ANCHORED heading marks the host
   // appendix region. A finding or deferred-follow-up title embedding the
   // heading inside a longer line can never move the boundary, and more than
   // one anchored heading is ambiguous scope evidence and refuses.
   const heading = lineAnchoredPosition(text, HOST_APPENDIX_HEADING);
   if (heading.count > 1) return null;
-  if (heading.count === 0) {
-    // No host heading: either a genuine pre-heading-era whole record or
-    // evidence erased by a publication redaction span — which always leaves
-    // its placeholder. With a placeholder present the absence is ambiguous:
-    // refuse rather than credit whole clearance.
-    return text.includes(REDACTION_PLACEHOLDER) ? null : { kind: 'legacy' };
-  }
+  if (heading.count === 0) return { kind: 'legacy' };
   const host = text.slice(heading.index);
-  // A region carrying a redaction placeholder can never be trusted for scope
-  // credit: a forged heading and scope line planted in the lead-authored
-  // report ahead of a span that erased the genuine appendix would otherwise
-  // decode as a genuine disclosure.
-  if (host.includes(REDACTION_PLACEHOLDER)) return null;
   const scopeLines = host.split('\n').filter((entry) => entry.startsWith('- Review scope: '));
-  if (scopeLines.length === 0) {
-    // No scope disclosure was ever emitted in this placeholder-free region: a
-    // genuine pre-Stage-5 whole review. A redaction confined to the report
-    // (before the heading) keeps this legacy credit.
-    return { kind: 'legacy' };
-  }
-  // A SCOPED disclosure is only credible when the bytes BEFORE the anchored
-  // heading are erasure-free too. A historical raw deferred title can plant a
-  // line-anchored heading AFTER a span that erased the genuine appendix, so
-  // the placeholder precedes the selected region and the surviving scope
-  // claim would rest on erased bytes alone (R9, reversed ordering). Refuse:
-  // modern rounds derive their scope from the immutable posted review block
-  // instead, and the legacy path above keeps its credit.
-  if (text.slice(0, heading.index).includes(REDACTION_PLACEHOLDER)) return null;
+  if (scopeLines.length === 0) return { kind: 'legacy' };
   // The host appendix emits exactly ONE scope line: two or more is ambiguous
   // scope evidence and refuses rather than picking one.
   if (scopeLines.length > 1) return null;
