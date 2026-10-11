@@ -578,7 +578,7 @@ export class BoardView {
     }
     // The focused control may have changed state (an option just recorded):
     // land on its card so focus stays inside the item the operator acted on.
-    const id = focusKey.split(':')[1] ?? null;
+    const id = notificationIdFromFocusKey(focusKey);
     if (id !== null) this.focusNotification(id, this.ownerMount);
   }
 
@@ -2102,7 +2102,7 @@ export class BoardView {
         return;
       }
     }
-    const id = key.split(':')[1] ?? null;
+    const id = notificationIdFromFocusKey(key);
     if (id !== null) this.focusNotification(id, list);
   }
 
@@ -2636,6 +2636,25 @@ interface ProposalRowState {
 
 /** Owner-surface focus (FOR YOU band + bell): stable keys survive the
  * re-render a snapshot push causes, so focus never falls to <body>. */
+/** The notification id inside a focus key. Keys are `notif:<id>:…` or the
+ * band's `owner-<kind>:<id>` forms — and a notification id may itself
+ * contain ':' (e.g. `lessons-proposal-withdrawn:<uuid>`), so a fixed
+ * split(':')[1] parses the wrong segment and drops focus to <body>. */
+function notificationIdFromFocusKey(key: string): string | null {
+  // The key suffix is known (`:details`, `:seen`, `:option:<id>`); parse it
+  // from the RIGHT so an id containing ':' survives intact.
+  if (key.startsWith('notif:')) {
+    const rest = key.slice('notif:'.length);
+    const optionAt = rest.indexOf(':option:');
+    if (optionAt !== -1) return rest.slice(0, optionAt) || null;
+    if (rest.endsWith(':details')) return rest.slice(0, -':details'.length) || null;
+    if (rest.endsWith(':seen')) return rest.slice(0, -':seen'.length) || null;
+    return rest || null;
+  }
+  const parts = key.split(':');
+  return parts.length >= 2 && parts[1] !== '' ? parts[1]! : null;
+}
+
 function captureOwnerFocusKey(root: HTMLElement): string | null {
   const active = document.activeElement;
   if (!(active instanceof HTMLElement) || !root.contains(active)) return null;

@@ -1934,6 +1934,10 @@ describe('Perkins lane-B r4: a swept row with a surviving branch HEALS on releas
     const healed = await h.manager.release({ worktreeId: 'job-heal', baseBranch: 'main' });
     expect(healed.status).toBe('swept');
     if (healed.status === 'swept') expect(healed.branch).toBe('deleted');
+    // The heal path also re-fires the sweep-completion hook: a scoped
+    // sweep-pause notice whose first resolution was lost (crash between the
+    // flip and the hook) settles on the retry (owner release 2026-10-11).
+    expect(h.swept).toContain('job-heal');
     expect(repo.git(['branch', '--list', row.branch!])).toBe('');
     // The id is reusable immediately.
     ledgerJob(h, 'job-heal-2', repo);

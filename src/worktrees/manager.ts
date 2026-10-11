@@ -930,7 +930,18 @@ export class WorktreeManager {
       // job branch when a dispose-then-flip window crashed between the
       // two, or when an older build flipped first. Verify-and-dispose on
       // every swept retry — never early-return 'none' over debris.
+      // A GONE tree is positive evidence the worktree is swept: re-fire the
+      // producer-resolution hook so a pause notice whose first resolution
+      // was lost (crash between the flip and the hook) still settles.
+      const treeGone = !existsSync(row.path);
       if (!existsSync(row.repoPath)) {
+        if (treeGone) {
+          try {
+            this.opts.onSwept?.({ worktree: row });
+          } catch (error) {
+            this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
+          }
+        }
         return {
           status: 'swept',
           preserved: null,
@@ -955,6 +966,13 @@ export class WorktreeManager {
               input.baseBranch,
               this.safeFreshRemoteBranch(row.repoPath),
             );
+          }
+        }
+        if (treeGone) {
+          try {
+            this.opts.onSwept?.({ worktree: row });
+          } catch (error) {
+            this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
           }
         }
         return {

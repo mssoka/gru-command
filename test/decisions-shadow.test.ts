@@ -328,12 +328,24 @@ describe('the enforce gate (issue #223)', () => {
       detail: 'no recorded backtest evidence yet',
       dedupe: 'active',
     });
+    // A lookalike kind that EXTENDS the surface name must stay open: the
+    // consumer must settle the exact kind, never a LIKE prefix (the CONSUMER,
+    // not just the helper, is what this test discriminates).
+    const lookalike = notifications.postIncident({
+      kind: `decisions.enforce-gate.${surface}-extra`,
+      routing: 'needs-owner',
+      severity: 'error',
+      title: `Decision enforce gate blocked for ${surface}-extra`,
+      detail: 'a different surface, still gated',
+      dedupe: 'active',
+    });
     expect(incident.routing).toBe('needs-owner');
     saveBacktestRecord(dataDir, backtestRecordFromReport(minimalReport, { metric: 'precision', label: null, min: 0.9 }));
     const runtime = await startedRuntime({ [surface]: surfaceEntry(profile, 'enforce') }, { dataDir, notifications });
     const outcome = await runtime.decide(eventRequest(), { surface });
     expect(outcome.provenance).toMatchObject({ source: 'jev' });
     expect(ledger.getNotification(incident.id)?.resolvedBy).toBe('enforce-gate-passed');
+    expect(ledger.getNotification(lookalike.id)?.resolvedAt).toBeNull();
     runtime.dispose();
   });
 

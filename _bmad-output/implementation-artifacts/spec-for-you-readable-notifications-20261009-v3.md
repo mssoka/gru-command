@@ -5,7 +5,7 @@ created: '2026-10-11'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'f738b9b1594081cdbb4929af7be256454951eb43'
-review_loop_iteration: 2
+review_loop_iteration: 3
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/BOARD.md'
@@ -94,7 +94,7 @@ Checkpoint-1 approval. Original decision-routing acceptance and the
 
 ## Code Map
 
-- `src/notifications/attention.ts` (new) — authoritative owner-attention registry: `owner-required | owner-allowed | owner-forbidden` per kind/prefix; unknown defaults to Gru triage; `requiresOwnerDecision(kind)`.
+- `src/notifications/attention.ts` (new) — authoritative owner-attention registry: `owner-required | owner-allowed | owner-forbidden` per kind/prefix; unknown defaults to Gru triage; `requiresTypedDecision(kind)`.
 - `src/ledger/notification-decision.ts` (new) — typed `NotificationDecision` (question/context/recommendation/reservedClass/whyNotDelegable/options/discussion) + strict validation and safe parse.
 - `src/ledger/db.ts` — migration 25: `ALTER TABLE notifications ADD COLUMN decision_json/decided_at/decided_by/decided_option`.
 - `src/ledger/api.ts` — `NotificationRecord` + `recordNotification(decision)` + `recordNotificationDecision()` + `notificationFromRow`; keep `ackNotification` (record-only now) and `disposeMachineNotification`.
@@ -279,6 +279,44 @@ Round-2 verification result: the reviews ran against 4d9d724c; the
 hygiene fixture-path commit and these fixes move the head, so a final
 whole-change round (3) reviews the exact final head before any merge
 presentation.
+
+Round 3 (head a86922d7; same three tracked lenses). All round-2
+resolutions verified. One blocker-class finding (its location intersects
+the round-2 hunks) and several follow-ups; fixed in one batch:
+
+- The exact-kind enforce-gate fix had no CONSUMER-level discriminating test
+  — high/blocker; patch. `test/decisions-shadow.test.ts` now opens a
+  `${surface}-extra` lookalike incident and asserts it stays unresolved
+  after the passing gated call (reverting to the prefix call would fail).
+- `docs/FLOW.md` still said the disposition endpoint refuses needs-owner
+  rows outright, contradicting the decided-row follow-through — low;
+  patch (wording corrected).
+- The sweep-heal path never re-fired `onSwept`, so a pause notice whose
+  first resolution was lost (crash between the flip and the hook) stayed
+  open — medium; patch (the hook re-fires when the tree is gone; the heal
+  test asserts it).
+- Boot clearance for port squats used prefix resolution — low; patch
+  (`resolveExactKind` + assembly pin updated).
+- Remaining "owner-held provider wall" wording (Silas brief, main comment,
+  chat refusal, ops-skill list, provider-recovery spec code-map) — low;
+  patch.
+- The focus fallback parsed ids with a fixed `split(':')[1]`, so an id
+  containing ':' (e.g. `lessons-proposal-withdrawn:<uuid>`) dropped focus
+  to `<body>` — medium; patch (suffix-aware parse + regression).
+- The legacy-owner paging claim (that the pass mutates the set it pages
+  over) — false: the function materializes every page before the mutation
+  loop; recorded refutation.
+- A vacuous `owner-ack:lp-1` null assertion in a proposal test — low;
+  patch (asserts the real Accept/Reject controls and the removed family).
+- Direct (non-HTTP) producers could store a malformed decision that reads
+  back as 'no decision' — medium; patch (the notification center now
+  deep-validates at its write boundary).
+- The spec's own Code Map named `requiresOwnerDecision` instead of
+  `requiresTypedDecision` — rejected by the review rule that bars fixes
+  editing this build's spec; corrected opportunistically as an agent-owned
+  Code Map typo.
+- The real-server compact epoch race stays deferred (pre-existing,
+  reproduced at the pristine base; recorded in deferred-work).
 
 ## Design Notes
 

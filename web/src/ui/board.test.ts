@@ -2768,7 +2768,12 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const band = document.getElementById('board-owner')!;
     expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
     expect(band.textContent).toContain('Accept writes these changes into the Book of Lessons');
-    expect(band.querySelector('[data-action-id="owner-ack:lp-1"]')).toBeNull();
+    // No generic Ack on the proposal row: the real controls are the
+    // review disclosure and Accept/Reject (the action-id family is
+    // `owner-proposal:<id>`).
+    expect(band.querySelector('.board-owner__ack.board-owner__accept')).not.toBeNull();
+    expect(band.querySelector('.board-owner__ack.board-owner__reject')).not.toBeNull();
+    expect(band.querySelector('[data-action-id^="owner-ack:"]')).toBeNull();
     openReview();
     await flush();
     expect(band.textContent).toContain('Close the shell first.\nThen restart.');
@@ -3385,6 +3390,22 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(more.textContent).toBe('+3 older pending');
     more.click();
     expect(document.getElementById('board-owner')!.querySelectorAll('.board-owner__row')).toHaveLength(9);
+  });
+
+  it('a colon-bearing notification id still resolves its card in the focus fallback', () => {
+    const view = new BoardView(() => {});
+    const row = notification('lessons-proposal-withdrawn:abc-123', { routing: 'fyi', detail: 'short notice' });
+    view.render(snapshot({ notifications: [row] }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const button = document.querySelector<HTMLButtonElement>('#notification-list [data-action-id="fyi-seen:lessons-proposal-withdrawn:abc-123"]')!;
+    button.focus();
+    // The control disappears on the next push (acked elsewhere): the
+    // fallback must parse the id through the first ':' after `notif:`,
+    // not a fixed segment index.
+    view.render(snapshot({ notifications: [{ ...row, ackedAt: '2026-01-01T00:05:00.000Z' }] }));
+    const active = document.activeElement as HTMLElement | null;
+    expect(active).not.toBeNull();
+    expect(document.getElementById('notification-list')!.contains(active)).toBe(true);
   });
 
   it('recording a decision from the bell keeps focus inside the bell after the option disappears', async () => {

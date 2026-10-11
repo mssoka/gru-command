@@ -892,8 +892,9 @@ creates an owner stop. A machine disposition closes the original incident.
 After acting on an `action-required` row Gru calls the authenticated
 `POST /api/notifications/{id}/disposition` with a nonempty JSON `detail`
 (the action taken or why no safe action was possible). The ledger records
-`notification.resolved` by `gru` with the action detail; the endpoint refuses `needs-owner` and
-FYI rows. Disposing an open `supervision.breaker` alert is also the
+`notification.resolved` by `gru` with the action detail; the endpoint refuses FYI
+and UNDECIDED `needs-owner` rows (a decided owner row resolves its
+follow-through through the same route, below). Disposing an open `supervision.breaker` alert is also the
 supported re-arm control for the stopped lane (same guarded
 recovery-authority fence as the historical ack). The authenticated `/ack`
 API itself refuses machine rows, not just the web UI. Both open machine

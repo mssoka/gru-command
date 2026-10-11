@@ -975,8 +975,8 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     // assembly-alarm shape.
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toMatch(/onNotificationDisposition:\s*\(id\)\s*=>\s*supervisorLive\.onNotificationDisposed\(id\)/u);
-    expect(mainSource).toMatch(/notifications\.resolveIncidents\('port-squat', 'service-boot'\)/u);
-    expect(mainSource).toMatch(/notifications\.resolveIncidents\('roll-port-squat', 'service-boot'\)/u);
+    expect(mainSource).toMatch(/notifications\.resolveExactKind\('port-squat', 'service-boot'\)/u);
+    expect(mainSource).toMatch(/notifications\.resolveExactKind\('roll-port-squat', 'service-boot'\)/u);
     expect(mainSource).toMatch(/reconcileLegacyOwnerAttention\(\{/u);
     expect(mainSource).toMatch(/notifications\.resolveIncidents\(`worktree-sweep-paused:\$\{worktree\.id\}:/u);
   });

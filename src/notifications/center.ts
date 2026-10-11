@@ -4,7 +4,7 @@ import type { BusEvent, EventBus } from '../events/bus.js';
 import type { DecisionService } from '../decisions/types.js';
 import { DECISION_SURFACE_EVENT_TRIAGE, eventDecisionRequest, redactedText } from '../decisions/questions.js';
 import { requiresTypedDecision, resolveNotificationRouting } from './attention.js';
-import type { NotificationDecision } from '../ledger/notification-decision.js';
+import { parseNotificationDecision, type NotificationDecision } from '../ledger/notification-decision.js';
 import {
   LedgerApi,
   type NotificationRecord,
@@ -154,6 +154,10 @@ export class NotificationCenter {
           '(question, context, reservedClass, whyNotDelegable, options) — an owner chore is never posted as a bare notice',
       );
     }
+    // Validate the typed decision at the write boundary itself, so a
+    // direct (non-HTTP) producer cannot store an unanswerable row that
+    // reads back as 'no decision'.
+    const decision = input.decision === undefined || input.decision === null ? null : parseNotificationDecision(input.decision);
     const resolved = resolveNotificationRouting(input.kind, input.routing);
     if (resolved.overridden) {
       this.log(
@@ -177,7 +181,7 @@ export class NotificationCenter {
       ...input,
       id: input.id ?? randomUUID(),
       routing: resolved.routing,
-      decision: input.decision ?? null,
+      decision,
     });
     this.log(input.severity === 'error' ? 'warn' : 'info', 'notification posted', {
       id: record.id,
@@ -210,6 +214,8 @@ export class NotificationCenter {
           '(question, context, reservedClass, whyNotDelegable, options) — an owner chore is never posted as a bare notice',
       );
     }
+    const decision =
+      input.decision === undefined || input.decision === null ? null : parseNotificationDecision(input.decision);
     const created = (record: NotificationRecord) => ({ record, created: true });
     const reused = (record: NotificationRecord) => ({ record, created: false });
     const effective = resolveNotificationRouting(input.kind, input.routing).routing;
@@ -255,7 +261,7 @@ export class NotificationCenter {
           input.dedupe === 'all' ? 'any' : input.dedupe,
         );
         if (openOwnerRow !== null) return reused(openOwnerRow);
-        return created(this.post(input));
+        return created(this.post({ ...input, decision }));
       }
       // Do not grandfather an old machine row into FOR YOU merely because
       // a newer post of the same kind is owner-held. Gru triages the old ID.

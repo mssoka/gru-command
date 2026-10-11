@@ -960,7 +960,8 @@ async function main(): Promise<number> {
         if (wait !== null) ledger.setProviderWaitIncident(wait.id, incidentId);
       },
       // The observation report for NON-machine-owned stops (incidentId
-      // null): the sink re-classifies; ineligible classes stay owner-held.
+      // null): the sink re-classifies; ineligible/unknown classes are
+      // machine attention (action-required) — Gru decides the direction.
       onProviderWall: (observation) => {
         void establishProviderWait(providerRecoverySensor, {
           agentId: observation.agentId,
@@ -1645,8 +1646,8 @@ async function main(): Promise<number> {
   // 2026-10-11): a successful bind proves the squatter is gone, so these
   // rows resolve themselves instead of waiting for a human Ack. A failed
   // bind above already posted (or kept) the notice.
-  notifications.resolveIncidents('port-squat', 'service-boot');
-  notifications.resolveIncidents('roll-port-squat', 'service-boot');
+  notifications.resolveExactKind('port-squat', 'service-boot');
+  notifications.resolveExactKind('roll-port-squat', 'service-boot');
   // Post-roll self-check (phase d): the relaunched build logs uptime+sha
   // once the socket is actually serving.
   if (rollAdoption.marker !== null) {
