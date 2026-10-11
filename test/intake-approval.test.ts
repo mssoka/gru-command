@@ -25,7 +25,7 @@ async function fixture(kind: 'issue' | 'spec' | 'bmad' = 'spec') {
   const dispatch = vi.fn(async (_input: { jobId: string; title: string; briefing: string }) => ({ settled: Promise.resolve() }));
   const capacity = { capacity: 1, occupied: 1, available: 0, queued: 0 };
   const pipeline = new PipelineService({ ledger, dispatch: { dispatch }, capacity: () => capacity });
-  const intake = new IntakeService({ dataDir: join(root, 'data'), workspaceRoot: join(root, 'workspace'), uploadsDir: join(root, 'data', 'uploads'), remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }), ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 1, html_url: 'https://github.com/owner/demo/issues/1', title: 'Capture', body: 'Implement native capture.', updated_at: '2026-10-10T12:00:00Z' }) }) });
+  const intake = new IntakeService({ dataDir: join(root, 'data'), workspaceRoot: join(root, 'workspace'), uploadsDir: join(root, 'data', 'uploads'), managedRepos: () => [repoPath], remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }), ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 1, html_url: 'https://github.com/owner/demo/issues/1', title: 'Capture', body: 'Implement native capture.', updated_at: '2026-10-10T12:00:00Z' }) }) });
   const approval = new IntakeApprovalService({ intake, ledger, pipeline });
   cleanups.push(() => { pipeline.dispose(); db.close(); rmSync(root, { recursive: true, force: true }); });
   const source = kind === 'issue' ? { kind, reference: '#1' } : { kind, document: { path: 'spec.md' } };

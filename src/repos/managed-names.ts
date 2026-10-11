@@ -32,7 +32,8 @@ const GIT_ROUTING_ENV = new Set([
 ]);
 
 function isGitProbeEnvironmentVariable(name: string): boolean {
-  return !GIT_ROUTING_ENV.has(name) && !/^GIT_CONFIG_(?:COUNT|(?:KEY|VALUE)_\d+)$/u.test(name);
+  const normalizedName = name.toUpperCase();
+  return !GIT_ROUTING_ENV.has(normalizedName) && !/^GIT_CONFIG_(?:COUNT|(?:KEY|VALUE)_\d+)$/u.test(normalizedName);
 }
 
 /** Keep the OS account's normal Git config authoritative, but ignore

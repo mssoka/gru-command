@@ -1379,6 +1379,18 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       await expectSelectedProviderCalls();
       vi.unstubAllEnvs();
 
+      vi.stubEnv('git_dir', join(foreign, '.git'));
+      vi.stubEnv('git_work_tree', selected);
+      vi.stubEnv('git_config_count', '1');
+      vi.stubEnv('git_config_key_0', 'remote.origin.url');
+      vi.stubEnv('git_config_value_0', 'https://github.com/acme/foreign.git');
+      const inheritedGitNames = Object.keys(gitProbeEnvironment()).map((name) => name.toUpperCase());
+      expect(inheritedGitNames).not.toContain('GIT_DIR');
+      expect(inheritedGitNames).not.toContain('GIT_WORK_TREE');
+      expect(inheritedGitNames.some((name) => /^GIT_CONFIG_(?:COUNT|(?:KEY|VALUE)_\d+)$/u.test(name))).toBe(false);
+      await expectSelectedProviderCalls();
+      vi.unstubAllEnvs();
+
       const homeRoot = join(root, 'home');
       mkdirSync(homeRoot);
       execFileSync('git', ['config', '--file', join(homeRoot, '.gitconfig'), 'url.https://github.com/acme/foreign.git.insteadOf', 'https://github.com/acme/selected.git']);

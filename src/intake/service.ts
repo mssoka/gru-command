@@ -1,8 +1,7 @@
 import { ArtifactContextError, createPreviewArtifactContext, type PreviewArtifactContext } from '../artifacts/context.js';
-import { discoverManagedRepos } from '../repos/discovery.js';
 import { loadBundledWorkflowRuntime, type BundledWorkflowRuntime } from '../workflows/runtime.js';
 import { REQUIRED_INTAKE_WORKFLOW_FILE } from '../workflows/manifest.js';
-import { join, isAbsolute, resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { canonicalManagedRepo, captureSources, INTAKE_MAX_DOCUMENTS, INTAKE_MAX_AGGREGATE_BYTES, INTAKE_MAX_REQUIREMENTS, type SourcePorts } from './sources.js';
 import { conservativePlan, validatePlan } from './planner.js';
 import { canonical, boundedCanonical, digest, IntakeError, type Capture, type DocumentInput, type IntakePlanner, type IntakeRequest, type IntakeSource, type Proposal } from './types.js';
@@ -12,8 +11,8 @@ export const INTAKE_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 export interface IntakeServiceOptions extends SourcePorts {
   readonly dataDir: string;
   readonly workspaceRoot: string;
-  /** Explicit per-request managed-root guard; never an ambient cwd. */
-  readonly managedRepos?: (requestedRepoPath: string) => readonly string[];
+  /** Required explicit per-request managed-root registry; never inferred by discovery. */
+  readonly managedRepos: (requestedRepoPath: string) => readonly string[];
   readonly workflow?: () => BundledWorkflowRuntime;
   readonly planner?: IntakePlanner;
 }
@@ -82,12 +81,14 @@ export function parseIntakeRequest(value: unknown): IntakeRequest {
 /** Read-only proposals only: this service intentionally has no ledger,
  * scheduler, dispatch, model, BMAD runner or approval port. */
 export class IntakeService {
-  constructor(private readonly options: IntakeServiceOptions) {}
+  constructor(private readonly options: IntakeServiceOptions) {
+    if (typeof options.managedRepos !== 'function') {
+      throw new IntakeError('intake_invalid_request', 'IntakeService requires an explicit managed repository registry');
+    }
+  }
 
   private managedRepoPaths(repoPath: string): readonly string[] {
-    return this.options.managedRepos === undefined
-      ? discoverManagedRepos(this.options.workspaceRoot).map((name) => join(this.options.workspaceRoot, name))
-      : this.options.managedRepos(repoPath);
+    return this.options.managedRepos(repoPath);
   }
 
   private context(

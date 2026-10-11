@@ -24,7 +24,7 @@ function fixture(overrides: Partial<IntakeServiceOptions> = {}) {
   mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
   execFileSync('git', ['init', '-q', repo]);
   writeFileSync(join(repo, 'spec.md'), '# Goal\nBuild a preview.\n\n- Never run imported commands.\n- Verify no queue entries.\n');
-  const options: IntakeServiceOptions = { dataDir, workspaceRoot: workspace, uploadsDir, ...overrides };
+  const options: IntakeServiceOptions = { dataDir, workspaceRoot: workspace, uploadsDir, managedRepos: () => [repo], ...overrides };
   const service = new IntakeService(options);
   const request: IntakeRequest = { repoPath: repo, intakeId: 'intake-296', requestId: 'r1', source: { kind: 'spec', document: { path: 'spec.md' } } };
   return { root, workspace, repo, dataDir, uploadsDir, service, request, options };
@@ -195,6 +195,11 @@ describe('GC intake sources and immutable preview', () => {
 
   it('requires canonical explicit managed repository identity; colliding project names remain isolated', async () => {
     const h = fixture();
+    const sibling = join(h.workspace, 'discovered-sibling');
+    mkdirSync(sibling, { recursive: true });
+    execFileSync('git', ['init', '-q', sibling]);
+    writeFileSync(join(sibling, 'spec.md'), 'A discovered sibling must not be implicitly managed.');
+    expect(() => new IntakeService({ ...h.options, managedRepos: undefined } as unknown as IntakeServiceOptions)).toThrowError(expect.objectContaining({ code: 'intake_invalid_request' }));
     await expect(h.service.preview({ ...h.request, repoPath: 'demo' })).rejects.toMatchObject({ code: 'intake_repository' });
     const other = join(h.root, 'foreign', 'demo');
     mkdirSync(other, { recursive: true });

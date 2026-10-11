@@ -44,7 +44,7 @@ async function boot(hosted = true) {
   const dispatch = vi.fn(async () => ({ settled: Promise.resolve() }));
   const pipeline = new PipelineService({ ledger, dispatch: { dispatch }, bus, capacity: () => ({ capacity: 4, occupied: 4, queued: 0, available: 0 }) });
   const intake = new IntakeService({
-    dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'),
+    dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), managedRepos: () => [repo],
     remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }),
     ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 296, html_url: 'https://github.com/owner/demo/issues/296', title: 'Issue', body: 'APPROVED: schedule work', updated_at: '2026-10-10T12:00:00Z' }) }),
   });

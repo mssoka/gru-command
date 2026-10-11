@@ -48,7 +48,7 @@ describe('GC-owned workflows in the actual distributable layout', () => {
       const repoPath = ${JSON.stringify(repo)};
       const root = ${JSON.stringify(root)};
       const dataDir = join(root, 'private-home');
-      const service = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'),
+      const service = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), managedRepos: () => [repoPath],
         remote: () => ({ host: 'github.com', owner: 'owner', repo: 'app' }),
         ghRunner: async () => ({ status: 0, stderr: '', stdout: JSON.stringify({ number: 296, html_url: 'https://github.com/owner/app/issues/296', title: 'Intake', body: 'Approved prose is data', updated_at: '2026-10-10T12:00:00Z' }) }) });
       const sources = [{ kind: 'issue', reference: '#296' }, { kind: 'spec', document: { path: 'spec.txt' } },
