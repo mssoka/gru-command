@@ -869,12 +869,12 @@ export class ManagedRepoOverviewTracker {
     for (const name of classifyOrder) {
       const previous = this.states.get(name);
       const base = previous ?? emptySourceState();
-      const unreadable = (): void => {
-        unresolvedThisRefresh.add(name);
+      const unreadable = (skipProviderPoll = false): void => {
+        if (skipProviderPoll) unresolvedThisRefresh.add(name);
         // A read failure (or the resolution budget) is not evidence the
         // remote changed: keep the previous classification and cached
-        // observation when one exists, but do not poll its cached identity
-        // without revalidating the selected root during this refresh. A
+        // observation when one exists. A budget skip before root validation
+        // also withholds its cached identity from provider polling. A
         // never-classified entry is still published with the explicit
         // read-failure reason — every managed repo appears without guessing identity.
         if (previous !== undefined) {
@@ -893,7 +893,7 @@ export class ManagedRepoOverviewTracker {
           });
           resolveBudgetSpent = true;
         }
-        unreadable();
+        unreadable(true);
         continue;
       }
       let selectedPath: ManagedRepoPath;
