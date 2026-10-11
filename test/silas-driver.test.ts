@@ -1331,7 +1331,7 @@ describe('silas digest (the four actionable states)', () => {
         writeFileSync(join(roundDir, 'manifest.json'), JSON.stringify({ repoPath: repo }), 'utf8');
         h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId: round.id, payload: {
           verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
-          url: prUrl, host: 'git.example.invalid',
+          url: `https://git.example.invalid/pull/${jobId}`, host: 'git.example.invalid',
           targetSha: sha, baseSha: 'b'.repeat(40),
           publicationFile, publicationSha256: createHash('sha256').update(body).digest('hex'), reviewEvent: 'APPROVE',
         } });
@@ -1410,7 +1410,7 @@ describe('silas digest (the four actionable states)', () => {
         writeFileSync(join(roundDir, 'manifest.json'), JSON.stringify({ repoPath: repo }), 'utf8');
         h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId: round.id, payload: {
           verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
-          url: `https://git.example.invalid/pull/${jobId}`, host: 'git.example.invalid',
+          url: prUrl, host: 'git.example.invalid',
           targetSha: sha, baseSha: 'b'.repeat(40),
           publicationFile, publicationSha256: createHash('sha256').update(body).digest('hex'), reviewEvent: 'APPROVE',
         } });
