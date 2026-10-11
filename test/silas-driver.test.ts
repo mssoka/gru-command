@@ -1421,7 +1421,7 @@ describe('silas digest (the four actionable states)', () => {
         // rotated: A's review exists but the B lookup excludes it; same:
         // the list is genuinely empty and the lookup runs as A.
         const list = mode === 'rotated'
-          ? `[{ id: 9400, user: { login: 'account-a' }, state: 'COMMENTED', commit_id: ${JSON.stringify(sha)}, body: ${JSON.stringify(body)} }]`
+          ? JSON.stringify([{ id: 9400, user: { login: 'account-a' }, state: 'COMMENTED', commit_id: sha, body }])
           : '[]';
         writeFileSync(binary, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(list)});\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  ${mode === 'rotated' ? `if (!existsSync(${JSON.stringify(userState)})) { writeFileSync(${JSON.stringify(userState)}, 'b'); process.stdout.write('account-b'); } else { process.stdout.write('account-a'); }` : "process.stdout.write('account-a');"}\n} else {\n  process.stdout.write(${JSON.stringify(`${sha}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
         const escalations: string[] = [];
