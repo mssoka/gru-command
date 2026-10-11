@@ -23,6 +23,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { buildShadowRecord } from '../src/decisions/shadow.js';
+import { computeDecisionShadowMeasures } from '../src/telemetry/yield.js';
 import { decisionRoute, deterministicOutcome } from '../src/decisions/service.js';
 import { requestFromCase, surfaceCaseSpec } from '../src/decisions/cases/registry.js';
 import type {
@@ -515,6 +516,7 @@ describe('shadow record disagreement is what the consumer would do (2026-10-11)'
       request,
       providerOutcome: jevOutcome(request, answers),
       deterministicOutcome: deterministicOutcome(request, thresholds, 'shadow_mode'),
+      thresholds,
     });
   }
 
@@ -539,8 +541,10 @@ describe('shadow record disagreement is what the consumer would do (2026-10-11)'
     const promoted = recordFor('event_triage', request, { ...fallback, needs_action: { type: 'noul', noul: 0.6 } });
     expect(pathOf(promoted, 'needs_action')).toBe('confirm');
     expect(promoted.disagrees).toBe(true);
-    // The baseline routes travel with the record.
+    // The baseline routes and the thresholds they were banded at travel
+    // with the record.
     expect((promoted.deterministic_routes as Record<string, { path: string }>)['event_class']!.path).toBe('act');
+    expect(promoted.thresholds).toEqual(thresholds);
   });
 
   it('supervision disagrees only when the supervisor would stop instead of restart, or for another reason', () => {
@@ -567,6 +571,34 @@ describe('shadow record disagreement is what the consumer would do (2026-10-11)'
     expect(record('network_failure', 0.9, 0.9, 2).disagrees).toBe(false);
     // A model-classified wall stops the agent the ladder would restart.
     expect(record('quota_wall', 0.9, 0.1).disagrees).toBe(true);
+  });
+
+  it('records the thresholds the runtime banded at, and the report measures the record at them', async () => {
+    const records: ShadowDecisionRecord[] = [];
+    // The stub answers needs_action 0.96: act at the defaults (0.75), but
+    // only confirm at an operational act threshold of 0.97.
+    const configured = {
+      ...configWithSurfaces({ event_triage: surfaceEntry('local', 'shadow') }),
+      thresholds: { ...thresholds, operational: { act: 0.97, confirm: 0.3, requireConfirmOnAct: false } },
+    };
+    const runtime = new DecisionRuntime(configured, {
+      instanceDir: temp('gru-decisions-shadow-thresholds-'),
+      env: { OPENROUTER_API_KEY: 'test-key' },
+      fetchImpl: stubFetch(),
+      watchConfig: false,
+      onShadowRecord: (record) => records.push(record),
+    });
+    await runtime.start();
+    await runtime.decide(eventRequest(), { surface: 'event_triage' });
+    runtime.dispose();
+    expect(records).toHaveLength(1);
+    const record = records[0]!;
+    expect(record.thresholds).toEqual(configured.thresholds);
+    expect(pathOf(record, 'needs_action')).toBe('confirm');
+    const measures = computeDecisionShadowMeasures([
+      { seq: 1, ts: '2026-10-11T00:00:00.000Z', kind: 'decisions.shadow', jobId: null, payload: JSON.parse(JSON.stringify(record)) as Record<string, unknown> },
+    ]);
+    expect(measures.bySurfaceProvider[0]).toMatchObject({ answered: 1, unmeasured: 0, assumedThresholds: 0, disagreements: 1 });
   });
 
   it('escalation triage and same-blocker disagree only when their case-spec action differs', () => {

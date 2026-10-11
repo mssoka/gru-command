@@ -169,6 +169,9 @@ export interface ShadowDecisionRecord {
   /** The deterministic baseline routes. Absent on rows recorded before
    * 2026-10-11; the yield report rebuilds those from the answers. */
   readonly deterministic_routes: unknown;
+  /** The thresholds both outcomes' routes were banded at. Absent on rows
+   * recorded before 2026-10-11; the yield report assumes the defaults. */
+  readonly thresholds: ThresholdsConfig;
   readonly latency_ms: number;
   readonly cost: number | null;
   readonly provenance_source: 'jev' | 'deterministic';

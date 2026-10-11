@@ -5,6 +5,7 @@ import type {
   DecisionRequest,
   QuestionSet,
   ShadowDecisionRecord,
+  ThresholdsConfig,
 } from './types.js';
 
 /** sha256 over the filtered request state plus the question ids (issue
@@ -22,15 +23,17 @@ export type ShadowRecorder = (record: ShadowDecisionRecord) => void;
 
 /** Assemble one `decisions.shadow` ledger payload (issue #223): what the
  * provider WOULD have done (`answers`/`routes`) next to the deterministic
- * baseline (`deterministic_answers`/`deterministic_routes`), with the
- * filtered request state reduced to its hash — the state text is NEVER
- * recorded. Pure. */
+ * baseline (`deterministic_answers`/`deterministic_routes`) and the
+ * thresholds both were banded at, with the filtered request state reduced
+ * to its hash — the state text is NEVER recorded. Pure. */
 export function buildShadowRecord<Q extends QuestionSet>(input: {
   readonly surface: string;
   readonly provider: string;
   readonly request: DecisionRequest<Q>;
   readonly providerOutcome: DecisionOutcome<Q>;
   readonly deterministicOutcome: DecisionOutcome<Q>;
+  /** The thresholds both outcomes' routes were banded at. */
+  readonly thresholds: ThresholdsConfig;
 }): ShadowDecisionRecord {
   // Null (unmeasured) rather than a throw: a dropped record would lose
   // the provider's answers, and the report counts null rows as skipped.
@@ -41,6 +44,7 @@ export function buildShadowRecord<Q extends QuestionSet>(input: {
     providerAnswers: input.providerOutcome.answers,
     providerRoutes: input.providerOutcome.routes,
     providerSource: input.providerOutcome.provenance.source,
+    thresholds: input.thresholds,
   });
   return {
     surface: input.surface,
@@ -51,6 +55,7 @@ export function buildShadowRecord<Q extends QuestionSet>(input: {
     routes: input.providerOutcome.routes,
     deterministic_answers: input.deterministicOutcome.answers,
     deterministic_routes: input.deterministicOutcome.routes,
+    thresholds: input.thresholds,
     latency_ms: input.providerOutcome.provenance.latencyMs,
     cost: input.providerOutcome.provenance.usage?.costUsd ?? null,
     provenance_source: input.providerOutcome.provenance.source,
