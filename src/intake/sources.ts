@@ -362,9 +362,7 @@ export function canonicalManagedRepo(requested: string, registered: readonly str
   if (!isAbsolute(requested) || resolve(requested) !== requested) fail('intake_repository', 'repoPath must be an explicit normalized absolute managed repository root');
   try {
     const canonical = realpathSync(requested);
-    const selected = registered.includes(requested) || registered.some((path) => {
-      try { return realpathSync(path) === requested; } catch { return false; }
-    });
+    const selected = registered.includes(requested);
     if (!selected || canonical !== requested) fail('intake_repository', 'repoPath must be the canonical root in the explicit managed repository registry');
     return requested;
   } catch (error) {

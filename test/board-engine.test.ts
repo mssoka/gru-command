@@ -1032,7 +1032,7 @@ describe('board engine — managed repository overview wiring', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toMatch(/createManagedRepoOverviewTracker\(config,/);
     expect(mainSource).toContain(
-      'managedRepos: () => config.managedRepos.map((name) => join(config.workspaceRoot, name))',
+      'managedRepos: () => managedRepoPathsForIntake(config.workspaceRoot, config.managedRepos)',
     );
     const runtimeSource = readFileSync(join(import.meta.dirname, '..', 'src', 'repos', 'runtime.ts'), 'utf8');
     expect(runtimeSource).toMatch(/managedRepos:\s*config\.managedRepos/);

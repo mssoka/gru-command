@@ -1,5 +1,6 @@
+import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
-import { isAbsolute, join, relative, sep, win32 } from 'node:path';
+import { dirname, isAbsolute, join, relative, sep, win32 } from 'node:path';
 
 export type ManagedRepoPath =
   | { readonly kind: 'available'; readonly path: string }
@@ -54,7 +55,13 @@ export async function resolveManagedRepoPath(
 
     const project = await realpath(candidate);
     const rel = relative(workspace, project);
-    if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    if (
+      rel === '' ||
+      rel === '..' ||
+      rel.startsWith(`..${sep}`) ||
+      isAbsolute(rel) ||
+      dirname(project) !== workspace
+    ) {
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
 
@@ -66,4 +73,59 @@ export async function resolveManagedRepoPath(
   } catch {
     return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
   }
+}
+
+/** Synchronous counterpart for intake's synchronous request-identity boundary. */
+export function resolveManagedRepoPathSync(
+  workspaceRoot: string,
+  name: string,
+): ManagedRepoPath {
+  if (managedRepoNameError(name) !== null) {
+    return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+  }
+
+  try {
+    const workspace = realpathSync(workspaceRoot);
+    const candidate = join(workspace, name);
+    const candidateInfo = lstatSync(candidate);
+    if (!candidateInfo.isDirectory() || candidateInfo.isSymbolicLink()) {
+      return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+    }
+
+    const project = realpathSync(candidate);
+    const rel = relative(workspace, project);
+    if (
+      rel === '' ||
+      rel === '..' ||
+      rel.startsWith(`..${sep}`) ||
+      isAbsolute(rel) ||
+      dirname(project) !== workspace
+    ) {
+      return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+    }
+
+    const gitMarker = lstatSync(join(project, '.git'));
+    if (gitMarker.isSymbolicLink() || (!gitMarker.isDirectory() && !gitMarker.isFile())) {
+      return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+    }
+    return { kind: 'available', path: project };
+  } catch {
+    return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+  }
+}
+
+/** Canonical, currently available roots for the intake registry. Unavailable,
+ * escaped and symlinked configured names never expand intake membership. */
+export function managedRepoPathsForIntake(
+  workspaceRoot: string,
+  names: readonly string[],
+): readonly string[] {
+  const paths: string[] = [];
+  for (const name of names) {
+    const resolved = resolveManagedRepoPathSync(workspaceRoot, name);
+    if (resolved.kind === 'available' && !paths.includes(resolved.path)) {
+      paths.push(resolved.path);
+    }
+  }
+  return paths;
 }

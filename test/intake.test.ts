@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeService, INTAKE_HELPER, type IntakeServiceOptions } from '../src/intake/service.js';
 import { conservativePlan, validatePlan } from '../src/intake/planner.js';
 import { captureSources } from '../src/intake/sources.js';
+import { managedRepoPathsForIntake } from '../src/repos/managed-names.js';
 import { canonical, boundedCanonical, INTAKE_MAX_JSON_NESTING, digest, type IntakeRequest, type Plan, type Proposal } from '../src/intake/types.js';
 import { loadBundledWorkflowRuntime, writeWorkflowManifest } from '../src/workflows/runtime.js';
 import { parseWorkflowManifest, WORKFLOW_MANIFEST } from '../src/workflows/manifest.js';
@@ -330,8 +331,32 @@ describe('intake review regressions', () => {
     const alias = join(h.workspace, 'alias');
     symlinkSync(h.repo, alias);
     const aliasedRegistry = new IntakeService({ ...h.options, managedRepos: () => [vanished, alias] });
-    expect(await aliasedRegistry.preview({ ...h.request, requestId: 'r2' })).toMatchObject({ repoPath: h.repo });
+    await expect(aliasedRegistry.preview({ ...h.request, requestId: 'r2' })).rejects.toMatchObject({ code: 'intake_repository' });
     await expect(aliasedRegistry.preview({ ...h.request, repoPath: alias })).rejects.toMatchObject({ code: 'intake_repository' });
+  });
+
+  it('does not let unavailable symlink selections widen intake to a sibling or escaped root', async () => {
+    const h = fixture();
+    const external = join(h.root, 'external');
+    mkdirSync(external);
+    execFileSync('git', ['init', '-q'], { cwd: external });
+    writeFileSync(join(external, 'spec.md'), 'External repository source');
+    const internalAlias = join(h.workspace, 'internal-alias');
+    const externalAlias = join(h.workspace, 'external-alias');
+    symlinkSync(h.repo, internalAlias);
+    symlinkSync(external, externalAlias);
+
+    const internalAliasRegistry = new IntakeService({ ...h.options, managedRepos: () => [internalAlias] });
+    const externalAliasRegistry = new IntakeService({ ...h.options, managedRepos: () => [externalAlias] });
+    await expect(internalAliasRegistry.preview({ ...h.request, requestId: 'internal-alias', repoPath: h.repo })).rejects.toMatchObject({ code: 'intake_repository' });
+    await expect(externalAliasRegistry.preview({ ...h.request, requestId: 'external-alias', repoPath: external })).rejects.toMatchObject({ code: 'intake_repository' });
+    expect(managedRepoPathsForIntake(h.workspace, ['internal-alias', 'external-alias'])).toEqual([]);
+    expect(existsSync(join(h.dataDir, 'projects'))).toBe(false);
+
+    const selectedRoots = managedRepoPathsForIntake(h.workspace, ['demo']);
+    expect(selectedRoots).toEqual([h.repo]);
+    const selected = new IntakeService({ ...h.options, managedRepos: () => selectedRoots });
+    expect(await selected.preview(h.request)).toMatchObject({ repoPath: h.repo });
   });
 
   it('stops after a rate-limited issue or comment and retains unattempted selected-source gaps', async () => {

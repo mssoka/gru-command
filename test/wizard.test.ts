@@ -481,8 +481,10 @@ describe('wizard CLI surface', () => {
     expect(first.status, first.stderr).toBe(0);
     expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', 'gamma']);
 
+    rmSync(join(workspace, 'gamma'), { recursive: true, force: true });
     const repeated = run({}, true);
     expect(repeated.status, repeated.stderr).toBe(0);
+    expect(repeated.stdout).toContain('Previously selected repository gamma is currently unavailable; keeping it in managed_repos.');
     expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', 'gamma']);
 
     // The prior custom workspace is used while validating the explicit new

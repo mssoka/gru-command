@@ -9,6 +9,7 @@ import {
   writeConfigText,
 } from '../src/wizard/steps.js';
 import { parseAnswers } from '../src/wizard/answers.js';
+import type { RepoRef } from '../src/dispatch/github-poll.js';
 import {
   createManagedRepoOverviewTracker,
 } from '../src/repos/runtime.js';
@@ -18,7 +19,6 @@ import {
   type RepoOverviewApiPort,
   type RepoOverviewMeta,
   type RepoOverviewRunRaw,
-  type RepoRef,
 } from '../src/repos/overview.js';
 
 const cleanupDirs: string[] = [];
