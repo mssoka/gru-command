@@ -3579,11 +3579,13 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       };
       expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
       await vi.waitFor(() => expect(gate.view().worker.queued.map((entry) => entry.id)).toContain('replay-park-agent'));
+      const first = firstReplacement.current;
+      if (first === null) throw new Error('restart did not spawn its first replacement');
       rig.api.setJobStatus('replay-park-job', 'parked');
       releaseHolder();
-      await vi.waitFor(() => expect(rig.supervisor.viewFor('replay-park-agent')).toMatchObject({ state: 'stopped', breakerOpen: true }));
-      expect(firstReplacement.current?.disposed).toBe(true);
-      expect(firstReplacement.current?.promptCalls).toHaveLength(0);
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(first.id)).toMatchObject({ state: 'stopped', breakerOpen: true }));
+      expect(first.disposed).toBe(true);
+      expect(first.promptCalls).toHaveLength(0);
       const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get('replay-park-agent');
       expect(agent?.pendingRecovery).not.toBeNull();
       const fresh = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
