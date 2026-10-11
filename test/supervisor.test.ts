@@ -1944,6 +1944,35 @@ describe('supervisor — Perkins r1 fixes', () => {
     h.dispose();
   });
 
+  it('undefined retry-field sentinels can never abort a tick or leak through a carry', () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'sentinel-job', repo: 'fixture', title: 'sentinel lane' });
+      h.api.setJobStatus('sentinel-job', 'working');
+      h.api.registerAgent({ id: 'sentinel-old', role: 'minion', jobId: 'sentinel-job' });
+      h.api.registerAgent({ id: 'sentinel-new', role: 'minion', jobId: 'sentinel-job' });
+      h.registry.adopt(new FakeHandle('minion', 'sentinel-old', null));
+      h.registry.adopt(new FakeHandle('minion', 'sentinel-new', null));
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, Record<string, unknown>>;
+        carryOverSupervision(old: unknown, newId: string): unknown;
+      };
+      const old = internals.agents.get('sentinel-old')!;
+      old.breakerOpen = true;
+      // The sentinel a hand-built/partial carry could plant.
+      (old as { pendingRearmFenceAlert?: unknown }).pendingRearmFenceAlert = undefined;
+      // The carry normalizes it before the adopted record can see it.
+      internals.carryOverSupervision(old, 'sentinel-new');
+      expect(internals.agents.get('sentinel-new')!.pendingRearmFenceAlert).toBeNull();
+      // ...and a tick pass over an undefined field never throws.
+      internals.agents.get('sentinel-new')!.pendingRearmFenceAlert = undefined;
+      expect(() => h.advance(0)).not.toThrow();
+    } finally {
+      h.dispose();
+    }
+  });
+
   it('r1-2: supervision.enabled=false gates EVERY side-effect — pure registry behavior', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);

@@ -255,10 +255,15 @@ function sampleSnapshot(): unknown {
     const job = jobs.find((candidate) => candidate.id === id)!;
     return { id: `job:${id}`, jobId: id, subject: `job:${id}`, title: job.title, kind: 'job', basis: `mock-basis:${id}`,
       reasons: labels.map((label) => ({ label, signal: label.replaceAll(' ', '-'), basis: `mock-reason:${label}` })),
-      state: 'needs-gru', owner: 'gru', disposition: null, receipt: null, notificationIds: id === 'demo-api-payment-fix' ? ['mock-n5'] : [],
+      state: 'needs-gru', owner: 'gru', disposition: null, receipt: null,
+      notificationIds:
+        id === 'demo-api-payment-fix' ? ['mock-n5'] : id === 'demo-api-quota-walled' ? ['mock-n4'] : [],
       producerOwned: false, references: [], restrictions: [], attentionKey: `mock-attention:${id}` };
   });
-  return { ...source, mailbox: { items, counts: { threads: items.length, incidents: 0, notifications: boardMode === 'clear-needs-you' ? 0 : 1, needsGru: items.length } } };
+  // Counts mirror the server projection: distinct live notification ids the
+  // items carry (the chip and the FOR GRU head must agree).
+  const attached = new Set(items.flatMap((item) => item.notificationIds));
+  return { ...source, mailbox: { items, counts: { threads: items.length, incidents: 0, notifications: boardMode === 'clear-needs-you' ? 0 : attached.size, needsGru: items.length } } };
 }
 
 /** The clear variant: drop the live machine row, settle the needs-you
