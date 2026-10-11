@@ -2131,7 +2131,8 @@ export class BoardView {
     const client = this.boardClient;
     if (client === null || this.receiptsLoading) return;
     this.receiptsLoading = true;
-    if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+    const current = this.effectiveSnapshot();
+    if (current !== null) this.renderNotifications(current);
     try {
       const page = await client.fetchReceipts(this.receiptsNextOffset);
       // Re-paired mid-fetch: the page belongs to the previous server's record.
@@ -2146,7 +2147,8 @@ export class BoardView {
     } finally {
       if (this.boardClient === client) {
         this.receiptsLoading = false;
-        if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+        const effective = this.effectiveSnapshot();
+        if (effective !== null) this.renderNotifications(effective);
       }
     }
   }
@@ -2442,6 +2444,13 @@ export class BoardView {
    * (submission state changed between pushes). */
   private rerenderNotifications(): void {
     if (this.snapshot !== null) this.render(this.snapshot);
+  }
+
+  /** The EFFECTIVE view of the last snapshot (decision overrides applied):
+   * every re-render path that bypasses render() must use this — the raw
+   * snapshot alone resurrects an already-recorded decision on one surface. */
+  private effectiveSnapshot(): BoardSnapshot | null {
+    return this.snapshot === null ? null : this.withDecisionOverrides(this.snapshot);
   }
 
   /** The discussion action: reveal the console/chat pane and focus the
@@ -2774,6 +2783,7 @@ function notificationIdFromFocusKey(key: string): string | null {
     if (rest.endsWith(':details')) return rest.slice(0, -':details'.length) || null;
     if (rest.endsWith(':seen')) return rest.slice(0, -':seen'.length) || null;
     if (rest.endsWith(':card')) return rest.slice(0, -':card'.length) || null;
+    if (rest.endsWith(':discuss')) return rest.slice(0, -':discuss'.length) || null;
     return rest || null;
   }
   const parts = key.split(':');

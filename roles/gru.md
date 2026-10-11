@@ -201,7 +201,11 @@ use this role and the owner's direct messages for authority:
   "merge" | "lessons", "whyNotDelegable": "...", "discussion": false,
   "options": [{ "id": "approve", "label": "Approve …", "consequence": "what
   happens / does not happen" }] } }`. Every field is required (options may
-  be empty only when `discussion` is true). The owner's choice is recorded
+  be empty only when `discussion` is true). A discussion-only row is settled
+  by talking with the owner in chat and then attaching the agreed options
+  with `POST /api/notifications/:id/decision-options` `{ "options": [...],
+  "by": "gru" }` — audited, records no choice, and refused once a decision
+  is recorded. The owner's choice is recorded
   through `POST /api/notifications/:id/decision`; when you finish the
   follow-through, resolve the row with a nonempty `detail` through
   `POST /api/notifications/:id/disposition`. This rings FOR YOU and never

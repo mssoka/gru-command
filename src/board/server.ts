@@ -40,8 +40,12 @@ export interface BoardServerOptions {
   /** E7 (owner release 2026-10-11): the GUARDED machine re-arm control,
    * consulted BEFORE any disposition is recorded. The supervisor returns a
    * typed outcome; a refusal (or a throw) leaves the alert and its
-   * retryable recovery debt intact instead of consuming the only control. */
-  readonly onNotificationDisposition?: (id: string, detail: string) => { readonly ok: boolean; readonly reason?: string } | void;
+   * retryable recovery debt intact instead of consuming the only control,
+   * and `rearmed: false` honestly reports that no stopped lane matched. */
+  readonly onNotificationDisposition?: (
+    id: string,
+    detail: string,
+  ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly reason?: string } | void;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
@@ -660,6 +664,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           if (suffix === '/disposition') {
             const detail = strField(body, 'detail');
+            // The ledger refuses a blank disposition detail (after the
+            // hook would already have run): validate it at the boundary so
+            // a ledger-side refusal can never consume the guarded control.
+            if (detail.trim() === '') {
+              json(res, 400, { error: 'bad_request', detail: 'disposition detail must be non-empty' });
+              return;
+            }
             const target = ledger.getNotification(id);
             const closer = target === null ? null : producerResolvedBy(target.kind);
             if (target !== null && closer !== null) {
@@ -695,7 +706,9 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                   });
                   return;
                 }
-                if (outcome !== undefined) rearm = 'accepted';
+                // Truthful typed outcome: `rearmed: false` means no
+                // stopped breaker matched this alert (pure record).
+                if (outcome !== undefined) rearm = outcome.rearmed === false ? 'not_applicable' : 'accepted';
               } catch (error) {
                 const message = String(error instanceof Error ? error.message : error);
                 ledger.appendCustomEvent({

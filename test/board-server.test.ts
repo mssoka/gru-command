@@ -1243,6 +1243,57 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
     }
   });
 
+  it('an alert that re-arms nothing reports the record-only outcome (rearmed: false)', async () => {
+    const { port, api, close } = await boot('board-test-token', {
+      onNotificationDisposition: () => ({ ok: true, rearmed: false }),
+    });
+    try {
+      api.recordNotification({
+        id: 'machine-unbound',
+        kind: 'supervision.hang',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Already resumed lane',
+        detail: 'no stopped breaker is bound here',
+      });
+      const res = await postJson(port, '/api/notifications/machine-unbound/disposition', 'board-test-token', {
+        detail: 'verified the lane resumed',
+      });
+      expect(res).toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
+      expect((res.body as { resolvedAt: string | null }).resolvedAt).not.toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  it('a blank disposition detail is refused BEFORE the guarded hook can consume the control', async () => {
+    const hookCalls: string[] = [];
+    const { port, api, close } = await boot('board-test-token', {
+      onNotificationDisposition: (id) => {
+        hookCalls.push(id);
+        return { ok: true, rearmed: true };
+      },
+    });
+    try {
+      api.recordNotification({
+        id: 'machine-blank-detail',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Stopped',
+        detail: 'breaker open',
+      });
+      const res = await postJson(port, '/api/notifications/machine-blank-detail/disposition', 'board-test-token', {
+        detail: '   ',
+      });
+      expect(res).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+      expect(hookCalls).toEqual([]);
+      expect(api.getNotification('machine-blank-detail')?.resolvedAt).toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
   it('a throwing re-arm fails LOUD (502) and never records the disposition', async () => {
     const { port, api, close } = await boot('board-test-token', {
       onNotificationDisposition: () => {

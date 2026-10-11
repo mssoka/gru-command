@@ -1762,6 +1762,7 @@ body {
   grid-template-areas:
     'title action'
     'meta action'
+    'context action'
     'note action';
   align-items: center;
   column-gap: 12px;
@@ -1835,7 +1836,9 @@ body {
 
 .board-owner__context,
 .board-owner__pointer-text {
-  grid-area: meta;
+  /* Own named track: sharing `meta` with the label stacked the prose ON
+     TOP of the uppercase line (both paint in one grid cell). */
+  grid-area: context;
   color: var(--muted);
   overflow-wrap: anywhere;
   font-size: 12px;
@@ -1879,6 +1882,7 @@ body {
   grid-template-areas:
     'title action'
     'meta action'
+    'context action'
     'note action'
     'review review'
     'error error';
@@ -1949,6 +1953,26 @@ body {
   filter: brightness(1.05);
 }
 
+.board-owner__goto {
+  grid-area: action;
+  justify-self: end;
+  align-self: center;
+  flex: none;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  background: var(--accent-soft, var(--soft));
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.board-owner__goto:hover {
+  filter: brightness(1.05);
+}
+
 .board-owner__nolink {
   grid-area: action;
   justify-self: end;
@@ -1962,6 +1986,7 @@ body {
     grid-template-areas:
       'title'
       'meta'
+      'context'
       'note'
       'action';
     row-gap: 6px;
@@ -1973,6 +1998,7 @@ body {
     grid-template-areas:
       'title'
       'meta'
+      'context'
       'note'
       'review'
       'action'

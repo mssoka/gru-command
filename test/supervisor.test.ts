@@ -3385,6 +3385,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       const refused = rig.supervisor.onNotificationDisposed(stop!.id);
       expect(refused.ok).toBe(false);
       if (!refused.ok) expect(refused.reason).toContain('parked');
+      expect(refused).not.toHaveProperty('rearmed');
       // The stop survives with its retryable debt: nothing was consumed.
       expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
       expect(rig.api.getNotification(stop!.id)?.resolvedAt).toBeNull();
@@ -3395,7 +3396,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       rig.api.setJobStatus('fenced-job', 'working');
       rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'fenced-agent-resumed', null);
       const accepted = rig.supervisor.onNotificationDisposed(stop!.id);
-      expect(accepted).toEqual({ ok: true });
+      expect(accepted).toEqual({ ok: true, rearmed: true });
       await vi.waitFor(() => expect(rig.supervisor.viewFor('fenced-agent-resumed')?.state).toBe('watching'));
       expect(rig.supervisor.viewFor('fenced-agent-resumed')?.breakerOpen).toBe(false);
     } finally {
@@ -3432,14 +3433,86 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       const fenced = h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.rearm-fenced');
       expect(fenced).toHaveLength(1);
       expect((fenced[0]!.payload as { reason?: string }).reason).toContain('parked');
-      // The hold lifts: the supported re-arm path (breaker clear + guarded
-      // rung) spawns the resumed handle.
+      // The consumed control is replaced: a FRESH open machine alert is
+      // bound to the stop, so the debt stays retryable through the same
+      // guarded disposition route (no private-method retry required).
+      const freshAlert = h.api
+        .listNotifications({ limit: 50 })
+        .find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(freshAlert).toMatchObject({ routing: 'action-required', resolvedAt: null, ackedAt: null });
+      expect(
+        (h.supervisor as unknown as { agents: Map<string, { breakerNotificationId: string | null }> }).agents.get(
+          'mid-await-agent',
+        )?.breakerNotificationId,
+      ).toBe(freshAlert!.id);
+      // The hold lifts: disposing the FRESH alert retries the guarded
+      // re-arm through the production path and spawns the resumed handle.
       h.api.setJobStatus('mid-await-job', 'working');
-      const rearm = h.supervisor as unknown as { completeRearm(agent: unknown, id: string | null): Promise<void> };
-      await rearm.completeRearm(agent, null);
+      expect(h.supervisor.onNotificationDisposed(freshAlert!.id)).toEqual({ ok: true, rearmed: true });
       await vi.waitFor(() => expect(h.registry.spawnCalls).toHaveLength(1));
       const spawnedId = [...h.registry.handlesById.keys()].at(-1)!;
       await vi.waitFor(() => expect(h.supervisor.viewFor(spawnedId)?.state).toBe('watching'));
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a fence that appears DURING the spawn await disposes the fresh handle unused (no adopt, no replay)', async () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'spawn-await-job', repo: 'fixture', title: 'spawn-await lane' });
+      h.api.setJobStatus('spawn-await-job', 'working');
+      h.api.registerAgent({ id: 'spawn-await-agent', role: 'minion', jobId: 'spawn-await-job' });
+      const handle = new FakeHandle('minion', 'spawn-await-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, unknown>;
+        restartRung(agent: unknown, reason: string, opts?: { rearmFence?: boolean }): Promise<void>;
+      };
+      const agent = internals.agents.get('spawn-await-agent');
+      expect(agent).toBeDefined();
+      let releaseSpawn!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseSpawn = resolve;
+      });
+      let spawnedRef: FakeHandle | null = null;
+      h.registry.spawnImpl = async (role, options) => {
+        const spawned = new FakeHandle(role, 'spawn-await-resumed', options?.resumeFile ?? null);
+        spawnedRef = spawned;
+        await gate;
+        return spawned;
+      };
+      const running = internals.restartRung(agent, 'fixture re-arm', { rearmFence: true });
+      // The parking hold lands WHILE the start is in flight (after the
+      // dispose await passed, exactly at the spawn await).
+      await vi.waitFor(() => expect(spawnedRef).not.toBeNull());
+      h.api.setJobStatus('spawn-await-job', 'parked');
+      releaseSpawn();
+      await running;
+      // The fresh handle was disposed unused: never adopted, never replayed.
+      expect(spawnedRef).not.toBeNull();
+      expect((spawnedRef as unknown as FakeHandle).disposed).toBe(true);
+      expect(h.registry.handlesById.has('spawn-await-resumed')).toBe(false);
+      expect(h.supervisor.viewFor('spawn-await-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(h.api.listNotifications({ limit: 50 }).some((row) => row.kind === 'supervision.rearm-fenced')).toBe(true);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('an alert bound to no stopped breaker reports a record-only outcome (never a fake re-arm)', () => {
+    const h = boot();
+    try {
+      h.api.recordNotification({
+        id: 'unbound-alert',
+        kind: 'supervision.hang',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Already resumed lane',
+        detail: 'no stopped breaker is bound here',
+      });
+      expect(h.supervisor.onNotificationDisposed('unbound-alert')).toEqual({ ok: true, rearmed: false });
     } finally {
       h.dispose();
     }
@@ -3458,7 +3531,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
       release();
       rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'fenced-admission-resumed', null);
-      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true });
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: true });
       await vi.waitFor(() => expect(rig.supervisor.viewFor('fenced-admission-resumed')?.state).toBe('watching'));
     } finally {
       rig.close();

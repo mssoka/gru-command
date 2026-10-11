@@ -1742,7 +1742,7 @@ export class Supervisor {
   private async restartRung(
     agentRef: SupervisedAgent,
     reason: string,
-    opts: { readonly rearmFence?: boolean } = {},
+    opts: { readonly rearmFence?: boolean; readonly rearmNotificationId?: string | null } = {},
   ): Promise<void> {
     const agent = agentRef;
     if (this.disposed || !this.cfg.enabled || agent.inRestart || agent.breakerOpen) return;
@@ -1754,7 +1754,7 @@ export class Supervisor {
       // all refuse instead of being bypassed by the disposition path.
       const refusal = this.rearmRefusal(agent, recovery);
       if (refusal !== null) {
-        this.fenceRearm(agent, null, refusal);
+        this.fenceRearm(agent, opts.rearmNotificationId ?? null, refusal);
         return;
       }
     } else if (!this.recoveryAuthorityCurrent(agent, recovery)) return;
@@ -1784,7 +1784,7 @@ export class Supervisor {
   private async restartRungInner(
     agentRef: SupervisedAgent,
     reason: string,
-    opts: { readonly rearmFence?: boolean } = {},
+    opts: { readonly rearmFence?: boolean; readonly rearmNotificationId?: string | null } = {},
   ): Promise<void> {
     let agent = agentRef;
     const restartSlot = agent.slot;
@@ -1854,7 +1854,7 @@ export class Supervisor {
         // controls), never replay a saved prompt across it.
         const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
         if (refusal !== null) {
-          this.fenceRearm(agent, null, refusal);
+          this.fenceRearm(agent, opts.rearmNotificationId ?? null, refusal);
           return;
         }
       }
@@ -1904,6 +1904,22 @@ export class Supervisor {
           // adopt it or notify swap listeners.
           await this.registry.disposeHandle(spawned).catch(() => {});
           return;
+        }
+        if (opts.rearmFence === true) {
+          // The last await is the spawn itself: a hold admitted while the
+          // start was in flight disposes the fresh handle UNUSED — never
+          // adopt, never replay the recovered prompt across it.
+          const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
+          if (refusal !== null) {
+            await this.registry.disposeHandle(spawned).catch((error: unknown) => {
+              this.log('warn', 'dispose of the fenced replacement failed', {
+                agent_id: spawned.id,
+                error: String(error),
+              });
+            });
+            this.fenceRearm(agent, opts.rearmNotificationId ?? null, refusal);
+            return;
+          }
         }
         if (predecessor !== null) {
           try {
@@ -2340,7 +2356,9 @@ export class Supervisor {
    * Returns a typed outcome: the caller records the disposition ONLY when
    * the guarded control accepted it, so a fence refusal leaves the alert
    * and its retryable debt intact. */
-  onNotificationDisposed(notificationId: string): { ok: true } | { ok: false; reason: string } {
+  onNotificationDisposed(
+    notificationId: string,
+  ): { ok: true; rearmed: boolean } | { ok: false; reason: string } {
     return this.reArmFromNotification(notificationId);
   }
 
@@ -2382,14 +2400,41 @@ export class Supervisor {
   }
 
   /** Refusal was proved after the disposition request began: keep the stop
-   * visible with the fence reason and the recovery debt retryable through
-   * the supported controls (a later disposition, slot use, or the owning
-   * subsystem's route). Never replay the saved prompt. */
+   * visible with the fence reason and the recovery debt retryable. When the
+   * notification that started the re-arm is already consumed (resolved) or
+   * unknown, a FRESH machine alert is raised and bound to this stop so a
+   * later Gru disposition retries through the same guarded route — the
+   * refusal never strands a stopped lane without a live control. Never
+   * replays the saved prompt. */
   private fenceRearm(agent: SupervisedAgent, notificationId: string | null, reason: string): void {
     agent.breakerOpen = true;
     agent.state = 'stopped';
     agent.stopReason = `re-arm fenced: ${reason}`;
     agent.stoppedAt = agent.stoppedAt ?? this.now();
+    const bound = agent.breakerNotificationId === null ? null : this.ledger.getNotification(agent.breakerNotificationId);
+    if (bound === null || bound.resolvedAt !== null) {
+      try {
+        const posted = this.notifications.post({
+          kind: 'supervision.rearm-fenced',
+          routing: 'action-required',
+          severity: 'error',
+          title: `Re-arm fenced: agent ${agent.agentId} stayed stopped`,
+          detail:
+            `The guarded restart was refused by a hold that appeared during the attempt (${reason}). ` +
+            'Resolve the hold, then dispose this alert to retry the re-arm.',
+          agentId: agent.agentId,
+        });
+        agent.breakerNotificationId = posted.id;
+      } catch (error) {
+        // The stop is still recorded and visible on the rail; a transient
+        // ledger failure to raise the alert must not throw out of the
+        // supervision path.
+        this.log('error', 'fenced re-arm alert post failed', {
+          agent_id: agent.agentId,
+          error: String(error),
+        });
+      }
+    }
     this.recordEvent('supervision.rearm-fenced', agent.agentId, {
       notification_id: notificationId,
       reason,
@@ -2402,36 +2447,51 @@ export class Supervisor {
   }
 
   /** Commit an accepted re-arm (breaker cleared, epoch and provider fences
-   * re-proved) and run the guarded restart rung with the re-arm fence. */
+   * re-proved) and run the guarded restart rung with the re-arm fence.
+   * Fire-and-forget by the hook: every failure path is contained here —
+   * a supervision bug or ledger hiccup must never surface as an unhandled
+   * rejection (fatal in main), and a partial commit keeps the stop
+   * truthful through the fence path. */
   private async completeRearm(agent: SupervisedAgent, notificationId: string | null): Promise<void> {
-    if (this.disposed || !this.cfg.enabled) return;
-    const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
-    if (refusal !== null) {
-      this.fenceRearm(agent, notificationId, refusal);
-      return;
+    try {
+      if (this.disposed || !this.cfg.enabled) return;
+      const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
+      if (refusal !== null) {
+        this.fenceRearm(agent, notificationId, refusal);
+        return;
+      }
+      agent.breakerOpen = false;
+      agent.stopReason = null;
+      agent.stoppedAt = null;
+      agent.breakerNotificationId = null;
+      agent.restartRing = [];
+      agent.consecutiveFailures = 0;
+      agent.state = 'watching';
+      this.restoredStops.delete(agent.agentId);
+      this.log('info', 'breaker re-armed by disposition — resuming supervision', {
+        agent_id: agent.agentId,
+        notification_id: notificationId,
+      });
+      this.ledger.appendCustomEvent({
+        kind: 'supervision.rearmed',
+        agentId: agent.agentId,
+        payload: { notification_id: notificationId },
+      });
+      await this.restartRung(agent, 'breaker re-armed', { rearmFence: true, rearmNotificationId: notificationId });
+    } catch (error) {
+      this.log('error', 're-arm commit failed — the stop stays fenced', {
+        agent_id: agent.agentId,
+        notification_id: notificationId,
+        error: String(error),
+      });
+      this.fenceRearm(agent, notificationId, `re-arm commit failed: ${String(error)}`);
     }
-    agent.breakerOpen = false;
-    agent.stopReason = null;
-    agent.stoppedAt = null;
-    agent.breakerNotificationId = null;
-    agent.restartRing = [];
-    agent.consecutiveFailures = 0;
-    agent.state = 'watching';
-    this.restoredStops.delete(agent.agentId);
-    this.log('info', 'breaker re-armed by disposition — resuming supervision', {
-      agent_id: agent.agentId,
-      notification_id: notificationId,
-    });
-    this.ledger.appendCustomEvent({
-      kind: 'supervision.rearmed',
-      agentId: agent.agentId,
-      payload: { notification_id: notificationId },
-    });
-    await this.restartRung(agent, 'breaker re-armed', { rearmFence: true });
   }
 
-  private reArmFromNotification(notificationId: string): { ok: true } | { ok: false; reason: string } {
-    if (this.disposed || !this.cfg.enabled) return { ok: true }; // off = acks are pure records
+  private reArmFromNotification(
+    notificationId: string,
+  ): { ok: true; rearmed: boolean } | { ok: false; reason: string } {
+    if (this.disposed || !this.cfg.enabled) return { ok: true, rearmed: false }; // off = acks are pure records
     for (const agent of this.agents.values()) {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
       const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
@@ -2448,9 +2508,12 @@ export class Supervisor {
         return { ok: false, reason: refusal };
       }
       void this.completeRearm(agent, notificationId);
-      return { ok: true };
+      return { ok: true, rearmed: true };
     }
-    return { ok: true };
+    // No stopped breaker is bound to this alert: the disposition is a pure
+    // record. Say so — an accepted outcome must never claim a re-arm that
+    // did not happen.
+    return { ok: true, rearmed: false };
   }
 
   /**

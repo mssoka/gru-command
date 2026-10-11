@@ -3412,7 +3412,29 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const css = readFileSync(file, 'utf8');
     const phone = css.slice(css.indexOf('@media (max-width: 560px) {'));
     const rule = /\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(phone.slice(0, phone.indexOf('\n}\n')))?.[1] ?? '';
-    expect(rule.replace(/\s+/gu, ' ')).toContain("grid-template-areas: 'title' 'meta' 'note' 'review' 'action' 'error';");
+    expect(rule.replace(/\s+/gu, ' ')).toContain(
+      "grid-template-areas: 'title' 'meta' 'context' 'note' 'review' 'action' 'error';",
+    );
+  });
+
+  it('the proposal context has its OWN grid track (never stacked on the meta label) and the pointer control is themed', async () => {
+    const { existsSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const file = [join(process.cwd(), 'src/styles/components.css'), join(process.cwd(), 'web/src/styles/components.css')].find((path) =>
+      existsSync(path),
+    )!;
+    const css = readFileSync(file, 'utf8');
+    const contextRule = /\.board-owner__context,\s*\.board-owner__pointer-text\s*\{([^}]*)\}/u.exec(css)?.[1] ?? '';
+    expect(contextRule.replace(/\s+/gu, ' ')).toContain('grid-area: context;');
+    // Both row templates carry the track, so the prose can never share the
+    // label's cell (the R1 overlap).
+    expect(css).toContain("'context action'");
+    const narrow = css.slice(css.indexOf('@media (max-width: 560px) {'));
+    expect(narrow.slice(0, narrow.indexOf('\n}\n'))).toContain("'context'");
+    // The bell pointer's Go-to control is not the one unstyled button.
+    const gotoRule = /\.board-owner__goto\s*\{([^}]*)\}/u.exec(css)?.[1] ?? '';
+    expect(gotoRule).toContain('grid-area: action;');
+    expect(gotoRule).toContain('border');
   });
 
   it('ready PR row: affected heist + exact-head reason + OPEN PR external link; non-https URLs fail closed', () => {
@@ -4468,6 +4490,69 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
     // retires the override.
     view.render(snapshot({ notifications: [decidedRow] }));
     expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded');
+  });
+
+  it('focus falls back to the card when the discuss control is replaced by attached options', () => {
+    const discussion = notification('discuss-focus', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision({ options: [], discussion: true }),
+    });
+    const bridged = { ...discussion, decision: ownerDecision() };
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [discussion] }));
+    const button = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('.board-notification__discuss-open')!;
+    button.focus();
+    // Gru attached agreed options through the bridge: the push replaces the
+    // chat action with the real options, and focus stays inside the item.
+    view.render(snapshot({ notifications: [bridged] }));
+    const active = document.activeElement as HTMLElement;
+    expect(document.getElementById('board-owner')!.contains(active)).toBe(true);
+    expect(
+      document.getElementById('board-owner')!.querySelector('[data-action-id="notif:discuss-focus:option:approve"]'),
+    ).not.toBeNull();
+  });
+
+  it('the receipts pager keeps the effective view: a recorded decision stays recorded', async () => {
+    const row = notification('pager-decide', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      decision: ownerDecision(),
+    });
+    const decidedRow = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decidedRow)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [notification('older-pager')], nextOffset: 1, hasMore: false })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    view.bindClient(client);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'pager-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-pager-lane', { role: 'minion', jobId: 'pager-lane' })],
+        notifications: [row, notification('pager-receipt', { agentId: 'minion-pager-lane' })],
+      }),
+    );
+    document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:pager-decide:option:approve"]')!
+      .click();
+    await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    document.querySelector<HTMLButtonElement>('.board-notification__more')!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')!.textContent).toContain('Notice older-pager'),
+    );
+    // The pagination re-render derived the effective view: the override
+    // survives and no live option buttons resurrect on the bell copy.
+    const bellCard = document.querySelector('#notification-list [data-notification-id="pager-decide"]')!;
+    expect(bellCard.textContent).toContain('Decision recorded');
+    expect(bellCard.querySelector('[data-action-id="notif:pager-decide:option:approve"]')).toBeNull();
   });
 
   it('focus lands on the card when a push removes the recorded option (band and bell)', async () => {

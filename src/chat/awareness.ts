@@ -88,7 +88,10 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'This turn was started by the service wake policy — no user message is waiting. ' +
   'This is machine attention and it is meant to be acted on in-turn: diagnose the item, ' +
   'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
-  'stage the rest. After acting on an action-required alert, explicitly resolve its ' +
+  'stage the rest. When an owner discussion-only escalation (empty options, discussion true) ' +
+  'reaches agreement in chat, attach the agreed options with POST /api/notifications/{id}/decision-options ' +
+  '({ options: [{ id, label, consequence }], by: "gru" }) so the owner can record the choice — it records nothing itself. ' +
+  'After acting on an action-required alert, explicitly resolve its ' +
   'notification ID with POST /api/notifications/{id}/disposition and a nonempty detail; ' +
   'prompt delivery alone never clears it. A producer-resolved alert (lessons.dream-failed) refuses ' +
   'a disposition: fix its cause and leave it open — it closes itself when its producer succeeds. When the right outcome is a hold or "needs no ' +
@@ -161,6 +164,8 @@ export type GruAwarenessLedger = Pick<
   | 'listNotifications'
   | 'recordNotification'
   | 'resolveNotificationById'
+  // Uncapped exact-kind open-incident lookup (wake-stop dedupe).
+  | 'findNotificationByKindAndRouting'
   | 'listJobs'
   | 'listAgents'
   | 'coveringDecision'
@@ -1125,12 +1130,12 @@ export class GruAwareness {
         // Open-incident deduplication: while ANY row of this incident's
         // kind is open the stop exists and is reused; a resolved or acked
         // row is history, so a NEW block episode posts a fresh stop (the
-        // machine alert would otherwise never re-raise its debt to the bell).
+        // machine alert would otherwise never re-raise its debt to the
+        // bell). UNCAPPED exact-kind lookup: a page window would miss an
+        // old open stop behind newer notifications and duplicate it.
         const incidentKind = `gru.wake-blocked.${id}`;
-        const open = this.ledger
-          .listNotifications({ limit: 1000, routing: 'needs-owner' })
-          .some((row) => row.kind === incidentKind && row.ackedAt === null && row.resolvedAt === null);
-        if (!open) {
+        const open = this.ledger.findNotificationByKindAndRouting(incidentKind, 'needs-owner', 'unacked');
+        if (open === null) {
           const posted = this.ledger.recordNotification({
             id: existing === null ? escalationId : this.nextEscalationId(escalationId),
             kind: `gru.wake-blocked.${id}`,
@@ -1205,10 +1210,9 @@ export class GruAwareness {
       // Open-incident dedupe: an OPEN stop for this exact kind reuses the
       // row; a resolved/acked stop is history, so a fresh exhaustion
       // re-raises the debt with a new identity instead of staying silent.
-      const open = this.ledger
-        .listNotifications({ limit: 1000, routing: 'needs-owner' })
-        .some((row) => row.kind === kind && row.ackedAt === null && row.resolvedAt === null);
-      if (!open) {
+      // UNCAPPED exact-kind lookup (same reason as the blocked-wake path).
+      const open = this.ledger.findNotificationByKindAndRouting(kind, 'needs-owner', 'unacked');
+      if (open === null) {
         const posted = this.ledger.recordNotification({
           id: existing === null ? escalationId : this.nextEscalationId(escalationId),
           kind,

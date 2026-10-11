@@ -909,7 +909,12 @@ owner's choice durably and idempotently — it never acks or resolves the
 row, and a decision receipt is not proof its follow-on operation ran; the
 row stays visible as "decision recorded — awaiting follow-through" until
 its owner records the follow-through (`POST /api/notifications/{id}/disposition`
-with the action detail; an undecided row is refused). Owner-only notices
+with the action detail; an undecided row is refused). A discussion-only
+decision (no options yet) is settled through the supported bridge: Gru
+attaches the agreed options with
+`POST /api/notifications/{id}/decision-options` after the chat discussion —
+audited, records no choice, and refused once the owner has decided — then
+the owner's recorded choice and the follow-through proceed normally. Owner-only notices
 carry no in-app control at all; they clear when their producer sees the
 condition end: a successful bind for port squats, decision-service
 recovery for degraded providers, a passing gated call for enforce-gate

@@ -691,6 +691,16 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           await expect(context).toContainText('Two lessons changed');
           expect(await context.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
           expect(await row.locator('.board-owner__consequence').evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+          // The prose owns its grid track: its box must NOT intersect the
+          // metadata label's box (the stacked-cell overlap is the R1 bug).
+          const metaBox = await row.locator('.board-owner__meta').boundingBox();
+          const contextBox = await context.boundingBox();
+          expect(metaBox).not.toBeNull();
+          expect(contextBox).not.toBeNull();
+          const metaBottom = metaBox!.y + metaBox!.height;
+          const contextBottom = contextBox!.y + contextBox!.height;
+          const overlap = metaBox!.y < contextBottom && contextBox!.y < metaBottom;
+          expect(overlap, `${theme} @${width}: proposal context overlaps its label`).toBe(false);
           // The review loads on open: readable lesson text, nonzero geometry.
           await row.locator('.board-owner__review > summary').click();
           const reviewText = row.locator('.board-owner__review-text').first();
@@ -710,6 +720,13 @@ test.describe('notification readability — fixed long-content fixtures', () => 
           const pointer = page.locator('#notification-list .board-owner__pointer-text');
           await expect(pointer).toContainText('Review the changes and decide in FOR YOU');
           expect(await pointer.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+          const pointerMeta = await page.locator('#notification-list .board-owner__meta').boundingBox();
+          const pointerBox = await pointer.boundingBox();
+          expect(pointerMeta).not.toBeNull();
+          expect(pointerBox).not.toBeNull();
+          const pointerOverlap =
+            pointerMeta!.y < pointerBox!.y + pointerBox!.height && pointerBox!.y < pointerMeta!.y + pointerMeta!.height;
+          expect(pointerOverlap, `${theme} @${width}: pointer text overlaps its label`).toBe(false);
           await captureViewport(page, `${theme}-proposal-width-${width}`, `${theme}: proposal review expanded at ${width}px`);
         } finally {
           await page.close();

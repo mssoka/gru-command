@@ -652,6 +652,44 @@ describe('gru awareness — wake policy', () => {
     }
   });
 
+  it('an open blocked-wake stop outside the newest page window still dedupes (uncapped exact-kind lookup)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+      awareness.setWakeSink(() => awareness.noteWakeBlocked('native writer uncertain'));
+      const alert = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Needs a wake' });
+      const canonical = `gru-wake-blocked:${alert.id}`;
+      expect(api.getNotification(canonical)).toMatchObject({ resolvedAt: null });
+      // More than a 1000-row page of NEWER needs-owner rows: a paged dedupe
+      // would miss the still-open canonical stop and duplicate the debt.
+      vi.advanceTimersByTime(1_000);
+      for (let index = 0; index < 1_001; index += 1) {
+        api.recordNotification({
+          id: `flood-${String(index).padStart(4, '0')}`,
+          kind: 'test.flood',
+          routing: 'needs-owner',
+          severity: 'info',
+          title: `flood ${index}`,
+        });
+      }
+      vi.advanceTimersByTime(5_000); // the blocked retry fires again
+      const stops = api
+        .listNotifications({ limit: 5_000, routing: 'needs-owner' })
+        .filter((row) => row.kind === `gru.wake-blocked.${alert.id}`);
+      expect(stops).toHaveLength(1);
+      expect(stops[0]?.id).toBe(canonical);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a resolved failed-wake escalation re-raises on the next exhausted cycle with a fresh identity', () => {
     vi.useFakeTimers();
     try {
