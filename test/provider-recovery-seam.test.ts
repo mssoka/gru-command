@@ -425,7 +425,8 @@ describe('supervisor ⇄ sensor seam', () => {
       expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
       expect(h.ledger.openProviderWaitForAgent(handle.id)?.id).toBe(wait?.id);
     } finally {
-      h.dispose();
+      h.supervisor.dispose();
+      h.sensor.stop();
     }
   });
 

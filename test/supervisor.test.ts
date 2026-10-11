@@ -3570,11 +3570,11 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       holder.release();
     };
     const { rig, stop } = directlyStoppedTurn('replay-park-job', 'replay-park-agent');
-    let firstReplacement: FakeHandle | null = null;
+    const firstReplacement: { current: FakeHandle | null } = { current: null };
     try {
       rig.registry.spawnImpl = async (role, options) => {
         const replacement = new FakeHandle(role, 'replay-park-first', options?.resumeFile ?? null);
-        firstReplacement = replacement;
+        firstReplacement.current = replacement;
         return replacement;
       };
       expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
@@ -3582,25 +3582,25 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       rig.api.setJobStatus('replay-park-job', 'parked');
       releaseHolder();
       await vi.waitFor(() => expect(rig.supervisor.viewFor('replay-park-agent')).toMatchObject({ state: 'stopped', breakerOpen: true }));
-      expect(firstReplacement?.disposed).toBe(true);
-      expect(firstReplacement?.promptCalls).toHaveLength(0);
+      expect(firstReplacement.current?.disposed).toBe(true);
+      expect(firstReplacement.current?.promptCalls).toHaveLength(0);
       const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get('replay-park-agent');
       expect(agent?.pendingRecovery).not.toBeNull();
       const fresh = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
       expect(fresh).toMatchObject({ routing: 'action-required', resolvedAt: null });
 
       rig.api.setJobStatus('replay-park-job', 'working');
-      let retryReplacement: FakeHandle | null = null;
+      const retryReplacement: { current: FakeHandle | null } = { current: null };
       rig.registry.spawnImpl = async (role, options) => {
         const replacement = new FakeHandle(role, 'replay-park-retried', options?.resumeFile ?? null);
-        retryReplacement = replacement;
+        retryReplacement.current = replacement;
         return replacement;
       };
       expect(rig.supervisor.onNotificationDisposed(fresh!.id)).toEqual({ ok: true, rearmed: true });
-      await vi.waitFor(() => expect(retryReplacement?.promptCalls).toEqual([
+      await vi.waitFor(() => expect(retryReplacement.current?.promptCalls).toEqual([
         { text: 'saved interrupted prompt', owner: 'dispatch:fixture' },
       ]));
-      expect(retryReplacement?.disposed).toBe(false);
+      expect(retryReplacement.current?.disposed).toBe(false);
     } finally {
       releaseHolder();
       rig.dispose();
@@ -3626,26 +3626,26 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
 
   it('a Perkins round admitted during spawn disposes the replacement before adoption', async () => {
     const { rig, stop } = directlyStoppedTurn('review-mid-spawn-job', 'review-mid-spawn-agent');
-    let spawned: FakeHandle | null = null;
+    const spawned: { current: FakeHandle | null } = { current: null };
     let releaseSpawn!: () => void;
     const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve; });
     rig.supervisor.setActiveReviewProbe((jobId) => rig.api.listRounds(jobId).some((candidate) => candidate.status === 'pending' || candidate.status === 'live'));
     try {
       rig.registry.spawnImpl = async (role, options) => {
         const replacement = new FakeHandle(role, 'review-mid-spawn-replacement', options?.resumeFile ?? null);
-        spawned = replacement;
+        spawned.current = replacement;
         await spawnGate;
         return replacement;
       };
       expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
-      await vi.waitFor(() => expect(spawned).not.toBeNull());
+      await vi.waitFor(() => expect(spawned.current).not.toBeNull());
       const round = rig.api.addRound({ jobId: 'review-mid-spawn-job', targetRef: 'PR-306', lenses: ['blind'] });
       rig.api.setJobStatus('review-mid-spawn-job', 'in-review');
       rig.api.setRoundStatus(round.id, 'live');
       releaseSpawn();
       await vi.waitFor(() => expect(rig.supervisor.viewFor('review-mid-spawn-agent')).toMatchObject({ state: 'stopped', breakerOpen: true }));
-      expect(spawned?.disposed).toBe(true);
-      expect(spawned?.promptCalls).toHaveLength(0);
+      expect(spawned.current?.disposed).toBe(true);
+      expect(spawned.current?.promptCalls).toHaveLength(0);
       expect(rig.api.listNotifications({ limit: 50 }).some((row) => row.kind === 'supervision.rearm-fenced')).toBe(true);
     } finally {
       releaseSpawn?.();
