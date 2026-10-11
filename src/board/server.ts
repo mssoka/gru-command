@@ -7,7 +7,7 @@ import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
 import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
-import { parseNotificationDecision } from '../ledger/notification-decision.js';
+import { parseDecisionOptions, parseNotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -37,10 +37,11 @@ export interface BoardServerOptions {
   readonly notifications: NotificationCenter;
   /** E7: fired after a successful ack (feed/notice receipts). */
   readonly onNotificationAck?: (id: string) => void;
-  /** E7 (owner release 2026-10-11): fired after a successful machine
-   * disposition — the supervisor re-arms a stopped lane whose breaker
-   * alert Gru just disposed, through the same guarded path. */
-  readonly onNotificationDisposition?: (id: string) => void;
+  /** E7 (owner release 2026-10-11): the GUARDED machine re-arm control,
+   * consulted BEFORE any disposition is recorded. The supervisor returns a
+   * typed outcome; a refusal (or a throw) leaves the alert and its
+   * retryable recovery debt intact instead of consuming the only control. */
+  readonly onNotificationDisposition?: (id: string, detail: string) => { readonly ok: boolean; readonly reason?: string } | void;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
@@ -589,15 +590,17 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           json(res, 201, row);
           return;
         }
-        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack') || path.endsWith('/disposition') || path.endsWith('/decision'))) {
+        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack') || path.endsWith('/disposition') || path.endsWith('/decision-options') || path.endsWith('/decision'))) {
           if (!authed(req, res)) return;
           const suffix = path.endsWith('/shown')
             ? '/shown'
             : path.endsWith('/disposition')
               ? '/disposition'
-              : path.endsWith('/decision')
-                ? '/decision'
-                : '/ack';
+              : path.endsWith('/decision-options')
+                ? '/decision-options'
+                : path.endsWith('/decision')
+                  ? '/decision'
+                  : '/ack';
           const id = decodeURIComponent(path.slice('/api/notifications/'.length, -suffix.length));
           const body = (await readBody(req)) as Record<string, unknown>;
           if (suffix === '/decision') {
@@ -612,6 +615,30 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               return;
             }
             json(res, 200, row);
+            return;
+          }
+          if (suffix === '/decision-options') {
+            // Supported discussion bridge (owner release 2026-10-11): attach
+            // agreed options to an existing discussion-only decision so the
+            // owner's eventual choice records through the typed path. The
+            // ledger refuses every other row shape (not_discussion,
+            // decision_recorded, not_open, not_owner_decision).
+            const options = parseDecisionOptions((body as Record<string, unknown>)['options']);
+            const by = optStrField(body, 'by') ?? 'gru';
+            try {
+              const row = notifications.attachDecisionOptions(id, options, by);
+              if (row === null) {
+                json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+                return;
+              }
+              json(res, 200, row);
+            } catch (error) {
+              if (error instanceof NotificationDecisionRefusal) {
+                json(res, 409, { error: error.code, code: error.code, detail: error.message });
+                return;
+              }
+              throw error;
+            }
             return;
           }
           if (suffix === '/shown') {
@@ -643,12 +670,42 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               });
               return;
             }
-            const beforeResolvedAt = target?.resolvedAt ?? null;
             // A DECIDED owner decision resolves through the same route as
             // its follow-through record; an UNDECIDED owner row is refused
-            // (resolution never silences an unanswered question), and
-            // machine attention keeps the pure disposition path.
+            // (resolution never silences an unanswered question).
             const ownerFollowThrough = target !== null && target.routing === 'needs-owner';
+            // Machine attention: the re-arm is a GUARDED action, so the
+            // supervisor's typed outcome is consulted BEFORE anything is
+            // recorded. A refused or failed re-arm returns an honest
+            // outcome and keeps the alert open with its retryable debt —
+            // settlement is never reported before the control accepts it.
+            let rearm: 'accepted' | 'not_applicable' = 'not_applicable';
+            if (!ownerFollowThrough && target !== null && target.resolvedAt === null) {
+              try {
+                const outcome = onNotificationDisposition(id, detail);
+                if (outcome !== undefined && outcome.ok === false) {
+                  ledger.appendCustomEvent({
+                    kind: 'notification.rearm-refused',
+                    payload: { id, reason: outcome.reason ?? 'refused' },
+                  });
+                  json(res, 409, {
+                    error: 'rearm_refused',
+                    code: 'rearm_refused',
+                    detail: outcome.reason ?? 'the guarded re-arm refused this disposition',
+                  });
+                  return;
+                }
+                if (outcome !== undefined) rearm = 'accepted';
+              } catch (error) {
+                const message = String(error instanceof Error ? error.message : error);
+                ledger.appendCustomEvent({
+                  kind: 'notification.rearm-failed',
+                  payload: { id, error: message },
+                });
+                json(res, 502, { error: 'rearm_failed', detail: message });
+                return;
+              }
+            }
             const row = ownerFollowThrough
               ? ledger.resolveOwnerDecision(id, detail)
               : ledger.disposeMachineNotification(id, detail);
@@ -656,13 +713,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;
             }
-            // Fire on the FIRST machine disposition (the state change); a
-            // repeat is an idempotent no-op for listeners too. The
-            // supervisor uses this hook for the guarded breaker re-arm —
-            // Gru's supported operations control, replacing the old owner
-            // Ack path. Owner follow-through never re-arms anything here.
-            if (!ownerFollowThrough && beforeResolvedAt === null && row.resolvedAt !== null) onNotificationDisposition(id);
-            json(res, 200, row);
+            json(res, 200, { ...row, rearm });
             return;
           }
           const existing = ledger.getNotification(id);

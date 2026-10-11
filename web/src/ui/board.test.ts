@@ -2539,15 +2539,23 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.textContent).toContain('Gru recommends');
     expect(band.textContent).toContain('Why this needs you');
     button.click();
-    expect(button.textContent).toBe('recording…');
-    expect(button.disabled).toBe(true);
+    const busy = band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!;
+    // The submission state is re-rendered from BoardView (shared by both
+    // surfaces): the chosen button keeps focus (aria-disabled, never the
+    // disabled property) and every other option is plain-disabled.
+    expect(busy.textContent).toBe('recording “Approve the slim contract”…');
+    expect(busy.getAttribute('aria-disabled')).toBe('true');
+    expect(busy.disabled).toBe(false);
+    expect(band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:keep"]')!.disabled).toBe(true);
+    expect(band.querySelector('.board-notification__submission--submitting')?.textContent).toContain('ecording');
+    busy.click(); // duplicate click on the in-flight option: no second request
     await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve'));
-    await vi.waitFor(() => expect(button.disabled).toBe(false));
+    expect(failing.decideNotification).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(band.querySelector('.board-notification__submission--unconfirmed')).not.toBeNull());
     // Ambiguous transport failure → the copy must NOT claim nothing was
     // recorded (the server may have committed before the reply was lost).
-    expect(button.textContent).toBe('Approve the slim contract');
-    expect(band.querySelector('.board-notification__option-error')?.textContent).toContain('Outcome unconfirmed');
-    expect(band.querySelector('[data-action-id="notif:decide-me:option:approve"]')).not.toBeNull();
+    expect(band.querySelector('.board-notification__submission')?.textContent).toContain('Outcome unconfirmed');
+    expect(band.querySelector('[data-action-id="notif:decide-me:option:approve"]')?.textContent).toBe('Approve the slim contract');
     // A server refusal PROVES nothing was recorded and shows the reason.
     const refused = {
       ackNotification: vi.fn(() => Promise.resolve()),
@@ -2558,7 +2566,9 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view3.render(snapshot({ notifications: [stop] }));
     const band3 = document.getElementById('board-owner')!;
     band3.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!.click();
-    await vi.waitFor(() => expect(band3.querySelector('.board-notification__option-error')?.textContent).toContain('already records decision'));
+    await vi.waitFor(() =>
+      expect(band3.querySelector('.board-notification__submission--refused')?.textContent).toContain('already records decision'),
+    );
     expect(band3.textContent).toContain('Not recorded');
     // Success → the server's authoritative row applies; the row stays
     // visible as decided — awaiting follow-through, never "completed".
@@ -2661,9 +2671,19 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       }),
     );
     const band = document.getElementById('board-owner')!;
-    expect(band.querySelector('.board-notification__discuss')?.textContent).toContain('needs discussion with Gru');
-    expect(band.querySelectorAll('.board-notification__option-button')).toHaveLength(0);
+    expect(band.querySelector('.board-notification__discuss-text')?.textContent).toContain('conversation with Gru');
+    // No invented one-click option: the single control is the real chat
+    // action, and clicking it focuses the composer (a genuine route, not
+    // a dead paragraph).
+    expect(band.querySelectorAll('.board-notification__option-button')).toHaveLength(1);
+    expect(band.querySelector('.board-notification__discuss-open')?.textContent).toBe('Discuss with Gru');
     expect(band.querySelector('.board-notification__ack')).toBeNull();
+    const chatInput = document.createElement('textarea');
+    chatInput.id = 'chat-input';
+    document.body.append(chatInput);
+    band.querySelector<HTMLButtonElement>('.board-notification__discuss-open')!.click();
+    expect(document.activeElement).toBe(chatInput);
+    chatInput.remove();
   });
 
   it('a long diagnostic card keeps mixed case on its face and the full text behind Details', () => {
@@ -3122,12 +3142,49 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const bell = document.getElementById('notification-list')!;
     const pointer = bell.querySelector('.board-owner__row--pointer')!;
     expect(pointer.textContent).toContain('Book of Lessons: 2 lesson changes proposed');
-    expect(pointer.textContent).toContain('waiting for you in For You — review the changes and decide there');
+    expect(pointer.textContent).toContain('Review the changes and decide in FOR YOU');
+    expect(pointer.querySelector('.board-owner__pointer-text')?.classList.contains('lbl')).toBe(false);
     expect(bell.querySelector('.board-owner__accept, .board-owner__reject, .board-owner__review')).toBeNull();
     pointer.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
     expect(document.getElementById('notification-panel')!.hidden).toBe(true);
     expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-owner__review > summary'));
     expect(client.getLessonProposal).not.toHaveBeenCalled();
+  });
+
+  it('proposal prose and the pointer are readable mixed-case text, never the uppercase label treatment (R1)', async () => {
+    const detailed = {
+      ...proposalNotice,
+      detail: 'Two lessons changed in the execution chapter — review the exact before/after text.',
+    };
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [detailed] }));
+    const band = document.getElementById('board-owner')!;
+    // The detail is readable prose in its own readable class...
+    const context = band.querySelector('.board-owner__context')!;
+    expect(context.textContent).toContain('Two lessons changed');
+    expect(context.classList.contains('lbl')).toBe(false);
+    // ...and the short metadata line carries ONLY the timestamp + state.
+    const meta = band.querySelector('.board-owner__meta')!;
+    expect(meta.classList.contains('lbl')).toBe(true);
+    expect(meta.textContent).toContain('owner decision owed');
+    expect(meta.textContent).not.toContain('Two lessons changed');
+    // The consequence line stays readable prose too.
+    expect(band.querySelector('.board-owner__consequence')!.classList.contains('lbl')).toBe(false);
+    // The review body (the lesson text itself) is never uppercase/label-spaced.
+    openReview();
+    await flush();
+    const reviewBody = band.querySelector('.board-owner__review-body')!;
+    expect(reviewBody.classList.contains('lbl')).toBe(false);
+    expect(reviewBody.textContent).toContain('Close the shell first');
+    // The real controls survive the readability fix.
+    expect(band.querySelector('.board-owner__accept')).not.toBeNull();
+    expect(band.querySelector('.board-owner__reject')).not.toBeNull();
+    // The bell copy is a readable pointer, not a label line.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const pointer = document.getElementById('notification-list')!.querySelector('.board-owner__pointer-text')!;
+    expect(pointer.classList.contains('lbl')).toBe(false);
+    expect(pointer.textContent).toContain('Review the changes and decide in FOR YOU');
   });
 
   it('"Go to For You" reveals a proposal six newer obligations hid, and never fetches or decides (C3)', async () => {
@@ -4219,5 +4276,228 @@ describe('board — megaminions nest under their heist', () => {
     const view = new BoardView(() => {});
     view.render(value);
     expect(document.querySelector('#chip-rail [data-kpi="jobs.total"]')?.textContent).toContain('2');
+  });
+});
+
+describe('R1: shared decision submissions, read-only gating and focus', () => {
+  const stop = () =>
+    notification('shared-submit', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision(),
+    });
+
+  it('a live push mid-submit keeps the same phase on both surfaces and refuses duplicates', async () => {
+    let resolveCall!: (row: NotificationView) => void;
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveCall = resolve;
+          }),
+      ),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    const row = stop();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const bell = document.getElementById('notification-list')!;
+    bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!.click();
+    // A live authoritative push arrives mid-submit: the phase survives on
+    // BOTH surfaces because it lives in BoardView, not in the DOM.
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    const bandButton = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>(
+      '[data-action-id="notif:shared-submit:option:approve"]',
+    )!;
+    const bellButton = bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!;
+    expect(bandButton.textContent).toContain('ecording');
+    expect(bellButton.textContent).toContain('ecording');
+    expect(bandButton.getAttribute('aria-disabled')).toBe('true');
+    expect(bellButton.getAttribute('aria-disabled')).toBe('true');
+    expect(bell.querySelector('.board-notification__submission--submitting')).not.toBeNull();
+    // The other surface cannot start a duplicate action either.
+    bellButton.click();
+    expect(client.decideNotification).toHaveBeenCalledTimes(1);
+    resolveCall({
+      ...row,
+      decidedAt: '2026-01-01T00:10:00.000Z',
+      decidedBy: 'web',
+      decidedOption: 'approve',
+    });
+    await vi.waitFor(() =>
+      expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'),
+    );
+  });
+
+  it('a refusal message survives live pushes on both surfaces, and a retry is allowed', async () => {
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() =>
+        Promise.reject(new BoardApiError('/decision', 409, 'decision_recorded', 'already records decision "keep"')),
+      ),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    const row = stop();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    document
+      .getElementById('notification-list')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!
+      .click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('board-owner')!.querySelector('.board-notification__submission--refused')).not.toBeNull(),
+    );
+    // The push re-renders both cards from the shared state: the honest
+    // refusal copy stays, and the options remain retryable.
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    const bandRefusal = document.getElementById('board-owner')!.querySelector('.board-notification__submission--refused');
+    const bellRefusal = document
+      .getElementById('notification-list')!
+      .querySelector('.board-notification__submission--refused');
+    expect(bandRefusal?.textContent).toContain('Not recorded');
+    expect(bandRefusal?.textContent).toContain('already records decision');
+    expect(bellRefusal?.textContent).toContain('Not recorded');
+    expect(
+      document.getElementById('board-owner')!.querySelector('[data-action-id="notif:shared-submit:option:approve"]'),
+    ).not.toBeNull();
+    // Clicking again retries the same idempotent request.
+    document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!
+      .click();
+    await vi.waitFor(() => expect(client.decideNotification).toHaveBeenCalledTimes(2));
+  });
+
+  it('a re-pair drops in-flight work begun for the old client (late replies change nothing)', async () => {
+    let rejectCall!: (error: Error) => void;
+    const oldClient = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectCall = reject;
+          }),
+      ),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, oldClient);
+    const row = stop();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!
+      .click();
+    view.bindClient({
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(row)),
+    } as unknown as import('../lib/board-client.js').BoardClient);
+    rejectCall(new Error('late failure from the old client'));
+    await Promise.resolve();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    // No stale phase and no stale refusal text from the retired client.
+    expect(document.querySelector('.board-notification__submission')).toBeNull();
+    expect(document.getElementById('board-owner')!.textContent).not.toContain('Not recorded');
+  });
+
+  it('machine rows and closed receipts keep typed options read-only — no fake controls', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [
+          notification('machine-typed', { routing: 'action-required', kind: 'supervision.breaker', decision: ownerDecision() }),
+          notification('closed-typed', {
+            routing: 'needs-owner',
+            kind: 'gru.owner-escalation',
+            decision: ownerDecision(),
+            resolvedAt: '2026-01-01T00:05:00.000Z',
+            resolvedBy: 'gru',
+          }),
+        ],
+      }),
+    );
+    const bell = document.getElementById('notification-list')!;
+    // The machine card renders in NEEDS GRU and the resolved owner row in
+    // FEED — neither may offer a decision button its API refuses.
+    const machineCard = bell.querySelector<HTMLElement>('[data-notification-id="machine-typed"]')!;
+    const closedCard = bell.querySelector<HTMLElement>('[data-notification-id="closed-typed"]')!;
+    expect(machineCard.querySelectorAll('[data-action-id]')).toHaveLength(0);
+    expect(closedCard.querySelectorAll('[data-action-id]')).toHaveLength(0);
+    // The options stay visible as information (read-only list).
+    expect(machineCard.querySelector('.board-notification__options--readonly')).not.toBeNull();
+    expect(closedCard.querySelector('.board-notification__options--readonly')).not.toBeNull();
+  });
+
+  it('a local re-render is not mistaken for incoming confirmation: the override dies only on a raw decided snapshot', async () => {
+    const row = notification('override-race', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      decision: ownerDecision(),
+    });
+    const decidedRow = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decidedRow)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [row] }));
+    document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:override-race:option:approve"]')!
+      .click();
+    await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+    // Local re-renders (proposal state, receipt pages) must NOT count as
+    // the server confirming: the override stays until a RAW snapshot
+    // carries the recorded state.
+    const localRerender = (view as unknown as { rerenderNotifications(): void }).rerenderNotifications.bind(view);
+    localRerender();
+    localRerender();
+    // A delayed STALE snapshot arrives (undecided): the recorded state and
+    // the hidden options must hold.
+    view.render(snapshot({ notifications: [row] }));
+    expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded');
+    expect(
+      document.getElementById('board-owner')!.querySelector('[data-action-id="notif:override-race:option:approve"]'),
+    ).toBeNull();
+    // Only an authoritative snapshot that carries the recorded state
+    // retires the override.
+    view.render(snapshot({ notifications: [decidedRow] }));
+    expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded');
+  });
+
+  it('focus lands on the card when a push removes the recorded option (band and bell)', async () => {
+    const row = notification('focus-removed', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision(),
+    });
+    const decidedRow = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    // Band: focus the option, then a push reports the decision was recorded.
+    const bandOption = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:focus-removed:option:approve"]')!;
+    bandOption.focus();
+    view.render(snapshot({ notifications: [decidedRow], unackedNeedsOwner: 1 }));
+    const bandActive = document.activeElement as HTMLElement;
+    expect(document.getElementById('board-owner')!.contains(bandActive)).toBe(true);
+    // Bell: same guarantee, and never the band's lookalike.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    const bellOption = document
+      .getElementById('notification-list')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:focus-removed:option:approve"]')!;
+    bellOption.focus();
+    view.render(snapshot({ notifications: [decidedRow], unackedNeedsOwner: 1 }));
+    const bellActive = document.activeElement as HTMLElement;
+    expect(document.getElementById('notification-list')!.contains(bellActive)).toBe(true);
+    expect(document.getElementById('board-owner')!.contains(bellActive)).toBe(false);
   });
 });

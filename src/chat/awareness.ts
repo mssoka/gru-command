@@ -1122,9 +1122,17 @@ export class GruAwareness {
         if (existing !== null && (existing.kind !== `gru.wake-blocked.${id}` || existing.routing !== 'needs-owner')) {
           throw new Error(`Gru blocked-wake ID ${escalationId} is already assigned to another notification`);
         }
-        if (existing === null) {
+        // Open-incident deduplication: while ANY row of this incident's
+        // kind is open the stop exists and is reused; a resolved or acked
+        // row is history, so a NEW block episode posts a fresh stop (the
+        // machine alert would otherwise never re-raise its debt to the bell).
+        const incidentKind = `gru.wake-blocked.${id}`;
+        const open = this.ledger
+          .listNotifications({ limit: 1000, routing: 'needs-owner' })
+          .some((row) => row.kind === incidentKind && row.ackedAt === null && row.resolvedAt === null);
+        if (!open) {
           const posted = this.ledger.recordNotification({
-            id: escalationId,
+            id: existing === null ? escalationId : this.nextEscalationId(escalationId),
             kind: `gru.wake-blocked.${id}`,
             routing: 'needs-owner',
             severity: 'error',
@@ -1149,6 +1157,16 @@ export class GruAwareness {
     } catch (error) {
       this.log('error', 'gru wake failure event failed', { error: String(error) });
     }
+  }
+
+  /** A fresh escalation identity when the canonical one is closed history:
+   * `base`, `base:2`, `base:3`… never colliding with a live row. */
+  private nextEscalationId(base: string): string {
+    for (let suffix = 2; suffix < 1000; suffix += 1) {
+      const candidate = `${base}:${suffix}`;
+      if (this.ledger.getNotification(candidate) === null) return candidate;
+    }
+    return `${base}:${this.now()}`;
   }
 
   /** Issue #115 terminal path: exactly one truthful needs-owner escalation
@@ -1184,9 +1202,15 @@ export class GruAwareness {
       if (existing !== null && (existing.kind !== kind || existing.routing !== 'needs-owner')) {
         throw new Error(`Gru failed-wake escalation id ${escalationId} is already assigned to another notification`);
       }
-      if (existing === null) {
+      // Open-incident dedupe: an OPEN stop for this exact kind reuses the
+      // row; a resolved/acked stop is history, so a fresh exhaustion
+      // re-raises the debt with a new identity instead of staying silent.
+      const open = this.ledger
+        .listNotifications({ limit: 1000, routing: 'needs-owner' })
+        .some((row) => row.kind === kind && row.ackedAt === null && row.resolvedAt === null);
+      if (!open) {
         const posted = this.ledger.recordNotification({
-          id: escalationId,
+          id: existing === null ? escalationId : this.nextEscalationId(escalationId),
           kind,
           routing: 'needs-owner',
           severity: 'error',

@@ -35,6 +35,7 @@ async function boot(
   overrides: Partial<{
     heartbeatMs: number;
     repoOverview: () => RepoOverviewView | null;
+    onNotificationDisposition: (id: string, detail: string) => { readonly ok: boolean; readonly reason?: string } | void;
   }> = {},
 ): Promise<{
   port: number;
@@ -948,7 +949,9 @@ describe('board server — empty token config locks every door', () => {
       bus,
       notifications,
       onNotificationAck: (id) => acked.push(id),
-      onNotificationDisposition: (id) => dispositions.push(id),
+      onNotificationDisposition: (id) => {
+        dispositions.push(id);
+      },
       pushDebounceMs: 10,
     });
     const http: HttpServer = createServer((req, res) => {
@@ -1183,6 +1186,185 @@ describe('board server — decision memory (issue #218)', () => {
       expect(afterClear.activeDecisionCount).toBe(0);
     } finally {
       await harness.close();
+    }
+  });
+});
+describe('board server — guarded machine re-arm and the discussion bridge (R1 fixes)', () => {
+  it('a refused re-arm is a typed 409 that consumes nothing; the same control retries once the fence clears', async () => {
+    let refusal: { ok: boolean; reason?: string } | null = {
+      ok: false,
+      reason: 'job "parked-lane" is parked (owner/ops hold)',
+    };
+    const hookCalls: string[] = [];
+    const { port, api, close } = await boot('board-test-token', {
+      onNotificationDisposition: (id) => {
+        hookCalls.push(id);
+        return refusal ?? { ok: true };
+      },
+    });
+    try {
+      api.recordNotification({
+        id: 'machine-rearm',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped: restart ladder tripped',
+        detail: 'breaker open',
+      });
+      const refused = await postJson(port, '/api/notifications/machine-rearm/disposition', 'board-test-token', {
+        detail: 'fix landed',
+      });
+      expect(refused).toMatchObject({ status: 409, body: { error: 'rearm_refused', code: 'rearm_refused' } });
+      // Nothing was recorded: the alert, its ack state and its retryable
+      // debt all survive the refusal.
+      expect(api.getNotification('machine-rearm')?.resolvedAt).toBeNull();
+      expect(api.getNotification('machine-rearm')?.ackedAt).toBeNull();
+      expect(
+        api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-refused'),
+      ).toHaveLength(1);
+      // The fence clears: the SAME control (no new alert, no new id) is
+      // accepted and the row closes with the truthful re-arm outcome.
+      refusal = null;
+      const accepted = await postJson(port, '/api/notifications/machine-rearm/disposition', 'board-test-token', {
+        detail: 'hold lifted',
+      });
+      expect(accepted).toMatchObject({ status: 200, body: { rearm: 'accepted' } });
+      expect((accepted.body as { resolvedAt: string | null }).resolvedAt).not.toBeNull();
+      expect(api.getNotification('machine-rearm')?.resolvedBy).toBe('gru');
+      // A repeat disposition of the resolved row is idempotent and never
+      // re-runs the guarded re-arm (the hook is skipped).
+      const repeat = await postJson(port, '/api/notifications/machine-rearm/disposition', 'board-test-token', {
+        detail: 'duplicate',
+      });
+      expect(repeat).toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
+      expect(hookCalls).toEqual(['machine-rearm', 'machine-rearm']);
+    } finally {
+      await close();
+    }
+  });
+
+  it('a throwing re-arm fails LOUD (502) and never records the disposition', async () => {
+    const { port, api, close } = await boot('board-test-token', {
+      onNotificationDisposition: () => {
+        throw new Error('supervisor unavailable');
+      },
+    });
+    try {
+      api.recordNotification({
+        id: 'machine-fail',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped',
+        detail: 'breaker open',
+      });
+      const res = await postJson(port, '/api/notifications/machine-fail/disposition', 'board-test-token', { detail: 'try' });
+      expect(res).toMatchObject({ status: 502, body: { error: 'rearm_failed' } });
+      expect(api.getNotification('machine-fail')?.resolvedAt).toBeNull();
+      expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed')).toHaveLength(1);
+    } finally {
+      await close();
+    }
+  });
+
+  it('without a supervisor hook a machine disposition still records (rearm not_applicable)', async () => {
+    const { port, api, close } = await boot('board-test-token');
+    try {
+      api.recordNotification({
+        id: 'machine-plain',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped',
+        detail: 'breaker open',
+      });
+      const res = await postJson(port, '/api/notifications/machine-plain/disposition', 'board-test-token', { detail: 'ok' });
+      expect(res).toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
+      expect((res.body as { resolvedAt: string | null }).resolvedAt).not.toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  it('the discussion bridge attaches agreed options, records nothing, and the typed path then settles', async () => {
+    const { port, api, close } = await boot('board-test-token');
+    try {
+      const created = await postJson(port, '/api/notifications/needs-owner', 'board-test-token', {
+        title: 'Which shape should the dashboard take?',
+        detail: 'Talk it through with Gru before a choice is recorded',
+        decision: {
+          question: 'Which shape should the dashboard take?',
+          context: 'The discussion has not converged on a concrete option.',
+          recommendation: null,
+          reservedClass: 'scope-design',
+          whyNotDelegable: 'It changes the agreed product scope.',
+          options: [],
+          discussion: true,
+        },
+      });
+      expect(created.status).toBe(201);
+      const row = created.body as { id: string };
+      // No option exists yet: the typed path cannot invent an approval.
+      expect(
+        (await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'go' })).status,
+      ).toBe(400);
+      const attached = await postJson(port, `/api/notifications/${row.id}/decision-options`, 'board-test-token', {
+        options: [
+          { id: 'go', label: 'Go with shape A', consequence: 'Gru commissions shape A.' },
+          { id: 'stop', label: 'Stop here', consequence: 'Nothing moves.' },
+        ],
+        by: 'gru',
+      });
+      expect(attached).toMatchObject({ status: 200, body: { decidedAt: null, resolvedAt: null } });
+      expect((attached.body as { decision: { options: readonly unknown[] } }).decision.options).toHaveLength(2);
+      // Attaching options records NO choice: follow-through stays refused
+      // until the owner decides.
+      expect(
+        (await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'premature' })).status,
+      ).toBe(409);
+      const events = api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.decision-options');
+      expect(events).toHaveLength(1);
+      expect(events[0]?.payload).toMatchObject({ id: row.id, by: 'gru', option_ids: ['go', 'stop'] });
+      const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'go', by: 'web' });
+      expect(decided).toMatchObject({ status: 200, body: { decidedOption: 'go', resolvedAt: null } });
+      expect((await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'executed' })).status).toBe(200);
+      // Refusal shapes: a typed (non-discussion) decision keeps its
+      // producer-authored options; malformed/empty lists and unknown rows
+      // are refused without touching anything.
+      const typed = await postJson(port, '/api/notifications/needs-owner', 'board-test-token', {
+        title: 'Typed decision',
+        detail: 'producer-authored options',
+        decision: {
+          question: 'Q?',
+          context: 'C',
+          recommendation: null,
+          reservedClass: 'scope-design',
+          whyNotDelegable: 'W',
+          options: [{ id: 'one', label: 'One', consequence: 'c' }],
+          discussion: false,
+        },
+      });
+      const typedId = (typed.body as { id: string }).id;
+      const replaced = await postJson(port, `/api/notifications/${typedId}/decision-options`, 'board-test-token', {
+        options: [{ id: 'two', label: 'Two', consequence: 'c' }],
+      });
+      expect(replaced).toMatchObject({ status: 409, body: { code: 'not_discussion' } });
+      expect(api.getNotification(typedId)?.decision?.options.map((option) => option.id)).toEqual(['one']);
+      expect(
+        (await postJson(port, '/api/notifications/missing/decision-options', 'board-test-token', {
+          options: [{ id: 'two', label: 'Two', consequence: 'c' }],
+        })).status,
+      ).toBe(404);
+      expect(
+        (await postJson(port, `/api/notifications/${typedId}/decision-options`, 'board-test-token', { options: [] })).status,
+      ).toBe(400);
+      expect(
+        (await postJson(port, `/api/notifications/${typedId}/decision-options`, 'board-test-token', {
+          options: [{ id: 'BAD', label: 'x', consequence: 'c' }],
+        })).status,
+      ).toBe(400);
+    } finally {
+      await close();
     }
   });
 });

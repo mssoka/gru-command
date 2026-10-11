@@ -397,6 +397,84 @@ describe('decision follow-through and cross-route guards', () => {
   });
 });
 
+describe('updateNotificationDecisionOptions — the supported discussion bridge', () => {
+  function seedDiscussion(rig: ReturnType<typeof boot>): string {
+    return rig.center.post({
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Which shape?',
+      detail: 'Talk it through with Gru first',
+      decision: decision({ options: [], discussion: true }),
+    }).id;
+  }
+
+  it('attaches agreed options to a discussion-only row: audited, no inferred approval, then the typed path decides', () => {
+    const rig = boot();
+    const id = seedDiscussion(rig);
+    const attached = rig.api.updateNotificationDecisionOptions(
+      id,
+      [
+        { id: 'go', label: 'Go with A', consequence: 'Gru commissions A.' },
+        { id: 'stop', label: 'Stop', consequence: 'Nothing moves.' },
+      ],
+      'gru',
+    );
+    expect(attached?.decision?.options.map((option) => option.id)).toEqual(['go', 'stop']);
+    // Attaching options is not a decision: the row stays undecided and
+    // follow-through remains refused until the owner records a choice.
+    expect(attached?.decidedAt).toBeNull();
+    expect(attached?.resolvedAt).toBeNull();
+    expect(() => rig.api.resolveOwnerDecision(id, 'premature')).toThrow(NotificationDecisionRefusal);
+    const events = rig.api
+      .listEvents({ limit: 100 })
+      .filter((event) => event.kind === 'notification.decision-options' && (event.payload as { id?: string }).id === id);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.payload).toMatchObject({ by: 'gru', option_ids: ['go', 'stop'] });
+    // The owner's recorded choice is the only thing that records a decision.
+    const decided = rig.center.decide(id, 'go', 'owner');
+    expect(decided?.decidedOption).toBe('go');
+    expect(rig.api.resolveOwnerDecision(id, 'executed')?.resolvedAt).not.toBeNull();
+  });
+
+  it('refuses every other row shape with typed codes and an empty option list', () => {
+    const rig = boot();
+    const codeOf = (fn: () => unknown): string => {
+      try {
+        fn();
+      } catch (error) {
+        if (error instanceof NotificationDecisionRefusal) return error.code;
+        throw error;
+      }
+      return 'no-error';
+    };
+    const options = [{ id: 'go', label: 'Go', consequence: 'moves' }];
+    const typed = rig.center.post({
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Typed',
+      detail: 'producer-authored options',
+      decision: decision(),
+    });
+    expect(codeOf(() => rig.api.updateNotificationDecisionOptions(typed.id, options, 'gru'))).toBe('not_discussion');
+    expect(() => rig.api.updateNotificationDecisionOptions(typed.id, [], 'gru')).toThrow(/at least one option/u);
+    expect(() => rig.api.updateNotificationDecisionOptions(typed.id, options, '  ')).toThrow(/by must be non-empty/u);
+    const machine = rig.center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Breaker' });
+    expect(codeOf(() => rig.api.updateNotificationDecisionOptions(machine.id, options, 'gru'))).toBe('not_owner_decision');
+    const notice = rig.center.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Squat' });
+    expect(codeOf(() => rig.api.updateNotificationDecisionOptions(notice.id, options, 'gru'))).toBe('no_decision');
+    const decidedId = seedDiscussion(rig);
+    rig.api.updateNotificationDecisionOptions(decidedId, options, 'gru');
+    rig.center.decide(decidedId, 'go', 'owner');
+    expect(codeOf(() => rig.api.updateNotificationDecisionOptions(decidedId, options, 'gru'))).toBe('decision_recorded');
+    const resolvedId = seedDiscussion(rig);
+    rig.api.resolveNotificationById(resolvedId, 'producer');
+    expect(codeOf(() => rig.api.updateNotificationDecisionOptions(resolvedId, options, 'gru'))).toBe('not_open');
+    expect(rig.api.updateNotificationDecisionOptions('missing', options, 'gru')).toBeNull();
+  });
+});
+
 describe('settlement paths for owner-only notices', () => {
   it('decisions.enforce-gate incidents resolve when a gated call passes (registry-routed owner row)', () => {
     const rig = boot();

@@ -4,7 +4,11 @@ import type { BusEvent, EventBus } from '../events/bus.js';
 import type { DecisionService } from '../decisions/types.js';
 import { DECISION_SURFACE_EVENT_TRIAGE, eventDecisionRequest, redactedText } from '../decisions/questions.js';
 import { requiresTypedDecision, resolveNotificationRouting } from './attention.js';
-import { parseNotificationDecision, type NotificationDecision } from '../ledger/notification-decision.js';
+import {
+  parseNotificationDecision,
+  type NotificationDecision,
+  type NotificationDecisionOption,
+} from '../ledger/notification-decision.js';
 import {
   LedgerApi,
   type NotificationRecord,
@@ -273,6 +277,12 @@ export class NotificationCenter {
   /** Record the owner's typed decision (see LedgerApi.recordNotificationDecision). */
   decide(id: string, optionId: string, by: string): NotificationRecord | null {
     return this.ledger.recordNotificationDecision(id, optionId, by);
+  }
+
+  /** Attach agreed options to a discussion-only decision (see
+   * LedgerApi.updateNotificationDecisionOptions). */
+  attachDecisionOptions(id: string, options: readonly NotificationDecisionOption[], by: string): NotificationRecord | null {
+    return this.ledger.updateNotificationDecisionOptions(id, options, by);
   }
 
   /** Refresh an open incident's detail (same id, same ack state). */

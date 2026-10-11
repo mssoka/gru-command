@@ -616,6 +616,82 @@ describe('gru awareness — wake policy', () => {
     }
   });
 
+  it('a resolved blocked-wake stop no longer suppresses the NEXT block episode (recurrence)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+      awareness.setWakeSink(() => awareness.noteWakeBlocked('native writer uncertain'));
+      const alert = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Needs a wake' });
+      const canonical = `gru-wake-blocked:${alert.id}`;
+      expect(api.getNotification(canonical)).toMatchObject({ routing: 'needs-owner', resolvedAt: null });
+      // The operator closes the notices after the manual recovery.
+      api.resolveNotificationById(canonical, 'operator');
+      expect(api.getNotification(canonical)?.resolvedAt).not.toBeNull();
+      // The machine alert is still pending; the next blocked retry must
+      // post a FRESH stop, not find the closed receipt and stay silent.
+      vi.advanceTimersByTime(5_000);
+      const stops = api.listNotifications({ limit: 100, routing: 'needs-owner' }).filter((row) => row.kind === `gru.wake-blocked.${alert.id}`);
+      expect(stops).toHaveLength(2);
+      const fresh = stops.find((row) => row.id !== canonical);
+      expect(fresh).toMatchObject({ routing: 'needs-owner', ackedAt: null, resolvedAt: null });
+      expect(fresh?.id.startsWith(`${canonical}:`)).toBe(true);
+      // Dedupe holds while the fresh stop is open: no further rows.
+      vi.advanceTimersByTime(15_000);
+      expect(
+        api.listNotifications({ limit: 100, routing: 'needs-owner' }).filter((row) => row.kind === `gru.wake-blocked.${alert.id}`),
+      ).toHaveLength(2);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a resolved failed-wake escalation re-raises on the next exhausted cycle with a fresh identity', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection === null) return;
+        awareness.noteWakeOutcome(true, undefined, injection);
+        awareness.noteWakeTurnFailure('model stream died', injection);
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-21:abc', routing: 'action-required', severity: 'error', title: 'Failing turn' });
+      vi.advanceTimersByTime(60_000);
+      const canonical = 'gru-wake-failed:github.ci-failed_j-21_abc';
+      expect(api.getNotification(canonical)).toMatchObject({ routing: 'needs-owner', resolvedAt: null });
+      api.resolveNotificationById(canonical, 'operator');
+      // A second exhausted cycle for the SAME incident (the machine alert
+      // is still open) must re-raise instead of dying against the closed row.
+      const injection = { text: 'retry', coveredThroughSeq: 0, notificationIds: [row.id] };
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      const escalations = api
+        .listNotifications({ limit: 100, routing: 'needs-owner' })
+        .filter((entry) => entry.kind === 'gru.wake-failed-escalation.github.ci-failed_j-21_abc');
+      expect(escalations.length).toBeGreaterThanOrEqual(2);
+      const fresh = escalations.find((entry) => entry.id !== canonical);
+      expect(fresh).toMatchObject({ resolvedAt: null, ackedAt: null });
+      expect(fresh?.id.startsWith(`${canonical}:`)).toBe(true);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not promote ordinary unresolved machine work to the owner bell by age', () => {
     vi.useFakeTimers();
     try {

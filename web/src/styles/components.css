@@ -1830,6 +1830,21 @@ body {
   grid-area: note;
   color: var(--muted);
   overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.board-owner__context,
+.board-owner__pointer-text {
+  grid-area: meta;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.board-owner__review-body {
+  margin-top: 4px;
+  min-width: 0;
 }
 
 .board-owner__ack,
@@ -3004,7 +3019,11 @@ a.repo-row__name:hover {
 .board-notification--error .board-notification__why,
 .board-notification--error .board-notification__decided,
 .board-notification--error .board-notification__guidance,
+.board-notification--error .board-notification__discuss,
+.board-notification--error .board-notification__discuss-text,
+.board-notification--error .board-notification__option-label,
 .board-notification--error .board-notification__option-consequence,
+.board-notification--error .board-notification__submission,
 .board-notification--error .board-notification__detail-text,
 .board-notification--error .board-notification__detail-kind {
   color: var(--on-state);
@@ -3075,6 +3094,17 @@ a.repo-row__name:hover {
   overflow-wrap: anywhere;
 }
 
+.board-notification__discuss {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  min-width: 0;
+}
+
+.board-notification__discuss-open {
+  justify-self: start;
+}
+
 .board-notification__why,
 .board-notification__decided,
 .board-notification__guidance,
@@ -3113,9 +3143,31 @@ a.repo-row__name:hover {
   overflow-wrap: anywhere;
 }
 
-.board-notification__option-button:disabled {
+.board-notification__option-button:disabled,
+.board-notification__option-button[aria-disabled='true'] {
   opacity: 0.6;
   cursor: default;
+}
+
+.board-notification__options--readonly .board-notification__option-label {
+  font-size: 12px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__submission {
+  font-size: 12px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.board-notification__submission--submitting {
+  color: var(--muted);
+}
+
+.board-notification__submission--refused,
+.board-notification__submission--unconfirmed {
+  color: var(--danger);
 }
 
 .board-notification__option-consequence {

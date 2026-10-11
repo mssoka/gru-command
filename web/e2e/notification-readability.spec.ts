@@ -184,6 +184,76 @@ function feedNotification(): NotificationView {
   };
 }
 
+/** A Book of Lessons proposal row (owner decision 2026-10-07): the
+ * review body is the actual lesson prose and must stay readable. */
+function proposalNotification(): NotificationView {
+  return {
+    id: 'proposal-1',
+    ts: T0,
+    kind: 'lessons.proposal',
+    routing: 'needs-owner',
+    severity: 'info',
+    title: 'Book of Lessons: 2 lesson changes proposed',
+    detail: 'Two lessons changed in the execution chapter — review the exact before/after text before Accept writes them.',
+    agentId: null,
+    shownAt: null,
+    ackedAt: null,
+    resolvedAt: null,
+    resolvedBy: null,
+    decision: null,
+    decidedAt: null,
+    decidedBy: null,
+    decidedOption: null,
+  };
+}
+
+function proposalReviewView(): Record<string, unknown> {
+  return {
+    id: 'lp-1',
+    createdAt: T0,
+    notificationId: 'proposal-1',
+    entries: 2,
+    throughSeq: 9,
+    chapters: [
+      {
+        slug: 'execution-practice',
+        title: { before: 'Execution practice', after: 'Execution practice' },
+        retired: false,
+        summary: { before: 'Restart discipline.', after: 'Restart discipline.' },
+        tags: { before: ['ops'], after: ['ops'] },
+        added: [
+          {
+            slug: 'close-shell',
+            body: 'Close the shell first.\nThen restart.',
+            recurred: 1,
+            tags: ['ops'],
+            previousBody: null,
+            previousRecurred: null,
+            previousTags: null,
+          },
+        ],
+        changed: [
+          {
+            slug: 'drain',
+            body: 'Drain before a roll.',
+            recurred: 3,
+            tags: ['ops'],
+            previousBody: 'Drain.',
+            previousRecurred: 2,
+            previousTags: [],
+          },
+        ],
+        removed: [],
+        provenanceTrimmed: 4,
+        bodiesTrimmed: 0,
+      },
+    ],
+    index: [],
+    decision: null,
+    recovery: null,
+  };
+}
+
 function job(id: string, status: string, title: string): JobView {
   return {
     id,
@@ -236,7 +306,7 @@ function fixtureSnapshot(overrides: Partial<BoardSnapshot> = {}): BoardSnapshot 
         supervision: { state: 'stopped', restarts: 0, breakerOpen: false, stopReason: null, stoppedAt: null },
       },
     ],
-    notifications: [decisionNotification(), machineNotification(), resolvedFeed, closedMachine],
+    notifications: [decisionNotification(), proposalNotification(), machineNotification(), resolvedFeed, closedMachine],
     decisions: {
       enabled: false,
       status: 'disabled',
@@ -262,7 +332,7 @@ interface Seed {
   push(snapshot: BoardSnapshot): void;
 }
 
-async function seedBoard(page: Page, initial: BoardSnapshot): Promise<Seed> {
+async function seedBoard(page: Page, initial: BoardSnapshot, proposal?: Record<string, unknown>): Promise<Seed> {
   if (!isValidSnapshot(initial)) throw new Error('fixture snapshot fails the production isValidSnapshot validator');
   const frame = parseBoardServerFrame({ type: 'board', snapshot: initial });
   if (frame === null || frame.type !== 'board') throw new Error('fixture board frame fails the production parser');
@@ -271,6 +341,9 @@ async function seedBoard(page: Page, initial: BoardSnapshot): Promise<Seed> {
   let current = initial;
   const sockets: WebSocketRoute[] = [];
   await page.route('**/api/board', (route) => route.fulfill({ json: current }));
+  if (proposal !== undefined) {
+    await page.route('**/api/lessons/proposal', (route) => route.fulfill({ json: proposal }));
+  }
   await page.routeWebSocket(/\/board\/ws$/, (ws: WebSocketRoute) => {
     let seeded = false;
     sockets.push(ws);
@@ -433,44 +506,80 @@ test.describe('notification readability — fixed long-content fixtures', () => 
     }
   });
 
-  test('390 / 768 / 1280 widths and a 320px notification container: nothing overflows or clips', async ({ browser }) => {
-    for (const width of [390, 768, 1280]) {
-      const page = await browser.newPage({ viewport: { width, height: 900 } });
+  test('390 / 768 / 1280 widths and a 320px container: expanded content reflows in both themes', async ({ browser }) => {
+    for (const theme of ['light', 'dark'] as const) {
+      for (const width of [390, 768, 1280]) {
+        const page = await browser.newPage({ viewport: { width, height: 900 } });
+        try {
+          const seed = await seedBoard(page, fixtureSnapshot());
+          await pairAndOpenBoard(page);
+          if (theme === 'dark') {
+            await page.locator('#theme-toggle').click();
+            await expect(page.locator('html')).toHaveClass(/dark/);
+          }
+          await settled(page);
+          expect(seed.pageErrors).toEqual([]);
+          expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
+          // EXPAND the diagnostics before measuring: the checked state is
+          // the full open body, never just the collapsed face.
+          const card = page.locator('#board-owner [data-notification-id="decision-1"]');
+          await card.locator('.board-notification__details summary').click();
+          await expect(card.locator('.board-notification__detail-text')).toContainText(LONG_PATH);
+          await settled(page);
+          for (const selector of [
+            '#board-owner [data-notification-id="decision-1"]',
+            '#board-owner [data-notification-id="decision-1"] .board-notification__title',
+            '#board-owner [data-notification-id="decision-1"] .board-notification__detail-text',
+          ]) {
+            const box = await overflows(page, selector);
+            expect(box.scrollWidth, `${selector} @${width} ${theme}`).toBeLessThanOrEqual(box.clientWidth + 1);
+          }
+          // Nonzero expanded geometry: the open block is really rendered.
+          const detailBox = await card.locator('.board-notification__detail-text').boundingBox();
+          expect(detailBox?.width ?? 0, `expanded detail width @${width} ${theme}`).toBeGreaterThan(0);
+          expect(detailBox?.height ?? 0, `expanded detail height @${width} ${theme}`).toBeGreaterThan(0);
+          await captureViewport(page, `${theme}-width-${width}-expanded`, `${theme} board at ${width}px with expanded diagnostics`);
+        } finally {
+          await page.close();
+        }
+      }
+    }
+    // 320px-wide notification container: the panel itself at the required
+    // narrowest width, both themes, with the diagnostics expanded.
+    for (const theme of ['light', 'dark'] as const) {
+      const page = await browser.newPage({ viewport: { width: 320, height: 800 } });
       try {
         const seed = await seedBoard(page, fixtureSnapshot());
         await pairAndOpenBoard(page);
+        if (theme === 'dark') {
+          await page.locator('#theme-toggle').click();
+          await expect(page.locator('html')).toHaveClass(/dark/);
+        }
+        await clickBell(page);
         await settled(page);
         expect(seed.pageErrors).toEqual([]);
         expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
-        for (const selector of [
-          '#board-owner [data-notification-id="decision-1"]',
-          '#board-owner [data-notification-id="decision-1"] .board-notification__title',
-          '#board-owner [data-notification-id="decision-1"] .board-notification__detail-text',
-        ]) {
-          const box = await overflows(page, selector);
-          expect(box.scrollWidth, `${selector} @${width}`).toBeLessThanOrEqual(box.clientWidth + 1);
+        for (const id of ['decision-1', 'machine-1', 'feed-resolved']) {
+          await page.locator(`#notification-list [data-notification-id="${id}"]`).scrollIntoViewIfNeeded();
         }
-        await captureViewport(page, `width-${width}`, `board at ${width}px with the long-content fixture`);
+        await page.locator('#notification-list [data-notification-id="machine-1"] .board-notification__details summary').click();
+        await expect(
+          page.locator('#notification-list [data-notification-id="machine-1"] .board-notification__detail-text'),
+        ).toContainText(LONG_SHA);
+        await settled(page);
+        for (const id of ['decision-1', 'machine-1', 'feed-resolved']) {
+          const panelCard = await overflows(page, `#notification-list [data-notification-id="${id}"]`);
+          expect(panelCard.scrollWidth, `${id} @320 panel ${theme}`).toBeLessThanOrEqual(panelCard.clientWidth + 1);
+        }
+        const expandedBox = await page
+          .locator('#notification-list [data-notification-id="machine-1"] .board-notification__detail-text')
+          .boundingBox();
+        expect(expandedBox?.width ?? 0).toBeGreaterThan(0);
+        expect(expandedBox?.height ?? 0).toBeGreaterThan(0);
+        await captureViewport(page, `${theme}-container-320-panel-expanded`, `${theme}: notification panel at 320px with diagnostics open`);
       } finally {
         await page.close();
       }
-    }
-    // 320px-wide container: the notification panel itself at 320px.
-    const page = await browser.newPage({ viewport: { width: 320, height: 800 } });
-    try {
-      const seed = await seedBoard(page, fixtureSnapshot());
-      await pairAndOpenBoard(page);
-      await clickBell(page);
-      await settled(page);
-      expect(seed.pageErrors).toEqual([]);
-      expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
-      for (const id of ['decision-1', 'machine-1', 'feed-resolved']) {
-        const panelCard = await overflows(page, `#notification-list [data-notification-id="${id}"]`);
-        expect(panelCard.scrollWidth, `${id} @320 panel`).toBeLessThanOrEqual(panelCard.clientWidth + 1);
-      }
-      await captureViewport(page, 'container-320-panel', 'notification panel at a 320px viewport');
-    } finally {
-      await page.close();
     }
   });
 
@@ -507,6 +616,105 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       await captureViewport(page, 'zoom-200-decision', '200% zoom emulation: decision card with Details open');
     } finally {
       await context.close();
+    }
+  });
+
+  test('real 200% text zoom (CSS zoom): the board and the proposal review reflow with nonzero geometry', async ({ browser }) => {
+    // Chromium exposes no text-only zoom; `zoom: 2` on the root scales text
+    // AND layout exactly like browser zoom (the honest approximation, and
+    // the assertions below prove reflow rather than a viewport change). The
+    // 1600px window stands for a 1600px display at 200%: the rendered CSS
+    // layout width is 800px, one of the widths exercised above. (On a
+    // 1280px display the console split keeps its own pre-existing minimum
+    // width and scrolls horizontally; the notification surfaces asserted
+    // here are unaffected by that chrome behavior.)
+    for (const theme of ['light', 'dark'] as const) {
+      const page = await browser.newPage({ viewport: { width: 1600, height: 1200 } });
+      try {
+        const seed = await seedBoard(page, fixtureSnapshot(), proposalReviewView());
+        await pairAndOpenBoard(page);
+        if (theme === 'dark') {
+          await page.locator('#theme-toggle').click();
+          await expect(page.locator('html')).toHaveClass(/dark/);
+        }
+        await page.evaluate(() => {
+          document.documentElement.style.zoom = '2';
+        });
+        await settled(page);
+        expect(seed.pageErrors).toEqual([]);
+        expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
+        // The decision card's expanded evidence block stays rendered.
+        const card = page.locator('#board-owner [data-notification-id="decision-1"]');
+        await card.locator('.board-notification__details summary').click();
+        const detail = card.locator('.board-notification__detail-text');
+        await expect(detail).toContainText(LONG_PATH);
+        const detailBox = await detail.boundingBox();
+        expect(detailBox?.width ?? 0).toBeGreaterThan(0);
+        expect(detailBox?.height ?? 0).toBeGreaterThan(0);
+        const cardOverflow = await overflows(page, '#board-owner [data-notification-id="decision-1"]');
+        expect(cardOverflow.scrollWidth).toBeLessThanOrEqual(cardOverflow.clientWidth + 1);
+        // The proposal review's lesson text is readable prose under zoom.
+        const proposal = page.locator('#board-owner [data-proposal-id="proposal-1"]');
+        await proposal.locator('.board-owner__review > summary').click();
+        const reviewText = proposal.locator('.board-owner__review-text').first();
+        await expect(reviewText).toContainText('Close the shell first');
+        expect(await reviewText.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+        const reviewBox = await reviewText.boundingBox();
+        expect(reviewBox?.width ?? 0).toBeGreaterThan(0);
+        expect(reviewBox?.height ?? 0).toBeGreaterThan(0);
+        const proposalOverflow = await overflows(page, '#board-owner [data-proposal-id="proposal-1"]');
+        expect(proposalOverflow.scrollWidth).toBeLessThanOrEqual(proposalOverflow.clientWidth + 1);
+        await captureViewport(page, `${theme}-text-zoom-200`, `${theme}: real 200% text zoom, decision + proposal review expanded`);
+      } finally {
+        await page.close();
+      }
+    }
+  });
+
+  test('proposal prose and the bell pointer are readable in both themes (expanded review included)', async ({ browser }) => {
+    for (const theme of ['light', 'dark'] as const) {
+      for (const width of [390, 1280]) {
+        const page = await browser.newPage({ viewport: { width, height: 900 } });
+        try {
+          const seed = await seedBoard(page, fixtureSnapshot(), proposalReviewView());
+          await pairAndOpenBoard(page);
+          if (theme === 'dark') {
+            await page.locator('#theme-toggle').click();
+            await expect(page.locator('html')).toHaveClass(/dark/);
+          }
+          await settled(page);
+          expect(seed.pageErrors).toEqual([]);
+          const row = page.locator('#board-owner [data-proposal-id="proposal-1"]');
+          await expect(row).toBeVisible();
+          // Prose is mixed-case readable text, never the label treatment.
+          const context = row.locator('.board-owner__context');
+          await expect(context).toContainText('Two lessons changed');
+          expect(await context.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+          expect(await row.locator('.board-owner__consequence').evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+          // The review loads on open: readable lesson text, nonzero geometry.
+          await row.locator('.board-owner__review > summary').click();
+          const reviewText = row.locator('.board-owner__review-text').first();
+          await expect(reviewText).toContainText('Close the shell first');
+          expect(await reviewText.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+          const reviewBox = await reviewText.boundingBox();
+          expect(reviewBox?.width ?? 0).toBeGreaterThan(0);
+          expect(reviewBox?.height ?? 0).toBeGreaterThan(0);
+          // Accept/Reject survive the readability fix.
+          await expect(row.locator('.board-owner__accept')).toBeVisible();
+          await expect(row.locator('.board-owner__reject')).toBeVisible();
+          const rowOverflow = await overflows(page, '#board-owner [data-proposal-id="proposal-1"]');
+          expect(rowOverflow.scrollWidth).toBeLessThanOrEqual(rowOverflow.clientWidth + 1);
+          expect(await bodyOverflow(page)).toBeLessThanOrEqual(0);
+          // The bell copy is a readable pointer, not a label line.
+          await clickBell(page);
+          const pointer = page.locator('#notification-list .board-owner__pointer-text');
+          await expect(pointer).toContainText('Review the changes and decide in FOR YOU');
+          expect(await pointer.evaluate((element) => getComputedStyle(element).textTransform)).toBe('none');
+          await captureViewport(page, `${theme}-proposal-width-${width}`, `${theme}: proposal review expanded at ${width}px`);
+        } finally {
+          await page.close();
+        }
+      }
     }
   });
 

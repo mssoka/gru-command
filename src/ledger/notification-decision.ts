@@ -96,6 +96,36 @@ function boundedOptionalString(value: unknown, what: string, max: number): strin
 
 /** Strict parse at the write boundary: a malformed decision is a loud
  * producer bug, never a silently dropped owner question. */
+/** Validate one concrete option list (1..4 entries). Shared by the
+ * escalation write boundary and the supported discussion follow-up that
+ * attaches agreed options to an existing discussion-only decision. */
+export function parseDecisionOptions(value: unknown): readonly NotificationDecisionOption[] {
+  if (!Array.isArray(value)) throw new Error('decision.options must be a list');
+  if (value.length > 4) throw new Error('decision.options supports at most 4 options');
+  const options: NotificationDecisionOption[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error('decision.options entries must be objects');
+    }
+    const option = entry as Record<string, unknown>;
+    const id = boundedString(option['id'], 'decision option id', 64);
+    if (!OPTION_ID.test(id)) {
+      throw new Error(`decision option id "${id}" must be a lowercase slug (a-z, 0-9, hyphen)`);
+    }
+    if (seen.has(id)) throw new Error(`decision option id "${id}" is duplicated`);
+    seen.add(id);
+    options.push({
+      id,
+      label: boundedString(option['label'], `decision option "${id}" label`, 120),
+      consequence: boundedString(option['consequence'], `decision option "${id}" consequence`, 400, {
+        allowNewlines: true,
+      }),
+    });
+  }
+  return options;
+}
+
 export function parseNotificationDecision(value: unknown): NotificationDecision {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error('decision must be an object');
@@ -120,31 +150,10 @@ export function parseNotificationDecision(value: unknown): NotificationDecision 
   const discussion = discussionRaw === true;
   const optionsRaw = raw['options'];
   if (!Array.isArray(optionsRaw)) throw new Error('decision.options must be a list');
-  if (optionsRaw.length > 4) throw new Error('decision.options supports at most 4 options');
   if (optionsRaw.length === 0 && !discussion) {
     throw new Error('decision.options requires at least one option unless decision.discussion is true');
   }
-  const options: NotificationDecisionOption[] = [];
-  const seen = new Set<string>();
-  for (const entry of optionsRaw) {
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
-      throw new Error('decision.options entries must be objects');
-    }
-    const option = entry as Record<string, unknown>;
-    const id = boundedString(option['id'], 'decision option id', 64);
-    if (!OPTION_ID.test(id)) {
-      throw new Error(`decision option id "${id}" must be a lowercase slug (a-z, 0-9, hyphen)`);
-    }
-    if (seen.has(id)) throw new Error(`decision option id "${id}" is duplicated`);
-    seen.add(id);
-    options.push({
-      id,
-      label: boundedString(option['label'], `decision option "${id}" label`, 120),
-      consequence: boundedString(option['consequence'], `decision option "${id}" consequence`, 400, {
-        allowNewlines: true,
-      }),
-    });
-  }
+  const options = parseDecisionOptions(optionsRaw);
   return {
     question,
     context,

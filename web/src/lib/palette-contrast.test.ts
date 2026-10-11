@@ -51,11 +51,18 @@ function contrast(vars: Map<string, string>, foreground: string, background: str
 
 /** One declaration from the FIRST block matching the given selector. */
 function declarationIn(css: string, selector: string, property: string): string | null {
-  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const block = new RegExp(`${escaped}\\s*\\{([\\s\\S]*?)\\}`).exec(css);
-  if (block === null) return null;
-  const declaration = new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+);`).exec(block[1]!);
-  return declaration === null ? null : declaration[1]!.trim();
+  // Selector LISTS count: the error-surface override declares several
+  // selectors in one rule, and each of them must resolve to the declared
+  // token (a selector in the middle of a list is as real as the last one).
+  const source = css.replace(/\/\*[\s\S]*?\*\//gu, '');
+  const rule = /([^{}]+)\{([^{}]*)\}/gu;
+  for (const match of source.matchAll(rule)) {
+    const selectors = match[1]!.split(',').map((entry) => entry.trim());
+    if (!selectors.includes(selector)) continue;
+    const declaration = new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+);`, 'u').exec(match[2]!);
+    return declaration === null ? null : declaration[1]!.trim();
+  }
+  return null;
 }
 
 /** The declared opacity of a selector, or null when it declares none. */
@@ -151,6 +158,14 @@ describe('palette contrast (v5)', () => {
       // (in dark, --danger IS --alert).
       const errorOptionToken = colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__option-error');
       expect(errorOptionToken).toBe('on-state');
+      // The discussion guidance, the submission status line and the
+      // read-only option labels must also stay on-state on the alert
+      // surface (R1: the discuss text was omitted from the override and
+      // failed AA on error cards in both themes).
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__discuss')).toBe('on-state');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__discuss-text')).toBe('on-state');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__submission')).toBe('on-state');
+      expect(colorTokenIn(COMPONENTS_CSS, '.board-notification--error .board-notification__option-label')).toBe('on-state');
       const pairs: readonly (readonly [string, string])[] = [
         ['ink', 'card'],
         ['muted', 'card'],

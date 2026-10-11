@@ -43,6 +43,7 @@ import {
   parseStoredNotificationDecision,
   serializeNotificationDecision,
   type NotificationDecision,
+  type NotificationDecisionOption,
 } from './notification-decision.js';
 import {
   canonicalIsoTimestamp,
@@ -494,7 +495,8 @@ export type NotificationDecisionRefusalCode =
   | 'unknown_option'
   | 'decision_recorded'
   | 'not_open'
-  | 'undecided';
+  | 'undecided'
+  | 'not_discussion';
 
 export class NotificationDecisionRefusal extends Error {
   constructor(
@@ -4722,6 +4724,63 @@ export class LedgerApi {
         kind: 'notification.decision',
         agentId: current.agentId,
         payload: { id, optionId, by },
+      });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
+  /** Attach concrete options to an EXISTING discussion-only decision
+   * (owner release 2026-10-11): the supported bridge from a discussion in
+   * chat to a recordable owner choice. Only an undecided, unresolved,
+   * discussion-only `needs-owner` row accepts this; the update is audited
+   * and never records a choice itself — the owner still records the
+   * decision through `recordNotificationDecision`, and follow-through
+   * resolves through `resolveOwnerDecision`. */
+  updateNotificationDecisionOptions(
+    id: string,
+    options: readonly NotificationDecisionOption[],
+    by: string,
+  ): NotificationRecord | null {
+    if (by.trim() === '') throw new Error('decision-options by must be non-empty');
+    if (options.length === 0) throw new Error('decision-options requires at least one option');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      if (current.routing !== 'needs-owner') {
+        throw new NotificationDecisionRefusal(
+          'not_owner_decision',
+          `notification "${id}" is ${current.routing}; only owner decisions accept attached options`,
+        );
+      }
+      if (current.decision === null) {
+        throw new NotificationDecisionRefusal(
+          'no_decision',
+          `notification "${id}" carries no typed decision — no options can be attached`,
+        );
+      }
+      if (current.resolvedAt !== null) {
+        throw new NotificationDecisionRefusal('not_open', `notification "${id}" is already resolved`);
+      }
+      if (current.decidedAt !== null) {
+        throw new NotificationDecisionRefusal(
+          'decision_recorded',
+          `notification "${id}" already records decision "${current.decidedOption}" — its options are not replaced`,
+        );
+      }
+      if (current.decision.discussion !== true) {
+        throw new NotificationDecisionRefusal(
+          'not_discussion',
+          `notification "${id}" is not a discussion decision — its producer-authored options are not replaced`,
+        );
+      }
+      const next: NotificationDecision = { ...current.decision, options: [...options] };
+      this.db
+        .prepare('UPDATE notifications SET decision_json = ? WHERE id = ?')
+        .run(serializeNotificationDecision(next), id);
+      this.appendEvent({
+        kind: 'notification.decision-options',
+        agentId: current.agentId,
+        payload: { id, by, option_ids: options.map((option) => option.id) },
       });
       return this.getNotification(id) as NotificationRecord;
     });

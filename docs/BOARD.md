@@ -245,9 +245,10 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   projection as the board's permanent FOR YOU band, so the two surfaces
   never disagree about what the owner owes (the badge and toasts still
   count needs-owner notifications only); opening it never completes an
-  obligation. A machine
-  alert left unresolved 30 minutes after delivery opens a separate
-  owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
+  obligation. Machine alerts never promote to owner attention
+  by age alone: a machine row leaves the queue when its producer resolves
+  it, and only a concrete typed escalation (never a timer) places an owner
+  decision in FOR YOU. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
   per surface (a display receipt is not an acknowledgement). Owner
   decisions are recorded through the decision endpoint; owner notices
