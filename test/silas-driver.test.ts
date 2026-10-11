@@ -1418,11 +1418,10 @@ describe('silas digest (the four actionable states)', () => {
         const ghRoot = mkdtempSync(join(tmpdir(), 'gru-command-silas-r3-gh-'));
         const binary = join(ghRoot, 'gh-double.mjs');
         const userState = join(ghRoot, 'user-state');
-        // rotated: A's review exists but the B lookup excludes it; same:
-        // the list is genuinely empty and the lookup runs as A.
-        const list = mode === 'rotated'
-          ? JSON.stringify([{ id: 9400, user: { login: 'account-a' }, state: 'COMMENTED', commit_id: sha, body }])
-          : '[]';
+        // Both cases use a covered empty list so this control isolates the
+        // prepared-vs-lookup identity binding. A foreign exact publication
+        // in COMMENTED is unresolved under native R6, not an absence control.
+        const list = '[]';
         writeFileSync(binary, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(list)});\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  ${mode === 'rotated' ? `if (!existsSync(${JSON.stringify(userState)})) { writeFileSync(${JSON.stringify(userState)}, 'b'); process.stdout.write('account-b'); } else { process.stdout.write('account-a'); }` : "process.stdout.write('account-a');"}\n} else {\n  process.stdout.write(${JSON.stringify(`${sha}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
         const escalations: string[] = [];
         chmodSync(binary, 0o755);
