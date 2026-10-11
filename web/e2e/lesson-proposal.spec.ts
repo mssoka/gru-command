@@ -216,9 +216,19 @@ for (const width of [360, 375, 390]) {
         const rect = node.getBoundingClientRect();
         const inViewport = rect.left >= 0 && rect.right <= window.innerWidth && rect.top >= 0 && rect.bottom <= window.innerHeight;
         const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-        return { inViewport, hit: top === node || node.contains(top) };
+        return {
+          inViewport,
+          hit: top === node || (top !== null && node.contains(top)),
+          top: top === null ? null : {
+            tag: top.tagName.toLowerCase(),
+            id: top.id,
+            className: typeof top.className === 'string' ? top.className : '',
+            ariaLabel: top.getAttribute('aria-label'),
+          },
+        };
       });
-      expect(hit).toEqual({ inViewport: true, hit: true });
+      expect(hit.inViewport).toBe(true);
+      expect(hit.hit, `topmost element at action center: ${JSON.stringify(hit.top)}`).toBe(true);
     }
     expect(decisions).toEqual([]);
     expect(pageErrors).toEqual([]);
