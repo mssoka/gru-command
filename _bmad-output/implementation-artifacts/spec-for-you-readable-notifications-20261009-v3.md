@@ -2,7 +2,7 @@
 title: 'Notifications — readable cards and clear owner decisions'
 type: 'feature'
 created: '2026-10-11'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'f738b9b1594081cdbb4929af7be256454951eb43'
 review_loop_iteration: 0
