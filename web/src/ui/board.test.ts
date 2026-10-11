@@ -2740,7 +2740,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.textContent).toContain('Close the shell first.\nThen restart.');
     expect(band.textContent).toContain('updated · recurred 2 → 3 · drain');
     expect(band.textContent).toContain('4 oldest journal handle(s) released to fit');
-    band.querySelector<HTMLButtonElement>('[data-action-id="owner-proposal:lp-1"][data-control="accept"]')!.click();
+    band.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
     await flush();
     expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
     expect(document.getElementById('board-owner')!.querySelector('[data-proposal-id="lp-1"]')).not.toBeNull();
