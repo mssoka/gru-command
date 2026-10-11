@@ -1406,6 +1406,20 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
           options: [{ id: 'two', label: 'Two', consequence: 'c' }],
         })).status,
       ).toBe(404);
+      // A needs-owner row with NO typed decision refuses the bridge with
+      // the documented typed code.
+      api.recordNotification({
+        id: 'notice-without-decision',
+        kind: 'port-squat',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Port occupied',
+        detail: 'bind refused',
+      });
+      const noDecision = await postJson(port, '/api/notifications/notice-without-decision/decision-options', 'board-test-token', {
+        options: [{ id: 'two', label: 'Two', consequence: 'c' }],
+      });
+      expect(noDecision).toMatchObject({ status: 409, body: { code: 'no_decision' } });
       expect(
         (await postJson(port, `/api/notifications/${typedId}/decision-options`, 'board-test-token', { options: [] })).status,
       ).toBe(400);

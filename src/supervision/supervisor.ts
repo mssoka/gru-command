@@ -155,6 +155,9 @@ interface SupervisedAgent {
    * the lane's displayed cause (code review 2026-10-04). */
   stoppedAt: number | null;
   breakerNotificationId: string | null;
+  /** A fenced re-arm whose fresh alert post FAILED: retried on every tick
+   * until the stop has a live bound control again (never a stranded debt). */
+  pendingRearmFenceAlert: { readonly reason: string } | null;
   /** A restart rung is executing: disposed envelopes must not evict us. */
   inRestart: boolean;
   /** Pending backoff timer (a scheduled next rung). */
@@ -503,6 +506,7 @@ export class Supervisor {
         existing.stopReason = null;
         existing.stoppedAt = null;
         existing.breakerNotificationId = null;
+        existing.pendingRearmFenceAlert = null;
         existing.restartRing = [];
       } else {
         // A caller-driven action (a chat message) is human intent: re-arm
@@ -513,6 +517,7 @@ export class Supervisor {
         existing.stoppedAt = null;
         const rearming = existing.breakerNotificationId;
         existing.breakerNotificationId = null;
+        existing.pendingRearmFenceAlert = null;
         existing.restartRing = [];
         existing.consecutiveFailures = 0;
         existing.state = 'watching';
@@ -879,6 +884,7 @@ export class Supervisor {
       stopReason: null,
       stoppedAt: null,
       breakerNotificationId: null,
+      pendingRearmFenceAlert: null,
       inRestart: false,
       backoffTimer: null,
       activityGeneration: 0,
@@ -901,6 +907,11 @@ export class Supervisor {
     const now = this.now();
     this.detectWake(now);
     for (const agent of this.agents.values()) {
+      // A fenced stop whose fresh control failed to post must never wait for
+      // an unrelated event: retry the bind on every tick.
+      if (agent.pendingRearmFenceAlert !== null) {
+        this.raiseFencedAlert(agent, agent.pendingRearmFenceAlert.reason);
+      }
       if (agent.handle === null || agent.state !== 'watching' || agent.breakerOpen) continue;
       // An automatic rate-limit retry waiting out its backoff owns recovery:
       // the failed turn's residual silence must not read as a hang. A
@@ -2016,6 +2027,7 @@ export class Supervisor {
     adopted.stopReason = old.breakerOpen ? old.stopReason : null;
     adopted.stoppedAt = old.breakerOpen ? old.stoppedAt : null;
     adopted.breakerNotificationId = old.breakerNotificationId;
+    adopted.pendingRearmFenceAlert = old.pendingRearmFenceAlert;
     // A turn interrupted by an earlier failed rung (or by the breaker
     // stop) still awaits resume on the next live handle.
     adopted.pendingRecovery = old.pendingRecovery;
@@ -2411,30 +2423,7 @@ export class Supervisor {
     agent.state = 'stopped';
     agent.stopReason = `re-arm fenced: ${reason}`;
     agent.stoppedAt = agent.stoppedAt ?? this.now();
-    const bound = agent.breakerNotificationId === null ? null : this.ledger.getNotification(agent.breakerNotificationId);
-    if (bound === null || bound.resolvedAt !== null) {
-      try {
-        const posted = this.notifications.post({
-          kind: 'supervision.rearm-fenced',
-          routing: 'action-required',
-          severity: 'error',
-          title: `Re-arm fenced: agent ${agent.agentId} stayed stopped`,
-          detail:
-            `The guarded restart was refused by a hold that appeared during the attempt (${reason}). ` +
-            'Resolve the hold, then dispose this alert to retry the re-arm.',
-          agentId: agent.agentId,
-        });
-        agent.breakerNotificationId = posted.id;
-      } catch (error) {
-        // The stop is still recorded and visible on the rail; a transient
-        // ledger failure to raise the alert must not throw out of the
-        // supervision path.
-        this.log('error', 'fenced re-arm alert post failed', {
-          agent_id: agent.agentId,
-          error: String(error),
-        });
-      }
-    }
+    this.raiseFencedAlert(agent, reason);
     this.recordEvent('supervision.rearm-fenced', agent.agentId, {
       notification_id: notificationId,
       reason,
@@ -2444,6 +2433,54 @@ export class Supervisor {
       notification_id: notificationId,
       reason,
     });
+  }
+
+  /** Bind a live retry control to a fenced stop. When the alert that began
+   * the re-arm is consumed (resolved) or unknown, a fresh machine alert is
+   * raised; a failed post is remembered and retried on every tick, so a
+   * ledger hiccup can never strand the stop without a control. Every read
+   * here is guarded: this is a fire-and-forget path. */
+  private raiseFencedAlert(agent: SupervisedAgent, reason: string): void {
+    if (!agent.breakerOpen) {
+      agent.pendingRearmFenceAlert = null;
+      return;
+    }
+    if (agent.pendingRearmFenceAlert === null) agent.pendingRearmFenceAlert = { reason };
+    let bound: ReturnType<LedgerApi['getNotification']> = null;
+    if (agent.breakerNotificationId !== null) {
+      try {
+        bound = this.ledger.getNotification(agent.breakerNotificationId);
+      } catch (error) {
+        // Treat an unreadable binding as gone: raise a fresh control rather
+        // than leaving the stop dependent on a row we cannot verify.
+        this.log('warn', 'bound alert lookup failed — raising a fresh control', {
+          agent_id: agent.agentId,
+          error: String(error),
+        });
+        bound = null;
+      }
+    }
+    if (bound !== null && bound.resolvedAt === null) return; // a live control already exists
+    try {
+      const posted = this.notifications.post({
+        kind: 'supervision.rearm-fenced',
+        routing: 'action-required',
+        severity: 'error',
+        title: `Re-arm fenced: agent ${agent.agentId} stayed stopped`,
+        detail:
+          `The guarded restart was refused by a hold that appeared during the attempt (${reason}). ` +
+          'Resolve the hold, then dispose this alert to retry the re-arm.',
+        agentId: agent.agentId,
+      });
+      agent.breakerNotificationId = posted.id;
+      agent.pendingRearmFenceAlert = null;
+    } catch (error) {
+      agent.pendingRearmFenceAlert = { reason };
+      this.log('error', 'fenced re-arm alert post failed — retrying on tick', {
+        agent_id: agent.agentId,
+        error: String(error),
+      });
+    }
   }
 
   /** Commit an accepted re-arm (breaker cleared, epoch and provider fences
@@ -2464,6 +2501,7 @@ export class Supervisor {
       agent.stopReason = null;
       agent.stoppedAt = null;
       agent.breakerNotificationId = null;
+      agent.pendingRearmFenceAlert = null;
       agent.restartRing = [];
       agent.consecutiveFailures = 0;
       agent.state = 'watching';
@@ -2549,6 +2587,7 @@ export class Supervisor {
     agent.stopReason = null;
     agent.stoppedAt = null;
     agent.breakerNotificationId = null;
+    agent.pendingRearmFenceAlert = null;
     agent.restartRing = [];
     agent.consecutiveFailures = 0;
     agent.state = 'watching';

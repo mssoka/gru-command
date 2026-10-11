@@ -22,7 +22,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'artifact-context.test.ts': 34,
   'attachments.test.ts': 28,
 
-  'awareness.test.ts': 84,
+  'awareness.test.ts': 85,
 
 
   'bmad-legacy-retirement.test.ts': 5,
@@ -156,7 +156,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
   'suite-shape.test.ts': 2,
-  'supervisor.test.ts': 101,
+  'supervisor.test.ts': 102,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 14,
   'uploads-dir.test.ts': 3,

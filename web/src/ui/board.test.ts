@@ -3426,11 +3426,20 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const css = readFileSync(file, 'utf8');
     const contextRule = /\.board-owner__context,\s*\.board-owner__pointer-text\s*\{([^}]*)\}/u.exec(css)?.[1] ?? '';
     expect(contextRule.replace(/\s+/gu, ' ')).toContain('grid-area: context;');
-    // Both row templates carry the track, so the prose can never share the
-    // label's cell (the R1 overlap).
-    expect(css).toContain("'context action'");
-    const narrow = css.slice(css.indexOf('@media (max-width: 560px) {'));
-    expect(narrow.slice(0, narrow.indexOf('\n}\n'))).toContain("'context'");
+    // EACH desktop template carries the track by name, so the prose can
+    // never share the label's cell (the R1 overlap). A global toContain
+    // would pass while one of the two templates regressed.
+    const compact = (block: string | undefined): string => (block ?? '').replace(/\s+/gu, ' ');
+    const desktopBase = /\.board-owner__row\s*\{([^}]*)\}/u.exec(css)?.[1];
+    const desktopProposal = /\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(css)?.[1];
+    expect(compact(desktopBase)).toContain("'context action'");
+    expect(compact(desktopProposal)).toContain("'context action'");
+    const narrowStart = css.indexOf('@media (max-width: 560px) {');
+    const narrow = css.slice(narrowStart, css.indexOf('\n}\n', narrowStart));
+    expect(compact(/\.board-owner__row\s*\{([^}]*)\}/u.exec(narrow)?.[1])).toContain("'context'");
+    expect(compact(/\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(narrow)?.[1])).toContain("'context'");
+    // The themed Go-to control follows the narrow alignment group too.
+    expect(narrow).toContain('.board-owner__goto,');
     // The bell pointer's Go-to control is not the one unstyled button.
     const gotoRule = /\.board-owner__goto\s*\{([^}]*)\}/u.exec(css)?.[1] ?? '';
     expect(gotoRule).toContain('grid-area: action;');

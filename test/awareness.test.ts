@@ -690,6 +690,53 @@ describe('gru awareness — wake policy', () => {
     }
   });
 
+  it('an OPEN failed-wake escalation outside the newest page window still dedupes (uncapped exact-kind lookup)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection === null) return;
+        awareness.noteWakeOutcome(true, undefined, injection);
+        awareness.noteWakeTurnFailure('model stream died', injection);
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-31:abc', routing: 'action-required', severity: 'error', title: 'Failing turn' });
+      vi.advanceTimersByTime(60_000); // the bound is spent: one escalation
+      const canonical = 'gru-wake-failed:github.ci-failed_j-31_abc';
+      expect(api.getNotification(canonical)).toMatchObject({ resolvedAt: null });
+      // More than a 1000-row page of NEWER needs-owner rows: a paged dedupe
+      // would miss the still-open canonical stop and post a duplicate :2.
+      vi.advanceTimersByTime(1_000);
+      for (let index = 0; index < 1_001; index += 1) {
+        api.recordNotification({
+          id: `fwarena-${String(index).padStart(4, '0')}`,
+          kind: 'test.flood',
+          routing: 'needs-owner',
+          severity: 'info',
+          title: `flood ${index}`,
+        });
+      }
+      const injection = { text: 'again', coveredThroughSeq: 0, notificationIds: [row.id] };
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      const stops = api
+        .listNotifications({ limit: 5_000, routing: 'needs-owner' })
+        .filter((entry) => entry.kind === 'gru.wake-failed-escalation.github.ci-failed_j-31_abc');
+      expect(stops).toHaveLength(1);
+      expect(stops[0]?.id).toBe(canonical);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a resolved failed-wake escalation re-raises on the next exhausted cycle with a fresh identity', () => {
     vi.useFakeTimers();
     try {

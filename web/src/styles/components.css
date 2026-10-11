@@ -2007,6 +2007,7 @@ body {
 
   .board-owner__ack,
   .board-owner__open,
+  .board-owner__goto,
   .board-owner__nolink {
     justify-self: start;
   }

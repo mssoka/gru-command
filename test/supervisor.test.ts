@@ -3457,6 +3457,44 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
     }
   });
 
+  it('a ledger failure during the re-arm commit is contained and leaves a live fenced control', async () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'commit-fail-job', repo: 'fixture', title: 'commit-fail lane' });
+      h.api.setJobStatus('commit-fail-job', 'working');
+      h.api.registerAgent({ id: 'commit-fail-agent', role: 'minion', jobId: 'commit-fail-job' });
+      const handle = new FakeHandle('minion', 'commit-fail-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, unknown>;
+        completeRearm(agent: unknown, id: string | null): Promise<void>;
+      };
+      const agent = internals.agents.get('commit-fail-agent');
+      expect(agent).toBeDefined();
+      // The re-arm event write fails mid-commit: it must be contained (the
+      // fire-and-forget promise can never reject into main) and the stop
+      // must end fenced with a fresh bound control.
+      const original = h.api.appendCustomEvent.bind(h.api);
+      h.api.appendCustomEvent = ((input: Parameters<LedgerApi['appendCustomEvent']>[0]) => {
+        if (input.kind === 'supervision.rearmed') throw new Error('ledger write failed');
+        return original(input);
+      }) as typeof h.api.appendCustomEvent;
+      await internals.completeRearm(agent, null);
+      h.api.appendCustomEvent = original;
+      expect(h.supervisor.viewFor('commit-fail-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(h.registry.spawnCalls).toHaveLength(0); // the rung never started
+      const fenced = h.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(fenced).toMatchObject({ routing: 'action-required', resolvedAt: null });
+      // The fresh control drives a successful retry once the ledger writes.
+      h.registry.spawnImpl = async (role) => new FakeHandle(role, 'commit-fail-resumed', null);
+      expect(h.supervisor.onNotificationDisposed(fenced!.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(h.registry.spawnCalls).toHaveLength(1));
+    } finally {
+      h.dispose();
+    }
+  });
+
   it('a fence that appears DURING the spawn await disposes the fresh handle unused (no adopt, no replay)', async () => {
     const h = boot();
     h.supervisor.start();
