@@ -9524,7 +9524,13 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     const absentPost = vi.fn();
     const absentWave = new WaveRunner({
       ledger: absentFix.ledger, worktrees: durabilityPort(),
-      poster: { post: absentPost, reconcile: vi.fn(async () => null), authenticatedActor: async () => 'gru-bot' },
+      poster: {
+        post: absentPost,
+        reconcile: vi.fn(async (call: { readonly onLookupIdentity?: (actor: string) => void }) => {
+          call.onLookupIdentity?.('gru-bot');
+          return null;
+        }),
+      },
       reviewArtifactRoot: absentFix.artifacts,
       spawner: vi.fn() as unknown as AgentSpawner,
     });
@@ -9600,7 +9606,14 @@ describe('formal GitHub publication durability and restart reconciliation', () =
       const wave = new WaveRunner({
         ledger: fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: fix.artifacts,
         spawner: vi.fn() as unknown as AgentSpawner,
-        poster: { post: vi.fn(), reconcile: vi.fn(async () => null), authenticatedActor: async () => current },
+        poster: {
+          post: vi.fn(),
+          // The lookup reports the account it actually authenticated as.
+          reconcile: vi.fn(async (call: { readonly onLookupIdentity?: (actor: string) => void }) => {
+            call.onLookupIdentity?.(current);
+            return null;
+          }),
+        },
         escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
       });
       await wave.recoverInterruptedRounds();
@@ -9652,5 +9665,43 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     expect(fix.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
     expect(pendingPublicationAttempt(fix.ledger, round.id)?.kind).toBe('unresolved-attempt');
     expect(escalations.join('\n')).toMatch(/stays unresolved|undecidable/u);
+  }, 120_000);
+
+  it('binds restart absence to the identity the lookup actually used (native R3)', async () => {
+    // Prepared as account A; the restart's real reconciliation authenticates
+    // as B and filters A's surviving review away; credentials return to A
+    // afterwards. Absence must stay bound to the LOOKUP identity (B), so no
+    // absence certificate and no automatic same-head publication result.
+    const fix = durabilityFixture('r3-lookup-identity');
+    const jobId = 'job-r3-lookup-identity';
+    try { fix.repo.git(['remote', 'add', 'origin', 'https://github.com/acme/fixture.git']); }
+    catch { fix.repo.git(['remote', 'set-url', 'origin', 'https://github.com/acme/fixture.git']); }
+    fix.ledger.addJob({ id: jobId, repo: 'fixture', title: 'r3 lookup identity', baseBranch: 'main', briefing: 'review' });
+    fix.ledger.setJobStatus(jobId, 'working');
+    fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/77');
+    const round = fix.ledger.addRound({ jobId, lenses: ['blind'], targetRef: fix.target });
+    fix.ledger.setRoundStatus(round.id, 'live');
+    const { attemptPayload } = seedAttempt(fix, jobId, round.id, fix.target);
+    fix.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'account-a', host: 'github.com', targetSha: fix.target } });
+    const committedBody = readFileSync(attemptPayload.publicationFile, 'utf8');
+    const ghRoot = mkdtempSync(join(tmpdir(), 'perkins-gh-r3-lookup-'));
+    dirs.push(ghRoot);
+    const binary = join(ghRoot, 'gh-double.mjs');
+    const userState = join(ghRoot, 'user-state');
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(JSON.stringify([{ id: 9400, user: { login: 'account-a' }, state: 'COMMENTED', commit_id: ${JSON.stringify(fix.target)}, body: ${JSON.stringify(committedBody)} }]));\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  if (!existsSync(${JSON.stringify(userState)})) { writeFileSync(${JSON.stringify(userState)}, 'b'); process.stdout.write('account-b'); } else { process.stdout.write('account-a'); }\n} else {\n  process.stdout.write(${JSON.stringify(`${fix.target}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
+    chmodSync(binary, 0o755);
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger: fix.ledger, worktrees: durabilityPort(), reviewArtifactRoot: fix.artifacts,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      poster: new GhPrPoster(binary),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    await wave.recoverInterruptedRounds();
+    expect(fix.ledger.latestRoundEvent(round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
+    expect(pendingPublicationAttempt(fix.ledger, round.id)?.kind).toBe('unresolved-attempt');
+    expect(fix.ledger.getRound(round.id)?.status).toBe('aborted');
+    expect(escalations.join('\n')).toMatch(/cannot be certified absent/u);
+    expect(escalations.join('\n')).toMatch(/account-b/u);
   }, 120_000);
 });

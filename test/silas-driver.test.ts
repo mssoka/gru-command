@@ -52,11 +52,12 @@ import {
   PUBLICATION_IDENTITY_EVENT,
   PUBLICATION_REBIND_UNRESOLVED_EVENT,
 } from '../src/dispatch/publication-evidence.js';
-import { WaveRunner } from '../src/dispatch/perkins.js';
+import { GhPrPoster, WaveRunner } from '../src/dispatch/perkins.js';
 import type { WorktreePort } from '../src/dispatch/worktree-port.js';
 import type { AgentSpawner } from '../src/dispatch/service.js';
 import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import type { AgentCapabilities, AgentHandle, RuntimeEvent } from '../src/runtime/types.js';
 import type { AgentSupervisionView } from '../src/supervision/supervisor.js';
 import type { EventRecord, JobDeliverable, JobRecord, RoundRecord } from '../src/ledger/api.js';
@@ -1340,8 +1341,12 @@ describe('silas digest (the four actionable states)', () => {
           ledger: h.ledger, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
           reviewArtifactRoot: artifacts, spawner: vi.fn() as unknown as AgentSpawner,
           poster: {
-            post: vi.fn(), reconcile: vi.fn(async () => null),
-            authenticatedActor: async () => (mode === 'rotated-identity' ? 'account-b' : 'account-a'),
+            post: vi.fn(),
+            // The lookup reports the account it actually authenticated as.
+            reconcile: vi.fn(async (call: { readonly onLookupIdentity?: (actor: string) => void }) => {
+              call.onLookupIdentity?.(mode === 'rotated-identity' ? 'account-b' : 'account-a');
+              return null;
+            }),
           },
         });
         return { round, wave };
@@ -1365,6 +1370,76 @@ describe('silas digest (the four actionable states)', () => {
       expect(h.ledger.latestRoundEvent(same.round.id, PUBLICATION_ABSENT_EVENT)).not.toBeNull();
       expect((await digestOf()).prWithoutReview).toMatchObject([
         { jobId: 'clean-r2-same', cleanAbort: { roundId: same.round.id, ruleId: 'clean-abort-service-restart' } },
+      ]);
+    } finally {
+      rmSync(artifacts, { recursive: true, force: true });
+      rmSync(repo, { recursive: true, force: true });
+      h.cleanup();
+    }
+  }, 120_000);
+
+  it('does not offer a clean-abort re-arm after a real-poster recovery whose lookup ran as a different account (native R3)', async () => {
+    // Real GhPrPoster reconciliation: the lookup authenticates as B (which
+    // filters A's surviving review away) while the prepared identity is A.
+    // The absence certificate must stay bound to the LOOKUP identity, so
+    // the shared digest must not offer a re-arm; the same-identity case
+    // keeps its credible bounded-absence clear.
+    const h = makeLedger();
+    const artifacts = mkdtempSync(join(tmpdir(), 'gru-command-silas-r3-artifacts-'));
+    const repo = mkdtempSync(join(tmpdir(), 'gru-command-silas-r3-repo-'));
+    try {
+      execFileSync('git', ['init', repo], { stdio: 'ignore' });
+      execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://git.example.invalid/acme/fixture.git']);
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      const seed = (jobId: string, sha: string, mode: 'rotated' | 'same') => {
+        addJobWithDelivery(h.ledger, jobId, { prUrl: `https://git.example.invalid/pull/${jobId}` });
+        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha } });
+        const round = h.ledger.addRound({ jobId, targetRef: sha });
+        h.ledger.setRoundStatus(round.id, 'live');
+        h.ledger.setJobStatus(jobId, 'in-review');
+        const roundDir = join(artifacts, round.id);
+        mkdirSync(roundDir, { recursive: true });
+        const body = '# Perkins Code Review\n\n**Verdict: READY TO MERGE**\n';
+        const publicationFile = join(roundDir, 'perkins-report.publication.md');
+        writeFileSync(publicationFile, body, 'utf8');
+        writeFileSync(join(roundDir, 'manifest.json'), JSON.stringify({ repoPath: repo }), 'utf8');
+        h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId: round.id, payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
+          url: `https://git.example.invalid/pull/${jobId}`, host: 'git.example.invalid',
+          targetSha: sha, baseSha: 'b'.repeat(40),
+          publicationFile, publicationSha256: createHash('sha256').update(body).digest('hex'), reviewEvent: 'APPROVE',
+        } });
+        h.ledger.appendCustomEvent({ kind: PUBLICATION_IDENTITY_EVENT, jobId, roundId: round.id, payload: { actor: 'account-a', host: 'git.example.invalid', targetSha: sha } });
+        const ghRoot = mkdtempSync(join(tmpdir(), 'gru-command-silas-r3-gh-'));
+        const binary = join(ghRoot, 'gh-double.mjs');
+        const userState = join(ghRoot, 'user-state');
+        // rotated: A's review exists but the B lookup excludes it; same:
+        // the list is genuinely empty and the lookup runs as A.
+        const list = mode === 'rotated'
+          ? `[{ id: 9400, user: { login: 'account-a' }, state: 'COMMENTED', commit_id: ${JSON.stringify(sha)}, body: ${JSON.stringify(body)} }]`
+          : '[]';
+        writeFileSync(binary, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from 'node:fs';\nconst input = readFileSync(0, 'utf8');\nconst argv = process.argv.slice(2);\nif (argv.some((entry) => entry.includes('/reviews?'))) {\n  process.stdout.write(${JSON.stringify(list)});\n} else if (argv.includes('user') && !argv.some((entry) => entry.includes('/'))) {\n  ${mode === 'rotated' ? `if (!existsSync(${JSON.stringify(userState)})) { writeFileSync(${JSON.stringify(userState)}, 'b'); process.stdout.write('account-b'); } else { process.stdout.write('account-a'); }` : "process.stdout.write('account-a');"}\n} else {\n  process.stdout.write(${JSON.stringify(`${sha}\t${'b'.repeat(40)}\n`)});\n}\n`, 'utf8');
+        const wave = new WaveRunner({
+          ledger: h.ledger, worktrees: { listWorktrees: () => [] } as unknown as WorktreePort,
+          reviewArtifactRoot: artifacts, spawner: vi.fn() as unknown as AgentSpawner,
+          poster: new GhPrPoster(binary),
+        });
+        return { round, wave };
+      };
+
+      const rotated = seed('clean-r3-rotated', 'sha-r3-rotated', 'rotated');
+      await rotated.wave.recoverInterruptedRounds();
+      expect(h.ledger.getRound(rotated.round.id)?.status).toBe('aborted');
+      expect(h.ledger.latestRoundEvent(rotated.round.id, PUBLICATION_ABSENT_EVENT)).toBeNull();
+      expect((await digestOf()).prWithoutReview.filter((row) => row.jobId === 'clean-r3-rotated')).toEqual([]);
+
+      const same = seed('clean-r3-same', 'sha-r3-same', 'same');
+      await same.wave.recoverInterruptedRounds();
+      expect(h.ledger.latestRoundEvent(same.round.id, PUBLICATION_ABSENT_EVENT)).not.toBeNull();
+      expect((await digestOf()).prWithoutReview).toMatchObject([
+        { jobId: 'clean-r3-same', cleanAbort: { roundId: same.round.id, ruleId: 'clean-abort-service-restart' } },
       ]);
     } finally {
       rmSync(artifacts, { recursive: true, force: true });
