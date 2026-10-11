@@ -1,4 +1,4 @@
-import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type Locator, type Page, type WebSocketRoute } from '@playwright/test';
 import {
   isValidLessonProposal,
   isValidSnapshot,
@@ -147,6 +147,47 @@ interface Box {
   readonly width: number;
 }
 
+/** Clear the hit target from sticky chrome using bounded, real page scrolls.
+ * The strict viewport/hit assertions below still fail if the control remains
+ * covered or cannot be brought fully on screen. */
+async function scrollFullyIntoView(locator: Locator): Promise<void> {
+  await locator.first().evaluate((element) => {
+    element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    const pad = 8;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const rect = element.getBoundingClientRect();
+      const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      if (top !== null && top !== element && !element.contains(top)) {
+        const cover = top.getBoundingClientRect();
+        const downNeed = Math.max(0, cover.bottom + pad - rect.top);
+        const upNeed = Math.max(0, rect.bottom - (cover.top - pad));
+        const roomDown = Math.max(0, window.innerHeight - pad - rect.bottom);
+        const roomUp = Math.max(0, rect.top - pad);
+        const canDown = downNeed > 0.5 && downNeed <= roomDown;
+        const canUp = upNeed > 0.5 && upNeed <= roomUp;
+        if (canDown && (!canUp || downNeed <= upNeed)) {
+          window.scrollBy(0, -downNeed);
+          continue;
+        }
+        if (canUp) {
+          window.scrollBy(0, upNeed);
+          continue;
+        }
+        break;
+      }
+      if (rect.bottom > window.innerHeight - pad) {
+        window.scrollBy(0, rect.bottom - (window.innerHeight - pad));
+        continue;
+      }
+      if (rect.top < pad) {
+        window.scrollBy(0, rect.top - pad);
+        continue;
+      }
+      break;
+    }
+  });
+}
+
 for (const width of [360, 375, 390]) {
   test(`the open proposal review stays one column and reachable with chat closed at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 });
@@ -208,9 +249,7 @@ for (const width of [360, 375, 390]) {
     // Accept and Reject: on screen and the topmost element at their centres.
     for (const selector of ['.board-owner__accept', '.board-owner__reject']) {
       const button = row.locator(selector);
-      // Minimal nearest placement can leave a fixed chat FAB over the action;
-      // center it before the strict on-screen/hit-target check.
-      await button.evaluate((node) => node.scrollIntoView({ block: 'center', inline: 'nearest' }));
+      await scrollFullyIntoView(button);
       await expect(button).toBeEnabled();
       const hit = await button.evaluate((node) => {
         const rect = node.getBoundingClientRect();
