@@ -1,3 +1,4 @@
+import type { BoardSnapshot, MailboxItemView } from '../src/lib/board-protocol.js';
 /**
  * ──────────────────────────── DEV TOOLING ONLY ────────────────────────────
  * Mock Gru chat socket for frontend development (E5). Implements the WS
@@ -239,8 +240,21 @@ function mergedReceiptStamp(): string {
 }
 
 function sampleSnapshot(): unknown {
-  const snapshot = defaultSampleSnapshot();
-  return boardMode === 'clear-needs-you' ? clearNeedsYouVariant(snapshot) : snapshot;
+  const snapshot = defaultSampleSnapshot() as BoardSnapshot;
+  const source = (boardMode === 'clear-needs-you' ? clearNeedsYouVariant(snapshot) : snapshot) as BoardSnapshot;
+  const jobs = source.repos.flatMap((repo) => repo.jobs);
+  const descriptors = boardMode === 'clear-needs-you' ? [] : [
+    { id: 'demo-api-payment-fix', labels: ['lens failed', 'action-required'] },
+    { id: 'demo-api-conflict-probe', labels: ['PR conflicting'] },
+  ];
+  const items: MailboxItemView[] = descriptors.map(({ id, labels }) => {
+    const job = jobs.find((candidate) => candidate.id === id)!;
+    return { id: `job:${id}`, jobId: id, subject: `job:${id}`, title: job.title, kind: 'job', basis: `mock-basis:${id}`,
+      reasons: labels.map((label) => ({ label, signal: label.replaceAll(' ', '-'), basis: `mock-reason:${label}` })),
+      state: 'needs-gru', owner: 'gru', disposition: null, receipt: null, notificationIds: id === 'demo-api-payment-fix' ? ['mock-n5'] : [],
+      producerOwned: false, references: [], restrictions: [], attentionKey: `mock-attention:${id}` };
+  });
+  return { ...source, mailbox: { items, counts: { threads: items.length, incidents: 0, notifications: boardMode === 'clear-needs-you' ? 0 : 1, needsGru: items.length } } };
 }
 
 /** The clear variant: drop the live machine row, settle the needs-you

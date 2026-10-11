@@ -280,3 +280,19 @@ names anywhere, ever.
 - E2E (`web/e2e/`): mock board render + transcript drawer; real-service
   board (API-seeded jobs, live push, crew rail, real transcript open +
   search, 401 doors, phone board-first).
+
+## Shared FOR GRU mailbox (GH-305)
+
+The server's `mailbox` snapshot is the only FOR GRU membership authority.
+Job threads aggregate exact-basis reasons (blocked/error, current review failure,
+PR conflict, machine alerts and live obligations); unbound incidents have their
+own rows. A concluded parent never hides a blocked child. The header separately
+counts **threads**, **incidents**, and source **notifications**. Waiting and
+delegated items remain inspectable with their owner, dependency, recheck,
+control/follow-up references, restrictions and delivery receipt. Source job
+statuses and child reports are never rewritten by mailbox reconciliation.
+
+An absent mailbox means **unavailable**, not guessed eligibility or a clean
+queue. FOR YOU, notification acknowledgements, and other bands keep their
+existing authority. The mailbox is read-only on the board; disclosure does not
+acknowledge or resolve anything.

@@ -978,4 +978,15 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE pending_directives ADD COLUMN work_revision INTEGER;
     `,
   },
+  {
+    id: 25,
+    name: 'gru-mailbox',
+    sql: `
+      CREATE TABLE gru_mailbox (
+        id TEXT PRIMARY KEY,
+        item TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
 ];
