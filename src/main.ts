@@ -43,6 +43,7 @@ import { reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { PipelineService } from './dispatch/pipeline.js';
+import { IntakeService } from './intake/service.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
@@ -1425,8 +1426,10 @@ async function main(): Promise<number> {
         spawn: (spawnOptions) => registry.spawn('silas', spawnOptions ?? {}),
       })
     : null;
+  const intake = new IntakeService({ dataDir: config.dataDir, workspaceRoot: config.workspaceRoot, uploadsDir });
   const dispatchServer = createDispatchServer({
     config,
+    intake,
     dispatch: dispatcher,
     wave,
     ledger,

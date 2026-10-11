@@ -9,7 +9,7 @@ import { dirname, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ModuleKind, ScriptTarget, transpileModule } from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createArtifactContext, ArtifactContextError, type ArtifactSource } from '../src/artifacts/context.js';
+import { createArtifactContext, createPreviewArtifactContext, ArtifactContextError, type ArtifactSource } from '../src/artifacts/context.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 
 const roots: string[] = [];
@@ -687,5 +687,93 @@ describe('explicit GC artifact context (#293)', () => {
     context.publishDocument({ path: 'spec.md', contents: 'approved', sources, approvalId: 'owner' });
     expect(protectedPaths.map(snapshot)).toEqual(before);
     expect(relative(f.dataDir, context.operationalDirectory)).toMatch(/^projects\//u);
+  });
+});
+
+describe('operational-only intake artifact binding (#296)', () => {
+  it('needs only a registered repo and logical intake id, never creates a job/lane/document, and retains revision workflow identities', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gru-preview-artifact-')));
+    roots.push(root);
+    const repoPath = join(root, 'repo');
+    mkdirSync(repoPath);
+    git(repoPath, ['init', '-q']);
+    const dataDir = join(root, 'private-home');
+    const input = { dataDir, repoPath, intakeId: 'intake-296', workflow };
+    const context = createPreviewArtifactContext(input);
+    const reference = context.writeOperational({ path: 'revisions/r1.json', contents: '{"executable":false}', sources });
+    expect(reference).toMatchObject({ intakeId: 'intake-296', scope: 'operational', approvalId: null, workflow });
+    expect(reference).not.toHaveProperty('jobId');
+    expect(context).not.toHaveProperty('publishDocument');
+    expect(context).not.toHaveProperty('knowledgeDirectory');
+    expect(context.readOperational('revisions/r1.json')).toBe('{"executable":false}');
+    expect(existsSync(join(dataDir, 'projects', context.projectKey, 'jobs'))).toBe(false);
+    expect(existsSync(join(repoPath, 'gru-output'))).toBe(false);
+    expect(git(repoPath, ['worktree', 'list', '--porcelain']).match(/^worktree /gmu)).toHaveLength(1);
+    expect(git(repoPath, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+    const refreshedWorkflow = { id: 'gru-build@2', sha256: hash('new owned workflow') };
+    const refreshed = createPreviewArtifactContext({ ...input, workflow: refreshedWorkflow });
+    expect(refreshed.readOperational('revisions/r1.json')).toBe('{"executable":false}');
+    expect(refreshed.writeOperational({ path: 'revisions/r2.json', contents: 'new revision', sources }).workflow).toEqual(refreshedWorkflow);
+    expect(() => refreshed.writeOperational({ path: 'revisions/r1.json', contents: '{"executable":false}', sources })).toThrow('different');
+    linkSync(join(context.operationalDirectory, 'revisions/r1.json'), join(root, 'foreign-hardlink'));
+    expect(() => context.readOperational('revisions/r1.json')).toThrow('foreign hardlinks');
+  });
+});
+
+describe('existing-only intake artifact opening', () => {
+  it('opens no absent/empty namespace and never mutates a healthy existing context on open', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gru-preview-existing-')));
+    roots.push(root);
+    const repoPath = join(root, 'repo');
+    mkdirSync(repoPath);
+    git(repoPath, ['init', '-q']);
+    const dataDir = join(root, 'private-home');
+    const input = { dataDir, repoPath, intakeId: 'intake-296', workflow };
+    expect(createPreviewArtifactContext(input, 'existing')).toBe(null);
+    expect(existsSync(dataDir)).toBe(false);
+    const namespace = join(dataDir, 'projects', hash(repoPath), 'intakes', input.intakeId);
+    mkdirSync(namespace, { recursive: true, mode: 0o700 });
+    const empty = snapshot(dataDir);
+    expect(createPreviewArtifactContext(input, 'existing')).toBe(null);
+    expect(snapshot(dataDir)).toBe(empty);
+    const created = createPreviewArtifactContext(input);
+    created.writeOperational({ path: 'requests/r1/proposal.json', contents: 'exact', sources });
+    const before = snapshot(dataDir);
+    const opened = createPreviewArtifactContext(input, 'existing');
+    expect(opened?.readOperational('requests/r1/proposal.json')).toBe('exact');
+    expect(snapshot(dataDir)).toBe(before);
+    rmSync(join(namespace, 'context.json'));
+    const damaged = snapshot(dataDir);
+    expect(() => createPreviewArtifactContext(input, 'existing')).toThrow('binding is missing');
+    expect(snapshot(dataDir)).toBe(damaged);
+  });
+
+  it('distinguishes genuinely absent artifacts from either orphan side and preserves exact publication recovery', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'gru-preview-pair-')));
+    roots.push(root);
+    const repoPath = join(root, 'repo');
+    mkdirSync(repoPath);
+    git(repoPath, ['init', '-q']);
+    const dataDir = join(root, 'private-home');
+    const context = createPreviewArtifactContext({ dataDir, repoPath, intakeId: 'intake-296', workflow });
+    const path = 'requests/r1/proposal.json';
+    expect(context.hasOperational(path)).toBe(false);
+    const write = { path, contents: 'exact', sources };
+    context.writeOperational(write);
+    const payload = join(context.operationalDirectory, path);
+    const receipt = join(dataDir, 'projects', context.projectKey, 'intakes', 'intake-296', 'references', `${hash(path)}.json`);
+    const original = readFileSync(receipt);
+    expect(context.hasOperational(path)).toBe(true);
+    rmSync(receipt);
+    expect(() => context.hasOperational(path)).toThrow('payload/receipt pair is incomplete');
+    expect(() => context.writeOperational(write)).toThrow('receipt missing');
+    writeFileSync(receipt, original, { mode: 0o600 });
+    rmSync(payload);
+    expect(() => context.hasOperational(path)).toThrow('payload/receipt pair is incomplete');
+    context.writeOperational(write);
+    expect(context.readOperational(path)).toBe('exact');
+    expect(readFileSync(receipt)).toEqual(original);
+    writeFileSync(payload, 'damaged');
+    expect(() => context.readOperational(path)).toThrow('does not match');
   });
 });

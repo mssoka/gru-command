@@ -18,11 +18,15 @@ The config file is always `<instance dir>/config.toml`.
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
 the supported installation path. It reads prompts from `/dev/tty`, so a
 `curl | bash` install remains one invocation, probes runtime CLIs, asks
-for managed repos, offers per-repo BMAD provisioning for the GC-managed
-runtime ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same
+which real repository directories to validate during setup, checks Git roots and GC worktree setup without provisioning
+or inspecting independent BMAD ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same
 **complete teaching config** as the generator below. Every concrete
 default is active; optional role/runtime overrides are shown commented
-because activating a placeholder would change precedence.
+because activating a placeholder would change precedence. The selection is not
+a management whitelist: the board discovers workspace Git entries live. Interactive
+setup excludes linked repo entries from validation defaults, without changing their
+links or the board's discovery behavior; explicit headless selection of a linked
+repo still fails before writes.
 
 True headless use is explicit: `--no-interact` accepts documented
 defaults, and optional `--answers '<json>'` may contain only non-secret
@@ -310,8 +314,9 @@ unchanged_rewake_ms = 21600000
 # every tracked branch is read through authenticated `gh api` — merged
 # PR state, mergeable_state conflicts, and check-run conclusions — and
 # the state-change mappings apply once per observed change (merged PR
-# closes the lane; conflict cascades an action-required notification;
-# CI failure posts a tiered notification with the run URL; CI green
+# closes the lane; conflict cascades an fyi notification (mechanical
+# tier — Silas coordinates the conflict integration); CI failure posts
+# a tiered notification with the run URL; CI green
 # records the review-gate signal event). 0 disables the poll; requires
 # an authenticated `gh` (see README Prerequisites). Rate-limit headroom:
 # calls are capped per tick — at most 3000 of the authenticated 5000/h.

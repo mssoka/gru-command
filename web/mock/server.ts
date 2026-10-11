@@ -392,7 +392,7 @@ function defaultSampleSnapshot(): unknown {
             prUrl: 'https://github.com/acme/demo-api/pull/43',
             prState: 'conflicting',
             baseBranch: 'main',
-            note: 'PR conflicts with main — rebase owed',
+            note: 'PR conflicts with main — integration owed',
             rounds: [],
             lane: null,
             lastAgentActivity: new Date(Date.now() - 300_000).toISOString(),
