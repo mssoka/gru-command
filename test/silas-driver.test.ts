@@ -1331,7 +1331,7 @@ describe('silas digest (the four actionable states)', () => {
         writeFileSync(join(roundDir, 'manifest.json'), JSON.stringify({ repoPath: repo }), 'utf8');
         h.ledger.appendCustomEvent({ kind: PUBLICATION_ATTEMPT_EVENT, jobId, roundId: round.id, payload: {
           verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
-          url: `https://git.example.invalid/pull/${jobId}`, host: 'git.example.invalid',
+          url: prUrl, host: 'git.example.invalid',
           targetSha: sha, baseSha: 'b'.repeat(40),
           publicationFile, publicationSha256: createHash('sha256').update(body).digest('hex'), reviewEvent: 'APPROVE',
         } });
@@ -1394,7 +1394,10 @@ describe('silas digest (the four actionable states)', () => {
         blockersForRound: async () => ({ blockers: [], note: null }),
         config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
       const seed = (jobId: string, sha: string, mode: 'rotated' | 'same') => {
-        addJobWithDelivery(h.ledger, jobId, { prUrl: `https://git.example.invalid/pull/${jobId}` });
+        // A well-formed GitHub-family URL: the REAL poster validates the
+        // owner/repo/pull-number shape and the repository origin.
+        const prUrl = `https://git.example.invalid/acme/fixture/pull/${mode === 'rotated' ? '71' : '72'}`;
+        addJobWithDelivery(h.ledger, jobId, { prUrl });
         h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha } });
         const round = h.ledger.addRound({ jobId, targetRef: sha });
         h.ledger.setRoundStatus(round.id, 'live');
