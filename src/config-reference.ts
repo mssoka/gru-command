@@ -448,6 +448,8 @@ export function renderReferenceConfig(
     '# opening a turn; breakers, provider walls and needs-owner rows always',
     '# wake. false restores waking for covered incidents.',
     `wake_defer_covered = ${preserved?.chat.wakeDeferCovered ?? true}`,
+    '# Code-only FOR GRU mailbox recovery; startup/events/ticks use existing wake gates.',
+    `mailbox_reconcile_interval_ms = ${preserved?.chat.mailboxReconcileIntervalMs ?? 300000}`,
     '# First delivered block after this much quiet time carries a "while you',
     '# were away" digest (wakes, actions, merges, staged PRs). 0 disables it.',
     `morning_digest_gap_ms = ${preserved?.chat.morningDigestGapMs ?? 28_800_000}`,

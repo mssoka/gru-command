@@ -1,3 +1,6 @@
+import type { MailboxSnapshot, MailboxItem } from '../../../src/gru-mailbox/types.js';
+export type MailboxView = MailboxSnapshot;
+export type MailboxItemView = MailboxItem;
 /**
  * Board socket + API contract (client side, E6) — the mirror of the
  * service's src/board/frames.ts. Snapshots are idempotent and
@@ -453,6 +456,8 @@ export interface RepoOverviewView {
 }
 
 export interface BoardSnapshot {
+  /** Absent means unavailable: eligibility must never be guessed by the browser. */
+  readonly mailbox?: MailboxView | null;
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
@@ -1125,11 +1130,35 @@ function isWakesView(value: unknown): boolean {
   return true;
 }
 
+function isMailboxView(value: unknown): value is MailboxView {
+  if (!isRecord(value) || !Array.isArray(value.items) || !isRecord(value.counts)) return false;
+  const counts = value.counts;
+  if (!['threads', 'incidents', 'notifications', 'needsGru'].every((key) => Number.isSafeInteger(counts[key]) && Number(counts[key]) >= 0)) return false;
+  const nonblank = (input: unknown): input is string => typeof input === 'string' && input.trim() !== '';
+  const nullableText = (input: unknown): boolean => input === null || nonblank(input);
+  const refs = (input: unknown): boolean => Array.isArray(input) && input.every((ref) => isRecord(ref) && typeof ref.kind === 'string' && ['decision', 'directive', 'obligation', 'agent', 'event'].includes(ref.kind) && nonblank(ref.id));
+  const states = ['needs-gru', 'delegated', 'waiting', 'resolved'];
+  return value.items.every((item) => {
+    if (!isRecord(item) || !nonblank(item.id) || !nonblank(item.subject) || !nonblank(item.title) || !nonblank(item.basis) || !nonblank(item.attentionKey) || !nonblank(item.owner)) return false;
+    if (typeof item.kind !== 'string' || !['job', 'incident'].includes(item.kind) || typeof item.state !== 'string' || !states.includes(item.state) || !nullableText(item.jobId) || typeof item.producerOwned !== 'boolean') return false;
+    if (!Array.isArray(item.reasons) || !item.reasons.every((reason) => isRecord(reason) && nonblank(reason.signal) && nonblank(reason.label) && nonblank(reason.basis))) return false;
+    if (!Array.isArray(item.notificationIds) || !item.notificationIds.every(nonblank) || !refs(item.references) || !Array.isArray(item.restrictions) || !item.restrictions.every(nonblank)) return false;
+    if (item.followUpAt !== undefined && (!Array.isArray(item.followUpAt) || !item.followUpAt.every(nonblank))) return false;
+    if (item.severity !== undefined && item.severity !== 'info' && item.severity !== 'error') return false;
+    const disposition = item.disposition;
+    if (disposition !== null && (!isRecord(disposition) || !nonblank(disposition.basis) || typeof disposition.state !== 'string' || !states.includes(disposition.state) || !nonblank(disposition.owner) || !nonblank(disposition.detail) || !nonblank(disposition.recordedAt) || !nullableText(disposition.dependency) || !nullableText(disposition.recheckAt) || !refs(disposition.references) || (disposition.sourceObligationId !== undefined && !nonblank(disposition.sourceObligationId)))) return false;
+    const receipt = item.receipt;
+    if (receipt !== null && (!isRecord(receipt) || !nonblank(receipt.basis) || !nonblank(receipt.attentionKey) || !nonblank(receipt.deliveryId) || !nonblank(receipt.receivedAt) || typeof receipt.source !== 'string' || !['chat', 'wake'].includes(receipt.source))) return false;
+    return true;
+  });
+}
+
 export function isValidSnapshot(value: unknown): value is BoardSnapshot {
   if (!isRecord(value)) return false;
   if (!Array.isArray(value.repos) || !Array.isArray(value.agents) || !Array.isArray(value.notifications)) {
     return false;
   }
+  if (value.mailbox !== undefined && value.mailbox !== null && !isMailboxView(value.mailbox)) return false;
   if (!isValidDecisionStatus(value.decisions)) return false;
   if (
     typeof value.unackedActionRequired !== 'number' ||

@@ -641,7 +641,7 @@ this stream; nothing avoids a wake silently.
 
 ### Exact directive/rebrief restart progress
 
-Migration 25 (`directive-native-progress`) is additive/nullable. Historical
+Migration 26 (`directive-native-progress`) is additive/nullable. Historical
 request rows retain NULL request kind/contract SHA/native target/native admission/
 checkpoint/authority epoch: NULL is unprovable, not safe-to-replay. New
 requests bind kind, immutable contract snapshot, revision and native
@@ -676,7 +676,7 @@ cannot release that ownership or mint readiness.
 
 ### Restart-recovery historical evidence and reserved-owner lineage
 
-Migration 25 adds nullable native progress and latest recovery pointers without inferring old facts. Immutable `silas.{directive,rebrief}-recovery-decided` events are uniquely indexed by exact subject + debt generation; pointers are compatibility/latest views, never mutable history. Audits retain canonical decision fingerprint, full exact marker/native subject snapshot, versioned legacy accepted/unproven receipt evidence and any concrete reserved-owner target binding.
+Migration 26 adds nullable native progress and latest recovery pointers without inferring old facts. Immutable `silas.{directive,rebrief}-recovery-decided` events are uniquely indexed by exact subject + debt generation; pointers are compatibility/latest views, never mutable history. Audits retain canonical decision fingerprint, full exact marker/native subject snapshot, versioned legacy accepted/unproven receipt evidence and any concrete reserved-owner target binding.
 
 Legacy receipt SHA is server-computed and compared inside judgment transactions; clocks/watermarks alone are not correlation. Missing historical HEAD/revision are never supplied from current state. `silas.rebrief-control-closed` is non-executing administrative closure of proven-completed control with absent delivery facts: full immutable evidence remains; a concrete current-inspection obligation owns the next fresh directive/verification action. No historical delivery/current revision/verification/READY is emitted by closure.
 
@@ -703,3 +703,75 @@ registry PID row only when both original PID and detached process group are
 absent. Terminal failures/SIGTERM, partial output and native review provenance
 are unchanged. Unsupported historical evidence stays actionable UNKNOWN.
 These controls authorize no owner Ack, production restart/deploy or merge.
+
+## FOR GRU mailbox metadata (GH-305)
+
+Migration 25 adds `gru_mailbox` only. Reconciliation changes metadata, never
+jobs, rounds, obligations, directives, notification lifecycle or owner stops.
+The forward-only migration runs with the ordinary ledger boot; this change
+performs no installed-ledger migration, deployment or restart.
+
+Authenticated `GET /api/mailbox?limit=50&cursor=<last item id>` returns `items`,
+`counts` and `nextCursor` (null at the end). Limit is 1–200; item ordering is
+stable locale ID order (cursor comparison uses the same ordering). Each item carries stable identity/subject, reason-specific
+bases and aggregate `basis`, next-action `owner`, lifecycle `state`, restrictions,
+control/follow-up references, disposition and delivery receipt. Terminal source
+receipts are retained; a merged parent never settles a child's mailbox item.
+
+`POST /api/mailbox/{encoded id}/disposition` accepts JSON:
+
+```json
+{
+  "basis": "exact basis returned by GET",
+  "state": "waiting",
+  "owner": "owner",
+  "detail": "continuation requires an explicit owner ruling",
+  "dependency": "owner continuation decision",
+  "recheckAt": "2026-11-01T00:00:00.000Z",
+  "references": [{ "kind": "decision", "id": "existing hold id" }]
+}
+```
+
+States are `needs-gru`, `delegated`, `waiting`, `resolved`. References are
+`decision`, `directive`, `obligation`, `agent` or `event`, validated against the
+same subject at the transactional boundary. Waiting/delegation require a real
+next-action owner, dependency and future canonical ISO recheck. Delegation also
+requires actual live control/work owned by that minion and an open follow-up
+obligation. Resolution requires an exact-basis acted/dismissed/superseded
+decision covering **every** reason, or a scoped correlated settled-obligation
+receipt accounting for the entire item. Generic read/wake receipts and wildcard
+holds cannot certify resolution. Producer-owned incident closure is refused.
+Malformed input returns 400; stale basis/references or unsupported resolution
+returns 409; unknown items return 404. Identical dispositions replay without
+minting another follow-up incarnation, including identical replay after the
+original deadline expires. Supporting references are revalidated on reads;
+cleared decisions and ended work cannot keep suppressing unresolved debt.
+Captured delivery receipts persist original reasons, source IDs, basis,
+incarnation and acceptance time even after source changes. Idempotent recovery
+never suppresses newer evidence; delivery without a next-action disposition
+rechecks five minutes after original acceptance. Due follow-ups reopen
+attention, not operational authority.
+
+Previously surfaced exact live obligations remain source-derived
+waiting/delegated metadata under their actual owner/dependency. Optional nested
+`disposition.sourceObligationId` cites the real obligation and is server-owned:
+disposition POST rejects caller-supplied provenance. Quiet code-only monitoring
+of non-Gru debt is distinct from a genuinely recorded Gru follow-up. Neither
+ownership transition nor a temporarily future-due obligation implies settlement.
+
+Malformed source evidence returns HTTP 503 `board_unavailable`, separate from
+input errors. WebSocket snapshot failures send a nonfatal error then close 1011;
+valid pairing tokens remain valid. Retained web rows/counts are explicitly
+last-known/unavailable until fresh evidence arrives. Notification IDs may use
+`mailbox:` and other ordinary prefixes; NUL characters are rejected before
+writes because Node SQLite cannot round-trip that identity.
+
+The shared bearer token authenticates access, not a caller's claimed role.
+Mailbox metadata adds no new operational capabilities or impersonated owner
+approval. Existing lifecycle/control boundaries remain authoritative.
+
+Obligation-only admission is restricted to live `gru-decision` debt: an open
+unscheduled/due decision or an actually due waiting receipt/dependency with
+recorded Gru follow-up. Healthy Silas-mechanical, owner-decision and
+external-wait debt alone do not widen FOR GRU. Independently eligible threads
+retain all applicable obligations and their follow-up clocks.

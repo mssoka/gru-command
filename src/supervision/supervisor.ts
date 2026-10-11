@@ -12,6 +12,7 @@ import {
   deterministicFailureClass,
   supervisionDecisionRequest,
 } from '../decisions/questions.js';
+import { supervisionGuidance } from '../decisions/effects.js';
 import {
   backoffDelayMs,
   isRateLimitErrorText,
@@ -1521,21 +1522,12 @@ export class Supervisor {
         (!runtimeError && agent.openControl !== expectedOpenControl) ||
         agent.breakerOpen
       ) return;
-      const classAnswer = outcome.routes.failure_class.path === 'fallback'
-        ? request.fallback.failure_class
-        : outcome.answers.failure_class;
-      const restartAnswer = outcome.routes.restart_advised.path === 'fallback'
-        ? request.fallback.restart_advised
-        : outcome.answers.restart_advised;
-      // Model guidance may refine unknown/transient failures, but it cannot
-      // contradict a provider wall that is already evident in the runtime
-      // error. Burning restart rungs on known auth/quota walls is futile.
-      const failureClass = deterministicWall ? deterministicClass : classAnswer.choice;
-      const classifiedWall = failureClass === 'authentication_wall' || failureClass === 'quota_wall';
-      const restartAdvised = classifiedWall ? false : restartAnswer.noul >= 0.5;
+      // The class, advice, authorization and next action are decided by
+      // supervisionGuidance — shared with shadow telemetry so a recorded
+      // disagreement means this code would have acted differently.
+      const { failureClass, restartAdvised, restartAuthorized, action } =
+        supervisionGuidance(request.fallback, outcome, deterministicClass);
       const restartRoute = outcome.routes.restart_advised;
-      const restartAuthorized =
-        restartAdvised && restartRoute.path === 'act' && restartRoute.requiresConfirm === false;
       this.ledger.appendCustomEvent({
         kind: 'supervision.guidance',
         agentId: agent.agentId,
@@ -1548,32 +1540,11 @@ export class Supervisor {
           requires_confirm: deterministicWall ? false : restartRoute.requiresConfirm,
         },
       });
-      if (classifiedWall) {
-        // A wall already evident in the runtime error stops unconditionally:
-        // model advice never burns rungs on it.
-        this.stopForGuidance(agent, failureClass, source);
+      if (action.kind === 'stop') {
+        this.stopForGuidance(agent, action.reason, source);
         return;
       }
-      if (restartAuthorized) {
-        // THE GRANT LEG: a high-confidence act-band answer yields the same
-        // unattended restart the deterministic ladder would have run — no
-        // human ack required, no escalation row.
-        if (allowRestart) await this.restartRung(agent, reason);
-        return;
-      }
-      if (restartRoute.path === 'fallback') {
-        // Uncertain advice is not a stop order: low confidence falls back to
-        // the exact deterministic behavior (the ladder) the no-service path
-        // would run, instead of stopping an agent the ladder would restart.
-        if (allowRestart) await this.restartRung(agent, reason);
-        return;
-      }
-      // Confirm band (or act with requireConfirm): the human gate owns it.
-      this.stopForGuidance(
-        agent,
-        restartAdvised ? 'restart_confirmation_required' : failureClass,
-        source,
-      );
+      if (allowRestart) await this.restartRung(agent, reason);
     } catch (error) {
       this.log('error', 'recovery classification failed; using deterministic restart guards', {
         agent_id: agent.agentId,

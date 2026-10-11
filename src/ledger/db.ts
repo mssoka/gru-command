@@ -980,6 +980,18 @@ export const MIGRATIONS: readonly Migration[] = [
   },
   {
     id: 25,
+    name: 'gru-mailbox',
+    sql: `
+      CREATE TABLE gru_mailbox (
+        id TEXT PRIMARY KEY,
+        item TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    // GH-286 is unshipped: retain main's landed mailbox migration 25.
+    id: 26,
     name: 'directive-native-progress',
     sql: `
       ALTER TABLE pending_directives ADD COLUMN request_kind TEXT CHECK (request_kind IS NULL OR request_kind IN ('directive','rebrief'));

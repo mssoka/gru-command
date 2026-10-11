@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+import { withMailboxFixture } from '../lib/mailbox-fixture.test-support.js';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -116,7 +117,7 @@ function snapshot(
     pipeline?: NonNullable<BoardSnapshot['pipeline']>;
   } = {},
 ): BoardSnapshot {
-  return {
+  return withMailboxFixture({
     repos: options.repos ?? [{ name: 'demo', jobs: options.jobs ?? [baseJob()] }],
     agents: options.agents ?? [],
     notifications: options.notifications ?? [],
@@ -143,7 +144,7 @@ function snapshot(
     ownerPrs: options.ownerPrs,
     pipeline: options.pipeline,
     repoOverview: options.repoOverview,
-  };
+  });
 }
 
 /** FOR GRU and COLD are collapsed/count-only by default (owner approval
@@ -626,7 +627,7 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(chip?.classList.contains('pp-chip--done')).toBe(true);
     const unacked = trackers?.querySelector<HTMLElement>('#board-unacked');
     expect(unacked?.hidden).toBe(false);
-    expect(unacked?.textContent).toContain('2 needs Gru');
+    expect(unacked?.textContent).toContain('2 notifications · needs Gru');
     // The count is the LIVE machine queue: the copy says so (A4).
     expect(unacked?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
     expect(unacked?.title).toContain('closed receipts stay in the record');
@@ -639,7 +640,7 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(chip?.hidden).toBe(true);
     view.render(snapshot({ unackedActionRequired: 2 }));
     expect(chip?.hidden).toBe(false);
-    expect(chip?.textContent).toContain('2 needs Gru');
+    expect(chip?.textContent).toContain('2 notifications · needs Gru');
   });
 
   it('shows the wake tracker inside TRACKERS with the durable count and last-fire stamp', () => {
@@ -853,7 +854,7 @@ describe('board v6 — dense job rows', () => {
     );
     expandForGru();
     const signal = document.querySelector('.board-job__signal');
-    expect(signal?.textContent).toContain('1 needs Gru');
+    expect(signal?.textContent).toContain('needs Gru');
     expect(signal?.textContent).toContain('1 blocker');
     expect(signal?.textContent).toContain('1 lens failure');
     expect(signal?.classList.contains('pp-chip--alert')).toBe(true);
@@ -2079,7 +2080,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expandCold();
     const unacked = document.querySelector<HTMLElement>('#board-unacked');
     expect(unacked?.hidden).toBe(false);
-    expect(unacked?.textContent).toContain('1 needs Gru');
+    expect(unacked?.textContent).toContain('needs Gru');
     // The record keeps BOTH durable rows. Machine rows clear through a Gru
     // disposition, not a human Ack, so neither carries an ack control.
     const rows = [...document.querySelectorAll('.board-notification')];
@@ -2100,7 +2101,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     // The live lane still carries its machine signal; the receipt carries none.
     const live = document.querySelector<HTMLElement>('.board-band--needs-you .board-job');
     expect(live?.getAttribute('data-job-id')).toBe('live-walled');
-    expect(live?.querySelector('.board-job__signal')?.textContent).toContain('1 needs Gru');
+    expect(live?.querySelector('.board-job__signal')?.textContent).toContain('needs Gru');
     expect(document.querySelector('.board-band--cold .board-job__signal, .board-band--settled .board-job__signal')).toBeNull();
   });
 
@@ -2374,9 +2375,9 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(row?.getAttribute('data-job-id')).toBe('walled');
     expect(row?.getAttribute('data-worker-state')).toBe('waiting');
     expect(row?.querySelector('.board-job__status')?.textContent).toBe('waiting · quota wall');
-    expect(row?.querySelector('.board-job__signal')?.textContent).toContain('1 needs Gru');
+    expect(row?.querySelector('.board-job__signal')?.textContent).toContain('needs Gru');
     const unacked = document.querySelector<HTMLElement>('#board-unacked');
-    expect(unacked?.textContent).toContain('1 needs Gru');
+    expect(unacked?.textContent).toContain('needs Gru');
   });
 
   it('the waiting truth is scoped to working lanes: an in-review lane with a live round keeps its true chip', () => {
@@ -3305,7 +3306,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       expect(section('NEEDS GRU').textContent).not.toContain('Notice closed-machine');
       expect(section('FEED').querySelector('[data-receipt="closed"]')?.textContent).toContain('Notice closed-machine');
       expect(section('FEED').querySelector('.board-notification__ack')).toBeNull();
-      expect(document.getElementById('board-unacked')?.textContent).toContain('1 needs Gru');
+      expect(document.getElementById('board-unacked')?.textContent).toContain('needs Gru');
       expect(document.querySelector('.board-band--needs-you .board-job')).toBeNull();
       expect(client.ackNotification).not.toHaveBeenCalled();
       expect(machine.ackedAt).toBeNull();
@@ -3377,7 +3378,7 @@ describe('board — compact owner-first presentation (j-1064)', () => {
       }),
     );
     const section = document.querySelector<HTMLElement>('.board-band--needs-you')!;
-    expect(section.querySelector('.board-band__count')?.textContent).toBe('3 heists');
+    expect(section.querySelector('.board-band__count')?.textContent).toBe('3 threads · 0 incidents · 0 notifications');
     expect(section.querySelectorAll('.board-job')).toHaveLength(0);
     const toggle = section.querySelector<HTMLButtonElement>('.board-band__more')!;
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
@@ -3390,7 +3391,7 @@ describe('board — compact owner-first presentation (j-1064)', () => {
     expect(expanded.querySelector<HTMLButtonElement>('.board-band__more')?.textContent).toBe('Hide machine queue');
     expanded.querySelector<HTMLButtonElement>('.board-band__more')!.click();
     expect(document.querySelector('.board-band--needs-you .board-job')).toBeNull();
-    expect(document.querySelector('.board-band--needs-you .board-band__count')?.textContent).toBe('3 heists');
+    expect(document.querySelector('.board-band--needs-you .board-band__count')?.textContent).toBe('3 threads · 0 incidents · 0 notifications');
   });
 
   it('Cold is COUNT ONLY by default: zero job rows until deliberately expanded, hide restores zero', () => {
@@ -3933,7 +3934,7 @@ describe('board — megaminions nest under their heist', () => {
     );
     expandForGru();
     const forGru = document.querySelector<HTMLElement>('#board-section-for-gru');
-    expect(forGru?.querySelector('.board-band__count')?.textContent).toBe('1 heist');
+    expect(forGru?.querySelector('.board-band__count')?.textContent).toBe('1 threads · 0 incidents · 0 notifications');
     const stuck = rowOf('rev-stuck');
     expect(forGru?.contains(stuck)).toBe(true);
     const link = stuck.querySelector<HTMLButtonElement>('button.board-job__parent');
@@ -3983,5 +3984,54 @@ describe('board — megaminions nest under their heist', () => {
     const view = new BoardView(() => {});
     view.render(value);
     expect(document.querySelector('#chip-rail [data-kpi="jobs.total"]')?.textContent).toContain('2');
+  });
+});
+
+
+describe('GH-305 rendered mailbox lifecycle', () => {
+  beforeEach(mountBoardDom);
+  it('renders an unbound waiting incident with dependency, follow-up, receipt and distinct counter units', () => {
+    const base = snapshot({ jobs: [], notifications: [] });
+    const item: NonNullable<BoardSnapshot['mailbox']>['items'][number] = {
+      id: 'incident:dream', subject: 'incident:lessons.dream-failed:book', kind: 'incident', jobId: null,
+      title: 'Book dream failure', basis: 'exact-basis', reasons: [{ signal: 'dream-failed', label: 'lessons.dream-failed', basis: 'reason-basis' }],
+      state: 'waiting', owner: 'producer', producerOwned: true, notificationIds: ['source-alert'],
+      disposition: { state: 'waiting', basis: 'exact-basis', owner: 'producer', detail: 'producer repair', dependency: 'successful Book dream', recheckAt: '2026-10-11T00:25:01.000Z', references: [{ kind: 'decision', id: 'hold' }], recordedAt: '2026-10-11T00:20:01.000Z' },
+      receipt: { basis: 'exact-basis', attentionKey: 'attention', source: 'wake', deliveryId: 'turn', receivedAt: '2026-10-11T00:20:02.000Z' },
+      references: [{ kind: 'decision', id: 'hold' }], restrictions: ['producer alone closes'], attentionKey: 'attention',
+    };
+    const view = new BoardView(() => {});
+    view.render({ ...base, mailbox: { items: [item], counts: { threads: 0, incidents: 1, notifications: 1, needsGru: 0 } } });
+    expandForGru();
+    const section = document.querySelector('#board-section-for-gru')!;
+    expect(section.querySelector('.board-band__count')?.textContent).toBe('0 threads · 1 incidents · 1 notifications');
+    expect(section.querySelector('.mailbox-incident')?.textContent).toContain('waiting · owner: producer');
+    expect(section.textContent).toContain('successful Book dream');
+    expect(section.textContent).toContain('decision:hold');
+    expect(section.textContent).toContain('producer alone closes');
+    expect(section.textContent).toContain('receipt: wake');
+  });
+
+  it('G09 source failure keeps rows and counts explicitly last-known until a fresh snapshot', () => {
+    const view = new BoardView(() => {});
+    const known = snapshot({ jobs: [baseJob({ status: 'blocked' })] });
+    view.render(known);
+    (view as unknown as { markUnavailable?: (message: string) => void }).markUnavailable?.('malformed evidence <script>');
+    expect(document.querySelector('#board-section-for-gru')?.textContent).toContain('last-known');
+    expect(document.querySelector('#board-section-for-gru')?.textContent).toContain('malformed evidence <script>');
+    expect(document.querySelector('#board-section-for-gru script')).toBeNull();
+    expandForGru();
+    expect(document.querySelector('#board-section-for-gru')?.textContent).toContain('last-known');
+    expect(document.querySelector('#board-section-for-gru .board-job')).not.toBeNull();
+    view.render(known);
+    expect(document.querySelector('#board-section-for-gru')?.textContent).not.toContain('last-known');
+  });
+
+  it('an absent mailbox renders unavailable and never guesses eligibility from blocked jobs', () => {
+    const view = new BoardView(() => {});
+    view.render({ ...snapshot({ jobs: [baseJob({ status: 'blocked' })] }), mailbox: null });
+    expect(document.querySelector('#board-section-for-gru')?.textContent).toContain('unavailable');
+    expect(document.querySelector('#board-section-for-gru .board-job')).toBeNull();
+    expect(document.querySelector('[data-nav="for-gru"] .board-nav__count')?.textContent).toBe('—');
   });
 });

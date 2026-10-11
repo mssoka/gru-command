@@ -1,3 +1,5 @@
+import { GruMailbox } from '../gru-mailbox/service.js';
+import type { MailboxSnapshot } from '../ledger/mailbox.js';
 import type { Role } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentState } from '../runtime/types.js';
@@ -257,6 +259,7 @@ export interface ActiveDecisionView {
 }
 
 export interface BoardSnapshot {
+  readonly mailbox: MailboxSnapshot;
   readonly repos: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
   readonly agents: readonly AgentView[];
   readonly notifications: readonly NotificationView[];
@@ -492,6 +495,7 @@ export interface BoardEngineOptions {
 }
 
 export class BoardEngine {
+  readonly mailbox: GruMailbox;
   private readonly ledger: LedgerApi;
   private readonly bus: EventBus;
   private readonly log: Log;
@@ -500,6 +504,7 @@ export class BoardEngine {
 
   constructor(opts: BoardEngineOptions) {
     this.ledger = opts.ledger;
+    this.mailbox = new GruMailbox(opts.ledger, opts.now);
     this.bus = opts.bus;
     this.log = opts.log ?? (() => {});
     this.supervisionFor = opts.supervisionFor ?? (() => null);
@@ -808,6 +813,7 @@ export class BoardEngine {
     );
     return {
       repos,
+      mailbox: this.mailbox.snapshot(),
       agents,
       notifications: this.notifications(isReceipt),
       decisions: this.decisionsStatus(),

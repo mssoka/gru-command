@@ -1,3 +1,5 @@
+import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
+import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { readFileSync } from 'node:fs';
@@ -460,6 +462,13 @@ export interface NotificationRecord {
 
 /** Marker for not-found failures the HTTP surface maps to 404 (typed —
  * never grepped from error text). */
+export class NotificationIdentityError extends Error {
+  constructor() {
+    super('notification id contains NUL; SQLite cannot round-trip this identity — use an ID without NUL characters');
+    this.name = 'NotificationIdentityError';
+  }
+}
+
 export class RecordNotFound extends Error {
   constructor(message: string) {
     super(message);
@@ -1007,6 +1016,7 @@ export class LedgerApi {
       result = write();
       this.db.exec('COMMIT');
     } catch (error) {
+      this.mailboxProjectionCache = null;
       this.pendingEvents.length = 0; // rolled back — phantom events are never published
       this.db.exec('ROLLBACK');
       throw error;
@@ -3105,6 +3115,12 @@ export class LedgerApi {
     return rows.map((row) => this.agentFromRow(row));
   }
 
+  latestSupervisionEvent(agentId: string): EventRecord | null {
+    const row = this.db.prepare(`SELECT * FROM events WHERE agent_id = ?
+      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
+    return row === undefined ? null : this.eventFromRow(row);
+  }
+
   setAgentState(id: string, state: AgentState, error?: string): AgentRecord {
     return this.transaction(() => {
       const agent = this.getAgent(id);
@@ -4560,6 +4576,7 @@ export class LedgerApi {
     if (input.id === '' || input.title === '') {
       throw new Error('notification id and title must be non-empty');
     }
+    if (input.id.includes('\u0000')) throw new NotificationIdentityError();
     return this.transaction(() => {
       if (this.getNotification(input.id) !== null) {
         throw new Error(`notification "${input.id}" already exists`);
@@ -9450,6 +9467,135 @@ export class LedgerApi {
       cleared_at: nstr(row.cleared_at),
       cleared_by: nstr(row.cleared_by),
       cleared_reason: nstr(row.cleared_reason),
+    });
+  }
+
+  private mailboxProjectionCache: { readonly changes: number; readonly version: number; readonly items: readonly MailboxItem[]; readonly nextCheckAt: number } | null = null;
+
+  private mailboxDatabaseRevision(): { readonly changes: number; readonly version: number } {
+    const changes = Number((this.db.prepare('SELECT total_changes() AS changes').get() as Row).changes);
+    const version = Number((this.db.prepare('PRAGMA data_version').get() as Row).data_version);
+    return { changes, version };
+  }
+
+  /** Event watermarks alone cannot detect source writes that emit no event. */
+  private mailboxSourceProjection(now: number): readonly MailboxItem[] {
+    const revision = this.mailboxDatabaseRevision();
+    const cache = this.mailboxProjectionCache;
+    if (cache !== null && now < cache.nextCheckAt && cache.changes === revision.changes && cache.version === revision.version) return cache.items;
+    let nextCheckAt = Infinity;
+    const items = projectMailbox(this, now, (at) => { nextCheckAt = Math.min(nextCheckAt, at); });
+    this.mailboxProjectionCache = { ...revision, items, nextCheckAt };
+    return items;
+  }
+
+  /** Additive mailbox metadata only: this path never changes operational rows. */
+  reconcileMailbox(now = nowIso()): readonly MailboxItem[] {
+    return this.transaction(() => {
+      const projected = this.mailboxSourceProjection(Date.parse(now));
+      const previous = new Map(this.listMailboxItems().map((item) => [item.id, item]));
+      const liveIds = new Set(projected.map((item) => item.id));
+      const items = projected.map((source): MailboxItem => {
+        const old = previous.get(source.id);
+        const saved = old?.disposition?.sourceObligationId === undefined ? old?.disposition ?? null : null;
+        let supported = saved?.basis === source.basis;
+        if (supported && saved !== null) {
+          try { validateMailboxDisposition(this, source, saved, now, true); }
+          catch (error) { if (!(error instanceof MailboxConflictError)) throw error; supported = false; }
+        }
+        const disposition = supported ? saved : source.disposition ?? saved;
+        const applicable = supported ? saved : source.disposition;
+        const due = applicable !== null && applicable.sourceObligationId === undefined && ((applicable.recheckAt !== null && Date.parse(applicable.recheckAt) <= Date.parse(now))
+          || (source.followUpAt ?? []).some((at) => Date.parse(at) > Date.parse(applicable.recordedAt) && Date.parse(at) <= Date.parse(now)));
+        const state = applicable !== null && !due ? applicable.state : 'needs-gru';
+        const baseAttentionKey = `${source.id}@${mailboxBasis([source.basis, applicable?.recordedAt ?? (saved?.basis === source.basis ? [saved.recordedAt, 'unsupported'] : null), due ? applicable?.recheckAt : null, (source.followUpAt ?? []).filter((at) => Date.parse(at) <= Date.parse(now))])}`;
+        const receipt = old?.receipt ?? null;
+        // Delivery without a next action owes a bounded recheck. Retain its
+        // incarnation through the grace window; only due unhandled debt gets
+        // a new key, so restart and duplicate events cannot create a storm.
+        const sameAttention = receipt?.basis === source.basis && (receipt.attentionKey === baseAttentionKey || receipt.attentionKey.startsWith(`${baseAttentionKey}:unhandled:`));
+        const attentionKey = state === 'needs-gru' && sameAttention
+          ? Date.parse(now) - Date.parse(receipt.receivedAt) >= 300_000
+            ? `${baseAttentionKey}:unhandled:${receipt.receivedAt}` : receipt.attentionKey
+          : baseAttentionKey;
+        const references = [...new Map([...source.references, ...(applicable?.references ?? [])].map((ref) => [`${ref.kind}:${ref.id}`, ref])).values()];
+        return { ...source, references, disposition, state, owner: applicable?.owner ?? 'gru', receipt: old?.receipt ?? null, attentionKey };
+      });
+      for (const old of previous.values()) {
+        if (!liveIds.has(old.id)) items.push({ ...old, state: 'resolved', restrictions: [...old.restrictions.filter((value) => value !== 'Source evidence no longer raises attention'), 'Source evidence no longer raises attention'] });
+      }
+      for (const item of items) {
+        const encoded = JSON.stringify(item);
+        if (JSON.stringify(previous.get(item.id)) === encoded) continue;
+        this.db.prepare(`INSERT INTO gru_mailbox (id, item, updated_at) VALUES (?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET item = excluded.item, updated_at = excluded.updated_at`).run(item.id, encoded, now);
+      }
+      if (this.mailboxProjectionCache !== null) this.mailboxProjectionCache = { ...this.mailboxProjectionCache, ...this.mailboxDatabaseRevision() };
+      return items.sort((a, b) => a.id.localeCompare(b.id));
+    });
+  }
+
+  listMailboxItems(): readonly MailboxItem[] {
+    return (this.db.prepare('SELECT item FROM gru_mailbox ORDER BY id').all() as Row[]).map((row) => JSON.parse(str(row.item)) as MailboxItem);
+  }
+
+  recordMailboxDisposition(id: string, input: unknown, now = nowIso()): MailboxItem {
+    return this.transaction(() => {
+      const item = this.reconcileMailbox(now).find((candidate) => candidate.id === id);
+      if (item === undefined) throw new RecordNotFound(`mailbox item "${id}" not found`);
+      const disposition = validateMailboxDisposition(this, item, input, now, true);
+      if (item.disposition !== null && JSON.stringify({ ...item.disposition, recordedAt: null }) === JSON.stringify({ ...disposition, recordedAt: null })) return item;
+      validateMailboxDisposition(this, item, input, now);
+      const updated: MailboxItem = { ...item, disposition };
+      this.db.prepare('UPDATE gru_mailbox SET item = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(updated), now, id);
+      this.appendEvent({ kind: 'mailbox.disposition', jobId: item.jobId, payload: { id, disposition } });
+      return this.reconcileMailbox(now).find((candidate) => candidate.id === id)!;
+    });
+  }
+
+  recordMailboxReceipt(id: string, basis: string, source: 'chat' | 'wake', deliveryId: string, now = nowIso()): void {
+    return this.transaction(() => {
+      const item = this.reconcileMailbox(now).find((candidate) => candidate.id === id);
+      if (item === undefined || item.basis !== basis) throw new MailboxConflictError('mailbox receipt basis is stale');
+      if (item.receipt?.deliveryId === deliveryId && item.receipt.source === source) return;
+      this.recordCapturedMailboxReceipt({ deliveryKey: `mailbox:${mailboxBasis(item.attentionKey)}`, id, jobId: item.jobId,
+        basis, attentionKey: item.attentionKey, reasons: item.reasons, notificationIds: item.notificationIds }, source, deliveryId, now, now);
+    });
+  }
+
+  /** Historical evidence is durable even when it no longer matches the live attention incarnation. */
+  recordCapturedMailboxReceipt(delivery: MailboxDelivery, source: 'chat' | 'wake', deliveryId: string, receivedAt: string, now = nowIso()): void {
+    if (source !== 'chat' && source !== 'wake') throw new Error('mailbox receipt source must be chat or wake');
+    if (deliveryId.trim() === '') throw new Error('mailbox deliveryId must be nonblank');
+    if (!isRealIsoUtcTimestamp(receivedAt) || new Date(receivedAt).toISOString() !== receivedAt || Date.parse(receivedAt) > Date.parse(now)) {
+      throw new Error('mailbox receivedAt must be a canonical ISO timestamp no later than receipt recovery');
+    }
+    if (delivery.deliveryKey !== `mailbox:${mailboxBasis(delivery.attentionKey)}` || !delivery.attentionKey.startsWith(`${delivery.id}@`)) {
+      throw new Error('mailbox captured delivery identity does not match its attention incarnation');
+    }
+    return this.transaction(() => {
+      const receipt = { basis: delivery.basis, source, deliveryId, receivedAt, attentionKey: delivery.attentionKey };
+      const prior = this.db.prepare(`SELECT payload FROM events WHERE kind = 'mailbox.received'
+        AND json_extract(payload, '$.id') = ? AND json_extract(payload, '$.receipt.source') = ?
+        AND json_extract(payload, '$.receipt.deliveryId') = ? AND json_extract(payload, '$.receipt.attentionKey') = ? LIMIT 1`)
+        .get(delivery.id, source, deliveryId, delivery.attentionKey) as Row | undefined;
+      if (prior !== undefined) {
+        const payload = JSON.parse(str(prior.payload)) as { readonly receipt: MailboxReceipt; readonly delivery?: MailboxDelivery };
+        const sameReceipt = payload.receipt.basis === receipt.basis && payload.receipt.source === source
+          && payload.receipt.deliveryId === deliveryId && payload.receipt.receivedAt === receivedAt && payload.receipt.attentionKey === delivery.attentionKey;
+        const fingerprint = (value: MailboxDelivery): string => mailboxBasis([value.deliveryKey, value.id, value.jobId, value.basis, value.attentionKey,
+          value.reasons.map((reason) => [reason.signal, reason.label, reason.basis]), value.notificationIds]);
+        if (!sameReceipt || (payload.delivery !== undefined && fingerprint(payload.delivery) !== fingerprint(delivery))) {
+          throw new MailboxConflictError('mailbox delivery replay changed captured evidence or original delivery time');
+        }
+        return;
+      }
+      const item = this.reconcileMailbox(now).find((candidate) => candidate.id === delivery.id);
+      if (item !== undefined && item.basis === delivery.basis && item.attentionKey === delivery.attentionKey
+        && (item.receipt === null || Date.parse(item.receipt.receivedAt) <= Date.parse(receivedAt))) {
+        this.db.prepare('UPDATE gru_mailbox SET item = ?, updated_at = ? WHERE id = ?').run(JSON.stringify({ ...item, receipt }), now, item.id);
+      }
+      this.appendEvent({ kind: 'mailbox.received', jobId: delivery.jobId, payload: { id: delivery.id, receipt, reasons: delivery.reasons, delivery } });
     });
   }
 

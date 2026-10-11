@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi, DEFAULT_LENSES, type PendingRebriefRecord } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
+import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import { renderRecordedVerification } from '../src/verify/evidence.js';
 import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
@@ -2253,4 +2254,82 @@ describe('directive producer evidence integrity — P18 current-behavior regress
       expect(() => ledger.claimDirectiveDispatch(request.requestId)).toThrow(/unproven/);
     } finally { db.close(); }
   });
+});
+
+describe('GH-305 additive mailbox metadata authority', () => {
+  it('rejects stale and unsupported dispositions transactionally, and persists receipts without changing obligations', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'mail-ledger', repo: 'r', title: 'mailbox' });
+      api.setJobStatus('mail-ledger', 'blocked');
+      const item = api.reconcileMailbox()[0]!;
+      const obligations = api.listObligationsDetailed({ jobId: 'mail-ledger' }).readable;
+      const watermark = api.latestEventSeq();
+      expect(() => api.recordMailboxDisposition(item.id, { state: 'resolved', basis: 'old', owner: 'gru', detail: 'read', references: [] })).toThrow(/basis/);
+      expect(() => api.recordMailboxDisposition(item.id, { state: 'resolved', basis: item.basis, owner: 'gru', detail: 'read', references: [] })).toThrow(/resolution requires/);
+      expect(api.latestEventSeq()).toBe(watermark);
+      api.recordMailboxReceipt(item.id, item.basis, 'wake', 'turn-start-receipt');
+      expect(api.reconcileMailbox()[0]?.state).toBe('needs-gru');
+      expect(api.getJob('mail-ledger')?.status).toBe('blocked');
+      expect(api.listObligationsDetailed({ jobId: 'mail-ledger' }).readable).toEqual(obligations);
+    } finally { db.close(); }
+    const reopened = new LedgerDb(dir);
+    try { expect(new LedgerApi(reopened.handle).listMailboxItems()[0]?.receipt?.deliveryId).toBe('turn-start-receipt'); }
+    finally { reopened.close(); }
+  });
+  it('G06/G27 recovers a captured historical receipt after restart without suppressing a newer same-basis incarnation', () => {
+    const dir = tmpDir();
+    const originalAt = '2026-10-11T00:20:01.000Z';
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    let serialized: string;
+    try {
+      api.addJob({ id: 'captured', repo: 'r', title: 'captured' });
+      api.setJobStatus('captured', 'blocked');
+      const mailbox = new GruMailbox(api, () => Date.parse(originalAt));
+      const captured = mailbox.captureDelivery(mailbox.attentionRows());
+      serialized = JSON.stringify(captured);
+      mailbox.receiptCaptured(captured, 'wake', 'original', originalAt);
+    } finally { db.close(); }
+    const reopened = new LedgerDb(dir);
+    try {
+      const recovered = new LedgerApi(reopened.handle);
+      const mailbox = new GruMailbox(recovered, () => Date.parse(originalAt) + 300000);
+      const captured = JSON.parse(serialized!);
+      const current = mailbox.attentionPage(8)[0]!;
+      expect(current.basis).toBe(captured[0].basis);
+      expect(current.attentionKey).not.toBe(captured[0].attentionKey);
+      mailbox.receiptCaptured(captured, 'chat', 'parked-passive', originalAt);
+      expect(mailbox.attentionPage(8)).toHaveLength(1);
+      const historical = recovered.listEvents({ limit: 20 }).filter((event) => event.kind === 'mailbox.received');
+      expect(historical).toHaveLength(2);
+      expect(historical[0]?.payload).toMatchObject({ receipt: { receivedAt: originalAt, attentionKey: captured[0].attentionKey } });
+      const watermark = recovered.latestEventSeq();
+      mailbox.receiptCaptured(captured, 'chat', 'parked-passive', originalAt);
+      expect(recovered.latestEventSeq()).toBe(watermark);
+      expect(() => mailbox.receiptCaptured(captured, 'chat', 'parked-passive', '2026-10-11T00:21:01.000Z')).toThrow(/original delivery time/);
+      expect(recovered.latestEventSeq()).toBe(watermark);
+      expect(mailbox.snapshot().items[0]?.receipt?.deliveryId).toBe('original');
+    } finally { reopened.close(); }
+  });
+
+  it('G03 invalidates source cache for eventless source writes through a second ledger connection', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    const otherDb = new LedgerDb(dir);
+    try {
+      api.addJob({ id: 'external-write', repo: 'r', title: 'j' });
+      api.registerAgent({ id: 'worker', role: 'minion', jobId: 'external-write' });
+      api.setAgentState('worker', 'error');
+      expect(api.reconcileMailbox()[0]?.state).toBe('needs-gru');
+      const watermark = api.latestEventSeq();
+      new LedgerApi(otherDb.handle).registerAgent({ id: 'worker', role: 'perkins' });
+      expect(api.latestEventSeq()).toBe(watermark);
+      expect(api.reconcileMailbox().filter((item) => item.state !== 'resolved')).toHaveLength(0);
+    } finally { otherDb.close(); db.close(); }
+  });
+
 });

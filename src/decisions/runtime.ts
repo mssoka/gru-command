@@ -566,6 +566,7 @@ export class DecisionRuntime implements DecisionService {
         request,
         providerOutcome,
         deterministicOutcome: deterministic,
+        thresholds,
       }));
     } catch (error) {
       this.log('error', 'decisions.shadow record failed; routing state remains usable', { error: String(error) });

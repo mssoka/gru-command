@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
+import { shadowEffectDisagreement } from './effects.js';
 import type {
   DecisionOutcome,
   DecisionRequest,
   QuestionSet,
   ShadowDecisionRecord,
+  ThresholdsConfig,
 } from './types.js';
 
 /** sha256 over the filtered request state plus the question ids (issue
@@ -17,34 +19,33 @@ export function requestHashOf(request: DecisionRequest<QuestionSet>): string {
     .digest('hex');
 }
 
-/** True when the provider's routes would have landed a different band
- * (act/confirm/fallback) than the deterministic baseline's on at least
- * one question. Pure; shared by the shadow recorder and the yield
- * telemetry so "disagreement" has exactly one definition. */
-export function routeDisagreement(
-  providerRoutes: Readonly<Record<string, { readonly path: string }>>,
-  deterministicRoutes: Readonly<Record<string, { readonly path: string }>>,
-): boolean {
-  const ids = new Set([...Object.keys(providerRoutes), ...Object.keys(deterministicRoutes)]);
-  for (const id of ids) {
-    if (providerRoutes[id]?.path !== deterministicRoutes[id]?.path) return true;
-  }
-  return false;
-}
-
 export type ShadowRecorder = (record: ShadowDecisionRecord) => void;
 
 /** Assemble one `decisions.shadow` ledger payload (issue #223): what the
  * provider WOULD have done (`answers`/`routes`) next to the deterministic
- * baseline (`deterministic_answers`), with the filtered request state
- * reduced to its hash — the state text is NEVER recorded. Pure. */
+ * baseline (`deterministic_answers`/`deterministic_routes`) and the
+ * thresholds both were banded at, with the filtered request state reduced
+ * to its hash — the state text is NEVER recorded. Pure. */
 export function buildShadowRecord<Q extends QuestionSet>(input: {
   readonly surface: string;
   readonly provider: string;
   readonly request: DecisionRequest<Q>;
   readonly providerOutcome: DecisionOutcome<Q>;
   readonly deterministicOutcome: DecisionOutcome<Q>;
+  /** The thresholds both outcomes' routes were banded at. */
+  readonly thresholds: ThresholdsConfig;
 }): ShadowDecisionRecord {
+  // Null (unmeasured) rather than a throw: a dropped record would lose
+  // the provider's answers, and the report counts null rows as skipped.
+  const disagrees = shadowEffectDisagreement({
+    surface: input.surface,
+    baselineAnswers: input.deterministicOutcome.answers,
+    baselineRoutes: input.deterministicOutcome.routes,
+    providerAnswers: input.providerOutcome.answers,
+    providerRoutes: input.providerOutcome.routes,
+    providerSource: input.providerOutcome.provenance.source,
+    thresholds: input.thresholds,
+  });
   return {
     surface: input.surface,
     request_hash: requestHashOf(input.request),
@@ -53,14 +54,13 @@ export function buildShadowRecord<Q extends QuestionSet>(input: {
     answers: input.providerOutcome.answers,
     routes: input.providerOutcome.routes,
     deterministic_answers: input.deterministicOutcome.answers,
+    deterministic_routes: input.deterministicOutcome.routes,
+    thresholds: input.thresholds,
     latency_ms: input.providerOutcome.provenance.latencyMs,
     cost: input.providerOutcome.provenance.usage?.costUsd ?? null,
     provenance_source: input.providerOutcome.provenance.source,
     fallback_reason: input.providerOutcome.provenance.fallbackReason,
     request_diagnostics: input.providerOutcome.provenance.diagnostics ?? null,
-    disagrees: routeDisagreement(
-      input.providerOutcome.routes as unknown as Readonly<Record<string, { readonly path: string }>>,
-      input.deterministicOutcome.routes as unknown as Readonly<Record<string, { readonly path: string }>>,
-    ),
+    disagrees,
   };
 }
