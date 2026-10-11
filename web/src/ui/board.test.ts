@@ -3123,7 +3123,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const band = document.getElementById('board-owner')!;
     expect(band.querySelector('[data-proposal-id="lp-1"]')).toBeNull();
     band.querySelector<HTMLButtonElement>('.board-band__more')!.click();
-    const review = band.querySelector<HTMLSummaryElement>('[data-proposal-id="lp-1"] .board-owner__review > summary');
+    const review = band.querySelector<HTMLElement>('[data-proposal-id="lp-1"] .board-owner__review > summary');
     expect(review?.dataset.actionId).toBe('owner-proposal:lp-1');
     expect(review?.dataset.control).toBe('disclose');
     expect(document.activeElement).toBe(review);
@@ -3144,7 +3144,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const departingDisclosure = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:gone"][data-control="disclose"]')!;
     departingDisclosure.focus();
     view.render(snapshot({ notifications: [proposalNotice] }));
-    const review = band.querySelector<HTMLSummaryElement>('[data-proposal-id="lp-1"] .board-owner__review > summary');
+    const review = band.querySelector<HTMLElement>('[data-proposal-id="lp-1"] .board-owner__review > summary');
     expect(document.activeElement).toBe(review);
     expect(document.activeElement).not.toBe(document.body);
     expect(band.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(true);
