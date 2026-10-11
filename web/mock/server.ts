@@ -246,6 +246,10 @@ function sampleSnapshot(): unknown {
   const descriptors = boardMode === 'clear-needs-you' ? [] : [
     { id: 'demo-api-payment-fix', labels: ['lens failed', 'action-required'] },
     { id: 'demo-api-conflict-probe', labels: ['PR conflicting'] },
+    // The quota-walled lane is a Gru-owned FOR GRU cause too (main's smoke
+    // section-truth test asserts it there): the server mailbox is the only
+    // FOR GRU membership authority, so the fixture must say so.
+    { id: 'demo-api-quota-walled', labels: ['quota wall'] },
   ];
   const items: MailboxItemView[] = descriptors.map(({ id, labels }) => {
     const job = jobs.find((candidate) => candidate.id === id)!;

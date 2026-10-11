@@ -850,8 +850,11 @@ test.describe('board (E6, mock feed)', () => {
       await expect(silent.locator('.board-job__stale')).toHaveText('stalled');
       await expect(silent.locator('.board-job__status')).toHaveText('working');
 
-      // Chip and bands agree: only the live machine row (mock-n5) counts.
-      await expect(page.locator('#board-unacked')).toContainText('1 notifications · needs Gru');
+      // Chip and bands agree: the live machine rows count — the global
+      // review escalation (mock-n5) AND the provider-wall stop (mock-n4,
+      // machine attention since the owner release), never the merged lane's
+      // closed receipt.
+      await expect(page.locator('#board-unacked')).toContainText('2 notifications · needs Gru');
       // Scoped acceptance clips (tracked-review A10): the full-page capture
       // is taken under sticky chrome that can occlude the IN FLIGHT band,
       // so the NEEDS GRU band and the waiting row get their own clips — the
