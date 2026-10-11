@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, sep, win32 } from 'node:path';
@@ -7,6 +8,20 @@ export type ManagedRepoPath =
   | { readonly kind: 'unavailable'; readonly reason: string };
 
 const UNAVAILABLE_REASON = 'selected repository is unavailable under workspace_root';
+
+function isGitWorktreeRootSync(project: string): boolean {
+  try {
+    const reportedRoot = execFileSync('git', ['-C', project, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      maxBuffer: 16_384,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2_000,
+    }).trim();
+    return realpathSync(reportedRoot) === project;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * A managed repository is one exact direct-child directory name, never a
@@ -105,7 +120,11 @@ export function resolveManagedRepoPathSync(
     }
 
     const gitMarker = lstatSync(join(project, '.git'));
-    if (gitMarker.isSymbolicLink() || (!gitMarker.isDirectory() && !gitMarker.isFile())) {
+    if (
+      gitMarker.isSymbolicLink() ||
+      (!gitMarker.isDirectory() && !gitMarker.isFile()) ||
+      !isGitWorktreeRootSync(project)
+    ) {
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
     return { kind: 'available', path: project };

@@ -359,6 +359,28 @@ describe('intake review regressions', () => {
     expect(await selected.preview(h.request)).toMatchObject({ repoPath: h.repo });
   });
 
+  it('rejects stale Git markers but accepts a valid worktree pointer file', () => {
+    const h = fixture();
+    const stale = join(h.workspace, 'stale');
+    mkdirSync(stale);
+    writeFileSync(join(stale, '.git'), 'gitdir: missing');
+    expect(managedRepoPathsForIntake(h.workspace, ['stale'])).toEqual([]);
+
+    const source = join(h.root, 'worktree-source');
+    mkdirSync(source);
+    execFileSync('git', ['init', '-q', source]);
+    execFileSync('git', [
+      '-C', source,
+      '-c', 'user.name=Gru Test',
+      '-c', 'user.email=gru-test@example.invalid',
+      'commit', '--allow-empty', '-m', 'initial',
+    ]);
+    const worktree = join(h.workspace, 'worktree-checkout');
+    execFileSync('git', ['-C', source, 'worktree', 'add', '--detach', '-q', worktree]);
+    expect(readFileSync(join(worktree, '.git'), 'utf8')).toMatch(/^gitdir:/u);
+    expect(managedRepoPathsForIntake(h.workspace, ['worktree-checkout'])).toEqual([realpathSync(worktree)]);
+  });
+
   it('stops after a rate-limited issue or comment and retains unattempted selected-source gaps', async () => {
     const calls: string[] = [];
     const h = fixture({ remote, ghRunner: async (args) => {
