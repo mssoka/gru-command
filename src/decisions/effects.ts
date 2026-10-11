@@ -3,19 +3,23 @@ import {
   DECISION_SURFACE_EVENT_TRIAGE,
   DECISION_SURFACE_SUPERVISION,
   EVENT_QUESTIONS,
+  EVENT_RISKS,
   SUPERVISION_QUESTIONS,
+  SUPERVISION_RISKS,
   type EventQuestions,
   type FailureClass,
   type SupervisionQuestions,
 } from './questions.js';
+import { decisionRoute, validateAnswer } from './service.js';
 import type {
   Answer,
   AnswersFor,
   DecisionOutcome,
   DecisionProvenance,
   DecisionRoute,
-  Question,
   QuestionSet,
+  RiskClass,
+  ThresholdsConfig,
 } from './types.js';
 
 /**
@@ -108,11 +112,12 @@ export function supervisionGuidance(
   return { failureClass, restartAdvised, restartAuthorized, action };
 }
 
-/** One surface's consumer effect, reduced to a comparable key, and the
- * surface's question set. An outcome that does not carry a readable
- * answer of the right type for every question cannot be measured. */
+/** One surface's consumer effect, reduced to a comparable key, with the
+ * surface's question set and per-question risk classes: an outcome is
+ * measurable only when it is valid for exactly those. */
 interface ShadowEffect {
   readonly questions: QuestionSet;
+  readonly risks: Readonly<Record<string, RiskClass>>;
   readonly effect: (fallback: AnswersFor<QuestionSet>, outcome: OutcomeView<QuestionSet>) => string;
 }
 
@@ -120,6 +125,7 @@ function caseSpecEffect(surface: string): ShadowEffect {
   const spec = surfaceCaseSpec(surface);
   return {
     questions: spec.questions,
+    risks: spec.risks,
     effect: (fallback, outcome) => spec.answerAction(servedAnswers(fallback, outcome)),
   };
 }
@@ -127,10 +133,12 @@ function caseSpecEffect(surface: string): ShadowEffect {
 const SHADOW_EFFECTS: Readonly<Record<string, ShadowEffect>> = {
   [DECISION_SURFACE_EVENT_TRIAGE]: {
     questions: EVENT_QUESTIONS,
+    risks: EVENT_RISKS,
     effect: (_fallback, outcome) => eventTriageRouting(outcome as unknown as OutcomeView<EventQuestions>),
   },
   [DECISION_SURFACE_SUPERVISION]: {
     questions: SUPERVISION_QUESTIONS,
+    risks: SUPERVISION_RISKS,
     effect: (fallback, outcome) => {
       const baseline = fallback as unknown as AnswersFor<SupervisionQuestions>;
       const { action } = supervisionGuidance(
@@ -151,37 +159,59 @@ export function hasShadowEffect(surface: string): boolean {
   return Object.hasOwn(SHADOW_EFFECTS, surface);
 }
 
-const ROUTE_PATHS: ReadonlySet<string> = new Set(['act', 'confirm', 'fallback']);
+/** The per-question risk classes of a surface with a consumer effect;
+ * null otherwise. */
+export function shadowSurfaceRisks(surface: string): Readonly<Record<string, RiskClass>> | null {
+  return hasShadowEffect(surface) ? SHADOW_EFFECTS[surface]!.risks : null;
+}
 
 function plainRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function readableAnswer(question: Question, value: unknown): value is Answer {
-  if (!plainRecord(value) || value['type'] !== question.type) return false;
-  if (question.type === 'choice') return typeof value['choice'] === 'string' && question.options.includes(value['choice']);
-  if (question.type === 'noul') return typeof value['noul'] === 'number' && Number.isFinite(value['noul']);
-  return typeof value['score'] === 'number' && Number.isFinite(value['score']);
+const ROUTE_KEYS: readonly string[] = ['metric', 'metricKind', 'path', 'requiresConfirm', 'riskClass'];
+
+const sameKeys = (value: Readonly<Record<string, unknown>>, expected: readonly string[]): boolean => {
+  const keys = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return keys.length === wanted.length && keys.every((key, index) => key === wanted[index]);
+};
+
+/** A recorded route is readable only when it is exactly the route
+ * `decisionRoute` builds for its answer, at the question's own risk class
+ * and the row's thresholds: same fields, band, confirmation flag, metric
+ * and metric kind. */
+function readableRoute(value: unknown, answer: Answer, riskClass: RiskClass, thresholds: ThresholdsConfig): value is DecisionRoute {
+  if (!plainRecord(value) || !sameKeys(value, ROUTE_KEYS) || value['riskClass'] !== riskClass) return false;
+  const expected = decisionRoute(answer, riskClass, thresholds);
+  return value['path'] === expected.path &&
+    value['requiresConfirm'] === expected.requiresConfirm &&
+    value['metric'] === expected.metric &&
+    value['metricKind'] === expected.metricKind;
 }
 
-function readableRoute(value: unknown): value is DecisionRoute {
-  return plainRecord(value) &&
-    typeof value['path'] === 'string' && ROUTE_PATHS.has(value['path']) &&
-    typeof value['requiresConfirm'] === 'boolean';
-}
-
-/** Read recorded answers and routes for every question; null when any
- * is missing, unreadable, or of the wrong type. */
+/** Read recorded answers and routes for exactly the surface's questions;
+ * null when the keys differ, any answer fails production validation
+ * (`validateAnswer`), or any route is not the one its answer bands to. */
 function readOutcome(
-  questions: QuestionSet,
+  effect: ShadowEffect,
   answers: unknown,
   routes: unknown,
   source: unknown,
+  thresholds: ThresholdsConfig,
 ): OutcomeView<QuestionSet> | null {
   if (!plainRecord(answers) || !plainRecord(routes)) return null;
   if (source !== 'jev' && source !== 'deterministic') return null;
-  for (const [id, question] of Object.entries(questions)) {
-    if (!readableAnswer(question, answers[id]) || !readableRoute(routes[id])) return null;
+  const ids = Object.keys(effect.questions);
+  if (!sameKeys(answers, ids) || !sameKeys(routes, ids)) return null;
+  for (const [id, question] of Object.entries(effect.questions)) {
+    let answer: Answer;
+    try {
+      answer = validateAnswer(question, answers[id], id);
+    } catch {
+      return null;
+    }
+    if (!readableRoute(routes[id], answer, effect.risks[id]!, thresholds)) return null;
   }
   return {
     answers: answers as AnswersFor<QuestionSet>,
@@ -193,8 +223,8 @@ function readOutcome(
 /** True when the consumer of `surface` would act differently on the
  * provider's outcome than on the deterministic baseline's. Null when no
  * consumer effect is defined for the surface, or when the recorded
- * answers or routes do not readably carry every question the effect
- * reads. Pure; shared by the shadow recorder and the yield telemetry so
+ * answers or routes are not valid for every question of the surface.
+ * Pure; shared by the shadow recorder and the yield telemetry so
  * "disagreement" has exactly one definition. */
 export function shadowEffectDisagreement(input: {
   readonly surface: string;
@@ -203,11 +233,13 @@ export function shadowEffectDisagreement(input: {
   readonly providerAnswers: unknown;
   readonly providerRoutes: unknown;
   readonly providerSource: unknown;
+  /** The thresholds both outcomes' routes were banded at. */
+  readonly thresholds: ThresholdsConfig;
 }): boolean | null {
   if (!hasShadowEffect(input.surface)) return null;
-  const { questions, effect } = SHADOW_EFFECTS[input.surface]!;
-  const baseline = readOutcome(questions, input.baselineAnswers, input.baselineRoutes, 'deterministic');
-  const provider = readOutcome(questions, input.providerAnswers, input.providerRoutes, input.providerSource);
+  const spec = SHADOW_EFFECTS[input.surface]!;
+  const baseline = readOutcome(spec, input.baselineAnswers, input.baselineRoutes, 'deterministic', input.thresholds);
+  const provider = readOutcome(spec, input.providerAnswers, input.providerRoutes, input.providerSource, input.thresholds);
   if (baseline === null || provider === null) return null;
-  return effect(baseline.answers, provider) !== effect(baseline.answers, baseline);
+  return spec.effect(baseline.answers, provider) !== spec.effect(baseline.answers, baseline);
 }
