@@ -21,6 +21,7 @@ import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { LockBusyError, type SessionStore } from '../sessions/store.js';
 import { resolveSpawnCwd } from './cwd.js';
+import { resolveGitCommit } from '../dispatch/perkins-review/artifacts.js';
 import { normalizeSessionPath, SessionAlreadyActiveError } from './session-paths.js';
 
 // E3 extracted the shared session-path helpers; re-export so existing
@@ -46,7 +47,7 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
-import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -742,16 +743,16 @@ export class PiRuntime implements AgentRuntime {
     // lock removal is bound to acquisition ownership, never mere existence
     // (Perkins r2 B4-race: the loser must never delete the winner's lock).
     let lockAcquired = false;
-    if (resumeFile !== undefined && !this.store.isHeld(resumeFile)) {
+    if (resumeFile !== undefined && (options.directiveRecoveryProducer !== undefined || !this.store.isHeld(resumeFile))) {
       const predecessor = options.directiveRecoveryProducer;
       if (predecessor === undefined) this.store.acquireLock(resumeFile);
       else {
         const proof = inspectDirectiveCheckpoint(resumeFile, predecessor.identity);
         const ownership = inspectDirectiveProducers(resumeFile, predecessor.identity).find(({ producer }) => isDeepStrictEqual(producer, predecessor));
-        if (predecessor.sessionFile !== resumeFile || ownership?.evidence !== 'host-absent' || proof.state !== 'resumable') {
+        if (predecessor.sessionFile !== resumeFile || ownership === undefined || ownership.evidence === 'unknown' || proof.state !== 'resumable') {
           throw new DirectiveCheckpointError('exact absent predecessor/safe checkpoint required before native lock reclaim');
         }
-        this.store.acquireLockAfterHostExit(resumeFile, predecessor.pid);
+        this.store.acquireLockAfterHostExit(resumeFile, predecessor.pid, predecessor.lockOwner);
       }
       lockAcquired = true;
     }
@@ -888,6 +889,7 @@ export class PiRuntime implements AgentRuntime {
         () => createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: session.agent.state.systemPrompt,
           tools: session.agent.state.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters, implementation: tool.execute.toString() })).sort((a, b) => a.name.localeCompare(b.name)),
           model: session.model ?? null })).digest('hex'),
+        () => resolveGitCommit(cwd, 'HEAD'),
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -991,6 +993,7 @@ export class PiAgentHandle implements AgentHandle {
     settled: boolean;
   } | null = null;
   private readonly directiveProducers = new Map<string, DirectiveProducer>();
+  private readonly pendingToolRefusals = new Map<string, { readonly producer: DirectiveProducer; readonly toolCallId: string; readonly reason: string }>();
   private disposed = false;
   private disposalPending: Promise<void> | null = null;
   private cleanupSucceeded = false;
@@ -1041,6 +1044,7 @@ export class PiAgentHandle implements AgentHandle {
      * The session file and its lock stay SDK-minted. */
     agentId?: string,
     private readonly directiveAuthorityManifest?: () => string,
+    private readonly directiveCompletionHead?: () => string,
   ) {
     this.role = role;
     // The SDK-minted session identity, retained separately from the
@@ -1066,12 +1070,28 @@ export class PiAgentHandle implements AgentHandle {
           if (directive === undefined) return;
           if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
           directive.beforeAdmission();
+          if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
+            throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before tool effect');
+          }
           flushDirectiveToolIntent(this.sessionFile, input.assistantMessage, input.toolCall);
         };
-        check();
-        const result = await before?.(input, signal);
-        check(); // prior extensions may await or change permission/native intent
-        return result;
+        try {
+          check();
+          const result = await before?.(input, signal);
+          check(); // prior extensions may await or change permission/native intent
+          return result;
+        } catch (error) {
+          const producer = directive === undefined ? undefined : this.directiveProducers.get(directive.identity.requestId);
+          if (producer !== undefined) {
+            const key = `${producer.incarnation}:${input.toolCall.id}`;
+            const refusal = { producer, toolCallId: input.toolCall.id, reason: String(error) };
+            this.pendingToolRefusals.set(key, refusal);
+            this.directiveAdmissionError = error;
+            try { recordDirectiveToolRefusal(producer, refusal.toolCallId, refusal.reason); this.pendingToolRefusals.delete(key); }
+            catch (journalError) { throw new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained'); }
+          }
+          throw error;
+        }
       };
       const executeBash = session.executeBash.bind(session);
       session.executeBash = (...args) => {
@@ -1142,7 +1162,9 @@ export class PiAgentHandle implements AgentHandle {
     if (this.liveTurn !== null || !this.session.isIdle || this.isCompacting() || this.session.isBashRunning === true || this.session.hasPendingBashMessages === true) {
       throw new DirectiveCheckpointError('native producer preparation requires genuine idle without independent controllers');
     }
-    const producer = prepareDirectiveProducer({ identity, agentId: this.id, sessionId: this.nativeSessionId, sessionFile: this.sessionFile });
+    const producer = prepareDirectiveProducer({ identity, agentId: this.id, sessionId: this.nativeSessionId, sessionFile: this.sessionFile,
+      ...(this.session instanceof AgentSession ? { lockOwner: this.store.ownedLockIdentity(this.sessionFile) } :
+        this.store.isHeld(this.sessionFile) ? { lockOwner: this.store.ownedLockIdentity(this.sessionFile) } : {}) });
     this.directiveProducers.set(identity.requestId, producer);
     return producer;
   };
@@ -1418,6 +1440,10 @@ export class PiAgentHandle implements AgentHandle {
     if (evidence === 'ceased' && !this.ownershipReleased) {
       // Fallible physical receipts precede release of either native lock or
       // runtime owner. A failed/committed-then-thrown append is retryable.
+      for (const [key, refusal] of this.pendingToolRefusals) {
+        recordDirectiveToolRefusal(refusal.producer, refusal.toolCallId, refusal.reason);
+        this.pendingToolRefusals.delete(key);
+      }
       for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
       this.store.releaseLock(this.sessionFile);
       this.setState('disposed');
@@ -1693,13 +1719,28 @@ export class PiAgentHandle implements AgentHandle {
           // real persisted native user entry, fsyncs it, then calls the host.
           queueMicrotask(() => {
             try {
-              inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
-              const binding = readDirectiveBinding(this.sessionFile, directive.identity.requestId);
-              if (binding?.userEntryId != null) directive.onAdmitted(binding);
+              const binding = inspectDirectiveAdmission(this.sessionFile, directive.identity);
+              directive.onAdmitted(binding);
             } catch (error) { this.directiveAdmissionError = error; }
           });
         }
         if (msg !== undefined && msg['role'] === 'assistant') {
+          if (msg['stopReason'] === 'stop' && this.liveDirective !== undefined) {
+            const directive = this.liveDirective;
+            const producer = this.directiveProducers.get(directive.identity.requestId);
+            let head: string | null = null;
+            try { head = this.directiveCompletionHead?.() ?? null; }
+            catch (error) { this.log('warn', 'native completion HEAD unavailable; current candidate gates remain owed', { error: String(error) }); }
+            // Capture HEAD NOW, before other callbacks/awaits can move the lane;
+            // only its persisted terminal checkpoint is associated afterward.
+            queueMicrotask(() => {
+              try {
+                const proof = inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
+                if (producer === undefined || proof.state !== 'terminal' || !proof.ok) throw new DirectiveCheckpointError('native completion checkpoint/producer unavailable');
+                recordDirectiveCompletion(producer, proof.checkpointId, head);
+              } catch (error) { this.directiveAdmissionError = error; }
+            });
+          }
           // Per-turn terminal evidence for the live prompt: every assistant
           // message updates it; the LAST one decides success vs failure.
           if (this.liveTurnStop !== null) {

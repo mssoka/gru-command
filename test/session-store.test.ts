@@ -1,9 +1,9 @@
 import { mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { LockBusyError, LockUnreadableError, SessionStore } from '../src/sessions/store.js';
 
 const cleanupDirs: string[] = [];
@@ -26,6 +26,48 @@ function seedSession(store: SessionStore, role = 'gru', text = '{"type":"session
 }
 
 describe('SessionStore', () => {
+  it('native recovery refuses foreign, legacy and unbound current lock owners despite predecessor PID absence', () => {
+    const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
+    const original = { host: hostname(), pid: 2_000_000_000, bootId: 'original-native-boot', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('absent predecessor'), { code: 'ESRCH' }); });
+    try {
+      for (const holder of [{ ...original, host: 'foreign-storage-host' }, { ...original, host: undefined }, { ...original, bootId: 'later-same-pid-owner' }]) {
+        const bytes = JSON.stringify(holder); writeFileSync(`${file}.lock`, bytes);
+        expect(() => store.acquireLockAfterHostExit(file, original.pid, original)).toThrow(LockBusyError);
+        expect(readFileSync(`${file}.lock`, 'utf8')).toBe(bytes);
+      }
+      writeFileSync(`${file}.lock`, JSON.stringify(original));
+      expect(() => store.acquireLockAfterHostExit(file, original.pid)).toThrow(LockBusyError);
+    } finally { probe.mockRestore(); store.dispose(); }
+  });
+
+  it('native lock recovery retains live and EPERM owners even when stale while ordinary stale-lock behavior is unchanged', () => {
+    const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
+    const owner = { host: hostname(), pid: process.pid, bootId: 'live-native-boot', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
+    const bytes = JSON.stringify(owner); writeFileSync(`${file}.lock`, bytes);
+    expect(() => store.acquireLockAfterHostExit(file, owner.pid, owner)).toThrow(LockBusyError);
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); });
+    try { expect(() => store.acquireLockAfterHostExit(file, owner.pid, owner)).toThrow(/permission denied/); expect(readFileSync(`${file}.lock`, 'utf8')).toBe(bytes); }
+    finally { probe.mockRestore(); store.dispose(); }
+  });
+
+  it('native lock recovery reclaims only a bound absent original owner and never steals a changed owner observed during its probe', () => {
+    const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
+    const owner = { host: hostname(), pid: 2_000_000_000, bootId: 'original-bound-boot', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
+    writeFileSync(`${file}.lock`, JSON.stringify(owner));
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => {
+      writeFileSync(`${file}.lock`, JSON.stringify({ ...owner, bootId: 'changed-owner' }));
+      throw Object.assign(new Error('absent predecessor'), { code: 'ESRCH' });
+    });
+    try {
+      expect(() => store.acquireLockAfterHostExit(file, owner.pid, owner)).toThrow(LockBusyError);
+      expect(JSON.parse(readFileSync(`${file}.lock`, 'utf8')).bootId).toBe('changed-owner');
+      probe.mockImplementation(() => { throw Object.assign(new Error('absent predecessor'), { code: 'ESRCH' }); });
+      writeFileSync(`${file}.lock`, JSON.stringify(owner)); store.acquireLockAfterHostExit(file, owner.pid, owner);
+      expect(store.ownedLockIdentity(file)).toMatchObject({ host: hostname(), pid: process.pid });
+    } finally { probe.mockRestore(); store.dispose(); }
+  });
+
   it('derives the sessions dir from the instance data dir with pi-standard role/cwd scoping', () => {
     const dataDir = tmpDataDir();
     const store = new SessionStore(dataDir);

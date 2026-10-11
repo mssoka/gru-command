@@ -7,7 +7,7 @@ import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
-import { DirectiveCheckpointError, inspectDirectiveProducers, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -2350,6 +2350,12 @@ export class LedgerApi {
   correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null {
     const newest = this.latestJobEvent(jobId, 'job.delivered');
     if (newest === null) return null;
+    const native = (typeof newest.payload === 'object' && newest.payload !== null ? newest.payload : {}) as { candidate_delivery_proven?: unknown; work_revision?: unknown };
+    if (native.candidate_delivery_proven === false) {
+      // Historical completion is a fact, not candidate authority. A later
+      // proven current delivery must identify the candidate before review.
+      return { revision: typeof native.work_revision === 'number' ? native.work_revision : 0, head: null };
+    }
     const revision = deliveredWorkRevision(newest);
     if (revision === 0) return null;
     const first = this.db.prepare(
@@ -7111,9 +7117,8 @@ export class LedgerApi {
       (debt.state === 'open' || debt.state === 'waiting' || debt.state === 'suspended') && debt.nextAction.kind === 'owner-decision')) {
       throw new DirectiveCheckpointError('owner-only decision holds this job — recovery cannot acknowledge it');
     }
-    const agents = new Set(this.listAgents().filter((agent) => agent.jobId === jobId).map((agent) => agent.id));
-    if (this.listNotifications({ routing: 'needs-owner', limit: 1000 }).some((note) =>
-      note.ackedAt === null && note.resolvedAt === null && note.agentId !== null && agents.has(note.agentId))) {
+    if (this.db.prepare(`SELECT 1 FROM notifications n JOIN agents a ON a.id = n.agent_id
+      WHERE a.job_id = ? AND n.routing = 'needs-owner' AND n.acked_at IS NULL AND n.resolved_at IS NULL LIMIT 1`).get(jobId)) {
       throw new DirectiveCheckpointError('owner-only stop holds this job — recovery cannot acknowledge it');
     }
   }
@@ -7176,6 +7181,8 @@ export class LedgerApi {
       if (row === null || isDirectiveTerminal(row.state) || !isDeepStrictEqual(this.directiveTurnIdentity(row.requestId), binding.identity)) throw new DirectiveCheckpointError('native admission does not match a live accepted request');
       if (binding.runtime !== 'pi' || !binding.sessionId || !binding.userEntryId || !/^[a-f0-9]{64}$/.test(binding.promptHash) ||
           row.nativeTarget?.agentId !== binding.agentId || row.nativeTarget?.sessionFile !== binding.sessionFile) throw new DirectiveCheckpointError('actual native admission identity is incomplete/mismatched');
+      const actual = inspectDirectiveAdmission(binding.sessionFile, binding.identity);
+      if (!isDeepStrictEqual(actual, binding)) throw new DirectiveCheckpointError('native admission does not match actual durable user readback');
       if (row.nativeBinding !== null) {
         if (!isDeepStrictEqual(row.nativeBinding, binding)) throw new DirectiveCheckpointError('actual native admission cannot be rebound');
         return row;
@@ -7288,7 +7295,7 @@ export class LedgerApi {
           row.nativeBinding !== null && row.nativeBinding.sessionId !== ownNativeProducer.sessionId) {
         throw new DirectiveCheckpointError('active native producer does not bind the exact current physical request/session/start token');
       }
-      const physical = inspectDirectiveProducers(ownNativeProducer.sessionFile, identity);
+      const physical = inspectDirectiveProducers(ownNativeProducer.sessionFile);
       const current = physical.find(({ producer }) => isDeepStrictEqual(producer, ownNativeProducer));
       if (current?.evidence !== 'unknown' || physical.some(({ producer, evidence }) => producer.incarnation !== ownNativeProducer.incarnation && evidence === 'unknown')) {
         throw new DirectiveCheckpointError('active native producer is ceased/unbound or another physical incarnation remains UNKNOWN');
@@ -7950,6 +7957,22 @@ export class LedgerApi {
    * a synchronous check inside the state transaction is authoritative. */
   private directiveRetirementBlockers(row: Pick<DirectiveRequestRecord, 'requestId' | 'jobId'>, laneId: string, ownSpawningAgentId?: string, ownProducerStartSeq?: number, ownNativeProducer?: DirectiveProducer): readonly string[] {
     const blockers: string[] = [...this.directiveCleanupBlockers(row.jobId, ownProducerStartSeq)];
+    const target = this.getDirective(row.requestId)?.nativeTarget;
+    if (target != null && ownNativeProducer === undefined) {
+      try {
+        const identity = this.directiveTurnIdentity(row.requestId);
+        const owners = inspectDirectiveProducers(target.sessionFile);
+        const original = owners.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
+        const last = owners.at(-1);
+        const lock = last === undefined ? null : directiveProducerLockBlocker(last.producer);
+        if (lock !== null) blockers.push(lock);
+        if (original.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) blockers.push('original native physical owner cessation remains UNKNOWN');
+        else if (original.some(({ evidence }) => evidence === 'host-absent')) {
+          const checkpoint = inspectDirectiveCheckpoint(target.sessionFile, identity);
+          if (checkpoint.state === 'unknown' || checkpoint.state === 'terminal' && !checkpoint.ok) blockers.push('original host absent but native effects/checkpoint remain UNKNOWN');
+        }
+      } catch (error) { blockers.push(`original native physical ownership unreadable: ${String(error)}`); }
+    }
     const openTurns = this.listAgents().filter(
       (agent) => agent.jobId === row.jobId && ((agent.state === 'spawning' && agent.id !== ownSpawningAgentId) ||
         // Only progress callers can supply a validated current physical owner.

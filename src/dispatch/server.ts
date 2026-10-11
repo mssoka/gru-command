@@ -1594,8 +1594,8 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const controller = new AbortController();
       directiveControllers.add(controller);
       const run = (async () => {
-        await options.wave.clearLaneForWriter({ jobId, writer: `rebrief ${intent.requestId}` });
         await executeAcceptedDirective({ registry: ops.registry, ledger: options.ledger, worktrees: ops.worktrees,
+          clearLaneForWriter: (input) => options.wave.clearLaneForWriter(input),
           notifications: ops.notifications, pendingProducerBlockers: options.pendingProducerBlockers, signal: controller.signal,
           ...(options.workerGate === undefined ? {} : { workerGate: options.workerGate }),
           ...(options.retrySettlement === undefined ? {} : { retrySettlement: options.retrySettlement }),

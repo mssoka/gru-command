@@ -652,6 +652,7 @@ export class RuntimeRegistry {
     });
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
+      ...(options.directiveRecoveryProducer !== undefined ? { directiveRecoveryProducer: options.directiveRecoveryProducer } : {}),
       ...(cwd !== undefined ? { cwd } : {}),
       ...((workflowSession?.agentId ?? options.agentId) !== undefined ? { agentId: workflowSession?.agentId ?? options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),

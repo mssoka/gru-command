@@ -1,6 +1,6 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -3779,7 +3779,7 @@ it('restart recovery rejects synchronous SDK disposal success as proof while the
 
 /** A real persisted ledger/lane for SDK ownership regressions, not a native
  * handoff fixture. It supplies no positive original-producer proof. */
-async function directiveRecoveryLedgerFixture(label: string) {
+async function directiveRecoveryLedgerFixture(label: string, materialRevision = false) {
   const { LedgerDb } = await import('../src/ledger/db.js');
   const { LedgerApi } = await import('../src/ledger/api.js');
   const { EventBus } = await import('../src/events/bus.js');
@@ -3794,15 +3794,16 @@ async function directiveRecoveryLedgerFixture(label: string) {
   ledger.addJob({ id: 'sdk-original-job', repo: 'fixture', title: label, briefing: 'immutable original approved contract' });
   ledger.setJobStatus('sdk-original-job', 'working');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'sdk-original-job' });
+  if (materialRevision) expect(ledger.addJobAmendment({ jobId: 'sdk-original-job', body: 'Approved original material scope.', supersedes: [], approval: { by: 'owner', reference: 'GH-286 completion fixture' }, effect: 'material', expectedContractSha256: ledger.directiveCurrentAuthority('sdk-original-job').contractSha256 }).status).toBe('accepted');
   const request = ledger.beginDirectiveIntent({ jobId: 'sdk-original-job', requestId: 'sdk-original-request',
     directive: 'perform original approved work only once', holder: 'gru' }).record;
   return { dir, repo, db, bus, ledger, notifications, worktrees, lane, request,
     identity: ledger.directiveTurnIdentity(request.requestId) };
 }
 
-async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void) {
+async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configureSession?: (session: Awaited<ReturnType<typeof actualDirectiveSdkSession>>, handle: AgentHandle) => void, materialRevision = false) {
   const fx = await fixture(turns);
-  const scene = await directiveRecoveryLedgerFixture('guarded-sdk-tools');
+  const scene = await directiveRecoveryLedgerFixture('guarded-sdk-tools', materialRevision);
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
   const registry = new RuntimeRegistry({ config: fx.config, store: fx.store,
     pi: { agentDir: fx.agentDir, modelRuntime: fx.modelRuntime } });
@@ -3839,6 +3840,79 @@ async function sdkDirectiveExecutionFixture(turns: readonly StubTurn[], configur
   return { fx, scene, registry, sessions, states, toolStates, deps, cleanup };
 }
 
+async function assertSdkOriginalCompletionHead(mode: 'known' | 'missing' | 'null' | 'conflicting' | 'malformed') {
+  const { execFileSync } = await import('node:child_process');
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js');
+  const { EventBus } = await import('../src/events/bus.js'); const { NotificationCenter } = await import('../src/notifications/center.js');
+  const { laneIsBusy } = await import('../src/dispatch/branch-idle.js');
+  let release!: () => void; const hold = new Promise<void>((done) => { release = done; });
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['Original accepted material scope genuinely finished.'], hold }], undefined, true);
+  const { lane, request } = f.scene;
+  const originalHead = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const publish = f.scene.ledger.appendCustomEventIfCurrentDirective.bind(f.scene.ledger);
+  const loss = vi.spyOn(f.scene.ledger, 'appendCustomEventIfCurrentDirective').mockImplementation((fields, identity) => {
+    if (fields.kind === 'job.delivered') throw new Error('lost original completion publication before commit');
+    return publish(fields, identity);
+  });
+  let moved = false;
+  try {
+    const running = executeAcceptedDirective(f.deps, request.requestId);
+    await waitFor(() => f.fx.script.calls.length === 1, 'actual SDK original model turn');
+    if (mode === 'null') { renameSync(lane.path, `${lane.path}.temporarily-absent`); moved = true; }
+    release(); await running; loss.mockRestore();
+    if (moved) { renameSync(`${lane.path}.temporarily-absent`, lane.path); moved = false; }
+    const row = f.scene.ledger.getDirective(request.requestId)!;
+    expect(row.state).toBe('admitted'); expect(row.workRevision).toBe(1);
+    expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toBeNull();
+    const path = `${row.nativeTarget!.sessionFile}.producers.jsonl`;
+    const receipts = readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; producer: unknown; checkpointId?: string; head?: string | null });
+    const completed = receipts.filter((receipt) => receipt.state === 'completed');
+    expect(completed).toHaveLength(1); expect(completed[0]!.head).toBe(mode === 'null' ? null : originalHead);
+    expect(completed[0]!.producer).toEqual((f.scene.ledger.latestJobEventByRequestId(row.jobId, 'silas.directive-producer-started', row.requestId)!.payload as { native_producer: unknown }).native_producer);
+    if (mode === 'missing') writeFileSync(path, receipts.filter((receipt) => receipt.state !== 'completed').map((receipt) => JSON.stringify(receipt)).join('\n') + '\n');
+    if (mode === 'conflicting') writeFileSync(path, readFileSync(path, 'utf8') + JSON.stringify({ ...completed[0], head: 'd'.repeat(40) }) + '\n');
+    if (mode === 'malformed') writeFileSync(path, readFileSync(path, 'utf8') + JSON.stringify({ ...completed[0], checkpointId: 9 }) + '\n');
+    writeFileSync(join(lane.path, 'later-owner-artifact.txt'), 'Later current branch evidence must not relabel original completion.\n');
+    execFileSync('git', ['-C', lane.path, 'add', 'later-owner-artifact.txt']);
+    execFileSync('git', ['-C', lane.path, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'later independent fixture head']);
+    expect(execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).not.toBe(originalHead);
+    const bytes = readFileSync(row.nativeTarget!.sessionFile, 'utf8'); const journal = readFileSync(path, 'utf8');
+    const accepted = f.scene.ledger.getDirective(row.requestId)!; const job = f.scene.ledger.getJob(row.jobId)!;
+    await f.registry.dispose(); f.scene.db.close();
+    for (let restart = 0; restart < 2; restart += 1) {
+      const db = new LedgerDb(f.scene.dir); const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+      try {
+        const spawn = vi.fn(async () => { throw new Error('completed original work must never execute or allocate again'); });
+        const service = new DirectiveProgressService({ ...f.deps, ledger, notifications: new NotificationCenter({ ledger, bus }), registry: { getHandle: () => null, spawn, disposeHandle: async () => {} } });
+        service.reconsider(); await service.settled(); service.reconsider(); await service.settled(); await service.dispose();
+        const refused = mode === 'conflicting' || mode === 'malformed';
+        expect(ledger.getDirective(row.requestId)?.state).toBe(refused ? 'admitted' : 'settled');
+        const delivery = ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
+        if (refused) expect(delivery).toBeNull();
+        else {
+          const known = mode === 'known';
+          expect(delivery?.payload).toMatchObject({ request_id: row.requestId, work_revision: 1, sha: known ? originalHead : null, candidate_delivery_proven: known, native_completion: { identity: { requestId: row.requestId, workRevision: 1 }, checkpoint_id: completed[0]!.checkpointId, binding: row.nativeBinding } });
+          expect(ledger.workRevisionState(row.jobId)).toEqual({ required: 1, delivered: known ? 1 : 0 });
+          expect(ledger.correctiveVerificationDebt(row.jobId)).toEqual({ revision: 1, head: known ? originalHead : null });
+          expect(laneIsBusy(ledger, ledger.getJob(row.jobId)!)).toBe(true);
+          expect(ledger.listEvents().filter((event) => event.jobId === row.jobId && event.kind === 'job.delivered')).toHaveLength(1);
+          if (!known) expect(ledger.listObligations({ jobId: row.jobId }).some((obligation) => obligation.nextAction.kind === 'gru-decision' && obligation.nextAction.decision.includes('completion HEAD is unproven'))).toBe(true);
+        }
+        expect(ledger.getDirective(row.requestId)).toMatchObject({ payloadHash: accepted.payloadHash, payload: accepted.payload, workRevision: 1, authorityEpoch: accepted.authorityEpoch, nativeTarget: accepted.nativeTarget, nativeBinding: accepted.nativeBinding });
+        expect(ledger.getJob(row.jobId)).toEqual(job); expect(f.scene.worktrees.listWorktrees({ jobId: row.jobId })).toEqual([lane]); expect(spawn).not.toHaveBeenCalled();
+      } finally { db.close(); }
+    }
+    expect(readFileSync(row.nativeTarget!.sessionFile, 'utf8')).toBe(bytes); expect(readFileSync(path, 'utf8')).toBe(journal);
+    expect(f.fx.script.calls).toHaveLength(1); expect(f.sessions).toHaveLength(1);
+  } finally { release(); loss.mockRestore(); if (moved) renameSync(`${lane.path}.temporarily-absent`, lane.path); await f.cleanup(); }
+}
+it('actual SDK original HEAD receipt survives later branch movement and two ledger/service restarts at accepted revision one', () => assertSdkOriginalCompletionHead('known'));
+it('absent historical completion HEAD never samples later branch HEAD or advances accepted candidate revision', () => assertSdkOriginalCompletionHead('missing'));
+it('actual SDK unavailable contemporaneous completion HEAD settles truthful original progress without candidate READY', () => assertSdkOriginalCompletionHead('null'));
+it('conflicting original SDK completion HEAD receipts remain UNKNOWN and unconsumed across two restarts', () => assertSdkOriginalCompletionHead('conflicting'));
+it('malformed original SDK completion receipt remains UNKNOWN and unconsumed across two restarts', () => assertSdkOriginalCompletionHead('malformed'));
+
 const guardedSdkTools: readonly StubTurn[] = [
   { deltas: [], toolCalls: [
     { id: 'guarded-first', name: 'bash', args: { command: "printf 'first\\n' > guarded-effects.txt" } },
@@ -3851,6 +3925,8 @@ async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveEx
   const { prepareDirectiveBinding, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const original = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'guarded-original-minion' });
   const session = await actualDirectiveSdkSession(original);
+  const lockOwner = JSON.parse(readFileSync(`${original.sessionFile!}.lock`, 'utf8')) as { host?: string; pid: number; bootId: string };
+  expect(f.fx.store.isHeld(original.sessionFile!)).toBe(true);
   const identity = f.scene.identity;
   f.scene.ledger.claimDirectiveDispatch(identity.requestId);
   f.scene.ledger.prepareDirectiveTarget(identity.requestId, { agentId: original.id, sessionFile: original.sessionFile! });
@@ -3871,7 +3947,7 @@ async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveEx
     request_id: identity.requestId, producer_start_seq: start, producer_identity: identity, native_producer: producer,
     agent_id: original.id, session_file: original.sessionFile,
   } });
-  return { original, proof, prefix: readFileSync(original.sessionFile!, 'utf8') };
+  return { original, proof, lockOwner, prefix: readFileSync(original.sessionFile!, 'utf8') };
 }
 
 async function assertGuardedSdkDelivery(resume: boolean) {
@@ -3907,15 +3983,17 @@ async function assertGuardedSdkDelivery(resume: boolean) {
 it('production shared executor permits only its exact streaming SDK producer to run two native tools and deliver', () => assertGuardedSdkDelivery(false));
 it('production checkpoint callback permits its exact streaming SDK producer to run two native tools without prompt replay', () => assertGuardedSdkDelivery(true));
 
-async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'foreign-streaming') {
+async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook') {
+  const hook = fault === 'prior-hook-await' || fault.endsWith('-hook');
+  const manifest = fault.startsWith('manifest-');
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
   let release!: () => void; const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
   let reached!: () => void; const boundary = new Promise<void>((resolveGate) => { reached = resolveGate; });
   const first = guardedSdkTools[0]!;
   const f = await sdkDirectiveExecutionFixture([
-    { ...first, ...(fault !== 'prior-hook-await' ? { hold, honorAbort: true } : {}) }, guardedSdkTools[1]!,
+    { ...first, ...(!hook ? { hold, honorAbort: true } : {}) }, guardedSdkTools[1]!,
   ], (session) => {
-    if (fault !== 'prior-hook-await') return;
+    if (!hook) return;
     // Actual awaited SDK extension hook: the adapter must recheck AFTER it.
     const runner = (session as unknown as { readonly _extensionRunner: {
       hasHandlers(type: string): boolean; emitToolCall(input: { toolCallId: string }): Promise<undefined>;
@@ -3936,7 +4014,7 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
     if (resume) await seedSdkUserCheckpoint(f);
     if (resume) { service = new DirectiveProgressService(f.deps); service.reconsider(); run = service.settled(); }
     else run = executeAcceptedDirective(f.deps, f.scene.request.requestId);
-    if (fault === 'prior-hook-await') await Promise.race([boundary, run.then(() => { throw new Error('SDK settled before genuine prior-hook await'); })]);
+    if (hook) await Promise.race([boundary, run.then(() => { throw new Error('SDK settled before genuine prior-hook await'); })]);
     else await waitFor(() => f.fx.script.calls.length === 1, 'genuine guarded model await');
     const active = f.scene.ledger.getDirective(f.scene.request.requestId)!;
     expect(f.scene.ledger.getAgent(active.nativeTarget!.agentId)?.state).toBe('streaming');
@@ -3958,13 +4036,34 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
       foreignTurn = foreign.prompt('independent foreign native turn held open');
       await waitFor(() => script.calls.length === 1 && f.scene.ledger.getAgent(foreign.id)?.state === 'streaming', 'truthful foreign SDK streaming producer');
       expect(foreign.health().state).toBe('streaming');
+    } else if (manifest) {
+      const session = f.sessions.at(-1)!;
+      if (fault.startsWith('manifest-role')) session.agent.state.systemPrompt = 'unapproved live system authority';
+      else if (fault.startsWith('manifest-model')) session.agent.state.model = { ...session.model!, maxTokens: session.model!.maxTokens - 1 };
+      else session.agent.state.tools = session.agent.state.tools.filter((tool) => tool.name !== 'read');
+      expect(f.scene.ledger.directiveTurnIdentity(active.requestId)).toEqual(f.scene.identity);
     } else f.scene.ledger.setJobStatus(active.jobId, 'parked');
     release(); await run;
     const path = join(f.scene.lane.path, 'guarded-effects.txt');
-    if (fault === 'prior-hook-await') expect(readFileSync(path, 'utf8')).toBe('first\n');
+    if (hook) expect(readFileSync(path, 'utf8')).toBe('first\n');
     else expect(existsSync(path)).toBe(false);
     expect(f.scene.ledger.getDirective(active.requestId)?.state).toBe('admitted');
     expect(f.scene.ledger.latestJobEventByRequestId(active.jobId, 'job.delivered', active.requestId)).toBeNull();
+    if (manifest) {
+      expect(f.fx.script.calls).toHaveLength(2); // SDK caught the refusal; model still returned final stop
+      expect(readFileSync(`${active.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toContain('guard-refused');
+      const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js');
+      const { EventBus } = await import('../src/events/bus.js'); const { NotificationCenter } = await import('../src/notifications/center.js');
+      await service?.dispose(); service = null; f.scene.db.close();
+      f.scene.db = new LedgerDb(f.scene.dir); f.scene.ledger = new LedgerApi(f.scene.db.handle, { bus: new EventBus({}) });
+      f.scene.notifications = new NotificationCenter({ ledger: f.scene.ledger, bus: new EventBus({}) });
+      const spawn = vi.spyOn(f.registry, 'spawn');
+      service = new DirectiveProgressService({ ...f.deps, ledger: f.scene.ledger, notifications: f.scene.notifications });
+      service.reconsider(); await service.settled();
+      expect(spawn).not.toHaveBeenCalled(); expect(f.scene.ledger.getDirective(active.requestId)?.state).toBe('admitted');
+      expect(f.scene.ledger.latestJobEventByRequestId(active.jobId, 'job.delivered', active.requestId)).toBeNull();
+      expect(f.scene.ledger.workRevisionState(active.jobId).delivered).toBe(0);
+    }
     if (fault === 'foreign-streaming') {
       expect(readFileSync(active.nativeTarget!.sessionFile, 'utf8')).toContain('foreign-streaming-producer (streaming)');
       expect(f.scene.ledger.getAgent('foreign-streaming-producer')?.state).toBe('streaming');
@@ -3980,6 +4079,10 @@ it('production shared SDK tool guard rechecks authority after its awaited native
 it('production checkpoint SDK tool guard rechecks authority after its awaited native prior hook', () => assertProductionSdkFence(true, 'prior-hook-await'));
 it('production shared SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(false, 'foreign-streaming'));
 it('production checkpoint SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(true, 'foreign-streaming'));
+it('real SDK model authority mutation refuses effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(false, 'manifest-model'));
+it('real resumed SDK system authority mutation refuses effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(true, 'manifest-role'));
+it('real SDK tool authority mutation after awaited prior hook retains only its permitted first effect across restart', () => assertProductionSdkFence(false, 'manifest-hook'));
+it('real resumed SDK tool authority mutation after awaited prior hook never gains final-stop delivery on restart', () => assertProductionSdkFence(true, 'manifest-hook'));
 
 async function actualDirectiveSdkSession(handle: AgentHandle) {
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');
@@ -4137,3 +4240,78 @@ it('resident actual SDK disposal and pre-durability UNKNOWN journal failures ret
     await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup();
   }
 });
+
+async function assertStrictOriginalSdkLock(mode: 'foreign' | 'legacy' | 'reused' | 'live' | 'eperm') {
+  const { hostname } = await import('node:os');
+  const f = await sdkDirectiveExecutionFixture([{ deltas: ['must never execute'] }]);
+  const seeded = await seedSdkUserCheckpoint(f); const file = seeded.original.sessionFile!;
+  const native = JSON.parse(readFileSync(`${file}.producers.jsonl`, 'utf8').trim().split('\n')[0]!) as { producer: import('../src/runtime/directive-checkpoint.js').DirectiveProducer };
+  // Bind the actual SDK-owned lock observed before real disposal. This
+  // independent fixture observation also works against received production
+  // whose missing producer binding is precisely the regression under test.
+  const owner = { ...seeded.lockOwner, host: seeded.lockOwner.host ?? native.producer.host };
+  const lock = { host: mode === 'foreign' ? 'foreign-host' : hostname(), pid: process.pid,
+    bootId: mode === 'reused' ? 'different-current-native-boot' : owner.bootId, acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
+  const body = mode === 'legacy' ? { pid: lock.pid, bootId: lock.bootId, acquiredAt: lock.acquiredAt, heartbeatAt: lock.heartbeatAt } : lock;
+  writeFileSync(`${file}.lock`, JSON.stringify(body));
+  const bytes = readFileSync(file, 'utf8'); const journal = readFileSync(`${file}.producers.jsonl`, 'utf8'); const agent = f.scene.ledger.getAgent(seeded.original.id);
+  const kill = mode === 'eperm' ? vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('original PID probe denied'), { code: 'EPERM' }); }) : null;
+  try {
+    const outcome = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: seeded.original.id, resumeFile: file,
+      directiveRecoveryProducer: { ...native.producer, lockOwner: owner } }).then(() => ({ accepted: true, message: '' }), (error: unknown) => ({ accepted: false, message: String(error) }));
+    expect(outcome.accepted).toBe(false); expect(outcome.message).toMatch(/lock|locked|owner|PID/);
+    expect(readFileSync(`${file}.lock`, 'utf8')).toBe(JSON.stringify(body)); expect(f.fx.store.isHeld(file)).toBe(false);
+    expect(readFileSync(file, 'utf8')).toBe(bytes); expect(readFileSync(`${file}.producers.jsonl`, 'utf8')).toBe(journal);
+    expect(f.scene.ledger.getAgent(seeded.original.id)).toEqual(agent); expect(f.fx.script.calls).toHaveLength(0); expect(f.sessions).toHaveLength(1);
+  } finally { kill?.mockRestore(); rmSync(`${file}.lock`, { force: true }); await f.cleanup(); }
+}
+it('actual Pi native resume refuses a stale foreign-host lock without stealing original bytes', () => assertStrictOriginalSdkLock('foreign'));
+it('actual Pi native resume refuses a stale legacy unbound lock without native admission', () => assertStrictOriginalSdkLock('legacy'));
+it('actual Pi native resume refuses a reused native boot incarnation without replacing the original lock', () => assertStrictOriginalSdkLock('reused'));
+it('actual Pi native resume refuses even a stale live original PID lock', () => assertStrictOriginalSdkLock('live'));
+it('actual Pi native resume refuses EPERM original PID evidence and preserves every ownership row', () => assertStrictOriginalSdkLock('eperm'));
+
+async function assertSdkRefusalJournalRetry(postCommit: boolean) {
+  const checkpoint = await import('../src/runtime/directive-checkpoint.js');
+  const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+  let release!: () => void; const hold = new Promise<void>((done) => { release = done; });
+  const f = await sdkDirectiveExecutionFixture([{ ...guardedSdkTools[0]!, hold }, guardedSdkTools[1]!]);
+  const original = checkpoint.recordDirectiveToolRefusal;
+  let failing = true;
+  const journal = vi.spyOn(checkpoint, 'recordDirectiveToolRefusal').mockImplementation((...args) => {
+    if (postCommit || !failing) original(...args);
+    if (failing) throw new Error(`refusal journal ${postCommit ? 'post' : 'pre'}-commit publication failure`);
+  });
+  try {
+    const run = executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    await waitFor(() => f.fx.script.calls.length === 1, 'actual guarded SDK model await');
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!; const file = row.nativeTarget!.sessionFile;
+    const handle = f.registry.getHandle(row.nativeTarget!.agentId)!;
+    f.sessions[0]!.agent.state.systemPrompt = 'unapproved current role authority'; release(); await run;
+    expect(existsSync(join(f.scene.lane.path, 'guarded-effects.txt'))).toBe(false); expect(f.fx.script.calls).toHaveLength(2);
+    expect(handle.cessationEvidence!()).toBe('unknown'); expect(f.fx.store.isHeld(file)).toBe(true); expect(existsSync(`${file}.lock`)).toBe(true);
+    expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toBeNull();
+    failing = false; await f.registry.disposeHandle(handle);
+    expect(handle.cessationEvidence!()).toBe('ceased'); expect(existsSync(`${file}.lock`)).toBe(false);
+    const receipts = readFileSync(`${file}.producers.jsonl`, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string });
+    expect(receipts.filter((receipt) => receipt.state === 'guard-refused').map((receipt) => receipt.toolCallId).sort()).toEqual(['guarded-first', 'guarded-second']);
+    expect(receipts.filter((receipt) => receipt.state === 'completed')).toHaveLength(0);
+    const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); await service.dispose();
+    f.scene.db.close(); const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js');
+    const { EventBus } = await import('../src/events/bus.js'); const { NotificationCenter } = await import('../src/notifications/center.js');
+    f.scene.db = new LedgerDb(f.scene.dir); const bus = new EventBus({}); f.scene.ledger = new LedgerApi(f.scene.db.handle, { bus });
+    const spawn = vi.spyOn(f.registry, 'spawn');
+    const restart = new DirectiveProgressService({ ...f.deps, ledger: f.scene.ledger, notifications: new NotificationCenter({ ledger: f.scene.ledger, bus }) });
+    restart.reconsider(); await restart.settled(); await restart.dispose();
+    expect(spawn).not.toHaveBeenCalled(); expect(f.scene.ledger.getDirective(row.requestId)?.state).toBe('admitted');
+    expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toBeNull();
+    expect(f.scene.ledger.workRevisionState(row.jobId).delivered).toBe(0);
+  } finally { release(); failing = false; journal.mockRestore(); await f.cleanup(); }
+}
+it('actual SDK pre-commit refusal journal failure retains lock and retries refusal before cessation or restart settlement', () => assertSdkRefusalJournalRetry(false));
+it('actual SDK post-commit refusal journal failure fsync-retries exact receipts without duplicate refusals or delivery', () => assertSdkRefusalJournalRetry(true));
+
+it('real SDK system mutation before native effects remains refused through final stop and restart', () => assertProductionSdkFence(false, 'manifest-role'));
+it('real SDK tools mutation before native effects remains refused through final stop and restart', () => assertProductionSdkFence(false, 'manifest-tools'));
+it('real SDK system mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-role-hook'));
+it('real SDK model mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-model-hook'));

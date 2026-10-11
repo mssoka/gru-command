@@ -288,6 +288,44 @@ describe('verification scheduler — global budget', () => {
     } finally { await resumed.dispose(); }
   });
 
+  it('two attached queued identities retain original scheduler-disposed no-start settlement through persistent restart and independent replay', async () => {
+    const dir = tempDir(); let db = new LedgerDb(dir); let ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+    ledger.addJob({ id: 'queued-job', repo: 'fixture', title: 'attached queued identities' }); ledger.setJobStatus('queued-job', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'queued-job', payload: { work_revision: 0 } });
+    const repo = makeRepo(); let spawns = 0;
+    const opts = { storageDir: join(dir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 },
+      onSpawn: () => { spawns += 1; }, record: (event: VerificationRecord) => {
+        if (!ledger.hasJobEventWithPayloadValues(event.jobId, [event.kind], [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) ledger.appendCustomEvent(event);
+      } };
+    let scheduler = new VerificationScheduler(opts); scheduler.start();
+    try {
+      const held = await scheduler.acquire(spec('independent-holder'));
+      let queued!: () => void; const boundary = new Promise<void>((resolve) => { queued = resolve; });
+      const first = repoSpec(repo, 'queued-job', { requestId: 'attached-shutdown-first' });
+      const second = { ...first, requestId: 'attached-shutdown-second' };
+      const firstRun = scheduler.submit(first, (frame) => { if (frame.type === 'queued') queued(); });
+      const firstRefused = expect(firstRun).rejects.toBeInstanceOf(VerificationDisposedError); await boundary;
+      const secondRun = scheduler.submit(second); const secondRefused = expect(secondRun).rejects.toBeInstanceOf(VerificationDisposedError);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const original = ledger.latestJobEvent('queued-job', 'verification.requested')!;
+      expect(scheduler.attemptStatus({ requestId: first.requestId })).toMatchObject({ runId: (original.payload as { run_id: string }).run_id, state: 'accepted', started: false });
+      expect(scheduler.queuedCount()).toBe(1);
+      expect(scheduler.attemptStatus({ requestId: second.requestId })).toMatchObject({ runId: (original.payload as { run_id: string }).run_id, state: 'accepted', started: false });
+      await scheduler.dispose(); await Promise.all([firstRefused, secondRefused]); scheduler.release(held);
+      const receipt = ledger.latestJobEvent('queued-job', 'verification.no-start')!;
+      expect(receipt.payload).toMatchObject({ run_id: (original.payload as { run_id: string }).run_id, request_ids: [first.requestId, second.requestId], started: false });
+      db.close(); db = new LedgerDb(dir); ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+      scheduler = new VerificationScheduler(opts); scheduler.start();
+      for (const input of [first, second]) {
+        expect(scheduler.attemptStatus({ requestId: input.requestId })).toMatchObject({ state: 'admission-failed', runId: (original.payload as { run_id: string }).run_id, started: false, error: { code: 'scheduler_disposed' } });
+        await expect(scheduler.submit(input)).rejects.toBeInstanceOf(VerificationDisposedError);
+      }
+      expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(false); expect(laneIsBusy(ledger, ledger.getJob('queued-job')!)).toBe(false);
+      expect(ledger.listJobEventsByKinds('queued-job', ['verification.no-start'])).toEqual([receipt]);
+      expect(ledger.listJobEventsByKinds('queued-job', ['verification.started'])).toEqual([]); expect(spawns).toBe(0);
+    } finally { await scheduler.dispose(); db.close(); }
+  });
+
   async function assertNoStartRecovery(fault: 'pre-commit' | 'post-commit' | 'state-storage' | 'identity-storage') {
     const dir = tempDir(); const db = new LedgerDb(dir); const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
     ledger.addJob({ id: 'queued-job', repo: 'fixture', title: 'queued' }); ledger.setJobStatus('queued-job', 'working');

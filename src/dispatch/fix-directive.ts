@@ -460,6 +460,8 @@ export function recordFollowUpDelivery(input: {
   readonly workRevision: number;
   /** Correlation for a genuinely completed historical request's lost delivery. */
   readonly rebriefMarker?: { readonly id: string; readonly payloadHash: string };
+  /** Exact native historical completion: null explicitly means unproven HEAD. */
+  readonly nativeCompletion?: { readonly sha: string | null; readonly provenance: unknown };
 }): { readonly sha: string | null; readonly lanePath: string | null; readonly note: string | null; readonly eventSeq: number } {
   if (!Number.isSafeInteger(input.workRevision) || input.workRevision < 0) {
     throw new Error(`delivery work revision must be a non-negative integer, got ${String(input.workRevision)}`);
@@ -468,7 +470,10 @@ export function recordFollowUpDelivery(input: {
   const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
   let sha: string | null = null;
   let note: string | null = null;
-  if (lane !== undefined) {
+  if (input.nativeCompletion !== undefined) {
+    sha = input.nativeCompletion.sha;
+    if (sha === null) note = 'original native completion HEAD unproven; current candidate delivery/verification/review remain owed';
+  } else if (lane !== undefined) {
     try {
       sha = resolveGitCommit(lane.path, lane.branch !== null && lane.branch !== '' ? lane.branch : 'HEAD');
     } catch (error) {
@@ -490,6 +495,7 @@ export function recordFollowUpDelivery(input: {
       ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
       ...(input.rebriefMarker === undefined ? {} : { marker_id: input.rebriefMarker.id, payload_hash: input.rebriefMarker.payloadHash }),
       work_revision: input.workRevision,
+      ...(input.nativeCompletion === undefined ? {} : { native_completion: input.nativeCompletion.provenance, candidate_delivery_proven: sha !== null }),
     },
   });
   // Issue #220: the report handback's commissioner obligation. A failure

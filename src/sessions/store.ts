@@ -13,6 +13,7 @@ import {
   renameSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { hostname } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 
@@ -20,6 +21,7 @@ import type { LogLevel } from '../logger.js';
 export type StoreLog = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
 export interface SessionLockInfo {
+  readonly host?: string;
   readonly pid: number;
   readonly bootId: string;
   readonly acquiredAt: string;
@@ -143,11 +145,12 @@ export class SessionStore {
    * writer is rejected loudly (LockBusyError naming the holder), and a
    * stale lock (heartbeat older than LOCK_STALE_MS) is stolen and logged.
    */
-  acquireLock(sessionFile: string): void {
+  acquireLock(sessionFile: string, allowStaleTakeover = true): void {
     if (this.disposed) throw new Error('session store disposed');
     if (this.heldLocks.has(sessionFile)) return; // already ours (re-entrant)
     const lockFile = this.lockFileFor(sessionFile);
     const info: SessionLockInfo = {
+      host: hostname(),
       pid: process.pid,
       bootId: this.bootId,
       acquiredAt: new Date().toISOString(),
@@ -167,6 +170,7 @@ export class SessionStore {
           throw new Error(`cannot acquire session lock ${lockFile}: lock keeps reappearing`);
         }
         steals += 1;
+        if (!allowStaleTakeover) throw new LockBusyError(lockFile, JSON.parse(readFileSync(lockFile, 'utf8')) as SessionLockInfo);
         this.stealIfStale(lockFile);
         continue;
       }
@@ -201,22 +205,33 @@ export class SessionStore {
 
   /** Bounded checkpoint recovery: reclaim only the exact absent original
    * PID's lock, never heartbeat expiry or logical-minion reuse. */
-  acquireLockAfterHostExit(sessionFile: string, expectedPid: number): void {
+  ownedLockIdentity(sessionFile: string): { readonly host: string; readonly pid: number; readonly bootId: string } {
+    const holder = JSON.parse(readFileSync(this.lockFileFor(sessionFile), 'utf8')) as SessionLockInfo;
+    if (!this.heldLocks.has(sessionFile) || holder.host !== hostname() || holder.pid !== process.pid || holder.bootId !== this.bootId) {
+      throw new LockBusyError(this.lockFileFor(sessionFile), holder);
+    }
+    return { host: holder.host, pid: holder.pid, bootId: holder.bootId };
+  }
+
+  acquireLockAfterHostExit(sessionFile: string, expectedPid: number, expectedOwner?: { readonly host: string; readonly pid: number; readonly bootId: string }): void {
     const lockFile = this.lockFileFor(sessionFile);
     let holder: SessionLockInfo;
     try { holder = JSON.parse(readFileSync(lockFile, 'utf8')) as SessionLockInfo; }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { this.acquireLock(sessionFile); return; }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { this.acquireLock(sessionFile, false); return; }
       throw new LockUnreadableError(lockFile, String(error));
     }
-    if (holder.pid !== expectedPid) throw new LockBusyError(lockFile, holder);
+    const snapshot = statSync(lockFile);
+    if (expectedOwner === undefined || expectedOwner.pid !== expectedPid || expectedOwner.host !== hostname() || holder.host !== expectedOwner.host ||
+        holder.pid !== expectedOwner.pid || holder.bootId !== expectedOwner.bootId) throw new LockBusyError(lockFile, holder);
     try { process.kill(expectedPid, 0); throw new LockBusyError(lockFile, holder); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
     // Re-read exact content before unlink; synchronous local reclaim, with
     // O_EXCL admission still deciding races against another new host.
-    if (JSON.stringify(JSON.parse(readFileSync(lockFile, 'utf8'))) !== JSON.stringify(holder)) throw new LockBusyError(lockFile, holder);
+    const current = statSync(lockFile);
+    if (current.ino !== snapshot.ino || current.dev !== snapshot.dev || JSON.stringify(JSON.parse(readFileSync(lockFile, 'utf8'))) !== JSON.stringify(holder)) throw new LockBusyError(lockFile, holder);
     unlinkSync(lockFile);
-    this.acquireLock(sessionFile);
+    this.acquireLock(sessionFile, false);
   }
 
   private stealIfStale(lockFile: string): void {

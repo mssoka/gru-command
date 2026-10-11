@@ -38,6 +38,7 @@ import type { AgentCapabilities, AgentHandle, AgentState, SpawnOptions } from '.
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
 
 /**
  * Supersede-and-resume (owner rules, 2026-10-08): material vs
@@ -509,8 +510,8 @@ class CapturingMinions implements DirectiveRegistry {
   readonly disposals: string[] = [];
   private readonly handles = new Map<string, AgentHandle>();
   private readonly sessionDir = temp('supersession-native-');
-  constructor(private readonly ledger?: LedgerApi) {}
-  register(id: string, file = join(this.sessionDir, `${id}.jsonl`)): void {
+  constructor(private readonly ledger?: LedgerApi, private readonly completionCwd?: string) {}
+  register(id: string, file = join(this.sessionDir, `${id}.jsonl`), cwd = this.completionCwd): void {
     const prompts = this.prompts;
     let state: AgentState = 'idle';
     const handle = withNativeDirectiveFixture({
@@ -525,14 +526,14 @@ class CapturingMinions implements DirectiveRegistry {
       state = next;
       const ledger = this.ledger;
       if (ledger !== undefined && ledger.getAgent(id) !== null) ledger.setAgentState(id, next);
-    });
+    }, cwd === undefined ? undefined : () => resolveGitCommit(cwd, 'HEAD'));
     this.handles.set(id, handle);
   }
   getHandle(id: string): AgentHandle | null { return this.handles.get(id) ?? null; }
   async spawn(_role: Role, options: SpawnOptions = {}): Promise<AgentHandle> {
     this.spawns.push(options);
     const id = options.agentId ?? `spawned-${this.handles.size + 1}`;
-    this.register(id, options.resumeFile ?? join(this.sessionDir, `${id}.jsonl`));
+    this.register(id, options.resumeFile ?? join(this.sessionDir, `${id}.jsonl`), options.cwd ?? this.completionCwd);
     return this.handles.get(id)!;
   }
   async disposeHandle(handle: AgentHandle): Promise<void> {
@@ -546,7 +547,9 @@ async function serve(
 ): Promise<{ port: number; registry: CapturingMinions }> {
   const dir = temp('supersession-server-');
   writeFileSync(join(dir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf-8');
-  const registry = new CapturingMinions(h.ledger);
+  const lane = h.port.listWorktrees({ jobId: h.jobId }).find((row) => row.kind === 'job');
+  if (lane === undefined) throw new Error('review HTTP fixture requires its original job lane for native completion HEAD');
+  const registry = new CapturingMinions(h.ledger, lane.path);
   registry.register('minion-lane');
   h.ledger.registerAgent({ id: 'minion-lane', role: 'minion', sessionFile: registry.getHandle('minion-lane')!.sessionFile, jobId: h.jobId });
   h.ledger.setAgentState('minion-lane', registry.getHandle('minion-lane')!.health().state); // native fixture initialization has settled

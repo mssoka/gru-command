@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { LedgerApi } from '../../src/ledger/api.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { inspectDirectiveCheckpoint, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, type DirectiveProducer, type DirectiveTurnIdentity } from '../../src/runtime/directive-checkpoint.js';
+import { inspectDirectiveCheckpoint, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, type DirectiveProducer, type DirectiveTurnIdentity } from '../../src/runtime/directive-checkpoint.js';
 import type { AgentHandle, PromptOptions, AgentState } from '../../src/runtime/types.js';
 
 /** HTTP/ledger doubles retain real persisted native evidence. Only adapter
@@ -14,7 +14,7 @@ export class DirectiveNativeFixture {
   private parentId: string | null = null;
   private current: DirectiveTurnIdentity | null = null;
   private readonly producers = new Map<string, DirectiveProducer>();
-  constructor(readonly file: string, private readonly agentId: string) {
+  constructor(readonly file: string, private readonly agentId: string, private readonly completionHead?: (identity: DirectiveTurnIdentity) => string | null) {
     mkdirSync(dirname(file), { recursive: true });
     if (existsSync(file) && readFileSync(file, 'utf8').trim() !== '') {
       const rows = readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { type: string; id: string });
@@ -48,7 +48,10 @@ export class DirectiveNativeFixture {
   end(ok = true): void {
     this.append({ role: 'assistant', stopReason: ok ? 'stop' : 'error', content: [{ type: 'text', text: 'native fixture terminal' }] });
     // Force durable terminal readback before caller settlement.
-    if (this.current !== null) this.inspect(this.current);
+    if (this.current !== null) {
+      const proof = this.inspect(this.current);
+      if (ok && this.completionHead !== undefined && proof.state === 'terminal') recordDirectiveCompletion(this.producers.get(this.current.requestId)!, proof.checkpointId, this.completionHead(this.current));
+    }
     this.current = null;
   }
   private append(message: Record<string, unknown>): void {
@@ -77,8 +80,8 @@ export function admitNativeDirectiveFixture(ledger: LedgerApi, requestId: string
   return ledger.getDirective(requestId)!.admissionSeq!;
 }
 
-export function withNativeDirectiveFixture(handle: AgentHandle, file: string, onState: (state: AgentState) => void = () => {}): AgentHandle {
-  const native = new DirectiveNativeFixture(file, handle.id);
+export function withNativeDirectiveFixture(handle: AgentHandle, file: string, onState: (state: AgentState) => void = () => {}, completionHead?: (identity: DirectiveTurnIdentity) => string | null): AgentHandle {
+  const native = new DirectiveNativeFixture(file, handle.id, completionHead);
   let disposed = false;
   return {
     ...handle, sessionFile: file, prepareDirectiveProducer: native.prepare, inspectDirective: native.inspect,

@@ -101,6 +101,34 @@ export function readDirectiveBinding(file: string, requestId: string): Directive
   }
   return latest.get(requestId) ?? null;
 }
+/** Admission is a prefix fact, independent of later unfinished/unknown effects.
+ * Read only through the exact user receipt, never infer admission from a shape. */
+export function inspectDirectiveAdmission(file: string, identity: DirectiveTurnIdentity): DirectiveNativeBinding {
+  validateDirectiveIdentity(identity);
+  const binding = readDirectiveBinding(file, identity.requestId);
+  if (binding === null || binding.runtime !== 'pi' || !isDeepStrictEqual(binding.identity, identity)) throw new DirectiveCheckpointError('exact native admission association unavailable');
+  const lines = readFileSync(file, 'utf8').split('\n'); lines.pop(); // a partial tail cannot undo an accepted prefix
+  const header = JSON.parse(lines[0] ?? 'null') as NativeEntry | null;
+  if (header?.type !== 'session' || header.id !== binding.sessionId) throw new DirectiveCheckpointError('native admission session identity mismatch');
+  let baselineFound = binding.baseline === null;
+  const ids = new Set<string>([header.id]);
+  for (const line of lines.slice(1)) {
+    const entry = JSON.parse(line) as NativeEntry;
+    if (!entry || typeof entry.id !== 'string' || !entry.id || ids.has(entry.id)) throw new DirectiveCheckpointError('malformed/rebound native admission prefix');
+    ids.add(entry.id);
+    if (!baselineFound) { baselineFound = entry.id === binding.baseline; continue; }
+    if (entry.type !== 'message' || entry.message?.role !== 'user' || entry.parentId !== binding.baseline || !Array.isArray(entry.message.content) ||
+        contentHash(entry.message.content) !== binding.promptHash || binding.userEntryId !== null && binding.userEntryId !== entry.id) {
+      throw new DirectiveCheckpointError('actual native admission user receipt unavailable/changed');
+    }
+    syncFile(file);
+    const admitted = { ...binding, userEntryId: entry.id };
+    if (binding.userEntryId === null) appendBinding(admitted);
+    return admitted;
+  }
+  throw new DirectiveCheckpointError('actual native admission user receipt unavailable');
+}
+
 /** Native transcript readback owns proof. Pi entries are tree-linked: only
  * the exact direct user child of the prepared baseline is admitted. A
  * missing result, branch/compaction or another prompt refuses continuation. */
@@ -123,6 +151,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   syncFile(file);
   const admitted = { ...binding, userEntryId: user.id };
   if (binding.userEntryId === null) appendBinding(admitted);
+  if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive tool boundary refused; exact turn remains incomplete');
   let parent = user.id;
   const pending = new Map<string, string>();
   let lastMessage = user.message;
@@ -163,6 +192,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
 
 /** Physical native host ownership; logical minion identity is not an incarnation. */
 export interface DirectiveProducer {
+  readonly lockOwner?: { readonly host: string; readonly pid: number; readonly bootId: string };
   readonly incarnation: string;
   readonly pid: number;
   readonly host: string;
@@ -171,7 +201,8 @@ export interface DirectiveProducer {
   readonly sessionId: string;
   readonly sessionFile: string;
 }
-interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent'; readonly producer: DirectiveProducer }
+interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent' | 'completed' | 'guard-refused'; readonly producer: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null; readonly toolCallId?: string; readonly reason?: string }
+export interface DirectiveCompletion { readonly producer: DirectiveProducer; readonly checkpointId: string; readonly head: string | null }
 function appendProducer(receipt: ProducerReceipt): void {
   const fd = openSync(`${receipt.producer.sessionFile}.producers.jsonl`, 'a', 0o600);
   try { writeFileSync(fd, `${JSON.stringify(receipt)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
@@ -190,10 +221,17 @@ function producerReceipts(file: string): readonly ProducerReceipt[] {
   if (!text.endsWith('\n')) throw new DirectiveCheckpointError('native producer journal has a partial write');
   const rows = text.trimEnd().split('\n').map((line) => JSON.parse(line) as ProducerReceipt);
   const starts = new Map<string, DirectiveProducer>();
-  for (const { state, producer } of rows) {
+  for (const receipt of rows) {
+    const { state, producer } = receipt;
+    if (state === 'completed' && (typeof receipt.checkpointId !== 'string' || !receipt.checkpointId ||
+        !(receipt.head === null || typeof receipt.head === 'string' && /^[a-f0-9]{40,64}$/.test(receipt.head)))) {
+      throw new DirectiveCheckpointError('malformed native completion HEAD receipt');
+    }
     validateDirectiveIdentity(producer.identity);
-    if (!['started', 'ceased', 'independent'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
-        !producer.host || !producer.agentId || !producer.sessionId || producer.sessionFile !== file) throw new DirectiveCheckpointError('malformed native producer journal');
+    if (state === 'guard-refused' && (!receipt.toolCallId || !receipt.reason)) throw new DirectiveCheckpointError('malformed native tool refusal receipt');
+    if (!['started', 'ceased', 'independent', 'completed', 'guard-refused'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
+        !producer.host || !producer.agentId || !producer.sessionId || producer.sessionFile !== file ||
+        producer.lockOwner !== undefined && (producer.lockOwner.host !== producer.host || producer.lockOwner.pid !== producer.pid || !producer.lockOwner.bootId)) throw new DirectiveCheckpointError('malformed native producer journal');
     const start = starts.get(producer.incarnation);
     if (state === 'started') {
       if (start !== undefined) throw new DirectiveCheckpointError('duplicate native producer incarnation');
@@ -210,10 +248,10 @@ export function recordDirectiveProducerCessation(producer: DirectiveProducer): v
 }
 /** ESRCH proves only host absence. Caller still needs a safe native checkpoint
  * and every independent child/process/tool fence before executing or settling. */
-export function inspectDirectiveProducers(file: string, identity: DirectiveTurnIdentity): readonly {
+export function inspectDirectiveProducers(file: string, identity?: DirectiveTurnIdentity): readonly {
   readonly producer: DirectiveProducer; readonly evidence: 'ceased' | 'host-absent' | 'unknown';
 }[] {
-  const rows = producerReceipts(file).filter((row) => isDeepStrictEqual(row.producer.identity, identity));
+  const rows = producerReceipts(file).filter((row) => identity === undefined || isDeepStrictEqual(row.producer.identity, identity));
   return rows.filter((row) => row.state === 'started').map(({ producer }) => {
     if (rows.some((row) => row.state === 'ceased' && isDeepStrictEqual(row.producer, producer))) return { producer, evidence: 'ceased' as const };
     if (rows.some((row) => row.state === 'independent' && isDeepStrictEqual(row.producer, producer))) return { producer, evidence: 'unknown' as const };
@@ -224,6 +262,50 @@ export function inspectDirectiveProducers(file: string, identity: DirectiveTurnI
     }
     return { producer, evidence: absent ? 'host-absent' as const : 'unknown' as const };
   });
+}
+
+export function recordDirectiveToolRefusal(producer: DirectiveProducer, toolCallId: string, reason: string): void {
+  const rows = producerReceipts(producer.sessionFile);
+  if (!toolCallId || !reason || !rows.some((row) => row.state === 'started' && isDeepStrictEqual(row.producer, producer))) throw new DirectiveCheckpointError('native tool refusal requires exact original physical start');
+  if (!rows.some((row) => row.state === 'guard-refused' && row.toolCallId === toolCallId && isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'guard-refused', producer, toolCallId, reason });
+  else syncFile(`${producer.sessionFile}.producers.jsonl`);
+}
+
+export function recordDirectiveCompletion(producer: DirectiveProducer, checkpointId: string, head: string | null): void {
+  if (!(head === null || /^[a-f0-9]{40,64}$/.test(head))) throw new DirectiveCheckpointError('native completion HEAD malformed');
+  const proof = inspectDirectiveCheckpoint(producer.sessionFile, producer.identity);
+  if (proof.state !== 'terminal' || !proof.ok || proof.checkpointId !== checkpointId || proof.binding.agentId !== producer.agentId || proof.binding.sessionId !== producer.sessionId) {
+    throw new DirectiveCheckpointError('native completion does not bind the original successful checkpoint/producer');
+  }
+  const prior = readDirectiveCompletion(producer.sessionFile, producer.identity, checkpointId);
+  const completion = { producer, checkpointId, head };
+  if (prior !== null && !isDeepStrictEqual(prior, completion)) throw new DirectiveCheckpointError('conflicting native completion HEAD receipts');
+  if (prior === null) appendProducer({ state: 'completed', ...completion });
+  else syncFile(`${producer.sessionFile}.producers.jsonl`);
+}
+export function readDirectiveCompletion(file: string, identity: DirectiveTurnIdentity, checkpointId: string): DirectiveCompletion | null {
+  const completed = producerReceipts(file).filter((row) => row.state === 'completed' && isDeepStrictEqual(row.producer.identity, identity));
+  let result: DirectiveCompletion | null = null;
+  for (const row of completed) {
+    const receipt = { producer: row.producer, checkpointId: row.checkpointId!, head: row.head! };
+    if (receipt.checkpointId !== checkpointId || result !== null && !isDeepStrictEqual(receipt, result)) throw new DirectiveCheckpointError('conflicting/mismatched native completion HEAD receipts');
+    result = receipt;
+  }
+  return result;
+}
+
+/** A native cessation receipt never identifies a later writer's lock.
+ * This is an additional fence, not cessation proof from lock absence. */
+export function directiveProducerLockBlocker(producer: DirectiveProducer): string | null {
+  let text: string;
+  try { text = readFileSync(`${producer.sessionFile}.lock`, 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  const holder = JSON.parse(text) as { host?: unknown; pid?: unknown; bootId?: unknown };
+  const expected = producer.lockOwner;
+  if (expected === undefined || holder.host !== expected.host || holder.pid !== expected.pid || holder.bootId !== expected.bootId || holder.host !== hostname()) return 'current native lock owner is foreign/legacy/unbound';
+  try { process.kill(expected.pid, 0); return 'current native lock owner is still live'; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return 'current native lock owner absence is unproven'; }
+  return readFileSync(`${producer.sessionFile}.lock`, 'utf8') === text ? null : 'current native lock owner changed during observation';
 }
 
 export function recordDirectiveIndependentController(producer: DirectiveProducer): void { appendProducer({ state: 'independent', producer }); }

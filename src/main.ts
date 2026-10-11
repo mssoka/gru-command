@@ -1316,6 +1316,7 @@ async function main(): Promise<number> {
   // names it for a Gru reconciliation — never an automatic retry
   // (admission-unknown is not no-effect proof).
   const directiveProgress = new DirectiveProgressService({ ledger, registry, worktrees: worktreeManager, notifications,
+    clearLaneForWriter: (input) => wave.clearLaneForWriter(input),
     pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), signal: serviceStop.signal,
     workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor,
     ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),

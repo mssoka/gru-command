@@ -1,3 +1,5 @@
+import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import { DirectiveProgressService } from '../src/dispatch/directive-progress.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -64,6 +66,8 @@ afterEach(async () => {
 });
 
 interface Harness {
+  readonly wave: WaveRunner;
+  readonly registry: DirectiveRegistry;
   readonly dir: string;
   readonly port: number;
   readonly ledger: LedgerApi;
@@ -132,7 +136,7 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
     const managed = role === 'minion' ? withNativeDirectiveFixture(handle, sessionFile, (next) => {
       state = next;
       if (ledger.getAgent(id) !== null) ledger.setAgentState(id, next);
-    }) : handle;
+    }, options?.cwd === undefined ? undefined : () => resolveGitCommit(options.cwd!, 'HEAD')) : handle;
     liveHandles.set(id, managed);
     return managed;
   };
@@ -158,6 +162,11 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
     reviewArtifactRoot: join(dir, 'reviews'),
     prHeadProbe: originHeadProbe(),
   });
+  const registry: DirectiveRegistry = {
+    getHandle: (id: string) => liveHandles.get(id) ?? null,
+    spawn: (role: Role, spawnOptions?: SpawnOptions) => spawner(role, spawnOptions),
+    disposeHandle: async (handle: AgentHandle) => { await handle.dispose(); liveHandles.delete(handle.id); },
+  };
   const server = createDispatchServer({
     config: cfg,
     dispatch,
@@ -166,14 +175,7 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     pendingProducerBlockers: opts.pendingProducerBlockers ?? (() => []),
     silasOps: {
-      registry: {
-        getHandle: (id: string) => liveHandles.get(id) ?? null,
-        spawn: (role: Role, spawnOptions?: SpawnOptions) => spawner(role, spawnOptions),
-        disposeHandle: async (handle: AgentHandle) => {
-          await handle.dispose();
-          liveHandles.delete(handle.id);
-        },
-      },
+      registry,
       worktrees,
       notifications,
     },
@@ -186,6 +188,7 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
   await new Promise<void>((resolveListen) => http.listen(0, '127.0.0.1', resolveListen));
   const port = (http.address() as AddressInfo).port;
   const harness: Harness = {
+    wave, registry,
     dir,
     port,
     ledger,
@@ -2056,8 +2059,14 @@ describe('legacy proven completion without fabricated historical delivery', () =
       payload: { phase_id: marker.phaseId, minion_id: 'original-completed-minion', note: 'real completed original phase; no duplicated revision or historical HEAD' } });
     const debt = h.ledger.openRebriefRecoveryDebt(marker.id, 'exact completion, absent historical delivery facts');
     const route = `/api/silas/rebriefs/${marker.id}`;
+    const readback = await call(h.port, 'GET', route, undefined, TOKEN);
+    expect(readback.status).toBe(200);
+    const evidence = field<ReturnType<LedgerApi['rebriefReceiptEvidence']>>(readback.json, 'receipt_evidence');
+    expect(evidence).toEqual(h.ledger.rebriefReceiptEvidence(marker.id));
+    const receiptHash = field<string>(readback.json, 'receipt_evidence_sha256');
+    expect(receiptHash).toBe(evidence.sha256);
     const body = () => ({ by: 'gru', expected_generation: debt.generation, expected_payload_hash: marker.payloadHash,
-      expected_receipt_evidence_sha256: h.ledger.rebriefReceiptEvidence(marker.id).sha256,
+      expected_receipt_evidence_sha256: receiptHash,
       expected_head: laneHead(lane), expected_epoch: h.ledger.directiveRecoveryEpoch(jobId),
       expected_work_revision: h.ledger.directiveCurrentAuthority(jobId).workRevision,
       expected_contract_sha256: h.ledger.directiveCurrentAuthority(jobId).contractSha256,
@@ -2119,3 +2128,37 @@ describe('legacy proven completion without fabricated historical delivery', () =
     expect(h.ledger.latestJobEvent(f.jobId, 'job.delivered')).toBeNull(); expect(h.spawns).toEqual([]);
   });
 });
+
+async function assertAuthenticatedRebriefClearance(revoke: boolean) {
+  const h = await boot(); const repo = makeFixtureRepo('authenticated-rebrief-clearance'); cleanupRepos.push(repo);
+  seedJob(h, 'http-clearance-job'); await seedLane(h, repo, 'http-clearance-job');
+  let allowed = false; let release!: () => void; let reached!: () => void;
+  const hold = new Promise<void>((done) => { release = done; }); const boundary = new Promise<void>((done) => { reached = done; });
+  const actualClearance = h.wave.clearLaneForWriter.bind(h.wave);
+  const clearance = vi.spyOn(h.wave, 'clearLaneForWriter').mockImplementation(async (input) => {
+    if (!allowed) throw new Error('original review disposal remains unproven');
+    if (revoke) { reached(); await hold; }
+    return actualClearance(input);
+  });
+  const result = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'http-clearance-job', note: 'original accepted rebrief', request_id: 'http-original-rebrief' }, TOKEN);
+  expect(result.status).toBe(202);
+  await waitFor(() => h.ledger.hasDirectiveDispatchDeferral('http-original-rebrief'), 'durable actual HTTP clearance refusal');
+  await waitFor(() => h.ledger.listJobAdmissions('http-clearance-job').length === 0, 'original HTTP reservation release');
+  const accepted = h.ledger.getDirective('http-original-rebrief')!; expect(accepted.nativeTarget).toBeNull(); expect(h.spawns).toEqual([]);
+  const service = new DirectiveProgressService({ ledger: h.ledger, registry: h.registry, worktrees: h.worktrees, notifications: h.notifications,
+    signal: new AbortController().signal, pendingProducerBlockers: () => [], clearLaneForWriter: (input) => h.wave.clearLaneForWriter(input) });
+  try {
+    service.reconsider(); await service.settled(); expect(h.spawns).toEqual([]);
+    allowed = true; service.reconsider();
+    if (revoke) { await boundary; h.ledger.setJobStatus(accepted.jobId, 'parked'); release(); }
+    await service.settled(); service.reconsider(); await service.settled();
+    const final = h.ledger.getDirective(accepted.requestId)!;
+    expect(final.state).toBe(revoke ? 'dispatching' : 'settled');
+    expect(final).toMatchObject({ requestId: accepted.requestId, payloadHash: accepted.payloadHash, payload: accepted.payload, authorityEpoch: accepted.authorityEpoch, workRevision: accepted.workRevision });
+    if (revoke) { expect(h.spawns).toEqual([]); expect(final.nativeTarget).toBeNull(); expect(h.ledger.latestJobEventByRequestId(accepted.jobId, 'job.delivered', accepted.requestId)).toBeNull(); }
+    else { expect(h.spawns.filter((spawn) => spawn.role === 'minion')).toHaveLength(1); expect(h.ledger.latestJobEventByRequestId(accepted.jobId, 'job.delivered', accepted.requestId)).not.toBeNull(); }
+    expect(clearance.mock.calls.length).toBeGreaterThanOrEqual(3);
+  } finally { release(); await service.dispose(); clearance.mockRestore(); }
+}
+it('authenticated HTTP rebrief gate refusal preserves the original accepted request until shared reconsideration positively clears it', () => assertAuthenticatedRebriefClearance(false));
+it('authenticated HTTP rebrief reconsideration rechecks owner authority after awaited clearance before native work', () => assertAuthenticatedRebriefClearance(true));

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { LedgerApi } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, isDirectiveTerminal } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
-import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { DirectiveDispatchDeferredError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
@@ -23,6 +23,7 @@ export interface DirectiveProgressDeps {
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   readonly lessons?: LessonsReferencePort;
+  readonly clearLaneForWriter?: (input: { readonly jobId: string; readonly writer: string }) => Promise<unknown>;
 }
 function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): void {
   if (deps.signal.aborted) throw new DirectiveCheckpointError('service stopping — directive recovery cancelled');
@@ -106,6 +107,12 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
   try {
     if (!deps.ledger.claimDirectiveDispatch(requestId)) return;
     dispatchStartSeq = deps.ledger.latestJobEventByRequestId(row.jobId, 'silas.directive-dispatch-started', requestId)!.seq;
+    if (row.requestKind === 'rebrief' && deps.clearLaneForWriter !== undefined) {
+      check(deps, identity);
+      try { await deps.clearLaneForWriter({ jobId: row.jobId, writer: `rebrief ${requestId}` }); }
+      catch (error) { throw new DirectiveDispatchDeferredError(error); }
+      check(deps, identity); // review clearance is not native admission or permission
+    }
     const payload = JSON.parse(row.payload) as { directive: string };
     const directive = row.requestKind === 'rebrief' ? renderRebriefPrompt({ jobId: row.jobId, note: payload.directive, briefing: row.contractSnapshot, workRevision: identity.workRevision }) : payload.directive;
     const result = await routeFixDirectiveToMinion({ ...deps, jobId: row.jobId, directive, freshSession: row.requestKind === 'rebrief',
@@ -185,21 +192,25 @@ function reconcileNativeProducer(deps: DirectiveProgressDeps, identity: Directiv
   if (row.nativeTarget === null) return;
   const proof = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, identity);
   const owners = inspectDirectiveProducers(row.nativeTarget.sessionFile, identity);
-  if (owners.length === 0 || owners.some(({ evidence }) => evidence === 'unknown')) throw new DirectiveCheckpointError(`exact original physical native producer cessation unproven; start ${deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId)?.seq ?? 'unbound'}`);
+  const sessionOwners = inspectDirectiveProducers(row.nativeTarget.sessionFile);
+  if (owners.length === 0 || sessionOwners.some(({ evidence }) => evidence === 'unknown')) throw new DirectiveCheckpointError(`exact original physical native producer cessation unproven; start ${deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId)?.seq ?? 'unbound'}`);
   if (owners.some(({ evidence }) => evidence === 'host-absent') && (proof.state === 'unknown' || (proof.state === 'terminal' && !proof.ok))) {
     throw new DirectiveCheckpointError('original host absent but native effects/checkpoint remain incomplete');
   }
   const start = deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-started', identity.requestId);
-  if (start === null) return; // native proof is still required for pre-ledger fixtures
-  const producer = (start.payload as { native_producer?: unknown }).native_producer;
-  const owner = owners.find(({ producer: native }) => JSON.stringify(native) === JSON.stringify(producer));
+  const producer = (start?.payload as { native_producer?: unknown } | undefined)?.native_producer;
+  const owner = start === null ? owners.at(-1) : owners.find(({ producer: native }) => JSON.stringify(native) === JSON.stringify(producer));
   if (owner === undefined) throw new DirectiveCheckpointError('legacy/unbound physical producer start remains UNKNOWN');
+  const agent = deps.ledger.getAgent(owner.producer.agentId);
+  const lockBlocker = directiveProducerLockBlocker(sessionOwners.at(-1)!.producer);
+  if (lockBlocker !== null) throw new DirectiveCheckpointError(lockBlocker);
+  if (JSON.stringify(sessionOwners.at(-1)?.producer) === JSON.stringify(owner.producer) && agent?.jobId === identity.jobId &&
+      agent.sessionFile === owner.producer.sessionFile && deps.registry.getHandle(agent.id) === null && agent.state !== 'disposed') {
+    deps.ledger.setAgentState(agent.id, 'disposed'); // exact physical cessation, never permission; repair receipt replay too
+  }
+  if (start === null) return;
   const ceased = deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-ceased', identity.requestId);
   if ((ceased?.payload as { producer_start_seq?: unknown } | undefined)?.producer_start_seq === start.seq) return;
-  const agent = deps.ledger.getAgent(owner.producer.agentId);
-  if (owner.evidence === 'host-absent' && agent?.sessionFile === owner.producer.sessionFile && deps.registry.getHandle(agent.id) === null) {
-    deps.ledger.setAgentState(agent.id, 'disposed'); // observed original host cessation, never permission
-  }
   checkAdmissionFences(deps, identity, undefined, start.seq);
   deps.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: identity.jobId, payload: {
     request_id: identity.requestId, agent_id: owner.producer.agentId, session_file: owner.producer.sessionFile,
@@ -209,8 +220,11 @@ function reconcileNativeProducer(deps: DirectiveProgressDeps, identity: Directiv
 
 /** Completion first, correlated and idempotent: no worker execution. */
 export function settleNativeDirective(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): boolean {
-  const row = deps.ledger.getDirective(identity.requestId);
+  let row = deps.ledger.getDirective(identity.requestId);
   if (row === null || isDirectiveTerminal(row.state)) return row?.state === 'settled';
+  // Historical admission is an exact prefix fact, not work permission.
+  // Restore it even when later bytes/effects or physical ownership are UNKNOWN.
+  if (row.nativeTarget !== null) row = deps.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(row.nativeTarget.sessionFile, identity));
   const landed = deps.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
   if (landed !== null && row.state === 'admitted') {
     checkAdmissionFences(deps, identity);
@@ -223,6 +237,7 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
   const binding = readDirectiveBinding(row.nativeTarget.sessionFile, identity.requestId);
   if (binding?.userEntryId != null) deps.ledger.bindDirectiveNativeAdmission(binding);
   if (proof.state !== 'terminal' || !proof.ok) return false;
+  const completion = readDirectiveCompletion(row.nativeTarget.sessionFile, identity, proof.checkpointId);
   check(deps, identity);
   checkAdmissionFences(deps, identity);
   // Preserve the exact accepted revision; completion proves no newer input.
@@ -242,8 +257,13 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
     getJob: (id) => deps.ledger.getJob(id), openReportObligation: (fields) => deps.ledger.openReportObligation(fields),
   }, worktrees: deps.worktrees, jobId: row.jobId,
     agentId: proof.binding.agentId, source: row.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive', requestId: row.requestId,
-    ...(phase === null ? {} : { phaseId: phase.phaseId }), workRevision: identity.workRevision });
+    ...(phase === null ? {} : { phaseId: phase.phaseId }), workRevision: identity.workRevision,
+    nativeCompletion: { sha: completion?.head ?? null, provenance: { identity, checkpoint_id: proof.checkpointId, binding: proof.binding,
+      receipt: completion, physical_cessation: inspectDirectiveProducers(row.nativeTarget.sessionFile, identity) } } });
   deps.ledger.recordDirectiveDelivery({ requestId: row.requestId, eventSeq: delivery.eventSeq });
+  if (delivery.sha === null) deps.ledger.recordBlockedObservation(row.jobId, { logicalStep: 'operation',
+    incidentKey: `directive-completion-head:${row.requestId}`, category: { kind: 'known', category: 'restart-recovery' }, observedAtSeq: delivery.eventSeq,
+    nextAction: { kind: 'gru-decision', decision: `Original request ${row.requestId} genuinely completed accepted revision ${identity.workRevision}, but its completion HEAD is unproven. Preserve that progress; inspect current original-lane artifacts and use separately accepted current authority/current-head verification and review. Never invent the old HEAD or replay the request.` } });
   return true;
 }
 
@@ -288,9 +308,17 @@ export class DirectiveProgressService {
     for (const row of rows) {
       cursor = this.deps.ledger.directiveRowid(row.requestId) ?? cursor;
       if (this.active.has(row.requestId) || this.deps.ledger.listJobAdmissions(row.jobId).length > 0) continue;
-      // New acceptance publishes before its HTTP owner can reserve. It is
-      // not a restart gap; a truthful failure or the next boot exposes one.
-      if (row.baselineSeq >= this.bootWatermark && row.dispatchStartedAt === null && row.failReason === null && !this.deps.ledger.isRecoverySuccessor(row.requestId)) continue;
+      // Publication may run inside synchronous intake before its HTTP owner
+      // reserves. Observe only after that turn, rechecking ownership; this
+      // never provides no-effect proof or permission to dispatch a null target.
+      if (row.baselineSeq >= this.bootWatermark && row.dispatchStartedAt === null && row.failReason === null && !this.deps.ledger.isRecoverySuccessor(row.requestId)) {
+        queueMicrotask(() => {
+          const current = this.deps.ledger.getDirective(row.requestId);
+          if (!this.disposed && !this.deps.signal.aborted && !this.active.has(row.requestId) && current?.state === 'dispatching' &&
+              current.dispatchStartedAt === null && this.deps.ledger.listJobAdmissions(row.jobId).length === 0) this.start(row.requestId);
+        });
+        continue;
+      }
       const job = this.deps.ledger.getJob(row.jobId);
       if (job === null || isJobTerminal(job.status)) continue;
       if (this.deps.ledger.recoveryOwnerBasis('directive', row.requestId).owned) {
@@ -329,7 +357,6 @@ export class DirectiveProgressService {
       }
       throw new DirectiveCheckpointError('accepted request has no exact native association; inspect before choosing fresh authority');
     }
-    reconcileNativeProducer(deps, identity);
     if (settleNativeDirective(deps, identity)) return;
     check(deps, identity);
     row = deps.ledger.getDirective(requestId)!;
@@ -376,10 +403,11 @@ export class DirectiveProgressService {
       const tools = deps.parentTools?.(proof.binding.agentId) ?? [];
       const predecessor = inspectDirectiveProducers(proof.binding.sessionFile, identity).at(-1);
       handle = await deps.registry.spawn('minion', { resumeFile: proof.binding.sessionFile, agentId: proof.binding.agentId,
-        ...(predecessor?.evidence === 'host-absent' ? { directiveRecoveryProducer: predecessor.producer } : {}),
+        ...(predecessor === undefined ? {} : { directiveRecoveryProducer: predecessor.producer }),
         cwd: lane.path, signal: deps.signal, ...(tools.length === 0 ? {} : { nativeTools: tools }) });
       deps.signal.addEventListener('abort', abort, { once: true });
-      assertProducerFences();
+      check(deps, identity);
+      if (handle.id !== proof.binding.agentId || handle.sessionFile !== proof.binding.sessionFile) throw new DirectiveCheckpointError('runtime changed the original native/logical session');
       if (handle.prepareDirectiveProducer === undefined) throw new DirectiveCheckpointError('runtime cannot attest physical checkpoint ownership');
       producer = handle.prepareDirectiveProducer(identity);
       producerStartSeq = deps.ledger.startDirectiveProducer(identity, producer);
@@ -404,6 +432,6 @@ export class DirectiveProgressService {
     if (completed && !settleNativeDirective(deps, identity)) throw new DirectiveCheckpointError('native continuation lacks correlated completion');
   }
 
-  async settled(): Promise<void> { await Promise.all(this.active.values()); }
+  async settled(): Promise<void> { await Promise.resolve(); await Promise.all(this.active.values()); }
   async dispose(): Promise<void> { this.disposed = true; this.stop.abort(); await this.settled(); }
 }
