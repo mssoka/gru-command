@@ -759,3 +759,8 @@ formal-verdicts-rev3-baseline = "sh tools/formal-verdicts-rev3-baseline.sh"
 # run against an isolated archive of the uncorrected head 89f3a71; the two
 # discriminating legs are classified by exact named AssertionErrors.
 formal-verdicts-r2-baseline = "sh tools/formal-verdicts-r2-baseline.sh"
+
+# Native R3 (lookup-identity) fail-before proof: the FINAL lookup-identity
+# regressions run against an isolated archive of the uncorrected head
+# 1f70503; both legs are classified by exact named behavioral AssertionErrors.
+formal-verdicts-r3-baseline = "sh tools/formal-verdicts-r3-baseline.sh"
