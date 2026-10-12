@@ -6040,6 +6040,8 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Hold every fallback minion turn open until the test releases it, so a
      * transport wait slice can expire while the review is genuinely live. */
     promptHold?: { readonly release: Promise<void> };
+    /** Live session health, read at every wait slice (default idle). */
+    healthState?: () => 'idle' | 'disposed' | 'error';
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -6107,7 +6109,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         async steer() {},
         async followUp() {},
         subscribe() { return () => {}; },
-        health() { return { state: options.inBandError === true ? 'error' : 'idle', lastActivity: null, sessionFile: file,
+        health() { return { state: options.healthState?.() ?? (options.inBandError === true ? 'error' : 'idle'), lastActivity: null, sessionFile: file,
           ...(options.inBandError === true ? { error: 'review turn failed in-band after submitting' } : {}) }; },
         async dispose() { disposed.push(`prod-minion-${spawnCwds.length}`); },
       };
@@ -6248,6 +6250,37 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     }
   });
 
+  it('aborts if an untracked file appears during a fallback turn without a ledger event (#188)', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    mutate = () => writeFileSync(join(h.repo.path, 'src/sneaky-untracked.ts'), 'export const sneaky = true;\n');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+  });
+
+  it('never reviews or passes a truncated working diff: oversize capture fails closed (#188)', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'src/huge.ts'), `export const huge = "${'x'.repeat(600 * 1024)}";\n`);
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('no truncated review can pass');
+    expect(h.prompts).toEqual([]);
+    expect(h.spawnCwds).toEqual([]);
+  });
+
+  it('fails closed when the working diff cannot be captured at all (#188)', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, '.git/index.lock'), '');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(h.prompts).toEqual([]);
+  });
+
   it('invalidates binary mutations even when their abbreviated Git blob identities collide', async () => {
     let mutate = () => {};
     const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
@@ -6385,6 +6418,149 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       rmSync(h.artifacts, { recursive: true, force: true });
       rmSync(h.sessions, { recursive: true, force: true });
     }
+  });
+
+  async function fallbackCase1(terminal: 'disposed' | 'error'): Promise<void> {
+    let rejectPrompt!: (reason: Error) => void;
+    const hold = { release: new Promise<void>((_resolve, reject) => { rejectPrompt = reject; }) };
+    let state: 'idle' | 'disposed' | 'error' = 'idle';
+    let openSettlement!: () => void;
+    const settlementOpen = new Promise<void>((resolve) => { openSettlement = resolve; });
+    let settlementEntered = false;
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await makeProductionGateHarness({
+      findingToWrite: [], promptHold: hold, workerGate: gate, healthState: () => state,
+      retrySettlement: async () => { settlementEntered = true; await settlementOpen; return 'none'; },
+    });
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      state = terminal;
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+      // Diagnosed, lease released, session still awaiting retry settlement.
+      expect(settlementEntered).toBe(true);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      expect(h.disposed).toEqual([]);
+      // The still-pending prompt now rejects LATE: it must not replace the diagnosis.
+      rejectPrompt(new Error('LATE-PROMPT-REJECTION'));
+      await vi.advanceTimersByTimeAsync(0);
+      openSettlement();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain(`entered terminal state "${terminal}"`);
+      expect(outcome.note).not.toContain('LATE-PROMPT-REJECTION');
+      expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+      expect(h.disposed).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+    } finally {
+      vi.useRealTimers();
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  }
+  it('keeps the first diagnosed disposed terminal error when the held prompt rejects late during retry settlement (#176)', () => fallbackCase1('disposed'));
+  it('keeps the first diagnosed error terminal error when the held prompt rejects late during retry settlement (#176)', () => fallbackCase1('error'));
+
+
+  async function abortDuringWait(afterSlice: boolean): Promise<void> {
+    const hold = { release: new Promise<void>(() => {}) };
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold, workerGate: gate });
+    const stillRunning = (): number => h.ledger.listEvents({ limit: 200 })
+      .filter((event) => (event.payload as { phase?: string }).phase === 'still-running').length;
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      if (afterSlice) {
+        await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+        expect(stillRunning()).toBe(1);
+      }
+      const reportedBefore = stillRunning();
+      await h.wave.shutdown();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('review operation aborted');
+      expect(outcome.note).not.toMatch(/timed out|timeout/i);
+      expect(h.disposed).toEqual(['prod-minion-1']);
+      expect(h.prompts).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      // No timer survives and no further wait slice is ever reported.
+      // (shutdown() itself leaves only its own 5 s drain race timer; let it
+      // lapse, then nothing — notably no 15 min wait-slice timer — remains.)
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS * 3);
+      expect(stillRunning()).toBe(reportedBefore);
+      expect(h.ledger.listEvents({ limit: 200 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  }
+  it('explicit abort before an expired wait slice reports cancellation, disposes the session and leaves no timer or still-running event (#177)', () => abortDuringWait(false));
+  it('explicit abort after an expired wait slice reports cancellation, disposes the session and leaves no timer or still-running event (#177)', () => abortDuringWait(true));
+
+  async function holdCase1(status: 'blocked' | 'parked'): Promise<void> {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    h.ledger.setJobStatus(h.job.id, status);
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain(`is ${status}`);
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    expect(h.disposed).toHaveLength(1);
+  }
+  it('a direct fallback gate moved to blocked while its reviewer is held never passes (#186)', () => holdCase1('blocked'));
+  it('a direct fallback gate moved to parked while its reviewer is held never passes (#186)', () => holdCase1('parked'));
+
+  async function holdCase2(status: 'blocked' | 'parked'): Promise<void> {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id, force: true });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    h.ledger.setJobStatus(h.job.id, status);
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain(`is ${status}`);
+  }
+  it('a force flag does not waive a blocked revocation while the reviewer is held (#186)', () => holdCase2('blocked'));
+  it('a force flag does not waive a parked revocation while the reviewer is held (#186)', () => holdCase2('parked'));
+
+  async function holdCase3(status: 'blocked' | 'parked'): Promise<void> {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    h.ledger.setJobStatus(h.job.id, status);
+    await expect(h.wave.runRound({ jobId: h.job.id })).rejects.toThrow(`is ${status}`);
+    expect(h.spawnCwds).toEqual([]);
+    expect(h.prompts).toEqual([]);
+  }
+  it('a direct fallback request on a blocked job is refused at round intake before any reviewer spawns (#186)', () => holdCase3('blocked'));
+  it('a direct fallback request on a parked job is refused at round intake before any reviewer spawns (#186)', () => holdCase3('parked'));
+
+  it('an unchanged review-eligible direct gate with a held reviewer still passes (#186 control)', async () => {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
   });
 
   it('the production fallback review takes a worker pacing slot before it spawns', async () => {

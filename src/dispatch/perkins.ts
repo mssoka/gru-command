@@ -2832,6 +2832,9 @@ export class WaveRunner {
    * a current head are NOT authorization: a job that became blocked/parked/
    * cancelled/owner-held/terminal after the durable request was accepted
    * is HELD for reconciliation attention, never auto-reviewed. */
+  /** Recoverable hold statuses that revoke an in-flight fallback review. */
+  private static readonly FALLBACK_REVOKING_STATUSES: ReadonlySet<string> = new Set(['blocked', 'parked']);
+
   private static readonly HANDOFF_AUTHORIZED_STATUSES: ReadonlySet<string> = new Set(['working', 'delivered', 'in-review']);
 
   /** Fence: throws when the CURRENT job state does not authorize this
@@ -3520,6 +3523,15 @@ export class WaveRunner {
         );
       }
     }
+    // Every fallback gate — direct or handoff, forced or not — must stay
+    // review-eligible: a hold (blocked/parked) revokes the review and no
+    // force flag waives it. The handoff's own authorization proof above
+    // is additional, never replaced.
+    if (jobNow !== null && WaveRunner.FALLBACK_REVOKING_STATUSES.has(jobNow.status)) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" is ${jobNow.status} — held lanes are not review-eligible, so the fallback gate stops fail-closed`,
+      );
+    }
     const lanesNow = this.opts.worktrees.listWorktrees();
     const ownersNow = lanesNow.filter((candidate) => candidate.kind === 'job' && candidate.status !== 'swept' &&
       candidate.jobId !== null && normalizeBranch(candidate.branch ?? laneBranch(candidate.jobId)) === admission.targetBranch);
@@ -3926,7 +3938,9 @@ export class WaveRunner {
           const settled = new Promise<PromptTurnVerdict | null>((resolve) => {
             void promptWithTerminalVerdict(session, prompt, { owner: 'bmad-review-gate' }).then(
               resolve,
-              (error) => { promptError = error; resolve(null); },
+              // First diagnosis wins: a rejection that lands after the wait
+              // loop already diagnosed a terminal failure must not replace it.
+              (error) => { if (promptError === null) promptError = error; resolve(null); },
             );
           });
           const aborted = new Promise<never>((_resolve, reject) => {
@@ -3969,7 +3983,7 @@ export class WaveRunner {
           if (abortListener !== null) input.signal.removeEventListener('abort', abortListener);
         }
       } catch (error) {
-        promptError = error;
+        if (promptError === null) promptError = error;
       } finally {
         // Release before the settlement wait: the retry reacquires the slot.
         lease?.release();
