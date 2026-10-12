@@ -3478,15 +3478,6 @@ export class WaveRunner {
         `job "${input.jobId}" is ${jobNow.status} — terminal lanes do not continue under fallback review`,
       );
     }
-    // Every fallback gate — direct or handoff, forced or not — must stay
-    // review-eligible: a hold (blocked/parked) revokes the review and no
-    // force flag waives it. The handoff's own authorization proof below
-    // is additional, never replaced.
-    if (jobNow !== null && WaveRunner.FALLBACK_REVOKING_STATUSES.has(jobNow.status)) {
-      throw new FallbackSafetyRefusal(
-        `job "${input.jobId}" is ${jobNow.status} — held lanes are not review-eligible, so the fallback gate stops fail-closed`,
-      );
-    }
     const lane = this.opts.worktrees
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept') ?? null;
@@ -3531,6 +3522,15 @@ export class WaveRunner {
           `the review handoff for job "${input.jobId}" is no longer authorized: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
+    }
+    // Every fallback gate — direct or handoff, forced or not — must stay
+    // review-eligible: a hold (blocked/parked) revokes the review and no
+    // force flag waives it. The handoff's own authorization proof above
+    // is additional, never replaced.
+    if (jobNow !== null && WaveRunner.FALLBACK_REVOKING_STATUSES.has(jobNow.status)) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" is ${jobNow.status} — held lanes are not review-eligible, so the fallback gate stops fail-closed`,
+      );
     }
     const lanesNow = this.opts.worktrees.listWorktrees();
     const ownersNow = lanesNow.filter((candidate) => candidate.kind === 'job' && candidate.status !== 'swept' &&
