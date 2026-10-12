@@ -2,7 +2,7 @@
 title: 'Dashboard slim strip — current-main continuation (approved Sample2 port)'
 type: 'feature'
 created: '2026-10-07'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
 review_loop_iteration: 10
@@ -80,8 +80,8 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 - [x] `web/e2e/dashboard-strip.spec.ts` — port the synthetic suite; extend silas fixtures to main's protocol; add CHILDREN present/absent and deferred-wakes cases; keep 1440/1200/768/360 × light/dark captures.
 - [x] `web/e2e/smoke.spec.ts`, `web/playwright.config.ts` — selector migration + mock testMatch union.
 - [x] `.gru-command/worktree.toml`, `.gitignore` — union scopes (`strip-browser`, `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts), `dashboard-slim-strip-baseline` base-pinned, `strip-browser-baseline` base-pinned) + `web/e2e-artifacts/`.
-- [ ] Perkins r6 baseline follow-through — overlay the test-only helper required by integrated `board.test.ts`, and classify every failed zero-assertion suite as setup/collection failure.
-- [ ] Commit, then built-in independent whole-change review via `POST /api/dispatch` (`deliverable: review`) on the exact head; fix findings; re-verify.
+- [x] Perkins r6 baseline follow-through — overlay the test-only helper required by integrated `board.test.ts`, classify every failed zero-assertion suite as setup/collection failure, and verify the feature-absence baseline at the current code head.
+- [ ] Built-in independent whole-change review via `POST /api/dispatch` (`deliverable: review`) on the exact committed head; triage every finding, address required changes, and re-verify any moved head.
 
 **Acceptance Criteria:**
 - Given complete/empty/zero/unknown/stale snapshots, when the strip renders, then every current-main labelled fact and `data-kpi` value is truthful, GRU wake/count stays independent of SILAS, and Binned stays distinct from Parked/success.
