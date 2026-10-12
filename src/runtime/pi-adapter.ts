@@ -972,9 +972,11 @@ export class PiAgentHandle implements AgentHandle {
       steer(text: string, images?: unknown): Promise<void>;
       followUp(text: string, images?: unknown): Promise<void>;
       subscribe(listener: (event: unknown) => void): () => void;
-      /** SDK 0.85.1 AgentSession.dispose awaits session-level waitForIdle
-       * (run, retry/continuation, compaction, branch summary). The wrapper
-       * MUST await it — calling it synchronously discards that proof. */
+      /** SDK 0.85.1 AgentSession.dispose() is synchronous (returns void) and
+       * does NOT await session-level waitForIdle. Awaiting it here proves only
+       * that the abort hooks ran, not that the session is idle. (Whether
+       * dispose() should additionally await a bounded waitForIdle is an open
+       * owner decision; see PR #332 review.) */
       dispose(): Promise<void> | void;
       waitForIdle?(): Promise<void>;
       /** Real controller-set queries (executeBash controllers, removed in
@@ -1259,10 +1261,12 @@ export class PiAgentHandle implements AgentHandle {
       item.reject(new Error('agent session disposed before queued message was delivered'));
     }
     try {
-      // AWAIT the SDK's dispose: AgentSession.dispose() itself awaits
-      // session-level waitForIdle (agent run + awaited listeners + retry
-      // gap + post-run continuations + compaction + branch summary).
-      // Calling it synchronously discards the only real completion proof.
+      // SDK 0.85.1 AgentSession.dispose() is synchronous: it runs the abort
+      // hooks (retry, compaction, branch summary, bash, agent) and returns
+      // void. It does NOT await session-level waitForIdle, so awaiting it here
+      // proves only that the abort hooks ran, not that the session is idle.
+      // (Whether disposal should additionally await a bounded waitForIdle is
+      // an open owner decision; see PR #332 review.)
       await this.session.dispose();
     } finally {
       this.store.releaseLock(this.sessionFile);
@@ -1281,10 +1285,14 @@ export class PiAgentHandle implements AgentHandle {
     let evidence: 'ceased' | 'unknown';
     try {
       const bashActive = this.session.isBashRunning === true || this.session.hasPendingBashMessages === true;
-      // The session-level idle was awaited inside dispose (proof for runs,
-      // retries, continuations, compaction, summary). Independent executeBash
-      // controllers are NOT part of isIdle: if still active, evidence is
-      // UNKNOWN (observable later by re-query; no timer/watcher added).
+      // dispose() (SDK 0.85.1) is synchronous and does NOT await session-level
+      // waitForIdle, so it does not prove the session is idle: 'ceased' is
+      // asserted here on the absence of an active bash controller alone.
+      // Independent executeBash controllers are NOT part of isIdle: if still
+      // active, evidence is UNKNOWN (observable later by re-query; no
+      // timer/watcher added). Whether disposal should await a bounded
+      // waitForIdle before reporting 'ceased' is an open owner decision (see
+      // PR #332 review).
       evidence = bashActive ? 'unknown' : 'ceased';
     } catch {
       evidence = 'unknown'; // throwing probes are unknown, never false

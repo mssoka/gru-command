@@ -34,6 +34,7 @@ const clearAuthEnv = () => {
 afterEach(() => {
   delete process.env['CLAUDE_DOUBLE_IGNORE_TERM'];
   delete process.env['CLAUDE_DOUBLE_LOG'];
+  delete process.env['CLAUDE_DOUBLE_EXPECT_REVIEW_AUTH'];
   clearAuthEnv();
 });
 afterAll(() => {
@@ -62,6 +63,13 @@ describe('specialist dispose() is bounded on the slowest production paths (#95)'
     const snapshot = await runtime.prepareReviewModel('perkins');
     let toolStarted!: () => void;
     const started = new Promise<void>((resolve) => { toolStarted = resolve; });
+    // The review child's env is a snapshot (`claudeReviewProcessEnv`) captured
+    // HERE, at spawn time — the turn-spawned process later inherits it verbatim.
+    // Setting this after spawn (as before) left the child SIGTERM-vulnerable, so
+    // the SIGKILL-escalation premise was never actually exercised. It must be
+    // set BEFORE spawn; not earlier, because prepareReviewModel's synchronous
+    // `--version`/auth probe child only exits cleanly without IGNORE_TERM.
+    process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
     const handle = await runtime.spawn('perkins', {
       reviewModel: snapshot,
       isolatedReview: {
@@ -74,7 +82,6 @@ describe('specialist dispose() is bounded on the slowest production paths (#95)'
         }],
       },
     });
-    process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
     const turn = handle.prompt('hold:never', { owner: 'alice' });
     const turnRejected = expect(turn).rejects.toThrow(/disposed/);
     // The invocation record carries the scoped bridge's MCP config.
@@ -99,7 +106,9 @@ describe('specialist dispose() is bounded on the slowest production paths (#95)'
     await turnRejected;
     client.destroy();
     expect(handle.health().state).toBe('disposed');
-    expect(existsSync(`${handle.sessionFile}.lock`)).toBe(false);
+    const sessionFile = handle.sessionFile;
+    expect(sessionFile).not.toBeNull();
+    expect(existsSync(`${sessionFile!}.lock`)).toBe(false);
     expect(existsSync(configFile)).toBe(false); // bridge directory removed
     // 5s bridge teardown cap + child exit/flush grace windows + generous CI slack.
     expect(elapsed).toBeLessThan(5_000 + killGraceMs * 3 + 10_000);
