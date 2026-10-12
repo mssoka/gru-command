@@ -124,7 +124,7 @@ describe('GH-313 report-handback custody', () => {
     const r = fixture();
     const held = r.wait();
     r.ledger.armReceiptExpectation({ obligationId: r.debt.id, receiptKind: 'job.delivered', deadlineAt: RECHECK,
-      correlation: {}, reason: 'a new report receipt is now required' });
+      correlation: { requestId: 'new-report-request' }, reason: 'a new report receipt is now required' });
     const item = r.mailbox.snapshot().items.find((row) => row.notificationIds.includes(held.notificationIds[0]!))!;
     expect(item.id).toBe(held.id);
     expect(item.basis).not.toBe(held.basis);
@@ -137,7 +137,7 @@ describe('GH-313 report-handback custody', () => {
     r.replace();
     r.ledger.settleReportDisposition({ jobId: JOB, outcome: 'dismissed', note: 'commissioner inspected the findings', by: 'writer' });
     expect(r.ledger.getJob(JOB)?.status).toBe('done');
-    expect(r.ledger.getObligation(r.debt.id)?.state).toBe('settled');
+    expect(r.ledger.getObligation(r.debt.id)?.state).toBe('closed');
     expect(r.mailbox.snapshot().items.find((row) => row.id === held.id)?.state).toBe('resolved');
     expect(r.mailbox.attentionPage(50)).toEqual([]);
     expect(r.reconcile().published).toBe(0);
