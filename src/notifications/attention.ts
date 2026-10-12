@@ -43,6 +43,7 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
  * including the worktree-scoped `worktree-sweep-paused:<id>:<pause>` form). */
 const OWNER_REQUIRED_PREFIXES: readonly string[] = [
   'gru.wake-blocked.',
+  'gru.wake-blocked-mailbox.',
   'gru.wake-failed-escalation.',
   'decisions.enforce-gate.',
   'worktree-sweep-paused:',

@@ -578,6 +578,7 @@ describe('gru awareness — wake policy', () => {
     const center = new NotificationCenter({ ledger: api, bus });
     const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
     const blocked = center.post({ kind: 'gru.wake-blocked.machine-alert', routing: 'needs-owner', severity: 'error', title: 'Gru wake blocked' });
+    const mailboxBlocked = center.post({ kind: 'gru.wake-blocked-mailbox.incident-x', routing: 'needs-owner', severity: 'error', title: 'Mailbox wake blocked' });
     const failed = center.post({ kind: 'gru.wake-failed-escalation.incident-x', routing: 'needs-owner', severity: 'error', title: 'Gru wake failed' });
     const machine = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Machine alert stays open' });
     awareness.setWakeSink(() => {
@@ -588,6 +589,7 @@ describe('gru awareness — wake policy', () => {
     });
     center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Wake me' });
     expect(api.getNotification(blocked.id)?.resolvedBy).toBe('chat-recovered');
+    expect(api.getNotification(mailboxBlocked.id)?.resolvedBy).toBe('chat-recovered');
     expect(api.getNotification(failed.id)?.resolvedBy).toBe('chat-recovered');
     expect(api.getNotification(machine.id)).toMatchObject({ resolvedAt: null, ackedAt: null, routing: 'action-required' });
   });

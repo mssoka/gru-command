@@ -1185,6 +1185,7 @@ export class GruAwareness {
       // until its own disposition.
       try {
         this.ledger.resolveNotificationsByKindPrefix?.('gru.wake-blocked.', 'chat-recovered');
+        this.ledger.resolveNotificationsByKindPrefix?.('gru.wake-blocked-mailbox.', 'chat-recovered');
         this.ledger.resolveNotificationsByKindPrefix?.('gru.wake-failed-escalation.', 'chat-recovered');
       } catch (error) {
         this.log('error', 'wake-stop resolution failed — rows stay open', { error: String(error) });

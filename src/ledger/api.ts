@@ -3093,7 +3093,13 @@ export class LedgerApi {
    */
   durableSupervisionStops(): Map<
     string,
-    { readonly role: Role; readonly reason: string | null; readonly restarts: number }
+    {
+      readonly role: Role;
+      readonly reason: string | null;
+      readonly restarts: number;
+      readonly notificationId: string | null;
+      readonly pendingFenceReason: string | null;
+    }
   > {
     const rows = this.db
       .prepare(
@@ -3110,7 +3116,16 @@ export class LedgerApi {
           WHERE e.kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearm-fenced')`,
       )
       .all() as Array<{ agent_id: string; role: Role; payload: string }>;
-    const stops = new Map<string, { role: Role; reason: string | null; restarts: number }>();
+    const stops = new Map<
+      string,
+      {
+        role: Role;
+        reason: string | null;
+        restarts: number;
+        notificationId: string | null;
+        pendingFenceReason: string | null;
+      }
+    >();
     for (const row of rows) {
       let payload: Record<string, unknown> = {};
       try {
@@ -3131,7 +3146,37 @@ export class LedgerApi {
         typeof payload['restarts'] === 'number' && Number.isFinite(payload['restarts'])
           ? payload['restarts']
           : 0;
-      stops.set(row.agent_id, { role: row.role, reason, restarts });
+      const pendingFenceReason =
+        typeof payload['pending_rearm_fence_reason'] === 'string' ? payload['pending_rearm_fence_reason'] : null;
+      let notificationId =
+        typeof payload['control_notification_id'] === 'string'
+          ? payload['control_notification_id']
+          : typeof payload['notification_id'] === 'string'
+            ? payload['notification_id']
+            : null;
+      if (notificationId !== null && pendingFenceReason === null) {
+        const openControl = this.db
+          .prepare('SELECT id FROM notifications WHERE id = ? AND resolved_at IS NULL')
+          .get(notificationId) as { id: string } | undefined;
+        if (openControl === undefined) notificationId = null;
+      }
+      if (notificationId === null && pendingFenceReason === null) {
+        const openControl = this.db
+          .prepare(
+            `SELECT id FROM notifications
+              WHERE agent_id = ?
+                AND resolved_at IS NULL
+                AND (
+                  kind IN ('supervision.breaker', 'supervision.rearm-fenced')
+                  OR kind LIKE 'supervision.provider-wall.%'
+                )
+              ORDER BY ts DESC, id DESC
+              LIMIT 1`,
+          )
+          .get(row.agent_id) as { id: string } | undefined;
+        notificationId = openControl?.id ?? null;
+      }
+      stops.set(row.agent_id, { role: row.role, reason, restarts, notificationId, pendingFenceReason });
     }
     return stops;
   }
@@ -4720,6 +4765,23 @@ export class LedgerApi {
           `notification "${id}" carries no typed decision — no option can be recorded`,
         );
       }
+      if (current.decidedAt !== null) {
+        // Same option: an idempotent replay (a retried click confirms the
+        // recorded choice), even when follow-through has since resolved the
+        // row. An unknown option remains a typed input error; a different
+        // valid option is refused rather than silently replacing the record.
+        if (current.decidedOption === optionId) return current;
+        if (!current.decision.options.some((candidate) => candidate.id === optionId)) {
+          throw new NotificationDecisionRefusal(
+            'unknown_option',
+            `option "${optionId}" is not one of this decision's options`,
+          );
+        }
+        throw new NotificationDecisionRefusal(
+          'decision_recorded',
+          `notification "${id}" already records decision "${current.decidedOption}"; it is not replaced`,
+        );
+      }
       if (current.resolvedAt !== null) {
         throw new NotificationDecisionRefusal('not_open', `notification "${id}" is already resolved`);
       }
@@ -4728,16 +4790,6 @@ export class LedgerApi {
         throw new NotificationDecisionRefusal(
           'unknown_option',
           `option "${optionId}" is not one of this decision's options`,
-        );
-      }
-      if (current.decidedAt !== null) {
-        // Same option: an idempotent replay (a retried click confirms the
-        // recorded choice). A different option: refuse — a recorded owner
-        // decision is never silently replaced.
-        if (current.decidedOption === optionId) return current;
-        throw new NotificationDecisionRefusal(
-          'decision_recorded',
-          `notification "${id}" already records decision "${current.decidedOption}"; it is not replaced`,
         );
       }
       this.db

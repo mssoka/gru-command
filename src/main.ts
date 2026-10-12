@@ -18,6 +18,7 @@ import { defaultPackageRoot, readBuildInfo } from './build-info.js';
 import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/service-review-wave.js';
 import { NotificationCenter } from './notifications/center.js';
 import { reconcileLegacyOwnerAttention } from './notifications/legacy-owner.js';
+import { bindSupervisorNotificationDisposition } from './supervision/notification-disposition.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
 import { DispatchService } from './dispatch/service.js';
@@ -1109,7 +1110,7 @@ async function main(): Promise<number> {
     bus,
     notifications,
     onNotificationAck: (id) => supervisorLive.onNotificationAcked(id),
-    onNotificationDisposition: (id) => supervisorLive.onNotificationDisposed(id),
+    onNotificationDisposition: bindSupervisorNotificationDisposition(supervisorLive),
     decisionsStatus: () => decisionRuntime.status(),
     onDecisionsRecheck: () => decisionRuntime.recheck(),
     siblingUpgradePaths: ['/ws'],

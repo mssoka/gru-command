@@ -75,6 +75,7 @@ describe('owner attention registry (Silas → Gru → owner)', () => {
       'roll-port-squat',
       'worktree-sweep-paused',
       'gru.wake-blocked.n1',
+      'gru.wake-blocked-mailbox.incident',
       'gru.wake-failed-escalation.job1',
     ]) {
       expect(ownerAttentionFor(kind), kind).toBe('owner-required');
@@ -273,8 +274,16 @@ describe('recordNotificationDecision — the side-effect boundary', () => {
     expect(codeOf(() => rig.center.decide(machine.id, 'approve', 'web'))).toBe('not_owner_decision');
     const notice = rig.center.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Squat' });
     expect(codeOf(() => rig.center.decide(notice.id, 'approve', 'web'))).toBe('no_decision');
+    rig.center.decide(id, 'approve', 'web');
     rig.api.resolveNotificationById(id, 'producer');
-    expect(codeOf(() => rig.center.decide(id, 'approve', 'web'))).toBe('not_open');
+    expect(rig.center.decide(id, 'approve', 'web')).toMatchObject({
+      decidedOption: 'approve',
+      resolvedBy: 'producer',
+    });
+    expect(codeOf(() => rig.center.decide(id, 'keep', 'web'))).toBe('decision_recorded');
+    const resolvedUndecided = seedDecision(rig);
+    rig.api.resolveNotificationById(resolvedUndecided, 'producer');
+    expect(codeOf(() => rig.center.decide(resolvedUndecided, 'approve', 'web'))).toBe('not_open');
     expect(rig.center.decide('missing', 'approve', 'web')).toBeNull();
   });
 });
@@ -564,15 +573,24 @@ describe('legacy owner-attention reconciliation', () => {
       title: 'Unknown stop',
       detail: 'details',
     });
+    const mailboxBlocked = rig.api.recordNotification({
+      id: 'legacy-mailbox-wake-stop',
+      kind: 'gru.wake-blocked-mailbox.incident-1',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Mailbox wake blocked',
+      detail: 'restore mailbox access',
+    });
     const report = reconcileLegacyOwnerAttention({ ledger: rig.api });
-    expect(report.examined).toBe(2);
+    expect(report.examined).toBe(3);
     expect(report.retriaged).toBe(2);
-    expect(report.kept).toBe(0);
+    expect(report.kept).toBe(1);
     const moved = rig.api.getNotification(legacyEscalation.id);
     expect(moved).toMatchObject({ routing: 'action-required', ackedAt: null, resolvedAt: null });
     expect(moved?.detail).toContain('Operational coordination: this is not a decision.');
     expect(moved?.detail).toContain('[owner-attention migration 2026-10-11]');
     expect(rig.api.getNotification(unknownKind.id)).toMatchObject({ routing: 'action-required', ackedAt: null });
+    expect(rig.api.getNotification(mailboxBlocked.id)).toMatchObject({ routing: 'needs-owner', ackedAt: null, resolvedAt: null });
     // The move is auditable and idempotent: a second pass finds nothing.
     expect(rig.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.triaged')).toHaveLength(2);
     expect(reconcileLegacyOwnerAttention({ ledger: rig.api }).retriaged).toBe(0);

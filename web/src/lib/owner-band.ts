@@ -31,13 +31,20 @@ export function ownerNoticeGuidance(kind: string): string {
   if (kind === 'port-squat' || kind === 'roll-port-squat') {
     return 'Stop the foreign process yourself, then restart the service. This notice clears on a successful bind.';
   }
-  if (kind.startsWith('decisions.degraded.') || kind.startsWith('decisions.enforce-gate.')) {
+  if (kind.startsWith('decisions.enforce-gate.')) {
+    return 'Repair or produce passing backtest evidence for this gate, then retry the gated surface.';
+  }
+  if (kind.startsWith('decisions.degraded.')) {
     return 'Fix the decision-provider credential or configuration, then use Recheck. This notice clears when the decision service recovers.';
   }
   if (kind === 'worktree-sweep-paused' || kind.startsWith('worktree-sweep-paused:')) {
     return 'Confirm nothing live is rooted in the listed worktree. The sweep stays paused until an operator deliberately completes it; the notice clears when that worktree is swept.';
   }
-  if (kind.startsWith('gru.wake-blocked.') || kind.startsWith('gru.wake-failed-escalation.')) {
+  if (
+    kind.startsWith('gru.wake-blocked.') ||
+    kind.startsWith('gru.wake-blocked-mailbox.') ||
+    kind.startsWith('gru.wake-failed-escalation.')
+  ) {
     return 'Restart the service to recover chat safely. The machine alert remains pending for retry.';
   }
   return 'No in-app action is supported for this notice; it stays visible until its producer resolves it.';

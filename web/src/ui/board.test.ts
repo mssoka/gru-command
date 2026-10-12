@@ -16,6 +16,7 @@ import type {
 import { memoryStorage } from '../lib/chat-storage.js';
 import { boardKpis, collectJobs } from '../lib/board-kpi.js';
 import { snapshotSections } from '../lib/board-sections.js';
+import { ConsoleShell } from './console.js';
 import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
 import { BoardApiError } from '../lib/board-client.js';
 
@@ -2561,14 +2562,14 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const refused = {
       ackNotification: vi.fn(() => Promise.resolve()),
       markNotificationShown: vi.fn(() => Promise.resolve(true)),
-      decideNotification: vi.fn(() => Promise.reject(new BoardApiError('/decision', 409, 'decision_recorded', 'already records decision "keep"'))),
+      decideNotification: vi.fn(() => Promise.reject(new BoardApiError('/decision', 400, 'unknown_option', 'that option is no longer supported'))),
     } as unknown as import('../lib/board-client.js').BoardClient;
     const view3 = new BoardView(() => {}, refused);
     view3.render(snapshot({ notifications: [stop] }));
     const band3 = document.getElementById('board-owner')!;
     band3.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!.click();
     await vi.waitFor(() =>
-      expect(band3.querySelector('.board-notification__submission--refused')?.textContent).toContain('already records decision'),
+      expect(band3.querySelector('.board-notification__submission--refused')?.textContent).toContain('no longer supported'),
     );
     expect(band3.textContent).toContain('Not recorded');
     // Success → the server's authoritative row applies; the row stays
@@ -2657,7 +2658,32 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(panel.textContent).not.toContain('Ack');
   });
 
-  it('a discussion-only decision offers the chat route and no invented option buttons', () => {
+  it('a discussion-only decision offers the chat route and opens a collapsed chat pane', () => {
+    const consoleRoot = document.createElement('div');
+    consoleRoot.id = 'console';
+    const fab = document.createElement('button');
+    fab.id = 'gru-fab';
+    const rail = document.createElement('button');
+    rail.id = 'chat-rail';
+    const collapseButton = document.createElement('button');
+    collapseButton.id = 'chat-collapse';
+    document.body.append(consoleRoot, fab, rail, collapseButton);
+    const chat = {
+      setPaneCollapsed: vi.fn(),
+      focusComposer: vi.fn(),
+      openSheet: vi.fn(),
+      closeSheet: vi.fn(),
+    };
+    const shell = new ConsoleShell({
+      root: consoleRoot,
+      fab,
+      rail,
+      collapseButton,
+      chat: chat as unknown as ConstructorParameters<typeof ConsoleShell>[0]['chat'],
+      storage: null,
+      matchMedia: () => ({ matches: true }),
+    });
+    shell.setCollapsed(true);
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -2682,9 +2708,16 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const chatInput = document.createElement('textarea');
     chatInput.id = 'chat-input';
     document.body.append(chatInput);
+    expect(shell.collapsed).toBe(true);
     band.querySelector<HTMLButtonElement>('.board-notification__discuss-open')!.click();
+    expect(shell.collapsed).toBe(false);
+    expect(consoleRoot.classList.contains('console--chat-collapsed')).toBe(false);
     expect(document.activeElement).toBe(chatInput);
     chatInput.remove();
+    consoleRoot.remove();
+    fab.remove();
+    rail.remove();
+    collapseButton.remove();
   });
 
   it('a long diagnostic card keeps mixed case on its face and the full text behind Details', () => {
@@ -4368,44 +4401,73 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
     );
   });
 
-  it('a refusal message survives live pushes on both surfaces, and a retry is allowed', async () => {
-    const client = {
+  it.each(['decision_recorded', 'not_open'] as const)(
+    'a stale %s conflict refreshes shared owner and bell state before choices return',
+    async (code) => {
+      const client = {
+        ackNotification: vi.fn(() => Promise.resolve()),
+        markNotificationShown: vi.fn(() => Promise.resolve(true)),
+        decideNotification: vi.fn(() =>
+          Promise.reject(new BoardApiError('/decision', 409, code, 'the decision state changed')),
+        ),
+        refetchSnapshot: vi.fn(() => Promise.resolve()),
+      } as unknown as import('../lib/board-client.js').BoardClient;
+      const view = new BoardView(() => {}, client);
+      const row = stop();
+      view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+      (document.getElementById('notification-bell') as HTMLButtonElement).click();
+      document
+        .getElementById('notification-list')!
+        .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!
+        .click();
+      await vi.waitFor(() =>
+        expect(document.getElementById('board-owner')!.querySelector('.board-notification__submission--reconciling')).not.toBeNull(),
+      );
+      expect(client.refetchSnapshot).toHaveBeenCalledTimes(1);
+      const band = document.getElementById('board-owner')!;
+      const bell = document.getElementById('notification-list')!;
+      expect(band.querySelector('.board-notification__submission--reconciling')?.textContent).toContain('Refresh');
+      expect(bell.querySelector('.board-notification__submission--reconciling')?.textContent).toContain('Refresh');
+      expect(band.textContent).not.toContain('Not recorded');
+      expect(bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')?.getAttribute('aria-disabled')).toBe('true');
+
+      const reconciled =
+        code === 'decision_recorded'
+          ? { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'other-view', decidedOption: 'keep' }
+          : { ...row, resolvedAt: '2026-01-01T00:10:00.000Z', resolvedBy: 'producer' };
+      view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: 0 }));
+      expect(band.querySelector('.board-notification__submission--reconciling')).toBeNull();
+      expect(band.querySelector('[data-action-id="notif:shared-submit:option:approve"]')).toBeNull();
+    },
+  );
+
+  it('a re-pair clears successful decision overrides before another service reuses the notification id', async () => {
+    const row = notification('shared-decision-id', { routing: 'needs-owner', decision: ownerDecision() });
+    const decided = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const oldClient = {
       ackNotification: vi.fn(() => Promise.resolve()),
       markNotificationShown: vi.fn(() => Promise.resolve(true)),
-      decideNotification: vi.fn(() =>
-        Promise.reject(new BoardApiError('/decision', 409, 'decision_recorded', 'already records decision "keep"')),
-      ),
+      decideNotification: vi.fn(() => Promise.resolve(decided)),
     } as unknown as import('../lib/board-client.js').BoardClient;
-    const view = new BoardView(() => {}, client);
-    const row = stop();
-    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
-    (document.getElementById('notification-bell') as HTMLButtonElement).click();
-    document
-      .getElementById('notification-list')!
-      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!
-      .click();
-    await vi.waitFor(() =>
-      expect(document.getElementById('board-owner')!.querySelector('.board-notification__submission--refused')).not.toBeNull(),
-    );
-    // The push re-renders both cards from the shared state: the honest
-    // refusal copy stays, and the options remain retryable.
-    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
-    const bandRefusal = document.getElementById('board-owner')!.querySelector('.board-notification__submission--refused');
-    const bellRefusal = document
-      .getElementById('notification-list')!
-      .querySelector('.board-notification__submission--refused');
-    expect(bandRefusal?.textContent).toContain('Not recorded');
-    expect(bandRefusal?.textContent).toContain('already records decision');
-    expect(bellRefusal?.textContent).toContain('Not recorded');
-    expect(
-      document.getElementById('board-owner')!.querySelector('[data-action-id="notif:shared-submit:option:approve"]'),
-    ).not.toBeNull();
-    // Clicking again retries the same idempotent request.
+    const newClient = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(oldClient);
+    view.render(snapshot({ notifications: [row] }));
     document
       .getElementById('board-owner')!
-      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-decision-id:option:approve"]')!
       .click();
-    await vi.waitFor(() => expect(client.decideNotification).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+
+    view.bindClient(newClient);
+    view.render(snapshot({ notifications: [row] }));
+    expect(document.getElementById('board-owner')!.textContent).not.toContain('Decision recorded');
+    expect(
+      document.getElementById('board-owner')!.querySelector('[data-action-id="notif:shared-decision-id:option:approve"]'),
+    ).not.toBeNull();
   });
 
   it('a re-pair drops in-flight work begun for the old client (late replies change nothing)', async () => {
@@ -4528,6 +4590,25 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
     expect(
       document.getElementById('board-owner')!.querySelector('[data-action-id="notif:discuss-focus:option:approve"]'),
     ).not.toBeNull();
+  });
+
+  it('focus falls back to the full notification id when its option marker is part of the id', () => {
+    const id = 'notice:option:embedded';
+    const row = notification(id, { routing: 'needs-owner', decision: ownerDecision() });
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [row] }));
+    const option = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:notice:option:embedded:option:approve"]')!;
+    option.focus();
+    view.render(
+      snapshot({
+        notifications: [
+          { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' },
+        ],
+      }),
+    );
+    expect((document.activeElement as HTMLElement).dataset.notificationId).toBe(id);
   });
 
   it('the receipts pager keeps the effective view: a recorded decision stays recorded', async () => {

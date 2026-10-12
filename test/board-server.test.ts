@@ -17,6 +17,9 @@ import { loadConfig } from '../src/config.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
 import { DREAM_FAILED_KIND, dreamFailureIncidents } from '../src/lessons/dream.js';
 import { ROLE_DEFINITIONS } from '../src/roles.js';
+import { bindSupervisorNotificationDisposition } from '../src/supervision/notification-disposition.js';
+import { Supervisor, type SupervisorRegistry } from '../src/supervision/supervisor.js';
+import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { RepoOverviewView } from '../src/repos/overview.js';
 
 const cleanupDirs: string[] = [];
@@ -43,6 +46,7 @@ async function boot(
   bus: EventBus;
   board: ReturnType<typeof createBoardServer>;
   engine: BoardEngine;
+  notifications: NotificationCenter;
   close: () => Promise<void>;
 }> {
   const dir = tmpDir();
@@ -101,6 +105,7 @@ async function boot(
     bus,
     board,
     engine,
+    notifications,
     async close() {
       decisions.dispose();
       await board.dispose();
@@ -1401,6 +1406,53 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       expect(hookCalls).toEqual(['machine-rearm', 'machine-rearm']);
     } finally {
       await close();
+    }
+  });
+
+  it('the production supervisor binding preserves a real refusal through the authenticated disposition route', async () => {
+    let disposition: ((id: string) => ReturnType<Supervisor['onNotificationDisposed']>) | null = null;
+    const harness = await boot('board-test-token', {
+      onNotificationDisposition: (id) => (disposition === null ? undefined : disposition(id)),
+    });
+    const registryTap: { listener: ((envelope: AgentEventEnvelope) => void) | null } = { listener: null };
+    const registry: SupervisorRegistry = {
+      onAgentEvent: (listener) => {
+        registryTap.listener = listener;
+        return () => { registryTap.listener = null; };
+      },
+      getHandle: () => null,
+      spawn: async () => { throw new Error('parked re-arm must refuse before spawn'); },
+      disposeHandle: async () => {},
+    };
+    const supervisor = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+      registry,
+      ledger: harness.api,
+      notifications: harness.notifications,
+      tickMs: 5_000,
+    });
+    disposition = bindSupervisorNotificationDisposition(supervisor);
+    try {
+      supervisor.start();
+      harness.api.addJob({ id: 'real-parked-lane', repo: 'fixture', title: 'parked lane' });
+      harness.api.setJobStatus('real-parked-lane', 'parked');
+      harness.api.registerAgent({ id: 'real-stopped-agent', role: 'minion', jobId: 'real-parked-lane' });
+      registryTap.listener?.({ agentId: 'real-stopped-agent', role: 'minion', sessionFile: null, phase: 'spawned' });
+      const internals = supervisor as unknown as { agents: Map<string, unknown>; tripBreaker(agent: unknown): void };
+      const agent = internals.agents.get('real-stopped-agent');
+      if (agent === undefined) throw new Error('supervisor did not adopt the fixture agent');
+      internals.tripBreaker(agent);
+      const stop = harness.api.listNotifications({ limit: 50 }).find((row) => row.agentId === 'real-stopped-agent' && row.kind === 'supervision.breaker');
+      if (stop === undefined) throw new Error('supervisor did not post the breaker control');
+
+      const response = await postJson(harness.port, `/api/notifications/${encodeURIComponent(stop.id)}/disposition`, 'board-test-token', {
+        detail: 'retry after hold review',
+      });
+      expect(response).toMatchObject({ status: 409, body: { error: 'rearm_refused', code: 'rearm_refused' } });
+      expect(harness.api.getNotification(stop.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+    } finally {
+      supervisor.dispose();
+      await harness.close();
     }
   });
 

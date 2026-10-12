@@ -3535,10 +3535,15 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get('retry-durable-agent');
       expect(agent?.pendingRecovery).not.toBeNull();
       expect(rig.api.latestSupervisionEvent('retry-durable-agent')?.kind).toBe('supervision.rearm-fenced');
-      expect(rig.api.durableSupervisionStops().get('retry-durable-agent')?.reason).toContain('re-arm fenced:');
+      expect(rig.api.durableSupervisionStops().get('retry-durable-agent')).toMatchObject({
+        reason: expect.stringContaining('re-arm fenced:'),
+        notificationId: fenced!.id,
+        pendingFenceReason: null,
+      });
 
       // A fresh process reconstructs the accepted-rearm → later-fence stop
-      // from the newest lifecycle event and exposes it to the board again.
+      // and its exact live control, so that alert still reaches the refusal
+      // path rather than being resolved as an unbound machine notice.
       rig.supervisor.dispose();
       restored = new Supervisor({
         config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
@@ -3550,9 +3555,69 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       });
       restored.start();
       expect(restored.viewFor('retry-durable-agent')).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: expect.stringContaining('re-arm fenced:') });
+      rig.registry.adopt(new FakeHandle('minion', 'retry-durable-agent', null));
+      const restoredAgent = (restored as unknown as { agents: Map<string, { breakerOpen: boolean; breakerNotificationId: string | null }> }).agents.get('retry-durable-agent');
+      expect(restoredAgent).toMatchObject({ breakerOpen: true, breakerNotificationId: fenced!.id });
+      expect(restored.onNotificationDisposed(fenced!.id)).toMatchObject({ ok: false, reason: expect.stringContaining('parked') });
+      expect(rig.api.getNotification(fenced!.id)?.resolvedAt).toBeNull();
       const engine = new BoardEngine({ ledger: rig.api, bus: new EventBus(), supervisionFor: (agentId) => restored?.viewFor(agentId) ?? null });
       expect(engine.snapshot().agents.find((row) => row.id === 'retry-durable-agent')?.supervision)
         .toMatchObject({ state: 'stopped', stopReason: expect.stringContaining('re-arm fenced:') });
+    } finally {
+      restored?.dispose();
+      rig.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failed fresh-control post survives restart as retry debt and is rebound when posting recovers', async () => {
+    const { rig, stop } = directlyStoppedTurn('pending-control-job', 'pending-control-agent');
+    let restored: Supervisor | null = null;
+    vi.useFakeTimers();
+    const originalPost = rig.center.post.bind(rig.center);
+    try {
+      rig.api.resolveNotificationById(stop.id, 'accepted-disposition');
+      rig.center.post = ((input: Parameters<NotificationCenter['post']>[0]) => {
+        if (input.kind === 'supervision.rearm-fenced') throw new Error('fresh control storage unavailable');
+        return originalPost(input);
+      }) as typeof rig.center.post;
+      const internals = rig.supervisor as unknown as {
+        agents: Map<string, { breakerNotificationId: string | null; pendingRearmFenceAlert: { reason: string } | null }>;
+        fenceRearm(agent: unknown, notificationId: string | null, reason: string): void;
+      };
+      const agent = internals.agents.get('pending-control-agent');
+      if (agent === undefined) throw new Error('test agent was not adopted');
+      internals.fenceRearm(agent, stop.id, 'park appeared during re-arm');
+      expect(agent.pendingRearmFenceAlert?.reason).toContain('park appeared');
+      expect(rig.api.durableSupervisionStops().get('pending-control-agent')).toMatchObject({
+        notificationId: stop.id,
+        pendingFenceReason: expect.stringContaining('park appeared'),
+      });
+
+      rig.supervisor.dispose();
+      restored = new Supervisor({
+        config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+        registry: rig.registry,
+        ledger: rig.api,
+        notifications: rig.center,
+        tickMs: 5,
+        now: () => rig.nowMs,
+      });
+      restored.start();
+      rig.center.post = originalPost;
+      rig.registry.adopt(new FakeHandle('minion', 'pending-control-agent', null));
+      const restoredAgent = (restored as unknown as { agents: Map<string, { breakerNotificationId: string | null; pendingRearmFenceAlert: { reason: string } | null }> }).agents.get('pending-control-agent');
+      expect(restoredAgent?.pendingRearmFenceAlert?.reason).toContain('park appeared');
+      (restored as unknown as { tick(): void }).tick();
+      const fresh = rig.api.listNotifications({ limit: 50, unackedOnly: true }).find(
+        (row) => row.kind === 'supervision.rearm-fenced' && row.resolvedAt === null,
+      );
+      expect(fresh).toMatchObject({ routing: 'action-required', resolvedAt: null });
+      expect(restoredAgent).toMatchObject({ breakerNotificationId: fresh!.id, pendingRearmFenceAlert: null });
+      expect(rig.api.durableSupervisionStops().get('pending-control-agent')).toMatchObject({
+        notificationId: fresh!.id,
+        pendingFenceReason: null,
+      });
     } finally {
       restored?.dispose();
       rig.dispose();

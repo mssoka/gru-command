@@ -211,17 +211,21 @@ describe('owner-notice guidance — honest scope per kind, never parsed prose', 
     expect(ownerNoticeGuidance('roll-port-squat')).toContain('Stop the foreign process yourself');
   });
 
-  it('degraded decisions name the real remediation, not an ack', () => {
-    const line = ownerNoticeGuidance('decisions.degraded.timeout');
-    expect(line).toContain('Fix the decision-provider credential');
-    expect(line).toContain('clears when the decision service recovers');
-    expect(ownerNoticeGuidance('decisions.enforce-gate.triage')).toBe(line);
+  it('degraded decisions and enforce-gate notices name their distinct remediation', () => {
+    const degraded = ownerNoticeGuidance('decisions.degraded.timeout');
+    expect(degraded).toContain('Fix the decision-provider credential');
+    expect(degraded).toContain('clears when the decision service recovers');
+    const enforceGate = ownerNoticeGuidance('decisions.enforce-gate.triage');
+    expect(enforceGate).toContain('passing backtest evidence');
+    expect(enforceGate).toContain('retry the gated surface');
+    expect(enforceGate).not.toContain('credential');
   });
 
   it('sweep confirmations and blocked wakes name the manual step', () => {
     expect(ownerNoticeGuidance('worktree-sweep-paused')).toContain('Confirm nothing live is rooted');
     expect(ownerNoticeGuidance('worktree-sweep-paused:lane-a:pause-1')).toContain('the notice clears when that worktree is swept');
     expect(ownerNoticeGuidance('gru.wake-blocked.n1')).toContain('Restart the service');
+    expect(ownerNoticeGuidance('gru.wake-blocked-mailbox.incident')).toContain('Restart the service');
     expect(ownerNoticeGuidance('gru.wake-failed-escalation.job')).toContain('Restart the service');
   });
 

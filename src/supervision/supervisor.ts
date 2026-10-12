@@ -390,6 +390,11 @@ export class Supervisor {
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
   private restoredStops = new Map<string, AgentSupervisionView>();
+  /** Durable breaker controls and alert-post debt paired with restored stops. */
+  private readonly restoredRearmControls = new Map<
+    string,
+    { readonly notificationId: string | null; readonly pendingFenceReason: string | null }
+  >();
   private readonly slots = new Map<string, SupervisedSlotInternal>();
   private readonly unsubscribeTap: () => void;
   private readonly tickMs: number;
@@ -440,6 +445,7 @@ export class Supervisor {
     // worker would otherwise lose its waiting truth (and a stalled lane
     // could wake) until the next live event (code review 2026-10-04).
     this.restoredStops = this.hydrateRestoredStops();
+    for (const agent of this.agents.values()) this.restoreDurableStop(agent);
     this.ticker = setInterval(() => {
       try {
         this.tick();
@@ -540,6 +546,7 @@ export class Supervisor {
         existing.consecutiveFailures = 0;
         existing.state = 'watching';
         this.restoredStops.delete(existing.agentId);
+        this.restoredRearmControls.delete(existing.agentId);
         this.log('info', 'breaker re-armed by slot use — resuming supervision', {
           agent_id: existing.agentId,
           slot: slot.id,
@@ -881,6 +888,7 @@ export class Supervisor {
       if (handle !== null && handle.sessionFile !== null) existing.sessionFile = handle.sessionFile;
       existing.lastEventAt = this.now();
       existing.activityGeneration += 1;
+      this.restoreDurableStop(existing);
       return true;
     }
     const sessionFile = handle?.sessionFile ?? envelope?.sessionFile ?? resumeFile ?? null;
@@ -915,6 +923,8 @@ export class Supervisor {
       rateLimitRetry: null,
       recoveryAdmission: null,
     });
+    const adopted = this.agents.get(agentId);
+    if (adopted !== undefined) this.restoreDurableStop(adopted);
     this.log('info', 'supervising agent', { agent_id: agentId, role, slot: slot?.id ?? null });
     return true;
   }
@@ -933,7 +943,7 @@ export class Supervisor {
       // bad carry value must never abort a whole tick pass.
       const pendingFence = agent.pendingRearmFenceAlert;
       if (pendingFence !== null && pendingFence !== undefined) {
-        this.raiseFencedAlert(agent, pendingFence.reason);
+        this.raiseFencedAlert(agent, pendingFence.reason, true);
       }
       if (agent.handle === null || agent.state !== 'watching' || agent.breakerOpen) continue;
       // An automatic rate-limit retry waiting out its backoff owns recovery:
@@ -1681,6 +1691,7 @@ export class Supervisor {
         dedupe: 'unacked',
       });
       agent.breakerNotificationId = notification.id;
+      this.rememberStop(agent);
       if (machineOwned) {
         this.providerWalls?.linkProviderWaitIncident?.({ agentId: agent.agentId, incidentId: notification.id });
       }
@@ -2354,6 +2365,7 @@ export class Supervisor {
       agentId: agent.agentId,
     });
     agent.breakerNotificationId = notification.id;
+    this.rememberStop(agent);
     this.log('error', 'crash-loop breaker tripped — agent stopped', {
       agent_id: agent.agentId,
       restarts: agent.restartRing.length,
@@ -2449,8 +2461,11 @@ export class Supervisor {
     agent.stoppedAt = agent.stoppedAt ?? this.now();
     this.rememberStop(agent);
     this.raiseFencedAlert(agent, reason);
+    this.rememberStop(agent);
     this.recordEvent('supervision.rearm-fenced', agent.agentId, {
       notification_id: notificationId,
+      control_notification_id: agent.breakerNotificationId,
+      pending_rearm_fence_reason: agent.pendingRearmFenceAlert?.reason ?? null,
       reason,
       stop_reason: agent.stopReason,
       restarts: agent.restartRing.length,
@@ -2492,7 +2507,7 @@ export class Supervisor {
    * raised; a failed post is remembered and retried on every tick, so a
    * ledger hiccup can never strand the stop without a control. Every read
    * here is guarded: this is a fire-and-forget path. */
-  private raiseFencedAlert(agent: SupervisedAgent, reason: string): void {
+  private raiseFencedAlert(agent: SupervisedAgent, reason: string, persistRecoveredControl = false): void {
     if (!agent.breakerOpen) {
       agent.pendingRearmFenceAlert = null;
       return;
@@ -2514,7 +2529,24 @@ export class Supervisor {
         bound = null;
       }
     }
-    if (bound !== null && bound.resolvedAt === null) return; // a live control already exists
+    if (bound !== null && bound.resolvedAt === null) {
+      if (agent.pendingRearmFenceAlert !== null && agent.pendingRearmFenceAlert !== undefined) {
+        const pendingReason = agent.pendingRearmFenceAlert.reason;
+        agent.pendingRearmFenceAlert = null;
+        if (persistRecoveredControl) {
+          this.recordEvent('supervision.rearm-fenced', agent.agentId, {
+            notification_id: bound.id,
+            control_notification_id: bound.id,
+            pending_rearm_fence_reason: null,
+            reason: pendingReason,
+            stop_reason: agent.stopReason,
+            restarts: agent.restartRing.length,
+          });
+          this.rememberStop(agent);
+        }
+      }
+      return; // a live control already exists
+    }
     try {
       const posted = this.notifications.post({
         kind: 'supervision.rearm-fenced',
@@ -2526,8 +2558,20 @@ export class Supervisor {
           'Resolve the hold, then dispose this alert to retry the re-arm.',
         agentId: agent.agentId,
       });
+      const pendingReason = agent.pendingRearmFenceAlert?.reason ?? reason;
       agent.breakerNotificationId = posted.id;
       agent.pendingRearmFenceAlert = null;
+      if (persistRecoveredControl) {
+        this.recordEvent('supervision.rearm-fenced', agent.agentId, {
+          notification_id: posted.id,
+          control_notification_id: posted.id,
+          pending_rearm_fence_reason: null,
+          reason: pendingReason,
+          stop_reason: agent.stopReason,
+          restarts: agent.restartRing.length,
+        });
+        this.rememberStop(agent);
+      }
     } catch (error) {
       agent.pendingRearmFenceAlert = { reason };
       this.log('error', 'fenced re-arm alert post failed — retrying on tick', {
@@ -2560,6 +2604,7 @@ export class Supervisor {
       agent.consecutiveFailures = 0;
       agent.state = 'watching';
       this.restoredStops.delete(agent.agentId);
+      this.restoredRearmControls.delete(agent.agentId);
       this.log('info', 'breaker re-armed by disposition — resuming supervision', {
         agent_id: agent.agentId,
         notification_id: notificationId,
@@ -2595,6 +2640,8 @@ export class Supervisor {
         });
         this.recordEvent('supervision.rearm-fenced', agent.agentId, {
           notification_id: notificationId,
+          control_notification_id: agent.breakerNotificationId,
+          pending_rearm_fence_reason: agent.pendingRearmFenceAlert?.reason ?? null,
           reason: refusal,
           stop_reason: agent.stopReason,
           restarts: agent.restartRing.length,
@@ -2648,6 +2695,7 @@ export class Supervisor {
     agent.consecutiveFailures = 0;
     agent.state = 'watching';
     this.restoredStops.delete(agent.agentId);
+    this.restoredRearmControls.delete(agent.agentId);
     this.log('info', 'breaker re-armed by owned provider recovery', {
       agent_id: agentId,
       wait_id: waitId,
@@ -2697,9 +2745,14 @@ export class Supervisor {
    * (restart-only; a malformed query must not take the service down). */
   private hydrateRestoredStops(): Map<string, AgentSupervisionView> {
     const stops = new Map<string, AgentSupervisionView>();
+    this.restoredRearmControls.clear();
     if (!this.cfg.enabled) return stops;
     try {
       for (const [agentId, stop] of this.ledger.durableSupervisionStops()) {
+        this.restoredRearmControls.set(agentId, {
+          notificationId: stop.notificationId,
+          pendingFenceReason: stop.pendingFenceReason,
+        });
         stops.set(agentId, {
           agentId,
           role: stop.role,
@@ -2721,9 +2774,61 @@ export class Supervisor {
     return stops;
   }
 
+  /** Attach the durable stop and its retry control to a newly adopted agent.
+   * A handle arriving for a stopped id is disposed, never treated as an
+   * implicit re-arm. Missing/closed controls become retryable alert debt. */
+  private restoreDurableStop(agent: SupervisedAgent): void {
+    if (agent.breakerOpen) return;
+    const stop = this.restoredStops.get(agent.agentId);
+    if (stop === undefined) return;
+    const control = this.restoredRearmControls.get(agent.agentId);
+    let notificationId = control?.notificationId ?? null;
+    let pendingFenceReason = control?.pendingFenceReason ?? null;
+    if (notificationId !== null && pendingFenceReason === null) {
+      try {
+        const row = this.ledger.getNotification(notificationId);
+        if (row === null || row.resolvedAt !== null) notificationId = null;
+      } catch (error) {
+        notificationId = null;
+        pendingFenceReason = `restored stop control lookup failed: ${String(error)}`;
+      }
+    }
+    if (notificationId === null && pendingFenceReason === null) {
+      pendingFenceReason = stop.stopReason ?? 'restored supervision stop has no open retry control';
+    }
+    agent.breakerOpen = true;
+    agent.state = 'stopped';
+    agent.stopReason = stop.stopReason;
+    agent.stoppedAt = null;
+    agent.restartRing = Array.from(
+      { length: Math.min(Math.max(0, stop.restarts), this.cfg.maxRestarts) },
+      () => this.now(),
+    );
+    agent.breakerNotificationId = notificationId;
+    agent.pendingRearmFenceAlert = pendingFenceReason === null ? null : { reason: pendingFenceReason };
+    agent.openTurn = false;
+    agent.openControl = false;
+    agent.openToolCalls.clear();
+    const handle = agent.handle;
+    if (handle !== null) {
+      agent.handle = null;
+      void this.registry.disposeHandle(handle).catch((error: unknown) => {
+        this.log('warn', 'dispose of restored stopped handle failed', {
+          agent_id: agent.agentId,
+          error: String(error),
+        });
+      });
+    }
+    this.rememberStop(agent);
+  }
+
   /** Mirror an in-process stop into the restored map so the truth survives
    * even if the live record is later removed. */
   private rememberStop(agent: SupervisedAgent): void {
+    this.restoredRearmControls.set(agent.agentId, {
+      notificationId: agent.breakerNotificationId,
+      pendingFenceReason: agent.pendingRearmFenceAlert?.reason ?? null,
+    });
     this.restoredStops.set(agent.agentId, {
       agentId: agent.agentId,
       role: agent.role,

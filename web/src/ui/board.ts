@@ -320,6 +320,7 @@ export class BoardView {
     this.clientGeneration += 1;
     this.proposalStates.clear();
     this.decisionSubmissions.clear();
+    this.decisionOverrides.clear();
     this.sentShown.clear();
     this.extraReceipts = [];
     this.receiptsNextOffset = 0;
@@ -2274,7 +2275,7 @@ export class BoardView {
             ? `Recording “${submission.label}”…`
             : (submission.message ?? 'The outcome is unconfirmed — the board will show the recorded state.'),
         );
-        status.setAttribute('role', submission.phase === 'submitting' ? 'status' : 'alert');
+        status.setAttribute('role', submission.phase === 'submitting' || submission.phase === 'reconciling' ? 'status' : 'alert');
         card.append(status);
       }
       if (decided) {
@@ -2399,11 +2400,12 @@ export class BoardView {
         button.dataset.actionId = key;
         button.dataset.focusKey = key;
         if (bandVisible) button.dataset.ownerFocusKey = key;
-        if (submission !== null && submission.phase === 'submitting') {
+        if (submission !== null && (submission.phase === 'submitting' || submission.phase === 'reconciling')) {
           // No duplicate action from ANY surface: the chosen button keeps
           // focus (aria-disabled, never the disabled property) while the
           // others are plain-disabled; the shared state guard also refuses
-          // repeats.
+          // repeats. Reconciliation also locks choices until authoritative
+          // state arrives after a stale-state conflict.
           if (submission.optionId === option.id) {
             button.setAttribute('aria-disabled', 'true');
             button.textContent = `recording “${option.label}”…`;
@@ -2439,9 +2441,8 @@ export class BoardView {
    * (surface-independent and generation-scoped): a live push mid-submit
    * re-renders the same phase on both surfaces, no duplicate action can
    * start anywhere, and the outcome message survives the push. On success
-   * the server's row (authoritative) applies until the next snapshot; a
-   * refusal proves nothing was recorded and a retry is the same idempotent
-   * request. */
+   * the server's row (authoritative) applies until the next snapshot; known
+   * stale-state conflicts refresh before the board offers another choice. */
   private submitDecision(item: NotificationView, optionId: string, surfaceRoot: HTMLElement): void {
     const client = this.boardClient;
     if (client === null) return;
@@ -2468,11 +2469,24 @@ export class BoardView {
         this.focusNotification(item.id, surfaceRoot);
       })
       .catch((error: unknown) => {
-        if (submission.generation !== this.clientGeneration) return;
-        // A server refusal PROVES nothing was recorded. A transport failure
-        // is ambiguous: the server may have committed the decision before
-        // the reply was lost, so the copy must not claim otherwise (a retry
-        // of the same option is idempotent and confirms the record).
+        if (submission.generation !== this.clientGeneration || this.decisionSubmissions.get(item.id) !== submission) return;
+        // A conflict can mean the open card is stale because another view
+        // already recorded or resolved it. Do not offer the same dead-end
+        // choice: clear any local success override, lock both surfaces, and
+        // fetch authoritative board state. Ordinary refusals remain retryable;
+        // transport failures are still ambiguous and same-option retry-safe.
+        if (
+          error instanceof BoardApiError &&
+          (error.code === 'decision_recorded' || error.code === 'not_open')
+        ) {
+          submission.phase = 'reconciling';
+          submission.message = 'The decision changed elsewhere. Refreshing the board before showing current choices.';
+          this.decisionOverrides.delete(item.id);
+          this.rerenderNotifications();
+          this.focusNotification(item.id, surfaceRoot);
+          void client.refetchSnapshot();
+          return;
+        }
         submission.phase = error instanceof BoardApiError ? 'refused' : 'unconfirmed';
         submission.message =
           error instanceof BoardApiError
@@ -2501,8 +2515,10 @@ export class BoardView {
   private openChatComposer(): void {
     const consoleRoot = document.getElementById('console');
     if (consoleRoot instanceof HTMLElement && consoleRoot.classList.contains('console--chat-collapsed')) {
-      const collapse = document.getElementById('chat-collapse');
-      if (collapse instanceof HTMLElement) collapse.click();
+      // The in-pane head button collapses (or closes the mobile sheet); the
+      // FAB is the actual expand/open control at both breakpoints.
+      const openChat = document.getElementById('gru-fab');
+      if (openChat instanceof HTMLElement) openChat.click();
     }
     const input = document.getElementById('chat-input');
     if (input instanceof HTMLElement) {
@@ -2799,14 +2815,15 @@ interface ProposalRowState {
 }
 
 /** ONE decision submission, shared by every surface that renders the
- * card. Phases: submitting (buttons locked everywhere), refused (a server
- * refusal — nothing was recorded, retry is safe), unconfirmed (transport
- * failure — the outcome is unknown, a same-choice retry is idempotent). */
+ * card. Phases: submitting (buttons locked everywhere), refused (an
+ * ordinary server refusal; retry is safe), unconfirmed (transport failure;
+ * same-choice retry is idempotent), or reconciling (known stale-state
+ * conflict; choices stay locked until fresh state arrives). */
 interface DecisionSubmission {
   readonly optionId: string;
   readonly label: string;
   readonly generation: number;
-  phase: 'submitting' | 'refused' | 'unconfirmed';
+  phase: 'submitting' | 'refused' | 'unconfirmed' | 'reconciling';
   message: string | null;
 }
 
@@ -2821,7 +2838,7 @@ function notificationIdFromFocusKey(key: string): string | null {
   // from the RIGHT so an id containing ':' survives intact.
   if (key.startsWith('notif:')) {
     const rest = key.slice('notif:'.length);
-    const optionAt = rest.indexOf(':option:');
+    const optionAt = rest.lastIndexOf(':option:');
     if (optionAt !== -1) return rest.slice(0, optionAt) || null;
     if (rest.endsWith(':details')) return rest.slice(0, -':details'.length) || null;
     if (rest.endsWith(':seen')) return rest.slice(0, -':seen'.length) || null;
