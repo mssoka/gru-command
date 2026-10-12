@@ -5,16 +5,17 @@
 # restart reconciliation trusted unverified publication bytes, had no bound
 # posting identity, and accepted an undecidable gh review list as absence.
 # Expected result is RED by BEHAVIORAL ASSERTION on the discriminating legs
-# (the digest/absence certificates were false there). The final additive
-# `publication-evidence.ts` rides the overlay because the final tests import
-# the new prepared-identity constants; it changes nothing else (type-only
-# imports at runtime, the base implementation never reads it). A pass on
-# either leg, a missing named case, an import/collection/setup failure, or a
-# named case that did not fail as an assertion is classified by
-# tools/assert-named-red-baseline.mjs and exits 2. The snapshot and the
-# ignored pointer file are preserved for inspection; nothing is deleted or
-# checked out; dependencies are only symlinked, never installed; the lane
-# checkout is never mutated.
+# (the digest/absence certificates were false there). Preserve the historical
+# `publication-evidence.ts` implementation: the base Silas consumer calls its
+# re-arm guard, so overlaying the current helper would mask the receipt-only
+# regression this baseline must discriminate. The final tests need the later
+# `PUBLICATION_IDENTITY_EVENT` name for an R2 fixture; append only that string
+# constant to the historical module. A pass on either leg, a missing named
+# case, an import/collection/setup failure, or a named case that did not fail
+# as an assertion is classified by tools/assert-named-red-baseline.mjs and
+# exits 2. The snapshot and the ignored pointer file are preserved for
+# inspection; nothing is deleted or checked out; dependencies are only
+# symlinked, never installed; the lane checkout is never mutated.
 set -eu
 base=89f3a7189da3ac82842802015d79b2d8f7f7af0e
 headrev=$(git rev-parse HEAD)
@@ -25,10 +26,12 @@ d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-formal-verdicts-r2.XXXXXX")
 git archive "$base" -o "$d/base.tar"
 tar -xf "$d/base.tar" -C "$d"
 rm -f "$d/base.tar"
-for f in test/perkins-builtin-wave.test.ts test/silas-driver.test.ts src/dispatch/publication-evidence.ts; do
+for f in test/perkins-builtin-wave.test.ts test/silas-driver.test.ts; do
   mkdir -p "$d/$(dirname "$f")"
   git show "$headrev:$f" > "$d/$f"
 done
+git show "$base:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"
+printf "\\n/** Test-fixture compatibility marker; keep base helper behavior. */\\nexport const PUBLICATION_IDENTITY_EVENT = 'round.publication-identity';\\n" >> "$d/src/dispatch/publication-evidence.ts"
 ln -s "$root/node_modules" "$d/node_modules"
 printf '%s base=%s head=%s\n' "$d" "$base" "$headrev" > "$prep/formal-verdicts-r2-baseline.last-snapshot.txt"
 cd "$d"

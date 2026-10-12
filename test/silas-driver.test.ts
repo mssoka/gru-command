@@ -1363,6 +1363,18 @@ describe('silas digest (the four actionable states)', () => {
       expect(afterAbsence).toMatchObject([
         { jobId: controlJobId, cleanAbort: { roundId: controlRound.id, ruleId: 'clean-abort-service-restart' } },
       ]);
+
+      const malformedJobId = 'clean-malformed-receipt-only';
+      const malformedRound = addCleanAbort(malformedJobId, 'sha-malformed-receipt-only');
+      h.ledger.appendCustomEvent({ kind: PUBLICATION_RECEIPT_EVENT, jobId: malformedJobId, roundId: malformedRound.id,
+        payload: { credited: false, reason: 'malformed' } });
+      expect(h.ledger.latestRoundEvent(malformedRound.id, PUBLICATION_ATTEMPT_EVENT)).toBeNull();
+      const afterMalformedReceipt = (await digestOf()).prWithoutReview;
+      expect(afterMalformedReceipt.filter((row) => row.jobId === malformedJobId)).toEqual([]);
+      expect(afterMalformedReceipt).toHaveLength(1);
+      expect(afterMalformedReceipt).toMatchObject([
+        { jobId: controlJobId, cleanAbort: { roundId: controlRound.id, ruleId: 'clean-abort-service-restart' } },
+      ]);
     } finally { h.cleanup(); }
   });
 

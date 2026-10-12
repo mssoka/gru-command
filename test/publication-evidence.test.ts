@@ -30,9 +30,9 @@ const receipt = {
 function ledgerWith(events: ReadonlyArray<{ kind: string; seq: number; payload: unknown }>): PublicationEvidenceReader {
   return {
     latestRoundEvent: (_roundId: string, kind: string) => {
-      const matching = events.filter((event) => event.kind === kind);
-      const latest = matching[matching.length - 1];
-      return latest === undefined ? null : { seq: latest.seq, payload: latest.payload };
+      const latest = events.reduce<{ kind: string; seq: number; payload: unknown } | null>((current, event) =>
+        event.kind === kind && (current === null || event.seq > current.seq) ? event : current, null);
+      return latest === null ? null : { seq: latest.seq, payload: latest.payload };
     },
   };
 }
@@ -90,11 +90,11 @@ describe('publication re-arm guard', () => {
     expect(malformed?.detail).toContain('unknown');
 
     const laterAbsence = pendingPublicationAttempt(ledgerWith([
-      { kind: PUBLICATION_RECEIPT_EVENT, seq: 1, payload: { ...attempt, receipt, credited: false, reason: 'recovered receipt' } },
+      { kind: PUBLICATION_RECEIPT_EVENT, seq: 1, payload: { credited: false, reason: 'malformed' } },
       { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'contradictory later absence' } },
-    ]), 'receipt-before-absence');
+    ]), 'malformed-receipt-before-absence');
     expect(laterAbsence?.kind).toBe('uncredited-receipt');
-    expect(laterAbsence?.detail).toContain('9001');
+    expect(laterAbsence?.detail).toContain('unknown');
   });
 
   it('holds an uncredited receipt as a provider write that must be reconciled first', () => {
@@ -111,6 +111,14 @@ describe('publication re-arm guard', () => {
       { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
       { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: 'a'.repeat(64), detail: 'proved absent' } },
     ]), 'r1')).toBeNull();
+
+    const newerAttempt = { ...attempt, targetSha: '3'.repeat(40), publicationSha256: 'd'.repeat(64) };
+    const reordered = pendingPublicationAttempt(ledgerWith([
+      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 3, payload: newerAttempt },
+      { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'stale absence' } },
+      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
+    ]), 'reordered-events');
+    expect(reordered?.kind).toBe('unresolved-attempt');
   });
 
   it('holds ANY recorded delivery whose credit is unresolved, with or without intent or marker', () => {

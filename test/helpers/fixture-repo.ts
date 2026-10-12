@@ -1,8 +1,7 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtempSync } from 'node:fs';
 import { markFixtureStep } from './harness-diagnostics.mjs';
 
 /**
@@ -42,10 +41,27 @@ export type FixtureRepoStep = 'tempdir' | 'git-init' | 'seed-files' | 'initial-c
 
 export function makeFixtureRepo(
   name = 'fixture-app',
-  onStep?: (step: FixtureRepoStep) => void,
+  onStep?: (step: FixtureRepoStep, tempDir: string) => void,
 ): FixtureRepo {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-fixture-'));
-  onStep?.('tempdir');
+  try {
+    return initializeFixtureRepo(dir, name, onStep);
+  } catch (error) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `failed to initialize and clean up fixture repository ${name}`);
+    }
+    throw error;
+  }
+}
+
+function initializeFixtureRepo(
+  dir: string,
+  name: string,
+  onStep?: (step: FixtureRepoStep, tempDir: string) => void,
+): FixtureRepo {
+  onStep?.('tempdir', dir);
   const path = join(dir, name);
   mkdirSync(path, { recursive: true });
   const git = (args: readonly string[], cwd: string = path): string =>
@@ -56,18 +72,18 @@ export function makeFixtureRepo(
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
   git(['init', '-b', 'main']);
-  onStep?.('git-init');
+  onStep?.('git-init', dir);
   writeFileSync(join(path, 'README.md'), `# ${name}\n\nFixture repository for dispatch-flow tests.\n`);
   mkdirSync(join(path, 'src'), { recursive: true });
   writeFileSync(join(path, 'src', 'main.ts'), 'export function answer(): number {\n  return 42;\n}\n');
-  onStep?.('seed-files');
+  onStep?.('seed-files', dir);
   // Historical two-process shape (restored 2026-10-02): `git commit --include .`
   // cannot stage untracked files on a fresh repository — it failed the 26e32a8
   // FULL with "pathspec '.' did not match any file(s) known to git" — so the
   // initial commit keeps `git add .` + `git commit` exactly as authored.
   git([...GIT_IDENTITY, 'add', '.']);
   git([...GIT_IDENTITY, 'commit', '-m', 'fixture: initial state']);
-  onStep?.('initial-commit');
+  onStep?.('initial-commit', dir);
   markFixtureStep(`fixture repo initialized: ${name}`);
 
   const repo: FixtureRepo = {

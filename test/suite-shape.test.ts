@@ -214,9 +214,11 @@ describe('suite shape', () => {
       expect(source, `${script}: Silas registration guard is stale`).toContain(`silas-driver.test.ts:${silasPin}`);
       if (script === 'formal-verdicts-r2-baseline.sh') {
         expect(source, 'R2 baseline filter omits the receipt-only consumer regression')
-          .toContain('uncredited receipt without its publication attempt');
+          .toContain('test/silas-driver.test.ts -t "native R2|uncredited receipt without its publication attempt"');
         expect(source, 'R2 baseline classifier omits the receipt-only consumer regression')
           .toContain('silas digest (the four actionable states) does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt');
+        expect(source, 'R2 baseline overlays the current helper and masks the fail-before behavior')
+          .toContain('git show "$base:src/dispatch/publication-evidence.ts"');
       }
     }
     const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');

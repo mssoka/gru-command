@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -1231,6 +1231,17 @@ describe('dispatch server (E8)', () => {
   it('refuses a clean-abort re-arm for an uncredited receipt without its publication attempt', async () => {
     const h = await boot();
     try {
+      let failedFixtureRoot: string | undefined;
+      expect(() => makeFixtureRepo('fixture-init-failure-cleanup', (step, tempDir) => {
+        if (step === 'git-init') {
+          failedFixtureRoot = tempDir;
+          throw new Error('controlled fixture initialization failure');
+        }
+      })).toThrow('controlled fixture initialization failure');
+      expect(failedFixtureRoot).toBeDefined();
+      if (failedFixtureRoot === undefined) throw new Error('fixture initialization probe did not expose its temp root');
+      expect(existsSync(failedFixtureRoot)).toBe(false);
+
       const repo = makeFixtureRepo('fixture-clean-abort-receipt-only');
       cleanupRepos.push(repo);
       attachBareOrigin(repo);
