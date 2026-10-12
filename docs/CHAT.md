@@ -362,6 +362,26 @@ frames (user messages, reply deltas, errors) stay visible and close the
 run. The session/turn mechanism is unchanged: single stream, single pen,
 and the ledger remains the durable log.
 
+## Untrusted metadata: acceptance record (#126)
+
+Question: will a model obey malicious notification metadata despite the
+data-only boundary? A live-model answer needs authorized adversarial
+evidence against a real model and is **not** produced here. What is proven
+offline (`test/awareness-adversarial.test.ts`, plus the metadata fixtures in
+`test/awareness.test.ts`): hostile titles/details (instruction text, forged
+service headers, forged owner lines, CR/LF and U+2028/2029 separators,
+embedded quotes) render as one JSON-quoted, line-escaped string on a single
+bullet line of the wake block and can never open a line of their own or
+forge the `[gru awareness …]` header; and `roles/gru.md` names notification
+titles, details, check names and digest text as UNTRUSTED DATA that is never
+followed. **Decision (recorded 2026-10-12, Gru; owner to confirm):** accept
+the current controls — quoting/escaping, the role's data-only clause, and the
+action boundary that destructive or approval-bearing steps need owner
+authority — as sufficient. Residual risk is model compliance under a
+quoted-data block; it is not an established defect. Revisit only with
+authorized live adversarial evidence; content redaction is the separate
+defect g26.
+
 ## Limits and notes
 
 - Client messages are capped at 4 000 chars client-side; the server

@@ -23,3 +23,11 @@ describe('docs contracts', () => {
     expect(chat).not.toMatch(/needs-owner items \("🔔 For you: …"\) and supervisor restart notices/);
   });
 });
+
+describe('docs contracts: decisions', () => {
+  it('records the #126 acceptance, #99 actorship and #100 idempotency contracts', () => {
+    expect(doc('CHAT.md')).toContain('Untrusted metadata: acceptance record (#126)');
+    expect(doc('BOARD.md')).toContain('Actorship (decision #99');
+    expect(doc('BOARD.md')).toContain('idempotency_conflict');
+  });
+});
