@@ -75,6 +75,15 @@ describe('publication re-arm guard', () => {
     expect(problem?.detail).toContain(TARGET);
   });
 
+  it('holds an uncredited receipt even when its publication-attempt marker is missing', () => {
+    const problem = pendingPublicationAttempt(ledgerWith([
+      { kind: PUBLICATION_RECEIPT_EVENT, seq: 1, payload: { ...attempt, receipt, credited: false, reason: 'recovered receipt' } },
+    ]), 'r1');
+    expect(problem?.kind).toBe('uncredited-receipt');
+    expect(problem?.detail).toContain('9001');
+    expect(problem?.detail).toContain(TARGET);
+  });
+
   it('holds an uncredited receipt as a provider write that must be reconciled first', () => {
     const problem = pendingPublicationAttempt(ledgerWith([
       { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },

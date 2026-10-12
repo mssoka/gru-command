@@ -172,3 +172,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-merge-authority-boundary.md`
   summary: The BMAD-onboarding rehearsal script still describes the fallback as "clear to merge" and Perkins as carrying "autonomous-merge authority".
   evidence: `scripts/rehearsal-bmad-onboarding.mjs:62-66` — repo-internal rehearsal harness (not shipped in the package, not session-reaching). The round-3 concluding review flagged it as a follow-up on untouched code; the shipped boundary (a fallback PASS is not a Perkins READY; no agent merges a PR) already governs real sessions.
+
+## Deferred from: post-integration tracked review of PR #289 (2026-10-12)
+
+- [Review][Defer] `captureFallbackInput` (`src/dispatch/perkins.ts`) runs `git reset -q --` after `git add -N .`; this can reset the caller's whole index (including staged-only content), and a partial `git add -N` failure may leave temporary intent-to-add entries. The exact code is already present at main `79c032e5` and unchanged by the task's PR-base diff, so it is outside this integration correction and remains an explicit follow-up, not fixed or dismissed as harmless. A separately authorized change should preserve/restore the caller's index and test staged-only content plus partial preparation failure.

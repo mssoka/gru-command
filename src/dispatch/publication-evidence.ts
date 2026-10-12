@@ -269,18 +269,18 @@ export function pendingPublicationAttempt(ledger: PublicationEvidenceReader, rou
       detail: `a provider delivery recorded on frozen head ${recorded.head}${recorded.reviewId === null ? '' : ` (review ${recorded.reviewId})`} was never credited; the frozen-commit write stays unresolved and no second same-head publication may be re-armed until it is reconciled`,
     };
   }
+  const receiptEvent = ledger.latestRoundEvent(roundId, PUBLICATION_RECEIPT_EVENT);
+  if (receiptEvent !== null) {
+    const evidence = parsePublicationReceiptEvidencePayload(receiptEvent.payload);
+    return {
+      kind: 'uncredited-receipt',
+      detail: `an uncredited provider receipt (review ${evidence?.receipt.reviewId ?? 'unknown'}) exists for frozen head ${evidence?.targetSha ?? 'unknown'}; reconcile it before re-arming a publication on the same head`,
+    };
+  }
   const attemptEvent = ledger.latestRoundEvent(roundId, PUBLICATION_ATTEMPT_EVENT);
   if (attemptEvent === null) return null;
   const attempt = parsePublicationAttemptPayload(attemptEvent.payload);
   const head = attempt?.targetSha ?? 'unknown';
-  const receiptEvent = ledger.latestRoundEvent(roundId, PUBLICATION_RECEIPT_EVENT);
-  if (receiptEvent !== null && receiptEvent.seq > attemptEvent.seq) {
-    const evidence = parsePublicationReceiptEvidencePayload(receiptEvent.payload);
-    return {
-      kind: 'uncredited-receipt',
-      detail: `an uncredited provider receipt (review ${evidence?.receipt.reviewId ?? 'unknown'}) exists for frozen head ${head}; reconcile it before re-arming a publication on the same head`,
-    };
-  }
   const absent = ledger.latestRoundEvent(roundId, PUBLICATION_ABSENT_EVENT);
   if (absent !== null && absent.seq > attemptEvent.seq && attempt !== null) {
     const evidence = parsePublicationAbsentPayload(absent.payload);

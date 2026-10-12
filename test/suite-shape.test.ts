@@ -156,7 +156,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'spec-rulings-drift.test.ts': 5,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 2,
+  'suite-shape.test.ts': 3,
   'supervisor.test.ts': 96,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 14,
@@ -176,7 +176,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'worktrees-server.test.ts': 8,
   'yield-report.test.ts': 43,
   'assert-formal-verdicts-baseline.test.ts': 5,
-  'publication-evidence.test.ts': 12,
+  'publication-evidence.test.ts': 13,
   'board-runtime-truth.test.ts': 14,
   'child-workers.test.ts': 30,
   'directive-markers.test.ts': 14,
@@ -201,6 +201,25 @@ describe('suite shape', () => {
     expect(workflow).toMatch(/- uses: actions\/checkout@v6\s*\n\s*- uses: actions\/setup-node@v6/);
     expect(workflow).not.toContain('github.event.pull_request.head.sha');
     expect(workflow).toContain('run: npm test');
+  });
+
+  it('keeps formal fail-before registration guards aligned with suite pins', () => {
+    const tools = join(import.meta.dirname, '..', 'tools');
+    const wavePin = PINS['perkins-builtin-wave.test.ts'];
+    const dispatchPin = PINS['dispatch-server.test.ts'];
+    const silasPin = PINS['silas-driver.test.ts'];
+    for (const script of ['formal-verdicts-r2-baseline.sh', 'formal-verdicts-r3-baseline.sh']) {
+      const source = readFileSync(join(tools, script), 'utf-8');
+      expect(source, `${script}: wave registration guard is stale`).toContain(`perkins-builtin-wave.test.ts:${wavePin}`);
+      expect(source, `${script}: Silas registration guard is stale`).toContain(`silas-driver.test.ts:${silasPin}`);
+    }
+    const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');
+    expect(r5, 'formal-verdicts-r5-baseline.sh: wave registration guard is stale').toContain(`perkins-builtin-wave.test.ts:${wavePin}`);
+    const r6 = readFileSync(join(tools, 'formal-verdicts-r6-baseline.sh'), 'utf-8');
+    expect(r6, 'formal-verdicts-r6-baseline.sh: dispatch registration guard is stale').toContain(`registered" != ${dispatchPin}`);
+    const rev3 = readFileSync(join(tools, 'formal-verdicts-rev3-baseline.sh'), 'utf-8');
+    expect(rev3, 'formal-verdicts-rev3-baseline.sh: dispatch registration guard is stale').toContain(`dispatch-server.test.ts:${dispatchPin}`);
+    expect(rev3, 'formal-verdicts-rev3-baseline.sh: Silas registration guard is stale').toContain(`silas-driver.test.ts:${silasPin}`);
   });
 
   it('every test file is pinned and registers exactly its expected test count', () => {
