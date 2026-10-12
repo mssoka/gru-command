@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { isGitHubRemote, isGitLabRemote } from '../review-path.js';
+import { repositoryGitEnv } from './artifacts.js';
 
 /**
  * Fresh-head freeze resolution (hotfix): a round that reviews a PR branch
@@ -69,6 +70,7 @@ function gitOutput(repoPath: string, args: readonly string[], gitBinary: string,
   const result = spawnSync(gitBinary, ['-C', repoPath, ...args], {
     encoding: 'utf8',
     timeout: timeoutMs,
+    env: repositoryGitEnv(false),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.error !== undefined) return { ok: false, stdout: '', detail: String(result.error) };

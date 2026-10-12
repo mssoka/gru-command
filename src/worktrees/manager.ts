@@ -16,6 +16,7 @@ import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
 import { applyWorktreeManifest, assertWorktreeBootstrapSupported, loadWorktreeManifest } from './manifest.js';
 import { redactedText } from '../decisions/questions.js';
+import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -279,7 +280,10 @@ function spawnGit(
     encoding: 'utf-8',
     maxBuffer: 16 * 1024 * 1024,
     ...(opts.timeoutMs !== undefined ? { timeout: opts.timeoutMs } : {}),
-    ...(opts.noPrompt === true ? { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } } : {}),
+    env: {
+      ...repositoryGitEnv(false),
+      ...(opts.noPrompt === true ? { GIT_TERMINAL_PROMPT: '0' } : {}),
+    },
   });
   return {
     status: result.status,

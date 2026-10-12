@@ -4,6 +4,7 @@ import { isJobTerminal, type JobStatus } from '../ledger/states.js';
 import { LIVE_DIRECTIVE_STATES, type DirectiveState } from '../ledger/directives.js';
 import type { WorkRevisionState } from '../review-inputs/amendments.js';
 import type { WorktreeLane } from './worktree-port.js';
+import { repositoryGitEnv } from './perkins-review/artifacts.js';
 
 /**
  * Branch-idle guard (proven 2026-09-23; cost: two wasted review rounds): a
@@ -214,7 +215,7 @@ export function branchNameForRef(repoPath: string | null, ref: string): string |
     const result = spawnSync(
       'git',
       ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref],
-      { encoding: 'utf-8', timeout: 10_000 },
+      { encoding: 'utf-8', timeout: 10_000, env: repositoryGitEnv(false) },
     );
     if (result.error !== undefined || result.status !== 0) return null;
     resolved = (result.stdout ?? '').trim();

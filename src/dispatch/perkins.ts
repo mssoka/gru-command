@@ -4544,6 +4544,7 @@ export class WaveRunner {
     const result = spawnSync('git', ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref], {
       encoding: 'utf-8',
       timeout: 30_000,
+      env: repositoryGitEnv(false),
     });
     const name = result.status === 0 ? (result.stdout ?? '').trim() : '';
     return name === '' ? null : name;
@@ -4557,6 +4558,7 @@ export class WaveRunner {
     const result = spawnSync('git', ['-C', repoPath, 'ls-remote', '--refs', 'origin', `refs/heads/${branch}`], {
       encoding: 'utf-8',
       timeout: 30_000,
+      env: repositoryGitEnv(false),
     });
     if (result.status !== 0) return true;
     return (result.stdout ?? '').trim() !== '';
