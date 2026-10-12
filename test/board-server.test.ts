@@ -1314,7 +1314,7 @@ describe('board server — report-handback decision signals (issue #314)', () =>
     } finally { await harness.close(); }
   });
 
-  async function resolveReport(decisionKind: 'acted' | 'dismissed'): Promise<void> {
+  async function rejectAttentionOnlyReportClosure(decisionKind: 'acted' | 'dismissed'): Promise<void> {
     const harness = await boot('report-signal-token');
     try {
       const jobId = `Review-${'A'.repeat(121)}`;
@@ -1328,15 +1328,19 @@ describe('board server — report-handback decision signals (issue #314)', () =>
         basis: item.basis, state: 'resolved', owner: 'gru', detail: 'Exact report attention accounted',
         references: [{ kind: 'decision', id: decision.id }],
       });
-      expect(resolved.status).toBe(200);
-      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'resolved' });
+      // GH-313 custody remains producer-owned until actual report settlement.
+      // GH-314 makes the full signal recordable, never grants closure authority.
+      expect(resolved.status).toBe(409);
+      expect(resolved.body).toMatchObject({ error: 'mailbox_conflict', detail: expect.stringContaining('producer-owned') });
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'needs-gru' });
+      expect(harness.api.getDecision(decision.id)).toEqual(decision);
       expect(harness.api.getJob(jobId)?.status).toBe('delivered');
-      expect(harness.api.findReportObligation(jobId)?.state).toBe('open');
+      expect(harness.api.findReportObligation(jobId)).toMatchObject({ state: 'open', settlement: null });
     } finally { await harness.close(); }
   }
 
-  it('an acted decision accounts long mixed-case report attention without settling its work', () => resolveReport('acted'));
-  it('a dismissed decision accounts long mixed-case report attention without settling its work', () => resolveReport('dismissed'));
+  it('an acted long mixed-case decision cannot bypass producer-owned report custody', () => rejectAttentionOnlyReportClosure('acted'));
+  it('a dismissed long mixed-case decision cannot bypass producer-owned report custody', () => rejectAttentionOnlyReportClosure('dismissed'));
 
   it('rejects malformed and oversized signals without persisting a decision', async () => {
     const harness = await boot('report-signal-token');
