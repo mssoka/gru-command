@@ -236,6 +236,14 @@ describe('suite shape', () => {
         expect(source, 'R2 baseline does not append the derived identity event')
           .toContain('"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"');
         const baselineLines = source.split(/\r?\n/u);
+        const baselineCodeLines = baselineLines.map((line) => line.trim())
+          .filter((line) => line !== '' && !line.startsWith('#'));
+        expect(baselineCodeLines.some((line) => line.includes('<<')), 'R2 baseline setup must not hide commands in a heredoc')
+          .toBe(false);
+        expect(baselineCodeLines.some((line) => /(?:^|[;&|])\s*(?:function(?:\s|$)|[A-Za-z_][A-Za-z0-9_]*\s*\(\)\s*(?:\{|$))/u.test(line)),
+          'R2 baseline setup commands must not be hidden in a function').toBe(false);
+        expect(baselineCodeLines.some((line) => /[;&|]\s*(?:if|for|while|until|case)\b/u.test(line)),
+          'R2 baseline setup must not open control flow after another same-line command').toBe(false);
         const uniqueExecutableLine = (command: string, label: string): number => {
           const matches = baselineLines.flatMap((line, index) => line.trim() === command ? [index] : []);
           expect(matches, `R2 baseline ${label} command must occur exactly once as a whole line`).toHaveLength(1);

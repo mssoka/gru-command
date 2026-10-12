@@ -1304,6 +1304,7 @@ describe('dispatch server (E8)', () => {
         status: 400,
         json: { error: 'bad_request', detail: expect.stringMatching(/uncredited provider receipt.*9003/u) },
       });
+      expect(field<string>(refused.json, 'detail')).toContain(`frozen head ${sha}`);
       expect(h.ledger.latestJobEvent(jobId, 'silas.review-triggered')).toBeNull();
       expect(h.ledger.listRounds(jobId)).toHaveLength(1);
     } finally { await h.close(); }
