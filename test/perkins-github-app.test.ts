@@ -1450,6 +1450,34 @@ describe('bounded ambiguous-POST reconciliation', () => {
     }
   });
 
+  it('accepts a bounded provider-quoted review id on an ambiguous POST — the same receipt as a numeric id, no second POST (#183)', async () => {
+    const fixture = bundleFixture();
+    const quoted = { ...MATCHING_REVIEW, id: '123' };
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [quoted] }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toEqual({ ...RECEIPT, reviewId: '123' });
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toEqual({ ...RECEIPT, reviewId: '123' });
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('keeps invalid review ids fail-closed: unproven on an ambiguous POST, never absence, no second POST (#183)', async () => {
+    for (const id of ['', 'has space', 'x'.repeat(201), '12/34']) {
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [{ ...MATCHING_REVIEW, id }] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '').not.toMatch(/did not land/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
+  });
+
   it('never credits an older round\u2019s identical bytes: stale submitted_at is not a match', async () => {
     const fixture = bundleFixture();
     const stale = { ...MATCHING_REVIEW, id: 111222, submitted_at: new Date(NOW - 3_600_000).toISOString() };

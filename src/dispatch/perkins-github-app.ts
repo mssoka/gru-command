@@ -593,7 +593,10 @@ function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
   const record = entry as Record<string, unknown>;
   const id = record['id'];
-  if (typeof id !== 'number' || !Number.isFinite(id)) return false;
+  // The same id contract the receipt uses: a finite number, or a bounded
+  // provider-quoted id (so a quoted-id match is decidable and creditable).
+  // Any other string stays malformed and never proves absence.
+  if (!(typeof id === 'number' && Number.isFinite(id)) && !(typeof id === 'string' && usableProviderReviewId(id) !== null)) return false;
   if (!('user' in record)) return false;
   const user = record['user'];
   if (user !== null) {
