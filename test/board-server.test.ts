@@ -1314,7 +1314,7 @@ describe('board server — report-handback decision signals (issue #314)', () =>
     } finally { await harness.close(); }
   });
 
-  async function resolveReport(decisionKind: 'acted' | 'dismissed'): Promise<void> {
+  async function rejectAttentionOnlyReportClosure(decisionKind: 'acted' | 'dismissed'): Promise<void> {
     const harness = await boot('report-signal-token');
     try {
       const jobId = `Review-${'A'.repeat(121)}`;
@@ -1337,12 +1337,12 @@ describe('board server — report-handback decision signals (issue #314)', () =>
       expect(harness.api.getDecision(decision.id)).toEqual(decision);
       expect(harness.api.getNotification(notificationId)).toMatchObject({ ackedAt: null, resolvedAt: null });
       expect(harness.api.getJob(jobId)?.status).toBe('delivered');
-      expect(harness.api.findReportObligation(jobId)?.state).toBe('open');
+      expect(harness.api.findReportObligation(jobId)).toMatchObject({ state: 'open', settlement: null });
     } finally { await harness.close(); }
   }
 
-  it('an acted long mixed-case decision cannot close producer-owned report custody', () => resolveReport('acted'));
-  it('a dismissed long mixed-case decision cannot close producer-owned report custody', () => resolveReport('dismissed'));
+  it('an acted long mixed-case decision cannot close producer-owned report custody', () => rejectAttentionOnlyReportClosure('acted'));
+  it('a dismissed long mixed-case decision cannot close producer-owned report custody', () => rejectAttentionOnlyReportClosure('dismissed'));
 
   it('rejects malformed and oversized signals without persisting a decision', async () => {
     const harness = await boot('report-signal-token');
