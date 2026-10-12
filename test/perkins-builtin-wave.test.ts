@@ -6420,7 +6420,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     }
   });
 
-  it.each(['disposed', 'error'] as const)('keeps the first diagnosed %s terminal error when the held prompt rejects late during retry settlement (#176)', async (terminal) => {
+  async function fallbackCase1(terminal: 'disposed' | 'error'): Promise<void> {
     let rejectPrompt!: (reason: Error) => void;
     const hold = { release: new Promise<void>((_resolve, reject) => { rejectPrompt = reject; }) };
     let state: 'idle' | 'disposed' | 'error' = 'idle';
@@ -6460,12 +6460,12 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       rmSync(h.artifacts, { recursive: true, force: true });
       rmSync(h.sessions, { recursive: true, force: true });
     }
-  });
+  }
+  it('keeps the first diagnosed disposed terminal error when the held prompt rejects late during retry settlement (#176)', () => fallbackCase1('disposed'));
+  it('keeps the first diagnosed error terminal error when the held prompt rejects late during retry settlement (#176)', () => fallbackCase1('error'));
 
-  it.each([
-    ['before', false],
-    ['after', true],
-  ] as const)('explicit abort %s an expired wait slice reports cancellation, disposes the session and leaves no timer or still-running event (#177)', async (_when, afterSlice) => {
+
+  async function abortDuringWait(afterSlice: boolean): Promise<void> {
     const hold = { release: new Promise<void>(() => {}) };
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold, workerGate: gate });
@@ -6503,9 +6503,11 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       rmSync(h.artifacts, { recursive: true, force: true });
       rmSync(h.sessions, { recursive: true, force: true });
     }
-  });
+  }
+  it('explicit abort before an expired wait slice reports cancellation, disposes the session and leaves no timer or still-running event (#177)', () => abortDuringWait(false));
+  it('explicit abort after an expired wait slice reports cancellation, disposes the session and leaves no timer or still-running event (#177)', () => abortDuringWait(true));
 
-  it.each(['blocked', 'parked'] as const)('a direct fallback gate moved to %s while its reviewer is held never passes (#186)', async (status) => {
+  async function holdCase1(status: 'blocked' | 'parked'): Promise<void> {
     let release!: () => void;
     const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
     const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
@@ -6519,9 +6521,11 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     expect(outcome.note).toContain(`is ${status}`);
     expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
     expect(h.disposed).toHaveLength(1);
-  });
+  }
+  it('a direct fallback gate moved to blocked while its reviewer is held never passes (#186)', () => holdCase1('blocked'));
+  it('a direct fallback gate moved to parked while its reviewer is held never passes (#186)', () => holdCase1('parked'));
 
-  it.each(['blocked', 'parked'] as const)('a force flag does not waive a %s revocation while the reviewer is held (#186)', async (status) => {
+  async function holdCase2(status: 'blocked' | 'parked'): Promise<void> {
     let release!: () => void;
     const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
     const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
@@ -6533,15 +6537,19 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     if (!('route' in outcome)) throw new Error('expected fallback route');
     expect(outcome.clearToMerge).toBe(false);
     expect(outcome.note).toContain(`is ${status}`);
-  });
+  }
+  it('a force flag does not waive a blocked revocation while the reviewer is held (#186)', () => holdCase2('blocked'));
+  it('a force flag does not waive a parked revocation while the reviewer is held (#186)', () => holdCase2('parked'));
 
-  it.each(['blocked', 'parked'] as const)('a direct fallback request on a %s job is refused at round intake before any reviewer spawns (#186)', async (status) => {
+  async function holdCase3(status: 'blocked' | 'parked'): Promise<void> {
     const h = await makeProductionGateHarness({ findingToWrite: [] });
     h.ledger.setJobStatus(h.job.id, status);
     await expect(h.wave.runRound({ jobId: h.job.id })).rejects.toThrow(`is ${status}`);
     expect(h.spawnCwds).toEqual([]);
     expect(h.prompts).toEqual([]);
-  });
+  }
+  it('a direct fallback request on a blocked job is refused at round intake before any reviewer spawns (#186)', () => holdCase3('blocked'));
+  it('a direct fallback request on a parked job is refused at round intake before any reviewer spawns (#186)', () => holdCase3('parked'));
 
   it('an unchanged review-eligible direct gate with a held reviewer still passes (#186 control)', async () => {
     let release!: () => void;
