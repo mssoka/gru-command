@@ -375,6 +375,13 @@ verification budget.
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
   wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for
   other runners.
+- **Compatible gates reuse one build.** A declared `npm run build` step
+  may be satisfied by the immediately preceding successful build in the
+  same lane when head, clean tree, configuration, environment and the
+  whole `dist/` tree digest are all unchanged — every other step still
+  runs and is reported. A second gate that arrives while that lane's
+  build is in flight never inherits it (`build-in-flight`) and runs its
+  own build.
 - **Project harness budgets compose with the run budget.** A repo may
   classify process-heavy integration files with their own finite ceilings
   and a smaller worker cap (gru-command: 120s and two workers, see
