@@ -5,6 +5,10 @@ command = "npm ci"
 [verify]
 full = "npm test"
 typecheck = "npm run typecheck"
+# GH-302: exact baseline dismissals must not hide corrective verification debt.
+corrective-debt-red = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/silas-verification-debt.test.ts --testNamePattern 'keeps one verification owed'"
+corrective-debt = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/silas-verification-debt.test.ts test/silas-driver.test.ts test/review-supersession.test.ts test/ledger-api.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
+corrective-debt-baseline = 'set -e; root="$PWD"; base=4590bea60ab55b9120e8d1a9e9528db938438fc4; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gh302-baseline.XXXXXX"); git archive "$base" | tar -x -C "$d"; cp test/silas-verification-debt.test.ts "$d/test/silas-verification-debt.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GH302 baseline source=%s current=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run test/silas-verification-debt.test.ts --testNamePattern "keeps one verification owed"'
 # GH-313 report custody: focused and fail-before scopes use the authenticated scheduler.
 report-handback = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/report-handback-mailbox.test.ts test/gru-mailbox.test.ts test/awareness.test.ts test/durable-reconcile.test.ts test/incident.test.ts test/ledger-obligations.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 report-handback-red = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/report-handback-mailbox.test.ts"
