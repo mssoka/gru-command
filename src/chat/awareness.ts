@@ -1714,7 +1714,13 @@ export class GruAwareness {
     if (actionCount > 0) push(`- actions: ${boardActions.length >= 101 || resolutions.length >= 101 ? '100+' : actionCount} board event${actionCount === 1 ? '' : 's'}`);
     const latestDisposition = resolutions.find((event) => payloadOf(event)['by'] === 'gru');
     if (latestDisposition !== undefined) {
-      push(clampLine(`- Gru disposition [${textOf(payloadOf(latestDisposition)['id']) ?? '?'}]: ${textOf(payloadOf(latestDisposition)['detail']) ?? 'no detail recorded'}`, this.limits.maxLineChars));
+      const disposition = payloadOf(latestDisposition);
+      // #99: `by: 'gru'` names the disposition ROLE, not a proven actor — the
+      // board's shared bearer can speak for owner or agent alike. Surface the
+      // role and any caller-declared actor rather than over-claiming "Gru".
+      const declared = textOf(disposition['declaredActor']);
+      const actor = declared !== null ? ` (declared actor: ${declared})` : '';
+      push(clampLine(`- Machine disposition [${textOf(disposition['id']) ?? '?'}]: ${textOf(disposition['detail']) ?? 'no detail recorded'}${actor}`, this.limits.maxLineChars));
     }
     const jobs = this.ledger.listJobs();
     const list = (ids: readonly string[]): string =>
