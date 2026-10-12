@@ -951,6 +951,9 @@ export interface SourceMovement {
   /** A killed git step would not stop: never retried; escalated naming its
    * process group (owner decision 2026-10-08). */
   readonly cleanupUnconfirmed?: true;
+  /** The unconfirmed step's process group id, structured so it survives
+   * any cut of the detail text. */
+  readonly processGroup?: number;
   /** Proof the failed step's whole process group stopped (owned execution,
    * R7-7): only such a failure may be retried. */
   readonly stopped?: true;
@@ -965,8 +968,13 @@ function isUnstopped(error: unknown): boolean {
  * provably stopped, that proof. */
 function failedCheck(error: unknown): SourceMovement {
   const failed = movement('check-failed', gitErrorDetail(error));
-  const facts = error as { cleanupUnconfirmed?: unknown; ownedStopped?: unknown } | null;
-  if (facts?.cleanupUnconfirmed === true) return { ...failed, cleanupUnconfirmed: true };
+  const facts = error as { cleanupUnconfirmed?: unknown; ownedStopped?: unknown; pgid?: unknown } | null;
+  if (facts?.cleanupUnconfirmed === true) {
+    return {
+      ...failed, cleanupUnconfirmed: true,
+      ...(typeof facts.pgid === 'number' && Number.isSafeInteger(facts.pgid) ? { processGroup: facts.pgid } : {}),
+    };
+  }
   return facts?.ownedStopped === true ? { ...failed, stopped: true } : failed;
 }
 
