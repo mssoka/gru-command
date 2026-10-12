@@ -1590,6 +1590,51 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     }
   });
 
+  it('bounds stalled managed-root validation and resumes on a later refresh', async () => {
+    vi.useFakeTimers();
+    const api = new FakeApi();
+    const clock = { ms: T0 };
+    const rootAttempts: string[] = [];
+    let alphaStalls = true;
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: ['alpha', 'beta'],
+      api,
+      intervalMs: 0,
+      now: () => clock.ms,
+      sleep: async () => {},
+      resolveRepoPath: (_workspaceRoot, name) => {
+        rootAttempts.push(name);
+        return name === 'alpha' && alphaStalls
+          ? new Promise(() => {})
+          : { kind: 'available', path: `/ws/${name}` };
+      },
+      resolveRemote: async (path) => githubRef(path.split('/').at(-1) as string),
+    });
+    try {
+      const completes = tracker.refresh().then((view) => ({ kind: 'completed' as const, view }));
+      const guard = new Promise<{ kind: 'guard' }>((resolve) => {
+        setTimeout(() => resolve({ kind: 'guard' }), REPO_OVERVIEW_RESOLVE_BUDGET_MS * 2);
+      });
+      const outcomePromise = Promise.race([completes, guard]);
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS * 2);
+      const outcome = await outcomePromise;
+      expect(outcome.kind).toBe('completed');
+      if (outcome.kind !== 'completed') return;
+      expect(row(outcome.view, 'alpha').error).toContain('root validation exceeded the origin-resolution budget');
+      expect(api.calls).toHaveLength(0);
+
+      alphaStalls = false;
+      const recovered = await tracker.refresh();
+      expect(rootAttempts.slice(1, 3)).toEqual(['beta', 'alpha']);
+      expect(row(recovered, 'alpha').linked).toBe(true);
+      expect(row(recovered, 'beta').linked).toBe(true);
+      expect(api.calls.length).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('coordinates root validation and provider cursors so joint budgets eventually observe every selected root', async () => {
     const names = Array.from({ length: 60 }, (_value, index) => `repo-${String(index).padStart(2, '0')}`);
     const api = new FakeApi();

@@ -104,11 +104,15 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
   }, 90_000);
 
-  it('installer defaults exclude unsupported names and unusable Git roots', () => {
+  it('installer defaults exclude unsupported names, unusable Git roots, and root-probe errors', () => {
     const workspace = fixtureWorkspace();
     const invalid = join(workspace, 'repo*');
     mkdirSync(invalid);
     execFileSync('git', ['-C', invalid, 'init', '-q']);
+    const probeError = join(workspace, 'repo-bad-config');
+    mkdirSync(probeError);
+    execFileSync('git', ['-C', probeError, 'init', '-q']);
+    writeFileSync(join(probeError, '.git', 'config'), '[core\n');
     const stale = join(workspace, 'repo-stale');
     mkdirSync(stale);
     writeFileSync(join(stale, '.git'), 'gitdir: ../missing-worktree\n');
@@ -127,6 +131,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(status, output).toBe(0);
     expect(output).toContain('"repo*": must not contain wildcard characters');
     expect(output).toContain('"repo-stale": .git does not identify this exact usable repository root');
+    expect(output).toContain('Git repository entries excluded from installer choices because Git root validation failed:');
+    expect(output).toContain('"repo-bad-config": Git root probe failed');
     expect(output).toContain('repo\\\\u{1b}[31m');
     expect(output).toContain('repo\\\\u{202e}hidden');
     expect(output).toContain('Managed repositories selected: repo-a, repo-b');
