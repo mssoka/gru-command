@@ -1,6 +1,7 @@
 import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
 import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { readGitState } from '../verify/scheduler.js';
@@ -414,6 +415,34 @@ export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number];
 const PRODUCER_RESOLVED_KINDS: Readonly<Record<string, string>> = {
   'lessons.dream-failed': 'a completed dream pass',
 };
+
+// The alias d is an immutable delivery. A protected root must cite its
+// complete original bytes and a genuinely settled native row/duty. Binding
+// and identity object key order cannot hide a candidacy refusal.
+const ORIGINAL_NATIVE_GATE_DEBT_SQL = `EXISTS (SELECT 1 FROM events r
+  WHERE r.job_id = d.job_id AND r.kind = 'silas.directive-current-gates-owed' AND r.seq > d.seq
+    AND json_extract(r.payload, '$.root_kind') = 'original-native-completion' AND json_extract(r.payload, '$.delivery_seq') = d.seq
+    AND json_extract(r.payload, '$.request_id') = json_extract(d.payload, '$.request_id')
+    AND json_extract(r.payload, '$.native_completion') = d.payload
+    AND json_extract(r.payload, '$.sha') IS json_extract(d.payload, '$.sha')
+    AND EXISTS (SELECT 1 FROM pending_directives p JOIN job_obligations o ON o.id = json_extract(r.payload, '$.obligation_id')
+      WHERE p.request_id = json_extract(r.payload, '$.request_id') AND p.job_id = d.job_id AND p.delivery_seq = d.seq AND p.state = 'settled'
+        AND p.native_binding IS NOT NULL AND p.payload_hash = json_extract(r.payload, '$.identity.payloadHash')
+        AND p.contract_sha256 = json_extract(r.payload, '$.identity.contractSha256') AND p.work_revision = json_extract(r.payload, '$.identity.workRevision')
+        AND p.authority_epoch = json_extract(r.payload, '$.identity.authorityEpoch') AND p.job_id = json_extract(r.payload, '$.identity.jobId')
+        AND p.request_id = json_extract(r.payload, '$.identity.requestId')
+        AND o.job_id = d.job_id AND o.incident_key = 'directive-current-gates:' || p.request_id AND o.generation = json_extract(r.payload, '$.generation')
+        AND o.first_origin_seq = d.seq AND o.next_action = json_extract(r.payload, '$.next_action')))`;
+
+// A modern delivery requires the ledger's independently checked settlement
+// decision. Later obligation generations cannot turn a rejected publisher
+// flag into eligibility. Old/missing modern decisions remain unproven.
+const UNPROVEN_NATIVE_CANDIDATE_SQL = `EXISTS (SELECT 1 FROM pending_directives p WHERE p.job_id = d.job_id
+  AND p.request_id = json_extract(d.payload, '$.request_id') AND p.request_kind IS NOT NULL
+  AND (p.state != 'settled' OR p.delivery_seq IS NOT d.seq OR COALESCE((SELECT json_extract(s.payload, '$.candidate_delivery_proven')
+    FROM events s WHERE s.job_id = d.job_id AND s.kind = 'silas.directive-settled'
+      AND json_extract(s.payload, '$.request_id') = p.request_id AND json_extract(s.payload, '$.delivery_seq') = d.seq
+    ORDER BY s.seq DESC LIMIT 1), 0) != 1))`;
 
 /** What closes a producer-resolved alert kind, or null for any other kind. */
 export function producerResolvedBy(kind: string): string | null {
@@ -1038,6 +1067,8 @@ export class LedgerApi {
     lens?: string | null;
     payload?: unknown;
   }): BusEvent {
+    if (fields.kind === 'silas.directive-settled' && typeof fields.payload === 'object' && fields.payload !== null &&
+        Object.hasOwn(fields.payload, 'candidate_delivery_proven')) this.assertNativeSettlementCandidate(fields.jobId ?? null, fields.payload as Record<string, unknown>);
     const ts = nowIso();
     const info = this.db
       .prepare(
@@ -2362,19 +2393,11 @@ export class LedgerApi {
    * Only freshness/revision projections exclude it. */
   private latestDeliveryForGates(jobId: string, candidateOnly: boolean): EventRecord | null {
     const row = this.db.prepare(`SELECT d.* FROM events d WHERE d.job_id = ? AND d.kind = 'job.delivered'
-      AND (? = 0 OR COALESCE(json_extract(d.payload, '$.candidate_delivery_proven'), 1) != 0) AND NOT (
-      COALESCE(json_extract(d.payload, '$.historical_bookkeeping_only'), 0) = 1 AND EXISTS (SELECT 1 FROM events r
-        WHERE r.job_id = d.job_id AND r.kind = 'silas.directive-current-gates-owed' AND r.seq > d.seq
-          AND json_extract(r.payload, '$.root_kind') = 'original-native-completion' AND json_extract(r.payload, '$.delivery_seq') = d.seq
-          AND json_extract(r.payload, '$.request_id') = json_extract(d.payload, '$.request_id')
-          AND json_extract(r.payload, '$.identity') = json_extract(d.payload, '$.native_completion.identity')
-          AND json_extract(r.payload, '$.sha') IS json_extract(d.payload, '$.sha')
-          AND EXISTS (SELECT 1 FROM pending_directives p JOIN job_obligations o ON o.id = json_extract(r.payload, '$.obligation_id')
-            WHERE p.request_id = json_extract(r.payload, '$.request_id') AND p.job_id = d.job_id AND p.delivery_seq = d.seq AND p.state = 'settled'
-              AND p.native_binding = json_extract(d.payload, '$.native_completion.binding') AND p.payload_hash = json_extract(r.payload, '$.identity.payloadHash')
-              AND p.contract_sha256 = json_extract(r.payload, '$.identity.contractSha256') AND p.work_revision = json_extract(r.payload, '$.identity.workRevision')
-              AND o.job_id = d.job_id AND o.incident_key = 'directive-current-gates:' || p.request_id AND o.generation = json_extract(r.payload, '$.generation')
-              AND o.first_origin_seq = d.seq AND o.next_action = json_extract(r.payload, '$.next_action')))) ORDER BY d.seq DESC LIMIT 1`).get(jobId, candidateOnly ? 1 : 0) as Row | undefined;
+      AND (? = 0 OR COALESCE(json_extract(d.payload, '$.candidate_delivery_proven'), 1) != 0)
+      AND (? = 0 OR NOT ${UNPROVEN_NATIVE_CANDIDATE_SQL})
+      AND NOT ((? = 1 OR COALESCE(json_extract(d.payload, '$.historical_bookkeeping_only'), 0) = 1)
+        AND ${ORIGINAL_NATIVE_GATE_DEBT_SQL}) ORDER BY d.seq DESC LIMIT 1`)
+      .get(jobId, candidateOnly ? 1 : 0, candidateOnly ? 1 : 0, candidateOnly ? 1 : 0) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -2391,7 +2414,7 @@ export class LedgerApi {
     const newest = this.latestDeliveryForGates(jobId, false);
     if (newest === null) return null;
     const native = (typeof newest.payload === 'object' && newest.payload !== null ? newest.payload : {}) as { candidate_delivery_proven?: unknown; work_revision?: unknown };
-    if (native.candidate_delivery_proven === false) {
+    if (native.candidate_delivery_proven === false || this.db.prepare(`SELECT 1 FROM events d WHERE d.seq = ? AND (${ORIGINAL_NATIVE_GATE_DEBT_SQL} OR ${UNPROVEN_NATIVE_CANDIDATE_SQL})`).get(newest.seq) !== undefined) {
       // Historical completion is a fact, not candidate authority. A later
       // proven current delivery must identify the candidate before review.
       return { revision: typeof native.work_revision === 'number' ? native.work_revision : 0, head: null };
@@ -5594,7 +5617,9 @@ export class LedgerApi {
     const originalProof = inspectDirectiveCheckpoint(original!.nativeTarget!.sessionFile, origin.identity);
     const originalCompletion = originalProof.state === 'terminal' && originalProof.ok ? readDirectiveCompletion(original!.nativeTarget!.sessionFile, origin.identity, originalProof.checkpointId) : null;
     const physical = inspectDirectiveProducers(original!.nativeTarget!.sessionFile, origin.identity);
-    if (originalCompletion === null || originalCompletion.head !== origin.sha || !(originalProof.state === 'terminal' && isDeepStrictEqual(originalProof.binding, original!.nativeBinding)) || physical.length === 0 || physical.some(({ evidence }) => evidence !== 'ceased') || physical.some(({ producer }) => directiveProducerLockBlocker(producer) !== null)) refuse('original proof or physical ownership remains UNKNOWN');
+    if ((originalCompletion?.head ?? null) !== origin.sha || !(originalProof.state === 'terminal' && originalProof.ok && isDeepStrictEqual(originalProof.binding, original!.nativeBinding)) ||
+        !physical.some(({ producer }) => isDeepStrictEqual(producer.identity, origin.identity) && producer.agentId === original!.nativeBinding!.agentId && producer.sessionId === original!.nativeBinding!.sessionId) ||
+        physical.some(({ evidence, producer }) => evidence === 'unknown' || directiveProducerLockBlocker(producer) !== null)) refuse('original proof or physical ownership remains UNKNOWN');
     const candidate = this.latestCandidateDelivery(row.jobId);
     const facts = candidate?.payload as { sha?: unknown; work_revision?: unknown; candidate_delivery_proven?: unknown; native_completion?: { identity?: DirectiveTurnIdentity; binding?: unknown } } | undefined;
     const identity = facts?.native_completion?.identity;
@@ -5608,8 +5633,8 @@ export class LedgerApi {
         const fields = event.payload as { producer_start_seq?: number; producer_identity?: unknown; native_producer?: unknown };
         const start = fields.producer_start_seq === undefined ? null : this.getEvent(fields.producer_start_seq);
         return start?.kind === 'silas.directive-producer-started' && start.jobId === row.jobId && start.seq < event.seq &&
-          isDeepStrictEqual(fields.producer_identity, origin.identity) && isDeepStrictEqual(fields.native_producer, originalCompletion!.producer) &&
-          isDeepStrictEqual((start.payload as { native_producer?: unknown }).native_producer, originalCompletion!.producer);
+          isDeepStrictEqual(fields.producer_identity, origin.identity) && physical.some(({ producer }) => isDeepStrictEqual(producer.identity, origin.identity) && isDeepStrictEqual(fields.native_producer, producer) &&
+            isDeepStrictEqual((start.payload as { native_producer?: unknown }).native_producer, producer));
       });
       const anchor = Math.min(root!.seq, originalCeased?.seq ?? root!.seq);
       if (current!.baselineSeq < anchor || current!.admissionSeq === null || current!.admissionSeq <= anchor) refuse('current native acceptance does not establish original-to-current causal chronology');
@@ -8171,9 +8196,11 @@ export class LedgerApi {
       const proof = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, identity);
       if (proof.state !== 'terminal' || !proof.ok || !isDeepStrictEqual(proof.binding, row.nativeBinding)) throw new DirectiveCheckpointError('historical completion requires exact original successful native ancestry');
       const completion = readDirectiveCompletion(row.nativeTarget.sessionFile, identity, proof.checkpointId);
-      if (completion === null) throw new DirectiveCheckpointError('original native completion HEAD receipt is unavailable; absence is not proof');
       const physical = inspectDirectiveProducers(row.nativeTarget.sessionFile);
-      if (!physical.some(({ producer }) => isDeepStrictEqual(producer, completion.producer)) || physical.some(({ evidence }) => evidence === 'unknown')) throw new DirectiveCheckpointError('historical completion original physical receipt is unbound or UNKNOWN');
+      const owners = physical.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
+      if (owners.length === 0 || owners.some(({ producer }) => producer.agentId !== proof.binding.agentId || producer.sessionId !== proof.binding.sessionId) ||
+          completion !== null && !owners.some(({ producer }) => isDeepStrictEqual(producer, completion.producer)) ||
+          physical.some(({ evidence, producer }) => evidence === 'unknown' || directiveProducerLockBlocker(producer) !== null)) throw new DirectiveCheckpointError('historical completion original physical receipt is unbound or UNKNOWN');
       for (const { producer } of physical) {
         const association = readDirectiveBinding(row.nativeTarget.sessionFile, producer.identity.requestId);
         const checkpoint = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, producer.identity);
@@ -8186,15 +8213,64 @@ export class LedgerApi {
         ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
       } });
       const delivery = this.appendEvent({ kind: 'job.delivered', jobId: row.jobId, agentId: proof.binding.agentId,
-        payload: { request_id: row.requestId, agentId: proof.binding.agentId, source: row.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive', sha: completion.head,
+        payload: { request_id: row.requestId, agentId: proof.binding.agentId, source: row.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive', sha: completion?.head ?? null,
           work_revision: identity.workRevision, candidate_delivery_proven: false, historical_bookkeeping_only: true, ...(phase === null ? {} : { phase_id: phase.phaseId }),
           native_completion: { identity, checkpoint_id: proof.checkpointId, binding: proof.binding, receipt: completion, physical_cessation: physical } } });
-      const duty = this.preserveParkedRecoveryDebt(this.recordBlockedObservation(row.jobId, { logicalStep: 'verification', incidentKey: `directive-current-gates:${row.requestId}`,
-        observedAtSeq: delivery.seq, category: { kind: 'known', category: 'restart-recovery' }, nextAction: { kind: 'gru-decision', decision: `Original native request ${row.requestId} completed accepted identity ${JSON.stringify(identity)} at recorded HEAD ${completion.head ?? 'UNPROVEN/null'}, historical delivery ${delivery.seq}. Current approved inputs ${JSON.stringify(authority)} still require a genuine current candidate and existing POST /api/verify declared full gate plus POST /api/dispatch/review actual complete whole-change review. Historical completion is neither current delivery authority nor PASS/READY.` } }));
-      this.appendEvent({ kind: 'silas.directive-current-gates-owed', jobId: row.jobId, payload: { root_kind: 'original-native-completion', request_id: row.requestId,
-        identity, delivery_seq: delivery.seq, sha: completion.head, native_completion: delivery.payload, obligation_id: duty.id, generation: duty.generation, next_action: duty.nextAction } });
+      this.retainOriginalNativeGateDebt(row, delivery, 'current authority is changed or parked');
       return this.recordDirectiveDelivery({ requestId: row.requestId, eventSeq: delivery.seq });
     });
+  }
+
+  private retainOriginalNativeGateDebt(row: DirectiveRequestRecord, delivery: EventRecord | BusEvent, reason: string): void {
+    const identity = this.directiveTurnIdentity(row.requestId);
+    const authority = this.directiveCurrentAuthority(row.jobId);
+    const sha = (delivery.payload as { sha: string | null }).sha;
+    const duty = this.preserveParkedRecoveryDebt(this.recordBlockedObservation(row.jobId, { logicalStep: 'verification', incidentKey: `directive-current-gates:${row.requestId}`,
+      observedAtSeq: delivery.seq, category: { kind: 'known', category: 'restart-recovery' }, nextAction: { kind: 'gru-decision', decision: `Original native request ${row.requestId} completed accepted identity ${JSON.stringify(identity)} at recorded HEAD ${sha ?? 'UNPROVEN/null'}, original delivery ${delivery.seq}. Current candidacy is unproven: ${reason}. Current approved inputs ${JSON.stringify(authority)} still require a genuine current candidate and existing POST /api/verify declared full gate plus POST /api/dispatch/review actual complete whole-change review. Historical completion is neither current delivery authority nor PASS/READY.` } }));
+    this.appendEvent({ kind: 'silas.directive-current-gates-owed', jobId: row.jobId, payload: { root_kind: 'original-native-completion', request_id: row.requestId,
+      identity, delivery_seq: delivery.seq, sha, native_completion: delivery.payload, obligation_id: duty.id, generation: duty.generation, next_action: duty.nextAction } });
+  }
+
+  /** Original completion is already proven separately. Current eligibility
+   * is established here, never by the publisher's positive flag. */
+  private nativeCandidateRefusal(row: DirectiveRequestRecord, payload: Record<string, unknown>): string | null {
+    try {
+      this.assertDirectiveAuthority(this.directiveTurnIdentity(row.requestId));
+      if (payload['historical_bookkeeping_only'] === true) return 'publisher retained historical-only bookkeeping';
+      const binding = row.nativeBinding!;
+      const header = readDirectiveSessionHeader(binding.sessionFile);
+      const lanes = this.listWorktrees({ jobId: row.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+      if (lanes.length !== 1 || header.type !== 'session' || header.id !== binding.sessionId || header.cwd !== lanes[0]!.path) return 'original native session/cwd does not bind the unique current original lane';
+      const lane = lanes[0]!;
+      const own = new Set([`directive ${row.requestId}`, `directive recovery ${row.requestId}`, `rebrief ${row.requestId}`]);
+      const blockers = this.directiveRetirementBlockers(row, lane.id).filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
+      const reservations = this.listJobAdmissions(row.jobId).filter((kind) => !own.has(kind));
+      if (blockers.length + reservations.length > 0) return `current producer fences: ${[...blockers, ...reservations].join('; ')}`;
+      const git = readGitState(lane.path);
+      if (git.sha === null || git.sha !== payload['sha'] || git.trackedDirty) return 'current original lane HEAD is different, dirty or unproven';
+      const branch = execFileSync('git', ['-C', lane.path, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim();
+      if (lane.branch === null || branch !== lane.branch) return 'current branch differs from the original registered lane';
+      return null;
+    } catch (error) { return `current original-lane/authority inspection refused: ${String(error)}`; }
+  }
+
+  /** Custom event writers cannot forge a positive settlement decision or
+   * retrospectively upgrade a completed original request. This guard also
+   * protects the internal append path, not just one public facade. */
+  private assertNativeSettlementCandidate(jobId: string | null, facts: Record<string, unknown>): void {
+    const row = typeof facts['request_id'] === 'string' ? this.getDirective(facts['request_id']) : null;
+    const delivery = Number.isSafeInteger(facts['delivery_seq']) ? this.getEvent(Number(facts['delivery_seq'])) : null;
+    if (row === null || row.state !== 'admitted' || row.requestKind === null || row.jobId !== jobId ||
+        delivery?.kind !== 'job.delivered' || delivery.jobId !== jobId || typeof facts['candidate_delivery_proven'] !== 'boolean') {
+      throw new DirectiveCheckpointError('native settlement candidacy requires its exact original admitted delivery; completed history cannot be upgraded');
+    }
+    const payload = delivery.payload as Record<string, unknown>;
+    if (payload['request_id'] !== row.requestId || payload['work_revision'] !== row.workRevision || payload['agentId'] !== row.nativeBinding?.agentId ||
+        row.admissionSeq === null || delivery.seq <= row.admissionSeq) throw new DirectiveCheckpointError('native settlement candidate receipt has foreign original bindings');
+    this.assertNativeDirectiveDelivery(row, payload);
+    if (facts['candidate_delivery_proven'] && (payload['candidate_delivery_proven'] !== true || this.nativeCandidateRefusal(row, payload) !== null)) {
+      throw new DirectiveCheckpointError('native settlement candidacy lacks independently proven current original-lane/HEAD/authority');
+    }
   }
 
   private assertNativeDirectiveDelivery(row: DirectiveRequestRecord, payload: Record<string, unknown>): void {
@@ -8259,10 +8335,21 @@ export class LedgerApi {
       if (payload['request_id'] !== input.requestId) {
         throw new Error(`delivery for "${input.requestId}" cites an event whose payload is not correlated to this request`);
       }
+      let candidateProven = false;
       if (row.requestKind !== null) {
         if (payload['work_revision'] !== row.workRevision || payload['agentId'] !== row.nativeBinding?.agentId) throw new DirectiveCheckpointError('original delivery revision/minion identity differs from accepted native admission');
         this.assertNativeDirectiveDelivery(row, payload);
+        if (payload['candidate_delivery_proven'] === true) {
+          const reason = this.nativeCandidateRefusal(row, payload);
+          candidateProven = reason === null;
+          if (reason !== null) this.retainOriginalNativeGateDebt(row, event, reason);
+        }
       }
+      // Durable action marker and, for modern requests, the independently
+      // checked candidacy decision. All writes publish only after commit.
+      this.appendEvent({ kind: 'silas.directive-settled', jobId: row.jobId,
+        payload: { request_id: input.requestId, delivery_seq: input.eventSeq,
+          ...(row.requestKind === null ? {} : { candidate_delivery_proven: candidateProven }) } });
       // A report handback can fail after the delivery event commits. Retry
       // the obligation open in the same transaction that records this
       // correlated terminal receipt, including the landed-delivery recovery
@@ -8295,13 +8382,6 @@ export class LedgerApi {
             reason: `actual separately authorized CURRENT inspection ${row.requestId} completed; applicable current verification/review action explicitly remains owned by ${duty.id}` } });
         }
       }
-      // Durable action marker: a settlement is machine follow-through and
-      // must be visible to health/action projections (issue #163 review).
-      this.appendEvent({
-        kind: 'silas.directive-settled',
-        jobId: row.jobId,
-        payload: { request_id: input.requestId, delivery_seq: input.eventSeq },
-      });
       if (row.requestKind === 'rebrief') this.appendEvent({ kind: 'silas.rebrief-settled', jobId: row.jobId, payload: { request_id: row.requestId, delivery_seq: input.eventSeq } });
       return this.getDirective(input.requestId) as DirectiveRequestRecord;
     });

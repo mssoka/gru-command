@@ -308,6 +308,7 @@ async function heldReview(input: {
   await port.createJobWorktree({ repoPath: repo.path, jobId });
   ledger.addJob({ id: jobId, repo: 'fixture', title: 'held', baseBranch: 'main', briefing: BRIEFING });
   ledger.setJobStatus(jobId, 'working');
+  ledger.registerWorktree(port.listWorktrees({ jobId })[0]!); // original fixture creation, before review/native work
   deliver(ledger, jobId);
   const escalations: string[] = [];
   const informs: string[] = [];
@@ -759,6 +760,7 @@ async function plainLane(jobId = 'job-plain'): Promise<ReviewHarness> {
   await port.createJobWorktree({ repoPath: repo.path, jobId });
   ledger.addJob({ id: jobId, repo: 'fixture', title: 'plain', baseBranch: 'main', briefing: BRIEFING });
   ledger.setJobStatus(jobId, 'working');
+  ledger.registerWorktree(port.listWorktrees({ jobId })[0]!); // original fixture creation, before native work
   const escalations: string[] = [];
   const informs: string[] = [];
   const wave = new WaveRunner({

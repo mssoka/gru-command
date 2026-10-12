@@ -3801,6 +3801,7 @@ async function directiveRecoveryLedgerFixture(label: string, materialRevision = 
   ledger.addJob({ id: 'sdk-original-job', repo: 'fixture', title: label, briefing: 'immutable original approved contract' });
   ledger.setJobStatus('sdk-original-job', 'working');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'sdk-original-job' });
+  ledger.registerWorktree(lane); // durable lane facts at original creation, never during recovery
   if (materialRevision) expect(ledger.addJobAmendment({ jobId: 'sdk-original-job', body: 'Approved original material scope.', supersedes: [], approval: { by: 'owner', reference: 'GH-286 completion fixture' }, effect: 'material', expectedContractSha256: ledger.directiveCurrentAuthority('sdk-original-job').contractSha256 }).status).toBe('accepted');
   let sourceRoundId: string | undefined;
   if (rebrief) { const source = ledger.addRound({ jobId: 'sdk-original-job', lenses: [] }); ledger.setRoundStatus(source.id, 'aborted'); sourceRoundId = source.id; }
@@ -4435,7 +4436,7 @@ it('P30 default pinned SDK parallel-safe read batch preserves exact accepted anc
   } finally { release(); await f.cleanup(); }
 });
 
-async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'owner-stop' | 'foreign' | 'older-unknown' | 'current-lock' | 'live-producer' | 'reservation' | 'multiple' | 'rebrief' | 'rebrief-missing') {
+async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'owner-stop' | 'foreign' | 'older-unknown' | 'current-lock' | 'live-producer' | 'reservation' | 'multiple' | 'rebrief' | 'rebrief-missing' | 'missing-head' | 'parked-missing-head') {
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
   let release!: () => void; const hold = new Promise<void>((resolve) => { release = resolve; });
   const f = await sdkDirectiveExecutionFixture([{ deltas: ['genuine past original completion'], hold }], undefined, false, false, mode === 'rebrief' || mode === 'rebrief-missing'); const stop = new AbortController();
@@ -4461,7 +4462,15 @@ async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'o
     if (mode === 'rebrief') expect(originalRebrief?.payload).toMatchObject({ rule_id: row.sourceContext!.ruleId, source_round_id: row.sourceContext!.sourceRoundId });
     if (mode === 'rebrief-missing') expect(originalRebrief).toBeNull();
     const originalPhase = f.scene.ledger.findPhaseHandoffByRequest({ jobId: row.jobId, requestId: row.requestId });
-    if (mode === 'parked') f.scene.ledger.setJobStatus(row.jobId, 'parked');
+    if (mode === 'missing-head' || mode === 'parked-missing-head') {
+      // Fault-inject loss of the original HEAD receipt only. Keep every
+      // original start/cessation byte; recovery never recreates completion.
+      const journal = `${row.nativeTarget!.sessionFile}.producers.jsonl`;
+      const rows = readFileSync(journal, 'utf8').trimEnd().split('\n');
+      expect(rows.some((line) => (JSON.parse(line) as { state: string }).state === 'completed')).toBe(true);
+      writeFileSync(journal, rows.filter((line) => (JSON.parse(line) as { state: string }).state !== 'completed').join('\n') + '\n');
+    }
+    if (mode === 'parked' || mode === 'parked-missing-head') f.scene.ledger.setJobStatus(row.jobId, 'parked');
     else f.scene.ledger.addJobAmendment({ jobId: row.jobId, body: 'changed approved current input', effect: 'administrative', supersedes: [], approval: { by: 'owner', reference: 'P39-boundaries' }, expectedContractSha256: originalIdentity.contractSha256 });
     if (mode === 'held' || mode === 'owner-stop') { const debt = f.scene.ledger.recordBlockedObservation(row.jobId, { logicalStep: 'operation', incidentKey: mode === 'held' ? `directive-recovery:${row.requestId}` : 'P39-owner-stop', observedAtSeq: f.scene.ledger.latestEventSeq(), category: { kind: 'known', category: 'restart-recovery' }, nextAction: mode === 'held' ? { kind: 'gru-decision', decision: 'retain suspended original context' } : { kind: 'owner-decision', decision: 'real original owner stop stays held' } }); if (mode === 'held') f.scene.ledger.suspendObligation(debt.id, 'explicit original hold'); }
     if (mode === 'current-lock') writeFileSync(`${row.nativeTarget!.sessionFile}.lock`, JSON.stringify({ host: 'foreign', pid: process.pid, bootId: 'foreign' }));
@@ -4469,12 +4478,18 @@ async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'o
     if (mode === 'live-producer') { f.scene.ledger.registerAgent({ id: 'P39-other-live', role: 'minion', jobId: row.jobId, sessionFile: null }); f.scene.ledger.setAgentState('P39-other-live', 'streaming'); }
     if (mode === 'reservation') reservation = f.scene.ledger.beginJobAdmission(row.jobId, 'independent reserved producer');
     const job = f.scene.ledger.getJob(row.jobId)!; const bytes = readFileSync(row.nativeTarget!.sessionFile, 'utf8');
+    const physicalBytes = readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8');
     const spawn = vi.spyOn(f.registry, 'spawn'); spawn.mockClear();
     service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
-    const positive = mode === 'parked' || mode === 'null' || mode === 'multiple' || mode === 'rebrief' || mode === 'rebrief-missing';
+    const positive = mode === 'parked' || mode === 'null' || mode === 'multiple' || mode === 'rebrief' || mode === 'rebrief-missing' || mode === 'missing-head' || mode === 'parked-missing-head';
     expect(f.scene.ledger.getDirective(row.requestId)?.state).toBe(positive ? 'settled' : 'admitted'); expect(spawn).not.toHaveBeenCalled(); expect(f.scene.ledger.getJob(row.jobId)).toEqual(job); expect(readFileSync(row.nativeTarget!.sessionFile, 'utf8')).toBe(bytes);
     const delivery = f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
-    if (positive) { expect(delivery?.payload).toMatchObject({ historical_bookkeeping_only: true, candidate_delivery_proven: false, native_completion: { identity: originalIdentity } }); if (mode === 'null') expect((delivery!.payload as { sha: unknown }).sha).toBeNull(); expect(f.scene.ledger.workRevisionState(row.jobId).delivered).toBe(0); expect(f.scene.ledger.latestJobEvent(row.jobId, 'silas.directive-current-gates-owed')).not.toBeNull(); }
+    if (mode === 'missing-head' || mode === 'parked-missing-head') {
+      expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toBe(physicalBytes);
+      expect((delivery!.payload as { native_completion: { receipt: unknown } }).native_completion.receipt).toBeNull();
+      expect(f.scene.ledger.latestCandidateDelivery(row.jobId)).toBeNull();
+    }
+    if (positive) { expect(delivery?.payload).toMatchObject({ historical_bookkeeping_only: true, candidate_delivery_proven: false, native_completion: { identity: originalIdentity } }); if (mode === 'null' || mode === 'missing-head' || mode === 'parked-missing-head') expect((delivery!.payload as { sha: unknown }).sha).toBeNull(); expect(f.scene.ledger.workRevisionState(row.jobId).delivered).toBe(0); expect(f.scene.ledger.latestJobEvent(row.jobId, 'silas.directive-current-gates-owed')).not.toBeNull(); }
     else expect(delivery).toBeNull();
     if (mode === 'rebrief' || mode === 'rebrief-missing') {
       const receipt = f.scene.ledger.latestJobEventByRequestId(row.jobId, 'silas.rebrief', row.requestId)!;
@@ -4490,6 +4505,8 @@ async function assertHistoricalSdkBoundary(mode: 'parked' | 'null' | 'held' | 'o
 
 it('P39 actual original SDK historical completion preserves parked boundary through restart without native replay', () => assertHistoricalSdkBoundary('parked'));
 it('P39 actual original SDK historical completion preserves null boundary through restart without native replay', () => assertHistoricalSdkBoundary('null'));
+it('P55 actual SDK historical completion retains truthful null HEAD after original receipt loss and restart', () => assertHistoricalSdkBoundary('missing-head'));
+it('P55 actual SDK parked historical completion retains truthful null HEAD without replay or sidecar backfill', () => assertHistoricalSdkBoundary('parked-missing-head'));
 it('P39 actual original SDK historical completion preserves held boundary through restart without native replay', () => assertHistoricalSdkBoundary('held'));
 it('P39 actual original SDK historical completion preserves owner-stop boundary through restart without native replay', () => assertHistoricalSdkBoundary('owner-stop'));
 it('P39 actual original SDK historical completion preserves foreign boundary through restart without native replay', () => assertHistoricalSdkBoundary('foreign'));

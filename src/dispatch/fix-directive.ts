@@ -147,10 +147,11 @@ export async function routeFixDirectiveToMinion(
   };
   const owner = input.owner ?? 'fix-directive';
   let nativeAttempted = false;
+  let priorCleanupPending = false;
   const guard = (handle?: AgentHandle): void => {
     try { input.beforeTurnSideEffect?.(handle); }
     catch (error) {
-      if (input.directiveTurn !== undefined && !nativeAttempted) throw new DirectiveDispatchDeferredError(error);
+      if (input.directiveTurn !== undefined && !nativeAttempted && !priorCleanupPending) throw new DirectiveDispatchDeferredError(error);
       throw error;
     }
   };
@@ -176,10 +177,11 @@ export async function routeFixDirectiveToMinion(
       const prior = input.registry.getHandle(minion.id);
       if (prior === null) continue;
       guard();
-      nativeAttempted = true;
+      priorCleanupPending = true;
       await disposeAndRecord(prior, true);
-      guard();
       if (prior.cessationEvidence?.() !== 'ceased') throw new Error(`prior minion ${prior.id} retains unproven producer ownership — rebrief refused`);
+      priorCleanupPending = false; // positive prior cessation is not this request's native attempt
+      guard();
     }
     minions = [];
   }

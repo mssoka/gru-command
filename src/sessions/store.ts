@@ -77,7 +77,7 @@ interface SizeSnapshot {
 }
 
 const LOCK_HEARTBEAT_MS = 5_000;
-/** A lock whose heartbeat is older than this is considered abandoned (dead holder). */
+/** Heartbeat age permits bounded inspection, never proves owner absence. */
 const LOCK_STALE_MS = 60_000;
 const BACKUP_INTERVAL_MS = 60 * 60 * 1000; // hourly (SPEC ruling 12)
 const BACKUP_SUFFIX = '.bak';
@@ -147,8 +147,9 @@ export class SessionStore {
   /**
    * Acquire the exclusive lock for a session file. The lock is a sidecar
    * `.lock` file created with O_EXCL holding pid + heartbeat; a second
-   * writer is rejected loudly (LockBusyError naming the holder), and a
-   * stale lock (heartbeat older than LOCK_STALE_MS) is stolen and logged.
+   * writer is rejected loudly (LockBusyError naming the holder). A stale
+   * heartbeat permits inspection only; reclaim requires a bound local
+   * owner positively absent at the exact unchanged lock pathname.
    */
   acquireLock(sessionFile: string, allowStaleTakeover = true): void {
     if (this.disposed) throw new Error('session store disposed');
@@ -268,25 +269,29 @@ export class SessionStore {
         throw new LockUnreadableError(lockFile, String(secondError ?? firstError));
       }
     }
+    if (typeof holder !== 'object' || holder === null || Array.isArray(holder)) throw new LockUnreadableError(lockFile, 'owner identity is not an object');
     const age = Date.now() - Date.parse(holder.heartbeatAt);
-    // The heartbeat timestamp IS the liveness proof: a heartbeat older
-    // than the steal threshold means the holder is dead or wedged — pid
-    // liveness is irrelevant (pid reuse and frozen-but-alive holders are
-    // both steal cases, not busy cases).
-    if (Number.isFinite(age) && age > LOCK_STALE_MS) {
-      this.log('warn', 'stale session lock stolen', {
-        lockFile,
-        holder_pid: holder.pid,
-        heartbeat_age_ms: age,
-      });
-      try {
-        this.unlinkLockFile(lockFile);
-      } catch {
-        /* raced away */
-      }
-      return;
+    if (!Number.isFinite(age) || age <= LOCK_STALE_MS || holder?.host !== hostname() ||
+        !Number.isSafeInteger(holder.pid) || holder.pid <= 0 || typeof holder.bootId !== 'string' || holder.bootId.trim() === '') {
+      throw new LockBusyError(lockFile, holder);
     }
-    throw new LockBusyError(lockFile, holder);
+    const snapshot = statSync(lockFile);
+    try { process.kill(holder.pid, 0); throw new LockBusyError(lockFile, holder); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw new LockBusyError(lockFile, holder);
+    }
+    // The coordinator serializes cooperative owners. Re-read the inode and
+    // complete identity as well: absence of a predecessor never permits
+    // deleting a replacement installed during observation.
+    const current = statSync(lockFile);
+    if (current.ino !== snapshot.ino || current.dev !== snapshot.dev ||
+        JSON.stringify(JSON.parse(readFileSync(lockFile, 'utf8'))) !== JSON.stringify(holder)) {
+      throw new LockBusyError(lockFile, holder);
+    }
+    this.unlinkLockFile(lockFile);
+    this.log('warn', 'stale session lock reclaimed after local owner absence', {
+      lockFile, holder_pid: holder.pid, heartbeat_age_ms: age,
+    });
   }
 
   releaseLock(sessionFile: string): void {

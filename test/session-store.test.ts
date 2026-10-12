@@ -28,6 +28,35 @@ function seedSession(store: SessionStore, role = 'gru', text = '{"type":"session
 }
 
 describe('SessionStore', () => {
+  function assertOrdinaryOwnerFence(mode: 'live' | 'foreign' | 'legacy' | 'eperm' | 'changed') {
+    const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
+    const holder = { host: mode === 'foreign' ? 'other-owner-host' : mode === 'legacy' ? undefined : hostname(), pid: mode === 'live' ? process.pid : 2_000_000_000, bootId: 'original-ordinary-owner', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
+    const bytes = JSON.stringify(holder); writeFileSync(`${file}.lock`, bytes);
+    const changed = JSON.stringify({ ...holder, bootId: 'replacement-observed-during-probe' });
+    const probe = mode === 'live' ? undefined : vi.spyOn(process, 'kill').mockImplementation(() => {
+      if (mode === 'changed') writeFileSync(`${file}.lock`, changed);
+      throw Object.assign(new Error(mode === 'eperm' ? 'permission denied' : 'absent local owner'), { code: mode === 'eperm' ? 'EPERM' : 'ESRCH' });
+    });
+    try {
+      expect(() => store.acquireLock(file)).toThrow(LockBusyError);
+      expect(store.isHeld(file)).toBe(false);
+      expect(readFileSync(`${file}.lock`, 'utf8')).toBe(mode === 'changed' ? changed : bytes);
+      if (mode === 'foreign' || mode === 'legacy') expect(probe).not.toHaveBeenCalled();
+    } finally { probe?.mockRestore(); store.dispose(); }
+  }
+  it('P53 ordinary acquisition refuses a stale live original PID without changing its lock', () => assertOrdinaryOwnerFence('live'));
+  it('P53 ordinary acquisition never probes or steals a stale foreign-host lock', () => assertOrdinaryOwnerFence('foreign'));
+  it('P53 ordinary acquisition never probes or steals a stale unbound legacy owner', () => assertOrdinaryOwnerFence('legacy'));
+  it('P53 ordinary acquisition treats EPERM as retained ownership, not absence', () => assertOrdinaryOwnerFence('eperm'));
+  it('P53 ordinary acquisition preserves a changed owner observed during its absence probe', () => assertOrdinaryOwnerFence('changed'));
+  it('P53 ordinary acquisition permits only a stale positively absent local bound owner', () => {
+    const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
+    const holder = { host: hostname(), pid: 2_000_000_000, bootId: 'original-absent-ordinary-owner', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
+    writeFileSync(`${file}.lock`, JSON.stringify(holder));
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('exact local owner absent'), { code: 'ESRCH' }); });
+    try { store.acquireLock(file); expect(probe).toHaveBeenCalledWith(holder.pid, 0); expect(store.ownedLockIdentity(file)).toMatchObject({ host: hostname(), pid: process.pid }); }
+    finally { probe.mockRestore(); store.dispose(); }
+  });
   it('native recovery refuses foreign, legacy and unbound current lock owners despite predecessor PID absence', () => {
     const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
     const original = { host: hostname(), pid: 2_000_000_000, bootId: 'original-native-boot', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
@@ -43,7 +72,7 @@ describe('SessionStore', () => {
     } finally { probe.mockRestore(); store.dispose(); }
   });
 
-  it('native lock recovery retains live and EPERM owners even when stale while ordinary stale-lock behavior is unchanged', () => {
+  it('native lock recovery retains live and EPERM owners even when stale', () => {
     const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
     const owner = { host: hostname(), pid: process.pid, bootId: 'live-native-boot', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
     const bytes = JSON.stringify(owner); writeFileSync(`${file}.lock`, bytes);
@@ -162,7 +191,7 @@ describe('SessionStore', () => {
     second.releaseLock(file);
   });
 
-  it('steals a stale lock even when the holder pid looks alive (heartbeat is the proof)', () => {
+  it('reclaims stale local absent ownership but preserves a stale live PID lock', () => {
     const logs: string[] = [];
     const store = new SessionStore(tmpDataDir(), {
       log: (level, msg) => {
@@ -173,6 +202,7 @@ describe('SessionStore', () => {
     // Forge a stale lock: dead pid + heartbeat older than the steal threshold.
     const lockFile = store.lockFileFor(file);
     const stale = {
+      host: hostname(),
       pid: 999_999_999,
       bootId: 'dead-boot',
       acquiredAt: new Date(Date.now() - 120_000).toISOString(),
@@ -180,17 +210,17 @@ describe('SessionStore', () => {
     };
     writeFileSync(lockFile, `${JSON.stringify(stale)}\n`, 'utf-8');
     expect(() => store.acquireLock(file)).not.toThrow();
-    expect(logs.some((msg) => msg.includes('stale session lock stolen'))).toBe(true);
+    expect(logs.some((msg) => msg.includes('local owner absence'))).toBe(true);
     store.releaseLock(file);
-    // A stale heartbeat with a LIVE pid (ours) also steals — pid liveness
-    // is irrelevant to the heartbeat proof.
+    // A stale heartbeat never revokes a LIVE owner's single-writer lock.
     writeFileSync(
       lockFile,
       `${JSON.stringify({ ...stale, pid: process.pid, bootId: 'old-boot' })}\n`,
       'utf-8',
     );
-    expect(() => store.acquireLock(file)).not.toThrow();
-    store.releaseLock(file);
+    const bytes = readFileSync(lockFile, 'utf8');
+    expect(() => store.acquireLock(file)).toThrow(LockBusyError);
+    expect(readFileSync(lockFile, 'utf8')).toBe(bytes); store.dispose();
   });
 
   it('refuses to steal an unreadable lock (loud, never auto-deleted)', () => {

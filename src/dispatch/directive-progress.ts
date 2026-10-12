@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { LedgerApi } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, isDirectiveTerminal } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { DirectiveDispatchDeferredError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
@@ -219,6 +219,18 @@ function reconcileNativeProducer(deps: DirectiveProgressDeps, identity: Directiv
   } });
 }
 
+/** Host absence is usable only with the exact successful accountable
+ * checkpoint. Both first publication and receipt replay still run the
+ * complete independent admission/producer fences after this inspection. */
+function assertCompletedNativeOwnership(file: string, identity: DirectiveTurnIdentity, proof: Extract<DirectiveCheckpoint, { state: 'terminal' }>): void {
+  const owners = inspectDirectiveProducers(file, identity);
+  const sessionOwners = inspectDirectiveProducers(file);
+  if (!proof.ok || owners.length === 0 || owners.some(({ producer }) => producer.agentId !== proof.binding.agentId || producer.sessionId !== proof.binding.sessionId) ||
+      sessionOwners.length === 0 || sessionOwners.some(({ evidence, producer }) => evidence === 'unknown' || directiveProducerLockBlocker(producer) !== null)) {
+    throw new DirectiveCheckpointError('correlated delivery retains UNKNOWN native physical ownership');
+  }
+}
+
 /** Completion first, correlated and idempotent: no worker execution. */
 export function settleNativeDirective(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): boolean {
   let row = deps.ledger.getDirective(identity.requestId);
@@ -234,12 +246,7 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
     const proof = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, identity);
     if (proof.state !== 'terminal' || !proof.ok) throw new DirectiveCheckpointError('correlated delivery lacks an exact successful native terminal checkpoint');
     const completion = readDirectiveCompletion(row.nativeTarget.sessionFile, identity, proof.checkpointId);
-    const owners = inspectDirectiveProducers(row.nativeTarget.sessionFile, identity);
-    const sessionOwners = inspectDirectiveProducers(row.nativeTarget.sessionFile);
-    if (owners.length === 0 || owners.some(({ evidence }) => evidence !== 'ceased') ||
-        sessionOwners.length === 0 || sessionOwners.some(({ evidence, producer }) => evidence !== 'ceased' || directiveProducerLockBlocker(producer) !== null)) {
-      throw new DirectiveCheckpointError('correlated delivery retains UNKNOWN native physical ownership');
-    }
+    assertCompletedNativeOwnership(row.nativeTarget.sessionFile, identity, proof);
     const payload = landed.payload as { request_id?: unknown; agentId?: unknown; sha?: unknown; work_revision?: unknown; candidate_delivery_proven?: unknown; native_completion?: unknown };
     const job = deps.ledger.getJob(identity.jobId);
     const currentAuthority = deps.ledger.directiveCurrentAuthority(identity.jobId);
@@ -271,6 +278,7 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
   const binding = readDirectiveBinding(row.nativeTarget.sessionFile, identity.requestId);
   if (binding?.userEntryId != null) deps.ledger.bindDirectiveNativeAdmission(binding);
   if (proof.state !== 'terminal' || !proof.ok) return false;
+  assertCompletedNativeOwnership(row.nativeTarget.sessionFile, identity, proof);
   const completion = readDirectiveCompletion(row.nativeTarget.sessionFile, identity, proof.checkpointId);
   const current = deps.ledger.directiveCurrentAuthority(identity.jobId);
   if (deps.ledger.getJob(identity.jobId)?.status === 'parked' || current.workRevision !== identity.workRevision || current.contractSha256 !== identity.contractSha256 || current.authorityEpoch !== identity.authorityEpoch) {

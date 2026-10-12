@@ -1090,6 +1090,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-x', 'req-x');
+    h.ledger.registerWorktree(lane); // original lane setup, before any native execution
     // An unrelated phase delivered after the status hop. Once the subject
     // request retires, ONLY its hold keeps this otherwise idle lane busy.
     h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-x', payload: { source: 'previous-phase' } });
@@ -1152,6 +1153,7 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const h = await boot();
     seedJob(h, 'job-z');
     const lane = await seedLane(h, repo, 'job-z');
+    h.ledger.registerWorktree(lane); // positive native candidacy needs the original durable lane
     // A delivered phase with a registered PR that would ordinarily be
     // offered for review.
     h.ledger.appendCustomEvent({
