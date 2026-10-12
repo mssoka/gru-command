@@ -1,4 +1,4 @@
-import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -451,7 +451,7 @@ describe('wizard CLI surface', () => {
     expect(execFileSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], {
       encoding: 'utf-8',
       env: gitProbeEnvironment(),
-    }).trim()).toBe(repo);
+    }).trim()).toBe(realpathSync(repo));
     expect(resolveManagedRepoPathSync(workspace, 'alpha')).toMatchObject({ kind: 'unavailable' });
 
     const home = tempDir('gru-command-wizard-symlink-git-home-');
