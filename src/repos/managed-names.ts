@@ -87,11 +87,14 @@ function isGitWorktreeRootSync(project: string): boolean {
  * A managed repository is one exact direct-child directory name, never a
  * path, traversal, glob or alternate-platform absolute path. Keep the
  * ordinary names already accepted by installer discovery (including
- * spaces and Unicode); reject ambiguous/path-forming values and names that
- * filesystems may normalize (trailing dot/space).
+ * spaces and Unicode); reject ambiguous/path-forming values, terminal-control
+ * characters and names that filesystems may normalize (trailing dot/space).
  */
 export function managedRepoNameError(name: string): string | null {
   if (name.trim() === '') return 'must not be empty';
+  if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(name)) {
+    return 'must not contain control, format, or line-separator characters';
+  }
   if (name.endsWith('.') || name.endsWith(' ')) return 'must not end with a dot or space';
   if (name === '.' || name === '..' || name.startsWith('.')) {
     return 'must be a plain directory name under workspace_root';

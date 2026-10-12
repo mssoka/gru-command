@@ -57,6 +57,14 @@ function fail(message: string, code = 1): never {
   process.exit(code);
 }
 
+/** Render untrusted filesystem names without terminal control or bidi effects. */
+function displayRepositoryName(name: string): string {
+  return name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint === undefined ? '' : `\\u{${codePoint.toString(16)}}`;
+  });
+}
+
 /** The repo root = two levels up from dist/wizard/main.js. */
 function repoRootFrom(importMetaUrl: string): string {
   return resolve(dirname(fileURLToPath(importMetaUrl)), '..', '..');
@@ -170,19 +178,21 @@ async function interactiveAnswers(
   const found = realCandidates.filter((name) => !unusableGitRoots.includes(name));
   if (invalidNameCandidates.length > 0) {
     out.write('\nGit repository entries excluded from installer choices because their names are unsupported:\n');
-    for (const { name, reason } of invalidNameCandidates) out.write(`  ${JSON.stringify(name)}: ${reason}\n`);
+    for (const { name, reason } of invalidNameCandidates) {
+      out.write(`  ${JSON.stringify(displayRepositoryName(name))}: ${reason}\n`);
+    }
   }
   if (unusableGitRoots.length > 0) {
     out.write('\nGit repository entries excluded from installer choices because their Git roots are unusable:\n');
     for (const name of unusableGitRoots) {
       out.write(
-        `  ${JSON.stringify(name)}: .git does not identify this exact usable repository root; ` +
+        `  ${JSON.stringify(displayRepositoryName(name))}: .git does not identify this exact usable repository root; ` +
           'repair Git metadata and rerun setup.\n',
       );
     }
   }
   if (linked.length > 0) {
-    out.write(`\nLinked repo entries excluded from installer choices: ${linked.join(', ')}.\n` +
+    out.write(`\nLinked repo entries excluded from installer choices: ${linked.map(displayRepositoryName).join(', ')}.\n` +
       'Select a real directory under workspace_root; links stay unchanged.\n');
   }
   out.write(
@@ -198,12 +208,12 @@ async function interactiveAnswers(
   let repos: string[] = [];
   if (found.length > 0 || existingSelection.length > 0) {
     out.write('\nGit repository candidates under workspace_root (not auto-enrolled on re-run):\n');
-    found.forEach((name, index) => out.write(`  ${index + 1}. ${name}\n`));
+    found.forEach((name, index) => out.write(`  ${index + 1}. ${displayRepositoryName(name)}\n`));
     if (found.length === 0) out.write('  (none currently available)\n');
     for (;;) {
       const defaultLabel = prior === null
         ? `all ${found.length}`
-        : existingSelection.length > 0 ? existingSelection.join(', ') : 'none';
+        : existingSelection.length > 0 ? existingSelection.map(displayRepositoryName).join(', ') : 'none';
       const answer = await ask(
         rl,
         `Repos to manage — comma-separated numbers or names; type none to clear [${defaultLabel}]: `,
@@ -642,7 +652,7 @@ async function main(argv: readonly string[]): Promise<number> {
   const configText = generateConfigToml({ answers, instanceDir, prior });
 
   stdout.write(
-    `\nManaged repositories selected: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
+    `\nManaged repositories selected: ${answers.repos.length > 0 ? answers.repos.map(displayRepositoryName).join(', ') : '(none)'}\n`,
   );
 
   if (answers.port !== 0) {

@@ -245,6 +245,9 @@ describe('config fail-loud validation', () => {
       ['managed_repos = ["*"]', /managed_repos\[0\].*wildcard/],
       ['managed_repos = ["alpha."]', /must not end with a dot or space/],
       ['managed_repos = ["alpha "]', /must not end with a dot or space/],
+      ['managed_repos = ["alpha\\u001B[31m"]', /must not contain control, format, or line-separator characters/],
+      ['managed_repos = ["alpha\\u202Ehidden"]', /must not contain control, format, or line-separator characters/],
+      ['managed_repos = ["alpha\\u2028hidden"]', /must not contain control, format, or line-separator characters/],
       ['managed_repos = ["alpha", "alpha"]', /must not contain duplicate/],
     ];
     for (const [toml, pattern] of cases) {

@@ -112,6 +112,13 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     const stale = join(workspace, 'repo-stale');
     mkdirSync(stale);
     writeFileSync(join(stale, '.git'), 'gitdir: ../missing-worktree\n');
+    const controlName = 'repo\u001b[31m';
+    const control = join(workspace, controlName);
+    mkdirSync(control);
+    execFileSync('git', ['-C', control, 'init', '-q']);
+    const bidi = join(workspace, 'repo\u202ehidden');
+    mkdirSync(bidi);
+    execFileSync('git', ['-C', bidi, 'init', '-q']);
     const instance = tempDir('gru-command-pty-invalid-candidate-');
     const { output, status } = ptyWizard([
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps('n'),
@@ -120,6 +127,8 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(status, output).toBe(0);
     expect(output).toContain('"repo*": must not contain wildcard characters');
     expect(output).toContain('"repo-stale": .git does not identify this exact usable repository root');
+    expect(output).toContain('repo\\\\u{1b}[31m');
+    expect(output).toContain('repo\\\\u{202e}hidden');
     expect(output).toContain('Managed repositories selected: repo-a, repo-b');
     expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
   }, 90_000);
