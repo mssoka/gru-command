@@ -24,8 +24,8 @@ async function assertFormalEventAssertion(tag: string, assertion: () => unknown)
   try {
     await assertion();
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`FORMAL_EVENT_ASSERTION:${tag}\n${detail}`, { cause: error });
+    if (!(error instanceof Error) || error.name !== 'AssertionError') throw error;
+    throw new Error(`FORMAL_EVENT_ASSERTION:${tag}\n${error.message}`, { cause: error });
   }
 }
 
@@ -3398,6 +3398,14 @@ describe('startup wiring pin (src/main.ts)', () => {
 // ---------------------------------------------------------------------------
 
 describe('formal GitHub verdict publication', () => {
+  it('marks only matcher failures as formal GitHub baseline evidence (formal GitHub)', async () => {
+    const unrelated = new TypeError('fixture evaluation failed before the matcher');
+    await expect(assertFormalEventAssertion('app-marker-regression', () => { throw unrelated; }))
+      .rejects.toBe(unrelated);
+    await expect(assertFormalEventAssertion('app-marker-regression', () => expect(true).toBe(false)))
+      .rejects.toThrow(/FORMAL_EVENT_ASSERTION:app-marker-regression/u);
+  });
+
   /** A provider review object the App bot enacted for `state`. `submittedAt`
    * defaults to the fixture clock (inside the strict reconciliation window);
    * pass null to model a provider record with no usable submission time. */

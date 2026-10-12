@@ -51,8 +51,8 @@ async function assertFormalEventAssertion(tag: string, assertion: () => unknown)
   try {
     await assertion();
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`FORMAL_EVENT_ASSERTION:${tag}\n${detail}`, { cause: error });
+    if (!(error instanceof Error) || error.name !== 'AssertionError') throw error;
+    throw new Error(`FORMAL_EVENT_ASSERTION:${tag}\n${error.message}`, { cause: error });
   }
 }
 
@@ -430,6 +430,14 @@ const ENACTED_REVIEW_STATE: Record<string, string> = {
 const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
 
 describe('GitHub SHA-bound Perkins delivery', () => {
+  it('marks only matcher failures as formal GitHub baseline evidence (formal GitHub)', async () => {
+    const unrelated = new TypeError('fixture evaluation failed before the matcher');
+    await expect(assertFormalEventAssertion('wave-marker-regression', () => { throw unrelated; }))
+      .rejects.toBe(unrelated);
+    await expect(assertFormalEventAssertion('wave-marker-regression', () => expect(1).toBe(2)))
+      .rejects.toThrow(/FORMAL_EVENT_ASSERTION:wave-marker-regression/u);
+  });
+
   it('delivers on head equality even when the recorded base is stale, and refuses a moved head', async () => {
     const root = mkdtempSync(join(tmpdir(), 'perkins-gh-poster-'));
     const log = join(root, 'calls.jsonl');

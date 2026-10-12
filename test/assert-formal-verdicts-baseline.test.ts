@@ -67,6 +67,9 @@ describe('formal GitHub verdicts fail-before classifier', () => {
   it('preserves the generic named-red classifier for R2-R6 while formal baselines use assertion markers', () => {
     expect(assertNamedRedBaselineLeg('r6', report(assertion('existing named regression', 'failed', ['AssertionError: expected false to be true'])), ['existing named regression']))
       .toContain('1 named assertion(s) RED behaviorally');
+    expect(() => assertNamedRedBaselineLeg(
+      'r6', report(assertion('legacy regression', 'failed', ['Error: FORMAL_EVENT_ASSERTION:app-approve-receipt unrelated'])), ['legacy regression'],
+    )).toThrow(/failure carries no formal-event behavioral marker/u);
     const titles = EXPECTED_FORMAL_EVENT_ASSERTIONS.app;
     const failures = titles.map((title, index) => assertion(
       title, 'failed', [`Error: ${EXPECTED_FORMAL_EVENT_FAILURE_MARKERS.app[index]} expected a formal state`],

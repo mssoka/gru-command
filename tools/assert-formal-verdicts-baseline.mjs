@@ -73,13 +73,12 @@ export const BEHAVIORAL_FAILURE_MARKERS = Object.freeze([
   /_Assertion/u,
   /instead of rejecting|instead of resolving/u,
   /state mismatch|enacted (?:APPROVED|CHANGES_REQUESTED|COMMENTED) instead of/u,
-  /FORMAL_EVENT_ASSERTION:/u,
 ]);
 
 /** Verify one leg: parseable report, no collection/setup failures, and every
  * required formal-event assertion failed behaviorally. Returns the proof
  * line; throws with the observed failed titles when the claim is broken. */
-export function assertNamedRedBaselineLeg(label, report, requiredTitles) {
+export function assertNamedRedBaselineLeg(label, report, requiredTitles, additionalBehavioralMarkers = []) {
   if (report === null || typeof report !== 'object' || report.numFailedTests < 1 || !Array.isArray(report.testResults)) {
     throw new Error(`${label}: no failed tests in a parseable Vitest report; import/setup failure is not behavioral RED`);
   }
@@ -91,6 +90,7 @@ export function assertNamedRedBaselineLeg(label, report, requiredTitles) {
     }
   }
   const results = report.testResults.flatMap((file) => file.assertionResults ?? []);
+  const behavioralMarkers = [...BEHAVIORAL_FAILURE_MARKERS, ...additionalBehavioralMarkers];
   const nameOf = (result) =>
     typeof result.fullName === 'string' && result.fullName !== '' ? result.fullName : result.title;
   const missing = [];
@@ -110,7 +110,7 @@ export function assertNamedRedBaselineLeg(label, report, requiredTitles) {
       missing.push(`${title} (failed for an import/setup reason, not behaviorally)`);
       continue;
     }
-    if (!BEHAVIORAL_FAILURE_MARKERS.some((pattern) => pattern.test(message))) {
+    if (!behavioralMarkers.some((pattern) => pattern.test(message))) {
       missing.push(`${title} (failure carries no formal-event behavioral marker)`);
     }
   }
@@ -141,7 +141,7 @@ export function assertFormalVerdictsBaselineLeg(label, report, requiredTitles) {
     requiredTitles.length !== expectedTitles.length || requiredTitles.some((title, index) => title !== expectedTitles[index])) {
     throw new Error(`${label}: formal-event baseline does not match its pinned assertion titles`);
   }
-  const proof = assertNamedRedBaselineLeg(label, report, requiredTitles);
+  const proof = assertNamedRedBaselineLeg(label, report, requiredTitles, [/FORMAL_EVENT_ASSERTION:/u]);
   const results = report.testResults.flatMap((file) => file.assertionResults ?? []);
   for (const [index, title] of requiredTitles.entries()) {
     const assertion = results.find((result) =>
