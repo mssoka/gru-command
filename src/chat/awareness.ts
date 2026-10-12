@@ -317,6 +317,9 @@ interface AwarenessState {
     readonly lastDeliveredAt: number | null;
     readonly lastOwnerAt?: number | null;
     readonly lastOwnerSeq?: number;
+    /** GH-111: install/first-start time, the bounded digest baseline used
+     * until the first owner turn is committed. */
+    readonly baselineAt?: number;
   };
   /** Passive queue rotation offsets (GH-109); absent in legacy state
    * files, which start a fresh cycle at the newest rows. */
@@ -520,6 +523,9 @@ export class GruAwareness {
   /** Only an owner-directed user turn advances the morning boundary. */
   private lastOwnerAt: number | null;
   private lastOwnerSeq: number;
+  /** GH-111: digest baseline while `lastOwnerAt` is null (no owner turn yet). */
+  private readonly digestBaselineAt: number;
+  private readonly baselineIsNew: boolean;
   private wakeSink: (() => void) | null = null;
   /** Candidate ids waiting to be released as ONE coalesced wake. */
   private readonly pendingWakeIds: Set<string>;
@@ -589,6 +595,12 @@ export class GruAwareness {
     this.lastDeliveredAt = state.digest?.lastDeliveredAt ?? null;
     this.lastOwnerAt = state.digest?.lastOwnerAt !== undefined ? state.digest.lastOwnerAt : this.lastDeliveredAt;
     this.lastOwnerSeq = state.digest?.lastOwnerSeq ?? state.coveredThroughSeq;
+    // Decision (GH-111, docs/decisions/awareness-digest-semantics.md): until
+    // the first owner turn, the digest baseline is the persisted install /
+    // first-start time. No synthetic owner turn, and history stays bounded
+    // by the digest's own 101-row caps and the `since` filters.
+    this.baselineIsNew = state.digest?.baselineAt === undefined;
+    this.digestBaselineAt = state.digest?.baselineAt ?? this.now();
     const compatibleLegacyRow = (id: string): NotificationRecord | null =>
       id.startsWith('mailbox:') && this.ledger.getNotification(id) === null ? this.mailbox?.getAttentionRow(id) ?? null : null;
     const normalizeLegacyKey = (id: string): string => {
@@ -627,6 +639,13 @@ export class GruAwareness {
         }),
       },
     );
+    if (this.baselineIsNew && this.lastOwnerAt === null) {
+      try { this.persist(); } catch (error) {
+        this.log('error', 'gru awareness baseline persist failed — digest baseline resets on restart', {
+          file: this.file, error: String(error),
+        });
+      }
+    }
     opts.bus?.subscribe((event) => this.onBusEvent(event));
   }
 
@@ -725,8 +744,10 @@ export class GruAwareness {
       const delivered = record['lastDeliveredAt'];
       const ownerAt = record['lastOwnerAt'];
       const ownerSeq = record['lastOwnerSeq'];
+      const baselineAt = record['baselineAt'];
       if (!(delivered === null || (typeof delivered === 'number' && Number.isFinite(delivered))) ||
           !(ownerAt === undefined || ownerAt === null || (typeof ownerAt === 'number' && Number.isFinite(ownerAt))) ||
+          !(baselineAt === undefined || (typeof baselineAt === 'number' && Number.isFinite(baselineAt))) ||
           !(ownerSeq === undefined || (typeof ownerSeq === 'number' && Number.isSafeInteger(ownerSeq) && ownerSeq >= 0))) {
         throw new Error(
           `gru awareness state ${file} has an invalid digest section; ` +
@@ -737,6 +758,7 @@ export class GruAwareness {
         lastDeliveredAt: delivered as number | null,
         ...(ownerAt !== undefined ? { lastOwnerAt: ownerAt as number | null } : {}),
         ...(ownerSeq !== undefined ? { lastOwnerSeq: ownerSeq as number } : {}),
+        ...(baselineAt !== undefined ? { baselineAt: baselineAt as number } : {}),
       };
     }
     const attentionRecord = record['attention'];
@@ -1723,8 +1745,8 @@ export class GruAwareness {
    * merges, and staged PRs from the ledger — the morning catch-up. Derived
    * from the ledger alone; null when the gap was short or nothing landed. */
   private morningDigest(): readonly string[] | null {
-    if (this.morningDigestGapMs <= 0 || this.lastOwnerAt === null) return null;
-    const since = this.lastOwnerAt;
+    if (this.morningDigestGapMs <= 0) return null;
+    const since = this.lastOwnerAt ?? this.digestBaselineAt;
     if (this.now() - since < this.morningDigestGapMs) return null;
     const lines: string[] = [];
     const push = (line: string): void => {
@@ -1786,7 +1808,7 @@ export class GruAwareness {
         ...(this.unreceipted.length > 0 ? { unreceipted: this.unreceipted.map((batch) => ({ ...batch, ids: [...batch.ids] })) } : {}),
         ...(this.wakeFailures.size > 0 ? { wakeFailures: Object.fromEntries(this.wakeFailures) } : {}),
       },
-      digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq },
+      digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq, baselineAt: this.digestBaselineAt },
       attention: { machineOffset: this.attentionRotation.machine, ownerOffset: this.attentionRotation.owner },
     };
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;

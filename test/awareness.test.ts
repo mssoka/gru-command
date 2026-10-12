@@ -1241,8 +1241,13 @@ describe('gru awareness — passive queue rotation (GH-109)', () => {
     const again = rig.awareness.prepare();
     expect(again?.notificationIds).toEqual(first?.notificationIds);
     expect(again?.text).toBe(first?.text);
-    // Nothing was delivered: no rotation was consumed or persisted.
-    expect(existsSync(join(rig.dir, AWARENESS_STATE_NAME))).toBe(false);
+    // Nothing was delivered: no rotation was consumed or persisted. (Boot
+    // writes only the GH-111 digest baseline: cursor 0, offsets absent.)
+    const booted = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+      coveredThroughSeq: number; attention?: { machineOffset: number; ownerOffset: number };
+    };
+    expect(booted.coveredThroughSeq).toBe(0);
+    expect(booted.attention).toEqual({ machineOffset: 0, ownerOffset: 0 });
     rig.awareness.commit(first!);
     const persisted = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
       attention?: { machineOffset: number; ownerOffset: number };
@@ -2833,6 +2838,45 @@ describe('GH-104 (g7): Gru actions are labeled apart from passive board activity
       expect(text).toContain('- Gru actions: 1 disposition');
       expect(text).toContain('Gru disposition');
       expect(text).toContain('Repaired the lane');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-111 (g15): the first-ever owner digest has a bounded install-time baseline', () => {
+  it('a fresh install that accumulated events gets a catch-up on the first owner turn after the gap', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const dir = tmpDir();
+      const rig = boot({ dir, now: () => Date.now() });
+      vi.setSystemTime(new Date('2026-09-22T22:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.dispose();
+      // Service restarts mid-night: the baseline is install time, not restart time.
+      vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+      const restarted = boot({ dir, now: () => Date.now() });
+      const first = restarted.awareness.prepare()!;
+      expect(first.text).toContain('While you were away (since 2026-09-22T21:00:00.000Z)');
+      expect(first.text).toContain('- fires: 1 wake delivered');
+      expect(first.text).toContain('- activity: 1 board event');
+      restarted.awareness.commit(first);
+      // Consumed once; nothing replays.
+      restarted.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      expect(restarted.awareness.prepare()?.text ?? '').not.toContain('While you were away');
+      restarted.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('stays quiet when the unattended interval is shorter than the gap', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      vi.setSystemTime(new Date('2026-09-22T23:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      expect(rig.awareness.prepare()?.text ?? '').not.toContain('While you were away');
       rig.awareness.dispose();
     } finally { vi.useRealTimers(); }
   });
