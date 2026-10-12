@@ -3473,7 +3473,67 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     release({ id: 'prop-1', decision: 'accepted' });
     await flush();
     expect(client.wake).toHaveBeenCalled();
-    expect(document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(true);
+    expect(document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled).toBe(true);
+  });
+
+  it('a re-pair with a submitted proposal decision preserves its choice lock and retries only that choice', async () => {
+    let releaseOld!: (result: unknown) => void;
+    const oldClient = proposalClient(() => new Promise((resolve) => { releaseOld = resolve; }));
+    const newClient = proposalClient();
+    const view = new BoardView(() => {}, oldClient);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(oldClient.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+
+    view.markSnapshotStale();
+    view.bindClient(newClient);
+    view.render(snapshot({ notifications: [proposalNotice] }), 'push');
+    let band = document.getElementById('board-owner')!;
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect([accept.disabled, reject.disabled]).toEqual([false, true]);
+    reject.click();
+    await flush();
+    expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
+
+    accept.click();
+    await flush();
+    expect(newClient.getLessonProposal).toHaveBeenCalledTimes(1);
+    expect(newClient.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(newClient.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+    releaseOld({ id: 'prop-1', decision: 'accepted' });
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled).toBe(true);
+  });
+
+  it('an ambiguous proposal decision keeps the opposite action locked across a fresh push and reloads before retry', async () => {
+    const outcomes: Array<() => Promise<unknown>> = [
+      () => Promise.reject(new Error('connection lost after submission')),
+      () => Promise.resolve({ id: 'prop-1', decision: 'accepted' }),
+    ];
+    const client = proposalClient(() => outcomes.shift()!());
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(client.wake).toHaveBeenCalled();
+
+    view.markSnapshotStale();
+    view.render(snapshot({ notifications: [proposalNotice] }), 'push');
+    let band = document.getElementById('board-owner')!;
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect([accept.disabled, reject.disabled]).toEqual([false, true]);
+    accept.click();
+    await flush();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(2);
+    expect(client.decideLessonProposal).toHaveBeenNthCalledWith(2, 'prop-1', 'accept');
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled).toBe(true);
   });
 
   it('a same-client reconnect retires a hung proposal fetch and allows a fresh review decision', async () => {

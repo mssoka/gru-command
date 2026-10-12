@@ -1037,6 +1037,44 @@ describe('board client', () => {
     }
   });
 
+  it('a stalled lesson proposal response body is bounded by the deadline too', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let client: BoardClient | null = null;
+    try {
+      const requestSignals: AbortSignal[] = [];
+      const json = vi.fn(() => new Promise<unknown>(() => {}));
+      const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const signal = init?.signal;
+        if (signal === undefined || signal === null) throw new Error('review request did not carry its deadline signal');
+        requestSignals.push(signal);
+        return Promise.resolve({ ok: true, json } as unknown as Response);
+      }) as unknown as typeof fetch;
+      client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      let settled: 'pending' | 'resolved' | 'rejected' = 'pending';
+      let rejectionMessage = '';
+      const pending = client.getLessonProposal().then(
+        () => { settled = 'resolved'; },
+        (error: unknown) => {
+          settled = 'rejected';
+          rejectionMessage = error instanceof Error ? error.message : String(error);
+        },
+      );
+      void pending;
+      await vi.advanceTimersByTimeAsync(15_000);
+      await Promise.resolve();
+      expect(json).toHaveBeenCalledTimes(1);
+      expect(requestSignals[0]?.aborted).toBe(true);
+      expect(settled).toBe('rejected');
+      expect(rejectionMessage).toBe('lesson proposal review timed out after 15 seconds');
+    } finally {
+      client?.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('a malformed review is refused before anything renders it — a valid one passes', async () => {
     const review = (removed: unknown) => ({
       id: 'prop-1',

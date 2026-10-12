@@ -317,8 +317,19 @@ export class BoardView {
   bindClient(client: BoardClient): void {
     this.boardClient = client;
     this.clientGeneration += 1;
-    for (const state of this.proposalStates.values()) this.invalidateProposalState(state);
-    this.proposalStates.clear();
+    for (const [id, state] of this.proposalStates) {
+      if (state.pendingDecision === null) {
+        this.invalidateProposalState(state);
+        this.proposalStates.delete(id);
+        continue;
+      }
+      // The old client may still deliver a submitted decision after re-pair.
+      // Keep its choice as the only retryable action until the new server
+      // confirms what happened; an opposite POST must never race it.
+      this.invalidateProposalState(state, true);
+      const label = state.pendingDecision === 'accept' ? 'Accept' : 'Reject';
+      state.message ??= `Your ${label} may have been recorded. The opposite choice is locked until the server confirms the outcome.`;
+    }
     this.decisionSubmissions.clear();
     this.decisionOverrides.clear();
     this.sentShown.clear();
@@ -348,14 +359,16 @@ export class BoardView {
     this.snapshotIsCurrent = false;
     this.snapshotFreshnessGeneration += 1;
     for (const state of this.proposalStates.values()) {
-      // A submitted decision stays locked; a review GET or an action still
-      // waiting on that GET must be retired so reconnect can fetch fresh text.
-      if (!state.decisionSubmitting) this.invalidateProposalState(state);
+      // A submitted decision stays locked. Retire review work begun against
+      // stale text, but preserve an ambiguous submitted choice as the only
+      // retryable action until its outcome is reconciled.
+      if (state.decisionSubmitting) continue;
+      this.invalidateProposalState(state, state.pendingDecision !== null);
     }
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
-  private invalidateProposalState(state: ProposalRowState): void {
+  private invalidateProposalState(state: ProposalRowState, preservePendingDecision = false): void {
     state.loadGeneration += 1;
     state.actionGeneration += 1;
     state.loadController?.abort();
@@ -364,8 +377,9 @@ export class BoardView {
     state.review = null;
     state.inFlight = null;
     state.decisionSubmitting = false;
+    if (!preservePendingDecision) state.pendingDecision = null;
     state.loadFailed = false;
-    if (state.recorded === null) state.message = null;
+    if (state.recorded === null && !preservePendingDecision) state.message = null;
     state.open = false;
     state.nested.clear();
   }
@@ -692,6 +706,7 @@ export class BoardView {
         actionGeneration: 0,
         inFlight: null,
         decisionSubmitting: false,
+        pendingDecision: null,
         recorded: null,
         message: null,
         loadFailed: false,
@@ -761,9 +776,13 @@ export class BoardView {
           }
           if (proposal.decision !== null) {
             // Recorded elsewhere (another device, or before a restart): only
-            // the same decision can finish it.
+            // the same decision can finish it. This authoritative review also
+            // releases any ambiguous local submission lock.
             const recorded = proposal.decision.kind === 'accepted' ? 'accept' : 'reject';
             current.recorded = recorded;
+            current.pendingDecision = null;
+            current.inFlight = null;
+            current.decisionSubmitting = false;
             current.message ??= recordedMessage(recorded, proposal.recovery?.conflict ?? null);
           }
           this.rerenderOwner();
@@ -819,10 +838,13 @@ export class BoardView {
     accept.textContent = current.inFlight === 'accept' ? 'accepting…' : 'Accept';
     reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : 'Reject';
     // A recorded decision can only be finished, never flipped.
-    accept.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'reject';
-    reject.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'accept';
+    accept.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'reject' ||
+      (current.pendingDecision !== null && current.pendingDecision !== 'accept');
+    reject.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'accept' ||
+      (current.pendingDecision !== null && current.pendingDecision !== 'reject');
     const decide = (decision: 'accept' | 'reject'): void => {
-      if (!this.snapshotIsCurrent || current.inFlight !== null) return;
+      if (!this.snapshotIsCurrent || current.inFlight !== null ||
+        (current.pendingDecision !== null && current.pendingDecision !== decision)) return;
       const client = this.boardClient;
       if (client === null) return;
       const freshnessGeneration = this.snapshotFreshnessGeneration;
@@ -839,7 +861,12 @@ export class BoardView {
             current.message = 'The board is catching up; your choice was not sent. Wait for a fresh snapshot and review it again.';
             return null;
           }
-          if (current.recorded !== null && current.recorded !== decision) return null; // never flip a recorded decision
+          if (current.recorded !== null && current.recorded !== decision) {
+            current.message = `Not applied — this lesson proposal was already ${current.recorded === 'accept' ? 'accepted' : 'rejected'}.`;
+            return null; // never flip a recorded decision
+          }
+          if (current.pendingDecision !== null && current.pendingDecision !== decision) return null;
+          current.pendingDecision = decision;
           current.decisionSubmitting = true;
           return client.decideLessonProposal(proposal.id, decision);
         })
@@ -854,6 +881,7 @@ export class BoardView {
           if (result.incomplete === true) {
             current.inFlight = null;
             current.decisionSubmitting = false;
+            current.pendingDecision = null;
             current.recorded = decision;
             current.message =
               `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded, but finishing it hit a problem` +
@@ -861,25 +889,32 @@ export class BoardView {
             this.rerenderOwner();
             return;
           }
-          // Success is NOT completion — the row closes only when the
-          // authoritative snapshot carries the resolution (any device). Ask
-          // for that snapshot now rather than wait for a push.
+          // A successful response confirms this recorded choice, but only
+          // the authoritative snapshot closes the row. Releasing the local
+          // lock still leaves the opposite choice disabled via `recorded`.
+          current.inFlight = null;
+          current.decisionSubmitting = false;
+          current.pendingDecision = null;
+          current.recorded = decision;
+          current.review = null;
+          current.message = `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded; the board is refreshing.`;
+          this.rerenderOwner();
           client.wake();
         })
         .catch((error: unknown) => {
           if (!currentAction()) return;
           current.inFlight = null;
           current.decisionSubmitting = false;
-          // A changed or decided proposal must be loaded again before any
-          // retry can rely on its previously displayed text.
-          if (error instanceof BoardApiError &&
-            ['proposal_stale', 'proposal_decided', 'proposal_mismatch'].includes(error.code ?? '')) current.review = null;
-          // Gone, or an outcome nobody confirmed: maybe decided here (a
-          // lost reply) or on another device — refresh, so the snapshot
-          // shows what actually happened. A recorded intent is kept.
-          const proven = error instanceof BoardApiError &&
-            ['proposal_stale', 'proposal_decided', 'proposal_mismatch'].includes(error.code ?? '');
-          if (!proven) client.wake();
+          // Never reuse review text after a failed submission. An ambiguous
+          // result keeps its original choice as the only retryable action;
+          // proven stale/mismatch refusals explicitly release that intent.
+          current.review = null;
+          const provenNotApplied = error instanceof BoardApiError &&
+            ['proposal_stale', 'proposal_mismatch'].includes(error.code ?? '');
+          if (provenNotApplied) current.pendingDecision = null;
+          // A refusal or lost reply needs an authoritative catch-up; the
+          // pending-choice fence remains until that read confirms a result.
+          client.wake();
           current.message = describeDecisionFailure(error, current.recorded);
           this.rerenderOwner();
         });
@@ -2925,6 +2960,8 @@ interface ProposalRowState {
   actionGeneration: number;
   inFlight: 'accept' | 'reject' | null;
   decisionSubmitting: boolean;
+  /** Submitted intent preserved while its outcome is ambiguous. */
+  pendingDecision: 'accept' | 'reject' | null;
   /** A decision the server recorded but has not finished (202). */
   recorded: 'accept' | 'reject' | null;
   message: string | null;

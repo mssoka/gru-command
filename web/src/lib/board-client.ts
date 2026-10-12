@@ -487,26 +487,32 @@ export class BoardClient {
   /** The pending Book of Lessons proposal, for the owner's review. */
   async getLessonProposal(signal?: AbortSignal): Promise<LessonProposalView> {
     const request = new AbortController();
+    let deadlineExpired = false;
+    const timeoutMessage = `lesson proposal review timed out after ${HTTP_REQUEST_DEADLINE_MS / 1000} seconds`;
+    let rejectAborted!: (error: Error) => void;
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAborted = reject; });
+    const onAbort = (): void => {
+      rejectAborted(deadlineExpired ? new Error(timeoutMessage) : new DOMException('aborted', 'AbortError'));
+    };
+    request.signal.addEventListener('abort', onAbort, { once: true });
     const abortFromCaller = (): void => request.abort();
     if (signal?.aborted) request.abort();
     else signal?.addEventListener('abort', abortFromCaller, { once: true });
-    let deadlineExpired = false;
     const deadline = setTimeout(() => {
       deadlineExpired = true;
       request.abort();
     }, HTTP_REQUEST_DEADLINE_MS);
     try {
-      const proposal = await this.api<unknown>('/api/lessons/proposal', request.signal);
+      const proposal = await Promise.race([
+        this.api<unknown>('/api/lessons/proposal', request.signal),
+        aborted,
+      ]);
       if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
       return proposal;
-    } catch (error) {
-      if (deadlineExpired) {
-        throw new Error(`lesson proposal review timed out after ${HTTP_REQUEST_DEADLINE_MS / 1000} seconds`, { cause: error });
-      }
-      throw error;
     } finally {
       clearTimeout(deadline);
       signal?.removeEventListener('abort', abortFromCaller);
+      request.signal.removeEventListener('abort', onAbort);
     }
   }
 
