@@ -42,7 +42,7 @@ function runTool(root: string) {
 
 describe('prune-stale-dist', () => {
   it('audits every live compiler output name in the finite runtime catalog', () => {
-    const outputs = readdirSync(join(repoRoot, 'src'), { recursive: true })
+    const outputs = readdirSync(join(repoRoot, 'src'), { recursive: true, encoding: 'utf8' })
       .filter((path) => path.endsWith('.ts') && !path.endsWith('.d.ts'))
       .map((path) => `dist/${path.slice(0, -3)}.js`);
     const unaudited = outputs.filter((path) => !PUBLIC_REVIEW_EXECUTABLE_PATHS.has(path));
