@@ -1616,6 +1616,40 @@ describe('chat server (real sockets, stub Gru)', () => {
   });
 });
 
+describe('chat server — failed control outcomes are durable (GH-105)', () => {
+  it('logs a failed compact as a replayable notice while the requester keeps its immediate result', async () => {
+    const h = await makeHarness();
+    try {
+      const writer = await authedClient(h.port);
+      writer.send('establish', 'establish-g8');
+      await writer.waitFor(isTurnEndFrame, 'established turn');
+      h.handle.nextCompactError = 'provider failure: quota exhausted';
+      writer.control('compact', 'failed-compact-g8');
+      const result = await writer.waitFor(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'failed-compact-g8',
+        'compact failure result',
+      );
+      expect(result).toMatchObject({ ok: false, code: 'failed' });
+      await pollUntil(
+        () => h.frameLog.history.some((frame) => frame.type === 'notice'),
+        'logged failed-control notice',
+      );
+      const logged = h.frameLog.history.find((frame) => frame.type === 'notice') as { text: string };
+      expect(logged.text).toBe('⚠️ compact context failed: provider failure: quota exhausted');
+      // Reload / full replay rebuilds it from the durable log.
+      const replay = await authedClient(h.port);
+      await replay.waitForCount(1 + h.frameLog.highWaterSeq);
+      expect(replay.frames.some((f) => f.type === 'notice' && String((f as { text?: string }).text).includes('compact context failed'))).toBe(true);
+      // The result itself stays ephemeral (never replayed).
+      expect(replay.frames.some((f) => f.type === 'control_result')).toBe(false);
+      await writer.close();
+      await replay.close();
+    } finally {
+      await h.close();
+    }
+  });
+});
+
 describe('chat server — supervision integration (E7)', () => {
   it('surfaceNotice logs + broadcasts a notice frame the web validator accepts', async () => {
     const harness = await makeHarness();
@@ -3404,6 +3438,48 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
+  it('records owner presence on an accepted turn with no awareness block (GH-119)', async () => {
+    const presence: number[] = [];
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => null,
+        commit: () => { throw new Error('no block to commit'); },
+        recordOwnerPresence: () => { presence.push(presence.length); },
+      },
+    });
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('plain message', 'm1');
+      await done;
+      expect(presence).toEqual([0]);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('does not record presence when the awareness layer failed to prepare (GH-119)', async () => {
+    const presence: number[] = [];
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => { throw new Error('ledger offline'); },
+        commit: () => {},
+        recordOwnerPresence: () => { presence.push(1); },
+      },
+    });
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('plain message', 'm1');
+      await done;
+      expect(presence).toEqual([]);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('wakeAwareness starts a turn from the injected block plus the wake instruction', async () => {
     const injection = sampleInjection();
     const commits: AwarenessInjection[] = [];
@@ -3427,6 +3503,35 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
         harness.frameLog.history.some((frame) => frame.type === 'turn' && frame.state === 'start'),
       ).toBe(true);
       expect(outcomes).toEqual([{ ok: true }]);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('logs the accepted wake context as a replayable service notice, never the instruction (GH-114)', async () => {
+    const injection = sampleInjection();
+    const harness = await makeHarness({
+      awareness: { prepare: () => injection, commit: () => {} },
+    });
+    try {
+      const live = await authedClient(harness.port);
+      harness.chat.wakeAwareness();
+      await pollUntil(() => harness.handle.calls.length === 1, 'awareness wake turn');
+      await pollUntil(
+        () => harness.frameLog.history.some((frame) => frame.type === 'notice'),
+        'wake context notice',
+      );
+      const logged = harness.frameLog.history.find((frame) => frame.type === 'notice') as { text: string };
+      expect(logged.text).toContain('Wake context');
+      expect(logged.text).toContain('job j1: working → in-review');
+      expect(logged.text).not.toContain(AWARENESS_WAKE_INSTRUCTION);
+      expect(logged.text).not.toContain('[gru awareness · service context');
+      // A fresh page replays it from the durable log.
+      const replay = await authedClient(harness.port);
+      await replay.waitForCount(1 + harness.frameLog.highWaterSeq);
+      expect(replay.frames.some((f) => f.type === 'notice' && String((f as { text?: string }).text).includes('Wake context'))).toBe(true);
+      await live.close();
+      await replay.close();
     } finally {
       await harness.close();
     }
