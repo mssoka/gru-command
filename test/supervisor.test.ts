@@ -1261,6 +1261,12 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         expect(sleeper.delays).toEqual([]); // never retry on a fatal session
         expect(f.rig.registry.spawnCalls).toHaveLength(1); // never blindly restart past the provider wall
         expect(f.replacement.disposed).toBe(true);
+        const rearmed = new FakeHandle('minion', f.original.id, '/fixture/wall-rearmed.jsonl');
+        f.rig.registry.spawnImpl = async () => rearmed;
+        const notice = f.rig.notificationsOfKind(`supervision.provider-wall.${f.original.id}.quota_wall`)[0]!;
+        f.rig.supervisor.onNotificationAcked(notice.id);
+        await flushMicrotasks();
+        expect(rearmed.promptCalls).toEqual([{ text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` }]);
       } finally { f.rig.dispose(); vi.useRealTimers(); }
     }
   });
@@ -1289,6 +1295,58 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         expect(successor.promptCalls).toEqual([]);
       } finally { f.rig.dispose(); vi.useRealTimers(); }
     }
+  });
+
+  it('quarantines its exact published result if a synchronous observer spends native authority', async () => {
+    for (const cleanupFails of [false, true]) {
+      vi.useFakeTimers();
+      const f = await deferredDispatchRestart();
+      try {
+        f.rig.registry.onAgentEvent((envelope) => {
+          if (envelope.phase === 'spawned' && envelope.handle === f.replacement)
+            f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'synchronous native supersession', briefing: null });
+        });
+        if (cleanupFails) f.replacement.dispose = async () => { throw new Error('published cleanup refused'); };
+        f.releaseSpawn(f.replacement);
+        await flushMicrotasks();
+        expect(f.replacement.promptCalls).toEqual([]);
+        expect(f.rig.supervisor.viewFor(f.replacement.id)).toBeNull();
+        expect(f.rig.registry.spawnCalls).toHaveLength(1);
+        if (cleanupFails) {
+          expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('cleanup unconfirmed');
+          expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')).toHaveLength(1);
+        } else {
+          expect(f.replacement.disposed).toBe(true);
+          expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+        }
+      } finally { f.rig.dispose(); vi.useRealTimers(); }
+    }
+  });
+
+  it('gives a delayed native same-id successor its own watching controller after old cleanup rejects', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart(true);
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'delayed native successor', briefing: null });
+      f.replacement.dispose = async () => { throw new Error('old cleanup refused'); };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks(); // old rung/flight has completely settled
+      const successor = new FakeHandle('minion', f.original.id, '/fixture/late-native.jsonl');
+      f.rig.registry.adopt(successor);
+      f.rig.api.registerAgent({ id: successor.id, role: 'minion', jobId: f.jobId, sessionFile: successor.sessionFile });
+      successor.pendingTurnSnapshot = { text: 'new native briefing', owner: 'native-successor' };
+      successor.setState('streaming');
+      successor.emit({ type: 'turn_start' });
+      expect(f.rig.supervisor.viewFor(successor.id)).toMatchObject({ state: 'watching', openTurn: true });
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('cleanup unconfirmed');
+      const recovered = new FakeHandle('minion', 'recovered-late-native', successor.sessionFile);
+      f.rig.registry.spawnImpl = async () => recovered;
+      f.rig.advance(60);
+      await flushMicrotasks();
+      expect(recovered.promptCalls).toEqual([{ text: 'new native briefing', owner: 'native-successor' }]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('cleanup unconfirmed');
+      expect(f.replacement.disposed).toBe(false);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
   it('preserves an independently adopted same-id owner stop when the stale rung finishes', async () => {

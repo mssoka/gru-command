@@ -175,6 +175,26 @@ describe('registry publication and production consumer custody (GH-280)', () => 
     } finally { await h.dispose(); }
   });
 
+  it('replays an accepted startup fatal through the actual registry before ever prompting the failed handle', async () => {
+    const h = fixture({ sameId: true });
+    try {
+      const failed = await h.start();
+      h.controls[1]!.emit({ type: 'error', error: 'accepted startup transport died', fatal: true });
+      expect(h.envelopes.some((envelope) => envelope.handle === failed)).toBe(false);
+      h.releaseTurn.resolve();
+      h.releaseSpawn.resolve();
+      await flush();
+      expect(h.envelopes.some((envelope) => envelope.handle === failed && envelope.phase === 'event' &&
+        envelope.event?.type === 'error' && envelope.event.fatal)).toBe(true);
+      expect(h.controls[1]!.prompts).toEqual([]);
+      expect(failed.cessationEvidence?.()).toBe('ceased');
+      expect(h.controls).toHaveLength(3);
+      expect(h.controls[2]!.prompts).toEqual(['original dispatch briefing']);
+      expect(h.supervisor.viewFor('worker-3')).toMatchObject({ state: 'watching', openTurn: false });
+      expect(h.ledger.getAgent(failed.id)?.state).toBe('disposed');
+    } finally { await h.dispose(); }
+  });
+
   it('retains a native same-id successor born after stale creation while stale cleanup is still pending', async () => {
     const h = fixture({ sameId: true, holdCleanup: true, holdThirdBirth: true, holdSecondBirth: true });
     let routing: ReturnType<typeof rebriefFreshMinion> | null = null;

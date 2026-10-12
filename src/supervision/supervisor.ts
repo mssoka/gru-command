@@ -246,6 +246,8 @@ interface RestartFlight {
   unsubscribe: (() => void) | null;
   superseded: boolean;
   pendingError: Extract<RuntimeEvent, { type: 'error' }> | null;
+  /** Canonical adapter event; its observer may run after registry forwarding. */
+  pendingErrorSource: Extract<RuntimeEvent, { type: 'error' }> | null;
 }
 
 interface RejectedRestartCleanup {
@@ -404,6 +406,7 @@ export class Supervisor {
    * ownership must still fence the captured job, including when disposal
    * rejects after the registry has already removed the handle. */
   private readonly rejectedRestartCleanup = new Map<AgentHandle, RejectedRestartCleanup>();
+  private readonly rejectedRestartControllers = new WeakSet<SupervisedAgent>();
   /** Rung ownership survives a newer same-id controller replacing its index. */
   private readonly restartingAgents = new Map<SupervisedAgent, RestartFlight>();
   /** Held startup failures must retain their synchronous pending-turn evidence. */
@@ -839,8 +842,9 @@ export class Supervisor {
               nextClass !== 'authentication_wall' && nextClass !== 'quota_wall' ? previous : event;
             const fatal = (previous?.fatal ?? false) || event.fatal;
             const deferred = fatal && !selected.fatal ? { ...selected, fatal: true } : selected;
-            const snapshot = this.restartErrorSnapshots.get(selected);
-            if (deferred !== selected && snapshot !== undefined) this.restartErrorSnapshots.set(deferred, snapshot);
+            // Look up this canonical event only after all adapter subscribers
+            // have run. A merged clone must never outrun synchronous custody.
+            flight.pendingErrorSource = selected === previous ? flight.pendingErrorSource ?? selected : selected;
             flight.pendingError = deferred;
             break;
           }
@@ -896,9 +900,12 @@ export class Supervisor {
     const role = handle?.role ?? envelope?.role;
     if (agentId === undefined || role === undefined) return false;
     let existing = this.agents.get(agentId);
-    const flight = existing === undefined ? undefined : this.restartingAgents.get(existing);
+    const existingHandle = existing?.handle;
+    const flight = existing === undefined ? undefined : this.restartingAgents.get(existing) ??
+      (existingHandle == null ? undefined : [...this.restartingAgents.values()].find((item) => item.handle === existingHandle));
     if (existing !== undefined && handle !== null && handle !== existing.handle &&
-      (flight !== undefined ? flight.handle !== handle : existing.backoffTimer !== null)) {
+      (this.rejectedRestartControllers.has(existing) ||
+        (flight !== undefined ? flight.handle !== handle : existing.backoffTimer !== null))) {
       // A native successor owns a NEW controller even when its logical id
       // is unchanged. The old coroutine must never settle its retry/stop.
       if (flight !== undefined) flight.superseded = true;
@@ -1791,7 +1798,7 @@ export class Supervisor {
     }
     agent.inRestart = true;
     const flight: RestartFlight = { authority: null, handle: null, publish: null, unsubscribe: null,
-      superseded: false, pendingError: null };
+      superseded: false, pendingError: null, pendingErrorSource: null };
     this.restartingAgents.set(agent, flight);
     agent.state = 'restarting';
     try {
@@ -1814,8 +1821,11 @@ export class Supervisor {
       const handle = flight.handle;
       const current = handle === null ? undefined : this.agents.get(handle.id);
       if (!this.disposed && handle !== null && current?.handle === handle && !current.breakerOpen && flight.pendingError !== null) {
-        const snapshot = this.restartErrorSnapshots.get(flight.pendingError);
-        if (snapshot !== undefined) current.pendingRecovery = snapshot;
+        const snapshot = this.restartErrorSnapshots.get(flight.pendingErrorSource ?? flight.pendingError);
+        if (snapshot !== undefined) {
+          this.restartErrorSnapshots.set(flight.pendingError, snapshot);
+          current.pendingRecovery = snapshot;
+        }
         this.onEnvelope({ handle, agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile,
           phase: 'event', event: flight.pendingError });
       }
@@ -1986,8 +1996,11 @@ export class Supervisor {
         agent.state = 'watching';
         flight.publish?.();
         // Synchronous observers may have installed a newer controller/stop.
-        if (flight.superseded || this.agents.get(spawned.id)?.handle !== spawned || agent.breakerOpen ||
-          !this.recoveryAuthorityCurrent(agent, restartAuthority)) return;
+        if (flight.superseded || this.agents.get(spawned.id)?.handle !== spawned || agent.breakerOpen) return;
+        if (!this.recoveryAuthorityCurrent(agent, restartAuthority)) {
+          await this.rejectRestartReplacement(agent, spawned, reason, restartAuthority);
+          return;
+        }
         this.log('info', 'agent restarted', {
           agent_id: agent.agentId,
           reason,
@@ -2051,6 +2064,7 @@ export class Supervisor {
     const { jobId } = authority;
     const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, disposalAcknowledged: false, notificationId: null };
     this.rejectedRestartCleanup.set(spawned, cleanup);
+    this.rejectedRestartControllers.add(agent);
     const observed = this.agents.get(spawned.id);
     if (observed?.handle === spawned) {
       this.clearRateLimitRetry(observed, 'superseded');
@@ -2099,7 +2113,7 @@ export class Supervisor {
           routing: 'needs-owner',
           severity: 'error',
           title: `Superseded minion ${spawned.id}: cleanup is unconfirmed`,
-          detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused before adoption, but cleanup is unconfirmed: ${cleanupError}. ` +
+          detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused automatic recovery, but cleanup is unconfirmed: ${cleanupError}. ` +
             'Producer ownership remains unknown. Confirm cleanup before retiring or resuming the lane; no automatic restart is authorized.',
           agentId: agent.agentId,
         });
