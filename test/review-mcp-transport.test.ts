@@ -185,7 +185,8 @@ describe('review MCP bridge: join, retention and explicit abort', () => {
       name: 'perkins_probe',
       description: 'probe',
       inputSchema: { type: 'object' },
-      execute: async (input) => {
+      execute: async (rawInput) => {
+        const input = rawInput as Record<string, unknown>;
         const label = String(input['label']);
         executions.set(label, (executions.get(label) ?? 0) + 1);
         if (label === 'wave') await gate.promise;
@@ -224,7 +225,8 @@ describe('review MCP bridge: join, retention and explicit abort', () => {
       name: 'perkins_probe',
       description: 'probe',
       inputSchema: { type: 'object' },
-      execute: async (input) => {
+      execute: async (rawInput) => {
+        const input = rawInput as Record<string, unknown>;
         const n = Number(input['n']);
         executions.set(n, (executions.get(n) ?? 0) + 1);
         return { text: '' };
@@ -248,7 +250,8 @@ describe('review MCP bridge: join, retention and explicit abort', () => {
       name: 'perkins_probe',
       description: 'probe',
       inputSchema: { type: 'object' },
-      execute: async (input) => {
+      execute: async (rawInput) => {
+        const input = rawInput as Record<string, unknown>;
         const label = String(input['label']);
         executions.set(label, (executions.get(label) ?? 0) + 1);
         // Empty text: only the structured details carry weight.
@@ -273,7 +276,8 @@ describe('review MCP bridge: join, retention and explicit abort', () => {
       name: 'perkins_probe',
       description: 'probe',
       inputSchema: { type: 'object' },
-      execute: async (input) => {
+      execute: async (rawInput) => {
+        const input = rawInput as Record<string, unknown>;
         if (input['fail'] === true) {
           throw new Error('boom');
         }
