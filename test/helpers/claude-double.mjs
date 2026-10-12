@@ -40,6 +40,8 @@
  *   CLAUDE_DOUBLE_COMPACT_MALFORMED_RESULT=1 omit required result fields
  *   CLAUDE_DOUBLE_COMPACT_HOLD_FILE=/path wait during /compact until disposed
  *   CLAUDE_DOUBLE_WORKFLOW_CANDIDATE=1 emit one security finding plus verifier response
+ *   CLAUDE_DOUBLE_GRU_ACT={baseUrl,token,detail} on a wake prompt, POST the
+ *                               notification disposition itself (Gru-authored action)
  */
 import process from 'node:process';
 import { Buffer } from 'node:buffer';
@@ -363,6 +365,30 @@ async function run() {
     out(init);
   } else {
     out(initFrame());
+  }
+
+  const gruAct = process.env['CLAUDE_DOUBLE_GRU_ACT'];
+  if (gruAct !== undefined && prompt.includes('[gru awareness · service context') &&
+      prompt.includes('started by the service wake policy')) {
+    // GH-124: the MODEL's turn performs the authorized disposition itself,
+    // through the live HTTP API, exactly as a tool-capable Gru would.
+    const spec = JSON.parse(gruAct);
+    // Mailbox-delivered wakes carry the real notification ids inside the item
+    // JSON; legacy notes carry `- <icon> [<id>]`.
+    const mailboxItem = /^- \[mailbox:[^\]]+\] (\{.*\})$/m.exec(prompt)?.[1];
+    const id = mailboxItem !== undefined
+      ? JSON.parse(mailboxItem).notificationIds?.[0]
+      : /^- \S+ \[([^\]]+)\]/m.exec(prompt)?.[1];
+    if (id === undefined) throw new Error('wake prompt carried no notification id to disposition');
+    const response = await fetch(`${spec.baseUrl}/api/notifications/${id}/disposition`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${spec.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ detail: spec.detail }),
+    });
+    if (response.status !== 200) throw new Error(`disposition failed: ${response.status} ${await response.text()}`);
+    await emitToolTurn('Bash');
+    out(resultFrame(`dispositioned ${id}`, false));
+    return;
   }
 
   if (prompt === '/compact') {

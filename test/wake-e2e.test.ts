@@ -7,7 +7,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { WebSocket } from 'ws';
 import { afterAll, describe, expect, it } from 'vitest';
-import { pickFreePort, startRealService, type RealServiceHandle } from './helpers/real-service.mjs';
+import { pickFreePort, REAL_SERVICE_TOKEN, startRealService, type RealServiceHandle } from './helpers/real-service.mjs';
 
 /**
  * Wake-on-alert e2e (owner ruling 2026-09-23): an action-required
@@ -96,6 +96,56 @@ describe('wake-on-alert real service (offline)', () => {
     // Co-tenant boot headroom (see helpers/real-service.mjs): this case
     // boots its own real service inside the test.
   }, 90_000);
+
+  it('a Gru-authored action: the wake turn itself dispositions the alert, durably attributed to gru (GH-124)', async () => {
+    // OFFLINE proof only: the model double performs the disposition inside
+    // the accepted wake turn. This is NOT the live post-roll acceptance gate
+    // (real benign event, real model, receipts), which stays separate.
+    const home = mkdtempSync(join(tmpdir(), 'gru-wake-act-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-wake-act-space-'));
+    const db = new LedgerDb(home);
+    const seed = new LedgerApi(db.handle);
+    const alert = seed.recordNotification({ id: 'gru-act-alert', kind: 'test.act', routing: 'action-required', severity: 'error', title: 'Gru must disposition this itself' });
+    db.close();
+    const port = await pickFreePort();
+    const detail = 'Gru opened a repair lane from inside the wake turn';
+    try {
+      service = await startRealService({
+        port, home, workspace, notifyWake: 'action-required', requireWebDist: false,
+        extraEnv: { CLAUDE_DOUBLE_GRU_ACT: JSON.stringify({ baseUrl: `http://127.0.0.1:${port}`, token: REAL_SERVICE_TOKEN, detail }) },
+      });
+      const { socket, frames } = await authedSocket(service);
+      try {
+        await waitForFrame(frames, (frame) => frame.type === 'turn' && frame.state === 'start', 'wake turn start');
+        await waitForFrame(frames, (frame) => frame.type === 'turn' && frame.state === 'end', 'wake turn end');
+        // The tool line proves a Gru turn acted; no owner/user prompt was sent.
+        expect(frames.some((frame) => frame.type === 'tool')).toBe(true);
+        expect(frames.some((frame) => frame.type === 'user')).toBe(false);
+        const board = await fetch(`${service.baseUrl}/api/board`, { headers: { Authorization: `Bearer ${service.token}` } });
+        const row = ((await board.json()) as { notifications: { id: string; resolvedBy?: string }[] }).notifications
+          .find((entry) => entry.id === alert.id);
+        expect(row).toMatchObject({ resolvedBy: 'gru' });
+      } finally { socket.close(); }
+      await service.stop();
+      service = null;
+      const reread = new LedgerDb(home);
+      try {
+        const history = new LedgerApi(reread.handle);
+        // Durable action record, attributed to Gru, carrying Gru's own detail.
+        const resolved = history.listEventsAfter(0, { kinds: ['notification.resolved'] });
+        expect(resolved).toHaveLength(1);
+        expect(resolved[0]!.payload).toMatchObject({ id: alert.id, by: 'gru', detail });
+        expect(history.getNotification(alert.id)).toMatchObject({ resolvedBy: 'gru' });
+        // No owner prompt: nothing was escalated to needs-owner.
+        expect(history.listNotifications({ routing: 'needs-owner', limit: 10 })).toEqual([]);
+      } finally { reread.close(); }
+    } finally {
+      await service?.stop();
+      service = null;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it('refused foreign-listener startup never consumes a seeded wake', async () => {
     const home = mkdtempSync(join(tmpdir(), 'gru-wake-refused-'));
