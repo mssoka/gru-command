@@ -686,6 +686,26 @@ function emptySourceState(): RepoSourceState {
   };
 }
 
+const ROOT_RESOLUTION_TIMEOUT = Symbol('root resolution timeout');
+
+async function resolveBeforeDeadline<T>(
+  work: () => T | Promise<T>,
+  timeoutMs: number,
+): Promise<T | typeof ROOT_RESOLUTION_TIMEOUT> {
+  if (timeoutMs <= 0) return ROOT_RESOLUTION_TIMEOUT;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(work),
+      new Promise<typeof ROOT_RESOLUTION_TIMEOUT>((resolveTimeout) => {
+        timer = setTimeout(() => resolveTimeout(ROOT_RESOLUTION_TIMEOUT), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 export interface ManagedRepoOverviewOptions {
   /** Configured workspace root containing selected project directories. */
   readonly workspaceRoot: string;
@@ -855,6 +875,7 @@ export class ManagedRepoOverviewTracker {
     const nextStates = new Map<string, RepoSourceState>();
     const resolveDeadline = this.now() + REPO_OVERVIEW_RESOLVE_BUDGET_MS;
     let resolveBudgetSpent = false;
+    let rootResolutionTimedOut = false;
     // Root validation and provider refresh share one rotation point. The
     // next pass starts validating where the prior provider work resumes, so
     // a root that was deferred from provider calls cannot land in the other
@@ -904,7 +925,7 @@ export class ManagedRepoOverviewTracker {
         }
         nextStates.set(name, row);
       };
-      if (this.now() > resolveDeadline) {
+      if (rootResolutionTimedOut || this.now() > resolveDeadline) {
         if (!resolveBudgetSpent) {
           this.log('warn', 'repo overview: origin-resolution budget spent — remaining repositories keep their prior state', {
             budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
@@ -912,12 +933,29 @@ export class ManagedRepoOverviewTracker {
           });
           resolveBudgetSpent = true;
         }
+        rootResolutionTimedOut = true;
         unreadable(true);
         continue;
       }
       let selectedPath: ManagedRepoPath;
       try {
-        selectedPath = await this.resolveRepoPath(this.opts.workspaceRoot, name);
+        const pendingPath = await resolveBeforeDeadline(
+          () => this.resolveRepoPath(this.opts.workspaceRoot, name),
+          Math.max(0, resolveDeadline - this.now()),
+        );
+        if (pendingPath === ROOT_RESOLUTION_TIMEOUT || this.now() > resolveDeadline) {
+          attemptedResolutions += 1;
+          rootResolutionTimedOut = true;
+          resolveBudgetSpent = true;
+          const detail = 'root validation exceeded the origin-resolution budget';
+          this.log('warn', 'repo overview: root validation exceeded its deadline — retaining cached observation without provider polling', {
+            repo: name,
+            budgetMs: REPO_OVERVIEW_RESOLVE_BUDGET_MS,
+          });
+          unreadable(true, detail);
+          continue;
+        }
+        selectedPath = pendingPath;
       } catch (error) {
         attemptedResolutions += 1;
         const detail = messageOf(error).slice(0, 300);

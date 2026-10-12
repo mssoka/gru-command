@@ -186,10 +186,15 @@ async function interactiveAnswers(
   // Symlink entries stay excluded, matching repository setup's real-root boundary.
   const realCandidates = validCandidates.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
   const linked = validCandidates.filter((name) => !realCandidates.includes(name));
-  const unusableGitRoots = realCandidates.filter(
-    (name) => resolveManagedRepoPathSync(workspaceAbs, name).kind === 'unavailable',
+  const rootResults = new Map(
+    realCandidates.map((name) => [name, resolveManagedRepoPathSync(workspaceAbs, name)] as const),
   );
-  const found = realCandidates.filter((name) => !unusableGitRoots.includes(name));
+  const unusableGitRoots = realCandidates.filter((name) => rootResults.get(name)?.kind === 'unavailable');
+  const rootProbeFailures = realCandidates.flatMap((name) => {
+    const result = rootResults.get(name);
+    return result?.kind === 'error' ? [{ name, error: result.error }] : [];
+  });
+  const found = realCandidates.filter((name) => rootResults.get(name)?.kind === 'available');
   if (invalidNameCandidates.length > 0) {
     out.write('\nGit repository entries excluded from installer choices because their names are unsupported:\n');
     for (const { name, reason } of invalidNameCandidates) {
@@ -202,6 +207,15 @@ async function interactiveAnswers(
       out.write(
         `  ${JSON.stringify(displayRepositoryName(name))}: .git does not identify this exact usable repository root; ` +
           'repair Git metadata and rerun setup.\n',
+      );
+    }
+  }
+  if (rootProbeFailures.length > 0) {
+    out.write('\nGit repository entries excluded from installer choices because Git root validation failed:\n');
+    for (const { name, error } of rootProbeFailures) {
+      out.write(
+        `  ${JSON.stringify(displayRepositoryName(name))}: Git root probe failed: ` +
+          `${displayRepositoryName(error)}; verify Git access and metadata, then rerun setup.\n`,
       );
     }
   }
