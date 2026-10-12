@@ -13,6 +13,9 @@ import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import {
   BranchBusyError,
   findBusyLanes,
+  forceCoversBlocker,
+  snapshotForceAuthorization,
+  type ForceAuthorization,
   laneIsBusy,
   laneBranch,
   normalizeBranch,
@@ -2668,8 +2671,9 @@ export class WaveRunner {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     // Branch-idle still gates the freeze. A minion's own busy turn may
     // acknowledge an intent now; it is armed only after job.delivered.
+    let forceAuthorization: ForceAuthorization | undefined;
     try {
-      this.enforceBranchIdleForRequest(input);
+      forceAuthorization = this.enforceBranchIdleForRequest(input);
     } catch (error) {
       if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
         error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId) ||
@@ -2816,7 +2820,8 @@ export class WaveRunner {
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
     }
     const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel,
-      reviewThinkingLevel: result.reviewThinkingLevel });
+      reviewThinkingLevel: result.reviewThinkingLevel,
+      ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
 
@@ -3011,7 +3016,7 @@ export class WaveRunner {
      * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
     claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
-    this.enforceBranchIdleForRequest(input);
+    const forceAuthorization = this.enforceBranchIdleForRequest(input);
     let reviewModel: ReviewPreflightResult['reviewModel'];
     let reviewThinkingLevel: string | undefined;
     if (this.opts.reviewPreflight !== undefined) {
@@ -3023,7 +3028,8 @@ export class WaveRunner {
         reviewThinkingLevel = result.reviewThinkingLevel;
       }
     }
-    return this.beginPerkinsRound({ ...input, reviewModel, reviewThinkingLevel });
+    return this.beginPerkinsRound({ ...input, reviewModel, reviewThinkingLevel,
+      ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
   }
 
   private resolveReviewRequestRepo(input: { jobId: string }): string | null {
@@ -3044,20 +3050,22 @@ export class WaveRunner {
     jobId: string;
     targetRef?: string;
     force?: boolean;
-  }): void {
+  }): ForceAuthorization | undefined {
     const job = this.opts.ledger.getJob(input.jobId);
-    if (job === null) return;
+    if (job === null) return undefined;
     const jobLane = this.opts.worktrees
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job') ?? null;
-    if (jobLane === null) return;
-    this.enforceBranchIdle({
+    if (jobLane === null) return undefined;
+    const armed = this.enforceBranchIdle({
       job,
       jobLane,
       ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
       ...(input.force !== undefined ? { force: input.force } : {}),
       phase: 'arm',
     });
+    // #267: what a force authorizes is the work present at THIS arm.
+    return input.force === true ? snapshotForceAuthorization(this.opts.ledger, armed.blockers) : undefined;
   }
 
   /** Branch-idle guard for one review target (rule 2026-09-23): resolve the
@@ -3135,6 +3143,8 @@ export class WaveRunner {
      * (working|blocked → in-review): the flip is bookkeeping and must not
      * mask the lane it moved. */
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
+    /** A forced check covers only the work its arm snapshot holds (#267). */
+    forceAuthorization?: ForceAuthorization;
   }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] } {
     const { targetBranch, blockers } = this.branchIdleBlockers(input);
     // A retirement hold is a fresh-authorization boundary, not ordinary
@@ -3144,7 +3154,8 @@ export class WaveRunner {
     const held = blockers.some((blocker) =>
       blocker.revision !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
     if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
-    const forced = input.force === true && !held;
+    const forced = input.force === true && !held && (input.forceAuthorization === undefined ||
+      blockers.every((blocker) => forceCoversBlocker(this.opts.ledger, input.forceAuthorization!, blocker)));
     this.opts.ledger.appendCustomEvent({
       kind: forced ? 'branch-idle.forced' : 'branch-idle.refused',
       jobId: input.job.id,
@@ -3173,6 +3184,9 @@ export class WaveRunner {
     reviewThinkingLevel?: string;
     /** The automatic admission retry this round carries out. */
     admissionRetry?: AdmissionRetry;
+    /** What a forced request authorized at its original arm (#267): the
+     * freeze and post-probe checks cover only that work. In memory only. */
+    forceAuthorization?: ForceAuthorization;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     if (this.roundAdmission.has(input.jobId)) throw new RoundAdmissionInProgress(input.jobId);
@@ -4024,6 +4038,9 @@ export class WaveRunner {
     reviewThinkingLevel?: string;
     /** The automatic admission retry this round carries out. */
     admissionRetry?: AdmissionRetry;
+    /** What a forced request authorized at its original arm (#267): the
+     * freeze and post-probe checks cover only that work. In memory only. */
+    forceAuthorization?: ForceAuthorization;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     // R7-14: the delivery THIS round reviews — fixed before any await, so a
@@ -4225,6 +4242,7 @@ export class WaveRunner {
         jobLane: jobWorktree,
         ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
         ...(input.force !== undefined ? { force: input.force } : {}),
+        ...(input.force === true ? { forceAuthorization: input.forceAuthorization ?? new Map() } : {}),
         phase: 'freeze',
         roundId: round.id,
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
@@ -4382,8 +4400,12 @@ export class WaveRunner {
         const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
         // A pending material correction is never covered by a force audit
         // (owner rule 2), even on a job whose other busy fact was audited.
-        const unaudited = afterProbe.blockers.filter((blocker) => blocker.revision !== undefined ||
-          !idle.blockers.some((audited) => audited.jobId === blocker.jobId));
+        // #267: only the work present at the original arm is covered — a
+        // new repair, directive, re-brief or verification on an audited job
+        // is a new generation and never authorized.
+        const authorization = input.forceAuthorization ?? new Map();
+        const unaudited = afterProbe.blockers.filter((blocker) =>
+          !forceCoversBlocker(this.opts.ledger, authorization, blocker));
         if (unaudited.length > 0) {
           this.opts.ledger.appendCustomEvent({
             kind: 'branch-idle.refused', jobId: job.id, roundId: round.id,

@@ -8723,6 +8723,40 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     }
   });
 
+  it('a forced review authorizes only the work present at its arm: the same job\'s NEXT repair — landing during setup or during the probe — is refused busy, not waved through as already audited (#267)', async () => {
+    for (const phase of ['setup', 'probe'] as const) {
+      const f = await transientFixture(`force-generation-${phase}`);
+      const escalations: string[] = [];
+      // Repair A is open at the arm: the lane is busy and the force audits it.
+      f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-a' } });
+      // A delivers and a NEW repair B starts on the same job.
+      const replaceGeneration = (): void => {
+        settleLane(f.ledger, f.jobId);
+        f.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: 'repair-b' } });
+      };
+      const wave = new WaveRunner({
+        ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+        prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100],
+        ...(phase === 'setup' ? { reviewPreflight: async () => { replaceGeneration(); return { ok: true as const, failures: [] }; } } : {}),
+        reviewFreezeObserver: () => { if (phase === 'probe') setTimeout(replaceGeneration, 300); },
+        escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      });
+      try {
+        rmSync(f.flag);
+        writeFileSync(f.slow, '');
+        await expect(wave.requestReview({ jobId: f.jobId, force: true }), phase).rejects.toThrow(/is busy/u);
+      } finally {
+        f.restorePath();
+        await wave.shutdown();
+      }
+      const rounds = f.ledger.listRounds(f.jobId);
+      expect(rounds.every((round) => round.status === 'aborted'), phase).toBe(true);
+      expect(f.ledger.listAgents().filter((agent) => agent.roundId !== null), phase).toEqual([]);
+      expect(kinds(f.ledger, f.jobId, 'branch-idle.refused').at(-1)?.roundId, phase).toBe(rounds.at(-1)!.id);
+      expect(escalations, phase).toEqual([]);
+    }
+  });
+
   it('a fresh request refused while a retry waits keeps it — same attempt and due time — so neither the retry nor the final escalation is lost (R7-11)', async () => {
     const { ledger, bus, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('takeover');
     const escalations: string[] = [];
