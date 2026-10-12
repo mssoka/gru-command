@@ -1651,7 +1651,14 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       const outcome = await outcomePromise;
       expect(outcome.kind).toBe('completed');
       if (outcome.kind !== 'completed') return;
-      expect(row(outcome.view, 'alpha').error).toContain('root validation exceeded the origin-resolution budget');
+      const alpha = row(outcome.view, 'alpha');
+      expect(alpha.linked).toBe(false);
+      expect(alpha.linkReason).toBe('origin remote could not be read yet');
+      expect(alpha.freshness).toBe('unchecked');
+      expect(alpha.checkedAt).toBeNull();
+      expect(alpha.lastAttemptAt).toBeNull();
+      expect(alpha.error).toBeNull();
+      expect(isValidSnapshot(validBoardSnapshot(outcome.view))).toBe(true);
       expect(api.calls).toHaveLength(0);
 
       alphaStalls = false;

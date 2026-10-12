@@ -153,11 +153,11 @@ export function managedRepoNameError(name: string): string | null {
     return 'must not contain control, format, or line-separator characters';
   }
   if (name.endsWith('.') || name.endsWith(' ')) return 'must not end with a dot or space';
+  if (name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) {
+    return 'must be a plain directory name under workspace_root';
+  }
   if (name.startsWith('.')) {
     return 'must not start with a dot; choose a visible directory name under workspace_root';
-  }
-  if (name.includes('/') || name.includes('\\') || name.includes('\0')) {
-    return 'must be a plain directory name under workspace_root';
   }
   if (['*', '?', '[', ']', '{', '}'].some((character) => name.includes(character))) {
     return 'must not contain wildcard characters';
