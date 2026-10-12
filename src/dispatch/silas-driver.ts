@@ -6,6 +6,7 @@ import type { SilasConfig } from '../config.js';
 import type { EventBus } from '../events/bus.js';
 import type {
   AgentRecord,
+  DecisionRecord,
   DirectiveRequestRecord,
   EventRecord,
   JobRecord,
@@ -329,15 +330,16 @@ export interface DigestLedger {
   hasUnsettledVerificationRun(jobId: string): boolean;
   listProviderWaits?(opts?: { status?: string }): readonly unknown[];
   listPendingProviderRecoveries?(): readonly unknown[];
-  /** Active decision rows (issue #218): the sweep gate wakes on a passed
-   * `recheckAt` even when the digest fingerprint is unchanged. Optional
-   * because the digest itself never reads decisions. */
+  /** Active decision rows (issue #218): exact verification-failure
+   * dismissals retire repair attention, never verification debt. The sweep
+   * gate also wakes on a passed `recheckAt`. An absent reader grants no
+   * dismissal. */
   listDecisions?(opts?: {
     readonly subject?: string;
     readonly activeOnly?: boolean;
     readonly limit?: number;
     readonly offset?: number;
-  }): readonly { readonly recheckAt: string | null }[];
+  }): readonly Pick<DecisionRecord, 'id' | 'decision' | 'covers' | 'basisFingerprint' | 'recheckAt'>[];
 }
 
 /** Blockers of one round, with an explicit loud note instead of a silent
@@ -2030,10 +2032,47 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       (jobSeqUnchanged(row.jobId) &&
        input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length === 0 &&
        input.ledger.listPendingRebriefs({ jobId: row.jobId }).length === 0));
+  // GH-302: only actionable repairs suppress corrective verification. Read
+  // exact scope/run dispositions at this final, no-await boundary, once per
+  // job and through every page. Other scopes are independent; the generic
+  // subject/signal covering query deliberately has different semantics.
+  const failureDecisions = new Map<string, Map<string, Pick<DecisionRecord, 'id' | 'decision' | 'recheckAt'>>>();
+  const dispositionNow = now();
+  const failureAttention = (failure: VerificationFailureRow): readonly VerificationFailureRow[] => {
+    if (failure.scope === null || failure.runId === null || input.ledger.listDecisions === undefined) return [failure];
+    let decisions = failureDecisions.get(failure.jobId);
+    if (decisions === undefined) {
+      decisions = new Map();
+      const pageSize = 500;
+      pages: for (let offset = 0;; offset += pageSize) {
+        const page = input.ledger.listDecisions({ subject: `job:${failure.jobId}`, activeOnly: true, limit: pageSize, offset });
+        for (const decision of page) {
+          if (!decision.covers.includes('verification-failure')) continue;
+          // A newer ANY-basis decision cannot authorize dismissal of an
+          // older exact failure. Preserve that fence, never borrow it.
+          if (decision.basisFingerprint === null) break pages;
+          if (!decisions.has(decision.basisFingerprint)) decisions.set(decision.basisFingerprint, decision);
+        }
+        if (page.length < pageSize) break;
+      }
+      failureDecisions.set(failure.jobId, decisions);
+    }
+    const decision = decisions.get(`verification-failure:${failure.scope}@${failure.runId}`);
+    if (decision?.decision !== 'dismissed') return [failure];
+    if (decision.recheckAt === null) return [];
+    const recheck = Date.parse(decision.recheckAt);
+    if (!Number.isFinite(recheck)) {
+      // Corrupt dismissal evidence fails closed for THIS repair, loudly,
+      // without stranding unrelated jobs by failing the whole digest.
+      return [{ ...failure, detail: `${failure.detail}; decision "${decision.id}" has an unparseable recheck_at "${decision.recheckAt}" — correct or clear the decision before reusing its dismissal` }];
+    }
+    return recheck > dispositionNow ? [] : [failure];
+  };
+  const verificationFailures = digest.verificationFailures.filter(continuationAllowed).flatMap(failureAttention);
   return {
     ...digest,
     verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
-    verificationFailures: digest.verificationFailures.filter(continuationAllowed),
+    verificationFailures,
     verificationWaits: digest.verificationWaits.filter(continuationAllowed),
     minionErrors: digest.minionErrors.filter(continuationAllowed),
     providerRecoveryPending: digest.providerRecoveryPending.filter((row) => {
@@ -2050,9 +2089,10 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       return job !== null && job.prUrl === null;
     }),
     verificationsOwed: digest.verificationsOwed.filter((row) => {
-      // A failed run on this head owes a REPAIR (verificationFailures), not
-      // another verification of the same bytes.
-      if (digest.verificationFailures.some((failure) => failure.jobId === row.jobId && failure.head === row.head)) return false;
+      // An unresolved failure on this head owes a REPAIR, not another
+      // verification of the same bytes. Exact attention dismissal never
+      // clears the ledger's corrective verification debt or FAILED receipt.
+      if (verificationFailures.some((failure) => failure.jobId === row.jobId && failure.head === row.head)) return false;
       if (!continuationAllowed(row) || !jobSeqUnchanged(row.jobId) || verificationInFlight(input.ledger, row.jobId) ||
           input.ledger.listPendingDirectives({ jobId: row.jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
           input.ledger.listPendingRebriefs({ jobId: row.jobId }).length > 0) return false;

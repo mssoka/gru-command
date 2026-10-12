@@ -217,7 +217,15 @@ latest revision → verify → fresh review. The service enforces it centrally.
   admitted the corrected work, later ordinary deliveries keep today's behavior (no
   verification may be in flight). This debt is a busy fact, so owner `force` may override
   it; it never overrides a pending revision. A pass re-offers a review request that was
-  waiting on it.
+  waiting on it. An active `dismissed` decision for `verification-failure` on
+  `job:<id>`, bound to the exact `verification-failure:<scope>@<run_id>` basis,
+  retires that run's repair attention only. Independent scopes retain their own
+  exact dispositions, but a newer ANY-basis `verification-failure` decision fences
+  older exact dismissals; an ANY-basis dismissal cannot retire a specific run.
+  Cleared or expired exact decisions and newer failures reopen repair.
+  When no unresolved same-head repair remains, the full Silas digest still offers
+  `verificationsOwed`. Dismissal never rewrites FAILED receipts or grants review:
+  the unchanged corrective-verification gate remains until eligible proof exists.
 - **Supersession.** Accepting a material amendment supersedes any review that owns the lane.
   A queued round is withdrawn, or a running round and its specialists are cancelled.
   `round.superseded` is recorded first, with the settled specialist checkpoints. Partial
