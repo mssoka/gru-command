@@ -1456,6 +1456,77 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
     }
   });
 
+  it('re-fences a pre-spawn re-arm failure through the authenticated disposition route', async () => {
+    let disposition: ((id: string) => ReturnType<Supervisor['onNotificationDisposed']>) | null = null;
+    const harness = await boot('board-test-token', {
+      onNotificationDisposition: (id) => (disposition === null ? undefined : disposition(id)),
+    });
+    const registryTap: { listener: ((envelope: AgentEventEnvelope) => void) | null } = { listener: null };
+    let spawnCalls = 0;
+    const registry: SupervisorRegistry = {
+      onAgentEvent: (listener) => {
+        registryTap.listener = listener;
+        return () => { registryTap.listener = null; };
+      },
+      getHandle: () => null,
+      spawn: async () => {
+        spawnCalls += 1;
+        throw new Error('pre-spawn notification failure must prevent spawn');
+      },
+      disposeHandle: async () => {},
+    };
+    const supervisor = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+      registry,
+      ledger: harness.api,
+      notifications: harness.notifications,
+      tickMs: 5_000,
+    });
+    disposition = bindSupervisorNotificationDisposition(supervisor);
+    const originalPost = harness.notifications.post.bind(harness.notifications);
+    harness.notifications.post = ((input: Parameters<NotificationCenter['post']>[0]) => {
+      if (input.kind === 'supervision.restart') throw new Error('restart notice unavailable');
+      return originalPost(input);
+    }) as typeof harness.notifications.post;
+    try {
+      supervisor.start();
+      harness.api.addJob({ id: 'pre-spawn-rearm-job', repo: 'fixture', title: 'pre-spawn re-arm failure' });
+      harness.api.setJobStatus('pre-spawn-rearm-job', 'working');
+      harness.api.registerAgent({ id: 'pre-spawn-rearm-agent', role: 'minion', jobId: 'pre-spawn-rearm-job' });
+      registryTap.listener?.({ agentId: 'pre-spawn-rearm-agent', role: 'minion', sessionFile: null, phase: 'spawned' });
+      const internals = supervisor as unknown as { agents: Map<string, unknown>; tripBreaker(agent: unknown): void };
+      const agent = internals.agents.get('pre-spawn-rearm-agent');
+      if (agent === undefined) throw new Error('supervisor did not adopt the fixture agent');
+      internals.tripBreaker(agent);
+      const stop = harness.api.listNotifications({ limit: 50 }).find(
+        (row) => row.agentId === 'pre-spawn-rearm-agent' && row.kind === 'supervision.breaker',
+      );
+      if (stop === undefined) throw new Error('supervisor did not post the breaker control');
+
+      const response = await postJson(
+        harness.port,
+        `/api/notifications/${encodeURIComponent(stop.id)}/disposition`,
+        'board-test-token',
+        { detail: 'retry after the restart notice failure' },
+      );
+      expect(response).toMatchObject({ status: 200, body: { rearm: 'accepted' } });
+      expect(harness.api.getNotification(stop.id)?.resolvedAt).not.toBeNull();
+      await vi.waitFor(() =>
+        expect(supervisor.viewFor('pre-spawn-rearm-agent')).toMatchObject({ state: 'stopped', breakerOpen: true }),
+      );
+      expect(spawnCalls).toBe(0);
+      const retryControl = harness.api.listNotifications({ limit: 50, unackedOnly: true }).find(
+        (row) => row.agentId === 'pre-spawn-rearm-agent' && row.kind === 'supervision.rearm-fenced',
+      );
+      expect(retryControl).toMatchObject({ routing: 'action-required', ackedAt: null, resolvedAt: null });
+      expect(retryControl?.id).not.toBe(stop.id);
+      expect(harness.api.latestSupervisionEvent('pre-spawn-rearm-agent')?.kind).toBe('supervision.rearm-fenced');
+    } finally {
+      supervisor.dispose();
+      await harness.close();
+    }
+  });
+
   it('an alert that re-arms nothing reports the record-only outcome (rearmed: false)', async () => {
     const { port, api, close } = await boot('board-test-token', {
       onNotificationDisposition: () => ({ ok: true, rearmed: false }),

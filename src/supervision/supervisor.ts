@@ -1784,8 +1784,14 @@ export class Supervisor {
       await this.restartRungInner(agent, reason, opts);
     } catch (error) {
       // A supervision bug or ledger hiccup must never kill the service
-      // (unhandled rejections are fatal in main). Settle the rung.
-      agent.state = agent.breakerOpen ? 'stopped' : 'watching';
+      // (unhandled rejections are fatal in main). An accepted re-arm is
+      // different: if the guarded rung fails before retry scheduling, restore
+      // the stop with a fresh control instead of reporting a watching lane.
+      if (opts.rearmFence === true) {
+        this.fenceRearm(agent, opts.rearmNotificationId ?? null, `restart rung failed: ${String(error)}`);
+      } else {
+        agent.state = agent.breakerOpen ? 'stopped' : 'watching';
+      }
       this.log('error', 'restart rung threw — settling', {
         agent_id: agent.agentId,
         reason,

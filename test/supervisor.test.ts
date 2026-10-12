@@ -3590,7 +3590,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       internals.fenceRearm(agent, stop.id, 'park appeared during re-arm');
       expect(agent.pendingRearmFenceAlert?.reason).toContain('park appeared');
       expect(rig.api.durableSupervisionStops().get('pending-control-agent')).toMatchObject({
-        notificationId: stop.id,
+        notificationId: null,
         pendingFenceReason: expect.stringContaining('park appeared'),
       });
 

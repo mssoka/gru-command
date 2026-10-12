@@ -281,10 +281,26 @@ describe('recordNotificationDecision — the side-effect boundary', () => {
       resolvedBy: 'producer',
     });
     expect(codeOf(() => rig.center.decide(id, 'keep', 'web'))).toBe('decision_recorded');
-    const resolvedUndecided = seedDecision(rig);
-    rig.api.resolveNotificationById(resolvedUndecided, 'producer');
-    expect(codeOf(() => rig.center.decide(resolvedUndecided, 'approve', 'web'))).toBe('not_open');
+    const unresolvedDecision = seedDecision(rig);
+    expect(codeOf(() => rig.api.resolveNotificationById(unresolvedDecision, 'producer'))).toBe('undecided');
+    expect(rig.api.getNotification(unresolvedDecision)).toMatchObject({ resolvedAt: null, decidedAt: null });
+    expect(rig.center.decide(unresolvedDecision, 'approve', 'web')).toMatchObject({
+      decidedOption: 'approve',
+      resolvedAt: null,
+    });
     expect(rig.center.decide('missing', 'approve', 'web')).toBeNull();
+  });
+
+  it('generic prefix and exact-kind resolution preserve unanswered typed owner decisions', () => {
+    const prefixRig = boot();
+    const prefixId = seedDecision(prefixRig);
+    expect(prefixRig.api.resolveNotificationsByKindPrefix('gru.owner-escalation', 'producer')).toEqual([]);
+    expect(prefixRig.api.getNotification(prefixId)).toMatchObject({ resolvedAt: null, decidedAt: null });
+
+    const exactRig = boot();
+    const exactId = seedDecision(exactRig);
+    expect(exactRig.api.resolveNotificationsByExactKind('gru.owner-escalation', 'producer')).toEqual([]);
+    expect(exactRig.api.getNotification(exactId)).toMatchObject({ resolvedAt: null, decidedAt: null });
   });
 });
 
@@ -497,7 +513,9 @@ describe('updateNotificationDecisionOptions — the supported discussion bridge'
     rig.center.decide(decidedId, 'go', 'owner');
     expect(codeOf(() => rig.api.updateNotificationDecisionOptions(decidedId, options, 'gru'))).toBe('decision_recorded');
     const resolvedId = seedDiscussion(rig);
-    rig.api.resolveNotificationById(resolvedId, 'producer');
+    rig.api.updateNotificationDecisionOptions(resolvedId, options, 'gru');
+    rig.center.decide(resolvedId, 'go', 'owner');
+    rig.api.resolveOwnerDecision(resolvedId, 'discussion follow-through completed');
     expect(codeOf(() => rig.api.updateNotificationDecisionOptions(resolvedId, options, 'gru'))).toBe('not_open');
     expect(rig.api.updateNotificationDecisionOptions('missing', options, 'gru')).toBeNull();
   });

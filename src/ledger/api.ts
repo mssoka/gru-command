@@ -4548,15 +4548,18 @@ export class LedgerApi {
 
   /**
    * Resolve product incidents without forging a human acknowledgement.
-   * Every changed row emits an event so connected status/notification
-   * surfaces refresh immediately.
+   * Unanswered typed owner decisions are deliberately excluded; they remain
+   * open for the guarded decision/follow-through path. Every changed row emits
+   * an event so connected status/notification surfaces refresh immediately.
    */
   resolveNotificationsByKindPrefix(prefix: string, by: string): readonly NotificationRecord[] {
     if (prefix === '' || by === '') throw new Error('resolution prefix/by must be non-empty');
     return this.transaction(() => {
       const escaped = prefix.replace(/[\\%_]/g, '\\$&');
       const rows = this.db
-        .prepare("SELECT * FROM notifications WHERE kind LIKE ? ESCAPE '\\' AND resolved_at IS NULL ORDER BY ts, id")
+        .prepare(
+          "SELECT * FROM notifications WHERE kind LIKE ? ESCAPE '\\' AND resolved_at IS NULL AND NOT (routing = 'needs-owner' AND decision_json IS NOT NULL AND decided_at IS NULL) ORDER BY ts, id",
+        )
         .all(`${escaped}%`) as Row[];
       const resolved: NotificationRecord[] = [];
       for (const raw of rows) {
@@ -4578,12 +4581,15 @@ export class LedgerApi {
 
   /** Resolve every open row of an EXACT kind (no LIKE wildcard semantics):
    * producer-evidence settlement where one kind must never bleed into a
-   * lookalike kind that shares its prefix (e.g. `triage` vs `triage-extra`). */
+   * lookalike kind that shares its prefix (e.g. `triage` vs `triage-extra`).
+   * Unanswered typed owner decisions remain open for the guarded follow-through. */
   resolveNotificationsByExactKind(kind: string, by: string): readonly NotificationRecord[] {
     if (kind === '' || by === '') throw new Error('resolution kind/by must be non-empty');
     return this.transaction(() => {
       const rows = this.db
-        .prepare('SELECT * FROM notifications WHERE kind = ? AND resolved_at IS NULL ORDER BY ts, id')
+        .prepare(
+          "SELECT * FROM notifications WHERE kind = ? AND resolved_at IS NULL AND NOT (routing = 'needs-owner' AND decision_json IS NOT NULL AND decided_at IS NULL) ORDER BY ts, id",
+        )
         .all(kind) as Row[];
       const resolved: NotificationRecord[] = [];
       for (const raw of rows) {
@@ -4603,7 +4609,6 @@ export class LedgerApi {
     });
   }
 
-  /** Resolve one exact incident ID without acknowledging it for the owner. */
   /** Replace an OPEN notification's detail (and, when given, title) in place — id, acknowledgement
    * and routing unchanged (a long-running incident refreshing its latest
    * cause). A resolved or missing row is left as-is and returned (or null). */
@@ -4618,11 +4623,20 @@ export class LedgerApi {
     });
   }
 
+  /** Resolve one exact incident ID without acknowledging it for the owner.
+   * Generic producer settlement cannot hide an unanswered typed owner decision;
+   * it must be recorded and then resolved through the guarded follow-through path. */
   resolveNotificationById(id: string, by: string): NotificationRecord | null {
     if (by.trim() === '') throw new Error('resolution by must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null || current.resolvedAt !== null) return current;
+      if (current.routing === 'needs-owner' && current.decision !== null && current.decidedAt === null) {
+        throw new NotificationDecisionRefusal(
+          'undecided',
+          `notification "${id}" is an unanswered owner decision and cannot be resolved by a generic producer`,
+        );
+      }
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
         .run(nowIso(), by, id);
       this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by } });

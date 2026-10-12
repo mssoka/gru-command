@@ -2562,14 +2562,14 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const refused = {
       ackNotification: vi.fn(() => Promise.resolve()),
       markNotificationShown: vi.fn(() => Promise.resolve(true)),
-      decideNotification: vi.fn(() => Promise.reject(new BoardApiError('/decision', 400, 'unknown_option', 'that option is no longer supported'))),
+      decideNotification: vi.fn(() => Promise.reject(new BoardApiError('/decision', 400, 'bad_request', 'the request was malformed'))),
     } as unknown as import('../lib/board-client.js').BoardClient;
     const view3 = new BoardView(() => {}, refused);
     view3.render(snapshot({ notifications: [stop] }));
     const band3 = document.getElementById('board-owner')!;
     band3.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!.click();
     await vi.waitFor(() =>
-      expect(band3.querySelector('.board-notification__submission--refused')?.textContent).toContain('no longer supported'),
+      expect(band3.querySelector('.board-notification__submission--refused')?.textContent).toContain('the request was malformed'),
     );
     expect(band3.textContent).toContain('Not recorded');
     // Success → the server's authoritative row applies; the row stays
@@ -4401,7 +4401,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
     );
   });
 
-  it.each(['decision_recorded', 'not_open'] as const)(
+  it.each(['decision_recorded', 'not_open', 'unknown_option'] as const)(
     'a stale %s conflict refreshes shared owner and bell state before choices return',
     async (code) => {
       let resolveRefresh!: () => void;
@@ -4412,7 +4412,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
         ackNotification: vi.fn(() => Promise.resolve()),
         markNotificationShown: vi.fn(() => Promise.resolve(true)),
         decideNotification: vi.fn(() =>
-          Promise.reject(new BoardApiError('/decision', 409, code, 'the decision state changed')),
+          Promise.reject(new BoardApiError('/decision', code === 'unknown_option' ? 400 : 409, code, 'the decision state changed')),
         ),
         refetchSnapshot: vi.fn(() => refresh),
       } as unknown as import('../lib/board-client.js').BoardClient;
@@ -4441,11 +4441,23 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       const reconciled =
         code === 'decision_recorded'
           ? { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'other-view', decidedOption: 'keep' }
-          : { ...row, resolvedAt: '2026-01-01T00:10:00.000Z', resolvedBy: 'producer' };
-      view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: 0 }));
+          : code === 'not_open'
+            ? { ...row, resolvedAt: '2026-01-01T00:10:00.000Z', resolvedBy: 'producer' }
+            : {
+                ...row,
+                decision: {
+                  ...row.decision!,
+                  options: [{ id: 'revised', label: 'Revised choice', consequence: 'Use the authoritative choices.' }],
+                },
+              };
+      view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: code === 'not_open' ? 0 : 1 }));
       resolveRefresh();
       expect(band.querySelector('.board-notification__submission--reconciling')).toBeNull();
       expect(band.querySelector('[data-action-id="notif:shared-submit:option:approve"]')).toBeNull();
+      if (code === 'unknown_option') {
+        expect(band.querySelector('[data-action-id="notif:shared-submit:option:revised"]')).not.toBeNull();
+        expect(band.textContent).toContain('Revised choice');
+      }
     },
   );
 

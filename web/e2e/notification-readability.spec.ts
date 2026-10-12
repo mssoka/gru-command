@@ -1333,13 +1333,21 @@ test.describe('notification readability — fixed long-content fixtures', () => 
     const refreshGate = new Promise<void>((resolve) => {
       releaseRefresh = resolve;
     });
+    const seedSnapshot = fixtureSnapshot();
+    const authoritativeSnapshot = fixtureSnapshot({
+      notifications: seedSnapshot.notifications.map((notification) =>
+        notification.id === 'decision-1'
+          ? { ...notification, decidedAt: '2026-10-12T00:00:00.000Z', decidedBy: 'other-view', decidedOption: 'keep' }
+          : notification,
+      ),
+    });
     try {
-      const seed = await seedBoard(page, fixtureSnapshot());
+      const seed = await seedBoard(page, seedSnapshot);
       await pairAndOpenBoard(page);
       await page.route('**/api/board', async (route) => {
         refreshRequests += 1;
         await refreshGate;
-        await route.fulfill({ json: fixtureSnapshot() });
+        await route.fulfill({ json: authoritativeSnapshot });
       });
       await page.route('**/api/notifications/*/decision', (route) => {
         if (route.request().method() !== 'POST') return route.fallback();
@@ -1356,9 +1364,9 @@ test.describe('notification readability — fixed long-content fixtures', () => 
 
       const choice = page.locator('#board-owner [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
       await choice.click();
-      await expect(page.locator('#board-owner [data-notification-id="decision-1"] .board-notification__submission--reconciling')).toBeVisible();
-      await expect.poll(() => refreshRequests).toBe(1);
       await expect.poll(() => decisionPosts).toBe(1);
+      await expect.poll(() => refreshRequests).toBe(1);
+      await expect(page.locator('#board-owner [data-notification-id="decision-1"] .board-notification__submission--reconciling')).toBeVisible();
       const lockedChoice = page.locator('#board-owner [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
       await expect(lockedChoice).toHaveAttribute('aria-disabled', 'true');
       // A DOM mouse activation and real keyboard activation both reach the
@@ -1368,6 +1376,16 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       await page.keyboard.press('Enter');
       await page.keyboard.press('Space');
       expect(decisionPosts).toBe(1);
+      expect(seed.pageErrors).toEqual([]);
+
+      // The real BoardClient fetches the authoritative snapshot and delivers
+      // it through the production BoardView subscription. The new decision
+      // must replace the stale card and clear its reconciliation lock.
+      releaseRefresh?.();
+      const decisionCard = page.locator('#board-owner [data-notification-id="decision-1"]');
+      await expect(decisionCard.locator('.board-notification__decided')).toContainText('Keep the current approach');
+      await expect(decisionCard.locator('.board-notification__submission--reconciling')).toHaveCount(0);
+      await expect(decisionCard.locator('[data-action-id$=":option:approve"]')).toHaveCount(0);
       expect(seed.pageErrors).toEqual([]);
     } finally {
       releaseRefresh?.();

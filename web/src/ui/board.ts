@@ -346,10 +346,14 @@ export class BoardView {
     const previous = this.snapshot;
     this.snapshot = snapshot;
     // Submissions end only when the authoritative snapshot carries the
-    // outcome (or the row leaves the pending surfaces) — never on a push.
-    for (const [id] of [...this.decisionSubmissions]) {
+    // outcome, refreshes a stale option set, or removes the row from pending.
+    for (const [id, submission] of [...this.decisionSubmissions]) {
       const row = snapshot.notifications.find((notification) => notification.id === id);
-      if (row === undefined || row.resolvedAt !== null || (row.decidedAt !== null && row.decidedAt !== undefined)) {
+      const optionsRefreshed =
+        row !== undefined &&
+        submission.reconcileOptionsSignature !== null &&
+        decisionOptionsSignature(row.decision) !== submission.reconcileOptionsSignature;
+      if (row === undefined || row.resolvedAt !== null || (row.decidedAt !== null && row.decidedAt !== undefined) || optionsRefreshed) {
         this.decisionSubmissions.delete(id);
       }
     }
@@ -2458,6 +2462,7 @@ export class BoardView {
       generation: this.clientGeneration,
       phase: 'submitting',
       message: null,
+      reconcileOptionsSignature: null,
     };
     this.decisionSubmissions.set(item.id, submission);
     this.rerenderNotifications();
@@ -2473,15 +2478,18 @@ export class BoardView {
       .catch((error: unknown) => {
         if (submission.generation !== this.clientGeneration || this.decisionSubmissions.get(item.id) !== submission) return;
         // A conflict can mean the open card is stale because another view
-        // already recorded or resolved it. Do not offer the same dead-end
-        // choice: clear any local success override, lock both surfaces, and
-        // fetch authoritative board state. Ordinary refusals remain retryable;
+        // recorded/resolved it or changed a discussion's supported options.
+        // Do not offer a dead-end choice: clear any local success override,
+        // lock both surfaces, and fetch authoritative board state. Ordinary refusals remain retryable;
         // transport failures are still ambiguous and same-option retry-safe.
         if (
           error instanceof BoardApiError &&
-          (error.code === 'decision_recorded' || error.code === 'not_open')
+          (error.code === 'decision_recorded' || error.code === 'not_open' || error.code === 'unknown_option')
         ) {
           submission.phase = 'reconciling';
+          if (error.code === 'unknown_option') {
+            submission.reconcileOptionsSignature = decisionOptionsSignature(item.decision);
+          }
           submission.message = 'The decision changed elsewhere. Refreshing the board before showing current choices.';
           this.decisionOverrides.delete(item.id);
           this.rerenderNotifications();
@@ -2827,6 +2835,11 @@ interface DecisionSubmission {
   readonly generation: number;
   phase: 'submitting' | 'refused' | 'unconfirmed' | 'reconciling';
   message: string | null;
+  reconcileOptionsSignature: string | null;
+}
+
+function decisionOptionsSignature(decision: NotificationView['decision']): string {
+  return JSON.stringify(decision?.options.map(({ id, label, consequence }) => [id, label, consequence]) ?? []);
 }
 
 /** Owner-surface focus (FOR YOU band + bell): stable keys survive the
