@@ -6250,6 +6250,37 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     }
   });
 
+  it('aborts if an untracked file appears during a fallback turn without a ledger event (#188)', async () => {
+    let mutate = () => {};
+    const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
+    mutate = () => writeFileSync(join(h.repo.path, 'src/sneaky-untracked.ts'), 'export const sneaky = true;\n');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('working diff or HEAD changed');
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+  });
+
+  it('never reviews or passes a truncated working diff: oversize capture fails closed (#188)', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, 'src/huge.ts'), `export const huge = "${'x'.repeat(600 * 1024)}";\n`);
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain('no truncated review can pass');
+    expect(h.prompts).toEqual([]);
+    expect(h.spawnCwds).toEqual([]);
+  });
+
+  it('fails closed when the working diff cannot be captured at all (#188)', async () => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    writeFileSync(join(h.repo.path, '.git/index.lock'), '');
+    const outcome = await h.wave.runRound({ jobId: h.job.id });
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(h.prompts).toEqual([]);
+  });
+
   it('invalidates binary mutations even when their abbreviated Git blob identities collide', async () => {
     let mutate = () => {};
     const h = await makeProductionGateHarness({ findingToWrite: [], onPrompt: () => mutate() });
