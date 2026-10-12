@@ -1242,6 +1242,48 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
+  it('combines every probe outcome: a real branch move beats an operational failure, in either probe (#266)', () => {
+    const review = branchTargetReview('mixed-movement');
+    const headBinding = (remote: SourceMovement | null) => admissionPreflight(review, review.manifest.targetRef, { precomputedRemoteMovement: remote })
+      .missing.find((entry) => entry.input === 'head-binding');
+    // The local probe fails operationally (stopped); the remote proved the branch moved.
+    const restore = gitShim('status', 'echo "fatal: index file locked" >&2; exit 128');
+    try {
+      const moved = headBinding({ cause: 'target-moved', detail: 'origin advertises abc, frozen at def' });
+      expect(moved?.detail).toContain('target-moved: origin advertises abc');
+      expect(moved).not.toHaveProperty('retryable'); // a real move is final, not retryable
+      // Local operational failure alone stays transient; with a remote operational failure that did NOT prove stopped, it is final.
+      expect(headBinding(null)).toMatchObject({ retryable: true });
+      expect(headBinding({ cause: 'check-failed', detail: 'ls-remote hung up' })).not.toHaveProperty('retryable');
+      expect(headBinding({ cause: 'check-failed', detail: 'ls-remote hung up', stopped: true })).toMatchObject({ retryable: true });
+      // Both operational failures are both named.
+      expect(headBinding({ cause: 'check-failed', detail: 'ls-remote hung up', stopped: true })?.detail).toMatch(/index file locked.*ls-remote hung up/u);
+    } finally {
+      restore();
+    }
+  });
+
+  it('a cleanup veto from both probes names every unconfirmed process group, as structured metadata ahead of the detail (#266)', () => {
+    const review = branchTargetReview('two-groups');
+    const live = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockReturnValue(true);
+    try {
+      const result = admissionPreflight(review, review.manifest.targetRef, {
+        precomputedRemoteMovement: { cause: 'check-failed', detail: 'cleanup unconfirmed: process group 4242 still running — git ls-remote did not stop', cleanupUnconfirmed: true, processGroup: 4242 },
+      });
+      const entry = result.missing.find((candidate) => candidate.input === 'head-binding');
+      expect(entry).toMatchObject({ cleanupUnconfirmed: true });
+      expect(entry).not.toHaveProperty('retryable');
+      expect(entry?.processGroups).toHaveLength(2);
+      expect(entry?.processGroups).toContain(4242);
+      expect(entry?.detail.startsWith(`cleanup unconfirmed: process groups ${entry!.processGroups!.join(', ')} still running`)).toBe(true);
+      // The group ids survive in the refusal message even when the detail is cut.
+      const message = new ReviewAdmissionError(result.missing).message;
+      for (const group of entry!.processGroups!) expect(message).toContain(String(group));
+    } finally {
+      live.mockRestore();
+    }
+  });
+
   it('a group of zombies is not executing, but membership that cannot be read completely always is (R7-9, R8-3)', async () => {
     // `sh` forks a short child and execs into `sleep`, which never reaps it.
     const child = spawn('/bin/sh', ['-c', 'sleep 0.1 & exec sleep 30'], { detached: true, stdio: 'ignore' });
