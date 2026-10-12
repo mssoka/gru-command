@@ -6,7 +6,10 @@ command = "npm ci"
 full = "npm test"
 typecheck = "npm run typecheck"
 # GH-270: repository-routing regressions, through the authenticated scheduler.
-review-git-environment-red = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-git-environment.test.ts"
+review-git-environment-regressions = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-git-environment.test.ts"
+# Negative evidence: authentic fetched base with only the final regression suite
+# and its heavy-suite registration overlaid. Preserve the real nonzero outcome.
+review-git-environment-baseline = 'set -e; root="$PWD"; base=45f8d002b5e2622aae2a9364f974c68f74613975; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-gh270-baseline.XXXXXX"); git archive "$base" | tar -x -C "$d"; cp test/review-git-environment.test.ts "$d/test/review-git-environment.test.ts"; cp test/helpers/test-budgets.ts "$d/test/helpers/test-budgets.ts"; ln -s "$root/node_modules" "$d/node_modules"; printf "GH270 baseline source=%s candidate=%s snapshot=%s\n" "$base" "$(git rev-parse HEAD)" "$d"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; npx vitest run --config vitest.heavy.config.ts test/review-git-environment.test.ts'
 review-git-environment = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-git-environment.test.ts test/perkins-freeze-freshhead.test.ts test/branch-idle-guard.test.ts test/worktree-manager.test.ts test/perkins-builtin-wave.test.ts && npx vitest run test/suite-shape.test.ts test/test-budgets.test.ts"
 # GH-313 report custody: focused and fail-before scopes use the authenticated scheduler.
 report-handback = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/report-handback-mailbox.test.ts test/gru-mailbox.test.ts test/awareness.test.ts test/durable-reconcile.test.ts test/incident.test.ts test/ledger-obligations.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
