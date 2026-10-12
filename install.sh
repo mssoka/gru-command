@@ -12,8 +12,10 @@
 #                                    an owned installed service; when the
 #                                    unit is absent, register it (prompted;
 #                                    automatic with --no-interact or with
-#                                    no terminal; a decline prints the
-#                                    --service hint). Run from inside the
+#                                    no terminal; a decline, an unrecognized
+#                                    answer, or end-of-input at the prompt
+#                                    prints the --service hint; answers are
+#                                    case-insensitive). Run from inside the
 #                                    managed service (an agent-owned shell),
 #                                    the restart is delegated to
 #                                    `gru-service roll` — never unload/load:
@@ -57,7 +59,9 @@ ANSWERS_SET=0
 NO_INTERACT=0
 FORCE=0
 UPDATE_REQUESTED=0
-SERVICE_REGISTRATION_DECLINED=0
+# The caller's cwd at launch (before build_product cds into the checkout):
+# the post-update recovery hint is read by a human in THAT directory.
+LAUNCH_PWD="$PWD"
 LAUNCHCTL_BIN="${GRU_COMMAND_LAUNCHCTL:-launchctl}"
 SYSTEMCTL_BIN="${GRU_COMMAND_SYSTEMCTL:-systemctl}"
 
@@ -240,7 +244,8 @@ render_unit() {
   # Service managers do not inherit a shell's version-manager PATH. Put
   # the stable Node installation's bin first (npm lives beside Node), then
   # retain the install-time PATH for any other runtime CLIs.
-  local runtime_path="$(dirname "$NODE_BIN"):$PATH:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
+  local runtime_path=""
+  runtime_path="$(dirname "$NODE_BIN"):$PATH:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
   if [[ "$runtime_path" == *$'\n'* ]]; then
     err "PATH contains a newline which the unit renderer cannot escape"
     exit 1
@@ -550,12 +555,35 @@ build_product() {
   "$NODE_BIN" tools/verify-perkins-resource.mjs "$REPO_ROOT"
 }
 
+# Register (or refresh) the OS service through the one platform mechanism
+# shared by --service, the wizard, and the updater.
+install_service() {
+  case "$OS" in
+    darwin) install_launchd ;;
+    linux) install_systemd ;;
+  esac
+}
+
+# Map a register-prompt reply to register | decline | unrecognized.
+# Case-insensitive (bash 3.2 compatible: no ${var,,}); empty = default-Y.
+classify_register_reply() {
+  local reply
+  reply="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$reply" in
+    ""|y|yes) echo register ;;
+    n|no) echo decline ;;
+    *) echo unrecognized ;;
+  esac
+}
+
 # Absent-unit update path: ask before registering. Reads the controlling
 # terminal when stdin is a pipe (`cat install.sh | bash` must not eat the
 # script from stdin); with no terminal at all (cron/CI) the default-Y
 # answer applies — matching the --no-interact outcome — and is announced
-# on stderr, never silent. Returns 0 = register, 1 = declined. bash 3.2
-# compatible (macOS /bin/bash).
+# on stderr, never silent. End-of-input at a real prompt (Ctrl-D, closed
+# terminal) is NOT consent: it declines and says so. Returns 0 = register,
+# 1 = declined. No file descriptors are opened or closed, so a caller's own
+# descriptors are untouched. bash 3.2 compatible (macOS /bin/bash).
 prompt_register_service() {
   local reply=""
   local prompt="No service unit installed — register one now? [Y/n] "
@@ -564,19 +592,22 @@ prompt_register_service() {
     # keyboard, and a /dev/tty read can block forever on an agent pty.
     # Take the documented default (register) and say so — never silent.
     echo "install.sh: running inside the managed service with no human to prompt — auto-registering (pass --no-interact to acknowledge, or run ./install.sh --service later)" >&2
-    reply=""
   elif [[ -t 0 ]]; then
-    read -r -p "$prompt" reply || true
-  elif { exec 3< /dev/tty; } 2>/dev/null; then
-    read -r -p "$prompt" reply <&3 || true
-    exec 3<&-
+    if ! read -r -p "$prompt" reply && [[ -z "$reply" ]]; then
+      err "no answer (end of input) — not registering (./install.sh --service registers it later)"
+      return 1
+    fi
+  elif { : < /dev/tty; } 2>/dev/null; then
+    if ! read -r -p "$prompt" reply < /dev/tty && [[ -z "$reply" ]]; then
+      err "no answer (end of input) — not registering (./install.sh --service registers it later)"
+      return 1
+    fi
   else
     echo "install.sh: no terminal for the register prompt — auto-registering (pass --no-interact to acknowledge, or run ./install.sh --service later)" >&2
-    reply=""
   fi
-  case "$reply" in
-    ""|y|Y|yes|Yes|YES) return 0 ;;
-    n|N|no|No|nO|NO) return 1 ;;
+  case "$(classify_register_reply "$reply")" in
+    register) return 0 ;;
+    decline) return 1 ;;
     *)
       err "unrecognized answer '$reply' — not registering (./install.sh --service registers it later)"
       return 1
@@ -602,42 +633,14 @@ restart_owned_service_in_service() {
   "$NODE_BIN" "$cli" roll
 }
 
-restart_owned_service_if_present() {
-  local ownership
-  ownership="$(service_ownership)"
-  case "$ownership" in
-    absent)
-      # A configured instance without its unit is a broken install, not a
-      # clean state (live 2026-09-21: deleted plist, green run, dead
-      # service). Register through the same path the wizard uses; an
-      # explicit decline stays green but names the recovery command after
-      # completion. Owned/foreign handling below is unchanged.
-      if [[ "$NO_INTERACT" -eq 1 ]] || prompt_register_service; then
-        echo "no installed unit found — registering the Gru Command service…"
-        case "$OS" in
-          darwin) install_launchd ;;
-          linux) install_systemd ;;
-        esac
-      else
-        SERVICE_REGISTRATION_DECLINED=1
-      fi
-      ;;
-    foreign)
-      err "refusing to restart unrelated service unit: $(service_target)"
-      exit 1
-      ;;
-    owned)
-      if inside_managed_service_pgroup; then
-        restart_owned_service_in_service
-      else
-        echo "restarting owned Gru Command service…"
-        case "$OS" in
-          darwin) install_launchd ;;
-          linux) install_systemd ;;
-        esac
-      fi
-      ;;
-  esac
+# Restart an OWNED installed unit (the owned arm of the updater).
+restart_owned_service() {
+  if inside_managed_service_pgroup; then
+    restart_owned_service_in_service
+  else
+    echo "restarting owned Gru Command service…"
+    install_service
+  fi
 }
 
 run_setup() {
@@ -727,16 +730,43 @@ run_setup() {
   # A configured instance is an update, never a request to regenerate user
   # settings.
   if [[ "$source_update" -eq 1 && -f "$INSTANCE_DIR/config.toml" && "$ANSWERS_SET" -eq 0 && "$FORCE" -eq 0 ]]; then
-    restart_owned_service_if_present
+    # Service reconciliation is keyed on unit ownership. The updater never
+    # reads an --answers register_service key: --answers is rejected with
+    # --update, and any --answers/--force run is routed to the wizard before
+    # this branch (the wizard owns that key), so the two cannot disagree.
+    local registration_declined=0
+    case "$(service_ownership)" in
+      absent)
+        # A configured instance without its unit is a broken install, not a
+        # clean state (live 2026-09-21: deleted plist, green run, dead
+        # service). Register through the same path the wizard uses; an
+        # explicit decline stays green but names the recovery command after
+        # completion.
+        if [[ "$NO_INTERACT" -eq 1 ]] || prompt_register_service; then
+          echo "no installed unit found — registering the Gru Command service…"
+          install_service
+        else
+          registration_declined=1
+        fi
+        ;;
+      foreign)
+        err "refusing to restart unrelated service unit: $(service_target)"
+        exit 1
+        ;;
+      owned) restart_owned_service ;;
+    esac
     echo "update complete; existing config preserved: $INSTANCE_DIR/config.toml"
     # Completion honesty: after a decline nothing is installed or running.
-    # The hint stays actionable when cwd is not the checkout (piped re-exec).
-    if [[ "$SERVICE_REGISTRATION_DECLINED" -eq 1 ]]; then
+    # The hint must work from the directory the OPERATOR launched from —
+    # build_product has already cd'd into the checkout, so compare against
+    # the launch directory, not the current one (a piped re-exec from
+    # elsewhere gets the absolute path).
+    if [[ "$registration_declined" -eq 1 ]]; then
       local service_hint="./install.sh"
       # Same-file test (dev+ino), not a path compare: bash's REPO_ROOT and
-      # $PWD can disagree on symlink depth (macOS /var vs /private/var),
-      # and the hint only needs ./install.sh to be THE checkout's installer.
-      [[ "./install.sh" -ef "$REPO_ROOT/install.sh" ]] || service_hint="$REPO_ROOT/install.sh"
+      # the launch dir can disagree on symlink depth (macOS /var vs
+      # /private/var).
+      [[ "$LAUNCH_PWD/install.sh" -ef "$REPO_ROOT/install.sh" ]] || service_hint="$REPO_ROOT/install.sh"
       echo "no service installed or running — $service_hint --service registers it later"
     fi
     return 0
@@ -778,10 +808,7 @@ case "$MODE" in
       err "dist/main.js not found — run 'npm install && npm run build' in $REPO_ROOT first"
       exit 1
     fi
-    case "$OS" in
-      darwin) install_launchd ;;
-      linux) install_systemd ;;
-    esac
+    install_service
     ;;
   setup)
     run_setup

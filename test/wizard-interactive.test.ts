@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -216,6 +217,141 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(loadConfig({ GRU_COMMAND_HOME: instance })).toEqual(before);
     expect(readFileSync(document, 'utf-8')).toBe('# portable knowledge\n');
   }, 90_000);
+});
+
+async function holdPort(port = 0): Promise<{ server: Server; port: number }> {
+  const server = createServer();
+  server.listen(port, '127.0.0.1');
+  await new Promise<void>((ready) => server.once('listening', ready));
+  return { server, port: (server.address() as { port: number }).port };
+}
+async function releasePort(server: Server): Promise<void> {
+  await new Promise<void>((done) => server.close(() => done()));
+}
+const REUSE_PROMPT = 'Reuse them and skip the questions';
+
+describe.skipIf(!ptyCapable || ptySkipOptOut)('port conflicts do not cost the operator their answers (#33)', () => {
+  it('the port prompt rejects an occupied port immediately and re-prompts', async () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-port-prompt-');
+    const { server, port } = await holdPort();
+    try {
+      const { output, status } = ptyWizard([
+        { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' },
+        ...finishSteps().slice(0, 4),
+        { expect: PORT_PROMPT, send: String(port) },
+        { expect: PORT_PROMPT, send: '0' },
+        ...finishSteps().slice(5),
+      ], { GRU_COMMAND_HOME: instance });
+      expect(status, output).toBe(0);
+      expect(output).toContain(`port ${port} on 127.0.0.1 is already in use`);
+      expect(output).toContain('Choose another port');
+      expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toContain('port = 0');
+    } finally {
+      await releasePort(server);
+    }
+  }, 90_000);
+
+  it('an occupied configured port is surfaced BEFORE the first question', async () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-port-preflight-');
+    // Seed an instance config whose port is a real free port, then occupy it.
+    const probe = await holdPort();
+    const port = probe.port;
+    await releasePort(probe.server);
+    execFileSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--answers', JSON.stringify({ port, smoke: false })], {
+      env: { ...process.env, GRU_COMMAND_HOME: instance }, stdio: 'ignore',
+    });
+    const held = await holdPort(port);
+    try {
+      const { output, status } = ptyWizard([
+        { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' },
+        ...finishSteps().slice(0, 4),
+        { expect: PORT_PROMPT, send: '0' },
+        ...finishSteps().slice(5),
+      ], { GRU_COMMAND_HOME: instance }, ['--force']);
+      expect(status, output).toBe(0);
+      expect(output.indexOf('Heads up before you answer anything')).toBeGreaterThanOrEqual(0);
+      expect(output.indexOf('Heads up before you answer anything')).toBeLessThan(output.indexOf(WS_PROMPT));
+      expect(output).toContain(`port ${port} on 127.0.0.1 is already in use`);
+    } finally {
+      await releasePort(held.server);
+    }
+  }, 90_000);
+
+  it('an abort after collection saves the answers (0600) and the next run reuses them without re-asking', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-resume-');
+    // An existing config without --force aborts AFTER the full flow.
+    execFileSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--answers', JSON.stringify({ port: 0, smoke: false })], {
+      env: { ...process.env, GRU_COMMAND_HOME: instance }, stdio: 'ignore',
+    });
+    const first = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' },
+      { expect: RUNTIME_PROMPT, send: '' }, { expect: MODEL_PROMPT, send: 'resumed-model-x' },
+      ...finishSteps().slice(2),
+    ], { GRU_COMMAND_HOME: instance });
+    expect(first.status, first.output).toBe(1);
+    expect(first.output).toContain('refusing to overwrite existing');
+    expect(first.output).toContain('Your answers are saved');
+    const draft = join(instance, 'wizard-draft.json');
+    expect(statSync(draft).mode & 0o777).toBe(0o600);
+    expect(readFileSync(draft, 'utf-8')).toContain('resumed-model-x');
+
+    const second = ptyWizard([{ expect: REUSE_PROMPT, send: '' }], { GRU_COMMAND_HOME: instance }, ['--force']);
+    expect(second.status, second.output).toBe(0);
+    expect(second.output).not.toContain(WS_PROMPT);
+    expect(second.output).toContain('Setup complete');
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toContain('resumed-model-x');
+    expect(existsSync(draft)).toBe(false);
+  }, 120_000);
+
+  it('port-conflict abort keeps the draft; once the port is free the rerun completes with zero questions', async () => {
+    const instance = tempDir('gru-command-pty-port-resume-');
+    const { server, port } = await holdPort();
+    const draft = join(instance, 'wizard-draft.json');
+    writeFileSync(draft, JSON.stringify({
+      workspace_root: tempDir('gru-command-pty-port-resume-ws-'), repos: [], runtime: 'pi', model: 'default',
+      thinking_level: 'default', host: '127.0.0.1', port, token: 'draft-token', register_service: false, smoke: false,
+    }), { mode: 0o600 });
+    try {
+      const blocked = ptyWizard([{ expect: REUSE_PROMPT, send: '' }], { GRU_COMMAND_HOME: instance });
+      expect(blocked.status, blocked.output).toBe(1);
+      expect(blocked.output).toContain(`port ${port} on 127.0.0.1 is already in use`);
+      expect(blocked.output).toContain('Your answers are saved');
+      expect(existsSync(draft)).toBe(true);
+      expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+    } finally {
+      await releasePort(server);
+    }
+    const resumed = ptyWizard([{ expect: REUSE_PROMPT, send: '' }], { GRU_COMMAND_HOME: instance });
+    expect(resumed.status, resumed.output).toBe(0);
+    expect(resumed.output).not.toContain(WS_PROMPT);
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toContain(`port = ${port}`);
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toContain('draft-token');
+    expect(existsSync(draft)).toBe(false);
+  }, 120_000);
+
+  it('declining the reuse offer asks every question again; a malformed draft is named and discarded', () => {
+    const workspace = fixtureWorkspace();
+    const instance = tempDir('gru-command-pty-draft-decline-');
+    writeFileSync(join(instance, 'wizard-draft.json'), '{not json');
+    const malformed = ptyWizard([
+      { expect: 'Ignoring an unreadable saved draft', send: '' },
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps(),
+    ], { GRU_COMMAND_HOME: instance });
+    expect(malformed.status, malformed.output).toBe(0);
+    expect(existsSync(join(instance, 'wizard-draft.json'))).toBe(false);
+
+    const instance2 = tempDir('gru-command-pty-draft-decline2-');
+    writeFileSync(join(instance2, 'wizard-draft.json'), JSON.stringify({ workspace_root: workspace, port: 0, smoke: false }));
+    const declined = ptyWizard([
+      { expect: REUSE_PROMPT, send: 'n' },
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps(),
+    ], { GRU_COMMAND_HOME: instance2 });
+    expect(declined.status, declined.output).toBe(0);
+    expect(existsSync(join(instance2, 'wizard-draft.json'))).toBe(false);
+  }, 120_000);
 });
 
 describe('pty gate (W-A — no silent PTY skips)', () => {
