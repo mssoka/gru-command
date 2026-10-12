@@ -380,7 +380,7 @@ async function run() {
       ? JSON.parse(mailboxItem).notificationIds?.[0]
       : /^- \S+ \[([^\]]+)\]/m.exec(prompt)?.[1];
     if (id === undefined) throw new Error('wake prompt carried no notification id to disposition');
-    const response = await fetch(`${spec.baseUrl}/api/notifications/${id}/disposition`, {
+    const response = await globalThis.fetch(`${spec.baseUrl}/api/notifications/${id}/disposition`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${spec.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ detail: spec.detail }),
