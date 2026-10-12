@@ -2416,7 +2416,15 @@ export class GruAwareness {
     }
     if (this.wakeSink === null) return; // boot binds this later
     this.cancelWakeTimer();
-    this.activeWakeIds = [...this.pendingWakeIds].slice(0, this.limits.maxActionNotes);
+    // GH-116: machine stops lead the batch. Pending ids keep insertion order
+    // within a priority class (stable sort), so FYI/owner volume in all mode
+    // cannot starve an older action-required id behind five-minute spacing.
+    const priority = (id: string): number => this.attentionRow(id)?.routing === 'action-required' ? 0 : 1;
+    this.activeWakeIds = [...this.pendingWakeIds]
+      .map((id, index) => ({ id, index, rank: priority(id) }))
+      .sort((left, right) => left.rank - right.rank || left.index - right.index)
+      .slice(0, this.limits.maxActionNotes)
+      .map(({ id }) => id);
     // The batch is durably pending; charge the attempt only at actual chat
     // admission (a queued wake may cross into quiet hours before prompt()).
     this.persistWakeState();

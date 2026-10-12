@@ -2932,3 +2932,30 @@ describe('GH-119 (g23): an accepted block-free owner turn records presence', () 
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe('GH-116 (g20): all-mode FYI backlog cannot outrank machine stops', () => {
+  it('puts an older action-required id in the first eligible batch ahead of FYI volume', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    const machine = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old machine stop' });
+    for (let i = 0; i < 20; i += 1) passive.notifications.post({ kind: 'noise', routing: 'fyi', severity: 'info', title: `FYI ${i}` });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    passive.awareness.dispose();
+    const active = boot({ dir, wakeMode: 'all' });
+    expect(active.woke.length).toBeGreaterThan(0);
+    expect(active.wakeBlocks[0]).toContain(machine.id);
+    // Existing gates still hold: the first batch is still bounded.
+    expect(active.wakeBlocks[0]!.split('\n').filter((line) => line.includes('title="FYI')).length).toBeLessThan(8);
+  });
+
+  it('keeps machine ids ahead of FYI after a restart restores pending order', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    for (let i = 0; i < 9; i += 1) passive.notifications.post({ kind: 'noise', routing: 'fyi', severity: 'info', title: `FYI ${i}` });
+    const machine = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Late machine stop' });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    passive.awareness.dispose();
+    const active = boot({ dir, wakeMode: 'all' });
+    expect(active.wakeBlocks[0]).toContain(machine.id);
+  });
+});
