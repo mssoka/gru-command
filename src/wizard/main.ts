@@ -47,7 +47,7 @@ import {
   writeConfigText,
 } from './steps.js';
 import { validateRepositorySetup } from './repository-setup.js';
-import { resolveManagedRepoPathSync } from '../repos/managed-names.js';
+import { managedRepoNameError, resolveManagedRepoPathSync } from '../repos/managed-names.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -154,10 +154,20 @@ async function interactiveAnswers(
 
   const workspaceAbs = workspaceRoot.replace(/^~(?=\/|$)/, homedir());
   const discovered = discoverManagedRepos(workspaceAbs);
-  // Discovery supplies installer candidates only. Symlink entries stay
-  // excluded, matching repository setup's real-root validation boundary.
-  const found = discovered.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
-  const linked = discovered.filter((name) => !found.includes(name));
+  // Discovery supplies installer candidates only. Reject names that runtime
+  // management cannot safely represent before offering the default-all choice.
+  const invalidCandidates = discovered.flatMap((name) => {
+    const reason = managedRepoNameError(name);
+    return reason === null ? [] : [{ name, reason }];
+  });
+  const validCandidates = discovered.filter((name) => managedRepoNameError(name) === null);
+  // Symlink entries stay excluded, matching repository setup's real-root boundary.
+  const found = validCandidates.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
+  const linked = validCandidates.filter((name) => !found.includes(name));
+  if (invalidCandidates.length > 0) {
+    out.write('\nGit repository entries excluded from installer choices because their names are unsupported:\n');
+    for (const { name, reason } of invalidCandidates) out.write(`  ${JSON.stringify(name)}: ${reason}\n`);
+  }
   if (linked.length > 0) {
     out.write(`\nLinked repo entries excluded from installer choices: ${linked.join(', ')}.\n` +
       'Select a real directory under workspace_root; links stay unchanged.\n');

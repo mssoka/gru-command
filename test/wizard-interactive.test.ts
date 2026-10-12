@@ -104,6 +104,22 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
   }, 90_000);
 
+  it('installer default excludes Git candidates rejected by managed-name validation', () => {
+    const workspace = fixtureWorkspace();
+    const invalid = join(workspace, 'repo*');
+    mkdirSync(invalid);
+    execFileSync('git', ['-C', invalid, 'init', '-q']);
+    const instance = tempDir('gru-command-pty-invalid-candidate-');
+    const { output, status } = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps('n'),
+    ], { GRU_COMMAND_HOME: instance });
+
+    expect(status, output).toBe(0);
+    expect(output).toContain('"repo*": must not contain wildcard characters');
+    expect(output).toContain('Managed repositories selected: repo-a, repo-b');
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
+  }, 90_000);
+
   it('interactive reruns preserve the prior subset on Enter and persist an explicit changed choice', () => {
     const workspace = fixtureWorkspace();
     const instance = tempDir('gru-command-pty-managed-rerun-');
