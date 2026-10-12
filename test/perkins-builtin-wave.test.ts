@@ -6431,6 +6431,49 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     }
   });
 
+  it.each([
+    ['before', false],
+    ['after', true],
+  ] as const)('explicit abort %s an expired wait slice reports cancellation, disposes the session and leaves no timer or still-running event (#177)', async (_when, afterSlice) => {
+    const hold = { release: new Promise<void>(() => {}) };
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold, workerGate: gate });
+    const stillRunning = (): number => h.ledger.listEvents({ limit: 200 })
+      .filter((event) => (event.payload as { phase?: string }).phase === 'still-running').length;
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      if (afterSlice) {
+        await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+        expect(stillRunning()).toBe(1);
+      }
+      const reportedBefore = stillRunning();
+      await h.wave.shutdown();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain('review operation aborted');
+      expect(outcome.note).not.toMatch(/timed out|timeout/i);
+      expect(h.disposed).toEqual(['prod-minion-1']);
+      expect(h.prompts).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      // No timer survives and no further wait slice is ever reported.
+      // (shutdown() itself leaves only its own 5 s drain race timer; let it
+      // lapse, then nothing — notably no 15 min wait-slice timer — remains.)
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS * 3);
+      expect(stillRunning()).toBe(reportedBefore);
+      expect(h.ledger.listEvents({ limit: 200 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
   it('the production fallback review takes a worker pacing slot before it spawns', async () => {
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
