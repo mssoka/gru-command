@@ -1644,6 +1644,30 @@ interface ReviewOperation {
   settled: Promise<unknown>;
 }
 
+/** A review request (internal fields are never accepted from the public HTTP endpoint). */
+export interface ReviewRequestInput {
+    jobId: string;
+    targetRef?: string;
+    /** Internal: a clean-abort re-arm's request-time delivered head; the
+     * freeze boundary refuses when a newer delivery superseded it. */
+    boundDeliveredSha?: string;
+    lenses?: readonly string[];
+    noSpec?: boolean;
+    force?: boolean;
+    /** Authorized private evidence attachments (service upload identities). */
+    evidence?: readonly ReviewEvidenceRequest[];
+    /** Prior indexes the implementing minion claimed fixed (fix-directive
+     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
+    claimedFixedPriors?: readonly number[];
+    /** Worker tool handoff: acknowledge without waiting for its own turn. */
+    handoff?: boolean;
+    /** Internal replay marker; never accepted from the public HTTP endpoint. */
+    fromHandoff?: boolean;
+    /** Internal: the automatic admission retry this request carries out;
+     * never accepted from the public HTTP endpoint. */
+    admissionRetry?: AdmissionRetry;
+}
+
 export class WaveRunner {
   private readonly opts: WaveRunnerOptions;
   private readonly log: Log;
@@ -2646,28 +2670,20 @@ export class WaveRunner {
   /** Review-path selection (user amendment 2026-09-20): the fail-closed
    * four-leg pre-flight runs at request time. All legs pass -> Perkins
    * (the gate). Any leg failing -> the bmad-review fallback gate. */
-  async requestReview(input: {
-    jobId: string;
-    targetRef?: string;
-    /** Internal: a clean-abort re-arm's request-time delivered head; the
-     * freeze boundary refuses when a newer delivery superseded it. */
-    boundDeliveredSha?: string;
-    lenses?: readonly string[];
-    noSpec?: boolean;
-    force?: boolean;
-    /** Authorized private evidence attachments (service upload identities). */
-    evidence?: readonly ReviewEvidenceRequest[];
-    /** Prior indexes the implementing minion claimed fixed (fix-directive
-     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
-    claimedFixedPriors?: readonly number[];
-    /** Worker tool handoff: acknowledge without waiting for its own turn. */
-    handoff?: boolean;
-    /** Internal replay marker; never accepted from the public HTTP endpoint. */
-    fromHandoff?: boolean;
-    /** Internal: the automatic admission retry this request carries out;
-     * never accepted from the public HTTP endpoint. */
-    admissionRetry?: AdmissionRetry;
-  }): Promise<ReviewRequestOutcome> {
+  /** Every review request is tracked per job from entry until it settles
+   * (#268), so a due automatic admission retry sees one still in preflight. */
+  async requestReview(input: ReviewRequestInput): Promise<ReviewRequestOutcome> {
+    this.requestsInFlight.set(input.jobId, (this.requestsInFlight.get(input.jobId) ?? 0) + 1);
+    try {
+      return await this.performReviewRequest(input);
+    } finally {
+      const remaining = (this.requestsInFlight.get(input.jobId) ?? 1) - 1;
+      if (remaining <= 0) this.requestsInFlight.delete(input.jobId);
+      else this.requestsInFlight.set(input.jobId, remaining);
+    }
+  }
+
+  private async performReviewRequest(input: ReviewRequestInput): Promise<ReviewRequestOutcome> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     // Branch-idle still gates the freeze. A minion's own busy turn may
     // acknowledge an intent now; it is armed only after job.delivered.
@@ -3167,6 +3183,8 @@ export class WaveRunner {
   }
 
   private readonly roundAdmission = new Set<string>();
+  /** In-flight requestReview calls per job (#268), counted. */
+  private readonly requestsInFlight = new Map<string, number>();
 
   private async beginPerkinsRound(input: {
     jobId: string;
@@ -3302,7 +3320,9 @@ export class WaveRunner {
     if (deliverySeq !== retry.deliverySeq) return 'a newer delivery replaced the refused one';
     const rounds = this.opts.ledger.listRounds(job.id);
     if (rounds[rounds.length - 1]?.id !== retry.roundId) return 'a newer review round already started';
-    if (this.roundAdmission.has(job.id) || this.handoffs.has(job.id)) return 'another review request for the job is under way';
+    if (this.roundAdmission.has(job.id) || this.handoffs.has(job.id) || this.requestsInFlight.has(job.id)) {
+      return 'another review request for the job is under way';
+    }
     return null;
   }
 

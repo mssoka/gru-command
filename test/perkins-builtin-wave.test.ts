@@ -8757,6 +8757,46 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     }
   });
 
+  it('a retry that comes due while a fresh request is still in preflight is skipped with one FYI — never a second parallel request (#268)', async () => {
+    const f = await transientFixture('due-in-preflight');
+    const informs: string[] = [];
+    const escalations: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    let gatedStarted = false;
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100],
+      reviewPreflight: async () => {
+        calls += 1;
+        if (calls === 2) { gatedStarted = true; await gate; }
+        return { ok: true as const, failures: [] };
+      },
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 1 is scheduled/u);
+      // A fresh ordinary request sits in preflight (in neither roundAdmission nor handoffs).
+      const fresh = wave.requestReview({ jobId: f.jobId });
+      const freshOutcome = fresh.then(() => 'admitted', (error: unknown) => String(error));
+      await until(() => gatedStarted);
+      await until(() => informs.some((line) => line.includes('skipped')));
+      release();
+      expect(await freshOutcome).toMatch(/automatic retry 1 of 1 is scheduled/u); // not RoundAdmissionInProgress
+      expect(informs.filter((line) => line.includes('skipped'))).toHaveLength(1);
+      expect(informs.find((line) => line.includes('skipped'))).toContain('another review request for the job is under way');
+      expect(calls).toBe(2); // the retry never reached preflight
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(2);
+      expect(escalations).toEqual([]);
+    } finally {
+      release();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
+
   it('a fresh request refused while a retry waits keeps it — same attempt and due time — so neither the retry nor the final escalation is lost (R7-11)', async () => {
     const { ledger, bus, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('takeover');
     const escalations: string[] = [];
