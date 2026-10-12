@@ -8548,8 +8548,19 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
   });
 
   it('a fresh request refused while a retry waits keeps it — same attempt and due time — so neither the retry nor the final escalation is lost (R7-11)', async () => {
-    const { ledger, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('takeover');
+    const { ledger, bus, port, jobId, sessions, artifacts, branch, restorePath } = await transientFixture('takeover');
     const escalations: string[] = [];
+    const unsubscribers: (() => void)[] = [];
+    const retrySettlement = (attempt: number): Promise<void> => new Promise((resolve) => {
+      const unsubscribe = bus.subscribe((event) => {
+        if (event.jobId === jobId && event.kind === 'round.admission-retry-settled'
+          && (event.payload as { attempt: number }).attempt === attempt) {
+          unsubscribe();
+          resolve();
+        }
+      });
+      unsubscribers.push(unsubscribe);
+    });
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner: makeSpawner(sessions, []), reviewArtifactRoot: artifacts,
       prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [0, 600],
@@ -8562,8 +8573,11 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
     try {
       await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
-      // Retry 1 runs at once and is refused: retry 2 now waits.
-      await until(() => kinds(ledger, jobId, 'round.admission-retry-scheduled').length === 2);
+      // Let retry 1 and its real Git rollback finish without advancing retry 2's clock.
+      const firstSettled = retrySettlement(1);
+      await vi.advanceTimersByTimeAsync(0);
+      await firstSettled;
+      expect(kinds(ledger, jobId, 'round.admission-retry-scheduled')).toHaveLength(2);
       const waiting = kinds(ledger, jobId, 'round.admission-retry-scheduled')[1]!;
       expect(waiting.payload).toMatchObject({ attempt: 2 });
       expect(Date.now()).toBeLessThan(Date.parse((waiting.payload as { dueAt: string }).dueAt));
@@ -8572,9 +8586,12 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       const taken = kinds(ledger, jobId, 'round.admission-retry-scheduled')[2]!;
       expect(taken.roundId).toBe(ledger.listRounds(jobId)[2]!.id);
       expect(taken.payload).toMatchObject({ attempt: 2, dueAt: (waiting.payload as { dueAt: string }).dueAt });
+      const finalSettled = retrySettlement(2);
       await vi.advanceTimersByTimeAsync(600);
-      await until(() => escalations.length === 1);
+      await finalSettled;
+      expect(escalations).toHaveLength(1);
     } finally {
+      for (const unsubscribe of unsubscribers) unsubscribe();
       restorePath();
       try { await wave.shutdown(); }
       finally { vi.useRealTimers(); }
