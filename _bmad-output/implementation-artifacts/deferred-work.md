@@ -232,3 +232,7 @@ warrants. They are recorded, not dropped:
 - source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
   summary: A pushed board frame arriving during a post-action snapshot refresh can be left as the last displayed state when that in-flight GET then fails, because the stale-epoch error branch returns without retrying.
   evidence: R15-B3 — `BoardClient.refetchSnapshot`'s stale-epoch catch path is present at integrated main `79c032e5` and unchanged in the SLIM delta; the owner-action `client.wake()` caller is also integrated-main code. Unlike the success path, the error path does not set `refreshOwed` or start the trailing refetch. This is a real main-side BoardClient refresh issue, not caused by the approved presentation change; handle in a separately scoped client follow-up.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Pending lesson-proposal rows remain full-detail instead of receiving the compact owner face proposed by R16.
+  evidence: The R16 observation at `web/src/ui/board.ts:759-765` is factually visible, but the owner scope-restoration amendment #7 and effective contract v11 exclude this absorbed-later-main proposal UI from the approved SLIM acceptance. The proposal row is already a current-main behavior at integration base `79c032e5`; compacting or otherwise redesigning it is a later feature decision. Preserve its current behavior in this PR rather than broadening the product change.

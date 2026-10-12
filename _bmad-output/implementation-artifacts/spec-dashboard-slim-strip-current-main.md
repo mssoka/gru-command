@@ -5,7 +5,7 @@ created: '2026-10-07'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
-review_loop_iteration: 10
+review_loop_iteration: 16
 context: []
 ---
 
@@ -531,3 +531,19 @@ Three fresh tracked reviewers inspected frozen range `49b558f243c7bacbfb46c7bc04
 | R15-V1 — a named Vitest instrument can omit its cause allowlist and skip feature-cause checks | medium — patch (R15-G2, pre-verified) | The verification-gap report establishes that an omitted `--require-file-substr` yields an empty allowlist and the classifier skips its cause guard; the R14 tests covered a present flag with a missing/empty value, not omission. Require the allowlist for named-instrument CLI mode. |
 
 Root-cause groups: G1 is an invalid nested Vitest report escaping the classifier boundary as exit 1; catch malformed-shape exceptions and return setup failure 3. G2 is the unpaired file-cause CLI contract: orphaned or omitted `--require-file-substr` disables the intended cause check; require both options together with a nonempty list. G3 is per-spec Playwright aggregation that drops later unexpected projects; inspect every unexpected test. The BoardClient issue is pre-existing at integrated main and deferred; the other findings are false or carried. No `intent_gap` or `bad_spec` remains; no Step 3 loopback is triggered.
+
+### Round 16 — built-in whole-change review at `b744e045`
+
+Three fresh tracked reviewers inspected immutable range `49b558f243c7bacbfb46c7bc04f749bf131cefea..b744e0454290d4fba12fe38f55e859e7a37aafb1` (6,124,110 bytes; SHA-256 `1686d714d550f7cd4bb856d31c3af33c12fa9fc121ccc027d663b5b896ac964d`). Reports and reviewer/worktree provenance are indexed in `review-r16/review-reports/STEP04-R16-INDEX.json`; all three jobs delivered, each reviewer worktree remained clean at integrated main `79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37`, and the frozen base/target objects were present.
+
+| Finding | Verdict and route | Evidence and disposition |
+|---|---|---|
+| R16-B1 — malformed Playwright stats can still produce classified RED | medium — patch (G1) | The accepted `stats.unexpected` count was the only counter checked against the report tree; a string `stats.expected` can still pass and coerce the computed total. Require the serializer's top-level `errors` array, non-negative safe-integer counters, and match all four outcome counts against the JSON tree before accepting evidence. Regressions cover a missing `errors` array, the reported `expected: "2"` case and a typed counter/tree mismatch. |
+| R16-E1 — proposal rows do not use the compact owner face | medium — defer / out of approved scope | The observation is accurate, but the owner scope-restoration amendment #7 and effective contract v11 exclude the absorbed-later-main lesson-proposal UI from SLIM acceptance; the integrated-main row is preserved rather than compacted here. The report's requested redesign would expand the feature. The separate follow-up is recorded in `deferred-work.md`; the existing `lesson-proposal-browser` scope is run at the settled candidate to check current-main preservation, not proposal compaction. |
+| R16-E2 — onboarding rehearsal imports the removed wizard artifact | follow-up — carried | Same claim as R13-E1/R14-E2/R15-E4; the existing out-of-scope deferred entry remains authoritative. No duplicate verification or deferral. |
+| R16-V1 — a failed Playwright spec with no unexpected test record can exit 2 | medium — patch (G1) | A report with `spec.ok: false`, one expected test and zero unexpected tests reaches the zero-unexpected branch before the retained incomplete-spec result is checked. Classify that report as setup failure (exit 3) before the claim-broken branch; a discriminating regression pins it. |
+| R16-V2 — timer-driven split wake-age refresh lacks a regression | medium — patch (G2) | The accepted ticker must refresh the split digits without a new snapshot. Add a fake-clock unit case that holds one snapshot through 9s→10s and checks the number/unit update; no product logic change is required. |
+| R16-V3 — wake/deferred/CHILDREN boundary geometry omits accepted widths | follow-up — carried | Same accepted-width gap already recorded under R10/R12/R13/R14; its existing deferred-work disposition remains authoritative. No duplicate patch or deferral. |
+| R16-V4 — strip-group accessible names use tooltip enumerations | follow-up — carried | Same claim as R10-BH-F7/R12-B2/R13-B2/R14-B3/R15-B6; existing deferred-work entry remains authoritative. No duplicate verification or deferral. |
+
+Root-cause groups: G1 is incomplete Playwright report validation: a missing errors array or malformed stats/tree can be accepted as behavioral evidence, while a failed spec absent from unexpected-test outcomes can be labeled an unexpectedly passing baseline. These now fail closed as exit 3, with exact regression cases. G2 is the missing timer-driven oracle for split wake-age updates; a deterministic unit test proves the unchanged-snapshot ticker path. The proposal redesign is deferred because owner amendment #7 excludes it from this feature; the other repeated observations remain carried. No `intent_gap` or `bad_spec` is triggered. The R16 reports are not re-settled after the implementation head advances beyond their reviewed SHA; no manual disposition is claimed.

@@ -779,6 +779,33 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     expect(silas?.querySelector('.strip-value__num')?.textContent).toMatch(/^\d+$/);
   });
 
+  it('refreshes a split wake age across 9s→10s without a new snapshot', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    try {
+      const heldSnapshot = snapshot({ wakes: { count: 1, lastAt: '2026-01-01T00:00:00.000Z' } });
+      const view = new BoardView(() => {});
+      view.render(heldSnapshot);
+      const wakes = document.querySelector<HTMLElement>('#board-wakes');
+      const age = wakes?.querySelector<HTMLElement>('.board-age-split');
+      const number = age?.querySelector<HTMLElement>('.board-age-split__num');
+      const unit = age?.querySelector<HTMLElement>('.board-age-split__unit');
+      expect(number?.textContent).toBe('0');
+      expect(view.current).toBe(heldSnapshot);
+
+      vi.advanceTimersByTime(9_000);
+      expect(number?.textContent).toBe('9');
+      vi.advanceTimersByTime(1_000);
+      expect(number?.textContent).toBe('10');
+      expect(unit?.textContent).toBe('s ago');
+      expect(age?.querySelector('.board-age-split__lead')?.textContent).toBe('wake ');
+      expect(view.current).toBe(heldSnapshot);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it('includes the CHILDREN group when the server reported counters and omits it when absent', () => {
     const view = new BoardView(() => {});
     view.render(snapshot());

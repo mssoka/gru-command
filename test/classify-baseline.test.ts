@@ -40,6 +40,7 @@ const assertion = (title: string, status: string, failureMessages: readonly stri
 });
 
 const playwrightReport = (results: readonly { title: string; message: string }[]) => ({
+  errors: [],
   stats: { expected: 0, unexpected: results.length, skipped: 0, flaky: 0 },
   suites: [
     {
@@ -50,6 +51,23 @@ const playwrightReport = (results: readonly { title: string; message: string }[]
       })),
     },
   ],
+});
+
+const playwrightStatusReport = (statuses: readonly ('expected' | 'unexpected' | 'skipped' | 'flaky')[]) => ({
+  errors: [],
+  stats: {
+    expected: statuses.filter((status) => status === 'expected').length,
+    unexpected: statuses.filter((status) => status === 'unexpected').length,
+    skipped: statuses.filter((status) => status === 'skipped').length,
+    flaky: statuses.filter((status) => status === 'flaky').length,
+  },
+  suites: [{
+    specs: statuses.map((status, index) => ({
+      title: `test-${index}`,
+      ok: status !== 'unexpected',
+      tests: [{ status, results: [] }],
+    })),
+  }],
 });
 
 const classifierCliPath = fileURLToPath(new URL('../tools/classify-baseline.mjs', import.meta.url));
@@ -296,6 +314,7 @@ describe('baseline classifier — Playwright (browser) branch', () => {
 
   it('checks every unexpected project in one spec instead of accepting its first feature failure', () => {
     const report = {
+      errors: [],
       stats: { expected: 0, unexpected: 2, skipped: 0, flaky: 0 },
       suites: [{ specs: [{
         title: 'strip is visible',
@@ -315,6 +334,57 @@ describe('baseline classifier — Playwright (browser) branch', () => {
     expect(result.code).toBe(3);
     expect(result.err).toMatch(/name NO slim surface/u);
     expect(result.err).toContain('ReferenceError: fixture helper failed');
+  });
+
+  it('rejects a Playwright report without its errors array', () => {
+    const { errors, ...reportWithoutErrors } = playwrightReport([
+      { title: 'strip is visible', message: "locator('.strip-status') expected 1" },
+    ]);
+    expect(errors).toEqual([]);
+    const result = classifyBaseline(reportWithoutErrors, { playwright: true, substrs });
+    expect(result.code).toBe(3);
+    expect(result.out).toBe('');
+    expect(result.err).toMatch(/errors field.*array/u);
+  });
+
+  it('rejects malformed Playwright stats before accepting a matching feature-absence failure', () => {
+    const report = playwrightReport([
+      { title: 'strip is visible', message: "locator('.strip-status') expected 1" },
+    ]);
+    const malformed = { ...report, stats: { ...report.stats, expected: '2' } };
+    const result = classifyBaseline(malformed, { playwright: true, substrs });
+    expect(result.code).toBe(3);
+    expect(result.out).toBe('');
+    expect(result.err).toMatch(/stats\.expected.*non-negative safe integer/u);
+  });
+
+  it('rejects well-typed Playwright stats that disagree with report-tree test statuses', () => {
+    const report = playwrightReport([
+      { title: 'strip is visible', message: "locator('.strip-status') expected 1" },
+    ]);
+    const inconsistent = { ...report, stats: { ...report.stats, expected: 1 } };
+    const result = classifyBaseline(inconsistent, { playwright: true, substrs });
+    expect(result.code).toBe(3);
+    expect(result.err).toMatch(/stats and test tree disagree/u);
+    expect(result.err).toContain('expected=1');
+    expect(result.err).toContain('expected=0');
+  });
+
+  it('treats a failed spec without an unexpected test record as setup failure', () => {
+    const report = {
+      ...playwrightStatusReport(['expected']),
+      suites: [{ specs: [{
+        title: 'strip baseline fixture',
+        file: 'dashboard-strip.spec.ts',
+        ok: false,
+        tests: [{ status: 'expected', results: [] }],
+      }] }],
+    };
+    const result = classifyBaseline(report, { playwright: true, substrs });
+    expect(result.code).toBe(3);
+    expect(result.out).toBe('');
+    expect(result.err).toMatch(/failed Playwright spec.*no unexpected test record/u);
+    expect(result.err).toContain('strip baseline fixture');
   });
 
   it('exits 3 when an unexpected failure names NO slim surface (unclassified cause)', () => {
@@ -342,6 +412,7 @@ describe('baseline classifier — Playwright (browser) branch', () => {
 
   it('reads a timedOut/unexpected result message instead of mapping it to an empty string', () => {
     const report = {
+      errors: [],
       stats: { expected: 0, unexpected: 1, skipped: 0, flaky: 0 },
       suites: [
         { specs: [{ title: 'rail', ok: false, tests: [{ status: 'unexpected', results: [
@@ -357,7 +428,7 @@ describe('baseline classifier — Playwright (browser) branch', () => {
     const emptyAllow = classifyBaseline(playwrightReport([{ title: 'x', message: 'anything' }]), { playwright: true, substrs: [] });
     expect(emptyAllow.code).toBe(3);
     expect(emptyAllow.err).toMatch(/no slim-surface substrings/u);
-    const skippedOnly = classifyBaseline({ stats: { expected: 0, unexpected: 0, skipped: 7, flaky: 0 }, suites: [] }, { playwright: true, substrs: ['strip-groups'] });
+    const skippedOnly = classifyBaseline(playwrightStatusReport(Array<'skipped'>(7).fill('skipped')), { playwright: true, substrs: ['strip-groups'] });
     expect(skippedOnly.code).toBe(3);
     expect(skippedOnly.err).toMatch(/no Playwright test actually ran/u);
   });
@@ -385,9 +456,9 @@ describe('baseline classifier — Playwright (browser) branch', () => {
   it('exits 3 when none match, and 2 when nothing failed', () => {
     const none = classifyBaseline(playwrightReport([{ title: 'x', message: 'some unrelated failure' }]), { playwright: true, substrs });
     expect(none.code).toBe(3);
-    const green = classifyBaseline({ stats: { expected: 5, unexpected: 0, skipped: 0, flaky: 0 }, suites: [] }, { playwright: true, substrs });
+    const green = classifyBaseline(playwrightStatusReport(Array<'expected'>(5).fill('expected')), { playwright: true, substrs });
     expect(green.code).toBe(2);
-    const zero = classifyBaseline({ stats: { expected: 0, unexpected: 0, skipped: 0, flaky: 0 }, suites: [] }, { playwright: true, substrs });
+    const zero = classifyBaseline({ errors: [], stats: { expected: 0, unexpected: 0, skipped: 0, flaky: 0 }, suites: [] }, { playwright: true, substrs });
     expect(zero.code).toBe(3);
   });
 });

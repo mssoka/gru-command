@@ -48,27 +48,46 @@ function classifyPlaywright(report, substrs) {
     // check must never be vacuous.
     return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: no slim-surface substrings supplied — cause cannot be identified' };
   }
-  if (Array.isArray(report?.errors) && report.errors.length > 0) {
+  if (report === null || typeof report !== 'object' || Array.isArray(report)) {
+    return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: Playwright report is not an object — not behavioral evidence' };
+  }
+  if (!Array.isArray(report.errors)) {
+    return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: Playwright report errors field is missing or not an array — not behavioral evidence' };
+  }
+  if (report.errors.length > 0) {
     // A config/webServer/global failure explains the run, not the feature.
     return { code: 3, out: '', err: `BASELINE SETUP FAILURE: Playwright reported ${report.errors.length} global error(s) — not behavioral evidence` };
   }
-  const stats = (report && report.stats) || {};
-  if (typeof stats !== 'object' || Array.isArray(stats)) {
+  const stats = report.stats;
+  if (stats === null || typeof stats !== 'object' || Array.isArray(stats)) {
     return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: Playwright report has no stats object — not behavioral evidence' };
   }
   // Playwright's JSON stats carry expected/unexpected/skipped/flaky — there
-  // is no `total` field; the run's size is their sum.
-  const total = (stats.expected ?? 0) + (stats.unexpected ?? 0) + (stats.skipped ?? 0) + (stats.flaky ?? 0);
-  const unexpected = stats.unexpected ?? 0;
-  if (total === 0) {
-    return {
-      code: 3,
-      out: '',
-      err: 'BASELINE SETUP/COLLECTION FAILURE: zero Playwright tests ran (build/webServer/spec load?) — not behavioral evidence',
-    };
+  // is no `total` field; the run's size is their sum. Each counter is required
+  // and must be a non-negative safe integer before it can support evidence.
+  const counterNames = ['expected', 'unexpected', 'skipped', 'flaky'];
+  for (const name of counterNames) {
+    if (!Number.isSafeInteger(stats[name]) || stats[name] < 0) {
+      return {
+        code: 3,
+        out: '',
+        err: `BASELINE SETUP FAILURE: Playwright stats.${name} must be a non-negative safe integer — not behavioral evidence`,
+      };
+    }
   }
+  const total = counterNames.reduce((sum, name) => sum + stats[name], 0);
+  if (!Number.isSafeInteger(total)) {
+    return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: Playwright stats total exceeds the safe integer range — not behavioral evidence' };
+  }
+  if (!Array.isArray(report.suites)) {
+    return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: Playwright report has no suites array — not behavioral evidence' };
+  }
+
   const results = [];
-  let observedUnexpected = 0;
+  const observed = { expected: 0, unexpected: 0, skipped: 0, flaky: 0 };
+  const failedSpecsWithoutUnexpected = [];
+  const malformedTree = [];
+  const testStatuses = new Set(counterNames);
   const failureStatuses = new Set(['failed', 'timedOut', 'interrupted', 'unexpected']);
   const failureMessage = (result) => {
     const messages = [result?.error?.message, ...(Array.isArray(result?.errors) ? result.errors.map((error) => error?.message) : [])]
@@ -77,10 +96,39 @@ function classifyPlaywright(report, substrs) {
     return messages.join('\n');
   };
   const walk = (suite) => {
-    for (const spec of Array.isArray(suite?.specs) ? suite.specs : []) {
-      const tests = Array.isArray(spec?.tests) ? spec.tests : [];
-      const unexpectedTests = tests.filter((test) => test?.status === 'unexpected');
-      observedUnexpected += unexpectedTests.length;
+    if (suite === null || typeof suite !== 'object' || Array.isArray(suite)) {
+      malformedTree.push('suite entry is not an object');
+      return;
+    }
+    if (suite.specs !== undefined && !Array.isArray(suite.specs)) {
+      malformedTree.push('suite specs field is not an array');
+      return;
+    }
+    if (suite.suites !== undefined && !Array.isArray(suite.suites)) {
+      malformedTree.push('suite child-suites field is not an array');
+      return;
+    }
+    for (const spec of suite.specs ?? []) {
+      if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) {
+        malformedTree.push('spec entry is not an object');
+        continue;
+      }
+      if (typeof spec.ok !== 'boolean' || !Array.isArray(spec.tests)) {
+        malformedTree.push('spec is missing its boolean ok field or tests array');
+        continue;
+      }
+      const unexpectedTests = [];
+      for (const test of spec.tests) {
+        if (test === null || typeof test !== 'object' || Array.isArray(test) || !testStatuses.has(test.status)) {
+          malformedTree.push('test entry is not an object with a recognized outcome status');
+          continue;
+        }
+        observed[test.status] += 1;
+        if (test.status === 'unexpected') unexpectedTests.push(test);
+      }
+      if (spec.ok === false && unexpectedTests.length === 0) {
+        failedSpecsWithoutUnexpected.push(spec.title ?? spec.file ?? 'unknown');
+      }
       for (const test of unexpectedTests) {
         const testLabel = [test?.projectName, test?.title]
           .filter((value) => typeof value === 'string' && value.trim() !== '')
@@ -94,24 +142,44 @@ function classifyPlaywright(report, substrs) {
         if (failures.length === 0) results.push({ title, message: '' });
         else for (const failure of failures) results.push({ title, message: failureMessage(failure) });
       }
-      if (unexpectedTests.length === 0 && spec?.ok === false) {
-        // A failing spec with no unexpected test record is malformed or
-        // incomplete; retain an unclassified failure rather than dropping it.
-        results.push({ title: spec?.title ?? spec?.file ?? 'unknown', message: '' });
-      }
     }
-    for (const child of Array.isArray(suite?.suites) ? suite.suites : []) walk(child);
+    for (const child of suite.suites ?? []) walk(child);
   };
-  for (const suite of Array.isArray(report?.suites) ? report.suites : []) walk(suite);
-  if (observedUnexpected !== unexpected) {
+  for (const suite of report.suites) walk(suite);
+  if (malformedTree.length > 0) {
     return {
       code: 3,
       out: '',
-      err: `BASELINE SETUP FAILURE: Playwright stats report ${unexpected} unexpected test(s), but the report tree contains ${observedUnexpected} — not behavioral evidence`,
+      err: `BASELINE SETUP FAILURE: malformed Playwright report tree (${malformedTree[0]}) — not behavioral evidence`,
     };
   }
+  const mismatchedCounters = counterNames.filter((name) => stats[name] !== observed[name]);
+  if (mismatchedCounters.length > 0) {
+    const statsSummary = counterNames.map((name) => `${name}=${stats[name]}`).join(', ');
+    const treeSummary = counterNames.map((name) => `${name}=${observed[name]}`).join(', ');
+    return {
+      code: 3,
+      out: '',
+      err: `BASELINE SETUP FAILURE: Playwright stats and test tree disagree (stats: ${statsSummary}; tree: ${treeSummary}) — not behavioral evidence`,
+    };
+  }
+  if (failedSpecsWithoutUnexpected.length > 0) {
+    return {
+      code: 3,
+      out: '',
+      err: `BASELINE SETUP FAILURE: failed Playwright spec(s) have no unexpected test record (${failedSpecsWithoutUnexpected.slice(0, 5).join(', ')}) — not behavioral evidence`,
+    };
+  }
+  if (total === 0) {
+    return {
+      code: 3,
+      out: '',
+      err: 'BASELINE SETUP/COLLECTION FAILURE: zero Playwright tests ran (build/webServer/spec load?) — not behavioral evidence',
+    };
+  }
+  const unexpected = stats.unexpected;
   if (unexpected === 0) {
-    const ran = (stats.expected ?? 0) + (stats.flaky ?? 0);
+    const ran = stats.expected + stats.flaky;
     if (ran === 0) {
       return { code: 3, out: '', err: 'BASELINE SETUP FAILURE: no Playwright test actually ran (all skipped?) — not behavioral evidence' };
     }
