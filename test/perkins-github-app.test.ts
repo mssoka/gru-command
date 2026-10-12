@@ -119,7 +119,6 @@ async function assertFormalAppReview<T>(
   if (posts.length === 0) {
     await assertFormalEventAssertion(tag, () => expect(posts).toHaveLength(1));
   }
-  expect(posts).toHaveLength(1);
   const post = posts[0]!;
   let request: unknown;
   try {
@@ -128,6 +127,9 @@ async function assertFormalAppReview<T>(
     request = undefined;
   }
   await assertFormalEventAssertion(tag, () => expect(request).toEqual(expectedRequest));
+  // A duplicate-count failure is not proof of missing formal event. Keep it
+  // after the marked payload assertion so it cannot hide that specific RED.
+  expect(posts).toHaveLength(1);
   if (outcome.kind === 'error') throw outcome.error;
   await assertFormalEventAssertion(tag, () => expect(outcome.receipt).toEqual(expectedReceipt));
 }
@@ -3463,6 +3465,10 @@ describe('formal GitHub verdict publication', () => {
         { ...recordedPost, body: JSON.stringify(expectedRequest) },
       ], expectedRequest, expectedReceipt,
     )).rejects.toBeInstanceOf(ChaiAssertionError);
+    const duplicateWrongEvent = { ...recordedPost, body: JSON.stringify({ ...expectedRequest, event: 'COMMENT' }) };
+    await expect(assertFormalAppReview(
+      'app-marker-regression', Promise.resolve(expectedReceipt), [duplicateWrongEvent, duplicateWrongEvent], expectedRequest, expectedReceipt,
+    )).rejects.toThrow(/FORMAL_EVENT_ASSERTION:app-marker-regression/u);
     await expect(assertFormalEventAssertion('app-marker-regression', () => expect(true).toBe(false)))
       .rejects.toThrow(/FORMAL_EVENT_ASSERTION:app-marker-regression/u);
   });
