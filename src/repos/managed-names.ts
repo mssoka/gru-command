@@ -1,11 +1,13 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
+import { userInfo } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep, win32 } from 'node:path';
 
 export type ManagedRepoPath =
   | { readonly kind: 'available'; readonly path: string }
-  | { readonly kind: 'unavailable'; readonly reason: string };
+  | { readonly kind: 'unavailable'; readonly reason: string }
+  | { readonly kind: 'error'; readonly error: string };
 
 const UNAVAILABLE_REASON = 'selected repository is unavailable under workspace_root';
 const GIT_ROUTING_ENV = new Set([
@@ -36,36 +38,84 @@ function isGitProbeEnvironmentVariable(name: string): boolean {
   return !GIT_ROUTING_ENV.has(normalizedName) && !/^GIT_CONFIG_(?:COUNT|(?:KEY|VALUE)_\d+)$/u.test(normalizedName);
 }
 
+function trustedAccountHome(): string {
+  const home = userInfo().homedir;
+  if (home === '' || !isAbsolute(home)) {
+    throw new Error('cannot determine an absolute OS-account home for Git probes');
+  }
+  return home;
+}
+
 /** Keep the OS account's normal Git config authoritative, but ignore
- * inherited routing, config-path and command-scope overrides for probes. */
-export function gitProbeEnvironment(): NodeJS.ProcessEnv {
-  return Object.fromEntries(
-    Object.entries(process.env).filter(([name]) => isGitProbeEnvironmentVariable(name)),
-  );
+ * inherited routing, config-path and command-scope overrides for probes.
+ * `trustedHome` is a deterministic seam for hermetic tests; production calls
+ * use the home reported by OS account metadata, never inherited HOME. */
+export function gitProbeEnvironment(trustedHome = trustedAccountHome()): NodeJS.ProcessEnv {
+  if (trustedHome === '' || !isAbsolute(trustedHome)) {
+    throw new Error('Git probe home must be an absolute OS-account home');
+  }
+  return {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => isGitProbeEnvironmentVariable(name)),
+    ),
+    HOME: trustedHome,
+  };
+}
+
+function confirmedNonRepository(error: unknown, stderr: string): boolean {
+  if (error === null || typeof error !== 'object') return false;
+  const detail = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string | null };
+  return typeof detail.code === 'number' && detail.killed !== true &&
+    (detail.signal === null || detail.signal === undefined) &&
+    /(?:not a git repository|invalid gitfile format|invalid gitdir format)/iu.test(stderr);
+}
+
+class ManagedRepoProbeError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
+    this.name = 'ManagedRepoProbeError';
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function rootProbeError(error: unknown): ManagedRepoPath {
+  const code = typeof error === 'object' && error !== null
+    ? (error as NodeJS.ErrnoException).code
+    : undefined;
+  if (!(error instanceof ManagedRepoProbeError) && (code === 'ENOENT' || code === 'ENOTDIR')) {
+    return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+  }
+  const message = errorText(error);
+  return {
+    kind: 'error',
+    error: (message.trim() || 'Git root validation failed without a message').slice(0, 300),
+  };
 }
 
 async function isGitWorktreeRoot(project: string): Promise<boolean> {
-  try {
-    const stdout = await new Promise<string>((resolveOutput, reject) => {
-      execFile(
-        'git',
-        ['-C', project, 'rev-parse', '--show-toplevel'],
-        {
-          encoding: 'utf8',
-          env: gitProbeEnvironment(),
-          maxBuffer: 16_384,
-          timeout: 2_000,
-        },
-        (error, output) => {
-          if (error !== null) reject(error);
-          else resolveOutput(output);
-        },
-      );
-    });
-    return (await realpath(stdout.trim())) === project;
-  } catch {
-    return false;
-  }
+  const stdout = await new Promise<string>((resolveOutput, reject) => {
+    execFile(
+      'git',
+      ['-C', project, 'rev-parse', '--show-toplevel'],
+      {
+        encoding: 'utf8',
+        env: gitProbeEnvironment(),
+        maxBuffer: 16_384,
+        timeout: 2_000,
+      },
+      (error, output, stderr) => {
+        if (error !== null) {
+          if (confirmedNonRepository(error, String(stderr))) resolveOutput('');
+          else reject(new ManagedRepoProbeError(errorText(error), error));
+        } else resolveOutput(output);
+      },
+    );
+  });
+  if (stdout === '') return false;
+  return (await realpath(stdout.trim())) === project;
 }
 
 function isGitWorktreeRootSync(project: string): boolean {
@@ -74,12 +124,14 @@ function isGitWorktreeRootSync(project: string): boolean {
       encoding: 'utf8',
       env: gitProbeEnvironment(),
       maxBuffer: 16_384,
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 2_000,
     }).trim();
     return realpathSync(reportedRoot) === project;
-  } catch {
-    return false;
+  } catch (error) {
+    const stderr = String((error as NodeJS.ErrnoException & { stderr?: Buffer | string }).stderr ?? '');
+    if (confirmedNonRepository(error, stderr)) return false;
+    throw new ManagedRepoProbeError(errorText(error), error);
   }
 }
 
@@ -113,9 +165,11 @@ export function managedRepoNameError(name: string): string | null {
 
 /**
  * Resolve one configured name to its exact direct project root. Missing,
- * symlinked, non-directory, escaped and non-Git entries stay selected but
- * truthfully unavailable; callers must not substitute a discovered sibling.
- * A `.git` directory and a Git worktree-pointer file are both supported.
+ * symlinked, non-directory, escaped and confirmed non-Git entries stay
+ * selected but truthfully unavailable; transient filesystem/Git probe faults
+ * are errors so callers can retain stale observations without polling an
+ * unvalidated root. A `.git` directory and a Git worktree-pointer file are
+ * both supported.
  */
 export async function resolveManagedRepoPath(
   workspaceRoot: string,
@@ -126,7 +180,9 @@ export async function resolveManagedRepoPath(
   }
 
   try {
-    const workspace = await realpath(workspaceRoot);
+    const workspace = await realpath(workspaceRoot).catch((error: unknown) => {
+      throw new ManagedRepoProbeError(`workspace root could not be read: ${errorText(error)}`, error);
+    });
     const candidate = join(workspace, name);
     const candidateInfo = await lstat(candidate);
     if (!candidateInfo.isDirectory() || candidateInfo.isSymbolicLink()) {
@@ -155,8 +211,8 @@ export async function resolveManagedRepoPath(
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
     return { kind: 'available', path: project };
-  } catch {
-    return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+  } catch (error) {
+    return rootProbeError(error);
   }
 }
 
@@ -170,7 +226,12 @@ export function resolveManagedRepoPathSync(
   }
 
   try {
-    const workspace = realpathSync(workspaceRoot);
+    let workspace: string;
+    try {
+      workspace = realpathSync(workspaceRoot);
+    } catch (error) {
+      throw new ManagedRepoProbeError(`workspace root could not be read: ${errorText(error)}`, error);
+    }
     const candidate = join(workspace, name);
     const candidateInfo = lstatSync(candidate);
     if (!candidateInfo.isDirectory() || candidateInfo.isSymbolicLink()) {
@@ -199,8 +260,8 @@ export function resolveManagedRepoPathSync(
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
     return { kind: 'available', path: project };
-  } catch {
-    return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+  } catch (error) {
+    return rootProbeError(error);
   }
 }
 

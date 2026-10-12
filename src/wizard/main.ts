@@ -65,6 +65,15 @@ function displayRepositoryName(name: string): string {
   });
 }
 
+function workspaceIdentity(workspaceRoot: string, home: string): string {
+  const absolute = resolve(expandTilde(workspaceRoot, home));
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
 /** The repo root = two levels up from dist/wizard/main.js. */
 function repoRootFrom(importMetaUrl: string): string {
   return resolve(dirname(fileURLToPath(importMetaUrl)), '..', '..');
@@ -130,11 +139,16 @@ function yn(value: string): boolean {
   return value.toLowerCase() === 'y' || value.toLowerCase() === 'yes';
 }
 
+interface InteractiveAnswersResult {
+  readonly answers: WizardAnswers;
+  readonly reposInherited: boolean;
+}
+
 async function interactiveAnswers(
   probe: readonly RuntimeProbeResult[],
   terminal: WizardTerminal,
   prior: ReturnType<typeof loadExistingInstanceConfig>,
-): Promise<WizardAnswers> {
+): Promise<InteractiveAnswersResult> {
   const rl = createInterface({ input: terminal.input, output: terminal.output });
   const out = terminal.output;
   out.write('\nGru Command setup — press Enter to accept every [default].\n');
@@ -206,6 +220,7 @@ async function interactiveAnswers(
     out.write(`Configured selections not currently available remain selected on Enter: ${missingExisting.join(', ')}.\n`);
   }
   let repos: string[] = [];
+  let reposInherited = false;
   if (found.length > 0 || existingSelection.length > 0) {
     out.write('\nGit repository candidates under workspace_root (not auto-enrolled on re-run):\n');
     found.forEach((name, index) => out.write(`  ${index + 1}. ${displayRepositoryName(name)}\n`));
@@ -220,6 +235,7 @@ async function interactiveAnswers(
       );
       if (answer === '') {
         repos = [...existingSelection];
+        reposInherited = prior !== null;
         break;
       }
       if (answer.toLowerCase() === 'none') {
@@ -334,7 +350,7 @@ async function interactiveAnswers(
       smoke,
     }),
   );
-  return { ...answers, repos };
+  return { answers: { ...answers, repos }, reposInherited };
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +610,7 @@ async function main(argv: readonly string[]): Promise<number> {
   // non-interactive validation below therefore runs first, and every probe
   // is loaded dynamically at its use site.
   let answers: WizardAnswers;
+  let reposInherited = false;
   let terminal: WizardTerminal | null = null;
   if (noInteract) {
     let rawKeys: ReadonlySet<string> = new Set();
@@ -623,6 +640,7 @@ async function main(argv: readonly string[]): Promise<number> {
         fail('secrets are forbidden in --answers: token — the wizard generates or preserves the pairing token', 1);
       }
       answers = seedAnswersFromConfig(parseAnswers(sourceAnswers), prior, rawKeys);
+      reposInherited = prior !== null && !rawKeys.has('repos');
     } catch (error) {
       if (error instanceof AnswersError) fail(String(error.message), 1);
       throw error;
@@ -642,7 +660,9 @@ async function main(argv: readonly string[]): Promise<number> {
     const probe = probeRuntimes();
     printProbe(probe);
     terminal = openWizardTerminal(repoRoot);
-    answers = await interactiveAnswers(probe, terminal, prior);
+    const selection = await interactiveAnswers(probe, terminal, prior);
+    answers = selection.answers;
+    reposInherited = selection.reposInherited;
   }
 
   const configPath = configPathFor(instanceDir);
@@ -668,12 +688,13 @@ async function main(argv: readonly string[]): Promise<number> {
   }
 
   const workspaceAbs = expandTilde(answers.workspaceRoot, homedir());
+  const samePriorWorkspace = prior !== null &&
+    workspaceIdentity(answers.workspaceRoot, homedir()) === workspaceIdentity(prior.workspaceRoot, homedir());
   for (const repo of answers.repos) {
-    const previouslySelected = prior?.managedRepos.includes(repo) === true;
-    let unavailable = false;
-    if (previouslySelected) {
-      unavailable = resolveManagedRepoPathSync(workspaceAbs, repo).kind === 'unavailable';
-    }
+    const inheritedBinding = reposInherited && samePriorWorkspace &&
+      prior?.managedRepos.includes(repo) === true;
+    const unavailable = inheritedBinding &&
+      resolveManagedRepoPathSync(workspaceAbs, repo).kind === 'unavailable';
     if (unavailable) {
       stdout.write(
         `Previously selected repository ${repo} is currently unavailable; keeping it in managed_repos. ` +

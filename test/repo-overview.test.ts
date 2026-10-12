@@ -1385,19 +1385,29 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-git-routing-'));
     const selected = join(root, 'selected');
     const foreign = join(root, 'foreign');
+    const trustedHome = join(root, 'trusted-home');
+    mkdirSync(trustedHome);
+    const environmentForTrustedHome = gitProbeEnvironment as unknown as (
+      home: string,
+    ) => NodeJS.ProcessEnv;
+    const trustedEnvironment = environmentForTrustedHome(trustedHome);
     try {
       execFileSync('git', ['init', '-q', selected]);
       execFileSync('git', ['-C', selected, 'remote', 'add', 'origin', 'https://github.com/acme/selected.git']);
       execFileSync('git', ['init', '-q', foreign]);
       execFileSync('git', ['-C', foreign, 'remote', 'add', 'origin', 'https://github.com/acme/foreign.git']);
       const expectSelectedProviderCalls = async (): Promise<void> => {
-        expect(repoRemote(selected)).toEqual({ host: 'github.com', owner: 'acme', repo: 'selected' });
+        expect(repoRemote(selected, 'git', trustedEnvironment)).toEqual({ host: 'github.com', owner: 'acme', repo: 'selected' });
         const api = new FakeApi();
         const tracker = new ManagedRepoOverviewTracker({
           workspaceRoot: root,
           managedRepos: ['selected'],
           api,
           intervalMs: 0,
+          resolveRemote: async (path) => {
+            const remote = repoRemote(path, 'git', trustedEnvironment);
+            return remote === null ? null : { host: remote.host, owner: remote.owner, repo: remote.repo };
+          },
         });
         const view = await tracker.refresh();
         expect(row(view, 'selected').fullName).toBe('acme/selected');

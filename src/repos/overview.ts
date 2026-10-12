@@ -122,7 +122,7 @@ export interface RepoOverviewRowView {
   /** Completion time of the last observation attempt (success or failure,
    * ISO) — null when no attempt has completed. */
   readonly lastAttemptAt: string | null;
-  /** Last failed attempt detail (provider text, bounded); null when clean. */
+  /** Last failed attempt detail (root validation or provider text, bounded); null when clean. */
   readonly error: string | null;
 }
 
@@ -744,7 +744,6 @@ export class ManagedRepoOverviewTracker {
    * repository rotates on so a budget too small to complete any
    * observation still makes fair progress. */
   private priorityName: string | null = null;
-  private classifyCursor = 0;
   private lastSearchAtMs: number | null = null;
   private refreshedOnce = false;
   private started = false;
@@ -856,10 +855,14 @@ export class ManagedRepoOverviewTracker {
     const nextStates = new Map<string, RepoSourceState>();
     const resolveDeadline = this.now() + REPO_OVERVIEW_RESOLVE_BUDGET_MS;
     let resolveBudgetSpent = false;
-    // Classification rotates with its own cursor: when the budget cuts a
-    // pass short, the NEXT pass starts where this one stopped, so a slow
-    // mount can never starve the tail of the registry forever.
-    const classifyStart = repos.length === 0 ? 0 : this.classifyCursor % repos.length;
+    // Root validation and provider refresh share one rotation point. The
+    // next pass starts validating where the prior provider work resumes, so
+    // a root that was deferred from provider calls cannot land in the other
+    // half of a repeatedly truncated validation window forever.
+    const pendingIndex = this.priorityName === null ? -1 : repos.indexOf(this.priorityName);
+    const classifyStart = repos.length === 0
+      ? 0
+      : pendingIndex >= 0 ? pendingIndex : this.cursor % repos.length;
     const classifyOrder = [...repos.slice(classifyStart), ...repos.slice(0, classifyStart)];
     // Advances by ATTEMPTED resolutions (successes AND failures), so a
     // prefix of slow-failing origins also rotates away and can never pin
@@ -869,20 +872,36 @@ export class ManagedRepoOverviewTracker {
     for (const name of classifyOrder) {
       const previous = this.states.get(name);
       const base = previous ?? emptySourceState();
-      const unreadable = (skipProviderPoll = false): void => {
+      const unreadable = (skipProviderPoll = false, detail: string | null = null): void => {
         if (skipProviderPoll) unresolvedThisRefresh.add(name);
         // A read failure (or the resolution budget) is not evidence the
         // remote changed: keep the previous classification and cached
-        // observation when one exists. A budget skip before root validation
-        // also withholds its cached identity from provider polling. A
-        // never-classified entry is still published with the explicit
-        // read-failure reason — every managed repo appears without guessing identity.
+        // observation when one exists. Root-validation faults disclose an
+        // attempt/error and withhold polling until this root is validated.
+        // A budget skip keeps its prior freshness untouched, but also
+        // withholds its cached identity from provider polling. A
+        // never-classified entry stays visible with an explicit read-failure
+        // reason — every managed repo appears without guessing identity.
         if (previous !== undefined) {
-          nextStates.set(name, previous);
+          if (detail === null) {
+            nextStates.set(name, previous);
+            return;
+          }
+          const failed = {
+            ...previous,
+            lastAttemptAt: new Date(this.now()).toISOString(),
+            error: (`root validation failed: ${detail.trim() || 'probe failed without a message'}`).slice(0, 300),
+          };
+          if (previous.ref === null) failed.linkReason = ORIGIN_READ_FAILED_REASON;
+          nextStates.set(name, failed);
           return;
         }
         const row = emptySourceState();
         row.linkReason = ORIGIN_READ_FAILED_REASON;
+        if (detail !== null) {
+          row.lastAttemptAt = new Date(this.now()).toISOString();
+          row.error = (`root validation failed: ${detail.trim() || 'probe failed without a message'}`).slice(0, 300);
+        }
         nextStates.set(name, row);
       };
       if (this.now() > resolveDeadline) {
@@ -899,11 +918,24 @@ export class ManagedRepoOverviewTracker {
       let selectedPath: ManagedRepoPath;
       try {
         selectedPath = await this.resolveRepoPath(this.opts.workspaceRoot, name);
-      } catch {
-        selectedPath = {
-          kind: 'unavailable',
-          reason: 'selected repository is unavailable under workspace_root',
-        };
+      } catch (error) {
+        attemptedResolutions += 1;
+        const detail = messageOf(error).slice(0, 300);
+        this.log('warn', 'repo overview: root validation failed — retaining cached observation without provider polling', {
+          repo: name,
+          error: detail,
+        });
+        unreadable(true, detail);
+        continue;
+      }
+      if (selectedPath.kind === 'error') {
+        attemptedResolutions += 1;
+        this.log('warn', 'repo overview: root validation failed — retaining cached observation without provider polling', {
+          repo: name,
+          error: selectedPath.error,
+        });
+        unreadable(true, selectedPath.error);
+        continue;
       }
       if (selectedPath.kind === 'unavailable') {
         const unavailable = emptySourceState();
@@ -956,18 +988,15 @@ export class ManagedRepoOverviewTracker {
         }
       }
     }
-    this.classifyCursor = repos.length === 0 ? 0 : (classifyStart + attemptedResolutions) % repos.length;
+    const classificationResumeIndex = repos.length === 0
+      ? 0
+      : (classifyStart + attemptedResolutions) % repos.length;
     this.registry = repos.filter((name) => nextStates.has(name) && !duplicateNames.has(name));
     this.states.clear();
     for (const [name, state] of nextStates) this.states.set(name, state);
-    // Resume at the discarded repository when one is pending (and still
-    // linked); otherwise use the rotation cursor.
-    const priorityIndex = this.priorityName !== null ? repos.indexOf(this.priorityName) : -1;
-    const priorityLinked =
-      priorityIndex >= 0 && this.states.get(this.priorityName as string)?.ref != null;
-    const start =
-      repos.length === 0 ? 0 : priorityLinked ? priorityIndex : this.cursor % repos.length;
-    const order = [...repos.slice(start), ...repos.slice(0, start)];
+    // Classification and provider polling share the same start point; an
+    // incomplete observation stays the highest-priority validated row.
+    const order = [...repos.slice(classifyStart), ...repos.slice(0, classifyStart)];
     const fetchable = order.filter((name) => {
       const state = this.states.get(name);
       return state !== undefined && state.ref !== null && !unresolvedThisRefresh.has(name);
@@ -1045,7 +1074,9 @@ export class ManagedRepoOverviewTracker {
     } else {
       this.priorityName = null;
       const resumeName = fetchable[nextIndex] ?? null;
-      this.cursor = resumeName === null ? 0 : Math.max(0, repos.indexOf(resumeName));
+      this.cursor = resumeName === null
+        ? classificationResumeIndex
+        : Math.max(0, repos.indexOf(resumeName));
     }
     if (aborted === 'budget') {
       this.log('warn', 'repo overview refresh: call budget exhausted — remaining repositories defer', {
