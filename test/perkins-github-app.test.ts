@@ -3553,3 +3553,32 @@ describe('App contract baseline scope (#190)', () => {
     }
   });
 });
+
+describe('App publication runbook (#191)', () => {
+  const doc = readFileSync(join(import.meta.dirname, '..', 'docs', 'PERKINS-APP-PUBLICATION.md'), 'utf8').replace(/\s+/gu, ' ');
+  const runbook = doc.slice(doc.indexOf('**Runbook for an unproven delivery.**'), doc.indexOf('Recovery across the publisher-identity change'));
+
+  it('does not claim that an invisible review proves non-delivery or that a retry is safe for an unresolved POST', () => {
+    expect(runbook.length).toBeGreaterThan(200);
+    expect(runbook).not.toMatch(/Otherwise it was not delivered/u);
+    expect(doc).not.toMatch(/Otherwise it was not delivered/u);
+    expect(runbook).toMatch(/not\s+(?:a|an)\s+authoritative|never proves|does not prove/iu);
+    expect(runbook).toMatch(/provider visibility can lag/iu);
+  });
+
+  it('distinguishes a verified receipt, authoritative complete-list absence, and an unresolved outcome that needs an operator decision', () => {
+    expect(runbook).toMatch(/Verified positive receipt/u);
+    expect(runbook).toMatch(/Authoritative complete-list absence/u);
+    expect(runbook).toMatch(/Unresolved/u);
+    expect(runbook).toMatch(/explicit operator (?:reconciliation|decision)/iu);
+  });
+
+  it('keeps the frozen-head, bot-author and body comparison guidance and forbids automatic re-POST on an unresolved same or new head', () => {
+    expect(runbook).toMatch(/<slug>\[bot\]/u);
+    expect(runbook).toMatch(/exact frozen head/u);
+    expect(runbook).toMatch(/body matches/u);
+    expect(runbook).toMatch(/never\s+(?:automatically\s+)?re-POST/iu);
+    expect(runbook).toMatch(/same or a new frozen head|same head or a new/iu);
+    expect(runbook).toMatch(/screenshot|UI alone/iu);
+  });
+});
