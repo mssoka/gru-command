@@ -2192,27 +2192,52 @@ describe('silas digest: stalled current phases (issue #162)', () => {
     }
   });
 
-  it('the no-minion-record variant is visible past the grace window, never silently invisible', async () => {
-    const h = makeLedger();
-    try {
-      reopenRepairPhase(h, 'job-no-worker');
-      const startedAt = Date.parse(h.ledger.latestJobEvent('job-no-worker', 'job.status')!.ts);
-      // Exactly at the grace boundary is not stalled; past it the absent
-      // worker record no longer hides the phase.
-      expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking).toEqual([]);
-      const past = await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
-      expect(past.stalledWorking).toEqual([
-        {
-          jobId: 'job-no-worker',
-          repo: 'fixture-app',
-          minionId: null,
-          minionState: null,
-          lastActivity: null,
-          idleMs: DEFAULT_SILAS_CONFIG.stallThresholdMs + 1,
-        },
-      ]);
-    } finally {
-      h.cleanup();
+  it('the no-minion-record variant is visible past the grace window, never silently invisible — also after a refused review admitted, aborted and restored the status (#271)', async () => {
+    for (const variant of ['plain', 'admission-abort-restore', 'admission-abort-restore-deep-history'] as const) {
+      const h = makeLedger();
+      try {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-10-04T00:00:00.000Z'));
+        const jobId = `job-no-worker-${variant}`;
+        reopenRepairPhase(h, jobId);
+        const startedAt = Date.parse(h.ledger.latestJobEvent(jobId, 'job.status')!.ts);
+        if (variant !== 'plain') {
+          // A review round flips the status, is refused, and restores it a minute later.
+          vi.setSystemTime(new Date(startedAt + 60_000));
+          const attemptStartSeq = h.ledger.latestJobEvent(jobId, 'job.status')!.seq;
+          const { round, flipSeq } = h.ledger.admitReviewRoundWithFlip({
+            jobId, expectedLatestRoundId: null, expectedJobStatus: 'working', lenses: ['correctness'], targetRef: 'a'.repeat(40),
+          });
+          vi.setSystemTime(new Date(startedAt + 120_000));
+          h.ledger.abortReviewSetupWithoutSpawn(round.id);
+          expect(h.ledger.restoreReviewSetupStatus({
+            jobId, roundId: round.id, priorStatus: 'working', attemptStartSeq, expectedStatusSeq: flipSeq ?? undefined,
+          })).toBe(true);
+          expect(h.ledger.latestJobEvent(jobId, 'job.status')!.seq).toBeGreaterThan(attemptStartSeq);
+          // Past the first history page: the start event is still found by paging.
+          if (variant === 'admission-abort-restore-deep-history') {
+            for (let index = 0; index < 450; index += 1) h.ledger.appendCustomEvent({ kind: 'job.note-fixture', jobId, payload: { index } });
+          }
+        }
+        // Exactly at the grace boundary — measured from the ORIGINAL repair
+        // start, never the restore — is not stalled; past it the absent
+        // worker record no longer hides the phase.
+        expect((await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs)).stalledWorking, variant).toEqual([]);
+        const past = await digestAt(h, startedAt + DEFAULT_SILAS_CONFIG.stallThresholdMs + 1);
+        expect(past.stalledWorking, variant).toEqual([
+          {
+            jobId,
+            repo: 'fixture-app',
+            minionId: null,
+            minionState: null,
+            lastActivity: null,
+            idleMs: DEFAULT_SILAS_CONFIG.stallThresholdMs + 1,
+          },
+        ]);
+      } finally {
+        vi.useRealTimers();
+        h.cleanup();
+      }
     }
   });
 

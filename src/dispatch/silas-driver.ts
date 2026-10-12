@@ -21,7 +21,7 @@ import { isJobTerminal, type TerminalJobStatus } from '../ledger/states.js';
 import type { LogLevel } from '../logger.js';
 import { DECISION_SURFACE_SAME_BLOCKER, fileOfLocation, sameBlockerDecisionRequest } from '../decisions/questions.js';
 import type { DecisionService } from '../decisions/types.js';
-import { openAttemptStartSeq, pendingWorkRevision } from './branch-idle.js';
+import { jobStatusEventAtSeq, openAttemptStartSeq, pendingWorkRevision } from './branch-idle.js';
 import type { JobAmendmentRecord, WorkRevisionState } from '../review-inputs/amendments.js';
 import type { AgentHandle, SpawnOptions } from '../runtime/types.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
@@ -1203,7 +1203,15 @@ function currentPhaseStart(ledger: DigestLedger, jobId: string): CurrentPhaseSta
   const statusHopSeq = openAttemptStartSeq(ledger, jobId);
   const statusEvent = ledger.latestJobEvent(jobId, 'job.status');
   let seq = statusHopSeq;
-  let event: EventRecord | null = statusEvent !== null && statusEvent.seq === statusHopSeq ? statusEvent : null;
+  // The latest status event is not always the attempt start: a refused
+  // review's admission flip and restore sit after it (#271). Then the
+  // start event itself — with its ORIGINAL timestamp, never the restore's —
+  // is looked up in the job history.
+  let event: EventRecord | null = statusEvent !== null && statusEvent.seq === statusHopSeq
+    ? statusEvent
+    : statusHopSeq > 0 && statusHopSeq < Number.MAX_SAFE_INTEGER
+      ? jobStatusEventAtSeq(ledger, jobId, statusHopSeq)
+      : null;
   let repairStartSeq = 0;
   for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
     const repair = ledger.latestJobEvent(jobId, kind);

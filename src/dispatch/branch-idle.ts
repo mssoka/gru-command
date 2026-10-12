@@ -259,6 +259,20 @@ function previousStatusEvent(ledger: BranchIdleLedger, jobId: string, flipSeq: n
   }
 }
 
+/** The job's status event with exactly this seq, found by paging the
+ * newest-first history (the ledger exposes only a limit-bounded window);
+ * null when it is not in the reachable history. */
+export function jobStatusEventAtSeq(ledger: Pick<BranchIdleLedger, 'listJobEvents'>, jobId: string, seq: number): EventRecord | null {
+  let limit = 200;
+  for (;;) {
+    const events = ledger.listJobEvents(jobId, { limit });
+    const found = events.find((event) => event.seq === seq && event.kind === 'job.status');
+    if (found !== undefined) return found;
+    if (events.length < limit || limit >= 12_800 || (events.at(-1)?.seq ?? 0) < seq) return null;
+    limit *= 4;
+  }
+}
+
 /** The attempt a `→ working` hop belongs to: its own, unless it is a
  * refused review round's restore — that resumes the attempt the round
  * interrupted (nothing ran on the lane, so the delivery that settled it
