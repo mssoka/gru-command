@@ -34,6 +34,7 @@ const GIT_ROUTING_ENV = new Set([
   'GIT_CONFIG_GLOBAL',
   'GIT_CONFIG_SYSTEM',
   'GIT_CONFIG_NOSYSTEM',
+  'LC_ALL',
   'XDG_CONFIG_HOME',
   'HOME',
   'USERPROFILE',
@@ -67,6 +68,8 @@ export function gitProbeEnvironment(trustedHome = trustedAccountHome()): NodeJS.
       Object.entries(process.env).filter(([name]) => isGitProbeEnvironmentVariable(name)),
     ),
     HOME: trustedHome,
+    // Root error classification recognizes English Git diagnostics.
+    LC_ALL: 'C',
   };
 }
 
