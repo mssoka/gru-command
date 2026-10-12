@@ -2668,8 +2668,9 @@ export class WaveRunner {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     // Branch-idle still gates the freeze. A minion's own busy turn may
     // acknowledge an intent now; it is armed only after job.delivered.
+    let forceAuthority: readonly string[] = [];
     try {
-      this.enforceBranchIdleForRequest(input);
+      forceAuthority = this.enforceBranchIdleForRequest(input);
     } catch (error) {
       if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
         error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId) ||
@@ -2815,7 +2816,7 @@ export class WaveRunner {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
     }
-    const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel,
+    const begun = await this.beginPerkinsRound({ ...input, forceAuthority, reviewModel: result.reviewModel,
       reviewThinkingLevel: result.reviewThinkingLevel });
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
@@ -3008,7 +3009,7 @@ export class WaveRunner {
      * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
     claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
-    this.enforceBranchIdleForRequest(input);
+    const forceAuthority = this.enforceBranchIdleForRequest(input);
     let reviewModel: ReviewPreflightResult['reviewModel'];
     let reviewThinkingLevel: string | undefined;
     if (this.opts.reviewPreflight !== undefined) {
@@ -3020,7 +3021,7 @@ export class WaveRunner {
         reviewThinkingLevel = result.reviewThinkingLevel;
       }
     }
-    return this.beginPerkinsRound({ ...input, reviewModel, reviewThinkingLevel });
+    return this.beginPerkinsRound({ ...input, forceAuthority, reviewModel, reviewThinkingLevel });
   }
 
   private resolveReviewRequestRepo(input: { jobId: string }): string | null {
@@ -3041,20 +3042,21 @@ export class WaveRunner {
     jobId: string;
     targetRef?: string;
     force?: boolean;
-  }): void {
+  }): readonly string[] {
     const job = this.opts.ledger.getJob(input.jobId);
-    if (job === null) return;
+    if (job === null) return [];
     const jobLane = this.opts.worktrees
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job') ?? null;
-    if (jobLane === null) return;
-    this.enforceBranchIdle({
+    if (jobLane === null) return [];
+    const idle = this.enforceBranchIdle({
       job,
       jobLane,
       ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
       ...(input.force !== undefined ? { force: input.force } : {}),
       phase: 'arm',
     });
+    return idle.authority;
   }
 
   /** Branch-idle guard for one review target (rule 2026-09-23): resolve the
@@ -3067,6 +3069,8 @@ export class WaveRunner {
   private branchIdleBlockers(input: {
     job: { readonly id: string };
     jobLane: WorktreeLane | null;
+    /** Authoritative resolved branch; never DWIM the caller spelling again. */
+    targetBranch?: string | undefined;
     targetRef?: string | undefined;
     force?: boolean | undefined;
     phase: BranchIdlePhase;
@@ -3076,7 +3080,7 @@ export class WaveRunner {
      * mask the lane it moved. */
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
   }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] } {
-    const targetBranch = resolveReviewTargetBranch({
+    const targetBranch = input.targetBranch ?? resolveReviewTargetBranch({
       jobId: input.job.id,
       ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
       lanePath: input.jobLane?.path ?? null,
@@ -3121,9 +3125,45 @@ export class WaveRunner {
     return { targetBranch, blockers };
   }
 
+  /** Force authorizes these exact busy facts, not the job id forever. The
+   * round's provisional status flip does not start a new work attempt. */
+  private branchIdleAuthority(blocker: BranchIdleBlocker): string {
+    const id = blocker.jobId;
+    return JSON.stringify({
+      jobId: id, branch: blocker.branch,
+      attemptStart: openAttemptStartSeq(this.opts.ledger, id),
+      deliverySeq: this.opts.ledger.latestJobEvent(id, 'job.delivered')?.seq ?? 0,
+      directiveSeq: this.opts.ledger.latestJobEvent(id, 'silas.directive-sent')?.seq ?? 0,
+      recoverySeq: this.opts.ledger.latestJobEvent(id, 'provider.recovery-claimed')?.seq ?? 0,
+      markers: this.opts.ledger.listPendingRebriefs({ jobId: id }).map((marker) => marker.id).sort(),
+      directives: this.opts.ledger.listPendingDirectives({ jobId: id }).map((directive) => directive.requestId).sort(),
+      verificationRun: this.opts.ledger.hasUnsettledVerificationRun(id),
+      verificationRequestedSeq: this.opts.ledger.latestJobEvent(id, 'verification.requested')?.seq ?? 0,
+      verificationStartedSeq: this.opts.ledger.latestJobEvent(id, 'verification.started')?.seq ?? 0,
+      revision: blocker.revision, verification: blocker.verification,
+    });
+  }
+
+  private refuseUnauditedBlockers(
+    jobId: string, roundId: string, idle: { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] },
+    authority: readonly string[],
+  ): void {
+    const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined ||
+      this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
+      !authority.includes(this.branchIdleAuthority(blocker)));
+    if (unaudited.length === 0) return;
+    this.opts.ledger.appendCustomEvent({
+      kind: 'branch-idle.refused', jobId, roundId,
+      payload: { phase: 'freeze', forced: false, targetBranch: idle.targetBranch, blockers: unaudited },
+    });
+    throw new BranchBusyError(idle.targetBranch, unaudited, 'freeze');
+  }
+
   private enforceBranchIdle(input: {
     job: { readonly id: string };
     jobLane: WorktreeLane | null;
+    /** Authoritative resolved branch; never DWIM the caller spelling again. */
+    targetBranch?: string | undefined;
     targetRef?: string | undefined;
     force?: boolean | undefined;
     phase: BranchIdlePhase;
@@ -3132,15 +3172,18 @@ export class WaveRunner {
      * (working|blocked → in-review): the flip is bookkeeping and must not
      * mask the lane it moved. */
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
-  }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] } {
+  }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[]; readonly authority: readonly string[] } {
     const { targetBranch, blockers } = this.branchIdleBlockers(input);
+    // Snapshot before publishing an audit: synchronous ledger observers can
+    // admit new work while that event is delivered, but cannot inherit it.
+    const authority = blockers.map((blocker) => this.branchIdleAuthority(blocker));
     // A retirement hold is a fresh-authorization boundary, not ordinary
     // branch activity. Neither force nor a foreign target may waive it. A
     // pending material correction is the same (owner rule 2): the candidate
     // is outdated by an approved change, and no override reviews it.
     const held = blockers.some((blocker) =>
       blocker.revision !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
-    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers };
+    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers, authority };
     const forced = input.force === true && !held;
     this.opts.ledger.appendCustomEvent({
       kind: forced ? 'branch-idle.forced' : 'branch-idle.refused',
@@ -3149,7 +3192,7 @@ export class WaveRunner {
       payload: { phase: input.phase, forced, targetBranch, blockers },
     });
     if (!forced) throw new BranchBusyError(targetBranch, blockers, input.phase);
-    return { targetBranch, blockers };
+    return { targetBranch, blockers, authority };
   }
 
   private readonly roundAdmission = new Set<string>();
@@ -3163,6 +3206,7 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    forceAuthority?: readonly string[];
     evidence?: readonly ReviewEvidenceRequest[];
     /** Prior indexes the implementing minion claimed fixed. */
     claimedFixedPriors?: readonly number[];
@@ -4003,6 +4047,7 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
+    forceAuthority?: readonly string[];
     evidence?: readonly ReviewEvidenceRequest[];
     /** Prior indexes the implementing minion claimed fixed. */
     claimedFixedPriors?: readonly number[];
@@ -4038,7 +4083,7 @@ export class WaveRunner {
     }
     const artifactRoot = this.artifactRoot();
     const candidateRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
-    const { targetSha, movementRef } = await this.resolveFreezeTarget({
+    const { targetSha, movementRef, targetBranch } = await this.resolveFreezeTarget({
       job,
       jobWorktree,
       candidateRef,
@@ -4206,15 +4251,21 @@ export class WaveRunner {
       }
       // Freeze-time close of the race window: a lane may have re-opened
       // between the arm intake and this freeze. The same refusal applies.
-      const idle = this.enforceBranchIdle({
+      const idleInput = {
         job,
         jobLane: jobWorktree,
+        targetBranch,
         ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
         ...(input.force !== undefined ? { force: input.force } : {}),
-        phase: 'freeze',
+        phase: 'freeze' as const,
         roundId: round.id,
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
-      });
+      };
+      if (input.force === true) {
+        this.refuseUnauditedBlockers(job.id, round.id, this.branchIdleBlockers(idleInput), input.forceAuthority ?? []);
+      }
+      const idle = this.enforceBranchIdle(idleInput);
+      const frozenForceAuthority = idle.authority;
       // A clean-abort re-arm proved ONE delivered head at request time; the
       // awaited pre-flight/capacity/setup window can admit a newer delivery.
       // Re-prove the unchanged-head precondition here, at the last boundary
@@ -4358,6 +4409,7 @@ export class WaveRunner {
         const recheck = {
           job,
           jobLane: jobWorktree,
+          targetBranch,
           ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
           phase: 'freeze' as const,
           roundId: round.id,
@@ -4366,17 +4418,7 @@ export class WaveRunner {
         // Unforced: the ordinary refusal (audited). Forced: its audit already
         // stands — only a blocker it never covered is refused (audited below).
         const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-        // A pending material correction is never covered by a force audit
-        // (owner rule 2), even on a job whose other busy fact was audited.
-        const unaudited = afterProbe.blockers.filter((blocker) => blocker.revision !== undefined ||
-          !idle.blockers.some((audited) => audited.jobId === blocker.jobId));
-        if (unaudited.length > 0) {
-          this.opts.ledger.appendCustomEvent({
-            kind: 'branch-idle.refused', jobId: job.id, roundId: round.id,
-            payload: { phase: 'freeze', forced: false, targetBranch: afterProbe.targetBranch, blockers: unaudited },
-          });
-          throw new BranchBusyError(afterProbe.targetBranch, unaudited, 'freeze');
-        }
+        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, frozenForceAuthority);
         // Owner rule 3: a setup superseded while it awaited (an approved
         // material change, or a writer that owns the lane) withdraws here,
         // before any admission effect — the rollback below unwinds it.
@@ -4570,7 +4612,7 @@ export class WaveRunner {
     candidateRef: string;
     /** True when the caller explicitly named `candidateRef` (target_ref). */
     explicitTarget: boolean;
-  }): Promise<{ readonly targetSha: string; readonly movementRef: string }> {
+  }): Promise<{ readonly targetSha: string; readonly movementRef: string; readonly targetBranch?: string }> {
     const candidateBranch = input.job.prUrl === null
       ? null
       : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
@@ -4633,7 +4675,8 @@ export class WaveRunner {
         });
         return {
           targetSha: resolved.sha,
-          movementRef: input.candidateRef,
+          movementRef: resolved.trackingRef ?? input.candidateRef,
+          ...(resolved.trackingRef !== null ? { targetBranch: normalizeBranch(resolved.trackingRef) } : {}),
         };
       }
       return {
@@ -4659,7 +4702,7 @@ export class WaveRunner {
         fetched: fresh.targetSha,
         movementRef: fresh.movementRef,
       });
-      return { targetSha: fresh.targetSha, movementRef: fresh.movementRef };
+      return { targetSha: fresh.targetSha, movementRef: fresh.movementRef, targetBranch: fresh.prHeadRefName };
     } catch (error) {
       if (error instanceof PrHeadVerificationError) {
         const detail = error.message.replace(/[\r\n]+/gu, ' ').slice(0, 1000);

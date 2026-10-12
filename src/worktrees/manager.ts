@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   copyFileSync,
   cpSync,
@@ -6,12 +7,13 @@ import {
   lstatSync,
   mkdirSync,
   readlinkSync,
+  readFileSync,
   readdirSync,
   realpathSync,
   symlinkSync,
   type Stats,
 } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
 import { applyWorktreeManifest, assertWorktreeBootstrapSupported, loadWorktreeManifest } from './manifest.js';
@@ -291,6 +293,17 @@ function spawnGit(
     stderr: result.stderr ?? '',
     error: result.error !== undefined ? String(result.error) : null,
   };
+}
+
+/** Git's locked worktree reason survives a failed post-checkout hook and
+ * identifies this invocation, unlike a pre-add absence check. Branches are
+ * created atomically with a matching reflog receipt, never claimed via DWIM. */
+interface CreationCustody {
+  readonly token: string;
+  readonly branch: string | null;
+  readonly sha: string;
+  branchCreated: boolean;
+  addAttempted: boolean;
 }
 
 /** A lane base resolved to a concrete commit, with its provenance. */
@@ -579,13 +592,14 @@ export class WorktreeManager {
   private resolveReviewRef(
     repoPath: string,
     ref: string,
-  ): { sha: string; baseSource: WorktreeBaseSource | null } {
+  ): { sha: string; baseSource: WorktreeBaseSource | null; trackingRef: string | null } {
     const prefix = 'refs/remotes/origin/';
     const strip = /^(?:refs\/)?remotes\/origin\/|^origin\//u;
     /** The fetch discipline one origin-branch spelling always gets. */
     const fetchedOriginBranch = (branch: string | null, namedAs: string, unverifiedDetail: string | null = null): {
       sha: string;
       baseSource: WorktreeBaseSource | null;
+      trackingRef: string;
     } => {
       if (branch === null) {
         throw new Error(
@@ -608,7 +622,7 @@ export class WorktreeManager {
             'refusing to check out a possibly stale origin tip; verify the remote and retry',
         );
       }
-      return { sha: fetched.sha, baseSource: 'origin' };
+      return { sha: fetched.sha, baseSource: 'origin', trackingRef: `refs/remotes/origin/${branch}` };
     };
     // (1) An EXACT origin-branch spelling classifies FIRST (Perkins R5):
     // git's ambiguous DWIM lets a local refs/heads/origin/topic or
@@ -643,7 +657,7 @@ export class WorktreeManager {
       const branch = suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : suffix;
       return fetchedOriginBranch(branch, ref);
     }
-    return { sha: runGit(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]), baseSource: null };
+    return { sha: runGit(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]), baseSource: null, trackingRef: null };
   }
 
   /** Resolve a review target exactly as `createReviewWorktree` does —
@@ -656,7 +670,7 @@ export class WorktreeManager {
   async resolveReviewTarget(input: {
     repoPath: string;
     ref: string;
-  }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+  }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null }> {
     return this.withRepoLock(input.repoPath, async () => this.resolveReviewRef(input.repoPath, input.ref));
   }
 
@@ -695,13 +709,12 @@ export class WorktreeManager {
       // not actually branch from (the 'freshHead lie' of 2026-09-23).
       const base = this.resolveBase(repo.repoPath);
       const sha = base.sha;
-      // Branch/path absence was proved above under the repo lock. Guard
-      // ADD as well as BOOTSTRAP AND REGISTRATION: a failed post-checkout
-      // hook can leave a tree+branch behind before Git returns nonzero.
+      const custody = this.creationCustody(branch, sha);
       let record;
       try {
-        runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, sha]);
+        this.addLane(repo.repoPath, path, custody);
         await this.bootstrap(repo.repoPath, path);
+        this.assertCreationCustody(repo.repoPath, path, custody);
         record = this.opts.ledger.registerWorktree({
           id: input.jobId,
           kind: 'job',
@@ -714,9 +727,10 @@ export class WorktreeManager {
           jobId: input.jobId,
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, branch, error);
+        this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
+      this.handoffLane(repo.repoPath, path, custody);
       this.log('info', 'job worktree created', {
         job: input.jobId,
         path,
@@ -757,14 +771,14 @@ export class WorktreeManager {
         throw new Error(`worktree path already exists: ${path}`);
       }
       const resolved = this.resolveReviewRef(repo.repoPath, input.ref);
-      // The path was absent under the repo lock. Guard ADD and registration
-      // together, including a hook failure after Git creates the tree.
+      const custody = this.creationCustody(null, resolved.sha);
       let record;
       try {
-        runGit(repo.repoPath, ['worktree', 'add', '--detach', path, resolved.sha]);
+        this.addLane(repo.repoPath, path, custody);
         // Review lanes must contain only bytes tracked by the frozen commit.
         // Job bootstrap links/setup outputs are intentionally not applied.
         const sha = runGit(path, ['rev-parse', 'HEAD']);
+        this.assertCreationCustody(repo.repoPath, path, custody);
         record = this.opts.ledger.registerWorktree({
           id: input.roundId,
           kind: 'review',
@@ -778,9 +792,10 @@ export class WorktreeManager {
           ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, null, error);
+        this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
+      this.handoffLane(repo.repoPath, path, custody);
       this.log('info', 'review worktree created (detached)', {
         round: input.roundId,
         path,
@@ -834,17 +849,13 @@ export class WorktreeManager {
           throw new Error(`branch ${branch} already exists — one lane per child, never a reused held branch`);
         }
       }
-      // Preserve the path/branch absence checks above; only this call's
-      // new resources are eligible for ADD/bootstrap/registration rollback.
+      const custody = this.creationCustody(branch, parentHead);
       let record;
       try {
-        if (branch !== null) {
-          runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, parentHead]);
-        } else {
-          runGit(repo.repoPath, ['worktree', 'add', '--detach', path, parentHead]);
-        }
+        this.addLane(repo.repoPath, path, custody);
         if (input.authority === 'writer') await this.bootstrap(repo.repoPath, path);
         const sha = runGit(path, ['rev-parse', 'HEAD']);
+        this.assertCreationCustody(repo.repoPath, path, custody);
         record = this.opts.ledger.registerWorktree({
           id: input.childId,
           kind: 'child',
@@ -859,9 +870,10 @@ export class WorktreeManager {
           jobId: input.jobId,
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, branch, error);
+        this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
+      this.handoffLane(repo.repoPath, path, custody);
       this.log('info', 'child worktree created', {
         child: input.childId,
         job: input.jobId,
@@ -1116,34 +1128,86 @@ export class WorktreeManager {
     return killed;
   }
 
-  /** Roll back a failed creation: remove the tree; delete a branch only
-   * when THIS call created it (reviews are detached — nothing to delete).
-   * Rollback failures are logged loudly but never mask the original error. */
-  private rollbackPartialLane(
-    repoPath: string,
-    path: string,
-    branchCreatedByThisCall: string | null,
-    originalError: unknown,
-  ): void {
+  private creationCustody(branch: string | null, sha: string): CreationCustody {
+    return { token: `gru-creation:${randomUUID()}`, branch, sha, branchCreated: false, addAttempted: false };
+  }
+
+  private addLane(repoPath: string, path: string, custody: CreationCustody): void {
+    if (custody.branch !== null) {
+      // A zero old value is Git's atomic create-only guard; an external
+      // creator between the earlier checks and here keeps its branch.
+      runGit(repoPath, ['update-ref', '--create-reflog', '-m', custody.token,
+        `refs/heads/${custody.branch}`, custody.sha, '0'.repeat(custody.sha.length)]);
+      custody.branchCreated = true;
+    }
+    custody.addAttempted = true;
+    runGit(repoPath, ['worktree', 'add', '--lock', '--reason', custody.token,
+      ...(custody.branch === null ? ['--detach'] : []), path, custody.branch ?? custody.sha]);
+    if (runGit(path, ['rev-parse', 'HEAD']) !== custody.sha ||
+      (custody.branch !== null && runGit(path, ['symbolic-ref', 'HEAD']) !== `refs/heads/${custody.branch}`)) {
+      throw new Error(`worktree creation target changed during add: ${path} — refusing registration`);
+    }
+  }
+
+  private assertCreationCustody(repoPath: string, path: string, custody: CreationCustody): void {
+    const common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    const gitFile = readFileSync(join(path, '.git'), 'utf8').trim();
+    if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
+    const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
+    if (dirname(admin) !== join(common, 'worktrees') ||
+      realpathSync(readFileSync(join(admin, 'gitdir'), 'utf8').trim()) !== realpathSync(join(path, '.git')) ||
+      readFileSync(join(admin, 'locked'), 'utf8').trim() !== custody.token) {
+      throw new Error('linked-worktree custody receipt does not match this invocation');
+    }
+  }
+
+  private handoffLane(repoPath: string, path: string, custody: CreationCustody): void {
     try {
-      runGit(repoPath, ['worktree', 'remove', '--force', path]);
-    } catch (rollbackError) {
-      this.log('error', 'rollback failed to remove the partial worktree', {
-        path,
-        error: String(rollbackError),
-      });
+      this.assertCreationCustody(repoPath, path, custody);
+      runGit(repoPath, ['worktree', 'unlock', path]);
+    } catch (error) {
+      throw new Error(`worktree creation custody handoff failed for ${path}; registered lane retained — inspect before retry`, { cause: error });
     }
-    if (branchCreatedByThisCall !== null) {
-      try {
-        runGit(repoPath, ['branch', '-D', branchCreatedByThisCall]);
-      } catch (rollbackError) {
-        this.log('error', 'rollback failed to delete the partial branch (job id may be wedged)', {
-          branch: branchCreatedByThisCall,
-          error: String(rollbackError),
-        });
+  }
+
+  private assertBranchCreationCustody(repoPath: string, custody: CreationCustody, ownedPath: string | null): void {
+    if (!custody.branchCreated || custody.branch === null) return;
+    const ref = `refs/heads/${custody.branch}`;
+    const receipt = runGit(repoPath, ['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
+    const tip = runGit(repoPath, ['rev-parse', '--verify', ref]);
+    const trees = runGit(repoPath, ['worktree', 'list', '--porcelain', '-z']);
+    const foreignHolder = trees.split('\0\0').some((entry) => {
+      const fields = entry.split('\0');
+      if (!fields.includes(`branch ${ref}`)) return false;
+      const tree = fields.find((field) => field.startsWith('worktree '))?.slice('worktree '.length);
+      return ownedPath === null || tree === undefined || realpathSync(tree) !== realpathSync(ownedPath);
+    });
+    if (tip !== custody.sha || receipt !== `${custody.sha}\0${custody.token}` || foreignHolder) {
+      throw new Error(`created branch ${ref} changed or is held by another worktree`);
+    }
+  }
+
+  /** Only matching Git-native invocation receipts permit destructive
+   * rollback. Check ALL custody before any cleanup; uncertainty retains the
+   * resources and reports both the original failure and the missing proof. */
+  private rollbackPartialLane(repoPath: string, path: string, custody: CreationCustody, originalError: unknown): void {
+    try {
+      const ownedPath = custody.addAttempted && existsSync(path) ? path : null;
+      if (ownedPath !== null) this.assertCreationCustody(repoPath, path, custody);
+      this.assertBranchCreationCustody(repoPath, custody, ownedPath);
+      if (ownedPath !== null) {
+        // Git protects locked lanes even against a single --force.
+        runGit(repoPath, ['worktree', 'remove', '--force', '--force', path]);
       }
+      if (custody.branchCreated && custody.branch !== null) {
+        this.assertBranchCreationCustody(repoPath, custody, null);
+        runGit(repoPath, ['update-ref', '-d', `refs/heads/${custody.branch}`, custody.sha]);
+      }
+    } catch (error) {
+      this.log('error', 'creation rollback custody unconfirmed; resources retained', { path, error: String(error) });
+      throw new AggregateError([originalError, error],
+        `worktree creation failed (${String(originalError)}); rollback custody unconfirmed for ${path} — inspect retained resources before retry`);
     }
-    void originalError;
   }
 
   /** Copy untracked-not-ignored deliverables into the preserve root.

@@ -163,6 +163,7 @@ class DeferredReviewPort implements WorktreePort {
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    readonly trackingRef: string | null;
   }> {
     return this.delegate.resolveReviewTarget(input);
   }
@@ -194,7 +195,7 @@ class DeferredReviewPort implements WorktreePort {
 class SlowReleasePort implements WorktreePort {
   constructor(private readonly delegate: WorktreePort, private readonly releaseMs: number) {}
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> { return this.delegate.createJobWorktree(input); }
-  resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+  resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null }> {
     return this.delegate.resolveReviewTarget(input);
   }
   createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
@@ -219,7 +220,7 @@ class GatedReleasePort implements WorktreePort {
   private gate: (() => void) | null = null;
   constructor(private readonly delegate: WorktreePort) {}
   createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> { return this.delegate.createJobWorktree(input); }
-  resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+  resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null }> {
     return this.delegate.resolveReviewTarget(input);
   }
   createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {

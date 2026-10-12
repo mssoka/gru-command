@@ -20,7 +20,7 @@ import { isExactOriginBranchSpelling } from '../../src/worktrees/manager.js';
 export function resolveReviewTargetReal(
   repoPath: string,
   ref: string,
-): { readonly sha: string; readonly baseSource: WorktreeBaseSource | null } {
+): { readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null } {
   // (1) An EXACT origin-branch spelling classifies FIRST (Perkins R5): a
   // local branch or tag named origin/topic would otherwise DWIM-shadow
   // the remote ref and pin local bytes. Fetch fresh, fail closed;
@@ -51,7 +51,7 @@ export function resolveReviewTargetReal(
     const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`], {
       encoding: 'utf-8',
     }).trim();
-    return { sha, baseSource: 'origin' };
+    return { sha, baseSource: 'origin', trackingRef: `refs/remotes/origin/${branch}` };
   }
   // (2) Everything else: local DWIM, then the exact pin.
   const sym = spawnSync('git', ['-C', repoPath, 'rev-parse', '--symbolic-full-name', '--verify', ref], {
@@ -84,12 +84,12 @@ export function resolveReviewTargetReal(
     const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`], {
       encoding: 'utf-8',
     }).trim();
-    return { sha, baseSource: 'origin' };
+    return { sha, baseSource: 'origin', trackingRef: `refs/remotes/origin/${branch}` };
   }
   const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', `${ref}^{commit}`], {
     encoding: 'utf-8',
   }).trim();
-  return { sha, baseSource: null };
+  return { sha, baseSource: null, trackingRef: null };
 }
 export class GitReviewPort implements WorktreePort {
   private readonly lanes = new Map<string, WorktreeLane>();
@@ -98,6 +98,7 @@ export class GitReviewPort implements WorktreePort {
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    readonly trackingRef: string | null;
   }> {
     return resolveReviewTargetReal(input.repoPath, input.ref);
   }

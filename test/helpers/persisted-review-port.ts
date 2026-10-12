@@ -40,6 +40,7 @@ export class PersistedReviewPort implements WorktreePort {
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    readonly trackingRef: string | null;
   }> {
     return resolveReviewTargetReal(input.repoPath, input.ref);
   }

@@ -70,20 +70,21 @@ function origin(repo: FixtureRepo): string {
   return path;
 }
 
-function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeManager } {
+function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeManager; readonly root: string } {
   const db = new LedgerDb(directory());
   dbs.push(db);
   const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+  const root = directory();
   return {
-    ledger,
+    ledger, root,
     worktrees: new WorktreeManager({
-      ledger, root: directory(), preserveRoot: directory(),
+      ledger, root, preserveRoot: directory(),
       setupTimeoutMs: 30_000, enumerateProcesses: () => [],
     }),
   };
 }
 
-async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe) {
+async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe, linkedPr = true) {
   const { ledger, worktrees } = manager();
   const job = ledger.addJob({
     id: 'git-env-job', repo: 'assigned', title: 'review assigned source',
@@ -92,7 +93,7 @@ async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe) {
   await worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
   ledger.setJobStatus(job.id, 'working');
   ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: {} });
-  ledger.setJobPr(job.id, 'https://github.com/acme/assigned/pull/7');
+  if (linkedPr) ledger.setJobPr(job.id, 'https://github.com/acme/assigned/pull/7');
   const artifactRoot = directory();
   const runtime = fakeWholeSpawner(directory(), { specialists: [], childAnswer: () => '[]' });
   const wave = new WaveRunner({
@@ -107,6 +108,14 @@ async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe) {
     reviewArtifactRoot: artifactRoot, prHeadProbe: probe,
   });
   return { ledger, worktrees, job, wave, runtime, artifactRoot };
+}
+
+function registerPrBranchLane(repo: FixtureRepo, ledger: LedgerApi, jobId: string): void {
+  const path = join(directory(), 'pr-owner');
+  git(repo.path, ['checkout', 'main']);
+  git(repo.path, ['worktree', 'add', path, 'feature/shared']);
+  ledger.registerWorktree({ id: jobId, kind: 'job', repoPath: repo.path, repoName: 'assigned', path,
+    branch: 'feature/shared', sha: git(path, ['rev-parse', 'HEAD']), baseSource: null, jobId });
 }
 
 function failingCheckoutHook(repo: FixtureRepo): { readonly hook: string; readonly log: string } {
@@ -378,6 +387,131 @@ if (argv.includes('POST')) {
     expect(foreignState(foreign)).toEqual(before);
   });
 
+  it('fences the refreshed PR branch instead of the stale request branch', async () => {
+    const repo = fixture('assigned-pr-idle-identity');
+    origin(repo);
+    repo.git(['checkout', '-b', 'feature/shared']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'feature/shared']);
+    const h = await waveFixture(repo, async () => ({ headRefName: 'feature/shared', headSha: target }));
+    const other = h.ledger.addJob({ id: 'busy-pr-owner', repo: 'assigned', title: 'busy PR writer', baseBranch: 'main' });
+    registerPrBranchLane(repo, h.ledger, other.id);
+    h.ledger.setJobStatus(other.id, 'working');
+    await expect(h.wave.requestReview({ jobId: h.job.id })).rejects.toMatchObject({ name: 'BranchBusyError', targetBranch: 'feature/shared' });
+    expect(h.runtime.leadCalls).toHaveLength(0);
+  });
+
+  it('never carries force authority from the requested branch to a newly discovered PR blocker', async () => {
+    const repo = fixture('assigned-pr-force-identity');
+    origin(repo);
+    repo.git(['checkout', '-b', 'feature/shared']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'feature/shared']);
+    const h = await waveFixture(repo, async () => ({ headRefName: 'feature/shared', headSha: target }));
+    const other = h.ledger.addJob({ id: 'busy-force-owner', repo: 'assigned', title: 'busy PR writer', baseBranch: 'main' });
+    registerPrBranchLane(repo, h.ledger, other.id);
+    h.ledger.setJobStatus(other.id, 'working');
+    await expect(h.wave.requestReview({ jobId: h.job.id, force: true })).rejects.toMatchObject({ name: 'BranchBusyError', targetBranch: 'feature/shared' });
+    expect(h.runtime.leadCalls).toHaveLength(0);
+    const forced = h.ledger.listJobEvents(h.job.id).filter((event) => event.kind === 'branch-idle.forced');
+    expect(forced.every((event) => (event.payload as { targetBranch: string }).targetBranch !== 'feature/shared')).toBe(true);
+  });
+
+  it('retains the refreshed PR branch for the post-probe admission idle check', async () => {
+    const repo = fixture('assigned-pr-post-probe');
+    origin(repo);
+    repo.git(['checkout', '-b', 'feature/shared']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'feature/shared']);
+    const h = await waveFixture(repo, async () => ({ headRefName: 'feature/shared', headSha: target }));
+    const other = h.ledger.addJob({ id: 'post-probe-owner', repo: 'assigned', title: 'late PR writer', baseBranch: 'main' });
+    registerPrBranchLane(repo, h.ledger, other.id);
+    h.ledger.setJobStatus(other.id, 'working');
+    h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: other.id, payload: {} });
+    // The freeze observer runs immediately before the awaited advertised probe.
+    const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, spawner: h.runtime.spawner,
+      reviewArtifactRoot: h.artifactRoot, prHeadProbe: async () => ({ headRefName: 'feature/shared', headSha: target }),
+      reviewFreezeObserver: () => { h.ledger.setJobStatus(other.id, 'blocked'); h.ledger.setJobStatus(other.id, 'working'); },
+    });
+    await expect(wave.requestReview({ jobId: h.job.id, force: true })).rejects.toMatchObject({ name: 'BranchBusyError', targetBranch: 'feature/shared' });
+    expect(h.runtime.leadCalls).toHaveLength(0);
+  });
+
+  it('requires fresh force authority when an already-audited PR owner opens a new attempt', async () => {
+    const repo = fixture('assigned-pr-force-new-attempt');
+    origin(repo);
+    repo.git(['checkout', '-b', 'feature/shared']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'feature/shared']);
+    const h = await waveFixture(repo, async () => ({ headRefName: 'feature/shared', headSha: target }));
+    const other = h.ledger.addJob({ id: 'audited-owner', repo: 'assigned', title: 'audited writer', baseBranch: 'main' });
+    registerPrBranchLane(repo, h.ledger, other.id);
+    h.ledger.setJobStatus(other.id, 'working');
+    const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, spawner: h.runtime.spawner,
+      reviewArtifactRoot: h.artifactRoot, prHeadProbe: async () => ({ headRefName: 'feature/shared', headSha: target }),
+      reviewFreezeObserver: () => { h.ledger.setJobStatus(other.id, 'blocked'); h.ledger.setJobStatus(other.id, 'working'); },
+    });
+    await expect(wave.requestReview({ jobId: h.job.id, targetRef: 'feature/shared', force: true }))
+      .rejects.toMatchObject({ name: 'BranchBusyError', targetBranch: 'feature/shared' });
+    expect(h.runtime.leadCalls).toHaveLength(0);
+  });
+
+  it('freezes a tag-shadowed non-PR tracking target with its exact fetched identity', async () => {
+    const repo = fixture('assigned-nopr-shadow');
+    origin(repo);
+    repo.git(['checkout', '-b', 'topic']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'topic']);
+    repo.git(['tag', 'origin/topic', 'main']);
+    const h = await waveFixture(repo, async () => { throw new Error('non-PR must not probe'); }, false);
+    const request = await h.wave.requestReview({ jobId: h.job.id, targetRef: 'origin/topic' });
+    if (request.route !== 'perkins') throw new Error(`expected native request, got ${request.route}`);
+    const outcome = await request.run;
+    expect(outcome.headMoved).toBe(false);
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE'); // Non-PR reviews retain the publication refusal.
+    expect(readFileSync(outcome.reportFile!, 'utf8')).toContain('the job has no pull request link');
+    expect(h.runtime.leadCalls).toHaveLength(1);
+    const manifest = JSON.parse(readFileSync(join(h.artifactRoot, outcome.round.id, 'manifest.json'), 'utf8'));
+    expect(manifest).toMatchObject({ targetRef: 'refs/remotes/origin/topic', targetSha: target });
+  });
+
+  it('proves advertised non-PR movement despite a tag shadow and an unchanged local tracking ref', async () => {
+    const repo = fixture('assigned-nopr-advertised');
+    const remote = origin(repo);
+    repo.git(['checkout', '-b', 'topic']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'topic']);
+    repo.git(['tag', 'origin/topic', target]);
+    const h = await waveFixture(repo, async () => { throw new Error('non-PR must not probe'); }, false);
+    const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, spawner: h.runtime.spawner,
+      reviewArtifactRoot: h.artifactRoot,
+      reviewFreezeObserver: () => { git(remote, ['update-ref', 'refs/heads/topic', git(repo.path, ['rev-parse', 'main'])]); },
+    });
+    await expect(wave.requestReview({ jobId: h.job.id, targetRef: 'origin/topic' })).rejects.toMatchObject({ name: 'ReviewAdmissionError' });
+    expect(git(repo.path, ['rev-parse', 'refs/remotes/origin/topic'])).toBe(target);
+    expect(h.runtime.leadCalls).toHaveLength(0);
+  });
+
+  it('carries the live origin/HEAD default identity rather than a stale cached symref', async () => {
+    const repo = fixture('assigned-nopr-live-default');
+    const remote = origin(repo);
+    repo.git(['checkout', '-b', 'trunk']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'trunk']);
+    repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+    git(remote, ['symbolic-ref', 'HEAD', 'refs/heads/trunk']);
+    const h = await waveFixture(repo, async () => { throw new Error('non-PR must not probe'); }, false);
+    const request = await h.wave.requestReview({ jobId: h.job.id, targetRef: 'origin/HEAD' });
+    if (request.route !== 'perkins') throw new Error(`expected native request, got ${request.route}`);
+    const outcome = await request.run;
+    expect(outcome.headMoved).toBe(false);
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE'); // Non-PR reviews retain the publication refusal.
+    expect(readFileSync(outcome.reportFile!, 'utf8')).toContain('the job has no pull request link');
+    expect(h.runtime.leadCalls).toHaveLength(1);
+    const manifest = JSON.parse(readFileSync(join(h.artifactRoot, outcome.round.id, 'manifest.json'), 'utf8'));
+    expect(manifest).toMatchObject({ targetRef: 'refs/remotes/origin/trunk', targetSha: target });
+  });
+
   it('sanitizes the secondary movement-ref proof when the frozen target is an exact commit pin', async () => {
     const repo = fixture('assigned-secondary-movement');
     repo.git(['checkout', '-b', 'feature/shared']);
@@ -413,6 +547,7 @@ if (argv.includes('POST')) {
     rmSync(hook);
     const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
     expect(lane.branch).toBe(`gru/${job.id}`);
+    expect(git(repo.path, ['worktree', 'list', '--porcelain'])).not.toContain('locked');
     // Existing lane ownership refusals must not roll back somebody else's prior lane.
     await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })).rejects.toThrow(/already exists/);
     expect(existsSync(lane.path)).toBe(true);
@@ -472,6 +607,77 @@ if (argv.includes('POST')) {
     }
     expect(await worktrees.release({ worktreeId: job.id })).toMatchObject({ status: 'swept' });
     expect(foreignState(foreign)).toEqual(state);
+  });
+
+  it('preserves concurrent external trees, branches and data for every creation authority', async () => {
+    const repo = fixture('assigned-external-race');
+    origin(repo);
+    const { ledger, worktrees, root } = manager();
+    const job = ledger.addJob({ id: 'external-race', repo: 'assigned', title: 'external custody', baseBranch: 'main' });
+    const parentJob = ledger.addJob({ id: 'external-parent', repo: 'assigned', title: 'parent', baseBranch: 'main' });
+    const parent = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: parentJob.id });
+    const round = ledger.addRound({ jobId: job.id, targetRef: repo.head() });
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const servicePath = process.env.PATH ?? '';
+    for (const authority of ['job', 'review', 'writer', 'read-only'] as const) {
+      const id = authority === 'job' ? job.id : authority === 'review' ? round.id : `external-${authority}`;
+      const path = join(root, 'assigned-external-race', `${authority === 'job' ? 'job' : authority === 'review' ? 'review' : 'child'}-${id}`);
+      const branch = authority === 'job' ? `gru/${job.id}` : authority === 'writer' ? `gru/${parentJob.id}-child-${id}` : `external-${authority}`;
+      const wrapperRoot = directory();
+      const marker = join(wrapperRoot, 'external-created');
+      const wrapper = join(wrapperRoot, 'git');
+      writeFileSync(wrapper, '#!/usr/bin/env node\n' +
+        'const fs = require("node:fs"), cp = require("node:child_process"); const args = process.argv.slice(2);\n' +
+        `if ((args[0] === 'update-ref' || (args[0] === 'worktree' && args[1] === 'add')) && !fs.existsSync(${JSON.stringify(marker)})) {\n` +
+        ` fs.writeFileSync(${JSON.stringify(marker)}, 'external creator');\n` +
+        ` cp.execFileSync(${JSON.stringify(realGit)}, ['worktree', 'add', '-b', ${JSON.stringify(branch)}, ${JSON.stringify(path)}, 'HEAD']);\n` +
+        ` fs.writeFileSync(require('node:path').join(${JSON.stringify(path)}, 'external-data.txt'), 'external owner'); }\n` +
+        `const r = cp.spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' }); process.exit(r.status ?? 1);\n`);
+      chmodSync(wrapper, 0o755);
+      vi.stubEnv('PATH', `${wrapperRoot}:${servicePath}`);
+      const create = authority === 'job' ? worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })
+        : authority === 'review' ? worktrees.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: repo.head() })
+          : worktrees.createChildWorktree({ repoPath: repo.path, jobId: parentJob.id, childId: id, parentPath: parent.path, authority });
+      await expect(create).rejects.toThrow();
+      expect(readFileSync(join(path, 'external-data.txt'), 'utf8')).toBe('external owner');
+      expect(git(repo.path, ['worktree', 'list', '--porcelain'])).toContain(path);
+      expect(git(repo.path, ['rev-parse', `refs/heads/${branch}`])).toBe(repo.head());
+      expect(ledger.getWorktree(id)).toBeNull();
+      vi.stubEnv('PATH', servicePath);
+    }
+  });
+
+  it('fails loudly without cleanup when a failed hook removes creation custody', async () => {
+    const repo = fixture('assigned-unknown-custody');
+    const { ledger, worktrees } = manager();
+    const job = ledger.addJob({ id: 'unknown-custody', repo: 'assigned', title: 'unknown custody', baseBranch: 'main' });
+    const round = ledger.addRound({ jobId: job.id, targetRef: repo.head() });
+    const { hook, log } = failingCheckoutHook(repo);
+    writeFileSync(hook, '#!/usr/bin/env node\n' +
+      `const fs = require('node:fs'), cp = require('node:child_process'); fs.writeFileSync(${JSON.stringify(log)}, process.cwd());\n` +
+      `cp.spawnSync('git', ['worktree', 'unlock', process.cwd()]); fs.writeFileSync('unknown-data.txt', 'retain'); process.exit(7);\n`);
+    await expect(worktrees.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: repo.head() }))
+      .rejects.toThrow(/custody/);
+    const path = readFileSync(log, 'utf8');
+    expect(readFileSync(join(path, 'unknown-data.txt'), 'utf8')).toBe('retain');
+    expect(ledger.getWorktree(round.id)).toBeNull();
+  });
+
+  it('preserves tree and branch when a failed hook changes the branch custody receipt', async () => {
+    const repo = fixture('assigned-hook-branch-custody');
+    const original = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    const { ledger, worktrees } = manager();
+    const job = ledger.addJob({ id: 'changed-branch', repo: 'assigned', title: 'changed custody', baseBranch: 'main' });
+    const { hook, log } = failingCheckoutHook(repo);
+    writeFileSync(hook, '#!/usr/bin/env node\n' +
+      `const fs = require('node:fs'), cp = require('node:child_process'); fs.writeFileSync(${JSON.stringify(log)}, process.cwd());\n` +
+      `cp.execFileSync('git', ['update-ref', 'HEAD', 'HEAD~1']); fs.writeFileSync('changed-data.txt', 'retain'); process.exit(7);\n`);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })).rejects.toThrow(/custody unconfirmed/);
+    const path = readFileSync(log, 'utf8');
+    expect(readFileSync(join(path, 'changed-data.txt'), 'utf8')).toBe('retain');
+    expect(git(repo.path, ['rev-parse', `refs/heads/gru/${job.id}`])).not.toBe(original);
+    expect(git(repo.path, ['worktree', 'list', '--porcelain'])).toContain('locked gru-creation:');
+    expect(ledger.getWorktree(job.id)).toBeNull();
   });
 
   it('keeps an intentional local origin-prefixed tag pinned even if foreign refs classify it as a branch', async () => {

@@ -25,6 +25,7 @@ export class InMemoryWorktreePort implements WorktreePort {
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
     readonly baseSource: WorktreeBaseSource | null;
+    readonly trackingRef: string | null;
   }> {
     // Git-backed fixtures resolve with the production discipline; the
     // non-git contract fixtures keep the fabricated identity this double
@@ -36,7 +37,7 @@ export class InMemoryWorktreePort implements WorktreePort {
       stdio: 'ignore',
     });
     if (probe.status === 0) return resolveReviewTargetReal(input.repoPath, input.ref);
-    return { sha: `sha-${input.ref}`, baseSource: null };
+    return { sha: `sha-${input.ref}`, baseSource: null, trackingRef: null };
   }
 
   async createJobWorktree(input: { repoPath: string; jobId: string }): Promise<WorktreeLane> {
