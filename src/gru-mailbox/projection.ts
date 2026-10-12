@@ -17,8 +17,9 @@ function notificationIdentity(row: NotificationRecord): string {
   return row.kind.includes(':') || producerResolvedBy(row.kind) !== null
     ? `${row.kind}:${row.agentId ?? 'service'}` : `notification:${row.id}`;
 }
-function notificationBasis(ledger: LedgerApi, row: NotificationRecord): string {
-  const evidence = [notificationIdentity(row), row.kind, row.detail, row.severity];
+function notificationBasis(ledger: LedgerApi, row: NotificationRecord, reportSource = row): string {
+  const source = reportHandbackJobId(row.kind) === null ? row : reportSource;
+  const evidence = [notificationIdentity(row), row.kind, source.detail, source.severity];
   const jobId = reportHandbackJobId(row.kind);
   if (jobId === null) return mailboxBasis(evidence);
   const job = ledger.getJob(jobId);
@@ -52,24 +53,30 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
   }
   // A resolved transport card is not closure of the commissioner's report debt.
   // Retain only already-surfaced report sources across replacement gaps; no new watcher or debt.
-  const activeKinds = new Set(notifications.map((row) => row.kind));
+  const activeIds = new Set(notifications.map((row) => row.id));
   const retainedKinds = new Set([...surfaced.values()].flatMap((item) => item.reasons.map((reason) => reason.label))
     .filter((kind) => reportHandbackJobId(kind) !== null));
-  for (const kind of retainedKinds) {
-    if (activeKinds.has(kind)) continue;
+  const reportKinds = new Set([...retainedKinds, ...notifications.map((row) => row.kind).filter((kind) => reportHandbackJobId(kind) !== null)]);
+  const reportSources = new Map<string, NotificationRecord>();
+  for (const kind of reportKinds) {
     const jobId = reportHandbackJobId(kind)!;
     const job = jobById.get(jobId);
     if (job === undefined || isJobTerminal(job.status) || job.deliverable === null || !isReportDeliverable(job.deliverable)) continue;
     const debt = ledger.findReportObligation(jobId);
     if (debt === null || !['open', 'waiting'].includes(debt.state)) continue;
     // Insertion order, not UUID lexical order, determines the most recent replacement.
+    // Older active cards must not resurrect old evidence after a newer card is dispositioned.
     const row = ledger.latestReportHandbackNotification(jobId);
-    if (row !== null && row.routing === 'action-required') notifications.push(row);
+    if (row !== null && row.routing === 'action-required') {
+      reportSources.set(kind, row);
+      if (retainedKinds.has(kind) && !activeIds.has(row.id)) notifications.push(row);
+    }
   }
   const bound = new Map<string, NotificationRecord[]>();
   const incidents = new Map<string, NotificationRecord[]>();
   for (const row of notifications) {
     const reportJobId = reportHandbackJobId(row.kind);
+    if (reportJobId !== null && jobById.has(reportJobId) && isJobTerminal(jobById.get(reportJobId)!.status)) continue;
     // Report custody belongs to the named report, not the notification's transport agent.
     const jobId = reportJobId !== null || row.agentId === null ? null : jobByAgent.get(row.agentId) ?? null;
     // Unknown agent bindings are incidents, never guessed job membership.
@@ -83,6 +90,12 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
     }
   }
   const items: MailboxItem[] = [];
+  const notificationBases = new Map<string, string>();
+  const basisOf = (row: NotificationRecord): string => {
+    const basis = notificationBases.get(row.id) ?? notificationBasis(ledger, row, reportSources.get(row.kind) ?? row);
+    notificationBases.set(row.id, basis);
+    return basis;
+  };
   const make = (id: string, subject: string, jobId: string | null, title: string, reasons: readonly MailboxReason[], rows: readonly NotificationRecord[], references: readonly MailboxReference[], restrictions: readonly string[], context: unknown = null): MailboxItem => {
     const ordered = reasons.map((reason) => ({ ...reason, basis: mailboxBasis([reason.basis, context]) })).sort((a, b) => a.signal.localeCompare(b.signal) || a.basis.localeCompare(b.basis));
     const basis = mailboxBasis(ordered.map((reason) => [reason.signal, reason.basis]));
@@ -149,8 +162,8 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
       }
     }
     const rows = bound.get(job.id) ?? [];
-    const distinctNotifications = new Map(rows.map((row) => [`${notificationIdentity(row)}:${notificationBasis(ledger, row)}`, row]));
-    for (const row of distinctNotifications.values()) add(incidentSignalOf(row), 'action-required', [notificationIdentity(row), notificationBasis(ledger, row)]);
+    const distinctNotifications = new Map(rows.map((row) => [`${notificationIdentity(row)}:${basisOf(row)}`, row]));
+    for (const row of distinctNotifications.values()) add(incidentSignalOf(row), 'action-required', [notificationIdentity(row), basisOf(row)]);
     const independentlyEligible = reasons.length > 0;
     let obligationError = false;
     let owesAnyGru = false;
@@ -273,7 +286,7 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
       if (page.length < 200) break;
     }
     items.push({ ...make(`incident:${mailboxBasis(key)}`, subject, null, row.title,
-      [...new Set(rows.map((source) => notificationBasis(ledger, source)))].map((basis) => ({ signal: incidentSignalOf(row), label: row.kind, basis: mailboxBasis([key, basis]) })), rows, references, restrictions), followUpAt });
+      [...new Set(rows.map((source) => basisOf(source)))].map((basis) => ({ signal: incidentSignalOf(row), label: row.kind, basis: mailboxBasis([key, basis]) })), rows, references, restrictions), followUpAt });
   }
   return items.sort((a, b) => a.id.localeCompare(b.id));
 }

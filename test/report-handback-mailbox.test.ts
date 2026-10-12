@@ -229,6 +229,31 @@ describe('GH-313 report-handback custody', () => {
     expect(gap.notificationIds).toEqual([]);
   });
 
+  it('does not resurrect old custody when an older card stays active after newer evidence is resolved', () => {
+    const r = fixture();
+    const held = r.wait();
+    r.ledger.recordNotification({ id: 'newer-with-older-active', kind: KIND, title: r.original.title, detail: 'new evidence',
+      severity: 'error', routing: 'action-required' });
+    const changed = r.mailbox.snapshot().items.find((row) => row.id === held.id)!;
+    expect(changed.state).toBe('needs-gru');
+    r.ledger.resolveNotificationById('newer-with-older-active', 'gru');
+    const retained = r.mailbox.snapshot().items.find((row) => row.id === held.id)!;
+    expect(retained.state).toBe('needs-gru');
+    expect(retained.basis).toBe(changed.basis);
+    expect(retained.notificationIds).toEqual(held.notificationIds);
+  });
+
+  it('actual report settlement closes custody even if a duplicate transport card remains', () => {
+    const r = fixture();
+    const held = r.wait();
+    const original = r.ledger.getNotification(held.notificationIds[0]!)!;
+    r.ledger.recordNotification({ id: 'duplicate-at-settlement', kind: KIND, title: original.title, detail: original.detail!,
+      routing: 'action-required', severity: original.severity });
+    r.ledger.settleReportDisposition({ jobId: JOB, outcome: 'dismissed', note: 'commissioner collected both copies', by: 'writer' });
+    expect(r.mailbox.snapshot().items.find((row) => row.id === held.id)?.state).toBe('resolved');
+    expect(r.mailbox.attentionPage(50)).toEqual([]);
+  });
+
   it('retains a receipt-waiting report obligation during a notification gap', () => {
     const r = fixture();
     r.ledger.armReceiptExpectation({ obligationId: r.debt.id, receiptKind: 'job.delivered', deadlineAt: RECHECK,

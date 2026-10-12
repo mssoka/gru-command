@@ -395,7 +395,14 @@ dependency and original recheck. A temporary gap after notification disposition
 retains already-surfaced open/waiting report debt; it does not mark the report
 collected or settled. Material report/target/plan/receipt changes or the due
 recheck restore attention through the same admission path. Missing or invalid
-custody remains actionable; actual report settlement closes custody.
+custody remains actionable; actual report settlement closes custody. Report
+custody cannot be marked resolved using an attention-only decision. Replacement
+evidence follows insertion order, including timestamp ties and older cards that
+remain active; display-title and transport-agent changes are not new reports.
+Pre-upgrade waiting metadata is adopted only when its original durable ruling
+and unchanged source can be authenticated, with a
+`mailbox.report-custody-migrated` audit event; original decisions and recheck
+clocks are never rewritten. Unprovable compatibility surfaces debt instead.
 Both passive and wake acceptance durably park immutable rendered identity,
 reason bases, source notification IDs, batch identity and original acceptance
 time before receipt writes. Recovery records historical evidence even if the
