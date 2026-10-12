@@ -43,7 +43,7 @@ never logged or replayed.
 | `delta` | `text`, `seq` | streamed reply chunk |
 | `tool` | `name`, `state: start\|end`, `seq` | live tool activity |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
-| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13; routing split 2026-09-23): needs-owner items ("🔔 For you: …") and supervisor restart notices. Logged + replayed; never fatal, never a turn |
+| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13; routing split 2026-09-23): needs-owner items ("🔔 For you: …" — the only *notification-routing* kind) and operational service events (supervisor restart, vision-unavailable, rejected-input notices; see "Notice routing" below). Logged + replayed; never fatal, never a turn |
 | `error` | `message`, `fatal?`, `seq?` | see the error classes below |
 | `context` | `epoch`, `replay_floor_seq`, `state: idle\|busy\|compacting\|resetting`, `usage`, `compact_supported`, `session_active`, `writer` | fresh server-owned snapshot after auth and on every control/writer/runtime-state transition. `usage` is provider-owned or `null`, never a frontend estimate |
 | `control_result` | `action`, `request_id`, `ok`, `epoch`, `code?`, `message?` | terminal result for exactly one request; failures distinguish `busy`, `unsupported`, `read_only`, `no_session`, and runtime/persistence `failed` |
@@ -343,7 +343,12 @@ relaying it. Two mechanisms share one boundary:
   a separate owner cursor, so autonomous turns cannot consume it. Capped
   counts are shown as lower bounds (e.g. `100+`).
 
-The client-facing `notice` frame is now the needs-owner channel only:
+**Notice routing.** The client-facing `notice` frame carries two distinct
+things: (1) *notification routing* — needs-owner is the only notification
+channel, and (2) operational service events (e.g. the supervisor-restart
+notice) that are not notifications and never ring the bell. The rest of this
+paragraph is about (1) only: the `notice` frame is now the needs-owner
+notification channel only:
 action-required rows never render in a human-facing band or ring the owner
 bell — they wake Gru and live in the board's NEEDS GRU machine queue
 (live rows only: rows bound to a terminal merged/done/binned lane are
