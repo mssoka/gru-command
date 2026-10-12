@@ -3544,6 +3544,9 @@ export class WaveRunner {
     }
     // Owner rule 2: a material correction accepted while the gate runs makes
     // its diff obsolete — no override carries the gate past it.
+    if (this.opts.ledger.hasOpenDirectiveRecoveryHold(input.jobId)) {
+      throw new FallbackSafetyRefusal(`job "${input.jobId}" has a recovery hold — fallback requires fresh authorization`);
+    }
     if (jobNow !== null && pendingWorkRevision(this.opts.ledger, jobNow) !== null) {
       throw new FallbackSafetyRefusal(
         `an approved material correction for job "${input.jobId}" is pending delivery — the old diff cannot pass`,
@@ -3591,7 +3594,12 @@ export class WaveRunner {
         `a lane on branch "${admission.targetBranch}" changed after fallback admission — the old diff cannot pass`,
       );
     }
-    const busyNow = findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch });
+    // Fallback reviews THIS checkout, even when target_ref names another
+    // branch. Its own live work cannot disappear behind target filtering.
+    const busyNow = [
+      ...findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch }),
+      ...findBusyLanes({ ledger: this.opts.ledger, lanes: [lane], targetBranch: normalizeBranch(lane.branch ?? laneBranch(input.jobId)) }),
+    ];
     if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined ||
       this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
       !admission.forceAuthority.includes(this.branchIdleAuthority(blocker)))) {
@@ -4695,9 +4703,13 @@ export class WaveRunner {
           ...(resolved.trackingRef !== null ? { targetBranch: normalizeBranch(resolved.trackingRef) } : {}),
         };
       }
+      const targetSha = resolveGitCommit(input.jobWorktree.path, input.candidateRef);
       return {
-        targetSha: resolveGitCommit(input.jobWorktree.path, input.candidateRef),
-        movementRef: input.candidateRef,
+        targetSha,
+        // Named refs retain movement proof in the shared object store.
+        // Revision expressions and commit pins bind once in the source
+        // lane, never against HEAD of the detached target checkout.
+        movementRef: this.resolvedLocalRefName(input.jobWorktree.path, input.candidateRef) ?? targetSha,
       };
     }
     try {

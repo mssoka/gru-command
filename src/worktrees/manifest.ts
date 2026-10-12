@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { parse } from 'smol-toml';
 import type { LogLevel } from '../logger.js';
+import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -325,6 +326,7 @@ async function execSetupCommand(command: string, cwd: string, timeoutMs: number)
   try {
     child = spawn('/bin/sh', ['-c', command], {
       cwd,
+      env: repositoryGitEnv(false),
       detached: true, // own process group: the timeout kill reaps children too
       stdio: ['ignore', 'pipe', 'pipe'],
     });

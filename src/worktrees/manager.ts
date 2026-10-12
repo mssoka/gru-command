@@ -1161,6 +1161,26 @@ export class WorktreeManager {
     }
   }
 
+  /** A failed hook can remove the checkout while leaving Git's locked
+   * administration entry. Its backlink and nonce still prove custody. */
+  private orphanCreationAdmin(repoPath: string, path: string, custody: CreationCustody): string | null {
+    const common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+    const container = join(common, 'worktrees');
+    if (!existsSync(container)) return null;
+    const expected = join(realpathSync(dirname(path)), basename(path), '.git');
+    for (const entry of readdirSync(container, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const admin = join(container, entry.name);
+      const backlink = resolve(admin, readFileSync(join(admin, 'gitdir'), 'utf8').trim());
+      if (backlink !== expected) continue;
+      if (readFileSync(join(admin, 'locked'), 'utf8').trim() !== custody.token) {
+        throw new Error('orphaned worktree custody receipt does not match this invocation');
+      }
+      return admin;
+    }
+    return null;
+  }
+
   private handoffLane(repoPath: string, path: string, custody: CreationCustody): void {
     try {
       this.assertCreationCustody(repoPath, path, custody);
@@ -1180,7 +1200,8 @@ export class WorktreeManager {
       const fields = entry.split('\0');
       if (!fields.includes(`branch ${ref}`)) return false;
       const tree = fields.find((field) => field.startsWith('worktree '))?.slice('worktree '.length);
-      return ownedPath === null || tree === undefined || realpathSync(tree) !== realpathSync(ownedPath);
+      return ownedPath === null || tree === undefined ||
+        join(realpathSync(dirname(tree)), basename(tree)) !== join(realpathSync(dirname(ownedPath)), basename(ownedPath));
     });
     if (tip !== custody.sha || receipt !== `${custody.sha}\0${custody.token}` || foreignHolder) {
       throw new Error(`created branch ${ref} changed or is held by another worktree`);
@@ -1192,15 +1213,19 @@ export class WorktreeManager {
    * resources and reports both the original failure and the missing proof. */
   private rollbackPartialLane(repoPath: string, path: string, custody: CreationCustody, originalError: unknown): void {
     try {
-      const ownedPath = custody.addAttempted && existsSync(path) ? path : null;
-      if (ownedPath !== null) this.assertCreationCustody(repoPath, path, custody);
+      const present = custody.addAttempted && existsSync(path);
+      const orphanAdmin = custody.addAttempted && !present ? this.orphanCreationAdmin(repoPath, path, custody) : null;
+      const ownedPath = present || orphanAdmin !== null ? path : null;
+      if (present) this.assertCreationCustody(repoPath, path, custody);
       this.assertBranchCreationCustody(repoPath, custody, ownedPath);
       if (custody.branchCreated && custody.branch !== null) {
         // Keep the invocation-owned checkout holding this branch until its
         // compare-and-delete finishes. Dropping the checkout first opens a
         // window for an ordinary external worktree to adopt the same tip.
         // No owned holder means no destructive authority: retain the ref.
-        if (ownedPath === null || runGit(ownedPath, ['symbolic-ref', 'HEAD']) !== `refs/heads/${custody.branch}`) {
+        const heldRef = orphanAdmin === null ? (ownedPath === null ? null : runGit(ownedPath, ['symbolic-ref', 'HEAD']))
+          : readFileSync(join(orphanAdmin, 'HEAD'), 'utf8').trim().replace(/^ref: /u, '');
+        if (ownedPath === null || heldRef !== `refs/heads/${custody.branch}`) {
           throw new Error(`created branch ${custody.branch} has no invocation-owned checkout reservation`);
         }
         runGit(repoPath, ['update-ref', '-d', `refs/heads/${custody.branch}`, custody.sha]);
