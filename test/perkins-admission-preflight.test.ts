@@ -1727,7 +1727,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, it } from 'vitest';
+import { afterEach, test } from 'vitest';
 import { createFixtureCleanup, discoverOwnGroup } from ${JSON.stringify(join(repoRoot, 'test/helpers/shim-reaper.ts'))};
 
 const fixtures = createFixtureCleanup({ ownGroup: discoverOwnGroup() });
@@ -1735,7 +1735,7 @@ afterEach(() => {
   fixtures.run();
 });
 
-it('fails before its own assertions', () => {
+test('fails before its own assertions', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hook-fixture-'));
   writeFileSync(join(process.env.HOOK_OUT!, 'dir.txt'), dir);
   const registry = join(dir, 'invocations');

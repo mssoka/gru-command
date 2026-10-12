@@ -8835,6 +8835,81 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     }
   });
 
+  it('default delays on a controlled clock: dueAt is exactly T+60,000 then T2+300,000, the armed delays are exact, nothing dispatches at dueAt-1 and one request dispatches at dueAt (R9-15)', async () => {
+    const f = await transientFixture('controlled-clock');
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    /** The controlled clock's scheduler: long (retry-sized) timers are held
+     * here with the delay they were armed with and fire only when the test
+     * advances the clock; everything else runs on real timers. */
+    const held: Array<{ readonly handle: object; readonly dueAt: number; readonly delay: number; readonly fn: () => void }> = [];
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...args: unknown[]) => {
+      if (typeof ms !== 'number' || ms <= 30_000) return (realSetTimeout as (...all: unknown[]) => NodeJS.Timeout)(fn, ms, ...args);
+      const handle = { unref: () => handle, ref: () => handle, hasRef: () => false, refresh: () => handle };
+      held.push({ handle, dueAt: Date.now() + ms, delay: ms, fn });
+      return handle as unknown as NodeJS.Timeout;
+    }) as unknown as typeof setTimeout);
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((handle?: Parameters<typeof clearTimeout>[0]) => {
+      const index = held.findIndex((entry) => entry.handle === (handle as unknown));
+      if (index >= 0) held.splice(index, 1);
+      else realClearTimeout(handle);
+    }) as typeof clearTimeout);
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), // default options: the production delays
+    });
+    const requests = vi.spyOn(wave, 'requestReview');
+    /** Move the clock to `at`, firing every held timer that is due by then. */
+    const advanceTo = (at: number): void => {
+      vi.setSystemTime(at);
+      for (const entry of held.filter((candidate) => candidate.dueAt <= at)) {
+        held.splice(held.indexOf(entry), 1);
+        entry.fn();
+      }
+    };
+    const scheduled = (): Array<{ dueAt: string; attempt: number }> =>
+      payloads(f.ledger, f.jobId, 'round.admission-retry-scheduled') as Array<{ dueAt: string; attempt: number }>;
+    try {
+      const T = 1_900_000_000_000;
+      vi.setSystemTime(T);
+      await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
+      expect(requests).toHaveBeenCalledTimes(1);
+      expect(scheduled()).toHaveLength(1);
+      const due1 = Date.parse(scheduled()[0]!.dueAt);
+      expect(due1).toBe(T + 60_000);
+      expect(held.map((entry) => ({ delay: entry.delay, dueAt: entry.dueAt }))).toEqual([{ delay: 60_000, dueAt: T + 60_000 }]);
+
+      advanceTo(due1 - 1);
+      await new Promise((resolve) => realSetTimeout(resolve, 200));
+      expect(requests).toHaveBeenCalledTimes(1);
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(1);
+
+      advanceTo(due1);
+      await vi.waitFor(() => expect(scheduled()).toHaveLength(2), { timeout: 30_000, interval: 20 });
+      expect(requests).toHaveBeenCalledTimes(2); // exactly ONE request dispatched at dueAt
+      const due2 = Date.parse(scheduled()[1]!.dueAt);
+      expect(due2).toBe(due1 + 300_000); // T2 is the retry's own refusal time, the frozen due1
+      await vi.waitFor(() => expect(held.length).toBe(1), { timeout: 30_000, interval: 20 });
+      expect(held.map((entry) => ({ delay: entry.delay, dueAt: entry.dueAt }))).toEqual([{ delay: 300_000, dueAt: due1 + 300_000 }]);
+
+      advanceTo(due2 - 1);
+      await new Promise((resolve) => realSetTimeout(resolve, 200));
+      expect(requests).toHaveBeenCalledTimes(2);
+      expect(f.ledger.listRounds(f.jobId)).toHaveLength(2);
+
+      advanceTo(due2);
+      await vi.waitFor(() => expect(settled(f.ledger, f.jobId).map((entry) => entry['outcome'])).toEqual(['refused', 'refused']), { timeout: 30_000, interval: 20 });
+      expect(requests).toHaveBeenCalledTimes(3);
+      expect(held).toHaveLength(0); // no third retry exists: the last refusal escalated
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+      vi.useRealTimers();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  }, 120_000);
+
   it('a clean-abort re-arm keeps its delivered-head fence through the retry (R7-23)', async () => {
     const f = await transientFixture('bound-head');
     const wave = new WaveRunner({
@@ -8898,6 +8973,66 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       await wave.shutdown();
     }
   });
+
+  it('a retry re-submits noSpec with its canonical catalog and genuine claimed priors, which still reach mandatory re-verification (R9-16)', async () => {
+    const f = await transientFixture('identity-matrix');
+    const noSpecCatalog = ['blind', 'edge', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations'];
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9003', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const options = (spawner: ReturnType<typeof fakeWholeSpawner>['spawner']): ConstructorParameters<typeof WaveRunner>[0] => ({
+      ledger: f.ledger, worktrees: f.port, spawner, reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [100], reconcileReviewAgent: async () => true,
+      poster: receiptPoster,
+    });
+    // Round 1 (whole, remote up): one blocker on a file the next delta never touches.
+    rmSync(f.flag);
+    const first = fakeWholeSpawner(f.sessions, { childAnswer: () => '[]', specialists: [], leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', title: 'prior blocker' }) });
+    const firstWave = new WaveRunner(options(first.spawner));
+    await firstWave.runRound({ jobId: f.jobId });
+    await firstWave.shutdown();
+    expect(f.ledger.listRounds(f.jobId)).toHaveLength(1);
+    f.repo.commitFile('src/other.ts', 'export const other = 1;\n');
+    f.repo.git(['push', '--quiet', 'origin', `refs/heads/${f.branch}`]);
+
+    const second = fakeWholeSpawner(f.sessions, { childAnswer: () => '[]', specialists: [] });
+    const wave = new WaveRunner(options(second.spawner));
+    const seen = vi.spyOn(wave, 'requestReview');
+    const request = { jobId: f.jobId, noSpec: true, lenses: noSpecCatalog, claimedFixedPriors: [0] };
+    try {
+      writeFileSync(f.flag, ''); // the remote is down for the first attempt only
+      await expect(wave.requestReview(request)).rejects.toThrow(/automatic retry 1 of 1/u);
+      rmSync(f.flag);
+      await until(() => settled(f.ledger, f.jobId).length === 1, 60_000);
+      const outcome = settled(f.ledger, f.jobId)[0]!;
+      expect(outcome).toMatchObject({ outcome: 'ran', route: 'perkins' });
+      // The retry carried every field of the refused request, verbatim.
+      expect(seen.mock.calls).toHaveLength(2);
+      expect(seen.mock.calls[1]![0]).toMatchObject(request);
+      expect(seen.mock.calls[1]![0]).not.toHaveProperty('force');
+      const roundId = String(outcome['ranRoundId']);
+      const ranRound = f.ledger.listRounds(f.jobId).find((round) => round.id === roundId)!;
+      expect(ranRound.seq).toBe(3); // round 2 was the refused admission
+      // noSpec reached the round: its own chips are the no-spec catalog, no acceptance.
+      expect(ranRound.lenses.map((chip) => chip.lens)).toEqual(noSpecCatalog);
+      // The claim reached the delta round: prior 0 sits in an UNTOUCHED file with
+      // unchanged evidence, so without the claim it would have been host-carried.
+      await until(() => second.leadCalls.length > 0, 30_000);
+      await until(() => existsSync(join(f.artifacts, roundId, 'consolidated.json')), 30_000);
+      const consolidated = JSON.parse(readFileSync(join(f.artifacts, roundId, 'consolidated.json'), 'utf8')) as {
+        convergence: { reviewScope: string; carriedPriors?: number[]; reverifyPriors?: number[] };
+      };
+      expect(consolidated.convergence).toMatchObject({ reviewScope: 'delta', reverifyPriors: [0] });
+      expect(consolidated.convergence.carriedPriors).toBeUndefined();
+    } finally {
+      f.restorePath();
+      await wave.shutdown();
+    }
+  }, 120_000);
 
   it('a git group that would not stop refuses its round, escalates ONCE naming the group, is never retried — and quarantines nothing (owner decision 2026-10-08, R8-25)', async () => {
     const stuckFile = join(mkdtempSync(join(tmpdir(), 'perkins-retry-stuck-')), 'groups');
