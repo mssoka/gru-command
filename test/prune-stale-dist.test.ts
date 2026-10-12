@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
+import { PUBLIC_REVIEW_EXECUTABLE_PATHS } from '../src/runtime/review-executable-paths.js';
 
 /**
  * tools/prune-stale-dist.mjs contract. `tsc` never deletes outputs of a
@@ -40,6 +41,13 @@ function runTool(root: string) {
 }
 
 describe('prune-stale-dist', () => {
+  it('audits every live compiler output name in the finite runtime catalog', () => {
+    const outputs = readdirSync(join(repoRoot, 'src'), { recursive: true })
+      .filter((path) => path.endsWith('.ts') && !path.endsWith('.d.ts'))
+      .map((path) => `dist/${path.slice(0, -3)}.js`);
+    const unaudited = outputs.filter((path) => !PUBLIC_REVIEW_EXECUTABLE_PATHS.has(path));
+    expect(unaudited).toEqual([]);
+  });
   it('removes every tsc output whose source is gone, and the directories it empties', () => {
     const root = fixtureRoot();
     touch(root, 'src/main.ts');
