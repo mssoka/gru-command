@@ -210,7 +210,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     const workspace = fixtureWorkspace();
     const { output, status } = ptyWizard([
       { expect: WS_PROMPT, send: 'code' }, { expect: WS_PROMPT, send: workspace },
-      { expect: REPOS_PROMPT, send: 'not-a-repo' }, { expect: REPOS_PROMPT, send: '' },
+      { expect: REPOS_PROMPT, send: 'not-a-repo\u202ehidden' }, { expect: REPOS_PROMPT, send: '' },
       { expect: RUNTIME_PROMPT, send: 'vim' }, { expect: RUNTIME_PROMPT, send: '' },
       { expect: MODEL_PROMPT, send: '' }, { expect: THINKING_PROMPT, send: '' },
       { expect: HOST_PROMPT, send: 'not a host!' }, { expect: HOST_PROMPT, send: '' },
@@ -221,6 +221,12 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     for (const text of ['workspace_root must be an absolute path', 'not an available Git repository candidate', 'valid runtimes:', 'answers.host must be', 'port must be an integer', 'Setup complete']) {
       expect(output).toContain(text);
     }
+    const rejectedRepoLine = output
+      .split('\n')
+      .find((line) => line.includes('not an available Git repository candidate:'));
+    expect(rejectedRepoLine).toBe(
+      '  ✗ not an available Git repository candidate: not-a-repo\\u{202e}hidden',
+    );
   }, 90_000);
 
   it('managed-repo multi-pick by INDEX selects exactly that repo', () => {

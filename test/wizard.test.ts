@@ -463,6 +463,28 @@ describe('wizard CLI surface', () => {
     expect(existsSync(configPathFor(home))).toBe(false);
   });
 
+  it('headless setup refuses case-folded names that runtime cannot manage', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-case-folded-ws-');
+    const repo = join(workspace, 'Alpha');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repo });
+
+    expect(resolveManagedRepoPathSync(workspace, 'alpha').kind).toBe('unavailable');
+    const caseAliasExists = existsSync(join(workspace, 'alpha', '.git'));
+    const home = tempDir('gru-command-wizard-case-folded-home-');
+    const result = spawnSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--answers', JSON.stringify({
+      workspace_root: workspace, repos: ['alpha'], port: 0, smoke: false,
+    })], { env: { ...process.env, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 30_000 });
+    expect(result.status).toBe(1);
+    expect(existsSync(configPathFor(home))).toBe(false);
+    if (caseAliasExists) {
+      expect(result.stderr).toContain('canonical directory spelling');
+    } else {
+      expect(result.stderr).toContain('not a git repo under the workspace root');
+    }
+  });
+
   it('headless setup accepts a wrong-kind user BMAD path without reading or changing it', () => {
     const repoRoot = join(import.meta.dirname, '..');
     const workspace = tempDir('gru-command-wizard-independent-ws-');

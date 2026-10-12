@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -1613,6 +1613,46 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       expect(rewritten).toBe('https://github.com/acme/rewritten.git');
     } finally {
       vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains cached overview as stale when a previously valid .git directory becomes unreadable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-git-permission-'));
+    const repo = join(root, 'alpha');
+    const gitDir = join(repo, '.git');
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
+      const api = new FakeApi().set('alpha', { openPrs: 4, openIssues: 2 });
+      const clock = { ms: T0 };
+      const tracker = new ManagedRepoOverviewTracker({
+        workspaceRoot: root,
+        managedRepos: ['alpha'],
+        api,
+        now: () => clock.ms,
+        sleep: async () => {},
+        intervalMs: 300_000,
+      });
+
+      const initial = row(await tracker.refresh(), 'alpha');
+      expect(initial).toMatchObject({ linked: true, freshness: 'fresh', openPrs: 4, openIssues: 2 });
+      const callsBeforeFailure = api.calls.length;
+
+      chmodSync(gitDir, 0);
+      clock.ms += 1;
+      const unreadable = row(await tracker.refresh(), 'alpha');
+      expect(unreadable).toMatchObject({ linked: true, freshness: 'stale', openPrs: 4, openIssues: 2 });
+      expect(unreadable.error).toMatch(/EACCES|permission denied/iu);
+      expect(api.calls).toHaveLength(callsBeforeFailure);
+
+      chmodSync(gitDir, 0o755);
+      clock.ms += 1;
+      const recovered = row(await tracker.refresh(), 'alpha');
+      expect(recovered).toMatchObject({ linked: true, freshness: 'fresh', openPrs: 4, openIssues: 2 });
+      expect(api.calls.length).toBeGreaterThan(callsBeforeFailure);
+    } finally {
+      if (existsSync(gitDir)) chmodSync(gitDir, 0o755);
       rmSync(root, { recursive: true, force: true });
     }
   });
