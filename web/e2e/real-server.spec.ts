@@ -221,7 +221,7 @@ test('service restart drops the socket; reconnect keeps history and flushes the 
     nodeImport: JEV_PRELOAD,
     extraEnv: { JEV_FETCH_LOG, JEV_FETCH_MODE_FILE: JEV_MODE_FILE },
   });
-  await expect(page.locator('#banners .banner')).toBeHidden({ timeout: 15_000 });
+  await expect(page.locator('#banners .banner:visible')).toHaveCount(0, { timeout: 15_000 });
   const flushedReply = echoReplies(page, 'typed while down').last();
   await expect(flushedReply).toBeVisible();
   await expect(flushedReply).toHaveCount(1);

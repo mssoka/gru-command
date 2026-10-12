@@ -2658,6 +2658,17 @@ export class Supervisor {
       void this.completeRearm(agent, notificationId);
       return { ok: true, rearmed: true };
     }
+    // A durable stop can outlive its runtime handle. Do not consume its only
+    // retry control while the agent has not yet been adopted.
+    for (const [agentId, control] of this.restoredRearmControls) {
+      if (control.notificationId !== notificationId) continue;
+      if (this.restoredStops.get(agentId)?.breakerOpen === true) {
+        return {
+          ok: false,
+          reason: 'restored breaker has not been adopted by a live agent yet; keep this control open and retry after adoption',
+        };
+      }
+    }
     // No stopped breaker is bound to this alert: the disposition is a pure
     // record. Say so — an accepted outcome must never claim a re-arm that
     // did not happen.

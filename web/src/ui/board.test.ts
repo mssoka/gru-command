@@ -4591,9 +4591,23 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
     }
   });
 
-  it('a re-pair clears successful decision overrides before another service reuses the notification id', async () => {
+  it('a re-pair keeps prior decision controls read-only until the new client snapshot arrives', async () => {
+    mountBoardDom();
     const row = notification('shared-decision-id', { routing: 'needs-owner', decision: ownerDecision() });
     const decided = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const replacement = notification('shared-decision-id', {
+      routing: 'needs-owner',
+      decision: ownerDecision({
+        question: 'Approve the replacement route?',
+        options: [{ id: 'approve', label: 'Approve the replacement route', consequence: 'Gru prepares only this route.' }],
+      }),
+    });
+    const replacementDecided = {
+      ...replacement,
+      decidedAt: '2026-01-01T00:11:00.000Z',
+      decidedBy: 'web',
+      decidedOption: 'approve',
+    };
     const oldClient = {
       ackNotification: vi.fn(() => Promise.resolve()),
       markNotificationShown: vi.fn(() => Promise.resolve(true)),
@@ -4602,22 +4616,43 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
     const newClient = {
       ackNotification: vi.fn(() => Promise.resolve()),
       markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(replacementDecided)),
     } as unknown as import('../lib/board-client.js').BoardClient;
     const view = new BoardView(() => {});
     view.bindClient(oldClient);
     view.render(snapshot({ notifications: [row] }));
-    document
+    const staleChoice = document
       .getElementById('board-owner')!
-      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-decision-id:option:approve"]')!
-      .click();
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-decision-id:option:approve"]')!;
+    staleChoice.click();
     await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
 
     view.bindClient(newClient);
-    view.render(snapshot({ notifications: [row] }));
+    expect(staleChoice.isConnected).toBe(false);
+    expect(document.getElementById('board-owner')!.textContent).toContain('Approve the slim contract?');
     expect(document.getElementById('board-owner')!.textContent).not.toContain('Decision recorded');
     expect(
       document.getElementById('board-owner')!.querySelector('[data-action-id="notif:shared-decision-id:option:approve"]'),
-    ).not.toBeNull();
+    ).toBeNull();
+    expect(
+      document.getElementById('notification-list')!.querySelector('[data-action-id="notif:shared-decision-id:option:approve"]'),
+    ).toBeNull();
+    staleChoice.click();
+    expect(newClient.decideNotification).not.toHaveBeenCalled();
+
+    view.render(snapshot({ notifications: [replacement] }));
+    const currentChoice = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-decision-id:option:approve"]');
+    expect(currentChoice?.textContent).toBe('Approve the replacement route');
+    expect(currentChoice?.disabled).toBe(false);
+    expect(
+      document.getElementById('notification-list')!.querySelector<HTMLButtonElement>(
+        '[data-action-id="notif:shared-decision-id:option:approve"]',
+      )?.textContent,
+    ).toBe('Approve the replacement route');
+    currentChoice?.click();
+    expect(newClient.decideNotification).toHaveBeenCalledWith('shared-decision-id', 'approve');
   });
 
   it('a re-pair drops in-flight work begun for the old client (late replies change nothing)', async () => {

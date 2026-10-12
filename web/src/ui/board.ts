@@ -200,6 +200,8 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
+  /** Decision controls are live only for a snapshot from the currently bound client. */
+  private snapshotIsCurrent = false;
   private snapshotRevision = 0;
   private unavailableReason: string | null = null;
   /** ONE sections derivation per render (classification truth is shared
@@ -327,10 +329,13 @@ export class BoardView {
     this.receiptsNextOffset = 0;
     this.receiptsExhausted = false;
     this.receiptsLoading = false;
+    this.snapshotIsCurrent = false;
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
   render(snapshot: BoardSnapshot, source: BoardSnapshotSource = 'http'): void {
     this.unavailableReason = null;
+    this.snapshotIsCurrent = true;
     this.snapshotRevision += 1;
     this.renderSnapshot(snapshot, source);
   }
@@ -2372,7 +2377,7 @@ export class BoardView {
     const decided = item.decidedAt !== null && item.decidedAt !== undefined;
     // Options are live only on an open OWNER row: machine queue rows and
     // closed receipts render their options read-only (no fake control).
-    const open = allowOptions && !decided && item.resolvedAt === null && item.ackedAt === null;
+    const open = allowOptions && this.snapshotIsCurrent && !decided && item.resolvedAt === null && item.ackedAt === null;
     if (open && decision.discussion && decision.options.length === 0) {
       // A discussion-only decision: chat is the supported way forward, and
       // the action actually OPENS the composer — the card stays pending
@@ -2452,7 +2457,7 @@ export class BoardView {
    * stale-state conflicts refresh before the board offers another choice. */
   private submitDecision(item: NotificationView, optionId: string, surfaceRoot: HTMLElement): void {
     const client = this.boardClient;
-    if (client === null) return;
+    if (client === null || !this.snapshotIsCurrent) return;
     const existing = this.decisionSubmissions.get(item.id);
     if (existing !== undefined && (existing.phase === 'submitting' || existing.phase === 'reconciling')) {
       return; // one action; no retries until authoritative refresh resolves the conflict

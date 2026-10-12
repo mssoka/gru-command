@@ -361,6 +361,7 @@ function fixtureSnapshot(overrides: Partial<BoardSnapshot> = {}): BoardSnapshot 
 
 interface Seed {
   readonly pageErrors: Error[];
+  readonly socketReady: Promise<void>;
   push(snapshot: BoardSnapshot): void;
 }
 
@@ -372,6 +373,8 @@ async function seedBoard(page: Page, initial: BoardSnapshot, proposal?: Record<s
   page.on('pageerror', (error) => pageErrors.push(error));
   let current = initial;
   const sockets: WebSocketRoute[] = [];
+  let markSocketReady!: () => void;
+  const socketReady = new Promise<void>((resolve) => { markSocketReady = resolve; });
   await page.route('**/api/board', (route) => route.fulfill({ json: current }));
   if (proposal !== undefined) {
     await page.route('**/api/lessons/proposal', (route) => route.fulfill({ json: proposal }));
@@ -384,10 +387,12 @@ async function seedBoard(page: Page, initial: BoardSnapshot, proposal?: Record<s
       seeded = true;
       ws.send(JSON.stringify({ type: 'auth_ok' }));
       ws.send(JSON.stringify({ type: 'board', snapshot: current }));
+      markSocketReady();
     });
   });
   return {
     pageErrors,
+    socketReady,
     push(snapshot: BoardSnapshot) {
       if (!isValidSnapshot(snapshot)) throw new Error('pushed snapshot fails the production validator');
       current = snapshot;
@@ -1389,6 +1394,79 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       expect(seed.pageErrors).toEqual([]);
     } finally {
       refreshRelease.current?.();
+      await page.close();
+    }
+  });
+
+  test('unknown_option keeps both owner surfaces locked across WebSocket A→B→A until the production HTTP refresh', async ({ browser }) => {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    const initial = fixtureSnapshot();
+    const decision = initial.notifications.find((notification) => notification.id === 'decision-1')?.decision;
+    if (decision === null || decision === undefined) throw new Error('decision fixture is missing typed options');
+    const withOptions = (options: typeof decision.options): BoardSnapshot =>
+      fixtureSnapshot({
+        notifications: initial.notifications.map((notification) =>
+          notification.id === 'decision-1'
+            ? { ...notification, decision: { ...decision, options } }
+            : notification,
+        ),
+      });
+    const snapshotB = withOptions([{ id: 'beta', label: 'Use plan B', consequence: 'The owner sees the updated alternative.' }]);
+    const snapshotA = withOptions(decision.options);
+    let refreshRequests = 0;
+    let decisionPosts = 0;
+    const releases: (() => void)[] = [];
+    try {
+      const seed = await seedBoard(page, initial);
+      await pairAndOpenBoard(page);
+      await seed.socketReady;
+      await settled(page);
+      await page.route('**/api/board', async (route) => {
+        const requestNumber = ++refreshRequests;
+        await new Promise<void>((resolve) => { releases[requestNumber - 1] = resolve; });
+        await route.fulfill({ json: requestNumber === 1 ? snapshotB : snapshotA });
+      });
+      await page.route('**/api/notifications/*/decision', (route) => {
+        if (route.request().method() !== 'POST') return route.fallback();
+        decisionPosts += 1;
+        return route.fulfill({
+          status: 400,
+          json: {
+            error: 'decision_refused',
+            code: 'unknown_option',
+            detail: 'the decision options changed elsewhere',
+          },
+        });
+      });
+
+      const ownerCard = page.locator('#board-owner [data-notification-id="decision-1"]');
+      await ownerCard.locator('[data-action-id$=":option:approve"]').click();
+      await expect.poll(() => decisionPosts).toBe(1);
+      await expect.poll(() => refreshRequests).toBe(1);
+      await expect(ownerCard.locator('.board-notification__submission--reconciling')).toBeVisible();
+
+      seed.push(snapshotB);
+      await expect(ownerCard.locator('[data-action-id$=":option:beta"]')).toBeDisabled();
+      seed.push(snapshotA);
+      await expect(ownerCard.locator('[data-action-id$=":option:approve"]')).toHaveAttribute('aria-disabled', 'true');
+      await page.locator('#notification-bell').click();
+      const bellChoice = page.locator('#notification-list [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
+      await expect(bellChoice).toHaveAttribute('aria-disabled', 'true');
+      await expect(page.locator('#notification-list [data-notification-id="decision-1"] [data-action-id$=":option:keep"]')).toBeDisabled();
+
+      // The first HTTP answer was asked for before the pushes, so BoardClient
+      // must discard it and owe a second, current HTTP snapshot.
+      releases[0]!();
+      await expect.poll(() => refreshRequests).toBe(2);
+      await expect(ownerCard.locator('.board-notification__submission--reconciling')).toBeVisible();
+      releases[1]!();
+      await expect(ownerCard.locator('[data-action-id$=":option:approve"]')).toBeEnabled();
+      await expect(bellChoice).toBeEnabled();
+      await expect(ownerCard.locator('.board-notification__submission--reconciling')).toHaveCount(0);
+      expect(decisionPosts).toBe(1);
+      expect(seed.pageErrors).toEqual([]);
+    } finally {
+      for (const release of releases) release?.();
       await page.close();
     }
   });

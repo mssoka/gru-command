@@ -157,3 +157,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-for-you-readable-notifications-20261009-v3.md`
   summary: Persist restart backoff and retry-control debt when a notification-driven re-arm's replacement spawn fails.
   evidence: The accepted re-arm records `supervision.rearmed` before spawning and the failed-spawn retry is held only in an in-memory timer; restarting before that timer fires can lose the retry/control. This behavior predates the current correction delta and does not demonstrate a stop/hold bypass; the accepted correction requires durable reconstruction of later fenced stops, not persistence of every un-fenced retry.
+- source_spec: `_bmad-output/implementation-artifacts/spec-for-you-readable-notifications-20261009-v3.md`
+  summary: `docs/SUPERVISION.md` and `docs/OPERATIONS.md` inaccurately say a service restart clears a durable open breaker.
+  evidence: R6 edge review at `821dfdb67853ce9f809fca47a045d4e26bc72b75`, `docs/SUPERVISION.md:119-121` and `docs/OPERATIONS.md:107-108`; `Supervisor.hydrateRestoredStops()` reconstructs durable open stops on startup. This is a pre-existing documentation correction outside the notification acceptance; updating it is deferred without changing restart/recovery behavior.

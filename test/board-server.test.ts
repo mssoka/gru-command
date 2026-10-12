@@ -1456,6 +1456,70 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
     }
   });
 
+  it('keeps a restored breaker control open when disposition precedes agent adoption', async () => {
+    let disposition: ((id: string) => ReturnType<Supervisor['onNotificationDisposed']>) | null = null;
+    const harness = await boot('board-test-token', {
+      onNotificationDisposition: (id) => (disposition === null ? undefined : disposition(id)),
+    });
+    const registryTap: { listener: ((envelope: AgentEventEnvelope) => void) | null } = { listener: null };
+    const registry: SupervisorRegistry = {
+      onAgentEvent: (listener) => {
+        registryTap.listener = listener;
+        return () => { registryTap.listener = null; };
+      },
+      getHandle: () => null,
+      spawn: async () => { throw new Error('an unadopted restored stop must refuse before spawn'); },
+      disposeHandle: async () => {},
+    };
+    const config = { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 };
+    const supervisor = new Supervisor({
+      config,
+      registry,
+      ledger: harness.api,
+      notifications: harness.notifications,
+      tickMs: 5_000,
+    });
+    let originalDisposed = false;
+    let restored: Supervisor | null = null;
+    disposition = bindSupervisorNotificationDisposition(supervisor);
+    try {
+      supervisor.start();
+      harness.api.addJob({ id: 'restore-before-adopt-job', repo: 'fixture', title: 'restored breaker control' });
+      harness.api.setJobStatus('restore-before-adopt-job', 'working');
+      harness.api.registerAgent({ id: 'restore-before-adopt-agent', role: 'minion', jobId: 'restore-before-adopt-job' });
+      registryTap.listener?.({ agentId: 'restore-before-adopt-agent', role: 'minion', sessionFile: null, phase: 'spawned' });
+      const internals = supervisor as unknown as { agents: Map<string, unknown>; tripBreaker(agent: unknown): void };
+      const agent = internals.agents.get('restore-before-adopt-agent');
+      if (agent === undefined) throw new Error('supervisor did not adopt the fixture agent');
+      internals.tripBreaker(agent);
+      const stop = harness.api.listNotifications({ limit: 50 }).find(
+        (row) => row.agentId === 'restore-before-adopt-agent' && row.kind === 'supervision.breaker',
+      );
+      if (stop === undefined) throw new Error('supervisor did not post the breaker control');
+
+      supervisor.dispose();
+      originalDisposed = true;
+      restored = new Supervisor({ config, registry, ledger: harness.api, notifications: harness.notifications, tickMs: 5_000 });
+      disposition = bindSupervisorNotificationDisposition(restored);
+      restored.start();
+      expect(restored.viewFor('restore-before-adopt-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+
+      const response = await postJson(
+        harness.port,
+        `/api/notifications/${encodeURIComponent(stop.id)}/disposition`,
+        'board-test-token',
+        { detail: 'retry after adoption' },
+      );
+      expect(response).toMatchObject({ status: 409, body: { error: 'rearm_refused', code: 'rearm_refused' } });
+      expect(harness.api.getNotification(stop.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+      expect(restored.viewFor('restore-before-adopt-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+    } finally {
+      restored?.dispose();
+      if (!originalDisposed) supervisor.dispose();
+      await harness.close();
+    }
+  });
+
   it('re-fences a pre-spawn re-arm failure through the authenticated disposition route', async () => {
     let disposition: ((id: string) => ReturnType<Supervisor['onNotificationDisposed']>) | null = null;
     const harness = await boot('board-test-token', {
