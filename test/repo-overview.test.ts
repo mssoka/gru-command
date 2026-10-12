@@ -1672,6 +1672,74 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     }
   });
 
+  it('retains cached data as stale while managed-root validation stalls and recovers later', async () => {
+    vi.useFakeTimers();
+    const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 3 });
+    const clock = { ms: T0 };
+    const rootAttempts: string[] = [];
+    let alphaStalls = false;
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: ['alpha'],
+      api,
+      intervalMs: 0,
+      now: () => clock.ms,
+      sleep: async () => {},
+      resolveRepoPath: (_workspaceRoot, name) => {
+        rootAttempts.push(name);
+        return name === 'alpha' && alphaStalls
+          ? new Promise(() => {})
+          : { kind: 'available', path: `/ws/${name}` };
+      },
+      resolveRemote: async (path) => githubRef(path.split('/').at(-1) as string),
+    });
+    try {
+      const initial = await tracker.refresh();
+      const initialAlpha = row(initial, 'alpha');
+      expect(initialAlpha.linked).toBe(true);
+      expect(initialAlpha.openPrs).toBe(7);
+      expect(initialAlpha.openIssues).toBe(3);
+      expect(initialAlpha.run).not.toBeNull();
+      expect(initialAlpha.checkedAt).not.toBeNull();
+      const callsAfterInitial = api.calls.length;
+      expect(callsAfterInitial).toBeGreaterThan(0);
+
+      alphaStalls = true;
+      const completes = tracker.refresh().then((view) => ({ kind: 'completed' as const, view }));
+      const guard = new Promise<{ kind: 'guard' }>((resolve) => {
+        setTimeout(() => resolve({ kind: 'guard' }), REPO_OVERVIEW_RESOLVE_BUDGET_MS * 4);
+      });
+      const outcomePromise = Promise.race([completes, guard]);
+      await vi.advanceTimersByTimeAsync(REPO_OVERVIEW_RESOLVE_BUDGET_MS * 5);
+      const outcome = await outcomePromise;
+      expect(outcome.kind).toBe('completed');
+      if (outcome.kind !== 'completed') return;
+
+      const stalledAlpha = row(outcome.view, 'alpha');
+      expect(stalledAlpha.linked).toBe(true);
+      expect(stalledAlpha.freshness).toBe('stale');
+      expect(stalledAlpha.openPrs).toBe(initialAlpha.openPrs);
+      expect(stalledAlpha.openIssues).toBe(initialAlpha.openIssues);
+      expect(stalledAlpha.run).toEqual(initialAlpha.run);
+      expect(stalledAlpha.checkedAt).toBe(initialAlpha.checkedAt);
+      expect(stalledAlpha.lastAttemptAt).not.toBeNull();
+      expect(stalledAlpha.error).toContain('root validation exceeded the origin-resolution budget');
+      expect(api.calls).toHaveLength(callsAfterInitial);
+      expect(isValidSnapshot(validBoardSnapshot(outcome.view))).toBe(true);
+
+      alphaStalls = false;
+      clock.ms += 1;
+      const recovered = await tracker.refresh();
+      expect(rootAttempts).toEqual(['alpha', 'alpha', 'alpha']);
+      expect(row(recovered, 'alpha').linked).toBe(true);
+      expect(row(recovered, 'alpha').freshness).toBe('fresh');
+      expect(row(recovered, 'alpha').error).toBeNull();
+      expect(api.calls.length).toBeGreaterThan(callsAfterInitial);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('coordinates root validation and provider cursors so joint budgets eventually observe every selected root', async () => {
     const names = Array.from({ length: 60 }, (_value, index) => `repo-${String(index).padStart(2, '0')}`);
     const api = new FakeApi();

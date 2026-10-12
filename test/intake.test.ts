@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IntakeService, INTAKE_HELPER, type IntakeServiceOptions } from '../src/intake/service.js';
+import * as reviewPath from '../src/dispatch/review-path.js';
+import * as managedNames from '../src/repos/managed-names.js';
 import { conservativePlan, validatePlan } from '../src/intake/planner.js';
 import { captureSources } from '../src/intake/sources.js';
 import { createManagedRepoIntakeResolver, managedRepoPathsForIntake, resolveManagedRepoPath } from '../src/repos/managed-names.js';
@@ -76,6 +78,62 @@ describe('GC intake sources and immutable preview', () => {
     const preview = await h.service.preview({ ...h.request, source: { kind: 'issue', reference: '#296' } });
     expect(preview.gaps).toEqual([]);
     expect(preview.snapshots[0]?.locator).toBe('https://github.com/owner/demo/issues/296');
+  });
+
+  it('uses trusted safe.directory for selected issue origins while filtering inherited Git overrides', async () => {
+    const h = fixture({ ghRunner: async () => ({ status: 0, stdout: issueRaw(), stderr: '' }) });
+    execFileSync('git', ['-C', h.repo, 'remote', 'add', 'origin', 'https://github.com/owner/demo.git']);
+    const trustedHome = join(h.root, 'trusted-home');
+    const inheritedHome = join(h.root, 'inherited-home');
+    const foreign = join(h.root, 'foreign');
+    mkdirSync(trustedHome);
+    mkdirSync(inheritedHome);
+    mkdirSync(foreign);
+    execFileSync('git', ['init', '-q', foreign]);
+    execFileSync('git', ['-C', foreign, 'remote', 'add', 'origin', 'https://github.com/attacker/foreign.git']);
+    const trustedConfig = join(trustedHome, '.gitconfig');
+    execFileSync('git', ['config', '--file', trustedConfig, 'safe.directory', h.repo]);
+    const inheritedConfig = join(h.root, 'inherited.gitconfig');
+    execFileSync('git', [
+      'config', '--file', inheritedConfig,
+      'url.https://github.com/attacker/rewritten.git.insteadOf',
+      'https://github.com/owner/demo.git',
+    ]);
+
+    vi.stubEnv('HOME', inheritedHome);
+    vi.stubEnv('XDG_CONFIG_HOME', join(inheritedHome, 'xdg'));
+    vi.stubEnv('GIT_DIR', join(foreign, '.git'));
+    vi.stubEnv('GIT_WORK_TREE', foreign);
+    vi.stubEnv('GIT_CONFIG_GLOBAL', inheritedConfig);
+    vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+    vi.stubEnv('GIT_CONFIG_COUNT', '1');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'remote.origin.url');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', 'https://github.com/attacker/foreign.git');
+    vi.stubEnv('GIT_TEST_ASSUME_DIFFERENT_OWNER', '1');
+    const trustedEnv = managedNames.gitProbeEnvironment(trustedHome);
+    expect(trustedEnv.HOME).toBe(trustedHome);
+    expect(trustedEnv.GIT_TEST_ASSUME_DIFFERENT_OWNER).toBe('1');
+    for (const key of [
+      'XDG_CONFIG_HOME', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM',
+      'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+    ]) expect(trustedEnv).not.toHaveProperty(key);
+
+    const environments: NodeJS.ProcessEnv[] = [];
+    const originalRepoRemote = reviewPath.repoRemote;
+    const remote = vi.spyOn(reviewPath, 'repoRemote').mockImplementation((repoPath, gitBinary, env) => {
+      const trusted = env ?? trustedEnv;
+      environments.push(trusted);
+      return originalRepoRemote(repoPath, gitBinary, trusted);
+    });
+    try {
+      const preview = await h.service.preview({ ...h.request, source: { kind: 'issue', reference: '#296' } });
+      expect(preview.gaps).toEqual([]);
+      expect(preview.snapshots[0]?.locator).toBe('https://github.com/owner/demo/issues/296');
+      expect(environments).toEqual([trustedEnv]);
+    } finally {
+      remote.mockRestore();
+      vi.unstubAllEnvs();
+    }
   });
 
   it('captures only explicitly selected comments with exact bytes and validates membership', async () => {
