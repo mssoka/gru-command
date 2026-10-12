@@ -114,12 +114,20 @@ async function assertFormalAppReview<T>(
     (receipt) => ({ kind: 'receipt' as const, receipt }),
     (error: unknown) => ({ kind: 'error' as const, error }),
   );
-  const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'));
-  if (post === undefined) {
-    if (outcome.kind === 'error') throw outcome.error;
-    throw new Error('formal GitHub review POST was not recorded');
+  const posts = calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'));
+  if (posts.length === 0 && outcome.kind === 'error') throw outcome.error;
+  if (posts.length === 0) {
+    await assertFormalEventAssertion(tag, () => expect(posts).toHaveLength(1));
   }
-  await assertFormalEventAssertion(tag, () => expect(JSON.parse(post.body!)).toEqual(expectedRequest));
+  expect(posts).toHaveLength(1);
+  const post = posts[0]!;
+  let request: unknown;
+  try {
+    request = JSON.parse(post.body ?? '');
+  } catch {
+    request = undefined;
+  }
+  await assertFormalEventAssertion(tag, () => expect(request).toEqual(expectedRequest));
   if (outcome.kind === 'error') throw outcome.error;
   await assertFormalEventAssertion(tag, () => expect(outcome.receipt).toEqual(expectedReceipt));
 }
@@ -3427,14 +3435,34 @@ describe('formal GitHub verdict publication', () => {
     const namedOnly = Object.assign(new Error('not a Vitest matcher failure'), { name: 'AssertionError' });
     await expect(assertFormalEventAssertion('app-marker-regression', () => { throw namedOnly; }))
       .rejects.toBe(namedOnly);
+    const expectedRequest = { body: 'review body\n', event: 'APPROVE' as const, commit_id: HEAD };
+    const expectedReceipt = { ...RECEIPT, event: 'APPROVED' };
     const preparationFailure = new PerkinsAppError('fixture preparation failed');
     await expect(assertFormalAppReview(
       'app-marker-regression',
       Promise.reject(preparationFailure),
       [],
-      { body: 'review body\n', event: 'APPROVE', commit_id: HEAD },
-      { ...RECEIPT, event: 'APPROVED' },
+      expectedRequest,
+      expectedReceipt,
     )).rejects.toBe(preparationFailure);
+    await expect(assertFormalAppReview(
+      'app-marker-regression', Promise.resolve(expectedReceipt), [], expectedRequest, expectedReceipt,
+    )).rejects.toThrow(/FORMAL_EVENT_ASSERTION:app-marker-regression/u);
+    const recordedPost: RecordedCall = {
+      url: 'https://api.github.com/repos/acme/widget/pulls/7/reviews',
+      method: 'POST',
+      headers: {},
+      body: '{invalid json',
+    };
+    await expect(assertFormalAppReview(
+      'app-marker-regression', Promise.resolve(expectedReceipt), [recordedPost], expectedRequest, expectedReceipt,
+    )).rejects.toThrow(/FORMAL_EVENT_ASSERTION:app-marker-regression/u);
+    await expect(assertFormalAppReview(
+      'app-marker-regression', Promise.resolve(expectedReceipt), [
+        { ...recordedPost, body: JSON.stringify(expectedRequest) },
+        { ...recordedPost, body: JSON.stringify(expectedRequest) },
+      ], expectedRequest, expectedReceipt,
+    )).rejects.toBeInstanceOf(ChaiAssertionError);
     await expect(assertFormalEventAssertion('app-marker-regression', () => expect(true).toBe(false)))
       .rejects.toThrow(/FORMAL_EVENT_ASSERTION:app-marker-regression/u);
   });
