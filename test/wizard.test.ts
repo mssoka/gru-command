@@ -361,7 +361,7 @@ describe('wizard pairing QR + repo discovery + runtime probe', () => {
     expect(generateToken()).not.toBe(generateToken());
   });
 
-  it('repo discovery: depth-1 .git scan, sorted, dot-dirs skipped, symlinked repos included', () => {
+  it('repo discovery: depth-1 .git scan includes dot-dirs for validation and symlinked repos', () => {
     const workspace = tempDir('gru-command-wizard-scan-');
     mkdirSync(join(workspace, 'repo-a', '.git'), { recursive: true });
     mkdirSync(join(workspace, 'repo-b'), { recursive: true });
@@ -374,7 +374,7 @@ describe('wizard pairing QR + repo discovery + runtime probe', () => {
     mkdirSync(join(realRepo, '.git'), { recursive: true });
     symlinkSync(realRepo, join(workspace, 'repo-link'));
     symlinkSync(join(workspace, 'nowhere'), join(workspace, 'broken-link'));
-    expect(discoverManagedRepos(workspace)).toEqual(['repo-a', 'repo-b', 'repo-link']);
+    expect(discoverManagedRepos(workspace)).toEqual(['.hidden', 'repo-a', 'repo-b', 'repo-link']);
     expect(discoverManagedRepos(join(workspace, 'does-not-exist'))).toEqual([]);
   });
 

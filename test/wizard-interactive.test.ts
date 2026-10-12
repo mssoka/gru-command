@@ -106,6 +106,9 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
 
   it('installer defaults exclude unsupported names, unusable Git roots, and root-probe errors', () => {
     const workspace = fixtureWorkspace();
+    const hidden = join(workspace, '.repo-hidden');
+    mkdirSync(hidden);
+    execFileSync('git', ['-C', hidden, 'init', '-q']);
     const invalid = join(workspace, 'repo*');
     mkdirSync(invalid);
     execFileSync('git', ['-C', invalid, 'init', '-q']);
@@ -129,6 +132,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     ], { GRU_COMMAND_HOME: instance });
 
     expect(status, output).toBe(0);
+    expect(output).toContain('".repo-hidden": must not start with a dot');
     expect(output).toContain('"repo*": must not contain wildcard characters');
     expect(output).toContain('"repo-stale": .git does not identify this exact usable repository root');
     expect(output).toContain('Git repository entries excluded from installer choices because Git root validation failed:');

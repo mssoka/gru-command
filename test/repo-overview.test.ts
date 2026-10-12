@@ -1346,6 +1346,36 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
   });
 
+  it('keeps first-refresh unavailable roots within the board protocol shape', async () => {
+    const h = harness({ names: ['alpha'] });
+    h.unavailableNames.add('alpha');
+    const view = await h.tracker.refresh();
+    const entry = row(view, 'alpha');
+
+    expect(entry.linked).toBe(false);
+    expect(entry.linkReason).toBe('selected repository is unavailable under workspace_root');
+    expect(entry.freshness).toBe('unchecked');
+    expect(entry.lastAttemptAt).toBeNull();
+    expect(entry.error).toBeNull();
+    expect(h.api.calls).toEqual([]);
+    expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
+  });
+
+  it('keeps first-refresh root-probe failures distinct and valid under the board protocol', async () => {
+    const h = harness({ names: ['alpha'] });
+    h.resolveRootError = true;
+    const view = await h.tracker.refresh();
+    const entry = row(view, 'alpha');
+
+    expect(entry.linked).toBe(false);
+    expect(entry.linkReason).toBe('origin remote could not be read yet');
+    expect(entry.freshness).toBe('unchecked');
+    expect(entry.lastAttemptAt).toBeNull();
+    expect(entry.error).toBeNull();
+    expect(h.api.calls).toEqual([]);
+    expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
+  });
+
   it('bounds the remote-resolution phase by wall clock and keeps prior rows', async () => {
     const h = harness({ names: ['alpha', 'beta', 'gamma'] });
     h.resolveDelayMs = REPO_OVERVIEW_RESOLVE_BUDGET_MS + 10_000;
@@ -1371,7 +1401,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       mkdirSync(join(root, 'target', '.git'));
       symlinkSync(join(root, 'target'), join(root, 'repo-link'));
       symlinkSync(join(root, 'missing'), join(root, 'broken-link'));
-      const expected = ['repo-dir', 'repo-file', 'repo-link', 'target'];
+      const expected = ['.hidden', 'repo-dir', 'repo-file', 'repo-link', 'target'];
       expect(discoverManagedRepos(root)).toEqual(expected);
       expect(await discoverManagedReposAsync(root)).toEqual(expected);
       expect(discoverManagedRepos(join(root, 'absent'))).toEqual([]);
