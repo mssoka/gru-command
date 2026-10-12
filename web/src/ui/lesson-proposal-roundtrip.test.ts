@@ -52,6 +52,8 @@ interface Harness {
   readonly notification: (id: string) => NotificationRow | null;
   readonly cursor: () => number;
   readonly proposalFile: string;
+  /** While on, the notice cleanup (resolving the For You notice) fails. */
+  readonly failCleanup: (on: boolean) => void;
   readonly propose: () => Promise<{ readonly id: string; readonly notificationId: string }>;
   readonly close: () => Promise<void>;
 }
@@ -69,7 +71,7 @@ async function boot(): Promise<Harness> {
       backend<{
         DreamEngine: new (options: Record<string, unknown>) => { run(): Promise<unknown> };
         LessonProposals: new (options: Record<string, unknown>) => Proposals;
-        lessonProposalNotifier: (options: { notifications: unknown; ledger: unknown }) => unknown;
+        lessonProposalNotifier: (options: { notifications: unknown; ledger: unknown }) => { resolve(id: string, by: string): void };
         loadDreamState: (file: string) => { readonly coveredThroughSeq: number };
         DREAM_STATE_FILE: string;
         PROPOSAL_FILE: string;
@@ -94,7 +96,16 @@ async function boot(): Promise<Harness> {
   const bus = new EventBus();
   const ledger = new LedgerApi(db.handle, { bus });
   const notifications = new NotificationCenter({ ledger, bus });
-  const proposals = new dream.LessonProposals({ bible, notifier: dream.lessonProposalNotifier({ notifications, ledger }) });
+  const realNotifier = dream.lessonProposalNotifier({ notifications, ledger });
+  let cleanupDown = false;
+  const notifier = {
+    ...realNotifier,
+    resolve: (id: string, by: string) => {
+      if (cleanupDown) throw new Error('notice cleanup is unavailable');
+      realNotifier.resolve(id, by);
+    },
+  };
+  const proposals = new dream.LessonProposals({ bible, notifier });
   const lessonsServer = createLessonsServer({
     config,
     journal,
@@ -144,6 +155,7 @@ async function boot(): Promise<Harness> {
     notification: (id) => ledger.getNotification(id),
     cursor: () => dream.loadDreamState(join(bible.dir, dream.DREAM_STATE_FILE)).coveredThroughSeq,
     proposalFile: join(bible.dir, dream.PROPOSAL_FILE),
+    failCleanup: (on) => { cleanupDown = on; },
     propose: async () => {
       journal.append({ kind: 'finding', source: 'gru', body: 'a live shell held the restart' });
       await engine.run();
@@ -164,14 +176,36 @@ async function boot(): Promise<Harness> {
 /** A real HTTP fetch for the client (relative paths, as in production),
  * independent of the DOM environment's fetch. `down()` points it at a
  * closed port: a genuine network failure, not a server refusal. */
-function nodeFetch(base: string): { readonly fetchImpl: typeof fetch; readonly down: (on: boolean) => void } {
+function nodeFetch(base: string): {
+  readonly fetchImpl: typeof fetch;
+  readonly down: (on: boolean) => void;
+  /** POSTs never leave the browser (a failure BEFORE the server hears them). */
+  readonly dropPosts: (on: boolean) => void;
+  /** POSTs reach the server and are answered, but the reply is lost. */
+  readonly loseReplies: (on: boolean) => void;
+  /** Proposal GETs made so far. */
+  readonly proposalGets: () => number;
+} {
   let target = base;
+  let dropPosts = false;
+  let loseReplies = false;
+  let proposalGets = 0;
   const fetchImpl = ((path: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) =>
     new Promise((resolveFetch, rejectFetch) => {
-      const req = request(`${target}${path}`, { method: init.method ?? 'GET', headers: init.headers ?? {} }, (res) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET' && path === '/api/lessons/proposal') proposalGets += 1;
+      if (method === 'POST' && dropPosts) {
+        rejectFetch(new TypeError('fetch failed (request never sent)'));
+        return;
+      }
+      const req = request(`${target}${path}`, { method, headers: init.headers ?? {} }, (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
+          if (method === 'POST' && loseReplies) {
+            rejectFetch(new TypeError('fetch failed (reply lost)'));
+            return;
+          }
           const text = Buffer.concat(chunks).toString('utf8');
           const status = res.statusCode ?? 0;
           resolveFetch({ ok: status >= 200 && status < 300, status, json: async () => JSON.parse(text) as unknown });
@@ -181,7 +215,13 @@ function nodeFetch(base: string): { readonly fetchImpl: typeof fetch; readonly d
       if (init.body !== undefined) req.write(init.body);
       req.end();
     })) as unknown as typeof fetch;
-  return { fetchImpl, down: (on) => { target = on ? 'http://127.0.0.1:9' : base; } };
+  return {
+    fetchImpl,
+    down: (on) => { target = on ? 'http://127.0.0.1:9' : base; },
+    dropPosts: (on) => { dropPosts = on; },
+    loseReplies: (on) => { loseReplies = on; },
+    proposalGets: () => proposalGets,
+  };
 }
 
 function mountBoardDom(): void {
@@ -236,8 +276,9 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     harness = null;
   });
 
-  async function connect(h: Harness): Promise<{ readonly down: (on: boolean) => void }> {
-    const { fetchImpl, down } = nodeFetch(h.base);
+  async function connect(h: Harness): Promise<ReturnType<typeof nodeFetch>> {
+    const wire = nodeFetch(h.base);
+    const { fetchImpl } = wire;
     const view = new BoardView(() => {}, null);
     let open: () => void = () => {};
     const opened = new Promise<void>((resolveOpen) => { open = resolveOpen; });
@@ -257,7 +298,7 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     view.bindClient(client);
     client.connect();
     await opened;
-    return { down };
+    return wire;
   }
 
   it('Accept in the band writes exactly the reviewed text, advances the cursor, resolves the notice and the snapshot closes the row', async () => {
@@ -323,6 +364,93 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     expect(document.getElementById('notification-list')!.querySelector('.board-owner__row--pointer')).toBeNull();
     expect(bookFiles(h.bible)).toBe(before);
     expect(h.cursor()).toBe(1);
+    expect(h.notification(notificationId)?.resolvedBy).toBe('owner:rejected');
+  });
+
+  /** The lost-reply scenario (#277): the server durably records the choice
+   * but its notice cleanup is down, so it answers 202 — and that reply is
+   * lost. The page must reload the proposal and lock the opposite choice
+   * from what the server holds, never from what was attempted. */
+  for (const [attempted, opposite] of [['accept', 'reject'], ['reject', 'accept']] as const) {
+    it(`a lost ${attempted} reply with a durable intent and open cleanup reloads the proposal, locks ${opposite} from the fetched decision and replaces the uncertainty wording (#277)`, async () => {
+      const h = (harness = await boot());
+      const wire = await connect(h);
+      const before = bookFiles(h.bible);
+      const { notificationId } = await h.propose();
+      await shownRow(notificationId);
+      openReview(notificationId);
+      await waitFor(() => {
+        if (row(notificationId)!.querySelector('.board-owner__review-lesson') === null) throw new Error('review not loaded yet');
+      });
+      const button = (kind: 'accept' | 'reject'): HTMLButtonElement => row(notificationId)!.querySelector<HTMLButtonElement>(`.board-owner__${kind}`)!;
+      const label = attempted === 'accept' ? 'Accept' : 'Reject';
+      expect(button('accept').disabled).toBe(false);
+      expect(button('reject').disabled).toBe(false);
+
+      h.failCleanup(true);
+      wire.loseReplies(true);
+      const getsBefore = wire.proposalGets();
+      button(attempted).click();
+      // The page asked the server again; the recorded decision replaces the
+      // uncertainty wording and locks the other choice.
+      await waitFor(() => {
+        const text = row(notificationId)?.querySelector('[role="alert"]')?.textContent;
+        if (text !== `Your ${label} is recorded but not finished — press ${label} to finish it.`) {
+          throw new Error(`still showing: ${String(text)}`);
+        }
+      });
+      expect(wire.proposalGets()).toBeGreaterThan(getsBefore);
+      expect(button(opposite).disabled).toBe(true);
+      expect(button(attempted).disabled).toBe(false);
+      expect(h.proposals.review()).toMatchObject({ decision: { kind: attempted === 'accept' ? 'accepted' : 'rejected' } });
+      expect((await alertText(notificationId))).not.toContain('may or may not');
+      // Nothing is closed yet: the cleanup is still down.
+      expect(h.notification(notificationId)?.resolvedAt).toBeNull();
+
+      // Cleanup back and replies flowing: the same choice finishes it.
+      wire.loseReplies(false);
+      h.failCleanup(false);
+      button(attempted).click();
+      await waitFor(() => {
+        if (row(notificationId) !== null) throw new Error('row still open');
+      });
+      expect(h.notification(notificationId)?.resolvedBy).toBe(`owner:${attempted === 'accept' ? 'accepted' : 'rejected'}`);
+      if (attempted === 'reject') expect(bookFiles(h.bible)).toBe(before);
+      else expect(h.bible.readChapter('ops-restarts')?.lessons[0]?.body).toBe('Close the shell first.\nThen restart.');
+    });
+  }
+
+  it('a genuinely pre-intent failure stays undecided: the reload shows no recorded decision, so both choices stay available (#277)', async () => {
+    const h = (harness = await boot());
+    const wire = await connect(h);
+    const { notificationId } = await h.propose();
+    await shownRow(notificationId);
+    openReview(notificationId);
+    await waitFor(() => {
+      if (row(notificationId)!.querySelector('.board-owner__review-lesson') === null) throw new Error('review not loaded yet');
+    });
+    const button = (kind: 'accept' | 'reject'): HTMLButtonElement => row(notificationId)!.querySelector<HTMLButtonElement>(`.board-owner__${kind}`)!;
+    wire.dropPosts(true);
+    const getsBefore = wire.proposalGets();
+    button('accept').click();
+    // The page still reloads to find out, and finds nothing recorded.
+    await waitFor(() => {
+      if (wire.proposalGets() <= getsBefore) throw new Error('the proposal was not reloaded');
+    });
+    expect(await alertText(notificationId)).toMatch(/^Couldn’t confirm the decision \(fetch failed \(request never sent\)\)/u);
+    expect(h.proposals.review()).toMatchObject({ decision: null });
+    await waitFor(() => {
+      if (button('accept').disabled || button('reject').disabled) throw new Error('still settling');
+    });
+    expect(button('accept').disabled).toBe(false);
+    expect(button('reject').disabled).toBe(false);
+    expect(h.bible.readChapter('ops-restarts')).toBeNull();
+    // The failure was transient: Reject is still a real, available choice.
+    wire.dropPosts(false);
+    button('reject').click();
+    await waitFor(() => {
+      if (row(notificationId) !== null) throw new Error('row still open');
+    });
     expect(h.notification(notificationId)?.resolvedBy).toBe('owner:rejected');
   });
 });
