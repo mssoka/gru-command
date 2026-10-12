@@ -225,3 +225,7 @@ warrants. They are recorded, not dropped:
 - source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
   summary: The repo-internal BMAD-onboarding rehearsal script appears incompatible with the current build: its static import targets a removed `dist/wizard/bmad-onboarding.js`, and its `parseAnswers` fixture includes the retired `bmad` answer. The script is unchanged in the SLIM review range; handle separately from this feature.
   evidence: Round 13 edge-case review at `scripts/rehearsal-bmad-onboarding.mjs:13,34-41`; this script is outside the approved SLIM product scope.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Fallback review input capture mutates the lane's real Git index, dropping staged changes and their partial-staging boundaries before review.
+  evidence: `src/dispatch/perkins.ts:1475-1489` runs `git add -N .`, then a worktree-only `git diff`, then `git reset -q --` with the real repository index; the fallback runner captures before and after reviewer turns. A disposable-repository reproduction showed the staged diff disappear and the change move to the unstaged diff after reset. This implementation is present at integrated `main` (`79c032e5`) and unchanged by the SLIM branch since that integration; fix it in a separately scoped review-infrastructure change.

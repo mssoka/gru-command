@@ -1,3 +1,9 @@
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { classifyBaseline } from '../tools/classify-baseline.mjs';
 
@@ -44,6 +50,48 @@ const playwrightReport = (results: readonly { title: string; message: string }[]
       })),
     },
   ],
+});
+
+const classifierCliPath = fileURLToPath(new URL('../tools/classify-baseline.mjs', import.meta.url));
+const runClassifierCli = (args: readonly string[], report: unknown) => {
+  const directory = mkdtempSync(join(tmpdir(), 'gru-baseline-classifier-'));
+  try {
+    const reportPath = join(directory, 'report.json');
+    writeFileSync(reportPath, JSON.stringify(report));
+    return spawnSync(process.execPath, [classifierCliPath, reportPath, ...args], { encoding: 'utf8', timeout: 10_000 });
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+};
+
+describe('baseline classifier CLI — required option values fail closed', () => {
+  it('rejects --require-file without a value instead of using generic RED classification', () => {
+    const report = vitestReport([
+      { name: 'board.test.ts', status: 'failed', message: '', assertionResults: [
+        assertion('unrelated assertion', 'failed', ['AssertionError: unrelated failure']),
+      ] },
+    ]);
+    const result = runClassifierCli(['--require-file'], report);
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--require-file requires a non-empty value/u);
+  });
+
+  it('rejects a missing or empty --require-file-substr allowlist instead of disabling cause checks', () => {
+    const report = vitestReport([
+      { name: 'slim-strip.baseline.test.ts', status: 'failed', message: '', assertionResults: [
+        assertion('mount guard', 'failed', ['AssertionError: rail mount guard failed']),
+      ] },
+    ]);
+    for (const optionValue of [undefined, ',,']) {
+      const args = ['--require-file', 'slim-strip.baseline.test.ts', '--require-file-substr'];
+      if (optionValue !== undefined) args.push(optionValue);
+      const result = runClassifierCli(args, report);
+      expect(result.status).toBe(3);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toMatch(/--require-file-substr requires/u);
+    }
+  });
 });
 
 describe('baseline classifier — setup/collection failures are never behavioral evidence', () => {

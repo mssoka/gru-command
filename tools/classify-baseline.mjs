@@ -288,15 +288,30 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     process.exit(3);
   }
   const reportPath = args[0];
-  const requireFileIdx = args.indexOf('--require-file');
-  const requireFile = requireFileIdx >= 0 ? args[requireFileIdx + 1] : null;
+  const requiredValue = (flag) => {
+    const index = args.indexOf(flag);
+    if (index < 0) return null;
+    const value = args[index + 1];
+    if (typeof value !== 'string' || value.trim() === '' || value.startsWith('--')) {
+      fail(`BASELINE SETUP FAILURE: ${flag} requires a non-empty value — refusing to classify a malformed invocation`);
+      process.exit(3);
+    }
+    return value;
+  };
+  const requiredList = (flag) => {
+    const value = requiredValue(flag);
+    if (value === null) return [];
+    const values = value.split(',').map((item) => item.trim()).filter(Boolean);
+    if (values.length === 0) {
+      fail(`BASELINE SETUP FAILURE: ${flag} requires at least one value — refusing to classify a malformed invocation`);
+      process.exit(3);
+    }
+    return values;
+  };
+  const requireFile = requiredValue('--require-file');
   const playwright = args.includes('--playwright');
-  const substrIdx = args.indexOf('--require-substr');
-  const substrs = substrIdx >= 0 ? String(args[substrIdx + 1] ?? '').split(',').filter(Boolean) : [];
-  const fileSubstrIdx = args.indexOf('--require-file-substr');
-  const requireFileSubstrs = fileSubstrIdx >= 0
-    ? String(args[fileSubstrIdx + 1] ?? '').split(',').filter(Boolean)
-    : [];
+  const substrs = requiredList('--require-substr');
+  const requireFileSubstrs = requiredList('--require-file-substr');
 
   let report = null;
   try {
