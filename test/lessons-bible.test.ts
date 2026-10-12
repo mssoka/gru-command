@@ -712,6 +712,9 @@ describe('repair and cap review fixes (bmad-code-review of #253, 2026-10-07)', (
     expect(failure.written).toEqual(['a']);
     expect(failure.message).toContain('repair stopped after replacing 1 of 2 chapter(s) (a) — disk full');
     expect(failure.message).toContain('may be partially repaired');
+    expect(failure.message).toContain('original bytes of the 2 chapter(s) planned for replacement');
+    expect(failure.message).toContain('unchanged chapters were not backed up');
+    expect(failure.message).not.toContain('every original');
     expect(readFileSync(join(failure.backupDir, 'chapters', 'b.md'), 'utf-8')).toBe(brokenA.replace('# A', '# B'));
   });
 
@@ -2029,6 +2032,40 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
       expect(() => bible.repairProvenance(JOURNAL_R5, { write: true }), name).not.toThrow();
       expect(parseChapter(readFileSync(join(bible.chaptersDir, 'ops.md'), 'utf8'), 'ops').lessons[0]!.provenance.map((ref) => ref.id), name).toEqual(['j-1']);
     }
+  });
+
+  it('an unchanged chapter deleted after a real replacement fails the repair by name, with the exact backup and honest wording; a retry succeeds once it is restored (#274)', () => {
+    const bible = tmpBible();
+    bible.ensureSeeded();
+    const ops = `# Ops\n\n## a\n\nrecurred: 1\nprovenance: j-1\n\nBody.\n`;
+    const healthy = `# Healthy\n\n## h\n\nrecurred: 1\nprovenance: j-2@${at(2)}\n\nHealthy body.\n`;
+    writeFileSync(join(bible.chaptersDir, 'ops.md'), ops);
+    writeFileSync(join(bible.chaptersDir, 'healthy.md'), healthy);
+    const store = bible as unknown as { writeAtomic(file: string, data: string | Buffer): void };
+    const real = store.writeAtomic.bind(bible);
+    // After the planned chapter is written, the unchanged one is deleted.
+    store.writeAtomic = (file, data) => {
+      real(file, data);
+      if (file === join(bible.chaptersDir, 'ops.md')) rmSync(join(bible.chaptersDir, 'healthy.md'));
+    };
+    let caught: unknown;
+    try {
+      bible.repairProvenance(JOURNAL_R5, { write: true });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(RepairWriteError);
+    const failure = caught as RepairWriteError;
+    expect(failure.message).toMatch(/chapter healthy\.md cannot be read back \(ENOENT\)/);
+    expect(failure.message).toContain('unchanged chapters were not backed up');
+    expect(failure.message).not.toContain('Every original');
+    expect(failure.written).toEqual(['ops']);
+    expect(readdirSync(join(failure.backupDir, 'chapters'))).toEqual(['ops.md']);
+    expect(readFileSync(join(failure.backupDir, 'chapters', 'ops.md'), 'utf8')).toBe(ops);
+    // Restored, the same repair runs again and succeeds: the lock was released.
+    store.writeAtomic = real;
+    writeFileSync(join(bible.chaptersDir, 'healthy.md'), healthy);
+    expect(() => bible.repairProvenance(JOURNAL_R5, { write: true })).not.toThrow();
   });
 
   it('a valid chapter with 150,004 handles on ONE line is read, bulk-read and repaired to fit — never a stack overflow, one append per handle (R10-09)', () => {

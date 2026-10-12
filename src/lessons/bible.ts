@@ -480,7 +480,7 @@ export class BibleStore {
           throw new RepairWriteError(
             `repair stopped after replacing ${written.length} of ${planned.length} chapter(s)` +
               `${written.length > 0 ? ` (${written.join(', ')})` : ''} — ${error instanceof Error ? error.message : String(error)}. ` +
-              `The book may be partially repaired; every original is saved in ${backupDir}.`,
+              `The book may be partially repaired; the original bytes of the ${planned.length} chapter(s) planned for replacement are saved in ${backupDir}; unchanged chapters were not backed up.`,
             backupDir,
             written,
           );
@@ -502,8 +502,17 @@ export class BibleStore {
           }
           if (!raw.equals(expected)) throw new BibleError(`chapter ${name} does not hold the planned bytes`);
         }
-        for (const name of readdirSync(this.chaptersDir).filter((entry) => entry.endsWith('.md')).sort()) {
-          const raw = readFileSync(join(this.chaptersDir, name));
+        // The union of every chapter known at preflight and any now present:
+        // an unchanged chapter that vanished is a failure, not a skipped file (#274).
+        const present = readdirSync(this.chaptersDir).filter((entry) => entry.endsWith('.md'));
+        for (const name of [...new Set([...names, ...present])].sort()) {
+          let raw: Buffer;
+          try {
+            raw = readFileSync(join(this.chaptersDir, name));
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            throw new BibleError(`chapter ${name} cannot be read back (ENOENT) — it was present before the repair, and INDEX.md may still point to it`);
+          }
           const expected = plannedBytes.get(name);
           if (expected !== undefined && !raw.equals(expected)) {
             throw new BibleError(`chapter ${name} does not hold the planned bytes`);
@@ -516,7 +525,8 @@ export class BibleStore {
       } catch (error) {
         throw new RepairWriteError(
           `repair replaced ${written.length} chapter(s) (${written.join(', ')}), but the result does not verify: ` +
-            `${error instanceof Error ? error.message : String(error)}. Every original is saved in ${backupDir}.`,
+            `${error instanceof Error ? error.message : String(error)}. The original bytes of the chapter(s) replaced (${written.join(', ')}) are saved in ${backupDir}; ` +
+            'unchanged chapters were not backed up.',
           backupDir,
           written,
         );
