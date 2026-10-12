@@ -67,7 +67,7 @@ function seedLegacyWait(r: ReturnType<typeof fixture>, recordRuling = true, noti
     basisFingerprint: basis, reason: 'pre-upgrade commissioner custody', by: 'gru', recheckAt: RECHECK });
   const disposition = { basis, state: 'waiting' as const, owner: 'writer', detail: 'pre-upgrade report custody',
     dependency: 'commissioner verification', recheckAt: RECHECK, references: [{ kind: 'decision' as const, id: hold.id }], recordedAt: new Date().toISOString() };
-  const legacy = { ...r.original, id, basis, reasons: [reason], disposition, state: 'waiting', producerOwned: false, attentionKey: `${id}@${basis}` };
+  const legacy = { ...r.original, id, basis, reasons: [reason], notificationIds: [row.id], disposition, state: 'waiting', producerOwned: false, attentionKey: `${id}@${basis}` };
   if (recordRuling) r.ledger.appendCustomEvent({ kind: 'mailbox.disposition', payload: { id, disposition } });
   // Simulate the real pre-GH313 persisted projection, not a new-format ruling.
   r.db.handle.prepare('DELETE FROM gru_mailbox WHERE id = ?').run(r.original.id);
