@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -1542,7 +1542,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       const validatedRoot = execFileSync('git', ['-C', selected, 'rev-parse', '--show-toplevel'], {
         encoding: 'utf8', env,
       }).trim();
-      expect(validatedRoot).toBe(selected);
+      expect(validatedRoot).toBe(realpathSync(selected));
       const rewritten = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
         encoding: 'utf8', env,
       }).trim();
