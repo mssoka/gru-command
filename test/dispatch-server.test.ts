@@ -153,18 +153,19 @@ async function boot(opts: {
         // itself; record it so tests can assert the cleanup ran.
         if (role === 'minion') disposedHandles.push(id);
       },
-    }, options?.resumeFile ?? join(dir, 'native-sessions', `${id}.jsonl`), (state) => { if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state); }, options?.cwd === undefined ? undefined : () => execFileSync('git', ['-C', options.cwd!, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
+    }, options?.resumeFile ?? join(dir, 'native-sessions', `${id}.jsonl`), (state) => { if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state); }, options?.cwd === undefined ? undefined : () => execFileSync('git', ['-C', options.cwd!, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), options?.cwd);
   };
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const minionPrompts: string[] = [];
   const minionTurnTexts: string[] = [];
   const liveHandles = new class extends Map<string, AgentHandle> {
     override set(id: string, handle: AgentHandle): this {
+      const row = ledger.getAgent(id);
+      const originalLane = row?.jobId == null ? undefined : worktrees.listWorktrees({ jobId: row.jobId }).find((lane) => lane.kind === 'job' && lane.status !== 'swept');
       const wrapped = withNativeDirectiveFixture(handle, join(dir, 'native-live', `${id}.jsonl`), (state) => { if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state); }, (identity) => {
         const lane = worktrees.listWorktrees({ jobId: identity.jobId }).find((row) => row.kind === 'job' && row.status !== 'swept');
         return lane === undefined ? null : execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-      });
-      const row = ledger.getAgent(id);
+      }, originalLane?.path);
       if (row !== null) {
         ledger.registerAgent({ id, role: row.role, jobId: row.jobId, sessionFile: wrapped.sessionFile });
         ledger.setAgentState(id, wrapped.health().state); // fixture's completed native initialization

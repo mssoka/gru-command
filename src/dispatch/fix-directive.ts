@@ -14,6 +14,7 @@ import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/p
 import type { PromptOptions, PromptTurnVerdict } from '../runtime/types.js';
 import type { WorktreePort } from './worktree-port.js';
 import { readGitState } from '../verify/scheduler.js';
+import { readDirectiveSessionHeader } from '../runtime/directive-checkpoint.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
 /**
@@ -479,9 +480,25 @@ export function recordFollowUpDelivery(input: {
     if (sha === null) note = 'original native completion HEAD unproven; current candidate delivery/verification/review remain owed';
     else if (liveJobLanes.length !== 1 || lane === undefined) note = 'original native completion is preserved, but no unique live job lane proves it is the current candidate';
     else {
-      const current = readGitState(lane.path);
-      if (current.sha !== sha || current.trackedDirty) note = 'original native completion is preserved, but the live job lane HEAD moved or its tracked tree is dirty; current candidate delivery/verification/review remain owed';
-      else candidateDeliveryProven = true;
+      const original = typeof input.nativeCompletion.provenance === 'object' && input.nativeCompletion.provenance !== null
+        ? input.nativeCompletion.provenance as { readonly binding?: { readonly sessionFile?: unknown; readonly sessionId?: unknown; readonly agentId?: unknown } } : null;
+      const binding = original?.binding;
+      if (typeof binding?.sessionFile !== 'string' || !binding.sessionFile || typeof binding.sessionId !== 'string' || !binding.sessionId || binding.agentId !== input.agentId) {
+        note = 'original native session/cwd/lane identity is unproven; original completion is preserved but current candidate gates remain owed';
+      } else {
+        try {
+          const header = readDirectiveSessionHeader(binding.sessionFile);
+          if (header.type !== 'session' || header.id !== binding.sessionId || header.cwd !== lane.path) {
+            note = 'original native session cwd does not match the current live job lane; original completion is preserved but current candidate gates remain owed';
+          } else {
+            const current = readGitState(lane.path);
+            if (current.sha !== sha || current.trackedDirty) note = 'original native completion is preserved, but the live job lane HEAD moved or its tracked tree is dirty; current candidate delivery/verification/review remain owed';
+            else candidateDeliveryProven = true;
+          }
+        } catch (error) {
+          note = `original native session cwd/lane cannot be verified: ${String(error)}; original completion is preserved but current candidate gates remain owed`;
+        }
+      }
     }
   } else if (lane !== undefined) {
     try {

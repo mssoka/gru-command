@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { LedgerApi } from '../../src/ledger/api.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { inspectDirectiveCheckpoint, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, type DirectiveProducer, type DirectiveTurnIdentity } from '../../src/runtime/directive-checkpoint.js';
+import { inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, readDirectiveCompletion, recordDirectiveCompletion, recordDirectiveProducerCessation, type DirectiveProducer, type DirectiveTurnIdentity } from '../../src/runtime/directive-checkpoint.js';
 import type { AgentHandle, PromptOptions, AgentState } from '../../src/runtime/types.js';
 
 /** HTTP/ledger doubles retain real persisted native evidence. Only adapter
@@ -14,12 +14,12 @@ export class DirectiveNativeFixture {
   private parentId: string | null = null;
   private current: DirectiveTurnIdentity | null = null;
   private readonly producers = new Map<string, DirectiveProducer>();
-  constructor(readonly file: string, private readonly agentId: string, private readonly completionHead?: (identity: DirectiveTurnIdentity) => string | null) {
+  constructor(readonly file: string, private readonly agentId: string, private readonly completionHead?: (identity: DirectiveTurnIdentity) => string | null, cwd?: string) {
     mkdirSync(dirname(file), { recursive: true });
     if (existsSync(file) && readFileSync(file, 'utf8').trim() !== '') {
       const rows = readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { type: string; id: string });
       this.sessionId = rows[0]!.id; this.parentId = rows.filter((row) => row.type !== 'session').at(-1)?.id ?? null;
-    } else writeFileSync(file, `${JSON.stringify({ type: 'session', id: this.sessionId, version: 3 })}\n`);
+    } else writeFileSync(file, `${JSON.stringify({ type: 'session', id: this.sessionId, version: 3, cwd })}\n`);
   }
   prepare = (identity: DirectiveTurnIdentity): DirectiveProducer => {
     const existing = this.producers.get(identity.requestId);
@@ -70,18 +70,37 @@ export function markHistoricalDirectiveFixture(ledger: LedgerApi, requestId: str
 }
 
 /** Persist genuine current-protocol admission for non-runtime ledger consumers. */
-export function admitNativeDirectiveFixture(ledger: LedgerApi, requestId: string, minionId: string, file: string): number {
+export function admitNativeDirectiveFixture(ledger: LedgerApi, requestId: string, minionId: string, file: string,
+  completed?: { readonly head: string | null; readonly cwd: string }): number {
   const row = ledger.getDirective(requestId)!;
   ledger.registerAgent({ id: minionId, role: 'minion', jobId: row.jobId, sessionFile: file, parentage: 'top-level' });
   ledger.setAgentState(minionId, 'idle');
   ledger.prepareDirectiveTarget(requestId, { agentId: minionId, sessionFile: file });
-  const native = new DirectiveNativeFixture(file, minionId);
+  const native = new DirectiveNativeFixture(file, minionId, completed === undefined ? undefined : () => completed.head, completed?.cwd);
   native.begin('exact approved fixture request', { directive: { identity: ledger.directiveTurnIdentity(requestId), beforeAdmission: () => {}, onAdmitted: (binding) => ledger.bindDirectiveNativeAdmission(binding) } });
+  if (completed !== undefined) { native.end(); native.ceased(); }
   return ledger.getDirective(requestId)!.admissionSeq!;
 }
 
-export function withNativeDirectiveFixture(handle: AgentHandle, file: string, onState: (state: AgentState) => void = () => {}, completionHead?: (identity: DirectiveTurnIdentity) => string | null): AgentHandle {
-  const native = new DirectiveNativeFixture(file, handle.id, completionHead);
+/** Read already-completed original fixture evidence; never synthesize it in
+ * recovery or mistake admission alone for native terminal/physical proof. */
+export function nativeDirectiveFixtureDeliveryProof(ledger: LedgerApi, requestId: string) {
+  const binding = ledger.getDirective(requestId)?.nativeBinding;
+  if (binding == null) throw new Error('fixture delivery lacks its original native admission');
+  const identity = ledger.directiveTurnIdentity(requestId);
+  const proof = inspectDirectiveCheckpoint(binding.sessionFile, identity);
+  const physical = inspectDirectiveProducers(binding.sessionFile, identity);
+  if (proof.state !== 'terminal' || !proof.ok || physical.length === 0 || physical.some(({ evidence }) => evidence !== 'ceased')) {
+    throw new Error('fixture delivery requires its already-completed and ceased original native turn');
+  }
+  const receipt = readDirectiveCompletion(binding.sessionFile, identity, proof.checkpointId);
+  if (receipt === null) throw new Error('fixture delivery must record its original HEAD or explicit null at completion');
+  return { candidate_delivery_proven: receipt.head !== null,
+    native_completion: { identity, checkpoint_id: proof.checkpointId, binding: proof.binding, receipt, physical_cessation: physical } };
+}
+
+export function withNativeDirectiveFixture(handle: AgentHandle, file: string, onState: (state: AgentState) => void = () => {}, completionHead?: (identity: DirectiveTurnIdentity) => string | null, cwd?: string): AgentHandle {
+  const native = new DirectiveNativeFixture(file, handle.id, completionHead, cwd);
   let disposed = false;
   return {
     ...handle, sessionFile: file, prepareDirectiveProducer: native.prepare, inspectDirective: native.inspect,

@@ -526,7 +526,7 @@ class CapturingMinions implements DirectiveRegistry {
       state = next;
       const ledger = this.ledger;
       if (ledger !== undefined && ledger.getAgent(id) !== null) ledger.setAgentState(id, next);
-    }, cwd === undefined ? undefined : () => resolveGitCommit(cwd, 'HEAD'));
+    }, cwd === undefined ? undefined : () => resolveGitCommit(cwd, 'HEAD'), cwd);
     this.handles.set(id, handle);
   }
   getHandle(id: string): AgentHandle | null { return this.handles.get(id) ?? null; }

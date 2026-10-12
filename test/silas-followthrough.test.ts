@@ -284,7 +284,7 @@ async function bootFollowThrough(input: {
       async dispose() {},
     }, join(reviewSessions, `${id}.jsonl`), (state) => {
       if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state);
-    }, options?.cwd === undefined ? undefined : () => execFileSync('git', ['-C', options.cwd!, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
+    }, options?.cwd === undefined ? undefined : () => execFileSync('git', ['-C', options.cwd!, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), options?.cwd);
   };
 
   const dispatch = new DispatchService({ ledger, worktrees, spawner });

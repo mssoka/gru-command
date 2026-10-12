@@ -3,9 +3,10 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { LockBusyError, LockUnreadableError, SessionStore } from '../src/sessions/store.js';
-import { SessionLockCoordinationError } from '../src/sessions/lock-coordination.js';
+import { SessionLockCoordinationError, withSessionLockCoordination } from '../src/sessions/lock-coordination.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -94,6 +95,26 @@ describe('SessionStore', () => {
       const owner = first.ownedLockIdentity(file);
       expect(JSON.parse(readFileSync(lockFile, 'utf8'))).toMatchObject(owner);
     } finally { unlinkSpy.mockRestore(); probe.mockRestore(); first.dispose(); second.dispose(); }
+  });
+
+  it('P49 refuses real SQLite contention without waiting or entering the native lock critical section', () => {
+    const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
+    const bytes = JSON.stringify({ host: hostname(), pid: process.pid, bootId: 'still-owned' }); writeFileSync(`${file}.lock`, bytes);
+    const coordinator = new DatabaseSync(`${file}.lock-coordination.sqlite`); coordinator.exec('BEGIN IMMEDIATE');
+    const operation = vi.fn(() => 'serialized observation'); const pragmas: string[] = [];
+    const exec = DatabaseSync.prototype.exec;
+    const observe = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql.startsWith('PRAGMA busy_timeout')) pragmas.push(sql);
+      return exec.call(this, sql);
+    });
+    try {
+      expect(() => withSessionLockCoordination(file, operation)).toThrow(SessionLockCoordinationError);
+      expect(operation).not.toHaveBeenCalled(); expect(readFileSync(`${file}.lock`, 'utf8')).toBe(bytes);
+      // Check the actual SQLite no-wait configuration, not a flaky elapsed-time threshold.
+      expect(pragmas).toEqual(['PRAGMA busy_timeout = 0']);
+    } finally { observe.mockRestore(); coordinator.exec('ROLLBACK'); coordinator.close(); }
+    expect(withSessionLockCoordination(file, operation)).toBe('serialized observation');
+    expect(operation).toHaveBeenCalledTimes(1); expect(readFileSync(`${file}.lock`, 'utf8')).toBe(bytes); store.dispose();
   });
 
   it('derives the sessions dir from the instance data dir with pi-standard role/cwd scoping', () => {

@@ -2347,7 +2347,7 @@ export class LedgerApi {
 
   /** The job's work revisions (owner rule 2): `required` is the highest
    * material amendment version (0 when none); `delivered` is the revision
-   * the newest `job.delivered` carried (0 when it carried none). A review
+   * the newest candidate `job.delivered` carried (0 when it carried none). A review
    * may freeze only when delivered >= required. */
   workRevisionState(jobId: string): WorkRevisionState {
     const required = requiredWorkRevision(this.listJobAmendments(jobId));
@@ -2355,7 +2355,14 @@ export class LedgerApi {
   }
 
   latestCandidateDelivery(jobId: string): EventRecord | null {
-    const row = this.db.prepare(`SELECT d.* FROM events d WHERE d.job_id = ? AND d.kind = 'job.delivered' AND NOT (
+    return this.latestDeliveryForGates(jobId, true);
+  }
+
+  /** Non-candidate history still owes its separate current-candidate gate.
+   * Only freshness/revision projections exclude it. */
+  private latestDeliveryForGates(jobId: string, candidateOnly: boolean): EventRecord | null {
+    const row = this.db.prepare(`SELECT d.* FROM events d WHERE d.job_id = ? AND d.kind = 'job.delivered'
+      AND (? = 0 OR COALESCE(json_extract(d.payload, '$.candidate_delivery_proven'), 1) != 0) AND NOT (
       COALESCE(json_extract(d.payload, '$.historical_bookkeeping_only'), 0) = 1 AND EXISTS (SELECT 1 FROM events r
         WHERE r.job_id = d.job_id AND r.kind = 'silas.directive-current-gates-owed' AND r.seq > d.seq
           AND json_extract(r.payload, '$.root_kind') = 'original-native-completion' AND json_extract(r.payload, '$.delivery_seq') = d.seq
@@ -2367,7 +2374,7 @@ export class LedgerApi {
               AND p.native_binding = json_extract(d.payload, '$.native_completion.binding') AND p.payload_hash = json_extract(r.payload, '$.identity.payloadHash')
               AND p.contract_sha256 = json_extract(r.payload, '$.identity.contractSha256') AND p.work_revision = json_extract(r.payload, '$.identity.workRevision')
               AND o.job_id = d.job_id AND o.incident_key = 'directive-current-gates:' || p.request_id AND o.generation = json_extract(r.payload, '$.generation')
-              AND o.first_origin_seq = d.seq AND o.next_action = json_extract(r.payload, '$.next_action')))) ORDER BY d.seq DESC LIMIT 1`).get(jobId) as Row | undefined;
+              AND o.first_origin_seq = d.seq AND o.next_action = json_extract(r.payload, '$.next_action')))) ORDER BY d.seq DESC LIMIT 1`).get(jobId, candidateOnly ? 1 : 0) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -2381,7 +2388,7 @@ export class LedgerApi {
    * (null when the delivery could not resolve its head: any later pass on
    * the job counts). */
   correctiveVerificationDebt(jobId: string): { readonly revision: number; readonly head: string | null } | null {
-    const newest = this.latestCandidateDelivery(jobId);
+    const newest = this.latestDeliveryForGates(jobId, false);
     if (newest === null) return null;
     const native = (typeof newest.payload === 'object' && newest.payload !== null ? newest.payload : {}) as { candidate_delivery_proven?: unknown; work_revision?: unknown };
     if (native.candidate_delivery_proven === false) {
@@ -8190,6 +8197,40 @@ export class LedgerApi {
     });
   }
 
+  private assertNativeDirectiveDelivery(row: DirectiveRequestRecord, payload: Record<string, unknown>): void {
+    const binding = row.nativeBinding;
+    if (binding === null || row.nativeTarget?.agentId !== binding.agentId || row.nativeTarget.sessionFile !== binding.sessionFile) {
+      throw new DirectiveCheckpointError('current directive delivery lacks its exact original native target');
+    }
+    const identity = this.directiveTurnIdentity(row.requestId);
+    const proof = inspectDirectiveCheckpoint(binding.sessionFile, identity);
+    if (proof.state !== 'terminal' || !proof.ok || !isDeepStrictEqual(proof.binding, binding)) {
+      throw new DirectiveCheckpointError('current directive delivery requires its exact successful native terminal checkpoint');
+    }
+    const physical = inspectDirectiveProducers(binding.sessionFile);
+    const owners = physical.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
+    if (owners.length === 0 || owners.some(({ producer }) => producer.agentId !== binding.agentId || producer.sessionId !== binding.sessionId) ||
+        physical.some(({ evidence, producer }) => evidence === 'unknown' || directiveProducerLockBlocker(producer) !== null)) {
+      throw new DirectiveCheckpointError('current directive delivery retains UNKNOWN native physical ownership');
+    }
+    const completion = readDirectiveCompletion(binding.sessionFile, identity, proof.checkpointId);
+    if (completion !== null && !owners.some(({ producer }) => isDeepStrictEqual(producer, completion.producer))) {
+      throw new DirectiveCheckpointError('current directive completion receipt has unbound native physical ownership');
+    }
+    const native = typeof payload['native_completion'] === 'object' && payload['native_completion'] !== null
+      ? payload['native_completion'] as Record<string, unknown> : null;
+    const recorded = native?.['physical_cessation'];
+    if (payload['sha'] !== (completion?.head ?? null) || typeof payload['candidate_delivery_proven'] !== 'boolean' ||
+        payload['candidate_delivery_proven'] && (completion === null || completion.head === null) ||
+        native === null || !isDeepStrictEqual(native['identity'], identity) || native['checkpoint_id'] !== proof.checkpointId ||
+        !isDeepStrictEqual(native['binding'], binding) || !isDeepStrictEqual(native['receipt'], completion) ||
+        !Array.isArray(recorded) || !recorded.every((record) => typeof record === 'object' && record !== null &&
+          ['ceased', 'host-absent'].includes(String(record.evidence)) && physical.some(({ producer }) => isDeepStrictEqual(producer, record.producer))) ||
+        !owners.every(({ producer }) => recorded.some((record) => isDeepStrictEqual(producer, record.producer)))) {
+      throw new DirectiveCheckpointError('current directive delivery does not bind its exact native completion provenance');
+    }
+  }
+
   /** Record the request's terminal receipt: the correlated `job.delivered`
    * event must exist, carry this request id, belong to the job and
    * postdate admission. A delivery for another phase/request can never
@@ -8218,7 +8259,10 @@ export class LedgerApi {
       if (payload['request_id'] !== input.requestId) {
         throw new Error(`delivery for "${input.requestId}" cites an event whose payload is not correlated to this request`);
       }
-      if (row.requestKind !== null && (payload['work_revision'] !== row.workRevision || payload['agentId'] !== row.nativeBinding?.agentId)) throw new DirectiveCheckpointError('original delivery revision/minion identity differs from accepted native admission');
+      if (row.requestKind !== null) {
+        if (payload['work_revision'] !== row.workRevision || payload['agentId'] !== row.nativeBinding?.agentId) throw new DirectiveCheckpointError('original delivery revision/minion identity differs from accepted native admission');
+        this.assertNativeDirectiveDelivery(row, payload);
+      }
       // A report handback can fail after the delivery event commits. Retry
       // the obligation open in the same transaction that records this
       // correlated terminal receipt, including the landed-delivery recovery

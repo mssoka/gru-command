@@ -43,6 +43,43 @@ describe('job deliverable kind (E19 durable-write guard)', () => {
 });
 
 
+describe('P48 candidate delivery projections preserve non-candidate debt', () => {
+  it('excludes later historical non-candidates from freshness while preserving their original facts and gate debt', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-candidate-projection-')); const db = new LedgerDb(dir); const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'candidate-job', repo: 'fixture', title: 'candidate' }); api.setJobStatus('candidate-job', 'working');
+      const original = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: { sha: 'a'.repeat(40), work_revision: 0 } });
+      const historical = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: {
+        sha: 'b'.repeat(40), work_revision: 0, historical_bookkeeping_only: true, candidate_delivery_proven: false,
+      } });
+      expect(api.latestCandidateDelivery('candidate-job')).toEqual(original);
+      expect(api.correctiveVerificationDebt('candidate-job')).toEqual({ revision: 0, head: null });
+      api.appendCustomEvent({ kind: 'verification.completed', jobId: 'candidate-job', payload: { sha: 'b'.repeat(40), ok: true } });
+      expect(api.correctiveVerificationDebt('candidate-job')).toEqual({ revision: 0, head: null });
+      expect(api.getEvent(historical.seq)).toEqual(historical);
+      const current = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'candidate-job', payload: {
+        sha: 'c'.repeat(40), work_revision: 0, candidate_delivery_proven: true,
+      } });
+      expect(api.latestCandidateDelivery('candidate-job')).toEqual(current);
+      expect(api.correctiveVerificationDebt('candidate-job')).toBeNull();
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('returns no candidate for exclusively unproven deliveries without dropping their revision or verification fence', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-unproven-projection-')); const db = new LedgerDb(dir); const api = new LedgerApi(db.handle);
+    try {
+      api.addJob({ id: 'unproven-job', repo: 'fixture', title: 'unproven' });
+      const historical = api.appendCustomEvent({ kind: 'job.delivered', jobId: 'unproven-job', payload: {
+        sha: 'd'.repeat(40), work_revision: 1, candidate_delivery_proven: false,
+      } });
+      expect(api.latestCandidateDelivery('unproven-job')).toBeNull();
+      expect(api.workRevisionState('unproven-job')).toEqual({ required: 0, delivered: 0 });
+      expect(api.correctiveVerificationDebt('unproven-job')).toEqual({ revision: 1, head: null });
+      expect(api.latestJobEvent('unproven-job', 'job.delivered')).toEqual(historical);
+    } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
 describe('completed verification history pagination (j-1594)', () => {
   function seeded(): { api: LedgerApi; db: LedgerDb; dir: string } {
     const dir = mkdtempSync(join(tmpdir(), 'gru-ledger-vhist-'));

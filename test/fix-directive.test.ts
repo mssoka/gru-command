@@ -321,8 +321,13 @@ it('P40 marks original native HEAD as a candidate only on one matching clean uns
   const worktrees = { listWorktrees: () => lanes };
   const appendCustomEvent = vi.fn<LedgerApi['appendCustomEvent']>().mockReturnValue({ seq: 1 } as ReturnType<LedgerApi['appendCustomEvent']>);
   const ledger = { appendCustomEvent, getJob: () => null, openReportObligation: vi.fn() };
+  // Unit-level original cwd evidence is recorded before any delivery. The
+  // ledger/native integration suites own terminal and physical proof.
+  const sessionFile = join(root, 'original-native.jsonl'); const sessionId = 'original-native-session';
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: sessionId, cwd: lane.path })}\n`);
   const deliver = () => recordFollowUpDelivery({ ledger, worktrees, jobId: 'P40-current', agentId: 'original-minion', source: 'silas-directive', workRevision: 1,
-    nativeCompletion: { sha: head, provenance: { original: 'immutable completion receipt' } } });
+    nativeCompletion: { sha: head, provenance: { original: 'immutable completion receipt',
+      binding: { sessionFile, sessionId, agentId: 'original-minion' } } } });
   expect(deliver().sha).toBe(head);
   expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: true }) }));
   writeFileSync(join(lane.path, 'src/main.ts'), 'export function answer(): number { return 43; }\n');

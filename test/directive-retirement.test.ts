@@ -21,7 +21,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
-import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { withNativeDirectiveFixture, markHistoricalDirectiveFixture, admitNativeDirectiveFixture, nativeDirectiveFixtureDeliveryProof } from './helpers/directive-native-fixture.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { VerificationScheduler } from '../src/verify/scheduler.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
@@ -161,7 +161,7 @@ async function boot(opts: { completeReview?: boolean; noDirectiveChanges?: boole
     const managed = role === 'minion' ? withNativeDirectiveFixture(handle, sessionFile, (next) => {
       state = next;
       if (ledger.getAgent(id) !== null) ledger.setAgentState(id, next);
-    }, options?.cwd === undefined ? undefined : () => resolveGitCommit(options.cwd!, 'HEAD')) : handle;
+    }, options?.cwd === undefined ? undefined : () => resolveGitCommit(options.cwd!, 'HEAD'), options?.cwd) : handle;
     liveHandles.set(id, managed);
     return managed;
   };
@@ -1184,11 +1184,12 @@ describe('directive retirement — continuation boundary and consumers', () => {
     // ordinary offer returns — the fence was the closed control decision,
     // not a permanent lane freeze.
     h.ledger.beginDirectiveIntent({ jobId: 'job-z', directive: 'fresh repair', holder: 'silas-ops', requestId: 'req-z-next' });
-    admitNativeDirectiveFixture(h.ledger, 'req-z-next', 'minion-z', join(h.dir, 'minion-z.jsonl'));
+    admitNativeDirectiveFixture(h.ledger, 'req-z-next', 'minion-z', join(h.dir, 'minion-z.jsonl'), { head: laneHead(lane), cwd: lane.path });
     const delivered = h.ledger.appendCustomEvent({
       kind: 'job.delivered',
       jobId: 'job-z',
-      payload: { request_id: 'req-z-next', source: 'silas-directive', sha: laneHead(lane), agentId: 'minion-z', work_revision: h.ledger.getDirective('req-z-next')!.workRevision },
+      payload: { request_id: 'req-z-next', source: 'silas-directive', sha: laneHead(lane), agentId: 'minion-z', work_revision: h.ledger.getDirective('req-z-next')!.workRevision,
+        ...nativeDirectiveFixtureDeliveryProof(h.ledger, 'req-z-next') },
     });
     h.ledger.recordDirectiveDelivery({ requestId: 'req-z-next', eventSeq: delivered.seq });
     expect((await digest()).prWithoutReview.map((row) => row.jobId)).toEqual(['job-z']);
@@ -1702,9 +1703,10 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const digest = await computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => {
       expect((await retire(h, 'req-settled-owner-race', laneHead(lane))).status).toBe(200);
       h.ledger.beginDirectiveIntent({ jobId: 'job-settled-owner-race', directive: 'fresh repair', holder: 'silas-ops', requestId: 'req-settled-owner-next' });
-      admitNativeDirectiveFixture(h.ledger, 'req-settled-owner-next', 'fresh-settled-minion', join(h.dir, 'fresh-settled-minion.jsonl'));
+      admitNativeDirectiveFixture(h.ledger, 'req-settled-owner-next', 'fresh-settled-minion', join(h.dir, 'fresh-settled-minion.jsonl'), { head: laneHead(lane), cwd: lane.path });
       const delivered = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'job-settled-owner-race',
-        payload: { request_id: 'req-settled-owner-next', minion_id: 'fresh-settled-minion', agentId: 'fresh-settled-minion', work_revision: h.ledger.getDirective('req-settled-owner-next')!.workRevision, sha: laneHead(lane) } });
+        payload: { request_id: 'req-settled-owner-next', minion_id: 'fresh-settled-minion', agentId: 'fresh-settled-minion', work_revision: h.ledger.getDirective('req-settled-owner-next')!.workRevision, sha: laneHead(lane),
+          ...nativeDirectiveFixtureDeliveryProof(h.ledger, 'req-settled-owner-next') } });
       h.ledger.recordDirectiveDelivery({ requestId: 'req-settled-owner-next', eventSeq: delivered.seq });
       return { blockers: [], note: null };
     }, config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
@@ -2249,8 +2251,10 @@ describe('legacy proven completion without fabricated historical delivery', () =
       expect(() => h.ledger.settleObligation({ obligationId: recipient.id, settlement: completedSettlement })).toThrow(/current native candidate/);
       expect(h.ledger.workRevisionState(f.jobId)).toEqual({ required: 2, delivered: 0 });
       const unknown = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: null, work_revision: 2, candidate_delivery_proven: false } });
-      expect(h.ledger.latestCandidateDelivery(f.jobId)?.seq).toBe(unknown.seq);
+      expect(h.ledger.latestCandidateDelivery(f.jobId)?.seq).toBe(historicCandidate.seq);
+      expect(h.ledger.latestJobEvent(f.jobId, 'job.delivered')?.seq).toBe(unknown.seq);
       expect(h.ledger.workRevisionState(f.jobId)).toEqual({ required: 2, delivered: 0 });
+      expect(h.ledger.correctiveVerificationDebt(f.jobId)).toEqual({ revision: 2, head: null });
       expect(() => h.ledger.settleObligation({ obligationId: recipient.id, settlement: completedSettlement })).toThrow(/current native candidate/);
       expect(h.ledger.getObligation(recipient.id)?.state).toBe('settled');
       expect(h.ledger.getEvent(historicCandidate.seq)).toEqual(historicCandidate);

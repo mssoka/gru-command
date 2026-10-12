@@ -797,8 +797,9 @@ describe('re-brief restart safety (durable markers)', () => {
       const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
       await report.settled;
       expect(report.completed).toBe(1);
-      const delivery = h.ledger.latestCandidateDelivery(jobId)!;
+      const delivery = h.ledger.latestJobEvent(jobId, 'job.delivered')!;
       expect(delivery.payload).toMatchObject({ sha: oldHead, work_revision: 1, historical_bookkeeping_only: true, candidate_delivery_proven: false });
+      expect(h.ledger.latestCandidateDelivery(jobId)).toBeNull();
       expect(h.ledger.workRevisionState(jobId)).toEqual({ required: 1, delivered: 0 });
       expect(h.ledger.correctiveVerificationDebt(jobId)).toEqual({ revision: 1, head: null });
     } finally { h.close(); }

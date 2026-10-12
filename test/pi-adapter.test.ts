@@ -4523,9 +4523,12 @@ it('P39 guarded single-flight then genuinely newer SDK candidate preserves histo
     for (let replay = 0; replay < 2; replay += 1) { f.scene.ledger.recordDirectiveDelivery({ requestId: original.requestId, eventSeq: historic.deliverySeq! }); service.reconsider(); await service.settled(); expect(f.scene.ledger.latestCandidateDelivery(original.jobId)).toEqual(candidate); expect(f.scene.ledger.workRevisionState(original.jobId)).toEqual({ required: 1, delivered: 1 }); expect(f.scene.ledger.getEvent(root.seq)).toEqual(root); }
     expect(f.fx.script.calls).toHaveLength(2); expect(readFileSync(original.nativeTarget!.sessionFile, 'utf8')).toBe(before);
     const unknown = f.scene.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: original.jobId, payload: { work_revision: 1, sha: null, candidate_delivery_proven: false } });
-    expect(f.scene.ledger.latestCandidateDelivery(original.jobId)?.seq).toBe(unknown.seq); expect(f.scene.ledger.workRevisionState(original.jobId).delivered).toBe(0);
+    expect(f.scene.ledger.latestCandidateDelivery(original.jobId)).toEqual(candidate); expect(f.scene.ledger.workRevisionState(original.jobId).delivered).toBe(1);
+    expect(f.scene.ledger.latestJobEvent(original.jobId, 'job.delivered')?.seq).toBe(unknown.seq);
+    expect(f.scene.ledger.correctiveVerificationDebt(original.jobId)).toEqual({ revision: 1, head: null });
     const callerFlag = f.scene.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: original.jobId, payload: { request_id: original.requestId, work_revision: 1, sha: null, candidate_delivery_proven: false, historical_bookkeeping_only: true } });
-    expect(f.scene.ledger.latestCandidateDelivery(original.jobId)?.seq).toBe(callerFlag.seq);
+    expect(f.scene.ledger.latestCandidateDelivery(original.jobId)).toEqual(candidate);
+    expect(f.scene.ledger.latestJobEvent(original.jobId, 'job.delivered')?.seq).toBe(callerFlag.seq);
     expect(f.scene.ledger.correctiveVerificationDebt(original.jobId)).toEqual({ revision: 1, head: null });
   } finally { loss.mockRestore(); await service?.dispose(); await f.cleanup(); }
 });
@@ -4557,7 +4560,9 @@ it('P39 genuine original SDK completion after amendment records historical-only 
     expect(() => f.scene.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'executed-action', action: 'old completion is not current gates', evidenceEventSeq: delivery.seq, evidenceEventKind: delivery.kind } })).toThrow(/current gate duty/);
     service.reconsider(); await service.settled(); expect(f.scene.ledger.listJobEventsByKinds(identity.jobId, ['silas.directive-current-gates-owed'])).toHaveLength(1);
     const unknown = f.scene.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: identity.jobId, payload: { sha: null, work_revision: 1, candidate_delivery_proven: false } });
-    expect(f.scene.ledger.latestCandidateDelivery(identity.jobId)?.seq).toBe(unknown.seq); expect(f.scene.ledger.workRevisionState(identity.jobId).delivered).toBe(0);
+    expect(f.scene.ledger.latestCandidateDelivery(identity.jobId)?.seq).toBe(newer.seq); expect(f.scene.ledger.workRevisionState(identity.jobId).delivered).toBe(1);
+    expect(f.scene.ledger.latestJobEvent(identity.jobId, 'job.delivered')?.seq).toBe(unknown.seq);
+    expect(f.scene.ledger.correctiveVerificationDebt(identity.jobId)).toEqual({ revision: 1, head: null });
   } finally { loss.mockRestore(); await service?.dispose(); await f.cleanup(); }
 });
 

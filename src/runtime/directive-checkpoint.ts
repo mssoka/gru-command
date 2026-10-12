@@ -78,7 +78,15 @@ function syncFile(path: string): void {
   const fd = openSync(path, 'r');
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
-interface NativeEntry { readonly type: string; readonly id: string; readonly parentId?: string | null; readonly message?: Record<string, unknown> }
+interface NativeEntry {
+  readonly type: string;
+  readonly id: string;
+  readonly parentId?: string | null;
+  readonly message?: Record<string, unknown>;
+  readonly provider?: unknown;
+  readonly modelId?: unknown;
+  readonly thinkingLevel?: unknown;
+}
 function entries(path: string): NativeEntry[] {
   const text = readBoundedUtf8(path, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
   if (text !== '' && !text.endsWith('\n')) throw new DirectiveCheckpointError('native transcript has a partial entry');
@@ -158,11 +166,24 @@ function hasLaterBoundRequest(file: string, native: readonly NativeEntry[], iden
   try {
     const checkpointIndex = native.findIndex((entry) => entry.id === checkpointId);
     if (checkpointIndex < 0) return false;
-    const immediate = native[checkpointIndex + 1];
-    if (immediate?.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== checkpointId) return false;
+    let baseline = checkpointId;
+    let nextIndex = checkpointIndex + 1;
+    // These controls change the NEXT request's model, not the completed
+    // request's ancestry. No branch, compaction or unbound effect is skipped.
+    while (native[nextIndex]?.type === 'model_change' || native[nextIndex]?.type === 'thinking_level_change') {
+      const control = native[nextIndex]!;
+      if (control.parentId !== baseline || control.type === 'model_change' &&
+          (typeof control.provider !== 'string' || !control.provider.trim() || typeof control.modelId !== 'string' || !control.modelId.trim()) ||
+          control.type === 'thinking_level_change' && (typeof control.thinkingLevel !== 'string' ||
+            !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(control.thinkingLevel))) return false;
+      baseline = control.id;
+      nextIndex += 1;
+    }
+    const immediate = native[nextIndex];
+    if (immediate?.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== baseline) return false;
     return readDirectiveBindings(file).some((candidate) => {
       if (candidate.identity.requestId === identity.requestId || candidate.identity.jobId !== identity.jobId ||
-          candidate.userEntryId !== immediate.id || candidate.baseline !== checkpointId) return false;
+          candidate.userEntryId !== immediate.id || candidate.baseline !== baseline) return false;
       return isDeepStrictEqual(inspectDirectiveAdmission(file, candidate.identity), candidate);
     });
   } catch { return false; }

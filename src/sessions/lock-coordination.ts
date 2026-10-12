@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 
-const LOCK_COORDINATION_BUSY_TIMEOUT_MS = 5_000;
+const LOCK_COORDINATION_BUSY_TIMEOUT_MS = 0;
 const LOCK_COORDINATION_SUFFIX = '.lock-coordination.sqlite';
 
 export class SessionLockCoordinationError extends Error {
@@ -12,7 +12,9 @@ export class SessionLockCoordinationError extends Error {
 
 /** Run one synchronous lock-file observation or transition under a cross-process
  * SQLite write reservation. The session lock itself remains the durable owner
- * record; this database serializes observations and pathname mutations. */
+ * record; this database serializes observations and pathname mutations.
+ * Synchronous event-loop callers never wait on another coordinator: contention
+ * refuses loudly and the bounded recovery pass may reconsider afterward. */
 export function withSessionLockCoordination<T>(sessionFile: string, operation: () => T): T {
   let database: DatabaseSync | null = null;
   try {
