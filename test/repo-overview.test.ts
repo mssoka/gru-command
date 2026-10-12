@@ -1658,6 +1658,54 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     }
   });
 
+  it('retains cached overview when a linked-worktree gitdir becomes unreadable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-worktree-permission-'));
+    const seed = join(root, 'seed');
+    const repo = join(root, 'alpha');
+    let gitDirPath = '';
+    try {
+      execFileSync('git', ['init', '-q', seed]);
+      execFileSync('git', [
+        '-C', seed, '-c', 'user.name=Test User', '-c', 'user.email=test@example.invalid',
+        'commit', '--allow-empty', '-m', 'initial',
+      ]);
+      execFileSync('git', ['-C', seed, 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
+      execFileSync('git', ['-C', seed, 'worktree', 'add', '--detach', repo, 'HEAD']);
+      gitDirPath = execFileSync('git', ['-C', repo, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8' }).trim();
+
+      const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 3 });
+      const clock = { ms: T0 };
+      const tracker = new ManagedRepoOverviewTracker({
+        workspaceRoot: root,
+        managedRepos: ['alpha'],
+        api,
+        now: () => clock.ms,
+        sleep: async () => {},
+        intervalMs: 300_000,
+      });
+
+      const initial = row(await tracker.refresh(), 'alpha');
+      expect(initial).toMatchObject({ linked: true, freshness: 'fresh', openPrs: 7, openIssues: 3 });
+      const callsBeforeFailure = api.calls.length;
+
+      chmodSync(gitDirPath, 0);
+      clock.ms += 1;
+      const unreadable = row(await tracker.refresh(), 'alpha');
+      expect(unreadable).toMatchObject({ linked: true, freshness: 'stale', openPrs: 7, openIssues: 3 });
+      expect(unreadable.error).toMatch(/EACCES|permission denied/iu);
+      expect(api.calls).toHaveLength(callsBeforeFailure);
+
+      chmodSync(gitDirPath, 0o755);
+      clock.ms += 1;
+      const recovered = row(await tracker.refresh(), 'alpha');
+      expect(recovered).toMatchObject({ linked: true, freshness: 'fresh', openPrs: 7, openIssues: 3 });
+      expect(api.calls.length).toBeGreaterThan(callsBeforeFailure);
+    } finally {
+      if (gitDirPath !== '' && existsSync(gitDirPath)) chmodSync(gitDirPath, 0o755);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('classifies Git root-probe spawn failures as read errors, not confirmed unavailable roots', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-root-spawn-'));
     const emptyPath = mkdtempSync(join(tmpdir(), 'gru-repo-overview-root-empty-path-'));
