@@ -25,6 +25,12 @@ import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha, type SilasOpsDigest } from './silas-driver.js';
 import { isVerdictRungRule, parseSilasRouteRuleId, strictOptStrField } from './silas-rules.js';
 import type { WorktreePort } from './worktree-port.js';
+import {
+  REVIEW_INPUT_LENSES,
+  ReviewSourceUnavailableError,
+  type ReviewRequiredInput,
+  type ReviewSourcePackage,
+} from './review-source.js';
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
@@ -216,6 +222,39 @@ function optEvidenceField(body: Record<string, unknown>): readonly ReviewEvidenc
       ...(typeof capturedAt === 'string' ? { capturedAt } : {}),
     };
   });
+}
+
+/** Issue #317: `required_inputs` — [{path, lens}] content the review needs.
+ * Only claims-needed lenses may declare inputs; a blind lens is refused here
+ * so a missing spec can never become a reason to feed claims to it (#316). */
+function optRequiredInputs(body: Record<string, unknown>): readonly ReviewRequiredInput[] | undefined {
+  const value = body['required_inputs'];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) throw new Error('required_inputs must be a non-empty array when supplied');
+  return value.map((entry, index) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new Error(`required_inputs[${index}] must be an object`);
+    const { path, lens, ...rest } = entry as Record<string, unknown>;
+    if (Object.keys(rest).length > 0) throw new Error(`required_inputs[${index}] has unknown field "${Object.keys(rest)[0]}"`);
+    if (typeof path !== 'string' || path.trim() === '' || path.startsWith('/') || path.split('/').includes('..')) {
+      throw new Error(`required_inputs[${index}].path must be a non-empty repo-relative path`);
+    }
+    if (typeof lens !== 'string' || !(REVIEW_INPUT_LENSES as readonly string[]).includes(lens)) {
+      throw new Error(`required_inputs[${index}].lens must be one of ${REVIEW_INPUT_LENSES.join('|')} (blind lenses never receive claims inputs)`);
+    }
+    return { path, lens: lens as ReviewRequiredInput['lens'] };
+  });
+}
+
+/** Issue #317: `source_package` — {path, sha256} of a hash-pinned bundle. */
+function optSourcePackage(body: Record<string, unknown>): ReviewSourcePackage | undefined {
+  const value = body['source_package'];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('source_package must be an object');
+  const { path, sha256, ...rest } = value as Record<string, unknown>;
+  if (Object.keys(rest).length > 0) throw new Error(`source_package has unknown field "${Object.keys(rest)[0]}"`);
+  if (typeof path !== 'string' || !path.startsWith('/')) throw new Error('source_package.path must be an absolute path');
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/iu.test(sha256)) throw new Error('source_package.sha256 must be 64 hex characters');
+  return { path, sha256 };
 }
 
 /** The optional explicit completion intent on phase-authorizing requests.
@@ -465,7 +504,12 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // its own job id so the board nests the child under that heist. The
       // ledger refuses an unknown, cross-repo, self, or grandchild parent.
       const parentJobId = parentJobIdField(body);
-      const outcome = await options.dispatch.dispatch({
+      const targetBase = optStrFieldStrict(body, 'target_base');
+      const requiredInputs = optRequiredInputs(body);
+      const sourcePackage = optSourcePackage(body);
+      let outcome: Awaited<ReturnType<typeof options.dispatch.dispatch>>;
+      try {
+        outcome = await options.dispatch.dispatch({
         jobId: strField(body, 'job_id'),
         repoPath: strField(body, 'repo_path'),
         title: strField(body, 'title'),
@@ -474,10 +518,27 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
         ...(targetRef !== undefined ? { targetRef } : {}),
         ...(targetSha !== undefined ? { targetSha } : {}),
+        ...(targetBase !== undefined ? { targetBase } : {}),
+        ...(requiredInputs !== undefined ? { requiredInputs } : {}),
+        ...(sourcePackage !== undefined ? { sourcePackage } : {}),
         ...(parentJobId !== undefined ? { parentJobId } : {}),
         briefing: strField(body, 'briefing'),
         ...(completionHandoff !== undefined ? { completionHandoff } : {}),
-      });
+        });
+      } catch (error) {
+        // Issue #317: the selected source cannot provide the named review
+        // inputs. No job, lane or reviewer exists; this is a refusal, not a
+        // report, and grants no automatic retry.
+        if (!(error instanceof ReviewSourceUnavailableError)) throw error;
+        log('warn', 'review source preflight refused dispatch', { problems: error.problems });
+        json(res, 422, {
+          error: 'review_source_unavailable',
+          detail: error.message,
+          problems: error.problems,
+          retry_authorized: false,
+        });
+        return true;
+      }
       // The minion's turn runs in the background; the board carries the
       // lifecycle. Track it so dispose() never orphans a live lane.
       track(outcome.settled);

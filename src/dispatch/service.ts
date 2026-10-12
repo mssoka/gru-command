@@ -17,6 +17,14 @@ import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-
 import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { WORKER_RULE_BLOCKS } from './worker-rules.js';
+import {
+  assertLaneUsesBoundStore,
+  renderReviewSourceBlock,
+  type ReviewRequiredInput,
+  type ReviewSourceBinding,
+  type ReviewSourcePackage,
+  type ReviewSourcePreflight,
+} from './review-source.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -70,6 +78,10 @@ export interface DispatchServiceOptions {
    * parent session (request/list/cancel child workers, bound to the
    * parent's agent id by closure). Absent = no child-request path. */
   readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
+  /** Issue #317: the review-source preflight (git against the actual
+   * selected object store). Absent = report reviews carry no source proof
+   * and may not name a base, required inputs or a source package. */
+  readonly reviewSource?: ReviewSourcePreflight;
   readonly log?: Log;
 }
 
@@ -94,6 +106,8 @@ export function renderMinionBriefing(input: {
    *  nothing, and an unmodified tree is the expected result; artifact and
    *  investigation jobs hand back their artifacts without opening a PR. */
   deliverable?: JobDeliverable;
+  /** Issue #317: the preflight-verified review source, bound verbatim. */
+  reviewSource?: ReviewSourceBinding;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -105,6 +119,7 @@ export function renderMinionBriefing(input: {
     '',
     'BRIEFING:',
     input.briefing,
+    ...(input.reviewSource === undefined ? [] : ['', ...renderReviewSourceBlock(input.reviewSource)]),
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
@@ -183,6 +198,12 @@ export class DispatchService {
     commissioner?: string;
     targetRef?: string;
     targetSha?: string;
+    /** Issue #317 review-source preflight inputs (review jobs only): the
+     * focused-delta base, content the review needs (claims lenses), and an
+     * optional hash-pinned git bundle authorizing a source repair. */
+    targetBase?: string;
+    requiredInputs?: readonly ReviewRequiredInput[];
+    sourcePackage?: ReviewSourcePackage;
     /** The commissioning job: a minion dispatching a specialist
      * (megaminion) names its own job so the child nests under that heist. */
     parentJobId?: string;
@@ -230,6 +251,28 @@ export class DispatchService {
     const targetSha = isReportKind ? input.targetSha?.trim() : undefined;
     const repoName = input.repoPath.split('/').filter(Boolean).pop() ?? input.repoPath;
 
+    // (0b) Issue #317: prove the ACTUAL selected object store holds the
+    // review inputs BEFORE any job row, worktree or reviewer turn exists. A
+    // refusal throws ReviewSourceUnavailableError — never a report.
+    const namesSourceFields = input.targetBase !== undefined || input.requiredInputs !== undefined || input.sourcePackage !== undefined;
+    if (namesSourceFields && input.deliverable !== 'review') {
+      throw new Error(`job "${input.jobId}": target_base/required_inputs/source_package only apply to review jobs`);
+    }
+    if (namesSourceFields && this.opts.reviewSource === undefined) {
+      throw new Error(`job "${input.jobId}": review source preflight is not wired — refusing to admit a review whose source cannot be proven`);
+    }
+    const reviewSource: ReviewSourceBinding | null =
+      input.deliverable === 'review' && targetSha !== undefined && this.opts.reviewSource !== undefined
+        ? this.opts.reviewSource({
+            jobId: input.jobId,
+            repoPath: input.repoPath,
+            targetSha,
+            ...(input.targetBase !== undefined ? { targetBase: input.targetBase.trim() } : {}),
+            ...(input.requiredInputs !== undefined ? { requiredInputs: input.requiredInputs } : {}),
+            ...(input.sourcePackage !== undefined ? { sourcePackage: input.sourcePackage } : {}),
+          })
+        : null;
+
     // (1) The job row: the briefing IS the contract (recorded verbatim).
     const job = this.opts.ledger.addJob({
       id: input.jobId,
@@ -243,6 +286,22 @@ export class DispatchService {
       ...(targetSha !== undefined ? { targetSha } : {}),
       ...(input.parentJobId !== undefined ? { parentJobId: input.parentJobId } : {}),
     });
+
+    if (reviewSource !== null) {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'job.review-source-verified',
+        jobId: job.id,
+        payload: {
+          object_store: reviewSource.objectStore,
+          target_sha: reviewSource.targetSha,
+          target_base: reviewSource.targetBase,
+          range_commits: reviewSource.rangeCommits,
+          inputs: reviewSource.inputs,
+          source: reviewSource.source,
+          package_sha256: reviewSource.packageSha256,
+        },
+      });
+    }
 
     // (2) Ops handoff: dispatched → working, on the record.
     this.opts.ledger.appendCustomEvent({
@@ -297,6 +356,14 @@ export class DispatchService {
         repoPath: input.repoPath,
         jobId: job.id,
       });
+      if (reviewSource !== null) {
+        try {
+          assertLaneUsesBoundStore(job.id, reviewSource, worktree.path);
+        } catch (error) {
+          await this.sweepQuietly(worktree.id);
+          throw error;
+        }
+      }
 
       // (4) The minion: a fresh agent session rooted in the PROJECT
       // worktree (ruling 17: dispatch cwd = project root, all runtimes).
@@ -535,6 +602,7 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+        ...(reviewSource !== null ? { reviewSource } : {}),
         agentId: handle.id,
         ...(this.opts.parentTools !== undefined && this.opts.parentTools(handle.id).length > 0
           ? { childWorkerTools: true }
