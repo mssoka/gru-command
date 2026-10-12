@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { branchNameForRef } from '../src/dispatch/branch-idle.js';
-import { repositoryGitEnv } from '../src/dispatch/perkins-review/artifacts.js';
+import { freezeReviewInputs, repositoryGitEnv } from '../src/dispatch/perkins-review/artifacts.js';
+import { headMovedSinceFreeze } from '../src/dispatch/perkins-review/whole.js';
 import { prBranchCandidate, resolveFreshPrHead, type PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
 import { GhPrPoster, GitLabMrPoster, WaveRunner } from '../src/dispatch/perkins.js';
 import { probeGitHubRemote, repoRemote, runReviewPreflight } from '../src/dispatch/review-path.js';
@@ -106,6 +107,24 @@ async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe) {
     reviewArtifactRoot: artifactRoot, prHeadProbe: probe,
   });
   return { ledger, worktrees, job, wave, runtime, artifactRoot };
+}
+
+function failingCheckoutHook(repo: FixtureRepo): { readonly hook: string; readonly log: string } {
+  const hook = join(repo.path, '.git', 'hooks', 'post-checkout');
+  const log = join(directory(), 'checkout-path.txt');
+  git(repo.path, ['config', 'core.hooksPath', join(repo.path, '.git', 'hooks')]);
+  writeFileSync(hook, '#!/usr/bin/env node\n' +
+    `require('node:fs').writeFileSync(${JSON.stringify(log)}, process.cwd()); process.exit(7);\n`);
+  chmodSync(hook, 0o755);
+  return { hook, log };
+}
+
+function assertNoPartialLane(repo: FixtureRepo, ledger: LedgerApi, id: string, log: string, before: string, branch?: string): void {
+  const path = readFileSync(log, 'utf8'); // Git really checked out the partial lane before its hook failed.
+  expect(existsSync(path)).toBe(false);
+  expect(git(repo.path, ['worktree', 'list', '--porcelain'])).toBe(before);
+  expect(ledger.getWorktree(id)).toBeNull();
+  if (branch !== undefined) expect(git(repo.path, ['branch', '--list', branch])).toBe('');
 }
 
 describe('review Git repository environment isolation (GH-270)', () => {
@@ -334,6 +353,125 @@ if (argv.includes('POST')) {
     expect(diff).toContain('export const assigned = true;');
     expect(diff).not.toContain('export const foreign = true;');
     expect(foreignState(foreign)).toEqual(before);
+  });
+
+  it('tracks the canonical PR branch when an origin-prefixed tag shadows that same branch', async () => {
+    const repo = fixture('assigned-pr-movement-shadow');
+    origin(repo);
+    repo.git(['checkout', '-b', 'feature/shared']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    repo.git(['push', '--quiet', 'origin', 'feature/shared']);
+    repo.git(['tag', 'origin/feature/shared', 'main']);
+    const foreign = fixture('foreign-pr-movement-shadow');
+    const before = foreignState(foreign);
+    const h = await waveFixture(repo, async () => ({ headRefName: 'feature/shared', headSha: target }));
+    poison(foreign);
+    const request = await h.wave.requestReview({ jobId: h.job.id, targetRef: 'feature/shared' });
+    if (request.route !== 'perkins') throw new Error(`expected native request, got ${request.route}`);
+    const outcome = await request.run;
+    expect(outcome.canonicalVerdict).toBe('READY TO MERGE');
+    expect(h.runtime.leadCalls).toHaveLength(1);
+    const manifest = JSON.parse(readFileSync(join(h.artifactRoot, outcome.round.id, 'manifest.json'), 'utf8')) as {
+      readonly targetRef: string; readonly targetSha: string;
+    };
+    expect(manifest).toMatchObject({ targetRef: 'refs/remotes/origin/feature/shared', targetSha: target });
+    expect(foreignState(foreign)).toEqual(before);
+  });
+
+  it('sanitizes the secondary movement-ref proof when the frozen target is an exact commit pin', async () => {
+    const repo = fixture('assigned-secondary-movement');
+    repo.git(['checkout', '-b', 'feature/shared']);
+    const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+    const foreign = fixture('foreign-secondary-movement');
+    foreign.git(['branch', 'feature/shared']);
+    const before = foreignState(foreign);
+    const { ledger, worktrees } = manager();
+    const job = ledger.addJob({ id: 'secondary-movement', repo: 'assigned', title: 'commit pin movement', baseBranch: 'main' });
+    const round = ledger.addRound({ jobId: job.id, targetRef: target });
+    const lane = await worktrees.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: target, jobId: job.id });
+    const frozen = freezeReviewInputs({
+      repoPath: lane.path, roundId: round.id, artifactRoot: directory(), baseRef: 'main', targetRef: target, noSpec: true,
+    });
+    poison(foreign);
+    expect(headMovedSinceFreeze(frozen, 'refs/heads/feature/shared')).toBeNull();
+    expect(headMovedSinceFreeze(frozen, 'refs/heads/main')).toMatchObject({ cause: 'target-moved' });
+    expect(foreignState(foreign)).toEqual(before);
+  });
+
+  it('rolls back a job lane after a failed checkout hook and retries the same id without touching foreign state', async () => {
+    const repo = fixture('assigned-hook-job');
+    origin(repo);
+    const foreign = fixture('foreign-hook-job');
+    const state = foreignState(foreign);
+    const { ledger, worktrees } = manager();
+    const job = ledger.addJob({ id: 'hook-job', repo: 'assigned', title: 'checkout hook refusal', baseBranch: 'main' });
+    const before = git(repo.path, ['worktree', 'list', '--porcelain']);
+    const { hook, log } = failingCheckoutHook(repo);
+    poison(foreign);
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })).rejects.toThrow(/git worktree add/);
+    assertNoPartialLane(repo, ledger, job.id, log, before, `gru/${job.id}`);
+    rmSync(hook);
+    const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    expect(lane.branch).toBe(`gru/${job.id}`);
+    // Existing lane ownership refusals must not roll back somebody else's prior lane.
+    await expect(worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })).rejects.toThrow(/already exists/);
+    expect(existsSync(lane.path)).toBe(true);
+    expect(ledger.getWorktree(job.id)).toMatchObject({ path: lane.path, status: 'active' });
+    expect(await worktrees.release({ worktreeId: job.id })).toMatchObject({ status: 'swept' });
+    expect(foreignState(foreign)).toEqual(state);
+  });
+
+  it('rolls back a detached review lane after a failed checkout hook and retries the same round', async () => {
+    const repo = fixture('assigned-hook-review');
+    const target = repo.head();
+    const foreign = fixture('foreign-hook-review');
+    const state = foreignState(foreign);
+    const { ledger, worktrees } = manager();
+    const job = ledger.addJob({ id: 'hook-review-job', repo: 'assigned', title: 'checkout hook refusal', baseBranch: 'main' });
+    const round = ledger.addRound({ jobId: job.id, targetRef: target });
+    const input = { repoPath: repo.path, roundId: round.id, ref: target, jobId: job.id };
+    const before = git(repo.path, ['worktree', 'list', '--porcelain']);
+    const { hook, log } = failingCheckoutHook(repo);
+    poison(foreign);
+    await expect(worktrees.createReviewWorktree(input)).rejects.toThrow(/git worktree add/);
+    assertNoPartialLane(repo, ledger, round.id, log, before);
+    rmSync(hook);
+    const lane = await worktrees.createReviewWorktree(input);
+    expect(lane.branch).toBeNull();
+    await expect(worktrees.createReviewWorktree(input)).rejects.toThrow(/already exists/);
+    expect(existsSync(lane.path)).toBe(true);
+    expect(await worktrees.release({ worktreeId: round.id })).toMatchObject({ status: 'swept' });
+    expect(foreignState(foreign)).toEqual(state);
+  });
+
+  it('rolls back writer and read-only child lanes after failed checkout hooks while preserving their parent', async () => {
+    const repo = fixture('assigned-hook-children');
+    origin(repo);
+    const foreign = fixture('foreign-hook-children');
+    const state = foreignState(foreign);
+    const { ledger, worktrees } = manager();
+    const job = ledger.addJob({ id: 'hook-child-job', repo: 'assigned', title: 'checkout hook refusal', baseBranch: 'main' });
+    const parent = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    const before = git(repo.path, ['worktree', 'list', '--porcelain']);
+    const parentSha = git(parent.path, ['rev-parse', 'HEAD']);
+    for (const authority of ['writer', 'read-only'] as const) {
+      const childId = `hook-${authority}`;
+      const input = { repoPath: repo.path, jobId: job.id, childId, parentPath: parent.path, authority };
+      const { hook, log } = failingCheckoutHook(repo);
+      poison(foreign);
+      await expect(worktrees.createChildWorktree(input)).rejects.toThrow(/git worktree add/);
+      assertNoPartialLane(repo, ledger, childId, log, before,
+        authority === 'writer' ? `gru/${job.id}-child-${childId}` : undefined);
+      rmSync(hook);
+      const child = await worktrees.createChildWorktree(input);
+      expect(child.sha).toBe(parentSha);
+      await expect(worktrees.createChildWorktree(input)).rejects.toThrow(/already exists/);
+      expect(existsSync(child.path)).toBe(true);
+      expect(await worktrees.release({ worktreeId: child.id })).toMatchObject({ status: 'swept' });
+      expect(git(parent.path, ['rev-parse', 'HEAD'])).toBe(parentSha);
+    }
+    expect(await worktrees.release({ worktreeId: job.id })).toMatchObject({ status: 'swept' });
+    expect(foreignState(foreign)).toEqual(state);
   });
 
   it('keeps an intentional local origin-prefixed tag pinned even if foreign refs classify it as a branch', async () => {
