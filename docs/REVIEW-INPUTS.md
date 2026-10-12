@@ -220,7 +220,9 @@ latest revision → verify → fresh review. The service enforces it centrally.
   waiting on it. An active `dismissed` decision for `verification-failure` on
   `job:<id>`, bound to the exact `verification-failure:<scope>@<run_id>` basis,
   retires that run's repair attention only. Independent scopes retain their own
-  dispositions; cleared or expired decisions and newer failures reopen repair.
+  exact dispositions, but a newer ANY-basis `verification-failure` decision fences
+  older exact dismissals; an ANY-basis dismissal cannot retire a specific run.
+  Cleared or expired exact decisions and newer failures reopen repair.
   When no unresolved same-head repair remains, the full Silas digest still offers
   `verificationsOwed`. Dismissal never rewrites FAILED receipts or grants review:
   the unchanged corrective-verification gate remains until eligible proof exists.

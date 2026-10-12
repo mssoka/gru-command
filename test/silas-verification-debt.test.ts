@@ -13,6 +13,7 @@ const HEAD = 'a'.repeat(40);
 const NEXT_HEAD = 'b'.repeat(40);
 const NOW = Date.parse('2030-01-01T00:00:00.000Z');
 const closers: Array<() => void> = [];
+const databases = new WeakMap<LedgerApi, LedgerDb>();
 afterEach(() => {
   while (closers.length > 0) closers.pop()!();
 });
@@ -21,7 +22,9 @@ function fixture(): LedgerApi {
   const root = mkdtempSync(join(tmpdir(), 'gru-silas-verification-debt-'));
   const db = new LedgerDb(root);
   closers.push(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
-  return new LedgerApi(db.handle);
+  const ledger = new LedgerApi(db.handle);
+  databases.set(ledger, db);
+  return ledger;
 }
 
 function correctiveDelivery(ledger: LedgerApi, jobId = 'corrective-job'): void {
@@ -58,6 +61,24 @@ function digest(ledger: LedgerApi, now = NOW): Promise<SilasOpsDigest> {
 
 function owed(jobId = 'corrective-job', head = HEAD): object[] {
   return [{ jobId, repo: 'fixture-app', revision: 3, head }];
+}
+
+function driverHarness(ledger: LedgerApi, now: () => number = () => NOW): { driver: SilasDriver; prompts: string[] } {
+  const prompts: string[] = [];
+  const handle: AgentHandle = { id: 'fixture-silas', role: 'silas', sessionFile: null,
+    capabilities: { streaming: false, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+    async prompt(text) { prompts.push(text); }, async steer() {}, async followUp() {}, async dispose() {},
+    subscribe: () => () => {}, health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }) };
+  const driver = new SilasDriver({ ledger, slot: { ensure: async () => handle },
+    config: { ...DEFAULT_SILAS_CONFIG, enabled: true, sweepIntervalMs: 0, pollIntervalMs: 0, unchangedRewakeMs: 0 },
+    ops: { baseUrl: 'http://127.0.0.1:7665', configPath: '/fixture/config.toml' }, skills: [], now });
+  return { driver, prompts };
+}
+
+function wakeDigest(prompt: string): SilasOpsDigest {
+  const serialized = /```json\n([\s\S]*?)\n```/u.exec(prompt);
+  expect(serialized).not.toBeNull();
+  return JSON.parse(serialized![1]!) as SilasOpsDigest;
 }
 
 describe('Silas corrective verification after exact failure dismissals (GH-302)', () => {
@@ -240,7 +261,7 @@ describe('Silas corrective verification after exact failure dismissals (GH-302)'
     const negative = completed(ledger, 'corrective-job', 'baseline', 'negative');
     disposition(ledger, 'corrective-job', 'baseline', 'negative');
     expect((await digest(ledger)).verificationsOwed).toEqual(owed());
-    completed(ledger, 'corrective-job', 'typecheck', 'eligible-pass', true, NEXT_HEAD);
+    completed(ledger, 'corrective-job', 'typecheck', 'other-head-pass', true, NEXT_HEAD);
     expect((await digest(ledger)).verificationsOwed).toEqual(owed());
     const dirty = ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'corrective-job',
       payload: { ok: true, exit_code: 0, scope: 'typecheck', run_id: 'dirty-pass', sha: HEAD, tracked_dirty: true } });
@@ -255,29 +276,109 @@ describe('Silas corrective verification after exact failure dismissals (GH-302)'
     expect(ledger.listJobEventsByKinds('corrective-job', ['verification.completed'])).toContainEqual(dirty);
   });
 
+  it('keeps a malformed dismissal date actionable without hiding unrelated jobs', async () => {
+    const ledger = fixture();
+    correctiveDelivery(ledger);
+    const failed = completed(ledger, 'corrective-job', 'baseline', 'negative');
+    const decision = disposition(ledger, 'corrective-job', 'baseline', 'negative');
+    databases.get(ledger)!.handle.prepare('UPDATE decisions SET recheck_at = ? WHERE id = ?').run('not-a-date', decision.id);
+    correctiveDelivery(ledger, 'unrelated-job');
+    completed(ledger, 'unrelated-job', 'baseline', 'unrelated-negative');
+    disposition(ledger, 'unrelated-job', 'baseline', 'unrelated-negative');
+    const result = await digest(ledger);
+    expect(result.verificationsOwed).toEqual(owed('unrelated-job'));
+    expect(result.verificationFailures).toEqual([expect.objectContaining({ jobId: 'corrective-job', runId: 'negative',
+      detail: expect.stringContaining(`decision "${decision.id}" has an unparseable recheck_at "not-a-date"`) })]);
+    expect(result.verificationFailures[0]?.detail).toContain('correct or clear the decision');
+    expect(laneIsBusy(ledger, ledger.getJob('corrective-job')!)).toBe(true);
+    expect(ledger.latestJobEvent('corrective-job', 'verification.completed')).toEqual(failed);
+  });
+
+  it('a newer wildcard fences older exact dismissals but not later independent exact decisions', async () => {
+    const ledger = fixture();
+    correctiveDelivery(ledger);
+    completed(ledger, 'corrective-job', 'baseline', 'older-negative');
+    disposition(ledger, 'corrective-job', 'baseline', 'older-negative');
+    expect((await digest(ledger)).verificationsOwed).toEqual(owed());
+    disposition(ledger, 'corrective-job', 'baseline', 'older-negative', { decision: 'hold', basisFingerprint: null });
+    const fenced = await digest(ledger);
+    expect(fenced.verificationFailures.map((row) => row.runId)).toEqual(['older-negative']);
+    expect(fenced.verificationsOwed).toEqual([]);
+    completed(ledger, 'corrective-job', 'r2-baseline', 'newer-negative');
+    disposition(ledger, 'corrective-job', 'r2-baseline', 'newer-negative');
+    const independent = await digest(ledger);
+    expect(independent.verificationFailures.map((row) => row.runId)).toEqual(['older-negative']);
+    expect(independent.verificationsOwed).toEqual([]);
+    disposition(ledger, 'corrective-job', 'baseline', 'older-negative');
+    expect((await digest(ledger)).verificationsOwed).toEqual(owed());
+  });
+
+  it('an unavailable decision reader grants no dismissal and keeps same-head repair actionable', async () => {
+    const ledger = fixture();
+    correctiveDelivery(ledger);
+    completed(ledger, 'corrective-job', 'baseline', 'negative');
+    disposition(ledger, 'corrective-job', 'baseline', 'negative');
+    Object.defineProperty(ledger, 'listDecisions', { value: undefined });
+    const result = await digest(ledger);
+    expect(result.verificationFailures.map((row) => row.runId)).toEqual(['negative']);
+    expect(result.verificationsOwed).toEqual([]);
+  });
+
+  it('failures without a scope or run identity cannot borrow an exact dismissal', async () => {
+    for (const missing of ['scope', 'run_id'] as const) {
+      const ledger = fixture();
+      correctiveDelivery(ledger);
+      ledger.appendCustomEvent({ kind: 'verification.completed', jobId: 'corrective-job',
+        payload: { ok: false, exit_code: 1, scope: 'baseline', run_id: 'negative', sha: HEAD, tracked_dirty: false, [missing]: null } });
+      disposition(ledger, 'corrective-job', 'baseline', 'negative');
+      const result = await digest(ledger);
+      expect(result.verificationFailures, missing).toEqual([expect.objectContaining({ head: HEAD,
+        ...(missing === 'scope' ? { scope: null } : { runId: null }) })]);
+      expect(result.verificationsOwed, missing).toEqual([]);
+    }
+  });
+
   it('the normal Silas sweep delivers the restored debt to its single wake slot', async () => {
     const ledger = fixture();
     correctiveDelivery(ledger);
     completed(ledger, 'corrective-job', 'baseline', 'negative');
     disposition(ledger, 'corrective-job', 'baseline', 'negative');
-    const prompts: string[] = [];
-    const handle: AgentHandle = { id: 'fixture-silas', role: 'silas', sessionFile: null,
-      capabilities: { streaming: false, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
-      async prompt(text) { prompts.push(text); }, async steer() {}, async followUp() {}, async dispose() {},
-      subscribe: () => () => {}, health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }) };
-    const driver = new SilasDriver({ ledger, slot: { ensure: async () => handle },
-      config: { ...DEFAULT_SILAS_CONFIG, enabled: true, sweepIntervalMs: 0, pollIntervalMs: 0, unchangedRewakeMs: 0 },
-      ops: { baseUrl: 'http://127.0.0.1:7665', configPath: '/fixture/config.toml' }, skills: [], now: () => NOW });
+    const { driver, prompts } = driverHarness(ledger);
     try {
       await driver.trigger({ kind: 'sweep' });
       expect(prompts).toHaveLength(1);
-      const serialized = /```json\n([\s\S]*?)\n```/u.exec(prompts[0]!);
-      expect(serialized).not.toBeNull();
-      const delivered = JSON.parse(serialized![1]!) as SilasOpsDigest;
-      expect(delivered.verificationsOwed).toEqual(owed());
-      expect(delivered.verificationFailures).toEqual([]);
+      expect(wakeDigest(prompts[0]!).verificationsOwed).toEqual(owed());
+      expect(wakeDigest(prompts[0]!).verificationFailures).toEqual([]);
       await driver.trigger({ kind: 'sweep' });
       expect(prompts).toHaveLength(1); // unchanged debt is not another producer or wake
+    } finally {
+      driver.stop();
+    }
+  });
+
+  it('a dismissal deadline reopens repair through the normal sweep with no new ledger traffic', async () => {
+    const ledger = fixture();
+    correctiveDelivery(ledger);
+    completed(ledger, 'corrective-job', 'baseline', 'negative');
+    disposition(ledger, 'corrective-job', 'baseline', 'negative', { recheckAt: new Date(NOW + 1_000).toISOString() });
+    let time = NOW;
+    const { driver, prompts } = driverHarness(ledger, () => time);
+    try {
+      await driver.trigger({ kind: 'sweep' });
+      expect(prompts).toHaveLength(1);
+      expect(wakeDigest(prompts[0]!).verificationsOwed).toEqual(owed());
+      const sourceSeq = ledger.listJobEvents('corrective-job', { limit: 1 })[0]!.seq;
+      time += 1_000;
+      await driver.trigger({ kind: 'sweep' });
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain('verificationFailures');
+      expect(prompts[1]).toContain('negative');
+      const reopened = await digest(ledger, time);
+      expect(reopened.verificationFailures.map((row) => row.runId)).toEqual(['negative']);
+      expect(reopened.verificationsOwed).toEqual([]);
+      expect(ledger.listJobEvents('corrective-job', { limit: 1 })[0]!.seq).toBe(sourceSeq);
+      await driver.trigger({ kind: 'sweep' });
+      expect(prompts).toHaveLength(2);
     } finally {
       driver.stop();
     }

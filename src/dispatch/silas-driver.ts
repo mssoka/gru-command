@@ -2038,8 +2038,8 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   // subject/signal covering query deliberately has different semantics.
   const failureDecisions = new Map<string, Map<string, Pick<DecisionRecord, 'id' | 'decision' | 'recheckAt'>>>();
   const dispositionNow = now();
-  const failureDismissed = (failure: VerificationFailureRow): boolean => {
-    if (failure.scope === null || failure.runId === null || input.ledger.listDecisions === undefined) return false;
+  const failureAttention = (failure: VerificationFailureRow): readonly VerificationFailureRow[] => {
+    if (failure.scope === null || failure.runId === null || input.ledger.listDecisions === undefined) return [failure];
     let decisions = failureDecisions.get(failure.jobId);
     if (decisions === undefined) {
       decisions = new Map();
@@ -2058,13 +2058,17 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
       failureDecisions.set(failure.jobId, decisions);
     }
     const decision = decisions.get(`verification-failure:${failure.scope}@${failure.runId}`);
-    if (decision?.decision !== 'dismissed') return false;
-    if (decision.recheckAt === null) return true;
+    if (decision?.decision !== 'dismissed') return [failure];
+    if (decision.recheckAt === null) return [];
     const recheck = Date.parse(decision.recheckAt);
-    if (!Number.isFinite(recheck)) throw new Error(`decision "${decision.id}" carries an unparseable recheck_at "${decision.recheckAt}"`);
-    return recheck > dispositionNow;
+    if (!Number.isFinite(recheck)) {
+      // Corrupt dismissal evidence fails closed for THIS repair, loudly,
+      // without stranding unrelated jobs by failing the whole digest.
+      return [{ ...failure, detail: `${failure.detail}; decision "${decision.id}" has an unparseable recheck_at "${decision.recheckAt}" — correct or clear the decision before reusing its dismissal` }];
+    }
+    return recheck > dispositionNow ? [] : [failure];
   };
-  const verificationFailures = digest.verificationFailures.filter((row) => continuationAllowed(row) && !failureDismissed(row));
+  const verificationFailures = digest.verificationFailures.filter(continuationAllowed).flatMap(failureAttention);
   return {
     ...digest,
     verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
