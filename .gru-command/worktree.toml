@@ -5,6 +5,8 @@ command = "npm ci"
 [verify]
 full = "npm test"
 typecheck = "npm run typecheck"
+# Integration correction: GH-314 decisions never close GH-313 producer-owned custody.
+report-signal-custody = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/board-server.test.ts test/report-handback-mailbox.test.ts test/gru-mailbox.test.ts"
 # GH-270: repository-routing regressions, through the authenticated scheduler.
 review-git-env-regressions = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-git-environment.test.ts"
 # Negative evidence: authentic fetched base with only the final regression suite
