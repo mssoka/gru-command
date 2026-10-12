@@ -1266,6 +1266,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
@@ -1288,6 +1289,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
@@ -1307,6 +1309,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
@@ -1328,6 +1331,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const link = (pages: ReadonlyArray<[number, string]>): Record<string, string> => ({
       link: pages.map(([page, rel]) => `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${page}>; rel="${rel}"`).join(', '),
@@ -1476,6 +1480,53 @@ describe('bounded ambiguous-POST reconciliation', () => {
       expect(error?.message ?? '').not.toMatch(/did not land/u);
       expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
     }
+  });
+
+  it('never certifies absence from a short list whose only entry omits a delivery-predicate field (#182)', async () => {
+    const complete = {
+      id: 3131,
+      user: { login: 'other-user', type: 'User' },
+      commit_id: HEAD,
+      state: 'COMMENTED',
+      body: 'someone else\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
+    };
+    for (const omitted of ['state', 'commit_id', 'body', 'submitted_at'] as const) {
+      const { [omitted]: _dropped, ...entry } = complete;
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [entry] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '', omitted).toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '', omitted).not.toMatch(/did not land/u);
+      // The unbounded recovery seam never reads submitted_at, so only the
+      // other three omissions are undecidable there.
+      if (omitted !== 'submitted_at') {
+        await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), omitted).rejects.toThrow(PerkinsAppError);
+      }
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), omitted).toHaveLength(1);
+    }
+  });
+
+  it('still certifies absence from a short list whose entry is fully typed and genuinely differs (#182)', async () => {
+    const fixture = bundleFixture();
+    const foreign = {
+      id: 3132,
+      user: { login: 'other-user', type: 'User' },
+      commit_id: HEAD,
+      state: 'COMMENTED',
+      body: 'someone else\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
+    };
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [foreign] }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/did not land/u);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toBeNull();
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
   });
 
   it('never credits an older round\u2019s identical bytes: stale submitted_at is not a match', async () => {
@@ -1894,6 +1945,7 @@ describe('idempotent recovery reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       {
@@ -1921,6 +1973,7 @@ describe('idempotent recovery reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       {
@@ -2363,6 +2416,7 @@ describe('bounded lookup growth and link sanity', () => {
     commit_id: HEAD,
     state: 'COMMENTED',
     body: 'review body\n',
+    submitted_at: new Date(NOW + 60_000).toISOString(),
   }));
 
   const link = (page: string, rel: string, base = 'https://api.github.com/repos/acme/widget/pulls/7/reviews') =>

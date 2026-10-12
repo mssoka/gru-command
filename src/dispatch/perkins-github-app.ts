@@ -589,7 +589,7 @@ function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogi
  * `[[]]`, `[{}]`, `[{user: …}]`, `[42]` — is a broken list, not a review
  * that happens to differ: its non-match proves nothing, so a walk over it
  * must stay unresolved rather than certify absence. */
-function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
+function isDecidableReviewEntry(entry: unknown, windowed: boolean): entry is ProviderReview {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
   const record = entry as Record<string, unknown>;
   const id = record['id'];
@@ -611,9 +611,15 @@ function isDecidableReviewEntry(entry: unknown): entry is ProviderReview {
       if (typeof author[field] !== 'string') return false;
     }
   }
-  for (const field of ['state', 'commit_id', 'body', 'submitted_at'] as const) {
+  // submitted_at is a delivery predicate only under a recency bound (the
+  // ambiguous-POST window); the unbounded recovery seam never reads it.
+  for (const field of ['state', 'commit_id', 'body', ...(windowed ? ['submitted_at' as const] : [])] as const) {
     const value = record[field];
-    if (!(value === null || value === undefined || typeof value === 'string')) return false;
+    // An OMITTED field is not "a review that differs": the delivery
+    // predicates read it, so its absence is undecidable and must never let
+    // a non-match certify that the publication did not land. Only a
+    // provider-typed value (string, or an explicit null) is decidable.
+    if (!(value === null || typeof value === 'string')) return false;
   }
   return true;
 }
@@ -1324,7 +1330,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // Never report "searched and not found" when no usable list was read.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
-      if (list.some((entry) => !isDecidableReviewEntry(entry))) {
+      if (list.some((entry) => !isDecidableReviewEntry(entry, notBeforeMs !== null))) {
         // A null, primitive, array-valued or otherwise undecidable entry is
         // a broken list, not absence: a lookup we cannot trust must never
         // become a certificate.
