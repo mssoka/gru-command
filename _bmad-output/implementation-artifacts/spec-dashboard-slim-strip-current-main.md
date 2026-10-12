@@ -470,3 +470,21 @@ The required Step 4 reviewers inspected the frozen `49b558f243c7bacbfb46c7bc04f7
 | R12-V1 — strip Playwright is absent from GitHub CI | false | GitHub CI is not this workflow's only verification path. The declared `strip-browser` scheduler scope ran at exact head `8187e6db` (run `c7b57499-58d8-45cf-a4c7-06ff28b65906`) and passed 68/68, including the responsive layout checks. No CI change is required for this task's gate. |
 
 Root-cause groups: G1 is R12-B1's non-canonical date parse path, medium, patch. G2 is the new older-pending viewport-coverage gap in R12-B4, medium, patch; the older wake/deferred coverage finding remains carried. The remaining findings are false, carried, or deferred as recorded above. No `intent_gap` or `bad_spec` finding remains; no Step 3 loopback is triggered.
+
+### Round 13 — rendered BMAD Step 4 review at `3da207a3`
+
+Three fresh tracked reviewers inspected the frozen `49b558f243c7bacbfb46c7bc04f749bf131cefea..3da207a3c3f481d04e0f203ab0b0a7e72baffec5` diff (SHA-256 `2593da8aa51b3f77b9c473e35353ea953f9a1062e94d0262458d931c2d68d8b2`, 4,348,775 bytes). Reports and transcript provenance are indexed in the Round 13 `STEP04-R13-INDEX.json`; all transcripts had zero skipped torn lines and each reviewer worktree was clean at `79c032e5` with both reviewed Git objects present. The only in-scope new finding is the timezone-less timestamp acceptance; the other reports are repeated carried issues or separate pre-existing follow-ups.
+
+| Finding | Verdict / route | Evidence and disposition |
+|---|---|---|
+| R13-B1 — timezone-less wake timestamp is parsed in viewer-local time | medium — patch (G1) | `Date.parse('2026-10-01T00:00:00')` is finite but uses local time, so the same snapshot can show different ages across time zones. Require an explicit zone in the wake-age path; add a regression test while preserving explicitly zoned timestamps. |
+| R13-B2 — strip group accessible names use KPI enumeration | follow-up (carried) | Same claim as R10 BH-F7 and R12-B2; existing deferred-work disposition is unchanged. No duplicate patch or deferral. |
+| R13-B3 — `bindClient` retains owner disclosure maps across re-pair | follow-up (carried) | Same claim as R11 BH-04 and R12-B3; existing deferred-work disposition is unchanged. No duplicate patch or deferral. |
+| R13-B4 — wake/deferred numeric-boundary checks omit accepted widths | follow-up (carried) | R12 fixed the older-pending width loop at all `VIEWPORTS`; the remaining wake-age/deferred-width legs are the already-carried R10 BH-F5 / R12-B4 follow-up. No new acceptance gap is introduced by this report. |
+| R13-B5 — visual captures use fixed ignored paths | follow-up (carried) | Same claim as R6 F-7 and R12-B5; existing deferred-work disposition is unchanged. |
+| R13-B6 — job mailbox item may have null `jobId` | defer (carried) | Same pre-existing protocol-validation gap as R12-E2; existing deferred-work entry remains authoritative. |
+| R13-B7 — non-resolved mailbox item may have empty `reasons` | defer (carried) | Same pre-existing protocol-validation gap as R12-E3; existing deferred-work entry remains authoritative. |
+| R13-E1 — rehearsal script imports a removed wizard artifact and uses a retired answer | defer / out of scope | `scripts/rehearsal-bmad-onboarding.mjs` is unchanged in the reviewed range; this repo-internal harness is unrelated to the SLIM presentation. Recorded as a separate follow-up in `deferred-work.md`. |
+| R13-V1 — signal-less GET can turn a received HTTP 401 into status-0 timeout | defer / integrated-main follow-up | The GET refusal path is existing `BoardClient` behavior from integrated main; the SLIM branch's prior fix addressed the POST race only. This is not required to render the strip and is recorded as a separate `deferred-work.md` follow-up. |
+
+The full review texts are `review-reports/step04-r13-blind-hunter.txt`, `review-reports/step04-r13-edge-case-hunter.txt`, and `review-reports/step04-r13-verification-gap.txt`; hashes and transcript counts are in `review-reports/STEP04-R13-INDEX.json`. Root-cause group G1 is the timezone-less `Date.parse` local-time path; patch the validator and regression test. Other reports are carried or explicitly deferred as above. No `intent_gap` or `bad_spec` remains; no Step 3 loopback is triggered.

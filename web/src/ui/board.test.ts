@@ -739,6 +739,20 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     view.render(nonCanonicalImpossibleDate);
     expect(wakes?.querySelector('.board-age-split__num')).toBeNull();
     expect(wakes?.querySelector('.board-wakes__unknown')).not.toBeNull();
+    // A timezone-less date-time parses in the viewer's local zone; date-only
+    // stamps also lack an explicit zone. Keep either snapshot but show no age.
+    for (const stamp of ['2026-10-01T00:00:00', '2026-10-01']) {
+      expect(Number.isFinite(Date.parse(stamp))).toBe(true);
+      const timezoneLess = snapshot({ wakes: { count: 3, lastAt: stamp } });
+      expect(isValidSnapshot(timezoneLess)).toBe(true);
+      view.render(timezoneLess);
+      expect(wakes?.querySelector('.board-age-split__num')).toBeNull();
+      expect(wakes?.querySelector('.board-wakes__unknown')).not.toBeNull();
+    }
+    // An explicit offset remains an unambiguous, displayable wake timestamp.
+    view.render(snapshot({ wakes: { count: 3, lastAt: '2026-10-01T00:00:00+02:00' } }));
+    expect(wakes?.querySelector('.board-age-split__num')).not.toBeNull();
+    expect(wakes?.querySelector('.board-wakes__unknown')).toBeNull();
     // 0 + no stamp WITH deferred demand: still the honest no-wakes state —
     // no fire time exists, so it is not "unknown"; the deferred tally is a
     // separate fact beside it.

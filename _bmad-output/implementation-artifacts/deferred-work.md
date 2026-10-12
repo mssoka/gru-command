@@ -217,3 +217,11 @@ warrants. They are recorded, not dropped:
 - source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
   summary: The mailbox snapshot validator accepts an empty `reasons` array for a non-resolved item, leaving its For Gru detail without a human-readable reason label if a malformed frame reaches the client. The required basis is still displayed, and current projection emits items with reasons; this is pre-existing protocol hardening, not a SLIM change.
   evidence: `web/src/lib/board-protocol.ts:1144` checks array shape but not non-emptiness; `web/src/ui/board.ts:1555-1559` renders reason labels and basis; `src/gru-mailbox/projection.ts:176-177` appends a job item only when `reasons.length > 0`, while incident reasons derive from notification rows at `src/gru-mailbox/projection.ts:219-235`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: A signal-less GET that receives HTTP 401 can be reported as a status-0 timeout because `refused()` stops the client and aborts the same request controller before the GET result is returned. The POST race was fixed in the SLIM integration; the GET variant is existing integrated-main client behavior and should be addressed in a separately scoped BoardClient follow-up.
+  evidence: Round 13 verification-gap review at `web/src/lib/board-client.ts:329-380`; GET consumers include proposal, receipt, and transcript reads. This finding is not part of the approved SLIM presentation acceptance.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The repo-internal BMAD-onboarding rehearsal script appears incompatible with the current build: its static import targets a removed `dist/wizard/bmad-onboarding.js`, and its `parseAnswers` fixture includes the retired `bmad` answer. The script is unchanged in the SLIM review range; handle separately from this feature.
+  evidence: Round 13 edge-case review at `scripts/rehearsal-bmad-onboarding.mjs:13,34-41`; this script is outside the approved SLIM product scope.

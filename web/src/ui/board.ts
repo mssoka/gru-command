@@ -138,10 +138,13 @@ function validWakeStamp(stamp: string | null): string | null {
   if (stamp === null || stamp === '') return null;
   const parsed = Date.parse(stamp);
   if (!Number.isFinite(parsed)) return null;
-  // Date.parse normalizes impossible ISO calendar days (for example Feb 30)
-  // into a later month. Validate the supplied date portion before showing an
-  // age; the snapshot remains usable and the UI can say the time is unknown.
-  const dateParts = /^(\d{4})-(\d{2})-(\d{2})(?:$|[Tt\s])/u.exec(stamp);
+  // Require a full timestamp with a zone; date-times without one use the
+  // viewer's local time and date-only values do not identify a zoned instant.
+  // Date.parse can also normalize impossible ISO calendar days (for example
+  // Feb 30), so validate the date before showing an age; the snapshot remains
+  // usable and the UI can say the time is unknown.
+  const dateParts =
+    /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.exec(stamp);
   if (dateParts === null) return null;
   const year = Number(dateParts[1]);
   const month = Number(dateParts[2]);
