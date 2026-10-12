@@ -25,6 +25,7 @@ import {
   type RateLimitBackoffPolicy, type RetrySettlement,
 } from '../runtime/pacing.js';
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
+import { stageSpawnRegistration } from '../runtime/spawn-registration.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -159,8 +160,6 @@ interface SupervisedAgent {
   breakerNotificationId: string | null;
   /** A restart rung is executing: disposed envelopes must not evict us. */
   inRestart: boolean;
-  /** Exact result of this rung, never an independently spawned same-id writer. */
-  restartSpawned: AgentHandle | null;
   /** Pending backoff timer (a scheduled next rung). */
   backoffTimer: ReturnType<typeof setTimeout> | null;
   /** Monotonic event/adoption generation; timestamps can collide within one ms. */
@@ -238,14 +237,12 @@ interface InterruptedTurn extends RecoveryAuthority {
   readonly originAgentId: string;
 }
 
-interface DeferredRestartTap {
-  readonly handle: AgentHandle;
-  readonly authority: RecoveryAuthority | null;
-  readonly openToolCalls: Map<string, string>;
-  openTurn: boolean;
-  openControl: boolean;
-  disposed: boolean;
-  lastEventAt: number;
+interface RestartFlight {
+  authority: RecoveryAuthority | null;
+  handle: AgentHandle | null;
+  publish: (() => void) | null;
+  unsubscribe: (() => void) | null;
+  superseded: boolean;
   pendingError: Extract<RuntimeEvent, { type: 'error' }> | null;
 }
 
@@ -405,12 +402,10 @@ export class Supervisor {
    * ownership must still fence the captured job, including when disposal
    * rejects after the registry has already removed the handle. */
   private readonly rejectedRestartCleanup = new Map<AgentHandle, RejectedRestartCleanup>();
-  private readonly deferredRestartTaps = new Map<SupervisedAgent, Map<AgentHandle, DeferredRestartTap>>();
-  /** A newer intentional controller can replace the indexed record while
-   * its predecessor's spawn is still in flight. Track the rung separately. */
-  private readonly restartingAgents = new Map<SupervisedAgent, number>();
-  /** Exact-handle observation avoids stale same-id disposal/error envelopes. */
-  private readonly restartTapObservers = new Map<AgentHandle, () => void>();
+  /** Rung ownership survives a newer same-id controller replacing its index. */
+  private readonly restartingAgents = new Map<SupervisedAgent, RestartFlight>();
+  /** Held startup failures must retain their synchronous pending-turn evidence. */
+  private readonly restartErrorSnapshots = new WeakMap<RuntimeEvent, InterruptedTurn>();
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
   private restoredStops = new Map<string, AgentSupervisionView>();
@@ -736,26 +731,21 @@ export class Supervisor {
   // Registry tap feed
   // ------------------------------------------------------------------
 
-  private onEnvelope(envelope: AgentEventEnvelope, sourceHandle?: AgentHandle): void {
+  private onEnvelope(envelope: AgentEventEnvelope): void {
     if (this.disposed) return;
     try {
       if (envelope.phase === 'spawned') {
-        // Until the rung returns its exact handle, a same-id tap might be
-        // its stale result OR a separately authorized native rebrief.
-        const restarting = [...this.restartingAgents.keys()].filter((agent) => agent.agentId === envelope.agentId).at(-1);
-        const handle = this.registry.getHandle(envelope.agentId);
-        if (restarting !== undefined) {
-          if (handle !== null) this.deferRestartTap(restarting, handle);
-          return;
-        }
+        const handle = envelope.handle ?? this.registry.getHandle(envelope.agentId);
+        // The awaiting owner, not its tap, adopts its authorized result.
+        if (handle !== null && [...this.restartingAgents.values()].some((flight) => flight.handle === handle)) return;
         this.adopt(handle ?? null, null, envelope.sessionFile, envelope);
         return;
       }
       const current = this.agents.get(envelope.agentId);
-      if (sourceHandle !== undefined && current?.handle !== sourceHandle) return;
-      if (sourceHandle === undefined && [...this.restartTapObservers.keys()].some((handle) => handle.id === envelope.agentId)) return;
+      if (envelope.handle !== undefined && current?.handle !== envelope.handle) return;
+      if (envelope.handle === undefined && current?.handle !== null &&
+        [...this.restartingAgents.values()].some((flight) => flight.superseded && flight.handle?.id === envelope.agentId)) return;
       if (envelope.phase === 'disposed') {
-        if (sourceHandle !== undefined) this.stopRestartTapObserver(sourceHandle);
         const agent = this.agents.get(envelope.agentId);
         if (agent === undefined) return;
         // A disposed handle can never deliver a pending retry: conclude
@@ -822,7 +812,7 @@ export class Supervisor {
             agent.openToolCalls.clear();
           }
           break;
-        case 'error':
+        case 'error': {
           if (!this.cfg.enabled) {
             // Supervision off = pure registry behavior: errors are the
             // runtime's/owner's business — observed, never acted on.
@@ -830,6 +820,13 @@ export class Supervisor {
               agent_id: agent.agentId,
               error: event.error,
             });
+            break;
+          }
+          // Publication can replay a startup error while its owner is still
+          // settling the rung. Defer that exact error, never another spawn.
+          const flight = [...this.restartingAgents.values()].find((item) => item.handle === agent.handle);
+          if (flight !== undefined) {
+            flight.pendingError = event;
             break;
           }
           if (event.fatal) {
@@ -849,7 +846,7 @@ export class Supervisor {
             // retry budget; everything else enters provider-wall
             // classification so known auth or quota failures produce durable
             // stop/re-arm guidance.
-            if (!this.absorbRateLimitFailure(agent, event.error)) {
+            if (!this.absorbRateLimitFailure(agent, event.error, this.restartErrorSnapshots.get(event))) {
               void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true, {
                 provider: event.provider ?? null,
                 model: event.model ?? null,
@@ -859,6 +856,7 @@ export class Supervisor {
             }
           }
           break;
+        }
         default:
           break;
       }
@@ -872,83 +870,6 @@ export class Supervisor {
     }
   }
 
-  private stopRestartTapObserver(handle: AgentHandle): void {
-    this.restartTapObservers.get(handle)?.();
-    this.restartTapObservers.delete(handle);
-  }
-
-  private deferRestartTap(agent: SupervisedAgent, handle: AgentHandle): void {
-    const taps = this.deferredRestartTaps.get(agent) ?? new Map<AgentHandle, DeferredRestartTap>();
-    if (taps.has(handle)) return;
-    let authority: RecoveryAuthority | null = null;
-    try { authority = this.captureJobAuthority(this.ledger.getAgent(agent.agentId)?.jobId ?? null, agent.agentId); }
-    catch (error) { this.log('warn', 'same-id tap authority unavailable', { agent_id: agent.agentId, error: String(error) }); }
-    const tap: DeferredRestartTap = { handle, authority, openToolCalls: new Map(), openTurn: false,
-      openControl: false, disposed: false, lastEventAt: this.now(), pendingError: null };
-    taps.set(handle, tap);
-    this.deferredRestartTaps.set(agent, taps);
-    const unsubscribe = handle.subscribe((event) => {
-      if (this.disposed) return;
-      tap.lastEventAt = this.now();
-      switch (event.type) {
-        case 'turn_start': tap.openTurn = true; tap.pendingError = null; break;
-        case 'turn_end': tap.openTurn = false; tap.openToolCalls.clear(); break;
-        case 'compaction_start': tap.openControl = true; break;
-        case 'compaction_end': tap.openControl = false; break;
-        case 'tool_start': tap.openToolCalls.set(event.callId, event.tool); break;
-        case 'tool_end': tap.openToolCalls.delete(event.callId); break;
-        case 'error': tap.pendingError = event; break;
-        case 'state': if (event.state === 'disposed') tap.disposed = true; break;
-        default: break;
-      }
-      if (this.agents.get(handle.id)?.handle === handle) {
-        this.onEnvelope({ agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'event', event }, handle);
-        if (tap.disposed) this.onEnvelope({ agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'disposed' }, handle);
-      }
-      if (tap.disposed) this.stopRestartTapObserver(handle);
-    });
-    this.restartTapObservers.set(handle, unsubscribe);
-  }
-
-  private restoreIndependentRestartTap(agent: SupervisedAgent, spawned: AgentHandle | null): void {
-    const taps = this.deferredRestartTaps.get(agent);
-    this.deferredRestartTaps.delete(agent);
-    if (taps === undefined) return;
-    const candidates = [...taps.values()].filter((tap) => tap.handle !== spawned && !tap.disposed);
-    const survivor = candidates.at(-1);
-    for (const tap of taps.values()) {
-      const authorizedResult = tap.handle === spawned && this.agents.get(tap.handle.id)?.handle === tap.handle;
-      if (tap !== survivor && !authorizedResult) this.stopRestartTapObserver(tap.handle);
-    }
-    if (survivor === undefined || this.disposed) return;
-    // An intentional adopter already owns this record, including any
-    // newer owner/provider stop. Never re-arm it from an obsolete rung.
-    const controller = this.agents.get(survivor.handle.id);
-    if (controller !== undefined && (controller !== agent || controller.handle === survivor.handle ||
-      (controller.slot !== null && controller.slotGeneration !== this.restartingAgents.get(agent)))) return;
-    // A separate native writer owns its own prompt. Restore observation,
-    // never the rejected rung's prompt or binding, after stale cleanup.
-    this.clearRecoveryAdmission(agent);
-    this.clearRateLimitRetry(agent, 'superseded');
-    if (agent.backoffTimer !== null) clearTimeout(agent.backoffTimer);
-    agent.backoffTimer = null;
-    agent.inRestart = false;
-    agent.pendingRecovery = null;
-    this.adopt(survivor.handle, null, survivor.handle.sessionFile);
-    const watched = this.agents.get(survivor.handle.id)!;
-    watched.state = 'watching';
-    watched.stopReason = null;
-    watched.stoppedAt = null;
-    watched.openTurn = survivor.openTurn;
-    watched.openControl = survivor.openControl;
-    watched.openToolCalls = survivor.openToolCalls;
-    watched.lastEventAt = survivor.lastEventAt;
-    if (survivor.pendingError !== null && survivor.authority !== null && this.recoveryAuthorityCurrent(watched, survivor.authority)) {
-      this.onEnvelope({ agentId: survivor.handle.id, role: survivor.handle.role, sessionFile: survivor.handle.sessionFile,
-        phase: 'event', event: survivor.pendingError }, survivor.handle);
-    }
-  }
-
   /** Idempotent adoption by agent id; creates or refreshes the record. */
   private adopt(
     handle: AgentHandle | null,
@@ -959,7 +880,17 @@ export class Supervisor {
     const agentId = handle?.id ?? envelope?.agentId;
     const role = handle?.role ?? envelope?.role;
     if (agentId === undefined || role === undefined) return false;
-    const existing = this.agents.get(agentId);
+    let existing = this.agents.get(agentId);
+    const flight = existing === undefined ? undefined : this.restartingAgents.get(existing);
+    if (existing !== undefined && flight !== undefined && handle !== null && flight.handle !== handle) {
+      // A native successor owns a NEW controller even when its logical id
+      // is unchanged. The old coroutine must never settle its retry/stop.
+      flight.superseded = true;
+      this.clearRateLimitRetry(existing, 'superseded');
+      this.clearRecoveryAdmission(existing);
+      this.agents.delete(agentId);
+      existing = undefined;
+    }
     if (existing !== undefined) {
       existing.handle = handle ?? existing.handle;
       existing.role = role;
@@ -1000,7 +931,6 @@ export class Supervisor {
       stoppedAt: null,
       breakerNotificationId: null,
       inRestart: false,
-      restartSpawned: null,
       backoffTimer: null,
       activityGeneration: 0,
       decisionPending: false,
@@ -1281,7 +1211,7 @@ export class Supervisor {
    * True = absorbed (a retry was scheduled, or this duplicates the attempt
    * already being retried); false = hand the failure to the existing
    * recovery ladder. Never intercepts when the policy is off. */
-  private absorbRateLimitFailure(agent: SupervisedAgent, errorText: string): boolean {
+  private absorbRateLimitFailure(agent: SupervisedAgent, errorText: string, snapshot?: InterruptedTurn): boolean {
     const policy = this.rateLimitBackoff;
     if (policy === null) return false;
     if (agent.handle?.reviewIsolation === true) {
@@ -1309,8 +1239,8 @@ export class Supervisor {
       // attempt, and never schedule two rungs for one failure.
       return true;
     }
-    const captured = this.captureInterruptedTurn(agent.handle, agent);
-    if (captured === null || captured.pending === null) {
+    const captured = snapshot ?? this.captureInterruptedTurn(agent.handle, agent);
+    if (captured === null || captured.pending === null || !this.recoveryAuthorityCurrent(agent, captured)) {
       // Nothing re-deliverable was captured: the failure keeps its existing
       // ladder behavior rather than parking the lane on an undeliverable
       // retry.
@@ -1837,9 +1767,12 @@ export class Supervisor {
       return;
     }
     agent.inRestart = true;
-    this.restartingAgents.set(agent, agent.slotGeneration);
+    const flight: RestartFlight = { authority: null, handle: null, publish: null, unsubscribe: null,
+      superseded: false, pendingError: null };
+    this.restartingAgents.set(agent, flight);
     agent.state = 'restarting';
     try {
+      flight.authority = recovery ?? this.captureJobAuthority(this.ledger.getAgent(agent.agentId)?.jobId ?? null, agent.agentId);
       await this.restartRungInner(agent, reason);
     } catch (error) {
       // A supervision bug or ledger hiccup must never kill the service
@@ -1853,10 +1786,16 @@ export class Supervisor {
     } finally {
       agent.inRestart = agent.backoffTimer !== null;
       if (agent.state === 'restarting' && agent.backoffTimer === null) agent.state = 'watching';
-      const spawned = agent.restartSpawned;
-      agent.restartSpawned = null;
-      this.restoreIndependentRestartTap(agent, spawned);
+      flight.unsubscribe?.();
       this.restartingAgents.delete(agent);
+      const handle = flight.handle;
+      const current = handle === null ? undefined : this.agents.get(handle.id);
+      if (!this.disposed && handle !== null && current?.handle === handle && !current.breakerOpen && flight.pendingError !== null) {
+        const snapshot = this.restartErrorSnapshots.get(flight.pendingError);
+        if (snapshot !== undefined) current.pendingRecovery = snapshot;
+        this.onEnvelope({ handle, agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile,
+          phase: 'event', event: flight.pendingError });
+      }
     }
   }
 
@@ -1904,6 +1843,9 @@ export class Supervisor {
       this.clearRecoveryAdmission(agent);
       const captured = this.captureInterruptedTurn(old, agent);
       if (captured !== null) agent.pendingRecovery = captured;
+      // Exact-handle filtering now ignores the retiring object's tap once
+      // detached. Conclude its retry explicitly before dropping its handle.
+      this.clearRateLimitRetry(agent, 'superseded');
       agent.handle = null;
       agent.openTurn = false;
       agent.openControl = false;
@@ -1939,7 +1881,8 @@ export class Supervisor {
       // Snapshot the explicit durable association BEFORE spawning: the tap
       // carries no job context and a resumed spawn may reuse this row's id.
       const predecessor = this.ledger.getAgent(agent.agentId);
-      const restartAuthority = agent.pendingRecovery ?? this.captureJobAuthority(predecessor?.jobId ?? null, agent.agentId);
+      const flight = this.restartingAgents.get(agent)!;
+      const restartAuthority = flight.authority!;
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
@@ -1947,16 +1890,28 @@ export class Supervisor {
         // also keeps the lane's bound BMAD runtime, issue #283), unless its
         // owning subsystem's policy names the cwd itself.
         const laneCwd = agent.role === 'minion' ? this.jobLanePath(agent.agentId) : undefined;
-        const spawnOptions: SpawnOptions = {
+        const spawnOptions = stageSpawnRegistration({
           ...(resumeFile !== null ? { resumeFile } : {}),
           ...(laneCwd !== undefined ? { cwd: laneCwd } : {}),
           ...(policy !== undefined && 'options' in policy ? policy.options : {}),
-        };
+        }, (handle, publish) => {
+          flight.handle = handle;
+          flight.publish = publish;
+          flight.unsubscribe = handle.subscribe((event) => {
+            if (event.type !== 'error') return;
+            try {
+              const snapshot = this.captureInterruptedTurn(handle, agentRef);
+              if (snapshot !== null) this.restartErrorSnapshots.set(event, snapshot);
+            } catch (error) {
+              this.log('error', 'held restart error snapshot failed', { agent_id: handle.id, error: String(error) });
+            }
+          });
+        });
         const spawned =
           restartSlot !== null
             ? await restartSlot.spawn(spawnOptions)
             : await this.registry.spawn(agent.role, spawnOptions);
-        agent.restartSpawned = spawned;
+        flight.handle = spawned;
         if (
           this.disposed ||
           (restartSlot !== null &&
@@ -1969,10 +1924,9 @@ export class Supervisor {
           await this.registry.disposeHandle(spawned).catch(() => {});
           return;
         }
-        // Spawn is an authority boundary too: the registry tap has already
-        // observed this handle, but a newer native handoff may have won
-        // during creation. Never bind/adopt it or notify ownership swaps.
-        if (!this.recoveryAuthorityCurrent(agent, restartAuthority)) {
+        // No tap consumer or dispatch lookup has seen the held result.
+        // Refuse before publication, binding, adoption, swaps or delivery.
+        if (flight.superseded || !this.recoveryAuthorityCurrent(agent, restartAuthority)) {
           await this.rejectRestartReplacement(agent, spawned, reason, restartAuthority);
           return;
         }
@@ -2007,6 +1961,10 @@ export class Supervisor {
         agent = this.carryOverSupervision(agent, spawned.id);
         agent.consecutiveFailures = 0;
         agent.state = 'watching';
+        flight.publish?.();
+        // Synchronous observers may have installed a newer controller/stop.
+        if (flight.superseded || this.agents.get(spawned.id)?.handle !== spawned || agent.breakerOpen ||
+          !this.recoveryAuthorityCurrent(agent, restartAuthority)) return;
         this.log('info', 'agent restarted', {
           agent_id: agent.agentId,
           reason,
@@ -2021,7 +1979,7 @@ export class Supervisor {
           }
         }
         // Resume (or visibly orphan) the turn this rung interrupted.
-        this.recoverInterruptedTurn(agent, spawned, reason);
+        if (flight.pendingError === null) this.recoverInterruptedTurn(agent, spawned, reason);
       } catch (error) {
         if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
         // Failed rung: count it, back off, schedule the next.
@@ -2697,7 +2655,9 @@ export class Supervisor {
       const open = agent.openTurn || agent.openControl || agent.openToolCalls.size > 0;
       return pending || open ? [`supervised producer: ${row.id} (${pending ? 'pending recovery/retry' : 'open turn/control/tool'})`] : [];
     });
-    return [...rejected, ...supervised];
+    const flights = [...this.restartingAgents].flatMap(([agent, flight]) =>
+      flight.authority?.jobId === jobId ? [`restart in flight: ${agent.agentId}`] : []);
+    return [...rejected, ...supervised, ...flights];
   }
 
   /** Board feed: supervision view for one agent id (or null). */
@@ -2735,10 +2695,7 @@ export class Supervisor {
       this.ticker = null;
     }
     this.unsubscribeTap();
-    for (const unsubscribe of this.restartTapObservers.values()) unsubscribe();
-    this.restartTapObservers.clear();
-    this.deferredRestartTaps.clear();
-    this.restartingAgents.clear();
+    for (const flight of this.restartingAgents.values()) flight.unsubscribe?.();
     for (const agent of this.agents.values()) {
       this.clearRateLimitRetry(agent, 'superseded');
       this.clearRecoveryAdmission(agent);

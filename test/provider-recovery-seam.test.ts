@@ -20,6 +20,7 @@ import type {
   SpawnOptions,
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
+import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
 import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
 import { DispatchService } from '../src/dispatch/service.js';
@@ -101,6 +102,7 @@ class FakeHandle implements AgentHandle {
 class FakeRegistry implements SupervisorRegistry {
   private readonly listeners = new Set<(envelope: AgentEventEnvelope) => void>();
   readonly handles = new Map<string, FakeHandle>();
+  private readonly unpublished = new Set<AgentHandle>();
   private next = 0;
   onAgentEvent(listener: (envelope: AgentEventEnvelope) => void): () => void {
     this.listeners.add(listener);
@@ -112,7 +114,8 @@ class FakeRegistry implements SupervisorRegistry {
     for (const listener of this.listeners) listener(envelope);
   }
   getHandle(agentId: string): AgentHandle | null {
-    return this.handles.get(agentId) ?? null;
+    const handle = this.handles.get(agentId);
+    return handle !== undefined && !this.unpublished.has(handle) ? handle : null;
   }
   spawns = 0;
   /** Test hook: observe EVERY spawned handle, whichever path spawns it
@@ -124,18 +127,30 @@ class FakeRegistry implements SupervisorRegistry {
     this.spawns += 1;
     const handle = new FakeHandle(role, `agent-${this.next}`, options?.resumeFile ?? null);
     this.handles.set(handle.id, handle);
-    this.emit({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
-    this.wireTap(handle, role);
+    this.unpublished.add(handle);
+    let published = false;
+    const buffered: AgentEventEnvelope[] = [];
+    this.wireTap(handle, role, (envelope) => {
+      if (published) this.emit(envelope);
+      else buffered.push(envelope);
+    });
+    publishSpawnRegistration(options ?? {}, handle, () => {
+      published = true;
+      this.unpublished.delete(handle);
+      this.emit({ handle, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+      for (const envelope of buffered.splice(0)) this.emit(envelope);
+    });
     this.onSpawn?.(handle);
     return handle;
   }
   /** Mirror the real registry: handle events flow through the tap. */
-  wireTap(handle: FakeHandle, role: Role): void {
+  wireTap(handle: FakeHandle, role: Role, forward: (envelope: AgentEventEnvelope) => void = (envelope) => this.emit(envelope)): void {
     handle.subscribe((event) => {
-      this.emit({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'event', event });
+      forward({ handle, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'event', event });
     });
   }
   async disposeHandle(handle: AgentHandle): Promise<void> {
+    this.unpublished.delete(handle);
     this.handles.delete(handle.id);
     await handle.dispose();
   }

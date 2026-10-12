@@ -14,6 +14,7 @@ import {
 } from '../src/supervision/supervisor.js';
 import { DEFAULT_DECISIONS_CONFIG, type Role } from '../src/config.js';
 import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
+import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
 import type {
@@ -159,6 +160,7 @@ class FakeRegistry implements SupervisorRegistry {
   private readonly listeners = new Set<(envelope: AgentEventEnvelope) => void>();
   readonly handlesById = new Map<string, FakeHandle>();
   private readonly liveHandles = new Set<FakeHandle>();
+  private readonly unpublished = new Set<FakeHandle>();
   readonly spawnCalls: { role: Role; resumeFile: string | null; cwd?: string }[] = [];
   /** Monotonic: a disposed handle's id is never re-minted. */
   private nextId = 0;
@@ -182,40 +184,49 @@ class FakeRegistry implements SupervisorRegistry {
   }
 
   getHandle(agentId: string): AgentHandle | null {
-    return this.handlesById.get(agentId) ?? null;
+    return [...this.liveHandles].find((handle) => handle.id === agentId && !this.unpublished.has(handle)) ?? null;
   }
 
   async spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle> {
     this.spawnCalls.push({ role, resumeFile: options?.resumeFile ?? null, ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}) });
     const handle = await this.spawnImpl(role, options);
-    this.adopt(handle);
+    this.adopt(handle, options);
     return handle;
   }
 
   /** Mimic the real registry's tap: spawned envelope + event forwarding
    * + a disposed envelope when the handle's state event says disposed. */
-  adopt(handle: FakeHandle): void {
+  adopt(handle: FakeHandle, options: SpawnOptions = {}): void {
     this.liveHandles.add(handle);
+    this.unpublished.add(handle);
     // Like RuntimeRegistry, duplicate logical IDs still name distinct handles.
     if (!this.handlesById.has(handle.id)) this.handlesById.set(handle.id, handle);
-    this.emit({ agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'spawned' });
+    let published = false;
+    const buffered: AgentEventEnvelope[] = [];
+    const forward = (envelope: AgentEventEnvelope): void => {
+      if (published) this.emit(envelope);
+      else buffered.push(envelope);
+    };
     handle.subscribe((event) => {
-      this.emit({
-        agentId: handle.id,
-        role: handle.role,
-        sessionFile: handle.sessionFile,
-        phase: 'event',
-        event,
-      });
+      forward({ handle, agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'event', event });
       if (event.type === 'state' && event.state === 'disposed') {
         this.removeHandle(handle);
-        this.emit({ agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'disposed' });
+        forward({ handle, agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'disposed' });
       }
+    });
+    publishSpawnRegistration(options, handle, () => {
+      if (published) return;
+      if (handle.disposed) throw new WorkerDisposalInProgressError();
+      published = true;
+      this.unpublished.delete(handle);
+      this.emit({ handle, agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'spawned' });
+      for (const envelope of buffered.splice(0)) this.emit(envelope);
     });
   }
 
   private removeHandle(handle: FakeHandle): void {
     this.liveHandles.delete(handle);
+    this.unpublished.delete(handle);
     if (this.handlesById.get(handle.id) !== handle) return;
     this.handlesById.delete(handle.id);
     const other = [...this.liveHandles].find((candidate) => candidate.id === handle.id);
@@ -1205,6 +1216,29 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { releaseTurn(); await routing; f.rig.dispose(); vi.useRealTimers(); }
   });
 
+  it('replays a same-id startup fatal after an unchanged-authority rung without delivering on the failed handle', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart(true);
+    try {
+      const recovery = new FakeHandle('minion', 'startup-fatal-recovery', f.replacement.sessionFile);
+      f.rig.registry.spawnImpl = async () => recovery;
+      const create = f.rig.registry.adopt.bind(f.rig.registry);
+      vi.spyOn(f.rig.registry, 'adopt').mockImplementation((handle, options) => {
+        create(handle, options);
+        if (handle !== f.replacement) return;
+        handle.emit({ type: 'error', error: 'startup transport died', fatal: true });
+        handle.setState('error');
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.replacement.promptCalls).toEqual([]);
+      expect(f.replacement.disposed).toBe(true);
+      expect(f.rig.registry.spawnCalls).toHaveLength(2);
+      expect(recovery.promptCalls).toEqual([{ text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` }]);
+      expect(f.rig.supervisor.viewFor(recovery.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
   it('preserves an independently adopted same-id owner stop when the stale rung finishes', async () => {
     vi.useFakeTimers();
     const f = await deferredRestart(true);
@@ -1274,21 +1308,26 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
-  it('keeps a same-id replacement out of current and ensure inside its spawned tap', async () => {
+  it('keeps a same-id replacement out of every spawned tap, current and ensure during creation', async () => {
     vi.useFakeTimers();
     const f = await deferredRestart(true);
-    let currentAtTap: AgentHandle | null | undefined;
+    let currentAtCreation: AgentHandle | null | undefined;
     let ensured: Promise<AgentHandle | Error> | null = null;
-    const unsubscribe = f.rig.registry.onAgentEvent((event) => {
-      if (event.phase !== 'spawned' || event.agentId !== f.replacement.id) return;
-      currentAtTap = f.slot.current();
+    const tapped = vi.fn();
+    const unsubscribe = f.rig.registry.onAgentEvent(tapped);
+    const create = f.rig.registry.adopt.bind(f.rig.registry);
+    vi.spyOn(f.rig.registry, 'adopt').mockImplementation((handle, options) => {
+      create(handle, options);
+      if (handle !== f.replacement) return;
+      currentAtCreation = f.slot.current();
       ensured = f.slot.ensure().catch((error: unknown) => error as Error);
     });
     try {
       f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'superseded during creation', briefing: null });
       f.releaseSpawn(f.replacement);
       await flushMicrotasks();
-      expect(currentAtTap).toBeNull();
+      expect(currentAtCreation).toBeNull();
+      expect(tapped).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(50);
       expect(await ensured).toBeInstanceOf(Error);
       expect(f.replacement.disposed).toBe(true);
