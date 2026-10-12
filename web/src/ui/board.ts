@@ -200,7 +200,7 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
-  /** Decision controls are live only for a snapshot from the currently bound client. */
+  /** Actions and receipts are live only for a snapshot from the currently bound client. */
   private snapshotIsCurrent = false;
   private snapshotRevision = 0;
   private unavailableReason: string | null = null;
@@ -295,7 +295,7 @@ export class BoardView {
     this.notificationBell.addEventListener('click', () => {
       this.notificationPanel.hidden = !this.notificationPanel.hidden;
       this.notificationBell.dataset.open = String(!this.notificationPanel.hidden);
-      if (!this.notificationPanel.hidden) {
+      if (!this.notificationPanel.hidden && this.snapshotIsCurrent) {
         // Opening the panel proves display of every current row: mark
         // seen (badge) AND send one receipt per surface (shown:true).
         for (const notification of this.snapshot?.notifications ?? []) {
@@ -342,6 +342,13 @@ export class BoardView {
 
   markUnavailable(message: string): void {
     this.unavailableReason = message;
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
+  }
+
+  /** A disconnected board cannot authorize actions from its last-known snapshot. */
+  markSnapshotStale(): void {
+    if (!this.snapshotIsCurrent) return;
+    this.snapshotIsCurrent = false;
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
@@ -733,10 +740,19 @@ export class BoardView {
       );
       return current.loading;
     };
+    summary.addEventListener('click', (event) => {
+      if (!this.snapshotIsCurrent && !current.open) event.preventDefault();
+    });
     review.addEventListener('toggle', () => {
-      // Only the owner opening it fetches: restoring an open disclosure on
-      // re-render (which also fires toggle) must never refetch in a loop.
+      // A stale row may keep an already-open review readable, but it cannot
+      // start a new fetch against the newly bound or reconnecting client.
       const wasOpen = current.open;
+      if (!this.snapshotIsCurrent && review.open && !wasOpen) {
+        review.open = false;
+        return;
+      }
+      // Restoring an open disclosure on re-render (which also fires toggle)
+      // must never refetch in a loop.
       current.open = review.open;
       if (review.open && !wasOpen) void load().catch(() => {});
     });
@@ -753,10 +769,10 @@ export class BoardView {
     accept.textContent = current.inFlight === 'accept' ? 'accepting…' : 'Accept';
     reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : 'Reject';
     // A recorded decision can only be finished, never flipped.
-    accept.disabled = current.inFlight !== null || current.recorded === 'reject';
-    reject.disabled = current.inFlight !== null || current.recorded === 'accept';
+    accept.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'reject';
+    reject.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'accept';
     const decide = (decision: 'accept' | 'reject'): void => {
-      if (current.inFlight !== null) return;
+      if (!this.snapshotIsCurrent || current.inFlight !== null) return;
       const client = this.boardClient;
       if (client === null) return;
       current.inFlight = decision;
@@ -765,6 +781,10 @@ export class BoardView {
       void load()
         .then((proposal) => {
           if (!live()) throw new Error('re-paired');
+          if (!this.snapshotIsCurrent) {
+            current.message = 'The board is catching up; your choice was not sent. Wait for a fresh snapshot and review it again.';
+            return null;
+          }
           if (current.recorded !== null && current.recorded !== decision) return null; // never flip a recorded decision
           return client.decideLessonProposal(proposal.id, decision);
         })
@@ -2311,7 +2331,7 @@ export class BoardView {
     }
     // A feed row earns a receipt-style "Mark seen" only where an ack has
     // meaning; machine and owner rows never show it.
-    if (item.routing === 'fyi' && !receipt && item.ackedAt === null && item.resolvedAt === null) {
+    if (item.routing === 'fyi' && !receipt && item.ackedAt === null && item.resolvedAt === null && this.snapshotIsCurrent) {
       const seen = document.createElement('button');
       seen.type = 'button';
       seen.className = 'board-notification__ack';
@@ -2319,6 +2339,7 @@ export class BoardView {
       seen.dataset.actionId = `fyi-seen:${item.id}`;
       seen.dataset.focusKey = `notif:${item.id}:seen`;
       seen.addEventListener('click', () => {
+        if (!this.snapshotIsCurrent) return;
         seen.disabled = true;
         void this.boardClient
           ?.ackNotification(item.id)
@@ -2596,6 +2617,7 @@ export class BoardView {
    * server upgrades shown_at per surface, so a toast receipt never
    * suppresses a later panel receipt. */
   private sendShown(notification: NotificationView, surface: string): void {
+    if (!this.snapshotIsCurrent) return;
     let surfaces = this.sentShown.get(notification.id);
     if (surfaces === undefined) {
       surfaces = new Set<string>();

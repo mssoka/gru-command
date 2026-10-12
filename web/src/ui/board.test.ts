@@ -3428,15 +3428,32 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     await flush();
     expect(oldClient.getLessonProposal).toHaveBeenCalledTimes(1);
     view.bindClient(newClient);
+    let band = document.getElementById('board-owner')!;
+    const staleAccept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    const staleReject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect(staleAccept.disabled).toBe(true);
+    expect(staleReject.disabled).toBe(true);
+    const staleReview = band.querySelector<HTMLDetailsElement>('.board-owner__review')!;
+    staleReview.open = true;
+    staleReview.dispatchEvent(new Event('toggle'));
+    await flush();
+    expect(staleReview.open).toBe(false);
+    expect(newClient.getLessonProposal).not.toHaveBeenCalled();
+    staleAccept.dispatchEvent(new Event('click', { bubbles: true }));
+    staleReject.dispatchEvent(new Event('click', { bubbles: true }));
+    expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
+    expect(newClient.markNotificationShown).not.toHaveBeenCalled();
+
     view.render(snapshot({ notifications: [proposalNotice] }));
     release(proposalReview());
     await flush();
     expect(oldClient.decideLessonProposal).not.toHaveBeenCalled();
     expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
-    const band = document.getElementById('board-owner')!;
+    band = document.getElementById('board-owner')!;
     expect(band.querySelector('[role="alert"]')).toBeNull();
     const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
     expect([accept.textContent, accept.disabled]).toEqual(['Accept', false]);
+    expect(newClient.markNotificationShown).toHaveBeenCalled();
   });
 
   it('the phone layout keeps the proposal review inside the single column', async () => {

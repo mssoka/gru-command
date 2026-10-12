@@ -351,8 +351,12 @@ function startBoard(token: string): void {
         if (boardClient !== current) return;
         // The board degrades to its last snapshot; the nav dot carries the
         // connection truth — including the stale window that used to read
-        // as "open" while the board was frozen.
+        // as "open" while the board was frozen. Last-known actions and
+        // visibility receipts stay read-only until a fresh snapshot arrives.
         renderConnectionDot(state);
+        if (state === 'stale' || state === 'reconnecting' || state === 'offline') {
+          boardView?.markSnapshotStale();
+        }
         commandBar.setBoardState(state);
       },
       unavailable: (message) => {

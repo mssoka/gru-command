@@ -362,7 +362,11 @@ function fixtureSnapshot(overrides: Partial<BoardSnapshot> = {}): BoardSnapshot 
 interface Seed {
   readonly pageErrors: Error[];
   readonly socketReady: Promise<void>;
+  holdNextBoardFrame(): Promise<void>;
+  socketCount(): number;
+  closeLatestSocket(): Promise<void>;
   push(snapshot: BoardSnapshot): void;
+  pushLatest(snapshot: BoardSnapshot): void;
 }
 
 async function seedBoard(page: Page, initial: BoardSnapshot, proposal?: Record<string, unknown>): Promise<Seed> {
@@ -372,6 +376,9 @@ async function seedBoard(page: Page, initial: BoardSnapshot, proposal?: Record<s
   const pageErrors: Error[] = [];
   page.on('pageerror', (error) => pageErrors.push(error));
   let current = initial;
+  let withholdNextBoardFrame = false;
+  let resolveWithheldBoardFrame: (() => void) | null = null;
+  let withheldBoardFrame: Promise<void> | null = null;
   const sockets: WebSocketRoute[] = [];
   let markSocketReady!: () => void;
   const socketReady = new Promise<void>((resolve) => { markSocketReady = resolve; });
@@ -386,6 +393,12 @@ async function seedBoard(page: Page, initial: BoardSnapshot, proposal?: Record<s
       if (seeded) return;
       seeded = true;
       ws.send(JSON.stringify({ type: 'auth_ok' }));
+      if (withholdNextBoardFrame) {
+        withholdNextBoardFrame = false;
+        resolveWithheldBoardFrame?.();
+        resolveWithheldBoardFrame = null;
+        return;
+      }
       ws.send(JSON.stringify({ type: 'board', snapshot: current }));
       markSocketReady();
     });
@@ -393,10 +406,30 @@ async function seedBoard(page: Page, initial: BoardSnapshot, proposal?: Record<s
   return {
     pageErrors,
     socketReady,
+    holdNextBoardFrame() {
+      withholdNextBoardFrame = true;
+      withheldBoardFrame = new Promise<void>((resolve) => { resolveWithheldBoardFrame = resolve; });
+      return withheldBoardFrame;
+    },
+    socketCount() {
+      return sockets.length;
+    },
+    async closeLatestSocket() {
+      const latest = sockets.at(-1);
+      if (latest === undefined) throw new Error('no board socket exists to close');
+      await latest.close({ code: 1001, reason: 'test connection interruption' });
+    },
     push(snapshot: BoardSnapshot) {
       if (!isValidSnapshot(snapshot)) throw new Error('pushed snapshot fails the production validator');
       current = snapshot;
       for (const ws of sockets) ws.send(JSON.stringify({ type: 'board', snapshot }));
+    },
+    pushLatest(snapshot: BoardSnapshot) {
+      if (!isValidSnapshot(snapshot)) throw new Error('pushed snapshot fails the production validator');
+      current = snapshot;
+      const latest = sockets.at(-1);
+      if (latest === undefined) throw new Error('no board socket exists to receive the snapshot');
+      latest.send(JSON.stringify({ type: 'board', snapshot }));
     },
   };
 }
@@ -1464,6 +1497,97 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       await expect(bellChoice).toBeEnabled();
       await expect(ownerCard.locator('.board-notification__submission--reconciling')).toHaveCount(0);
       expect(decisionPosts).toBe(1);
+      expect(seed.pageErrors).toEqual([]);
+    } finally {
+      for (const release of releases) release?.();
+      await page.close();
+    }
+  });
+
+  test('a board disconnect keeps stale owner choices read-only until a fresh production snapshot', async ({ browser }) => {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    const base = fixtureSnapshot();
+    const initial = fixtureSnapshot({ notifications: [...base.notifications, feedNotification()] });
+    const releases: (() => void)[] = [];
+    let refreshRequests = 0;
+    let decisionPosts = 0;
+    let acknowledgementPosts = 0;
+    try {
+      const seed = await seedBoard(page, initial);
+      await pairAndOpenBoard(page);
+      await seed.socketReady;
+      await settled(page);
+      await clickBell(page);
+
+      const ownerChoice = page.locator('#board-owner [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
+      const bellChoice = page.locator('#notification-list [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
+      const seenAction = page.locator('#notification-list [data-notification-id="feed-1"] .board-notification__ack');
+      await expect(ownerChoice).toBeEnabled();
+      await expect(bellChoice).toBeEnabled();
+      await expect(seenAction).toBeEnabled();
+      await page.evaluate(() => {
+        const owner = document.querySelector<HTMLButtonElement>(
+          '#board-owner [data-notification-id="decision-1"] [data-action-id$=":option:approve"]',
+        );
+        const bell = document.querySelector<HTMLButtonElement>(
+          '#notification-list [data-notification-id="decision-1"] [data-action-id$=":option:approve"]',
+        );
+        const seen = document.querySelector<HTMLButtonElement>(
+          '#notification-list [data-notification-id="feed-1"] .board-notification__ack',
+        );
+        if (owner === null || bell === null || seen === null) throw new Error('live actions must be present before disconnect');
+        const testWindow = window as Window & { __r7StaleChoices?: HTMLButtonElement[] };
+        testWindow.__r7StaleChoices = [owner, bell, seen];
+      });
+
+      await page.route('**/api/board', async (route) => {
+        const requestNumber = ++refreshRequests;
+        await new Promise<void>((resolve) => { releases[requestNumber - 1] = resolve; });
+        await route.fulfill({ json: initial });
+      });
+      await page.route('**/api/notifications/*/decision', (route) => {
+        if (route.request().method() !== 'POST') return route.fallback();
+        decisionPosts += 1;
+        return route.fulfill({
+          status: 400,
+          json: { error: 'decision_refused', code: 'unknown_option', detail: 'a stale choice was submitted' },
+        });
+      });
+      await page.route('**/api/notifications/*/ack', (route) => {
+        if (route.request().method() !== 'POST') return route.fallback();
+        acknowledgementPosts += 1;
+        return route.fulfill({ status: 200, json: { ok: true } });
+      });
+
+      const reconnectedWithoutSnapshot = seed.holdNextBoardFrame();
+      await seed.closeLatestSocket();
+      await expect(page.locator('#conn-dot')).toHaveClass(/conn-dot--busy/u);
+      await expect(ownerChoice).toHaveCount(0);
+      await expect(bellChoice).toHaveCount(0);
+      await expect(seenAction).toHaveCount(0);
+      await expect(page.locator('#board-owner [data-notification-id="decision-1"] .board-notification__option-label')).toHaveCount(2);
+      await expect(page.locator('#notification-list [data-notification-id="decision-1"] .board-notification__option-label')).toHaveCount(2);
+      await expect.poll(() => seed.socketCount()).toBe(2);
+      await reconnectedWithoutSnapshot;
+      await expect(page.locator('#conn-dot')).toHaveClass(/conn-dot--busy/u);
+
+      await page.evaluate(() => {
+        const testWindow = window as Window & { __r7StaleChoices?: HTMLButtonElement[] };
+        for (const choice of testWindow.__r7StaleChoices ?? []) choice.click();
+      });
+      expect(decisionPosts).toBe(0);
+      expect(acknowledgementPosts).toBe(0);
+
+      // The reconnection itself is not enough: only its new board snapshot
+      // restores the options, on both production-rendered owner surfaces.
+      seed.pushLatest(initial);
+      await expect(ownerChoice).toBeEnabled();
+      await expect(bellChoice).toBeEnabled();
+      await expect(seenAction).toBeEnabled();
+      await expect(page.locator('#conn-dot')).toHaveClass(/conn-dot--open/u);
+      expect(decisionPosts).toBe(0);
+      expect(acknowledgementPosts).toBe(0);
+      expect(refreshRequests).toBeGreaterThan(0);
       expect(seed.pageErrors).toEqual([]);
     } finally {
       for (const release of releases) release?.();

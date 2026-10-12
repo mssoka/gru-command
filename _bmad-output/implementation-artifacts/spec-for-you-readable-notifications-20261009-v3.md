@@ -5,7 +5,7 @@ created: '2026-10-11'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'f738b9b1594081cdbb4929af7be256454951eb43'
-review_loop_iteration: 6
+review_loop_iteration: 7
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/BOARD.md'
@@ -467,7 +467,14 @@ R6 correction work on the next candidate: owner decision controls are read-only 
 
 Local diagnostic evidence (not a scheduled gate): the two new red tests failed before their respective fixes; the restored-breaker test returned 200 and resolved the alert before the supervisor guard, then passed with the guard. Targeted board/server tests passed, `npm run build:web` passed, and the isolated Playwright run for notification readability plus `real-server.spec.ts` passed all 32 tests. The default browser ports were in use by an unrelated worktree and were left untouched; the local run used isolated ports and the repository snapshot template. The authorized R6 run at `821dfdb67853ce9f809fca47a045d4e26bc72b75` remains a historical failure: `full` timed out (SIGTERM) and `owner-decisions-browser` had 67 passes and one strict-mode failure because `#banners .banner` matched two elements. These receipts are preserved and are not passes for a later head.
 
-The first local full `npm test` run had one unrelated watcher-timing failure in `test/decisions.test.ts` (expected `credential_missing`, observed `disabled`); the isolated test passed 1/1 and the full rerun passed. Final local diagnostic rerun: lint, typecheck, build; backend 139 files/3102 passed/11 skipped; heavy backend 38 files/1028 passed/6 skipped; web 53 files/735 passed. Local diagnostics do not substitute for authenticated scheduled verification at the newly published head. `review_loop_iteration` remains 6 until a later review round is completed.
+The first local full `npm test` run had one unrelated watcher-timing failure in `test/decisions.test.ts` (expected `credential_missing`, observed `disabled`); the isolated test passed 1/1 and the full rerun passed. Final local diagnostic rerun: lint, typecheck, build; backend 139 files/3102 passed/11 skipped; heavy backend 38 files/1028 passed/6 skipped; web 53 files/735 passed. Local diagnostics do not substitute for authenticated scheduled verification at the newly published head. At that historical point, `review_loop_iteration` remained 6 pending the next review round.
+
+Round 7 tracked reviews (target `35d080766b57328e4e7a1de6499c08459105a337`, complete diff base `79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37`, correction delta `821dfdb67853ce9f809fca47a045d4e26bc72b75..35d080766b57328e4e7a1de6499c08459105a337`). The clean replacement blind returned no actionable findings and was dismissed. The edge and verification reports identified stale decision controls after a board disconnect and unguarded Book of Lessons proposal actions during re-pair. An authenticated board read on 2026-10-12 found both report jobs already `done`; no duplicate disposition POST was attempted.
+
+- `medium` — edge: on reconnect, the old snapshot could remain actionable because `snapshotIsCurrent` was reset on re-pair but not connection loss. The view now marks last-known state stale on `stale`, `reconnecting` and `offline`; typed decisions, proposal actions, FYI Mark-seen and display receipts stay read-only until a fresh snapshot. A production-wired browser test holds the reconnect HTTP refresh and board frame, clicks detached old controls, proves no decision/ack request, then restores actions only after a new board snapshot.
+- `medium` — verification-gap: lesson proposal Accept/Reject and review loading were not protected during client re-pair. Proposal controls now render disabled until a current snapshot, opening a stale review is blocked, and an in-flight review cannot submit after the snapshot becomes stale. The unit regression proves no new-client fetch, decision or shown receipt before the fresh snapshot.
+
+Both correction regressions were observed red before the production guards and pass afterward. The complete local `npm test` rerun passed: fast backend 139 files/3,102 passed/11 skipped; heavy backend 38 files/1,028 passed/6 skipped; web 53 files/735 passed, with lint, typecheck and build green. The first full local run had one review-admission head-binding network preflight failure; the exact test passed in isolation and the complete rerun passed. Local `npm run e2e` had 108 passing tests, including all notification-readability and real-server tests, but three `pipeline-board` viewport-geometry cases failed (desktop 1440 light and tablet 768 light/dark); the same three failures reproduced in the isolated pipeline-board project. No pipeline-board source or test changes were made in this correction; the failures remain non-green browser evidence. Exact-head authenticated verification and fresh review of the correction commit remain required.
 
 ## Design Notes
 
