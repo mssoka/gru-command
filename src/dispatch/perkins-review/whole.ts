@@ -446,7 +446,7 @@ function headMovedSinceFreeze(review: FrozenReview, movementRef: string, options
   try {
     return execFileSync(
       'git', ['-C', review.manifest.repoPath, 'rev-parse', '--verify', `${movementRef}^{commit}`],
-      { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS },
+      { encoding: 'utf8', timeout: GIT_PROOF_TIMEOUT_MS, env: repositoryGitEnv(false) },
     ).trim() === review.manifest.targetSha ? null : { cause: 'target-moved', detail: `movement ref ${movementRef} no longer matches ${review.manifest.targetSha}` };
   } catch {
     return { cause: 'target-moved', detail: `movement ref ${movementRef} cannot resolve` };

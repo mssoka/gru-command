@@ -695,14 +695,12 @@ export class WorktreeManager {
       // not actually branch from (the 'freshHead lie' of 2026-09-23).
       const base = this.resolveBase(repo.repoPath);
       const sha = base.sha;
-      runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, sha]);
-      // Perkins lane-B r1 B1: the guard covers BOOTSTRAP *AND REGISTRATION*
-      // — a registration failure (missing owner row, DB error) used to
-      // leave tree+branch on disk with no registry row: retries wedged on
-      // 'path already exists' and registry-paths-only sweeps never saw
-      // the debris.
+      // Branch/path absence was proved above under the repo lock. Guard
+      // ADD as well as BOOTSTRAP AND REGISTRATION: a failed post-checkout
+      // hook can leave a tree+branch behind before Git returns nonzero.
       let record;
       try {
+        runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, sha]);
         await this.bootstrap(repo.repoPath, path);
         record = this.opts.ledger.registerWorktree({
           id: input.jobId,
@@ -759,11 +757,11 @@ export class WorktreeManager {
         throw new Error(`worktree path already exists: ${path}`);
       }
       const resolved = this.resolveReviewRef(repo.repoPath, input.ref);
-      runGit(repo.repoPath, ['worktree', 'add', '--detach', path, resolved.sha]);
-      // Same guard as job lanes (Perkins lane-B r1 B1): registration
-      // failures roll the detached tree back — no unregistered debris.
+      // The path was absent under the repo lock. Guard ADD and registration
+      // together, including a hook failure after Git creates the tree.
       let record;
       try {
+        runGit(repo.repoPath, ['worktree', 'add', '--detach', path, resolved.sha]);
         // Review lanes must contain only bytes tracked by the frozen commit.
         // Job bootstrap links/setup outputs are intentionally not applied.
         const sha = runGit(path, ['rev-parse', 'HEAD']);
@@ -835,14 +833,16 @@ export class WorktreeManager {
         if (existing.status === 0) {
           throw new Error(`branch ${branch} already exists — one lane per child, never a reused held branch`);
         }
-        runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, parentHead]);
-      } else {
-        runGit(repo.repoPath, ['worktree', 'add', '--detach', path, parentHead]);
       }
-      // Same guard as job/review lanes: registration failures roll the
-      // tree AND the branch back — no unregistered debris, no wedge.
+      // Preserve the path/branch absence checks above; only this call's
+      // new resources are eligible for ADD/bootstrap/registration rollback.
       let record;
       try {
+        if (branch !== null) {
+          runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, parentHead]);
+        } else {
+          runGit(repo.repoPath, ['worktree', 'add', '--detach', path, parentHead]);
+        }
         if (input.authority === 'writer') await this.bootstrap(repo.repoPath, path);
         const sha = runGit(path, ['rev-parse', 'HEAD']);
         record = this.opts.ledger.registerWorktree({

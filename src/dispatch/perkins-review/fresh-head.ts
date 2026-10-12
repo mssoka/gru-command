@@ -285,5 +285,5 @@ export async function resolveFreshPrHead(input: FreshPrHeadInput): Promise<Fresh
         'The round was not started; request the review again to freeze the current head.',
     );
   }
-  return { targetSha, movementRef: `origin/${prHeadRefName}`, prHeadSha, prHeadRefName };
+  return { targetSha, movementRef: `refs/remotes/origin/${prHeadRefName}`, prHeadSha, prHeadRefName };
 }

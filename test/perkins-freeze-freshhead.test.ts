@@ -166,7 +166,7 @@ describe('fresh PR head resolution (freeze source of truth)', () => {
     });
     expect(fresh.targetSha).toBe(tip);
     expect(fresh.prHeadSha).toBe(tip);
-    expect(fresh.movementRef).toBe('origin/feature/lane');
+    expect(fresh.movementRef).toBe('refs/remotes/origin/feature/lane');
     expect(repo.git(['rev-parse', 'refs/remotes/origin/feature/lane'])).toBe(tip);
     // The recorded local ref is a hint only: it is never rewritten.
     expect(repo.git(['rev-parse', 'refs/heads/feature/lane'])).toBe(stale);
@@ -186,7 +186,7 @@ describe('fresh PR head resolution (freeze source of truth)', () => {
       probe: fixedProbe('feature/lane', tip),
     });
     expect(fresh.targetSha).toBe(tip);
-    expect(fresh.movementRef).toBe('origin/feature/lane');
+    expect(fresh.movementRef).toBe('refs/remotes/origin/feature/lane');
   });
 
   it('rejects a fetched tip that disagrees with the live code-host head', async () => {
@@ -227,7 +227,7 @@ describe('fresh PR head resolution (freeze source of truth)', () => {
     });
     expect(fresh.prHeadRefName).toBe('gru/pr-head');
     expect(fresh.targetSha).toBe(tip);
-    expect(fresh.movementRef).toBe('origin/gru/pr-head');
+    expect(fresh.movementRef).toBe('refs/remotes/origin/gru/pr-head');
     expect(repo.git(['rev-parse', 'refs/remotes/origin/gru/pr-head'])).toBe(tip);
   });
 
