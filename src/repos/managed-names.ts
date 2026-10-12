@@ -18,6 +18,9 @@ export type ManagedRepoPath =
   | { readonly kind: 'error'; readonly error: string };
 
 const UNAVAILABLE_REASON = 'selected repository is unavailable under workspace_root';
+const MANAGED_REPO_DISPLAY_CONTROL = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const MANAGED_REPO_DISPLAY_MARK = /\p{M}/u;
+const MANAGED_REPO_DISPLAY_BASE = /[^\p{Cc}\p{Cf}\p{M}\p{Zl}\p{Zp}\s]/u;
 const GIT_ROUTING_ENV = new Set([
   'GIT_DIR',
   'GIT_WORK_TREE',
@@ -264,14 +267,29 @@ export function managedRepoNameError(name: string): string | null {
   return null;
 }
 
-/** Render untrusted repository names without terminal-control or bidi effects. */
+/** Render untrusted repository names without terminal effects. Escape combining
+ * marks until a visible base has appeared; whitespace and controls reset it. */
 export function displayManagedRepoName(name: string): string {
-  return name.replace(/^[\p{M}]+|[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (characters) =>
-    Array.from(characters, (character) => {
-      const codePoint = character.codePointAt(0);
-      return codePoint === undefined ? '' : `\\u{${codePoint.toString(16)}}`;
-    }).join(''),
-  );
+  let hasVisibleBase = false;
+  return [...name]
+    .map((character) => {
+      if (MANAGED_REPO_DISPLAY_CONTROL.test(character)) {
+        hasVisibleBase = false;
+        return `\\u{${character.codePointAt(0)?.toString(16) ?? '?'}}`;
+      }
+      if (MANAGED_REPO_DISPLAY_MARK.test(character)) {
+        return hasVisibleBase
+          ? character
+          : `\\u{${character.codePointAt(0)?.toString(16) ?? '?'}}`;
+      }
+      if (MANAGED_REPO_DISPLAY_BASE.test(character)) {
+        hasVisibleBase = true;
+        return character;
+      }
+      hasVisibleBase = false;
+      return character;
+    })
+    .join('');
 }
 
 /**
