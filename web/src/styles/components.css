@@ -3247,6 +3247,10 @@ a.repo-row__name:hover {
   overflow-wrap: anywhere;
 }
 
+.notice-line--multiline {
+  white-space: pre-wrap;
+}
+
 .board-notification__ack {
   margin-top: 6px;
   align-self: flex-start;

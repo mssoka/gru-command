@@ -1042,7 +1042,10 @@ export class ChatView {
         // E7: product notices (wake failures, supervisor restarts, control
         // outcomes) are service machinery — they join the collapsed
         // service band so the conversation stays readable.
-        this.appendServiceLine(el('div', 'notice-line', frame.text));
+        const noticeLine = el('div', 'notice-line', frame.text);
+        // Wake context (GH-114) is a short multi-line block: keep its lines.
+        if (frame.text.includes('\n')) noticeLine.classList.add('notice-line--multiline');
+        this.appendServiceLine(noticeLine);
         if (live) this.bumpUnread();
         this.followContent(live);
         break;

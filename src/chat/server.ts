@@ -42,6 +42,8 @@ const CHAT_OWNER = 'chat';
 const MAX_CONTROL_MESSAGE_CHARS = 240;
 const MAX_DEFERRED_CONTROL_FRAMES = 128;
 const MAX_PENDING_NOTICES = 128;
+/** Bound on the wake context a replayable service notice carries (GH-114). */
+const WAKE_CONTEXT_NOTICE_CHARS = 1_500;
 
 function boundedControlMessage(message: string): string {
   if (message.length <= MAX_CONTROL_MESSAGE_CHARS) return message;
@@ -708,6 +710,21 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
     }
   }
 
+  /** GH-114: the wake's service context reaches the model as a synthetic
+   * prompt; log the bounded context (never the wake instruction) as a typed
+   * `notice` frame at the accepted boundary so replay reconstructs what
+   * triggered Gru's reply in the existing collapsed service band. */
+  function logWakeContext(injection: AwarenessInjection): void {
+    try {
+      const body = injection.text.split('\n').slice(1).join('\n').trim();
+      if (body === '') return;
+      const bounded = body.length > WAKE_CONTEXT_NOTICE_CHARS ? `${body.slice(0, WAKE_CONTEXT_NOTICE_CHARS - 1)}…` : body;
+      emitLogged({ type: 'notice', text: `Wake context — minions raised service events:\n${bounded}` });
+    } catch (error) {
+      log('error', 'failed to log the wake service context', { error: errorMessage(error) });
+    }
+  }
+
   function awarenessCommit(injection: AwarenessInjection, source: 'chat' | 'wake' = 'chat'): void {
     try {
       options.awareness?.commit(injection, source);
@@ -932,6 +949,7 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
               acceptAwarenessTurn = { source: gru, accept: () => {
                 if (wake) {
                   acceptedWakeInjection = injection;
+                  logWakeContext(injection);
                   awarenessCommit(injection, 'wake');
                   options.awareness?.noteWakeOutcome?.(true, undefined, injection);
                 } else {

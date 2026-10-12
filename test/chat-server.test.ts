@@ -3474,6 +3474,35 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
+  it('logs the accepted wake context as a replayable service notice, never the instruction (GH-114)', async () => {
+    const injection = sampleInjection();
+    const harness = await makeHarness({
+      awareness: { prepare: () => injection, commit: () => {} },
+    });
+    try {
+      const live = await authedClient(harness.port);
+      harness.chat.wakeAwareness();
+      await pollUntil(() => harness.handle.calls.length === 1, 'awareness wake turn');
+      await pollUntil(
+        () => harness.frameLog.history.some((frame) => frame.type === 'notice'),
+        'wake context notice',
+      );
+      const logged = harness.frameLog.history.find((frame) => frame.type === 'notice') as { text: string };
+      expect(logged.text).toContain('Wake context');
+      expect(logged.text).toContain('job j1: working → in-review');
+      expect(logged.text).not.toContain(AWARENESS_WAKE_INSTRUCTION);
+      expect(logged.text).not.toContain('[gru awareness · service context');
+      // A fresh page replays it from the durable log.
+      const replay = await authedClient(harness.port);
+      await replay.waitForCount(1 + harness.frameLog.highWaterSeq);
+      expect(replay.frames.some((f) => f.type === 'notice' && String((f as { text?: string }).text).includes('Wake context'))).toBe(true);
+      await live.close();
+      await replay.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('#219: the wake prompt is re-read after the awaited spawn — never the stale pre-spawn block', async () => {
     const stale = sampleInjection();
     const fresh: AwarenessInjection = {
