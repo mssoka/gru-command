@@ -30,17 +30,6 @@ async function assertFormalEventAssertion(tag: string, assertion: () => unknown)
   }
 }
 
-async function receiptOrExpectedLegacyCommentMismatch<T>(
-  publication: Promise<T>,
-  enactedState: 'APPROVED' | 'CHANGES_REQUESTED',
-): Promise<T | PerkinsAppError> {
-  return await publication.catch((error: unknown) => {
-    const expectedMismatch = `review publication state mismatch: provider review 987654 enacted ${enactedState} instead of COMMENTED`;
-    if (error instanceof PerkinsAppError && error.message.includes(expectedMismatch)) return error;
-    throw error;
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Fixtures: synthetic keys, fixture homes, fixture repo, mocked api.github.com
 // ---------------------------------------------------------------------------
@@ -3417,13 +3406,6 @@ describe('formal GitHub verdict publication', () => {
     const namedOnly = Object.assign(new Error('not a Vitest matcher failure'), { name: 'AssertionError' });
     await expect(assertFormalEventAssertion('app-marker-regression', () => { throw namedOnly; }))
       .rejects.toBe(namedOnly);
-    await expect(assertFormalEventAssertion('app-marker-regression', () =>
-      receiptOrExpectedLegacyCommentMismatch(Promise.reject(unrelated), 'APPROVED')))
-      .rejects.toBe(unrelated);
-    const unrelatedAppError = new PerkinsAppError('fixture configuration failed');
-    await expect(assertFormalEventAssertion('app-marker-regression', () =>
-      receiptOrExpectedLegacyCommentMismatch(Promise.reject(unrelatedAppError), 'APPROVED')))
-      .rejects.toBe(unrelatedAppError);
     await expect(assertFormalEventAssertion('app-marker-regression', () => expect(true).toBe(false)))
       .rejects.toThrow(/FORMAL_EVENT_ASSERTION:app-marker-regression/u);
   });
@@ -3445,14 +3427,15 @@ describe('formal GitHub verdict publication', () => {
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('APPROVED') }) },
     ]);
-    const receipt = await receiptOrExpectedLegacyCommentMismatch(
-      poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' }),
-      'APPROVED',
+    const outcome = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' }).then(
+      (receipt) => ({ kind: 'receipt' as const, receipt }),
+      (error: unknown) => ({ kind: 'error' as const, error }),
     );
-    await assertFormalEventAssertion('app-approve-receipt', () => expect(receipt).toEqual({ ...RECEIPT, event: 'APPROVED' }));
     const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
     await assertFormalEventAssertion('app-approve-receipt', () =>
       expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'APPROVE', commit_id: HEAD }));
+    if (outcome.kind === 'error') throw outcome.error;
+    await assertFormalEventAssertion('app-approve-receipt', () => expect(outcome.receipt).toEqual({ ...RECEIPT, event: 'APPROVED' }));
   });
 
   it('delivers a formal REQUEST_CHANGES bound to the frozen head and proves the CHANGES_REQUESTED state (formal GitHub)', async () => {
@@ -3460,14 +3443,15 @@ describe('formal GitHub verdict publication', () => {
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('CHANGES_REQUESTED') }) },
     ]);
-    const receipt = await receiptOrExpectedLegacyCommentMismatch(
-      poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' }),
-      'CHANGES_REQUESTED',
+    const outcome = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' }).then(
+      (receipt) => ({ kind: 'receipt' as const, receipt }),
+      (error: unknown) => ({ kind: 'error' as const, error }),
     );
-    await assertFormalEventAssertion('app-request-changes-receipt', () => expect(receipt).toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' }));
     const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
     await assertFormalEventAssertion('app-request-changes-receipt', () =>
       expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'REQUEST_CHANGES', commit_id: HEAD }));
+    if (outcome.kind === 'error') throw outcome.error;
+    await assertFormalEventAssertion('app-request-changes-receipt', () => expect(outcome.receipt).toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' }));
   });
 
   it('never credits a COMMENTED review beside an approval intent and never re-posts (formal GitHub)', async () => {
