@@ -336,7 +336,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(tip);
-    expect(manifest.targetRef).toBe('origin/feature/lane');
+    expect(manifest.targetRef).toBe('refs/remotes/origin/feature/lane');
     expect(poster.post).toHaveBeenCalledTimes(1);
     expect(poster.post.mock.calls[0]![0]).toMatchObject({ targetSha: tip });
   });
@@ -471,7 +471,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(tip);
-    expect(manifest.targetRef).toBe('origin/feature/pr-head');
+    expect(manifest.targetRef).toBe('refs/remotes/origin/feature/pr-head');
     expect(poster.post).toHaveBeenCalledTimes(1);
   });
 
@@ -768,7 +768,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(laneSha);
-    expect(manifest.targetRef).toBe('origin/feature/lane');
+    expect(manifest.targetRef).toBe('refs/remotes/origin/feature/lane');
   });
 
   it('a FULLY-QUALIFIED revision pin (refs/remotes/origin/feature/lane~1) skips the advertised probe — a genuine qualified tracking ref keeps it (gh-169 P9)', async () => {
