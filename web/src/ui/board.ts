@@ -119,7 +119,7 @@ function lensProgressLabel(summary: RoundSummary): string {
   }
   return parts.join(' · ');
 }
-import { BoardApiError, type BoardClient } from '../lib/board-client.js';
+import { BoardApiError, type BoardClient, type BoardSnapshotSource } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
@@ -200,6 +200,7 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
+  private snapshotRevision = 0;
   private unavailableReason: string | null = null;
   /** ONE sections derivation per render (classification truth is shared
    * by the shortcut strip and the section bodies — computed from the SAME
@@ -328,9 +329,10 @@ export class BoardView {
     this.receiptsLoading = false;
   }
 
-  render(snapshot: BoardSnapshot): void {
+  render(snapshot: BoardSnapshot, source: BoardSnapshotSource = 'http'): void {
     this.unavailableReason = null;
-    this.renderSnapshot(snapshot);
+    this.snapshotRevision += 1;
+    this.renderSnapshot(snapshot, source);
   }
 
   markUnavailable(message: string): void {
@@ -338,22 +340,23 @@ export class BoardView {
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
-  private renderSnapshot(snapshot: BoardSnapshot): void {
+  private renderSnapshot(snapshot: BoardSnapshot, source: BoardSnapshotSource | 'local' = 'local'): void {
     // The RAW snapshot is kept; decision overrides are DERIVED per render,
     // so a stale override can never compound across pushes (the override
     // dies the moment the snapshot carries the recorded state).
     const effective = this.withDecisionOverrides(snapshot);
     const previous = this.snapshot;
     this.snapshot = snapshot;
-    // Submissions end only when the authoritative snapshot carries the
-    // outcome, refreshes a stale option set, or removes the row from pending.
+    // Submissions end only when an authoritative snapshot carries an
+    // outcome, removes the row, or an HTTP refresh after unknown_option proves
+    // the current option state (even when its content matches the old set).
     for (const [id, submission] of [...this.decisionSubmissions]) {
       const row = snapshot.notifications.find((notification) => notification.id === id);
-      const optionsRefreshed =
-        row !== undefined &&
-        submission.reconcileOptionsSignature !== null &&
-        decisionOptionsSignature(row.decision) !== submission.reconcileOptionsSignature;
-      if (row === undefined || row.resolvedAt !== null || (row.decidedAt !== null && row.decidedAt !== undefined) || optionsRefreshed) {
+      const optionsReconciled =
+        source === 'http' &&
+        submission.reconcileAfterSnapshotRevision !== null &&
+        this.snapshotRevision > submission.reconcileAfterSnapshotRevision;
+      if (row === undefined || row.resolvedAt !== null || (row.decidedAt !== null && row.decidedAt !== undefined) || optionsReconciled) {
         this.decisionSubmissions.delete(id);
       }
     }
@@ -2462,7 +2465,7 @@ export class BoardView {
       generation: this.clientGeneration,
       phase: 'submitting',
       message: null,
-      reconcileOptionsSignature: null,
+      reconcileAfterSnapshotRevision: null,
     };
     this.decisionSubmissions.set(item.id, submission);
     this.rerenderNotifications();
@@ -2488,7 +2491,10 @@ export class BoardView {
         ) {
           submission.phase = 'reconciling';
           if (error.code === 'unknown_option') {
-            submission.reconcileOptionsSignature = decisionOptionsSignature(item.decision);
+            // Only a post-refusal HTTP snapshot can discharge this lock. A
+            // changed content signature is not proof: options may change
+            // A→B→A while the authoritative refresh is in flight.
+            submission.reconcileAfterSnapshotRevision = this.snapshotRevision;
           }
           submission.message = 'The decision changed elsewhere. Refreshing the board before showing current choices.';
           this.decisionOverrides.delete(item.id);
@@ -2510,7 +2516,7 @@ export class BoardView {
   /** Re-render both notification surfaces from the last RAW snapshot
    * (submission state changed between pushes). */
   private rerenderNotifications(): void {
-    if (this.snapshot !== null) this.render(this.snapshot);
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
   /** The EFFECTIVE view of the last snapshot (decision overrides applied):
@@ -2835,11 +2841,7 @@ interface DecisionSubmission {
   readonly generation: number;
   phase: 'submitting' | 'refused' | 'unconfirmed' | 'reconciling';
   message: string | null;
-  reconcileOptionsSignature: string | null;
-}
-
-function decisionOptionsSignature(decision: NotificationView['decision']): string {
-  return JSON.stringify(decision?.options.map(({ id, label, consequence }) => [id, label, consequence]) ?? []);
+  reconcileAfterSnapshotRevision: number | null;
 }
 
 /** Owner-surface focus (FOR YOU band + bell): stable keys survive the

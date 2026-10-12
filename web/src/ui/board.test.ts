@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { withMailboxFixture } from '../lib/mailbox-fixture.test-support.js';
 
+import { request as nodeHttpRequest } from 'node:http';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   AgentView,
@@ -18,7 +19,8 @@ import { boardKpis, collectJobs } from '../lib/board-kpi.js';
 import { snapshotSections } from '../lib/board-sections.js';
 import { ConsoleShell } from './console.js';
 import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
-import { BoardApiError } from '../lib/board-client.js';
+import { BoardApiError, BoardClient } from '../lib/board-client.js';
+import { startBoardServerHarness } from '../test-support/board-server-harness.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
 
@@ -4450,7 +4452,13 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
                   options: [{ id: 'revised', label: 'Revised choice', consequence: 'Use the authoritative choices.' }],
                 },
               };
-      view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: code === 'not_open' ? 0 : 1 }));
+      if (code === 'unknown_option') {
+        // A WebSocket push may have been queued before the refusal; it is
+        // not the post-conflict authoritative HTTP refresh we are awaiting.
+        view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: 1 }), 'push');
+        expect(band.querySelector('.board-notification__submission--reconciling')).not.toBeNull();
+      }
+      view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: code === 'not_open' ? 0 : 1 }), 'http');
       resolveRefresh();
       expect(band.querySelector('.board-notification__submission--reconciling')).toBeNull();
       expect(band.querySelector('[data-action-id="notif:shared-submit:option:approve"]')).toBeNull();
@@ -4460,6 +4468,128 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       }
     },
   );
+
+  it('reconciles A→B→A option changes through the real server and BoardClient on both owner surfaces', async () => {
+    const server = await startBoardServerHarness();
+    const nativeFetch: typeof fetch = (input, init) => new Promise((resolve, reject) => {
+      const target = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url, server.url);
+      const request = nodeHttpRequest(target, {
+        method: init?.method ?? 'GET',
+        headers: init?.headers as Record<string, string> | undefined,
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: response.statusCode ?? 500 })));
+      });
+      request.on('error', reject);
+      if (init?.signal?.aborted) request.destroy(new Error('request aborted'));
+      init?.signal?.addEventListener('abort', () => request.destroy(new Error('request aborted')), { once: true });
+      if (typeof init?.body === 'string') request.write(init.body);
+      request.end();
+    });
+    const notificationId = 'joined-stale-options';
+    const optionA = { id: 'alpha', label: 'Keep Alpha', consequence: 'Leave the current plan in place.' };
+    const optionB = { id: 'beta', label: 'Choose Beta', consequence: 'Use the revised plan.' };
+    const notification = server.notifications.post({
+      id: notificationId,
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Confirm the plan',
+      detail: 'The discussion options may have changed.',
+      decision: {
+        question: 'Which plan should continue?',
+        context: 'The discussion is being converted into a recordable choice.',
+        recommendation: 'Review the current choices.',
+        reservedClass: 'scope-design',
+        whyNotDelegable: 'Only the owner may select the plan.',
+        options: [],
+        discussion: true,
+      },
+    });
+    let refreshPausedObserved = false;
+    let refreshIsPaused!: () => void;
+    const refreshPaused = new Promise<void>((resolve) => { refreshIsPaused = resolve; });
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    let pauseNextBoardRead = false;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const path = typeof input === 'string' ? input : input instanceof URL ? input.pathname : input.url;
+      if (pauseNextBoardRead && path === '/api/board') {
+        pauseNextBoardRead = false;
+        refreshPausedObserved = true;
+        refreshIsPaused();
+        await refreshGate;
+      }
+      return nativeFetch(new URL(path, server.url), init);
+    };
+    const view = new BoardView(() => {});
+    const client = new BoardClient(
+      { token: server.token, host: '127.0.0.1', fetchImpl },
+      {
+        connection: () => {},
+        snapshot: (current, source) => view.render(current, source),
+        fatal: (message) => { throw new Error(message); },
+      },
+    );
+    view.bindClient(client);
+
+    const attachOptions = async (
+      options: readonly { readonly id: string; readonly label: string; readonly consequence: string }[],
+    ): Promise<void> => {
+      const response = await nativeFetch(
+        new URL(`/api/notifications/${notification.id}/decision-options`, server.url),
+        {
+          method: 'POST',
+          headers: { authorization: `Bearer ${server.token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ options, by: 'gru' }),
+        },
+      );
+      expect(response.status).toBe(200);
+    };
+
+    try {
+      await attachOptions([optionA]);
+      await client.refetchSnapshot();
+      const band = document.getElementById('board-owner')!;
+      const bell = document.getElementById('notification-bell') as HTMLButtonElement;
+      const panel = document.getElementById('notification-list')!;
+      const action = `[data-action-id="notif:${notification.id}:option:alpha"]`;
+      expect(band.querySelector(action)?.textContent).toBe('Keep Alpha');
+      bell.click();
+      expect(panel.querySelector(action)?.textContent).toBe('Keep Alpha');
+      await vi.waitFor(() => expect(server.api.getNotification(notificationId)?.shownAt).not.toBeNull());
+
+      // The client still holds A while the authoritative server has B. The
+      // stale submission gets the real HTTP 400, and its post-refusal GET is
+      // paused so the server can return to A before that snapshot is served.
+      await attachOptions([optionB]);
+      pauseNextBoardRead = true;
+      band.querySelector<HTMLButtonElement>(action)!.click();
+      await vi.waitFor(() => expect(refreshPausedObserved).toBe(true));
+      await refreshPaused;
+      expect(band.querySelector('.board-notification__submission--reconciling')).not.toBeNull();
+      expect(panel.querySelector('.board-notification__submission--reconciling')).not.toBeNull();
+      expect(band.querySelector<HTMLButtonElement>(action)?.getAttribute('aria-disabled')).toBe('true');
+      expect(panel.querySelector<HTMLButtonElement>(action)?.getAttribute('aria-disabled')).toBe('true');
+
+      await attachOptions([optionA]);
+      releaseRefresh();
+      await vi.waitFor(() => {
+        expect(band.querySelector('.board-notification__submission--reconciling')).toBeNull();
+        expect(panel.querySelector('.board-notification__submission--reconciling')).toBeNull();
+      });
+      for (const surface of [band, panel]) {
+        expect(surface.querySelector(action)?.textContent).toBe('Keep Alpha');
+        expect(surface.querySelector('[data-action-id*="option:beta"]')).toBeNull();
+        expect(surface.querySelector<HTMLButtonElement>(action)?.disabled).toBe(false);
+      }
+    } finally {
+      releaseRefresh();
+      client.stop();
+      await server.close();
+    }
+  });
 
   it('a re-pair clears successful decision overrides before another service reuses the notification id', async () => {
     const row = notification('shared-decision-id', { routing: 'needs-owner', decision: ownerDecision() });

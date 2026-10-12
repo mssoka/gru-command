@@ -1327,11 +1327,11 @@ test.describe('notification readability — fixed long-content fixtures', () => 
 
   test('stale decision conflicts use the HTTP reason and lock mouse/keyboard retries until refresh', async ({ browser }) => {
     const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    let releaseRefresh: (() => void) | null = null;
+    const refreshRelease: { current: (() => void) | null } = { current: null };
     let refreshRequests = 0;
     let decisionPosts = 0;
     const refreshGate = new Promise<void>((resolve) => {
-      releaseRefresh = resolve;
+      refreshRelease.current = resolve;
     });
     const seedSnapshot = fixtureSnapshot();
     const authoritativeSnapshot = fixtureSnapshot({
@@ -1381,14 +1381,14 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       // The real BoardClient fetches the authoritative snapshot and delivers
       // it through the production BoardView subscription. The new decision
       // must replace the stale card and clear its reconciliation lock.
-      releaseRefresh?.();
+      refreshRelease.current?.();
       const decisionCard = page.locator('#board-owner [data-notification-id="decision-1"]');
       await expect(decisionCard.locator('.board-notification__decided')).toContainText('Keep the current approach');
       await expect(decisionCard.locator('.board-notification__submission--reconciling')).toHaveCount(0);
       await expect(decisionCard.locator('[data-action-id$=":option:approve"]')).toHaveCount(0);
       expect(seed.pageErrors).toEqual([]);
     } finally {
-      releaseRefresh?.();
+      refreshRelease.current?.();
       await page.close();
     }
   });

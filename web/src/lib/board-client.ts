@@ -41,9 +41,11 @@ export type BoardConnectionState =
   | 'reconnecting'
   | 'offline';
 
+export type BoardSnapshotSource = 'http' | 'push';
+
 export interface BoardClientEvents {
   connection(state: BoardConnectionState): void;
-  snapshot(snapshot: BoardSnapshot): void;
+  snapshot(snapshot: BoardSnapshot, source?: BoardSnapshotSource): void;
   /** Current membership is unavailable; retained rows/counts are last-known only. */
   unavailable?(message: string): void;
   /** Fatal (bad token) — pairing must redo. */
@@ -265,7 +267,7 @@ export class BoardClient {
         this.attempts = 0;
         this.setState('open');
         this.snapshotEpoch += 1;
-        this.events.snapshot(frame.snapshot);
+        this.events.snapshot(frame.snapshot, 'push');
         return;
       }
       if (frame.type === 'ping') return;
@@ -355,7 +357,7 @@ export class BoardClient {
       // A stopped (re-paired) client's late answer never reaches the board.
       if (this.stopped || request !== this.fetchSeq) return;
       if (epoch === this.snapshotEpoch) {
-        this.events.snapshot(snapshot);
+        this.events.snapshot(snapshot, 'http');
         this.demandMet();
       } else {
         // C13: the push that won may itself be OLDER (queued before a

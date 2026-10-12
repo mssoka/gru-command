@@ -450,7 +450,7 @@ describe('board client', () => {
       expect(tracked.getState()).not.toBe('open');
       second.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged('recovered') }) });
       expect(tracked.getState()).toBe('open');
-      expect(received).toHaveBeenLastCalledWith(tagged('recovered'));
+      expect(received).toHaveBeenLastCalledWith(tagged('recovered'), 'push');
       expect(fatal).not.toHaveBeenCalled();
     } finally { tracked.stop(); vi.useRealTimers(); }
   });

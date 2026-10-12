@@ -360,10 +360,10 @@ function startBoard(token: string): void {
         boardView?.markUnavailable(message);
         showBanner('board-unavailable', 'work', `Board unavailable — rows and counts are last-known. ${message}`);
       },
-      snapshot: (snapshot) => {
+      snapshot: (snapshot, source) => {
         if (boardClient !== current) return;
         clearBanner('board-unavailable');
-        boardView?.render(snapshot);
+        boardView?.render(snapshot, source);
         commandBar.setSnapshot(snapshot);
         // The first snapshot discloses the chip rail — the chrome just
         // grew, so the sticky offsets re-measure.
