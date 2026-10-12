@@ -6,6 +6,7 @@ import { GruAwareness } from '../src/chat/awareness.js';
 import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 import { EventBus } from '../src/events/bus.js';
 import { GruMailbox } from '../src/gru-mailbox/service.js';
+import { mailboxBasis } from '../src/gru-mailbox/projection.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -54,6 +55,24 @@ function fixture() {
     return ledger.findNotificationByKind(KIND, 'active')!;
   };
   return { db, dir, ledger, mailbox, awareness, original, debt, wait, replace, reconcile };
+}
+
+function seedLegacyWait(r: ReturnType<typeof fixture>) {
+  const row = r.ledger.getNotification(r.original.notificationIds[0]!)!;
+  const key = `notification:${row.id}`;
+  const id = `incident:${mailboxBasis(key)}`;
+  const reason = { ...r.original.reasons[0]!, basis: mailboxBasis([mailboxBasis([key, mailboxBasis([key, row.kind, row.detail, row.severity])]), null]) };
+  const basis = mailboxBasis([[reason.signal, reason.basis]]);
+  const hold = r.ledger.recordDecision({ subject: r.original.subject, decision: 'hold', covers: [reason.signal],
+    basisFingerprint: basis, reason: 'pre-upgrade commissioner custody', by: 'gru', recheckAt: RECHECK });
+  const disposition = { basis, state: 'waiting' as const, owner: 'writer', detail: 'pre-upgrade report custody',
+    dependency: 'commissioner verification', recheckAt: RECHECK, references: [{ kind: 'decision' as const, id: hold.id }], recordedAt: new Date().toISOString() };
+  const legacy = { ...r.original, id, basis, reasons: [reason], disposition, state: 'waiting', producerOwned: false, attentionKey: `${id}@${basis}` };
+  r.ledger.appendCustomEvent({ kind: 'mailbox.disposition', payload: { id, disposition } });
+  // Simulate the real pre-GH313 persisted projection, not a new-format ruling.
+  r.db.handle.prepare('DELETE FROM gru_mailbox WHERE id = ?').run(r.original.id);
+  r.db.handle.prepare('INSERT INTO gru_mailbox (id, item, updated_at) VALUES (?, ?, ?)').run(id, JSON.stringify(legacy), new Date().toISOString());
+  return legacy;
 }
 
 describe('GH-313 report-handback custody', () => {
@@ -168,6 +187,153 @@ describe('GH-313 report-handback custody', () => {
     const independent = r.mailbox.attentionPage(50).filter((row) => row.kind === 'incident');
     expect(independent).toHaveLength(3);
     expect(independent.every((row) => row.id !== held.id)).toBe(true);
+  });
+
+  it('preserves custody through presentation-only title changes', () => {
+    const r = fixture();
+    const held = r.wait();
+    const replacement = r.replace();
+    r.ledger.updateNotificationDetail(replacement.id, replacement.detail!, 'Review is ready for collection');
+    const item = r.mailbox.snapshot().items.find((row) => row.id === held.id)!;
+    expect(item.subject).toBe(held.subject);
+    expect(item.basis).toBe(held.basis);
+    expect(item.state).toBe('waiting');
+    expect(item.disposition).toEqual(held.disposition);
+  });
+
+  it('refuses a resolved mailbox ruling while its actual report debt remains open', () => {
+    const r = fixture();
+    const decision = r.ledger.recordDecision({ subject: r.original.subject, decision: 'dismissed', covers: r.original.reasons.map((reason) => reason.signal),
+      basisFingerprint: r.original.basis, reason: 'attention alone cannot settle a report', by: 'gru' });
+    expect(() => r.mailbox.disposition(r.original.id, { basis: r.original.basis, state: 'resolved', owner: 'writer', detail: 'false report closure',
+      references: [{ kind: 'decision', id: decision.id }] })).toThrow(/producer/);
+    const replacement = r.replace();
+    expect(r.mailbox.attentionPage(50).find((row) => row.notificationIds.includes(replacement.id))?.state).toBe('needs-gru');
+    expect(r.ledger.getObligation(r.debt.id)?.settlement).toBeNull();
+  });
+
+  it('uses the latest inserted evidence during a same-timestamp replacement gap', () => {
+    const r = fixture();
+    const held = r.wait();
+    const original = r.ledger.getNotification(held.notificationIds[0]!)!;
+    r.ledger.resolveNotificationById(original.id, 'gru');
+    r.ledger.recordNotification({ id: 'zzzz-new-evidence', kind: KIND, title: original.title, detail: 'changed findings',
+      severity: 'error', routing: 'action-required' });
+    expect(r.ledger.getNotification('zzzz-new-evidence')?.ts).toBe(original.ts);
+    const changed = r.mailbox.snapshot().items.find((row) => row.id === held.id)!;
+    expect(changed.state).toBe('needs-gru');
+    r.ledger.resolveNotificationById('zzzz-new-evidence', 'gru');
+    const gap = r.mailbox.snapshot().items.find((row) => row.id === held.id)!;
+    expect(gap.basis).toBe(changed.basis);
+    expect(gap.state).toBe('needs-gru');
+    expect(gap.notificationIds).toEqual([]);
+  });
+
+  it('retains a receipt-waiting report obligation during a notification gap', () => {
+    const r = fixture();
+    r.ledger.armReceiptExpectation({ obligationId: r.debt.id, receiptKind: 'job.delivered', deadlineAt: RECHECK,
+      correlation: { requestId: 'waiting-report' }, reason: 'await actual commissioner receipt' });
+    const held = r.wait(r.mailbox.snapshot().items.find((row) => row.kind === 'incident')!);
+    r.ledger.resolveNotificationById(held.notificationIds[0]!, 'gru');
+    const gap = r.mailbox.snapshot().items.find((row) => row.id === held.id)!;
+    expect(gap.state).toBe('waiting');
+    expect(gap.disposition).toEqual(held.disposition);
+    expect(r.ledger.getObligation(r.debt.id)?.state).toBe('waiting');
+  });
+
+  it('reopens on a new delivery alone without changing notification or obligation bytes', () => {
+    const r = fixture();
+    const held = r.wait();
+    const before = r.ledger.getObligation(r.debt.id);
+    r.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: JOB, payload: { report: 'corrected findings' } });
+    const changed = r.mailbox.attentionPage(50).find((row) => row.id === held.id)!;
+    expect(changed.basis).not.toBe(held.basis);
+    expect(changed.state).toBe('needs-gru');
+    expect(r.ledger.getObligation(r.debt.id)).toEqual(before);
+    expect(changed.notificationIds).toEqual(held.notificationIds);
+  });
+
+  it('resumed nonterminal report work invalidates rather than closes gap custody', () => {
+    const r = fixture();
+    const held = r.wait();
+    r.ledger.resolveNotificationById(held.notificationIds[0]!, 'gru');
+    r.ledger.setJobStatus(JOB, 'working');
+    const changed = r.mailbox.snapshot().items.find((row) => row.id === held.id)!;
+    expect(changed.basis).not.toBe(held.basis);
+    expect(changed.state).toBe('needs-gru');
+    expect(r.ledger.getObligation(r.debt.id)?.state).toBe('open');
+  });
+
+  it('coalesces same-report transport agents without losing custody when one card is resolved', () => {
+    const r = fixture();
+    const held = r.wait();
+    const original = r.ledger.getNotification(held.notificationIds[0]!)!;
+    r.ledger.registerAgent({ id: 'transport-minion', role: 'minion', jobId: JOB });
+    r.ledger.recordNotification({ id: 'transport-replacement', kind: KIND, agentId: 'transport-minion', title: original.title,
+      detail: original.detail!, severity: original.severity, routing: 'action-required' });
+    r.ledger.resolveNotificationById(original.id, 'gru');
+    const item = r.mailbox.snapshot().items.find((row) => row.notificationIds.includes('transport-replacement'))!;
+    expect(item.id).toBe(held.id);
+    expect(item.basis).toBe(held.basis);
+    expect(item.state).toBe('waiting');
+    r.ledger.resolveNotificationById('transport-replacement', 'gru');
+    expect(r.mailbox.snapshot().items.find((row) => row.id === held.id)?.state).toBe('waiting');
+  });
+
+  it('uses already-loaded jobs instead of querying each terminal historical report', () => {
+    const r = fixture();
+    for (let index = 0; index < 100; index += 1) {
+      const id = `archived-${index}`;
+      r.ledger.addJob({ id, repo: 'demo', title: id, deliverable: 'review', commissioner: 'writer' });
+      r.ledger.setJobStatus(id, 'working');
+      r.ledger.setJobStatus(id, 'done');
+      const item = { ...r.original, id: `historical-${index}`, state: 'resolved', reasons: [{ ...r.original.reasons[0]!, label: `silas.report-handback.${id}` }] };
+      r.db.handle.prepare('INSERT INTO gru_mailbox (id, item, updated_at) VALUES (?, ?, ?)').run(item.id, JSON.stringify(item), new Date().toISOString());
+    }
+    const lookup = vi.spyOn(r.ledger, 'getJob');
+    r.mailbox.snapshot();
+    expect(lookup.mock.calls.some(([id]) => id.startsWith('archived-'))).toBe(false);
+    lookup.mockRestore();
+  });
+
+  it('authenticates and adopts an unchanged pre-upgrade wait without resetting T', () => {
+    const r = fixture();
+    const legacy = seedLegacyWait(r);
+    const upgraded = r.mailbox.snapshot().items.find((row) => row.id === r.original.id)!;
+    expect(upgraded.state).toBe('waiting');
+    expect(upgraded.disposition).toEqual({ ...legacy.disposition, basis: upgraded.basis });
+    r.replace();
+    expect(r.mailbox.snapshot().items.find((row) => row.id === upgraded.id)?.disposition).toEqual(upgraded.disposition);
+    expect(r.ledger.listEventsAfter(0, { kinds: ['mailbox.report-custody-migrated'], limit: 100 })).toHaveLength(1);
+    expect(r.ledger.getDecision(legacy.disposition.references[0]!.id)?.basisFingerprint).toBe(legacy.basis);
+  });
+
+  it('does not adopt legacy coverage after a material source write', () => {
+    const r = fixture();
+    seedLegacyWait(r);
+    r.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: JOB, payload: { report: 'changed after old ruling' } });
+    expect(r.mailbox.snapshot().items.find((row) => row.id === r.original.id)?.state).toBe('needs-gru');
+    expect(r.ledger.latestEventOfKind('mailbox.report-custody-migrated')).toBeNull();
+  });
+
+  it('refuses unauthenticated legacy metadata rather than inventing a custody ruling', () => {
+    const r = fixture();
+    const legacy = seedLegacyWait(r);
+    const tampered = { ...legacy, disposition: { ...legacy.disposition, owner: 'invented-owner' } };
+    r.db.handle.prepare('UPDATE gru_mailbox SET item = ? WHERE id = ?').run(JSON.stringify(tampered), legacy.id);
+    expect(r.mailbox.snapshot().items.find((row) => row.id === r.original.id)?.state).toBe('needs-gru');
+    expect(r.ledger.latestEventOfKind('mailbox.report-custody-migrated')).toBeNull();
+  });
+
+  it('loads retained custody from a separately reopened durable ledger connection', () => {
+    const r = fixture();
+    const held = r.wait();
+    r.replace();
+    const reopened = new LedgerDb(r.dir);
+    closes.unshift(() => { reopened.close(); });
+    const snapshot = new GruMailbox(new LedgerApi(reopened.handle)).snapshot();
+    expect(snapshot.items.find((row) => row.id === held.id)?.disposition).toEqual(held.disposition);
+    expect(snapshot.items.find((row) => row.id === held.id)?.state).toBe('waiting');
   });
 
   it('admits no extra Gru turn from ID churn before T and admits one at T through awareness', () => {
