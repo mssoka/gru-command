@@ -95,6 +95,13 @@ async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe) {
   const runtime = fakeWholeSpawner(directory(), { specialists: [], childAnswer: () => '[]' });
   const wave = new WaveRunner({
     ledger, worktrees, spawner: runtime.spawner,
+    poster: {
+      post: async ({ targetSha, body }) => ({
+        reviewId: 'fixture-review', actor: 'fixture-bot', event: 'COMMENTED',
+        commitId: targetSha, headSha: targetSha, baseSha: 'fixture-base',
+        bodySha256: createHash('sha256').update(body, 'utf8').digest('hex'),
+      }),
+    },
     reviewArtifactRoot: artifactRoot, prHeadProbe: probe,
   });
   return { ledger, worktrees, job, wave, runtime, artifactRoot };
@@ -254,13 +261,15 @@ describe('review Git repository environment isolation (GH-270)', () => {
     const repo = fixture('assigned-remote-collision');
     origin(repo);
     repo.git(['tag', 'origin/topic', 'main']);
-    repo.git(['checkout', '-b', 'topic']);
+    repo.git(['push', '--quiet', 'origin', 'main:topic']);
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/topic']);
+    repo.git(['checkout', '-b', 'feature/assigned']);
     const target = repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
-    repo.git(['push', '--quiet', 'origin', 'topic']);
+    repo.git(['push', '--quiet', 'origin', 'feature/assigned']);
     const foreign = fixture('foreign-no-collision');
     origin(foreign);
     foreign.git(['tag', 'origin/topic', 'main']); // Foreign origin has no topic branch.
-    const probe = vi.fn(async () => ({ headRefName: 'topic', headSha: target }));
+    const probe = vi.fn(async () => ({ headRefName: 'feature/assigned', headSha: target }));
     const h = await waveFixture(repo, probe);
     poison(foreign);
     const request = await h.wave.requestReview({ jobId: h.job.id, targetRef: 'origin/topic' });
