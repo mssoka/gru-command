@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
  */
 const PINS: Record<string, number> = {
   'assert-binned-baseline.test.ts': 3,
-  'classify-baseline.test.ts': 31,
+  'classify-baseline.test.ts': 32,
   'assert-merge-authority-baseline.test.ts': 8,
   'assert-repo-overview-baseline.test.ts': 4,
   'assert-verify-keepalive-baseline.test.ts': 7,
@@ -158,7 +158,7 @@ const PINS: Record<string, number> = {
   'spec-rulings-drift.test.ts': 5,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 2,
+  'suite-shape.test.ts': 3,
   'supervisor.test.ts': 96,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 14,
@@ -201,6 +201,18 @@ describe('suite shape', () => {
     expect(workflow).toMatch(/- uses: actions\/checkout@v6\s*\n\s*- uses: actions\/setup-node@v6/);
     expect(workflow).not.toContain('github.event.pull_request.head.sha');
     expect(workflow).toContain('run: npm test');
+  });
+
+  it('the SLIM baseline scope names every independently measured instrument surface', () => {
+    const worktree = readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8');
+    const line = worktree.split('\n').find((candidate) => candidate.startsWith('dashboard-slim-strip-baseline = '));
+    const allowlist = /--require-file-substr "([^"]+)"/u.exec(line ?? '')?.[1].split(',') ?? [];
+    expect(allowlist).toEqual([
+      'slim strip labelled status pairs',
+      'slim strip Heists/PRs/Crew count groups',
+      'reserved numeric slot for strip KPIs',
+      'reveal-only compact disclosure',
+    ]);
   });
 
   it('every test file is pinned and registers exactly its expected test count', () => {

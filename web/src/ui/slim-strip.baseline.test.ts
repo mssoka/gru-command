@@ -91,9 +91,13 @@ describe('slim strip — fail-before feature absence on the recorded base', () =
     view.render(snap());
     // Setup proof: the board mount itself rendered real sections on the base.
     expect(document.getElementById('board-jobs')?.children.length, 'board sections rendered (setup proof)').toBeGreaterThan(0);
-    // The slim feature: labelled status pairs + count groups.
-    expect(document.querySelector('.strip-status'), 'slim strip labelled status pairs').toBeTruthy();
-    expect(document.querySelector('.strip-groups'), 'slim strip Heists/PRs/Crew count groups').toBeTruthy();
+    // Collect both surfaces before asserting so the fail-before report records
+    // each named absence instead of stopping at the first missing selector.
+    const missingSurfaces = [
+      ...(document.querySelector('.strip-status') === null ? ['slim strip labelled status pairs'] : []),
+      ...(document.querySelector('.strip-groups') === null ? ['slim strip Heists/PRs/Crew count groups'] : []),
+    ];
+    expect(missingSurfaces, `missing slim surfaces: ${missingSurfaces.join(' | ')}`).toEqual([]);
   });
 
   it('every strip number keeps its reserved tabular slot (base renders bare chips)', () => {

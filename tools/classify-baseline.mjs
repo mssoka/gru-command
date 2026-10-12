@@ -304,9 +304,6 @@ function classifyVitest(report, requireFile, requireFileSubstrs = []) {
         `tree total=${treeTotal}, passed=${treePassed}, failed=${treeFailed}) — not behavioral evidence`,
     };
   }
-  if (failed === 0) {
-    return { code: 2, out: '', err: `FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${passed}/${total} passed)` };
-  }
   // Per-test cause accounting across the overlay. When a named instrument
   // defines the behavioral claim, assertions from its companion suites are
   // context only: a pre-existing unrelated assertion must never be counted
@@ -377,6 +374,12 @@ function classifyVitest(report, requireFile, requireFileSubstrs = []) {
         err: `BASELINE SETUP FAILURE: ${nonAssertion.length} instrument failure(s) are not AssertionErrors — not behavioral evidence\n${lines}`,
       };
     }
+  }
+  // A named instrument's skipped-only run is non-evidence, not a green
+  // baseline. Check the instrument state above before treating zero failures
+  // as a broken fail-before claim.
+  if (failed === 0) {
+    return { code: 2, out: '', err: `FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${passed}/${total} passed)` };
   }
   if (assertions === 0) {
     // No named instrument and not one assertion failure: whatever failed is

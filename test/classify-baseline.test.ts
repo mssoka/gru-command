@@ -320,6 +320,17 @@ describe('baseline classifier — vitest (unit) branch', () => {
     expect(result.code).toBe(3);
     expect(result.err).toMatch(/none is an AssertionError/u);
   });
+
+  it('classifies a skipped-only named instrument as setup failure, not a broken claim', () => {
+    const skippedOnly = classifyBaseline(
+      vitestReport([{ name: 'slim-strip.baseline.test.ts', status: 'skipped', message: '', assertionResults: [
+        assertion('strip absence was skipped', 'skipped'),
+      ] }]),
+      { requireFile: 'slim-strip.baseline.test.ts' },
+    );
+    expect(skippedOnly.code).toBe(3);
+    expect(skippedOnly.err).toMatch(/SKIPPED/u);
+  });
 });
 
 describe('baseline classifier — Playwright (browser) branch', () => {
