@@ -164,8 +164,12 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     const workspace = fixtureWorkspace();
     const instance = tempDir('gru-command-pty-managed-rerun-');
     const unavailableName = '\u0301missing';
+    const unavailableRepo = join(workspace, unavailableName);
+    mkdirSync(unavailableRepo);
+    execFileSync('git', ['-C', unavailableRepo, 'init', '-q']);
     const prior = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['repo-a', unavailableName] }));
     writeInstanceConfig({ instanceDir: instance, answers: prior });
+    rmSync(unavailableRepo, { recursive: true, force: true });
 
     const preserved = ptyWizard(
       [{ expect: WS_PROMPT, send: '' }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps('n')],
