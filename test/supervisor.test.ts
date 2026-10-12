@@ -1349,6 +1349,68 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
+  it('cleans only its published handle when a tap installs an independent same-id successor', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart(true);
+    try {
+      const successor = new FakeHandle('minion', f.original.id, '/fixture/publication-successor.jsonl');
+      f.rig.registry.onAgentEvent((envelope) => {
+        if (envelope.phase === 'spawned' && envelope.handle === f.replacement) f.rig.registry.adopt(successor);
+      });
+      f.replacement.dispose = async () => { throw new Error('old published cleanup refused'); };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.rig.registry.getHandle(successor.id)).toBe(successor);
+      expect(f.rig.supervisor.viewFor(successor.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(successor.disposed).toBe(false);
+      expect(successor.promptCalls).toEqual([]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('cleanup unconfirmed');
+      expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')).toHaveLength(1);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('retains captured-job cleanup debt when shutdown wins creation and disposal rejects', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart();
+    try {
+      f.rig.supervisor.dispose();
+      f.replacement.dispose = async () => { throw new Error('shutdown cleanup refused'); };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.register).not.toHaveBeenCalled();
+      expect(f.replacement.promptCalls).toEqual([]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('cleanup unconfirmed');
+      expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')).toHaveLength(1);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('retains the first usable prompt when duplicate deferred 429 frames arrive after snapshot clearance', async () => {
+    vi.useFakeTimers();
+    const sleeper = new ManualSleeper();
+    const f = await deferredDispatchRestart(true, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      f.replacement.promptHook = (text, options) => {
+        if (f.replacement.promptCalls.length > 1) return;
+        f.replacement.pendingTurnSnapshot = { text, owner: options?.owner ?? null };
+        f.replacement.emit({ type: 'error', error: '429 too many requests', fatal: false });
+        f.replacement.pendingTurnSnapshot = null;
+        f.replacement.emit({ type: 'error', error: '429 duplicated after turn ended', fatal: false });
+        throw new Error('429 too many requests');
+      };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(sleeper.delays).toEqual([100]);
+      await sleeper.release();
+      await flushMicrotasks();
+      expect(f.replacement.promptCalls).toEqual([
+        { text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` },
+        { text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` },
+      ]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.supervisor.viewFor(f.replacement.id)?.breakerOpen).toBe(false);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
   it('preserves an independently adopted same-id owner stop when the stale rung finishes', async () => {
     vi.useFakeTimers();
     const f = await deferredRestart(true);

@@ -248,12 +248,15 @@ interface RestartFlight {
   pendingError: Extract<RuntimeEvent, { type: 'error' }> | null;
   /** Canonical adapter event; its observer may run after registry forwarding. */
   pendingErrorSource: Extract<RuntimeEvent, { type: 'error' }> | null;
+  /** Last usable synchronous custody; duplicate errors may follow clearance. */
+  pendingErrorSnapshot: InterruptedTurn | null;
 }
 
 interface RejectedRestartCleanup {
   readonly jobId: string | null;
   readonly agent: SupervisedAgent;
   readonly recovery: InterruptedTurn | null;
+  readonly preserveController: boolean;
   disposalAcknowledged: boolean;
   notificationId: string | null;
 }
@@ -1798,7 +1801,7 @@ export class Supervisor {
     }
     agent.inRestart = true;
     const flight: RestartFlight = { authority: null, handle: null, publish: null, unsubscribe: null,
-      superseded: false, pendingError: null, pendingErrorSource: null };
+      superseded: false, pendingError: null, pendingErrorSource: null, pendingErrorSnapshot: null };
     this.restartingAgents.set(agent, flight);
     agent.state = 'restarting';
     try {
@@ -1821,7 +1824,8 @@ export class Supervisor {
       const handle = flight.handle;
       const current = handle === null ? undefined : this.agents.get(handle.id);
       if (!this.disposed && handle !== null && current?.handle === handle && !current.breakerOpen && flight.pendingError !== null) {
-        const snapshot = this.restartErrorSnapshots.get(flight.pendingErrorSource ?? flight.pendingError);
+        const selectedSnapshot = this.restartErrorSnapshots.get(flight.pendingErrorSource ?? flight.pendingError);
+        const snapshot = selectedSnapshot?.pending != null ? selectedSnapshot : flight.pendingErrorSnapshot ?? selectedSnapshot;
         if (snapshot !== undefined) {
           this.restartErrorSnapshots.set(flight.pendingError, snapshot);
           current.pendingRecovery = snapshot;
@@ -1934,7 +1938,10 @@ export class Supervisor {
             if (event.type !== 'error') return;
             try {
               const snapshot = this.captureInterruptedTurn(handle, agentRef);
-              if (snapshot !== null) this.restartErrorSnapshots.set(event, snapshot);
+              if (snapshot !== null) {
+                this.restartErrorSnapshots.set(event, snapshot);
+                if (snapshot.pending !== null) flight.pendingErrorSnapshot = snapshot;
+              }
             } catch (error) {
               this.log('error', 'held restart error snapshot failed', { agent_id: handle.id, error: String(error) });
             }
@@ -1954,7 +1961,7 @@ export class Supervisor {
           // Shutdown, release, or an intentional fresh replacement won while
           // this restart was in flight. Dispose the stale result and never
           // adopt it or notify swap listeners.
-          await this.registry.disposeHandle(spawned).catch(() => {});
+          await this.rejectRestartReplacement(agent, spawned, reason, restartAuthority);
           return;
         }
         // No tap consumer or dispatch lookup has seen the held result.
@@ -1996,7 +2003,11 @@ export class Supervisor {
         agent.state = 'watching';
         flight.publish?.();
         // Synchronous observers may have installed a newer controller/stop.
-        if (flight.superseded || this.agents.get(spawned.id)?.handle !== spawned || agent.breakerOpen) return;
+        if (agent.breakerOpen && this.agents.get(spawned.id) === agent) return;
+        if (flight.superseded || this.agents.get(spawned.id)?.handle !== spawned) {
+          await this.rejectRestartReplacement(agent, spawned, reason, restartAuthority);
+          return;
+        }
         if (!this.recoveryAuthorityCurrent(agent, restartAuthority)) {
           await this.rejectRestartReplacement(agent, spawned, reason, restartAuthority);
           return;
@@ -2062,9 +2073,10 @@ export class Supervisor {
     const recovery = agent.pendingRecovery;
     // Captured before spawn: failed authority reads must not lose cleanup's job.
     const { jobId } = authority;
-    const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, disposalAcknowledged: false, notificationId: null };
+    const preserveController = agent.breakerOpen && this.agents.get(agent.agentId) === agent;
+    const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, preserveController, disposalAcknowledged: false, notificationId: null };
     this.rejectedRestartCleanup.set(spawned, cleanup);
-    this.rejectedRestartControllers.add(agent);
+    if (!preserveController) this.rejectedRestartControllers.add(agent);
     const observed = this.agents.get(spawned.id);
     if (observed?.handle === spawned) {
       this.clearRateLimitRetry(observed, 'superseded');
@@ -2080,9 +2092,11 @@ export class Supervisor {
       this.settleRejectedRestartCleanup(spawned, cleanup);
     } catch (error) {
       cleanupError = String(error);
-      agent.state = 'stopped';
-      agent.stopReason = `restart cleanup unconfirmed: ${spawned.id}`;
-      agent.stoppedAt = this.now();
+      if (!preserveController) {
+        agent.state = 'stopped';
+        agent.stopReason = `restart cleanup unconfirmed: ${spawned.id}`;
+        agent.stoppedAt = this.now();
+      }
       this.log('error', 'superseded restart replacement cleanup unconfirmed', {
         agent_id: agent.agentId,
         replacement_agent_id: spawned.id,
@@ -2135,9 +2149,9 @@ export class Supervisor {
   private settleRejectedRestartCleanup(handle: AgentHandle, cleanup: RejectedRestartCleanup): void {
     this.rejectedRestartCleanup.delete(handle);
     const { agent, recovery, notificationId } = cleanup;
-    if (agent.pendingRecovery === recovery) agent.pendingRecovery = null;
-    // Preserve durable history, not a dead in-process recovery owner.
-    if (this.agents.get(agent.agentId) === agent && agent.handle === null) this.agents.delete(agent.agentId);
+    if (!cleanup.preserveController && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
+    // Preserve explicit owner/provider stops and their re-arm custody.
+    if (!cleanup.preserveController && this.agents.get(agent.agentId) === agent && agent.handle === null) this.agents.delete(agent.agentId);
     if (notificationId !== null) {
       try {
         this.ledger.resolveNotificationById(notificationId, 'supervision-cleanup-confirmed');
