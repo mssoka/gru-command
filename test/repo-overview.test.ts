@@ -1640,6 +1640,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       const callsBeforeFailure = api.calls.length;
 
       chmodSync(gitDir, 0);
+      expect(resolveManagedRepoPathSync(root, 'alpha')).toMatchObject({ kind: 'error' });
       clock.ms += 1;
       const unreadable = row(await tracker.refresh(), 'alpha');
       expect(unreadable).toMatchObject({ linked: true, freshness: 'stale', openPrs: 4, openIssues: 2 });

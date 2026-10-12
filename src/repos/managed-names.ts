@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { lstatSync, realpathSync } from 'node:fs';
-import { lstat, realpath } from 'node:fs/promises';
+import { accessSync, constants, lstatSync, realpathSync } from 'node:fs';
+import { access, lstat, realpath } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep, win32 } from 'node:path';
 
@@ -98,6 +98,17 @@ function rootProbeError(error: unknown): ManagedRepoPath {
     kind: 'error',
     error: (message.trim() || 'Git root validation failed without a message').slice(0, 300),
   };
+}
+
+/** Check access before Git can collapse permission failures into a generic non-repository diagnostic. */
+async function assertGitMarkerAccessible(markerPath: string, isDirectory: boolean): Promise<void> {
+  await access(markerPath, isDirectory ? constants.R_OK | constants.X_OK : constants.R_OK);
+  if (isDirectory) await access(join(markerPath, 'HEAD'), constants.R_OK);
+}
+
+function assertGitMarkerAccessibleSync(markerPath: string, isDirectory: boolean): void {
+  accessSync(markerPath, isDirectory ? constants.R_OK | constants.X_OK : constants.R_OK);
+  if (isDirectory) accessSync(join(markerPath, 'HEAD'), constants.R_OK);
 }
 
 async function isGitWorktreeRoot(project: string): Promise<boolean> {
@@ -215,12 +226,16 @@ export async function resolveManagedRepoPath(
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
 
-    const gitMarker = await lstat(join(project, '.git'));
+    const gitMarkerPath = join(project, '.git');
+    const gitMarker = await lstat(gitMarkerPath);
     if (
       gitMarker.isSymbolicLink() ||
-      (!gitMarker.isDirectory() && !gitMarker.isFile()) ||
-      !(await isGitWorktreeRoot(project))
+      (!gitMarker.isDirectory() && !gitMarker.isFile())
     ) {
+      return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+    }
+    await assertGitMarkerAccessible(gitMarkerPath, gitMarker.isDirectory());
+    if (!(await isGitWorktreeRoot(project))) {
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
     return { kind: 'available', path: project };
@@ -264,12 +279,16 @@ export function resolveManagedRepoPathSync(
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
 
-    const gitMarker = lstatSync(join(project, '.git'));
+    const gitMarkerPath = join(project, '.git');
+    const gitMarker = lstatSync(gitMarkerPath);
     if (
       gitMarker.isSymbolicLink() ||
-      (!gitMarker.isDirectory() && !gitMarker.isFile()) ||
-      !isGitWorktreeRootSync(project)
+      (!gitMarker.isDirectory() && !gitMarker.isFile())
     ) {
+      return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
+    }
+    assertGitMarkerAccessibleSync(gitMarkerPath, gitMarker.isDirectory());
+    if (!isGitWorktreeRootSync(project)) {
       return { kind: 'unavailable', reason: UNAVAILABLE_REASON };
     }
     return { kind: 'available', path: project };

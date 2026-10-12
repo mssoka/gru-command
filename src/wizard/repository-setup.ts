@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative } from 'node:path';
 import { assertWorktreeBootstrapSupported, loadWorktreeManifest } from '../worktrees/manifest.js';
 import { gitProbeEnvironment } from '../repos/managed-names.js';
@@ -17,6 +17,11 @@ export function validateRepositorySetup(workspaceRoot: string, repoName: string)
   const workspace = realpathSync(workspaceRoot);
   const candidate = join(workspace, repoName);
   if (!existsSync(candidate)) throw new RepositorySetupError(`selected repo no longer exists: ${candidate}`);
+  if (!readdirSync(workspace).includes(repoName)) {
+    throw new RepositorySetupError(
+      'selected repository name does not match the canonical directory spelling; select the exact name shown under workspace_root',
+    );
+  }
   if (lstatSync(candidate).isSymbolicLink()) {
     throw new RepositorySetupError(`selected repo is a symlink: ${candidate}; select a real repository under the workspace root`);
   }

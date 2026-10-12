@@ -262,7 +262,7 @@ async function interactiveAnswers(
         else if (!resolvedRepos.includes(name)) resolvedRepos.push(name);
       }
       if (bad !== null) {
-        out.write(`  ✗ not an available Git repository candidate: ${bad}\n`);
+        out.write(`  ✗ not an available Git repository candidate: ${displayRepositoryName(bad)}\n`);
         continue;
       }
       repos = resolvedRepos;
