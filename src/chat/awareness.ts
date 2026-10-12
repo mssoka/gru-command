@@ -155,6 +155,9 @@ export interface GruAwarenessPort {
   /** Charge an admitted prompt against the minimum wake interval. */
   noteWakeAttempt?(): void;
   commit(injection: AwarenessInjection, source?: 'chat' | 'wake'): void;
+  /** GH-119: an owner turn was accepted although prepare() returned no
+   * block (nothing to report). Records presence without a digest. */
+  recordOwnerPresence?(): void;
   /** Accepted turn_start claims visible IDs and arms unresolved attention;
    * pre-acceptance failures remain pending for retry. */
   noteWakeOutcome?(ok: boolean, detail?: string, injection?: AwarenessInjection): void;
@@ -523,6 +526,8 @@ export class GruAwareness {
   /** Only an owner-directed user turn advances the morning boundary. */
   private lastOwnerAt: number | null;
   private lastOwnerSeq: number;
+  /** GH-119: ledger seq a block-free chat prepare() covered, else null. */
+  private blockFreeThroughSeq: number | null = null;
   /** GH-111: digest baseline while `lastOwnerAt` is null (no owner turn yet). */
   private readonly digestBaselineAt: number;
   private readonly baselineIsNew: boolean;
@@ -873,6 +878,32 @@ export class GruAwareness {
    * separately once the turn actually received the block.
    */
   prepare(source: 'chat' | 'wake' = 'chat'): AwarenessInjection | null {
+    const block = this.prepareBlock(source);
+    if (source === 'chat') this.blockFreeThroughSeq = block === null ? this.ledger.latestEventSeq() : null;
+    return block;
+  }
+
+  /** GH-119: an accepted owner turn that carried no awareness block (nothing
+   * to report) still proves the owner was present. Advance only the owner
+   * watermark — through the seq the block-free prepare() saw, so events that
+   * landed afterwards stay owed — never the event cursor, the wake claims, or
+   * a digest. A no-op unless the last chat prepare() was block-free. */
+  recordOwnerPresence(): void {
+    if (this.blockFreeThroughSeq === null) return;
+    this.lastOwnerAt = this.now();
+    this.lastOwnerSeq = Math.max(this.lastOwnerSeq, this.blockFreeThroughSeq);
+    this.blockFreeThroughSeq = null;
+    try {
+      this.persist();
+    } catch (error) {
+      this.log('error', 'gru awareness presence persist failed — owner presence resets after restart', {
+        file: this.file,
+        error: String(error),
+      });
+    }
+  }
+
+  private prepareBlock(source: 'chat' | 'wake'): AwarenessInjection | null {
     const latest = this.ledger.latestEventSeq();
     const exclusiveWake = source === 'wake' && this.activeWakeIds !== null;
     const morning = source === 'chat' ? this.morningDigest() : null;

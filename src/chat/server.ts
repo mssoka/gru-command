@@ -693,11 +693,14 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
 
   /** Awareness context for one prompt; fail-soft — a broken awareness layer
    * must never take message delivery down. */
+  let awarenessPrepareFailed = false;
   function awarenessPrepare(source: 'chat' | 'wake' = 'chat'): AwarenessInjection | null {
+    awarenessPrepareFailed = false;
     if (options.awareness === undefined) return null;
     try {
       return options.awareness.prepare(source);
     } catch (error) {
+      awarenessPrepareFailed = true;
       log('error', 'gru awareness prepare failed — delivering without service context', {
         error: errorMessage(error),
       });
@@ -934,6 +937,18 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
                 } else {
                   acceptedPassive = true;
                   awarenessCommit(injection);
+                }
+              } };
+            }
+            if (injection === null && !wake && !awarenessPrepareFailed && options.awareness?.recordOwnerPresence !== undefined) {
+              // GH-119: a block-free owner turn still proves presence.
+              acceptAwarenessTurn = { source: gru, accept: () => {
+                try {
+                  options.awareness?.recordOwnerPresence?.();
+                } catch (error) {
+                  log('error', 'gru awareness presence record failed — digest gap may overstate absence', {
+                    error: errorMessage(error),
+                  });
                 }
               } };
             }

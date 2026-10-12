@@ -2881,3 +2881,54 @@ describe('GH-111 (g15): the first-ever owner digest has a bounded install-time b
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe('GH-119 (g23): an accepted block-free owner turn records presence', () => {
+  it('advances the owner watermark without a digest or a cursor/wake change', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.commit(rig.awareness.prepare()!);
+      // Six hours later the owner talks; nothing is digestible, so no block.
+      vi.setSystemTime(new Date('2026-09-23T03:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'misc.noise', payload: {} });
+      expect(rig.awareness.prepare('chat')).toBeNull();
+      rig.awareness.recordOwnerPresence();
+      // Presence is durable and does not move the event cursor.
+      const state = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+        coveredThroughSeq: number; digest: { lastOwnerAt: number; lastOwnerSeq: number };
+      };
+      expect(state.digest.lastOwnerAt).toBe(Date.parse('2026-09-23T03:00:00Z'));
+      expect(state.digest.lastOwnerSeq).toBe(rig.api.latestEventSeq());
+      // Five hours after that turn (11 h after the last delivered block) the
+      // gap is measured from the turn, so no digest fires and nothing from
+      // before the turn is re-reported later either.
+      vi.setSystemTime(new Date('2026-09-23T08:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+      expect(rig.awareness.prepare('chat')?.text ?? '').not.toContain('While you were away');
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const digest = rig.awareness.prepare('chat')!;
+      expect(digest.text).toContain('While you were away (since 2026-09-23T03:00:00.000Z)');
+      expect(digest.text).toContain('- fires: 1 wake delivered');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('never skips events that landed after the block-free prepare', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.commit(rig.awareness.prepare()!);
+      vi.setSystemTime(new Date('2026-09-23T03:00:00Z'));
+      expect(rig.awareness.prepare('chat')).toBeNull();
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['late'], count: 1 } });
+      rig.awareness.recordOwnerPresence();
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      expect(rig.awareness.prepare('chat')?.text).toContain('- fires: 1 wake delivered');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});

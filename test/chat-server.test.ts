@@ -3404,6 +3404,48 @@ describe('chat server — Gru awareness (dispatch briefing 2026-09-22)', () => {
     }
   });
 
+  it('records owner presence on an accepted turn with no awareness block (GH-119)', async () => {
+    const presence: number[] = [];
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => null,
+        commit: () => { throw new Error('no block to commit'); },
+        recordOwnerPresence: () => { presence.push(presence.length); },
+      },
+    });
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('plain message', 'm1');
+      await done;
+      expect(presence).toEqual([0]);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('does not record presence when the awareness layer failed to prepare (GH-119)', async () => {
+    const presence: number[] = [];
+    const harness = await makeHarness({
+      awareness: {
+        prepare: () => { throw new Error('ledger offline'); },
+        commit: () => {},
+        recordOwnerPresence: () => { presence.push(1); },
+      },
+    });
+    try {
+      const client = await authedClient(harness.port);
+      const done = nextTurnEnd(client);
+      client.send('plain message', 'm1');
+      await done;
+      expect(presence).toEqual([]);
+      await client.close();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('wakeAwareness starts a turn from the injected block plus the wake instruction', async () => {
     const injection = sampleInjection();
     const commits: AwarenessInjection[] = [];
