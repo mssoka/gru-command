@@ -388,6 +388,21 @@ the first reconciliation at or after that bound; restart preserves the bound.
 Waiting/delegated/resolved exact-basis dispositions stay quiet until changed
 head/round/control/failure evidence or a due follow-up restores attention.
 Unresolved items remain visible in passive context and on the board.
+Report-handback custody (GH-313) follows the producer's report/job identity and
+actual report/obligation evidence, not replacement notification IDs. Re-posting
+an unchanged `silas.report-handback.<job>` card preserves its recorded owner,
+dependency and original recheck. A temporary gap after notification disposition
+retains already-surfaced open/waiting report debt; it does not mark the report
+collected or settled. Material report/target/plan/receipt changes or the due
+recheck restore attention through the same admission path. Missing or invalid
+custody remains actionable; actual report settlement closes custody. Report
+custody cannot be marked resolved using an attention-only decision. Replacement
+evidence follows insertion order, including timestamp ties and older cards that
+remain active; display-title and transport-agent changes are not new reports.
+Pre-upgrade waiting metadata is adopted only when its original durable ruling
+and unchanged source can be authenticated, with a
+`mailbox.report-custody-migrated` audit event; original decisions and recheck
+clocks are never rewritten. Unprovable compatibility surfaces debt instead.
 Both passive and wake acceptance durably park immutable rendered identity,
 reason bases, source notification IDs, batch identity and original acceptance
 time before receipt writes. Recovery records historical evidence even if the

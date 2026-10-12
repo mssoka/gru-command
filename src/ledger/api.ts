@@ -1,5 +1,5 @@
 import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
-import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt } from './mailbox.js';
+import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt, type MailboxDisposition } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
 import type { IntakeReviewRecord } from '../intake/types.js';
 import { canonical as canonicalIntake, digest as intakeDigest, IntakeError } from '../intake/types.js';
@@ -4443,6 +4443,13 @@ export class LedgerApi {
     return row === undefined ? null : this.notificationFromRow(row);
   }
 
+  /** Report replacements are ordered by insertion, including same-timestamp UUID ties. */
+  latestReportHandbackNotification(jobId: string): NotificationRecord | null {
+    const row = this.db.prepare('SELECT * FROM notifications WHERE kind = ? ORDER BY rowid DESC LIMIT 1')
+      .get(`silas.report-handback.${jobId}`) as Row | undefined;
+    return row === undefined ? null : this.notificationFromRow(row);
+  }
+
   /**
    * Routing-scoped open-incident lookup (Perkins R1/R2, gh-97): the plain
    * kind lookup ties-break by id (ts DESC, id ASC), so a legacy
@@ -8262,6 +8269,55 @@ export class LedgerApi {
     return items;
   }
 
+  /** Adopt an authenticated pre-GH313 incident wait only when its report source stayed unchanged. */
+  private migrateLegacyReportCustody(source: MailboxItem, previous: ReadonlyMap<string, MailboxItem>, now: string): MailboxItem | null {
+    if (source.kind !== 'incident' || source.reasons.length !== 1) return null;
+    const kind = source.reasons[0]!.label;
+    const jobId = /^silas\.report-handback\.(.+)$/u.exec(kind)?.[1];
+    if (jobId === undefined) return null;
+    const current = this.latestReportHandbackNotification(jobId);
+    const job = this.getJob(jobId);
+    const debt = this.findReportObligation(jobId);
+    if (current === null || job === null || debt === null) return null;
+    const candidates: { readonly item: MailboxItem; readonly seq: number }[] = [];
+    let latestRulingSeq = 0;
+    for (const old of previous.values()) {
+      if (old.kind !== 'incident' || old.notificationIds.length !== 1 || !old.reasons.some((reason) => reason.label === kind)) continue;
+      const row = this.getNotification(old.notificationIds[0]!);
+      if (row === null || row.kind !== kind) continue;
+      const key = `notification:${row.id}`;
+      if (old.id !== `incident:${mailboxBasis(key)}`) continue;
+      const ruling = this.db.prepare(`SELECT seq, payload FROM events WHERE kind = 'mailbox.disposition'
+        AND json_extract(payload, '$.id') = ? ORDER BY seq DESC LIMIT 1`).get(old.id) as Row | undefined;
+      if (ruling === undefined) continue;
+      // Any newer report-wide ruling wins, including explicit needs-gru/resolved rulings.
+      latestRulingSeq = Math.max(latestRulingSeq, Number(ruling.seq));
+      const saved = old.disposition;
+      if (old.subject !== source.subject || saved?.state !== 'waiting' || saved.sourceObligationId !== undefined
+        || saved.basis !== old.basis || row.detail !== current.detail || row.severity !== current.severity) continue;
+      const legacyReason = mailboxBasis([mailboxBasis([key, mailboxBasis([key, row.kind, row.detail, row.severity])]), null]);
+      if (old.basis !== mailboxBasis([[source.reasons[0]!.signal, legacyReason]])) continue;
+      if (JSON.stringify((JSON.parse(str(ruling.payload)) as { disposition: MailboxDisposition }).disposition) !== JSON.stringify(saved)) continue;
+      // Mailbox receipts/dispositions are metadata, never source mutations. Other later job writes
+      // remain unprovable without an old source fingerprint and must restore attention.
+      if (Date.parse(job.updatedAt) > Date.parse(saved.recordedAt) || Date.parse(debt.updatedAt) > Date.parse(saved.recordedAt)
+        || this.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND seq > ?
+          AND kind NOT IN ('mailbox.disposition', 'mailbox.received', 'mailbox.report-custody-migrated') LIMIT 1`)
+          .get(jobId, Number(ruling.seq)) !== undefined) continue;
+      try { validateMailboxDisposition(this, old, saved, now, true); }
+      catch (error) { if (!(error instanceof MailboxConflictError)) throw error; continue; }
+      candidates.push({ item: old, seq: Number(ruling.seq) });
+    }
+    const old = candidates.find((candidate) => candidate.seq === latestRulingSeq)?.item;
+    if (old === undefined) return null;
+    const disposition = { ...old.disposition!, basis: source.basis };
+    this.appendEvent({ kind: 'mailbox.report-custody-migrated', payload: {
+      from_id: old.id, from_basis: old.basis, id: source.id, basis: source.basis,
+      original_disposition: old.disposition, notification_id: current.id, obligation_id: debt.id,
+    } });
+    return { ...old, id: source.id, basis: source.basis, disposition };
+  }
+
   /** Additive mailbox metadata only: this path never changes operational rows. */
   reconcileMailbox(now = nowIso()): readonly MailboxItem[] {
     return this.transaction(() => {
@@ -8269,7 +8325,7 @@ export class LedgerApi {
       const previous = new Map(this.listMailboxItems().map((item) => [item.id, item]));
       const liveIds = new Set(projected.map((item) => item.id));
       const items = projected.map((source): MailboxItem => {
-        const old = previous.get(source.id);
+        const old = previous.get(source.id) ?? this.migrateLegacyReportCustody(source, previous, now) ?? undefined;
         const saved = old?.disposition?.sourceObligationId === undefined ? old?.disposition ?? null : null;
         let supported = saved?.basis === source.basis;
         if (supported && saved !== null) {
