@@ -336,12 +336,13 @@ const SAFE_HOST = /^[A-Za-z0-9.-]+$/;
  * fail the mirrored web validator and freeze every snapshot, so an
  * invisible-only name is disclosed as visible escapes — never dropped,
  * never used as an identity. Control/format characters (bidi overrides
- * included) and leading combining marks are escaped even beside visible
- * text; combining marks after a visible base remain legitimate in many
- * scripts. */
+ * included), non-ASCII separator spaces and leading combining marks are
+ * escaped even beside visible text; combining marks after a visible base
+ * remain legitimate in many scripts. */
 const VISIBLE_CHARACTER = /[^\p{Cf}\p{Cc}\p{M}\s]/u;
 const COMBINING_MARK = /\p{M}/u;
 const CONTROL_OR_FORMAT = /[\p{Cf}\p{Cc}]/u;
+const SEPARATOR_SPACE = /\p{Zs}/u;
 
 export function safeDisplayName(name: string): string {
   const escape = (char: string): string => `\\u{${char.codePointAt(0)?.toString(16) ?? '?'}}`;
@@ -354,6 +355,10 @@ export function safeDisplayName(name: string): string {
           return escape(char);
         }
         if (COMBINING_MARK.test(char)) return hasVisibleBase ? char : escape(char);
+        if (SEPARATOR_SPACE.test(char) && char !== ' ') {
+          hasVisibleBase = false;
+          return escape(char);
+        }
         if (VISIBLE_CHARACTER.test(char)) {
           hasVisibleBase = true;
           return char;

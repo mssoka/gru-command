@@ -20,6 +20,7 @@ export type ManagedRepoPath =
 const UNAVAILABLE_REASON = 'selected repository is unavailable under workspace_root';
 const MANAGED_REPO_DISPLAY_CONTROL = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const MANAGED_REPO_DISPLAY_MARK = /\p{M}/u;
+const MANAGED_REPO_DISPLAY_SEPARATOR_SPACE = /\p{Zs}/u;
 const MANAGED_REPO_DISPLAY_BASE = /[^\p{Cc}\p{Cf}\p{M}\p{Zl}\p{Zp}\s]/u;
 const GIT_ROUTING_ENV = new Set([
   'GIT_DIR',
@@ -281,6 +282,10 @@ export function displayManagedRepoName(name: string): string {
         return hasVisibleBase
           ? character
           : `\\u{${character.codePointAt(0)?.toString(16) ?? '?'}}`;
+      }
+      if (MANAGED_REPO_DISPLAY_SEPARATOR_SPACE.test(character) && character !== ' ') {
+        hasVisibleBase = false;
+        return `\\u{${character.codePointAt(0)?.toString(16) ?? '?'}}`;
       }
       if (MANAGED_REPO_DISPLAY_BASE.test(character)) {
         hasVisibleBase = true;

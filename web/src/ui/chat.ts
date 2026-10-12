@@ -147,6 +147,8 @@ export class ChatView {
   private intakeFilePick: ((chip: AttachmentChip, uploaded: boolean) => void) | null = null;
   private intakeRepoPick: ((path: string) => void) | null = null;
   private intakeRepoPath: string | null = null;
+  private managedRepositoryNames: ReadonlySet<string> = new Set();
+  private pickerResult: BrowseResult | null = null;
   private intakeRemaining = 8;
   private intakeBatch: ((pending: boolean, error?: string) => void) | undefined;
   private deviceChooser: { readonly epoch: number; readonly generation: number; readonly pick: ((chip: AttachmentChip, uploaded: boolean) => void) | null; readonly remaining: number; readonly batch: ((pending: boolean, error?: string) => void) | undefined } | null = null;
@@ -162,6 +164,10 @@ export class ChatView {
     this.closePicker();
     this.intakeRepoPick = callback;
     void this.openPicker('');
+  }
+  setManagedRepositoryNames(names: readonly string[]): void {
+    this.managedRepositoryNames = new Set(names);
+    if (!this.picker.hidden && this.pickerResult !== null) this.renderBrowse(this.pickerResult);
   }
   private pickerAt = '';
   /** Latest browse request/close generation; stale responses never repaint. */
@@ -680,17 +686,20 @@ export class ChatView {
     this.picker.hidden = false;
     this.attachButton.setAttribute('aria-expanded', 'true');
     this.pickerError.hidden = true;
+    this.pickerResult = null;
     this.pickerList.replaceChildren(el('div', 'attach-picker__loading', 'browsing…'));
     try {
       const result = await this.attach.browse(path);
       if (generation !== this.browseGeneration) return;
       this.pickerAt = result.path;
       this.browseRoot = result.root;
+      this.pickerResult = result;
       this.picker.dataset.parent = result.parent ?? '';
       this.pickerPath.textContent = `/${result.path}`;
       this.renderBrowse(result);
     } catch (error) {
       if (generation !== this.browseGeneration) return;
+      this.pickerResult = null;
       this.pickerList.replaceChildren();
       this.pickerError.textContent = String(error instanceof Error ? error.message : error);
       this.pickerError.hidden = false;
@@ -701,10 +710,14 @@ export class ChatView {
     const list = this.pickerList;
     list.replaceChildren();
     if (this.intakeRepoPick !== null && result.path !== '') {
-      const choose = el('button', 'pp-btn', 'Use this repository');
-      choose.type = 'button';
-      choose.addEventListener('click', () => { this.intakeRepoPick?.(`${result.root}/${result.path}`); this.closePicker(); });
-      list.append(choose);
+      if (this.managedRepositoryNames.has(result.path)) {
+        const choose = el('button', 'pp-btn', 'Use this repository');
+        choose.type = 'button';
+        choose.addEventListener('click', () => { this.intakeRepoPick?.(`${result.root}/${result.path}`); this.closePicker(); });
+        list.append(choose);
+      } else {
+        list.append(el('div', 'attach-picker__empty', 'Only configured managed repository roots can be selected.'));
+      }
     }
     if (result.entries.length === 0) {
       list.append(el('div', 'attach-picker__empty', 'nothing pickable here'));
@@ -751,6 +764,7 @@ export class ChatView {
     this.intakeBatch = undefined;
     this.intakeRepoPick = null;
     this.intakeRepoPath = null;
+    this.pickerResult = null;
     this.attachButton.setAttribute('aria-expanded', 'false');
   }
 

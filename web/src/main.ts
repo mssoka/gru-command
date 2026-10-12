@@ -364,6 +364,7 @@ function startBoard(token: string): void {
         if (boardClient !== current) return;
         clearBanner('board-unavailable');
         boardView?.render(snapshot);
+        chatView?.setManagedRepositoryNames(snapshot.repoOverview?.rows.map(({ key }) => key) ?? []);
         commandBar.setSnapshot(snapshot);
         // The first snapshot discloses the chip rail — the chrome just
         // grew, so the sticky offsets re-measure.
