@@ -31,7 +31,7 @@ import { PacingGate, type RateLimitBackoffPolicy } from '../src/runtime/pacing.j
 import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
-import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import { rebriefFreshMinion, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
@@ -158,6 +158,7 @@ class FakeHandle implements AgentHandle {
 class FakeRegistry implements SupervisorRegistry {
   private readonly listeners = new Set<(envelope: AgentEventEnvelope) => void>();
   readonly handlesById = new Map<string, FakeHandle>();
+  private readonly liveHandles = new Set<FakeHandle>();
   readonly spawnCalls: { role: Role; resumeFile: string | null; cwd?: string }[] = [];
   /** Monotonic: a disposed handle's id is never re-minted. */
   private nextId = 0;
@@ -194,7 +195,9 @@ class FakeRegistry implements SupervisorRegistry {
   /** Mimic the real registry's tap: spawned envelope + event forwarding
    * + a disposed envelope when the handle's state event says disposed. */
   adopt(handle: FakeHandle): void {
-    this.handlesById.set(handle.id, handle);
+    this.liveHandles.add(handle);
+    // Like RuntimeRegistry, duplicate logical IDs still name distinct handles.
+    if (!this.handlesById.has(handle.id)) this.handlesById.set(handle.id, handle);
     this.emit({ agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'spawned' });
     handle.subscribe((event) => {
       this.emit({
@@ -205,16 +208,23 @@ class FakeRegistry implements SupervisorRegistry {
         event,
       });
       if (event.type === 'state' && event.state === 'disposed') {
-        this.handlesById.delete(handle.id);
+        this.removeHandle(handle);
         this.emit({ agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile, phase: 'disposed' });
       }
     });
   }
 
-  async disposeHandle(handle: AgentHandle): Promise<void> {
-    const fake = this.handlesById.get(handle.id);
+  private removeHandle(handle: FakeHandle): void {
+    this.liveHandles.delete(handle);
+    if (this.handlesById.get(handle.id) !== handle) return;
     this.handlesById.delete(handle.id);
-    await (fake ?? (handle as FakeHandle)).dispose();
+    const other = [...this.liveHandles].find((candidate) => candidate.id === handle.id);
+    if (other !== undefined) this.handlesById.set(handle.id, other);
+  }
+
+  async disposeHandle(handle: AgentHandle): Promise<void> {
+    this.removeHandle(handle as FakeHandle);
+    await handle.dispose();
   }
 }
 
@@ -1080,6 +1090,141 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(rejected[0]?.payload).toMatchObject({ replacement_agent_id: f.replacement.id, disposition: 'disposed', authority_epoch: f.epoch });
       expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).filter((event) =>
         ['supervision.turn-recovery', 'job.delivered', 'silas.directive-sent', 'silas.directive-settled', 'silas.directive-failed'].includes(event.kind))).toEqual([]);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  async function deferredDispatchRestart(sameId = false) {
+    const rig = boot();
+    const jobId = 'empty-authority-job';
+    rig.api.addJob({ id: jobId, repo: 'fixture', title: 'Initially empty native authority' });
+    rig.api.setJobStatus(jobId, 'working');
+    const original = new FakeHandle('minion', 'empty-original', '/fixture/empty-original.jsonl');
+    original.pendingTurnSnapshot = { text: 'old dispatch briefing', owner: `dispatch:${jobId}` };
+    rig.registry.adopt(original);
+    rig.api.registerAgent({ id: original.id, role: 'minion', jobId, sessionFile: original.sessionFile });
+    hang(original);
+    const replacement = new FakeHandle('minion', sameId ? original.id : 'empty-replacement', original.sessionFile);
+    let releaseSpawn!: (handle: FakeHandle) => void;
+    rig.registry.spawnImpl = () => new Promise((resolve) => { releaseSpawn = resolve; });
+    original.emit({ type: 'error', error: 'dispatch transport died', fatal: true });
+    await flushMicrotasks();
+    expect(rig.registry.spawnCalls).toHaveLength(1);
+    expect(rig.api.directiveRecoveryEpoch(jobId)).toBe(0);
+    expect(rig.api.listPendingRebriefs({ jobId })).toEqual([]);
+    const register = vi.spyOn(rig.api, 'registerAgent');
+    return { rig, jobId, original, replacement, releaseSpawn, register };
+  }
+
+  async function completedHandoffDuringSpawn(kind: 'failed-directive' | 'settled-directive' | 'settled-rebrief') {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart();
+    try {
+      if (kind === 'settled-rebrief') {
+        const markers = f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'successor completed', briefing: null });
+        for (const eventKind of ['silas.rebrief', 'job.delivered']) {
+          f.rig.api.appendCustomEventIfCurrentRebrief({ kind: eventKind, jobId: f.jobId, payload: { sha: 'successor-head' } }, markers);
+        }
+        expect(f.rig.api.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+      } else {
+        const requestId = 'completed-successor';
+        f.rig.api.beginDirectiveIntent({ jobId: f.jobId, directive: 'successor work', holder: 'silas-ops', requestId });
+        if (kind === 'failed-directive') f.rig.api.failDirective({ requestId, reason: 'explicit successor failure' });
+        else {
+          const sent = f.rig.api.appendCustomEvent({ kind: 'silas.directive-sent', jobId: f.jobId, payload: { request_id: requestId, minion_id: 'successor' } });
+          f.rig.api.recordDirectiveAdmission({ requestId, minionId: 'successor', eventSeq: sent.seq });
+          const delivered = f.rig.api.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { request_id: requestId, sha: 'successor-head' } });
+          f.rig.api.recordDirectiveDelivery({ requestId, eventSeq: delivered.seq });
+        }
+      }
+      expect(f.rig.api.directiveRecoveryEpoch(f.jobId)).toBe(0);
+      expect(f.rig.api.listPendingRebriefs({ jobId: f.jobId })).toEqual([]);
+      expect(f.rig.api.listPendingDirectives({ jobId: f.jobId, states: ['dispatching', 'admitted'] })).toEqual([]);
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.replacement.disposed).toBe(true);
+      expect(f.register).not.toHaveBeenCalled();
+      expect(f.replacement.promptCalls).toEqual([]);
+      expect(f.rig.supervisor.viewFor(f.replacement.id)).toBeNull();
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  }
+
+  it('fences a native directive accepted and failed before an empty-authority spawn returns', () => completedHandoffDuringSpawn('failed-directive'));
+  it('fences a native directive accepted and settled before an empty-authority spawn returns', () => completedHandoffDuringSpawn('settled-directive'));
+  it('fences a native rebrief accepted and settled before an empty-authority spawn returns', () => completedHandoffDuringSpawn('settled-rebrief'));
+
+  it('keeps a real independently authorized same-id rebrief supervised after stale replacement cleanup', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart(true);
+    const successor = new FakeHandle('minion', f.original.id, '/fixture/new-rebrief.jsonl');
+    let releaseTurn!: () => void;
+    const turn = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    successor.promptHook = async (text, options) => {
+      successor.pendingTurnSnapshot = { text, owner: options?.owner ?? null };
+      successor.setState('streaming');
+      successor.emit({ type: 'turn_start' });
+      await turn;
+      successor.pendingTurnSnapshot = null;
+      if (!successor.disposed) successor.setState('idle');
+      successor.emit({ type: 'turn_end' });
+    };
+    const markers = f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'new authorized briefing', briefing: null });
+    f.rig.registry.spawnImpl = async (_role, options) => {
+      expect(options?.agentId).toBe(f.original.id);
+      return successor;
+    };
+    const routing = rebriefFreshMinion({ registry: f.rig.registry, ledger: f.rig.api,
+      worktrees: { listWorktrees: () => [{ kind: 'job', status: 'active', path: tmpDir() }] } as unknown as WorktreePort,
+      jobId: f.jobId, note: 'new authorized briefing', briefing: null,
+      onSpawned: (worker) => f.rig.api.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: worker.id, sessionFile: worker.sessionFile }) });
+    try {
+      await flushMicrotasks();
+      expect(successor.promptCalls).toHaveLength(1);
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.replacement.disposed).toBe(true);
+      expect(successor.disposed).toBe(false);
+      expect(f.rig.registry.getHandle(successor.id)).toBe(successor);
+      expect(f.rig.supervisor.viewFor(successor.id)).toMatchObject({ state: 'watching', openTurn: true });
+      expect(f.rig.api.getAgent(successor.id)?.sessionFile).toBe(successor.sessionFile);
+      expect(f.replacement.promptCalls).toEqual([]);
+      // Queued envelopes from the refused same-id transport cannot erase
+      // or restart the independently observed successor.
+      f.replacement.emit({ type: 'error', error: 'stale queued frame', fatal: true });
+      f.replacement.setState('disposed');
+      await flushMicrotasks();
+      expect(f.rig.supervisor.viewFor(successor.id)).toMatchObject({ state: 'watching', openTurn: true });
+      expect(f.rig.registry.spawnCalls).toHaveLength(2);
+      const recovery = new FakeHandle('minion', 'authorized-successor-recovery', successor.sessionFile);
+      f.rig.registry.spawnImpl = async () => recovery;
+      successor.emit({ type: 'error', error: 'session stream died', fatal: true });
+      await flushMicrotasks();
+      expect(recovery.promptCalls, JSON.stringify(f.rig.supervisor.status())).toHaveLength(1);
+      expect(recovery.promptCalls[0]?.text).toContain('new authorized briefing');
+      expect(recovery.promptCalls[0]?.text).not.toBe('old dispatch briefing');
+    } finally { releaseTurn(); await routing; f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('preserves an independently adopted same-id owner stop when the stale rung finishes', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart(true);
+    try {
+      const successor = new FakeHandle('minion', f.original.id, '/fixture/owner-held-successor.jsonl');
+      successor.dispose = async () => { throw new Error('owner-stop cleanup remains unknown'); };
+      f.rig.registry.adopt(successor);
+      f.slot.adoptReplacement(successor);
+      successor.emit({ type: 'error', error: 'quota exceeded', fatal: false });
+      await flushMicrotasks();
+      const held = f.rig.supervisor.viewFor(successor.id)!;
+      expect(held.state).toBe('stopped');
+      expect(held.stopReason).not.toBeNull();
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.replacement.disposed).toBe(true);
+      expect(f.slot.current()).toBeNull();
+      expect(f.rig.supervisor.viewFor(successor.id)).toMatchObject({ state: held.state, stopReason: held.stopReason, stoppedAt: held.stoppedAt, breakerOpen: true });
+      expect(successor.disposed).toBe(false);
+      expect(successor.promptCalls).toEqual([]);
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
