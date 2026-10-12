@@ -206,7 +206,7 @@ never re-publishes their decisions.
 
 ## Activation and live check (owner-controlled)
 
-1. Land and deploy the approved code (owner merges; worker never merges).
+1. Land and deploy the approved code (the owner performs the final PR merge; no agent merges a PR).
 2. Confirm the bundle exists under the *deployed instance dir* (or its
    relocated `data_dir`); no App reinstall and no new permissions are
    required.

@@ -1,5 +1,5 @@
 import type { BusEvent } from '../events/bus.js';
-import type { DecisionRequest, QuestionSet, ScoreAnswer } from './types.js';
+import type { DecisionRequest, QuestionSet, RiskClass, ScoreAnswer } from './types.js';
 
 /**
  * The stable decision surface names (issues #222/#224). Each production
@@ -104,7 +104,7 @@ const EVENT_CLASSES = [
   'unknown',
 ] as const;
 
-const EVENT_QUESTIONS = {
+export const EVENT_QUESTIONS = {
   needs_action: {
     type: 'noul',
     instructions: 'Does this orchestration transition require an operator action rather than informational display?',
@@ -131,6 +131,10 @@ const EVENT_QUESTIONS = {
     criteria: ['low: routine informational state', 'medium: inspect soon', 'high: action is required now'],
   },
 } as const satisfies QuestionSet;
+export type EventQuestions = typeof EVENT_QUESTIONS;
+export const EVENT_RISKS: Readonly<Record<keyof EventQuestions, RiskClass>> = {
+  needs_action: 'operational', event_class: 'read_only', severity: 'read_only',
+};
 
 export interface EventDecisionContext {
   /** Bounded redacted tail of the event's primary text (the transcript
@@ -160,7 +164,7 @@ export function eventDecisionRequest(
       },
     }),
     questions: EVENT_QUESTIONS,
-    risks: { needs_action: 'operational', event_class: 'read_only', severity: 'read_only' },
+    risks: EVENT_RISKS,
     fallback: {
       needs_action: { type: 'noul', noul: 0 },
       event_class: {
@@ -202,7 +206,7 @@ export function deterministicFailureClass(reason: string): FailureClass {
   return 'unknown';
 }
 
-const SUPERVISION_QUESTIONS = {
+export const SUPERVISION_QUESTIONS = {
   failure_class: {
     type: 'choice',
     instructions: 'Classify the observed runtime failure signature into exactly one operational class.',
@@ -231,6 +235,10 @@ const SUPERVISION_QUESTIONS = {
     criteria: ['low: transient and recoverable', 'medium: degraded; inspect', 'high: operator intervention required'],
   },
 } as const satisfies QuestionSet;
+export type SupervisionQuestions = typeof SUPERVISION_QUESTIONS;
+export const SUPERVISION_RISKS: Readonly<Record<keyof SupervisionQuestions, RiskClass>> = {
+  failure_class: 'operational', restart_advised: 'operational', severity: 'read_only',
+};
 
 export function supervisionDecisionRequest(input: {
   readonly reason: string;
@@ -244,7 +252,7 @@ export function supervisionDecisionRequest(input: {
   return {
     state: filteredState(input),
     questions: SUPERVISION_QUESTIONS,
-    risks: { failure_class: 'operational', restart_advised: 'operational', severity: 'read_only' },
+    risks: SUPERVISION_RISKS,
     fallback: {
       failure_class: {
         type: 'choice',

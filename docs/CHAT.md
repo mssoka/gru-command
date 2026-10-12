@@ -370,3 +370,54 @@ and the ledger remains the durable log.
   boot-settle closes anything left open.
 - v1 is LAN-only, no TLS. The token is the whole credential — treat it
   like one.
+
+## Durable mailbox attention (GH-305)
+
+Gru's existing conversation consumes the same server mailbox as the board.
+Startup, coalesced source events and `[chat].mailbox_reconcile_interval_ms`
+(default 300000; accepted range 1–2147483647 ms) recover attention without a browser. Reconciliation is code
+only, executes no work, and admits through the existing routing/severity,
+quiet-hour, rate, owner-stop and busy-session gates. Busy sessions retain one
+trailing wake; policy deferrals are durable `gru.wake-deferred` observations.
+Fair admission pages use a durable cursor, including policy-deferred pages.
+
+Accepted delivery records an exact-basis mailbox receipt, **not a disposition**.
+Duplicate delivered evidence stays quiet within a five-minute grace window.
+Without a next-action disposition, unresolved debt becomes eligible again on
+the first reconciliation at or after that bound; restart preserves the bound.
+Waiting/delegated/resolved exact-basis dispositions stay quiet until changed
+head/round/control/failure evidence or a due follow-up restores attention.
+Unresolved items remain visible in passive context and on the board.
+Both passive and wake acceptance durably park immutable rendered identity,
+reason bases, source notification IDs, batch identity and original acceptance
+time before receipt writes. Recovery records historical evidence even if the
+source changed; only a matching live incarnation receives suppression. The
+five-minute clock starts at acceptance, not retry. Receipt-only recovery never
+opens another prompt or rolls back a newer autonomous rate budget. Legacy debt
+without reconstructable captures remains parked with an actionable
+`MailboxDeliveryRecoveryError`, never fabricated history.
+An empty mailbox opens no turn. Individual context-budget overflows are
+explicit durable deferrals, never coverage receipts, and cannot hide smaller
+items behind them; full evidence remains available through paged GET. Wake
+events distinguish `mailbox_keys` and
+`mailbox_count` from real `notification_ids` / `notification_count`; genuine
+source IDs remain linked for yield and training. Privately branded adapters
+and domain-qualified internal `attention_keys` distinguish real notifications
+even when their displayed IDs exactly collide with mailbox keys. Failed-turn
+budgets follow exact item/basis across unhandled grace incarnations and restart;
+exhaustion never automatically rearms owner escalation.
+
+A previously surfaced live obligation remains waiting/delegated when its
+follow-up moves into the future or to a different actual owner. Optional
+server-owned `disposition.sourceObligationId` identifies this source-derived
+metadata, not a Gru ruling. Code-only non-Gru monitoring stays quiet; a genuine
+explicit Gru recheck (mailbox disposition or applicable decision memory)
+restores attention when due without changing the operational owner.
+
+Mailbox delivery keys are not notification IDs. Inspect authenticated
+`GET /api/mailbox` before acting and use its stable item `id` and `basis` with
+`POST /api/mailbox/{id}/disposition`. References reuse actual controls,
+obligations and decision memory. A recheck grants no permission to acknowledge
+an owner stop, merge, restart, duplicate a writer, or infer a child's completion
+from a parent/similarly named successor. Producer-owned incidents (including
+`lessons.dream-failed`) stay open until producer success.

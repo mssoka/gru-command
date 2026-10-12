@@ -845,7 +845,7 @@ test.describe('board (E6, mock feed)', () => {
       await expect(silent.locator('.board-job__status')).toHaveText('working');
 
       // Chip and bands agree: only the live machine row (mock-n5) counts.
-      await expect(page.locator('#board-unacked')).toContainText('1 needs Gru');
+      await expect(page.locator('#board-unacked')).toContainText('1 notifications · needs Gru');
       // Scoped acceptance clips (tracked-review A10): the full-page capture
       // is taken under sticky chrome that can occlude the IN FLIGHT band,
       // so the NEEDS GRU band and the waiting row get their own clips — the

@@ -168,3 +168,7 @@
 
 - [Review][Defer] Exact frozen-head/publication-body GitHub/App reviews with unknown authorship may still be skipped during foreign-account reconciliation (`src/dispatch/perkins.ts`, `src/dispatch/perkins-github-app.ts`). This repeats the already accepted nonholding native R6 F2 follow-up; preserve null/covered-empty-list distinctions, avoid a blanket null/history campaign, and leave the whole-change scope decision to exact-final-head native judgment. Not fixed or waived.
 - [Review][Defer] GitHub CLI credential identity can change between preparation, irreversible POST, `/user`, and review-list subprocesses; a same-state older review can also match the documented unbounded idempotent recovery seam. These repeat existing R6/R6d whole-change follow-ups. No credential/provider redesign, live rotation test, or cross-provider recovery-window expansion is authorized here; do not claim resolved.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-merge-authority-boundary.md`
+  summary: The BMAD-onboarding rehearsal script still describes the fallback as "clear to merge" and Perkins as carrying "autonomous-merge authority".
+  evidence: `scripts/rehearsal-bmad-onboarding.mjs:62-66` — repo-internal rehearsal harness (not shipped in the package, not session-reaching). The round-3 concluding review flagged it as a follow-up on untouched code; the shipped boundary (a fallback PASS is not a Perkins READY; no agent merges a PR) already governs real sessions.

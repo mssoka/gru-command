@@ -26,9 +26,9 @@ export interface RoleDefinition {
    */
   readonly skills: readonly string[];
   /**
-   * The role runs BMAD build workflows (issue #283): its non-review
-   * sessions also receive the GC-managed BMAD runtime bound to their cwd
-   * (the job lane), beside the project's own skills.
+   * Stable internal flag for build-workflow roles: new implementation jobs
+   * receive GC-owned resources and explicit context; historical lanes retain
+   * their original BMAD workflow. Project conventions remain relevant.
    */
   readonly managedBmadRuntime: boolean;
   /**
@@ -118,7 +118,7 @@ export const ROLE_DEFINITIONS: Readonly<Record<Role, RoleDefinition>> = {
 /**
  * SPEC ruling 17 guard: a 'spawn_provided' role without an explicit cwd
  * is a dispatch bug (the agent would silently land at the workspace root
- * and lose the project's skills and its lane-bound BMAD runtime). Fail
+ * and lose the project's conventions and its lane-bound workflow). Fail
  * loud at the call site instead. Returns the cwd for chaining.
  */
 export function requireSpawnCwd(role: Role, cwd: string | undefined): string {

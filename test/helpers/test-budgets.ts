@@ -51,7 +51,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   },
   {
     file: 'bmad-onboarding.test.ts',
-    workload: 'BMAD project provisioning over many real git repository fixtures',
+    workload: 'compiled GC setup CLI over many real Git repositories, including unchanged independent BMAD state',
   },
   {
     file: 'bmad-runtime-packaged.test.ts',
@@ -73,6 +73,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'HTTP ops surface over real git fixture repositories',
   },
   { file: 'fix-directive.test.ts', workload: 'dispatch/fix flow over real git fixtures' },
+  { file: 'gc-bootstrap-retirement.test.ts', workload: 'runs owner retirement/restore shell and Python commands over Git worktrees and backup corruption fixtures' },
   {
     file: 'harness-diagnostics.test.ts',
     workload: 'spawns a real Vitest child over a temp fixture to prove the timeout/failure wiring',
@@ -81,6 +82,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'harness-routing.test.ts',
     workload: 'spawns two real Vitest collection children as the runtime phase-partition guard',
   },
+  { file: 'intake-approval-packaged.test.ts', workload: 'actual npm archive approval and dispatch over disposable git worktrees' },
   { file: 'install-one-line.test.ts', workload: 'install.sh clone/build/service pipelines' },
   { file: 'install.test.ts', workload: 'install.sh CLI contracts through real subprocesses' },
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },
@@ -112,6 +114,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   { file: 'uploads-dir.test.ts', workload: 'real service boot against real filesystem state' },
   { file: 'verification-server.test.ts', workload: 'verification runner spawning real declared commands' },
   { file: 'wake-e2e.test.ts', workload: 'real service wake-on-alert flow' },
+  { file: 'workflow-runtime-packaged.test.ts', workload: 'extracts the actual npm archive and drives compiled workflow CLIs over a real git lane' },
   { file: 'wizard-interactive.test.ts', workload: 'PTY wizard session against the built CLI' },
   { file: 'wizard-register.test.ts', workload: 'install.sh service registration subprocess' },
   { file: 'wizard.test.ts', workload: 'built wizard CLI subprocesses' },

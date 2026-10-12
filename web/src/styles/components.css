@@ -694,9 +694,10 @@ body {
 
 .chat-panel {
   display: grid;
-  /* Pane face: head, scrollable log, context controls, compose. Inside
-     the overlay sheet the head hides and row 1 collapses to 0. */
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  container-type: size;
+  /* Pane face: head, compact intake, scrollable log, context controls,
+     compose. In the overlay sheet the head hides and row 1 collapses. */
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   overflow: hidden;
   position: relative;
 }
@@ -715,9 +716,10 @@ body {
    capped scroll box and grow to its full content height (which also
    broke the bottom-distance math that drives auto-follow). */
 .chat-panel > .chat-panel__head { grid-area: 1 / 1; }
-.chat-panel > .chat-log { grid-area: 2 / 1; }
-.chat-panel > .chat-context { grid-area: 3 / 1; }
-.chat-panel > .chat-compose { grid-area: 4 / 1; }
+.chat-panel > #intake-mount { grid-area: 2 / 1; }
+.chat-panel > .chat-log { grid-area: 3 / 1; }
+.chat-panel > .chat-context { grid-area: 4 / 1; }
+.chat-panel > .chat-compose { grid-area: 5 / 1; }
 
 /* The pane head: 🧠 Gru + the collapse affordance (v5). */
 .chat-panel__head {
@@ -809,7 +811,7 @@ body {
    disengaged (the reader is in history). It sits in the log's grid cell
    and never takes layout from the message column. */
 .chat-jump {
-  grid-area: 2 / 1;
+  grid-area: 3 / 1;
   align-self: end;
   justify-self: center;
   z-index: 2;
@@ -1289,6 +1291,7 @@ body {
 
 /* The mount constrains the panel; the log scrolls inside it. */
 .chat-sheet #chat-sheet-mount {
+  grid-area: 2 / 1;
   min-height: 0;
   display: grid;
 }
@@ -1296,7 +1299,7 @@ body {
 .chat-sheet .chat-panel {
   height: 100%;
   min-height: 0;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   border: none;
   border-radius: 0;
   box-shadow: none;
@@ -3498,3 +3501,21 @@ a.repo-row__name:hover {
     font-size: 15px;
   }
 }
+
+/* Compact review stays in the one chat pane, with bounded scroll estate. */
+/* Container units bind the cap to the pane, not the intake's own auto
+   grid row (a percentage there clips even the collapsed summary). */
+#intake-mount { min-height: 0; max-height: 52cqh; overflow: auto; }
+.intake { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.intake summary { cursor: pointer; }
+.intake-body { display: grid; gap: 8px; padding-top: 8px; min-width: 0; }
+.intake-body .pp-input { width: 100%; min-width: 0; }
+.intake-review pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.intake-review p { overflow-wrap: anywhere; }
+.intake-editor { min-height: 160px; resize: vertical; font-family: monospace; }
+.intake-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.intake-selection { display: flex; align-items: center; gap: 6px; }
+.intake-status { overflow-wrap: anywhere; }
+
+.mailbox-detail { padding: .5rem 1rem; font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
+.mailbox-incident { padding: .75rem; border: 1px solid currentColor; border-radius: .4rem; }
