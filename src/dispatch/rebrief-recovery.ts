@@ -247,7 +247,8 @@ export function finalizeRebriefRequest(input: {
 
     const landedDelivery = deliveryMarker === null ? null : input.ledger.pendingRebriefReceipt(deliveryMarker);
     if (deliveryMarker !== null && landedDelivery === null) {
-      const original = input.ledger.reconstructCompletedRebriefDelivery(markers);
+      const lanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+      const original = input.ledger.reconstructCompletedRebriefDelivery(markers, lanes.length === 1 ? lanes[0] : undefined);
       if (original === null) throw new Error('historical completion is proven but original delivery HEAD/revision is absent — use exact legacy reconcile-completed control closure and current inspection, never synthesize historical delivery');
       deliveredSha = (original.payload as { sha: string }).sha;
       deliveryRecorded = true;
@@ -345,18 +346,29 @@ export function observePendingRebriefs(
 ): ReconcileReport {
   if (deps.stopSignal?.aborted || deps.stopping?.()) return { examined: 0, completed: 0, redispatched: 0, retired: 0, settled: Promise.resolve() };
   const scope = 'historical-rebrief-observation';
+  const retryScope = `${scope}-retry`;
   const limit = opts.limit ?? 100;
   let cursor = deps.ledger.readReconcileCursor(scope) ?? 0;
   const groups = deps.ledger.listPendingRebriefGroups({ afterRowid: cursor, limit });
+  // One durable retry slot supplements the fair main page: a failure is
+  // reconsidered on the next pass without starving unrelated generations.
+  const retryCursor = deps.ledger.readReconcileCursor(retryScope) ?? 0;
+  const retryCandidate = retryCursor > 0 ? deps.ledger.listPendingRebriefGroups({ afterRowid: retryCursor - 1, limit: 1 })[0] : undefined;
+  const retryGroup = retryCandidate?.cursor === retryCursor ? retryCandidate : undefined;
+  let nextRetryCursor = retryGroup === undefined ? 0 : retryCursor;
+  const retryOnly = retryGroup !== undefined && !groups.some((group) => group.cursor === retryCursor)
+    ? [{ ...retryGroup, fromMainPage: false }] : [];
+  const workGroups = [...retryOnly, ...groups.map((group) => ({ ...group, fromMainPage: true }))];
   let examined = 0;
   let completed = 0;
   const redispatched = 0;
   let retired = 0;
   const failures: unknown[] = [];
 
-  for (const { jobId, cursor: groupCursor } of groups) {
+  for (const { jobId, cursor: groupCursor, fromMainPage } of workGroups) {
     if (deps.stopSignal?.aborted || deps.stopping?.()) break;
-    cursor = groupCursor;
+    if (fromMainPage) cursor = groupCursor;
+    if (groupCursor === retryCursor && nextRetryCursor === retryCursor) nextRetryCursor = 0;
     try {
       const group = deps.ledger.listPendingRebriefs({ jobId });
       examined += group.length;
@@ -417,7 +429,8 @@ export function observePendingRebriefs(
       if (job !== null && completePair && missing.every((marker) => marker.kind === 'job.delivered')) {
         let followUp: ReturnType<LedgerApi['reconstructCompletedRebriefDelivery']>;
         try {
-          followUp = deps.ledger.reconstructCompletedRebriefDelivery(group);
+          const lanes = deps.worktrees.listWorktrees({ jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
+          followUp = deps.ledger.reconstructCompletedRebriefDelivery(group, lanes.length === 1 ? lanes[0] : undefined);
           if (followUp === null) {
             escalateRecoveryFailure(deps, jobId, group, new Error('exact original completion has no original delivery HEAD/revision — use legacy reconcile-completed control closure plus separate current artifact inspection; original-work successor and historical fabrication are forbidden'));
             continue;
@@ -456,9 +469,11 @@ export function observePendingRebriefs(
       escalateRecoveryFailure(deps, jobId, group, new Error('legacy re-brief has no exact native request checkpoint — original prompt and fresh-session fallback are forbidden; concrete Gru recovery decision required'));
     } catch (error) {
       failures.push(error);
+      nextRetryCursor = nextRetryCursor === 0 ? groupCursor : Math.min(nextRetryCursor, groupCursor);
       deps.log?.('error', 'historical re-brief observation failed', { job: jobId, error: String(error) });
     }
   }
+  deps.ledger.writeReconcileCursor({ scope: retryScope, cursor: nextRetryCursor });
   deps.ledger.writeReconcileCursor({ scope, cursor: groups.length < limit && !deps.stopSignal?.aborted && !deps.stopping?.() ? 0 : cursor });
   if (failures.length > 0) throw new AggregateError(failures, `historical re-brief observation failed: ${failures.map(String).join('; ')}`);
   return {
@@ -580,7 +595,21 @@ export interface DirectiveReconcileReport {
  * dedupe), no provider calls, no worker spawns, no re-dispatch.
  */
 export function reconcilePendingDirectives(deps: ReconcileDirectivesDeps): DirectiveReconcileReport {
-  const live = listAllLiveDirectives(deps.ledger);
+  return reconcilePendingDirectivesForRows(deps, false);
+}
+
+/** Boot-only legacy protocol reconciliation. Current requests are owned by
+ * DirectiveProgressService and require their exact native checkpoint; only
+ * rows predating that protocol may use correlated event-only recovery. */
+export function reconcilePendingLegacyDirectives(deps: ReconcileDirectivesDeps): DirectiveReconcileReport {
+  return reconcilePendingDirectivesForRows(deps, true);
+}
+
+function reconcilePendingDirectivesForRows(
+  deps: ReconcileDirectivesDeps,
+  legacyOnly: boolean,
+): DirectiveReconcileReport {
+  const live = listAllLiveDirectives(deps.ledger).filter((row) => !legacyOnly || row.requestKind === null);
   let completed = 0;
   let escalated = 0;
   for (const row of live) {
@@ -763,8 +792,9 @@ function listAllLiveDirectives(ledger: LedgerApi): readonly DirectiveRequestReco
 function completeDirectiveFromEvidence(ledger: LedgerApi, row: DirectiveRequestRecord): DirectiveRequestRecord | null {
   let current = row;
   // Event-only decoding belongs solely to rows accepted by the historical
-  // protocol. Current requests require the adapter-owned native binding.
-  if (current.requestKind !== null && current.nativeBinding === null) return null;
+  // protocol. Every current request requires exact native checkpoint proof,
+  // even if its admission binding has already been persisted.
+  if (current.requestKind !== null) return null;
   if (current.state === 'dispatching') {
     const sent = findCorrelatedEvent(ledger, current.jobId, current.requestId, 'silas.directive-sent', (event) => event.seq > current.baselineSeq);
     if (sent === null) return null;

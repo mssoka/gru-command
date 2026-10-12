@@ -34,6 +34,7 @@ import { directiveRetirementFingerprint } from '../src/ledger/directives.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
 import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-recovery/sensor.js';
 import type { AgentCapabilities, AgentHandle, AgentState, SpawnOptions } from '../src/runtime/types.js';
+import type { LessonsReferencePort } from '../src/lessons/types.js';
 
 /**
  * Guarded interrupted-directive recovery (owner approval j-1348).
@@ -82,7 +83,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function boot(opts: { completeReview?: boolean; wrapLedger?: (ledger: LedgerApi) => LedgerApi; workerGate?: PacingGate;
+async function boot(opts: { completeReview?: boolean; noDirectiveChanges?: boolean; lessons?: LessonsReferencePort; wrapLedger?: (ledger: LedgerApi) => LedgerApi; workerGate?: PacingGate;
   pendingProducerBlockers?: (jobId: string) => readonly string[] } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-retirement-'));
   cleanupDirs.push(dir);
@@ -135,6 +136,7 @@ async function boot(opts: { completeReview?: boolean; wrapLedger?: (ledger: Ledg
       capabilities: FAKE_CAPABILITIES,
       async prompt(_text: string) {
         if (role !== 'minion' || options?.cwd === undefined) return;
+        if (opts.noDirectiveChanges === true) { state = 'idle'; return; }
         promptSeq += 1;
         const file = join(options.cwd, `retire-deliverable-${id}-${promptSeq}.txt`);
         writeFileSync(file, 'settled\n');
@@ -201,6 +203,7 @@ async function boot(opts: { completeReview?: boolean; wrapLedger?: (ledger: Ledg
     ledger,
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
     pendingProducerBlockers: opts.pendingProducerBlockers ?? (() => []),
+    ...(opts.lessons !== undefined ? { lessons: opts.lessons } : {}),
     silasOps: {
       registry,
       worktrees,
@@ -258,8 +261,8 @@ function field<T>(json: unknown, key: string): T {
   return (json as Record<string, unknown>)[key] as T;
 }
 
-function seedJob(h: Harness, jobId: string, status = 'working'): JobRecord {
-  const job = h.ledger.addJob({ id: jobId, repo: 'fixture-app', title: jobId, briefing: `briefing for ${jobId}` });
+function seedJob(h: Harness, jobId: string, status = 'working', deliverable?: 'review' | 'artifact' | 'investigation'): JobRecord {
+  const job = h.ledger.addJob({ id: jobId, repo: 'fixture-app', title: jobId, briefing: `briefing for ${jobId}`, ...(deliverable === undefined ? {} : { deliverable }) });
   if (status !== 'dispatched') h.ledger.setJobStatus(jobId, status as never);
   return job;
 }
@@ -923,6 +926,22 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
       by: 'silas-ops',
     });
     expect(fingerprint).toBe('5f3198a42e1724892a714e3508561be919d694a473c41fae73e551c5c2f3a610');
+  });
+
+  it('retries a failed report-handback open before settling a correlated native delivery', async () => {
+    const h = await boot({ noDirectiveChanges: true });
+    const jobId = 'report-handback-open-retry';
+    seedJob(h, jobId, 'working', 'review');
+    const repo = makeFixtureRepo('report-handback-open-retry'); cleanupRepos.push(repo);
+    await seedLane(h, repo, jobId);
+    const open = vi.spyOn(h.ledger, 'openReportObligation').mockImplementationOnce(() => { throw new Error('transient report obligation write failure'); });
+    const accepted = await call(h.port, 'POST', '/api/silas/directive',
+      { job_id: jobId, directive: 'complete the approved report task', request_id: 'report-handback-retry-request' }, TOKEN);
+    expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
+    await waitFor(() => h.ledger.getDirective('report-handback-retry-request')?.state === 'settled', 'report request delivery');
+    expect(open).toHaveBeenCalledTimes(2);
+    expect(h.ledger.findReportObligation(jobId)).toMatchObject({ state: 'open' });
+    expect(h.ledger.listJobEventsByKinds(jobId, ['job.report-handback'])).toHaveLength(1);
   });
 
   it('never replays a consumed request id as a new turn', async () => {
@@ -1863,8 +1882,8 @@ describe('directive retirement — continuation boundary and consumers', () => {
 });
 
 describe('exact recovery reserved-owner HTTP lifecycle', () => {
-  async function ownerFixture(kind: 'directives' | 'rebriefs') {
-    const h = await boot(); const repo = makeFixtureRepo('recovery-owner-http'); cleanupRepos.push(repo);
+  async function ownerFixture(kind: 'directives' | 'rebriefs', lessons?: LessonsReferencePort) {
+    const h = await boot(lessons === undefined ? {} : { lessons }); const repo = makeFixtureRepo('recovery-owner-http'); cleanupRepos.push(repo);
     const jobId = `owner-${kind}`; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
     const original = h.ledger.beginDirectiveIntent({ jobId, requestId: `${jobId}-original`, directive: 'approved original', holder: 'gru' }).record;
     let subjectId = original.requestId; let payloadHash = original.payloadHash;
@@ -1916,7 +1935,8 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
   }
 
   async function assertOwnerLifecycle(kind: 'directives' | 'rebriefs') {
-    const f = await ownerFixture(kind); const { h } = f;
+    const lessons: LessonsReferencePort = { referencesFor: () => [{ chapter: 'recovery', lesson: 'exact-successor', path: '/fixture/lessons/recovery.md', why: 'verify successor prompt context' }] };
+    const f = await ownerFixture(kind, lessons); const { h } = f;
     const permissionBody = await f.actionBody();
     const permission = await call(h.port, 'POST', `${f.route}/owner-resolution`, permissionBody, TOKEN); expect(permission.status, JSON.stringify(permission.json)).toBe(200);
     const ruling = field<{ payload: { fingerprint: string } }>(permission.json, 'receipt');
@@ -1942,6 +1962,10 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
     expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
     for (let i = 0; i < 200 && h.ledger.getDirective(successorId)?.state !== 'settled'; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     expect(h.ledger.getDirective(successorId)?.state).toBe('settled'); expect(h.ledger.getObligation(next.id)?.state).toBe('settled');
+    const successorSession = h.ledger.getDirective(successorId)?.nativeTarget?.sessionFile;
+    expect(successorSession).toBeTruthy();
+    const successorTranscript = readFileSync(successorSession!, 'utf8');
+    expect(successorTranscript).toContain('/fixture/lessons/recovery.md#exact-successor');
     expect(h.ledger.getObligation(f.debt.id)?.state).toBe('closed'); expect(h.ledger.getNotification(f.ownerStop.id)?.ackedAt).toBeNull();
     const history = h.ledger.recoveryDecisionHistory(kind === 'directives' ? 'directive' : 'rebrief', f.subjectId);
     expect(history.map((row) => row.generation)).toEqual([f.debt.generation, next.generation]);
@@ -2099,8 +2123,8 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
 });
 
 describe('legacy proven completion without fabricated historical delivery', () => {
-  async function completedFixture(full = false) {
-    const h = await boot({ completeReview: full }); const repo = makeFixtureRepo('completed-control-http'); cleanupRepos.push(repo);
+  async function completedFixture(full = false, noDirectiveChanges = false) {
+    const h = await boot({ completeReview: full, noDirectiveChanges }); const repo = makeFixtureRepo('completed-control-http'); cleanupRepos.push(repo);
     if (full) { attachBareOrigin(repo); repo.git(['push', 'origin', 'main']); }
     const jobId = 'completed-control-job'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
     if (full) {
@@ -2134,8 +2158,8 @@ describe('legacy proven completion without fabricated historical delivery', () =
     return { h, lane, jobId, markers, marker, original, debt, route, body };
   }
 
-  async function verifiedCurrentGateFixture() {
-    const f = await completedFixture(true); const { h } = f;
+  async function verifiedCurrentGateFixture(noDirectiveChanges = false) {
+    const f = await completedFixture(true, noDirectiveChanges); const { h } = f;
     expect((await call(h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN)).status).toBe(200);
     const closure = h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')!;
     expect((await call(h.port, 'POST', '/api/silas/directive', { job_id: f.jobId, request_id: 'separate-current-inspection', directive: (closure.payload as { inspection_directive: string }).inspection_directive }, TOKEN)).status).toBe(202);
@@ -2226,9 +2250,44 @@ describe('legacy proven completion without fabricated historical delivery', () =
       expect(h.ledger.workRevisionState(f.jobId)).toEqual({ required: 2, delivered: 0 });
       const unknown = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: null, work_revision: 2, candidate_delivery_proven: false } });
       expect(h.ledger.latestCandidateDelivery(f.jobId)?.seq).toBe(unknown.seq);
+      expect(h.ledger.workRevisionState(f.jobId)).toEqual({ required: 2, delivered: 0 });
       expect(() => h.ledger.settleObligation({ obligationId: recipient.id, settlement: completedSettlement })).toThrow(/current native candidate/);
       expect(h.ledger.getObligation(recipient.id)?.state).toBe('settled');
       expect(h.ledger.getEvent(historicCandidate.seq)).toEqual(historicCandidate);
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('P37 requires both full verification and whole review after a later current candidate delivery', async () => {
+    const { f, h, duty, scheduler, evidence } = await verifiedCurrentGateFixture(true);
+    try {
+      const accepted = await call(h.port, 'POST', '/api/silas/rebrief',
+        { job_id: f.jobId, request_id: 'P37-later-candidate', note: 'separately accepted same-head candidate' }, TOKEN);
+      expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
+      await waitFor(() => h.ledger.getDirective('P37-later-candidate')?.state === 'settled', 'later P37 candidate delivery');
+      const candidate = h.ledger.latestCandidateDelivery(f.jobId)!;
+      expect(candidate.seq).toBeGreaterThan(evidence.seq);
+      const priorReview = { kind: 'accepted-evidence' as const, gate: 'genuine but pre-candidate verification and review',
+        evidenceEventSeq: evidence.seq, evidenceEventKind: evidence.kind };
+      expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: priorReview })).toThrow(/predates the current candidate delivery/);
+      expect(h.ledger.getObligation(duty.id)?.state).toBe('open');
+      const reviewWithoutFreshFull = await h.wave.beginRound({ jobId: f.jobId, targetRef: f.lane.branch! });
+      expect((await reviewWithoutFreshFull.run).verdict).toBe('approved');
+      const reviewAfterCandidate = h.ledger.latestRoundEvent(reviewWithoutFreshFull.round.id, 'round.perkins-review')!;
+      expect(reviewAfterCandidate.seq).toBeGreaterThan(candidate.seq);
+      const currentReview = { ...priorReview, evidenceEventSeq: reviewAfterCandidate.seq };
+      expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: currentReview })).toThrow(/predates the current candidate delivery/);
+      expect(h.ledger.getObligation(duty.id)?.state).toBe('open');
+      const full = await scheduler.submit({ jobId: f.jobId, requestId: 'P37-full-after-candidate', scope: 'full',
+        command: 'test ! -f .P37-fail && printf verified', cwd: f.lane.path }, () => {});
+      expect(full.ok).toBe(true);
+      const reviewAfterFull = await h.wave.beginRound({ jobId: f.jobId, targetRef: f.lane.branch! });
+      expect((await reviewAfterFull.run).verdict).toBe('approved');
+      const finalReview = h.ledger.latestRoundEvent(reviewAfterFull.round.id, 'round.perkins-review')!;
+      expect(finalReview.seq).toBeGreaterThan(candidate.seq);
+      const db = new LedgerDb(h.dir); const reopened = new LedgerApi(db.handle);
+      try {
+        expect(reopened.settleObligation({ obligationId: duty.id, settlement: { ...priorReview, evidenceEventSeq: finalReview.seq } }).state).toBe('settled');
+      } finally { db.close(); }
     } finally { await scheduler.dispose(); }
   });
 

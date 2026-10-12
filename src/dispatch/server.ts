@@ -1440,6 +1440,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             notifications: ops.notifications, pendingProducerBlockers: options.pendingProducerBlockers, signal: controller.signal,
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
             ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+            ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
             ...(options.childWorkers !== undefined ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) } : {}),
           }, outcome.successor.requestId).finally(() => directiveControllers.delete(controller));
           track(run);

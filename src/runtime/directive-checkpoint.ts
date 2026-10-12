@@ -1,8 +1,9 @@
 import { hostname } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, fsyncSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, fstatSync, fsyncSync, openSync, readSync, writeFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { dirname } from 'node:path';
+import { withSessionLockCoordination } from '../sessions/lock-coordination.js';
 
 /** Accepted authority, not a prompt or a claim lease. */
 export interface DirectiveTurnIdentity {
@@ -31,6 +32,41 @@ export type DirectiveCheckpoint =
 export class DirectiveCheckpointError extends Error {
   constructor(message: string) { super(message); this.name = 'DirectiveCheckpointError'; }
 }
+const MAX_NATIVE_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
+const MAX_NATIVE_TRANSCRIPT_ENTRIES = 250_000;
+const MAX_DIRECTIVE_JOURNAL_BYTES = 4 * 1024 * 1024;
+const MAX_DIRECTIVE_JOURNAL_ENTRIES = 100_000;
+const MAX_NATIVE_LOCK_BYTES = 4 * 1024;
+function readBoundedUtf8(path: string, limit: number, label: string): string {
+  const fd = openSync(path, 'r');
+  try {
+    const initialSize = fstatSync(fd).size;
+    if (initialSize > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, limit + 1 - total));
+      const count = readSync(fd, chunk, 0, chunk.length, null);
+      if (count === 0) break;
+      total += count;
+      if (total > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
+      chunks.push(chunk.subarray(0, count));
+    }
+    if (fstatSync(fd).size !== total) throw new DirectiveCheckpointError(`${label} changed during bounded inspection`);
+    return Buffer.concat(chunks, total).toString('utf8');
+  } finally { closeSync(fd); }
+}
+function assertEntryLimit(text: string, limit: number, label: string): void {
+  let entries = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text.charCodeAt(index) !== 10) continue;
+    entries += 1;
+    if (entries > limit) throw new DirectiveCheckpointError(`${label} exceeds the entry inspection limit`);
+  }
+  if (text !== '' && !text.endsWith('\n') && ++entries > limit) {
+    throw new DirectiveCheckpointError(`${label} exceeds the entry inspection limit`);
+  }
+}
 export function validateDirectiveIdentity(identity: DirectiveTurnIdentity): void {
   if (!identity || [identity.requestId, identity.jobId].some((value) => typeof value !== 'string' || value.trim() === '') ||
       ![identity.payloadHash, identity.contractSha256].every((hash) => typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)) ||
@@ -44,9 +80,22 @@ function syncFile(path: string): void {
 }
 interface NativeEntry { readonly type: string; readonly id: string; readonly parentId?: string | null; readonly message?: Record<string, unknown> }
 function entries(path: string): NativeEntry[] {
-  const text = readFileSync(path, 'utf8');
+  const text = readBoundedUtf8(path, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
   if (text !== '' && !text.endsWith('\n')) throw new DirectiveCheckpointError('native transcript has a partial entry');
-  return text.trim() === '' ? [] : text.trimEnd().split('\n').map((line) => JSON.parse(line) as NativeEntry);
+  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
+  if (text.trim() === '') return [];
+  const lines = text.trimEnd().split('\n');
+  return lines.map((line) => JSON.parse(line) as NativeEntry);
+}
+/** Header facts use the same bounded read as checkpoint inspection. They
+ * identify a session/cwd, never admission, completion or work authority. */
+export function readDirectiveSessionHeader(file: string): { readonly type?: unknown; readonly id?: unknown; readonly cwd?: unknown } {
+  const text = readBoundedUtf8(file, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
+  const end = text.indexOf('\n');
+  if (end < 0) throw new DirectiveCheckpointError('native transcript has no complete session header');
+  const header = JSON.parse(text.slice(0, end)) as unknown;
+  if (typeof header !== 'object' || header === null) throw new DirectiveCheckpointError('native session header is malformed');
+  return header;
 }
 function contentHash(content: unknown): string { return createHash('sha256').update(JSON.stringify(content)).digest('hex'); }
 function proofPath(file: string): string { return `${file}.directives.jsonl`; }
@@ -75,11 +124,12 @@ export function prepareDirectiveBinding(input: {
   appendBinding(binding);
   return binding;
 }
-export function readDirectiveBinding(file: string, requestId: string): DirectiveNativeBinding | null {
+function readDirectiveBindings(file: string): readonly DirectiveNativeBinding[] {
   let raw: string;
-  try { raw = readFileSync(proofPath(file), 'utf8'); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  try { raw = readBoundedUtf8(proofPath(file), MAX_DIRECTIVE_JOURNAL_BYTES, 'directive native association'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
   if (!raw.endsWith('\n')) throw new DirectiveCheckpointError('directive native association has a partial write');
+  assertEntryLimit(raw, MAX_DIRECTIVE_JOURNAL_ENTRIES, 'directive native association');
   const rows = raw.trimEnd().split('\n').map((line) => JSON.parse(line) as DirectiveNativeBinding);
   const latest = new Map<string, DirectiveNativeBinding>();
   for (const row of rows) {
@@ -99,7 +149,23 @@ export function readDirectiveBinding(file: string, requestId: string): Directive
     }
     latest.set(row.identity.requestId, row);
   }
-  return latest.get(requestId) ?? null;
+  return [...latest.values()];
+}
+export function readDirectiveBinding(file: string, requestId: string): DirectiveNativeBinding | null {
+  return readDirectiveBindings(file).find((row) => row.identity.requestId === requestId) ?? null;
+}
+function hasLaterBoundRequest(file: string, native: readonly NativeEntry[], identity: DirectiveTurnIdentity, checkpointId: string): boolean {
+  try {
+    const checkpointIndex = native.findIndex((entry) => entry.id === checkpointId);
+    if (checkpointIndex < 0) return false;
+    const immediate = native[checkpointIndex + 1];
+    if (immediate?.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== checkpointId) return false;
+    return readDirectiveBindings(file).some((candidate) => {
+      if (candidate.identity.requestId === identity.requestId || candidate.identity.jobId !== identity.jobId ||
+          candidate.userEntryId !== immediate.id || candidate.baseline !== checkpointId) return false;
+      return isDeepStrictEqual(inspectDirectiveAdmission(file, candidate.identity), candidate);
+    });
+  } catch { return false; }
 }
 /** Admission is a prefix fact, independent of later unfinished/unknown effects.
  * Read only through the exact user receipt, never infer admission from a shape. */
@@ -107,7 +173,9 @@ export function inspectDirectiveAdmission(file: string, identity: DirectiveTurnI
   validateDirectiveIdentity(identity);
   const binding = readDirectiveBinding(file, identity.requestId);
   if (binding === null || binding.runtime !== 'pi' || !isDeepStrictEqual(binding.identity, identity)) throw new DirectiveCheckpointError('exact native admission association unavailable');
-  const lines = readFileSync(file, 'utf8').split('\n'); lines.pop(); // a partial tail cannot undo an accepted prefix
+  const text = readBoundedUtf8(file, MAX_NATIVE_TRANSCRIPT_BYTES, 'native transcript');
+  assertEntryLimit(text, MAX_NATIVE_TRANSCRIPT_ENTRIES, 'native transcript');
+  const lines = text.split('\n'); lines.pop(); // a partial tail cannot undo an accepted prefix
   const header = JSON.parse(lines[0] ?? 'null') as NativeEntry | null;
   if (header?.type !== 'session' || header.id !== binding.sessionId) throw new DirectiveCheckpointError('native admission session identity mismatch');
   let baselineFound = binding.baseline === null;
@@ -141,6 +209,11 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   const native = entries(file);
   const header = native[0] as (NativeEntry & { readonly id?: string }) | undefined;
   if (header?.type !== 'session' || header.id !== binding.sessionId) return unknown('native session identity mismatch');
+  const ids = new Set<string>([header.id]);
+  for (const entry of native.slice(1)) {
+    if (!entry || typeof entry.id !== 'string' || entry.id === '' || ids.has(entry.id)) return unknown('native checkpoint has a malformed or duplicate entry identity');
+    ids.add(entry.id);
+  }
   const start = binding.baseline === null ? 1 : native.findIndex((entry) => entry.id === binding.baseline) + 1;
   if (start <= 0) return unknown('native baseline unavailable');
   const user = native[start];
@@ -157,7 +230,18 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   let lastMessage = user.message;
   let terminal = false;
   for (const entry of native.slice(start + 1)) {
-    if (terminal) return unknown('native entries follow the correlated terminal checkpoint');
+    if (terminal) {
+      // A later user entry is not part of this completed turn when its own
+      // distinct, durably read-back admission binds it. Keep the earlier
+      // checkpoint readable without treating an unbound/replayed user tail
+      // as proof that the old request completed.
+      if (hasLaterBoundRequest(file, native, identity, parent)) {
+        const ok = lastMessage.stopReason === 'stop';
+        return { state: 'terminal', binding: admitted, checkpointId: parent, ok,
+          error: ok ? null : String(lastMessage.errorMessage ?? `native stopReason: ${String(lastMessage.stopReason)}`) };
+      }
+      return unknown('native entries follow the correlated terminal checkpoint without a distinct bound request');
+    }
     if (entry.type !== 'message' || entry.parentId !== parent || !entry.id || entry.message === undefined) return unknown('native branch/control/partial checkpoint');
     parent = entry.id;
     const message = entry.message;
@@ -216,9 +300,10 @@ export function prepareDirectiveProducer(input: Omit<DirectiveProducer, 'incarna
 }
 function producerReceipts(file: string): readonly ProducerReceipt[] {
   let text: string;
-  try { text = readFileSync(`${file}.producers.jsonl`, 'utf8'); }
+  try { text = readBoundedUtf8(`${file}.producers.jsonl`, MAX_DIRECTIVE_JOURNAL_BYTES, 'native producer journal'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
   if (!text.endsWith('\n')) throw new DirectiveCheckpointError('native producer journal has a partial write');
+  assertEntryLimit(text, MAX_DIRECTIVE_JOURNAL_ENTRIES, 'native producer journal');
   const rows = text.trimEnd().split('\n').map((line) => JSON.parse(line) as ProducerReceipt);
   const starts = new Map<string, DirectiveProducer>();
   for (const receipt of rows) {
@@ -297,15 +382,17 @@ export function readDirectiveCompletion(file: string, identity: DirectiveTurnIde
 /** A native cessation receipt never identifies a later writer's lock.
  * This is an additional fence, not cessation proof from lock absence. */
 export function directiveProducerLockBlocker(producer: DirectiveProducer): string | null {
-  let text: string;
-  try { text = readFileSync(`${producer.sessionFile}.lock`, 'utf8'); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
-  const holder = JSON.parse(text) as { host?: unknown; pid?: unknown; bootId?: unknown };
-  const expected = producer.lockOwner;
-  if (expected === undefined || holder.host !== expected.host || holder.pid !== expected.pid || holder.bootId !== expected.bootId || holder.host !== hostname()) return 'current native lock owner is foreign/legacy/unbound';
-  try { process.kill(expected.pid, 0); return 'current native lock owner is still live'; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return 'current native lock owner absence is unproven'; }
-  return readFileSync(`${producer.sessionFile}.lock`, 'utf8') === text ? null : 'current native lock owner changed during observation';
+  return withSessionLockCoordination(producer.sessionFile, () => {
+    let text: string;
+    try { text = readBoundedUtf8(`${producer.sessionFile}.lock`, MAX_NATIVE_LOCK_BYTES, 'native session lock'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+    const holder = JSON.parse(text) as { host?: unknown; pid?: unknown; bootId?: unknown };
+    const expected = producer.lockOwner;
+    if (expected === undefined || holder.host !== expected.host || holder.pid !== expected.pid || holder.bootId !== expected.bootId || holder.host !== hostname()) return 'current native lock owner is foreign/legacy/unbound';
+    try { process.kill(expected.pid, 0); return 'current native lock owner is still live'; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return 'current native lock owner absence is unproven'; }
+    return readBoundedUtf8(`${producer.sessionFile}.lock`, MAX_NATIVE_LOCK_BYTES, 'native session lock') === text ? null : 'current native lock owner changed during observation';
+  });
 }
 
 export function recordDirectiveIndependentController(producer: DirectiveProducer): void { appendProducer({ state: 'independent', producer }); }

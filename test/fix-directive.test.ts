@@ -292,7 +292,7 @@ function minionRecord(id: string, jobId: string | null, sessionFile: string | nu
   };
 }
 
-it('P40 supplied native delivery boundary refuses malformed or coerced HEAD before delivery and report effects', () => {
+it('P40 preserves historical native HEADs without labeling them current candidates when no live lane matches', () => {
   const appendCustomEvent = vi.fn<LedgerApi['appendCustomEvent']>().mockReturnValue({ seq: 1 } as ReturnType<LedgerApi['appendCustomEvent']>);
   const getJob = vi.fn(() => null); const openReportObligation = vi.fn();
   const ledger = { appendCustomEvent, getJob, openReportObligation };
@@ -304,9 +304,42 @@ it('P40 supplied native delivery boundary refuses malformed or coerced HEAD befo
     expect(appendCustomEvent).not.toHaveBeenCalled(); expect(getJob).not.toHaveBeenCalled(); expect(openReportObligation).not.toHaveBeenCalled();
   }
   for (const sha of ['a'.repeat(40), 'b'.repeat(64), null]) {
-    expect(deliver(sha).sha).toBe(sha);
-    expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha, candidate_delivery_proven: sha !== null }) }));
+    const result = deliver(sha);
+    expect(result.sha).toBe(sha);
+    expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha, candidate_delivery_proven: false }) }));
+    if (sha !== null) expect(result.note).toMatch(/no unique live job lane/u);
   }
+});
+
+it('P40 marks original native HEAD as a candidate only on one matching clean unswept job lane', async () => {
+  const repo = makeFixtureRepo('P40-native-current-candidate'); cleanupRepos.push(repo);
+  const root = mkdtempSync(join(tmpdir(), 'gru-command-native-current-candidate-')); cleanupDirs.push(root);
+  const backing = new InMemoryWorktreePort(root);
+  const lane = await backing.createJobWorktree({ repoPath: repo.path, jobId: 'P40-current' });
+  const head = execFileSync('git', ['-C', lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  let lanes: readonly WorktreeLane[] = [lane];
+  const worktrees = { listWorktrees: () => lanes };
+  const appendCustomEvent = vi.fn<LedgerApi['appendCustomEvent']>().mockReturnValue({ seq: 1 } as ReturnType<LedgerApi['appendCustomEvent']>);
+  const ledger = { appendCustomEvent, getJob: () => null, openReportObligation: vi.fn() };
+  const deliver = () => recordFollowUpDelivery({ ledger, worktrees, jobId: 'P40-current', agentId: 'original-minion', source: 'silas-directive', workRevision: 1,
+    nativeCompletion: { sha: head, provenance: { original: 'immutable completion receipt' } } });
+  expect(deliver().sha).toBe(head);
+  expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: true }) }));
+  writeFileSync(join(lane.path, 'src/main.ts'), 'export function answer(): number { return 43; }\n');
+  const dirty = deliver();
+  expect(dirty.sha).toBe(head); expect(dirty.note).toMatch(/tracked tree is dirty/u);
+  expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: false }) }));
+  writeFileSync(join(lane.path, 'src/main.ts'), 'export function answer(): number {\n  return 42;\n}\n');
+  writeFileSync(join(lane.path, 'moved.txt'), 'moved\n');
+  execFileSync('git', ['-C', lane.path, 'add', 'moved.txt']);
+  execFileSync('git', ['-C', lane.path, '-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'move current head'], { stdio: 'ignore' });
+  const moved = deliver();
+  expect(moved.sha).toBe(head); expect(moved.note).toMatch(/HEAD moved/u);
+  expect(appendCustomEvent).toHaveBeenLastCalledWith(expect.objectContaining({ payload: expect.objectContaining({ sha: head, candidate_delivery_proven: false }) }));
+  lanes = [{ ...lane, status: 'swept' as const }];
+  expect(deliver().note).toMatch(/no unique live job lane/u);
+  lanes = [];
+  expect(deliver().note).toMatch(/no unique live job lane/u);
 });
 
 describe('recordFollowUpDelivery (the loop-closing signal)', () => {

@@ -39,7 +39,7 @@ import { claimProviderRecoveryContinuation } from './provider-recovery/resume.js
 import { GhCliApi, GitHubSignalPoll, type LaneRemoteResolver } from './dispatch/github-poll.js';
 import { GhRepoOverviewApi, ManagedRepoOverviewTracker } from './repos/overview.js';
 import { routeFixDirectiveToMinion } from './dispatch/fix-directive.js';
-import { reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
+import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs } from './dispatch/rebrief-recovery.js';
 import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, reconcilePhaseHandoffs, reconcileUnmarkedHandbacks } from './dispatch/obligations.js';
 import { createDispatchServer } from './dispatch/server.js';
 import { PipelineService } from './dispatch/pipeline.js';
@@ -1310,11 +1310,19 @@ async function main(): Promise<number> {
   if (childRecovery.resumed > 0 || childRecovery.failed > 0) {
     logger.info('child worker reconciliation', childRecovery);
   }
-  // Directive-request restart safety (phase 3): a request accepted before
-  // the crash reconciles from correlated evidence when it exists; when
-  // admission or the terminal receipt is UNKNOWN, one bounded escalation
-  // names it for a Gru reconciliation — never an automatic retry
-  // (admission-unknown is not no-effect proof).
+  // Preserve event-only recovery for pre-native protocol rows at boot.
+  // Current requests are reconciled below only through their exact native
+  // checkpoint and producer-cessation evidence.
+  const legacyDirectiveRecovery = reconcilePendingLegacyDirectives({ ledger, notifications,
+    log: (level, msg, fields) => logger.log(level, msg, fields),
+  });
+  if (legacyDirectiveRecovery.examined > 0) {
+    logger.info('legacy directive reconciliation', {
+      examined: legacyDirectiveRecovery.examined,
+      completed: legacyDirectiveRecovery.completed,
+      escalated: legacyDirectiveRecovery.escalated,
+    });
+  }
   const directiveProgress = new DirectiveProgressService({ ledger, registry, worktrees: worktreeManager, notifications,
     clearLaneForWriter: (input) => wave.clearLaneForWriter(input),
     pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), signal: serviceStop.signal,

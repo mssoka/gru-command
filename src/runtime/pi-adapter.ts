@@ -886,9 +886,19 @@ export class PiRuntime implements AgentRuntime {
         },
         this.heartbeatMs(),
         options.agentId,
-        () => createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: session.agent.state.systemPrompt,
-          tools: session.agent.state.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters, implementation: tool.execute.toString() })).sort((a, b) => a.name.localeCompare(b.name)),
-          model: session.model ?? null })).digest('hex'),
+        () => {
+          const unboundNativeTools = declaredNativeTools.filter((tool) => typeof tool.authorityManifest !== 'string' || tool.authorityManifest.length === 0);
+          if (unboundNativeTools.length > 0) {
+            throw new Error(`native directive tools lack stable authority manifests: ${unboundNativeTools.map((tool) => tool.name).join(', ')}`);
+          }
+          return createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: session.agent.state.systemPrompt,
+            toolExecution: session.agent.toolExecution,
+            tools: session.agent.state.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters,
+              executionMode: tool.executionMode ?? null, implementation: tool.execute.toString() })).sort((a, b) => a.name.localeCompare(b.name)),
+            nativeTools: declaredNativeTools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.inputSchema,
+              authorityManifest: tool.authorityManifest, implementation: tool.execute.toString() })).sort((a, b) => a.name.localeCompare(b.name)),
+            model: session.model ?? null })).digest('hex');
+        },
         () => resolveGitCommit(cwd, 'HEAD'),
       );
       this.handles.add(handle);

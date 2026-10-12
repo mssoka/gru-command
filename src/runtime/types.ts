@@ -97,6 +97,9 @@ export interface NativeAgentTool {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Readonly<Record<string, unknown>>;
+  /** Stable, non-secret identity for authority-bearing values captured by execute().
+   * Required by restartable native turns; omitted declarations cannot prove the same closure authority. */
+  readonly authorityManifest?: string;
   execute(input: unknown, signal?: AbortSignal): Promise<NativeAgentToolResult>;
 }
 

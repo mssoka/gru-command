@@ -99,6 +99,7 @@ describe('directive requests — durable ledger contract', () => {
       directive: 'fix the blocker',
       holder: 'silas-ops',
       requestId: 'req-d1',
+      sourceContext: { ruleId: 'rule-original', sourceRoundId: 'round-original' },
     }).record;
     expect(intent.state).toBe('dispatching');
     expect(intent.claim?.holder).toBe('silas-ops');
@@ -110,6 +111,7 @@ describe('directive requests — durable ledger contract', () => {
       directive: 'fix the blocker',
       holder: 'silas-ops',
       requestId: 'req-d1',
+      sourceContext: { ruleId: 'rule-original', sourceRoundId: 'round-original' },
     }).record;
     expect(replay.requestId).toBe('req-d1');
     expect(replay.payloadHash).toBe(intent.payloadHash);
@@ -118,6 +120,8 @@ describe('directive requests — durable ledger contract', () => {
     expect(() =>
       api.beginDirectiveIntent({ jobId: 'job-d1', directive: 'DIFFERENT work', holder: 'silas-ops', requestId: 'req-d1' }),
     ).toThrow(DirectiveConflictError);
+    expect(() => api.beginDirectiveIntent({ jobId: 'job-d1', directive: 'fix the blocker', holder: 'silas-ops', requestId: 'req-d1',
+      sourceContext: { ruleId: 'different-rule', sourceRoundId: 'round-original' } })).toThrow(DirectiveConflictError);
     // Terminal lanes take no directives.
     api.addJob({ id: 'job-done', repo: 'r', title: 'Done' });
     api.setJobStatus('job-done', 'working');

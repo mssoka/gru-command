@@ -2,7 +2,6 @@ import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
 import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
-import { readFileSync } from 'node:fs';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { readGitState } from '../verify/scheduler.js';
 import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
@@ -11,9 +10,10 @@ import type { RecoverySubject, RecoverySubjectKind, RecoveryOwnerTransfer, Recov
 import type { DatabaseSync } from 'node:sqlite';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
+import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -143,6 +143,8 @@ import {
 } from './decision-memory.js';
 
 const VERIFICATION_KIND = 'verification.completed';
+const MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS = 4_096;
+const MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES = 8 * 1024 * 1024;
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRecoveryHold, DirectiveRequestRecord, DirectiveRetirementRefusalCode, DirectiveState } from './directives.js';
 export { DirectiveRetirementError } from './directives.js';
@@ -3830,9 +3832,36 @@ export class LedgerApi {
     return { completionSeq: receipt.seq, minionId: payload.minion_id, sha: payload.sha, workRevision: payload.work_revision };
   }
 
-  /** Reconstruct only explicit ORIGINAL facts. No current branch lookup,
-   * revision default or approval read may supply a historical outcome. */
-  reconstructCompletedRebriefDelivery(expected: readonly PendingRebriefRecord[]): EventRecord | null {
+  /** Current eligibility is separate from immutable historical outcome.
+   * Only the original successful native HEAD/identity plus an exact clean
+   * current job lane can establish candidate proof; caller flags cannot. */
+  private rebriefCurrentCandidateProof(marker: PendingRebriefRecord,
+    facts: NonNullable<ReturnType<LedgerApi['originalRebriefDeliveryFacts']>>, lane?: WorktreeLane) {
+    if (lane === undefined || lane.kind !== 'job' || lane.status !== 'active' || lane.jobId !== marker.jobId || marker.sessionFile === null) return null;
+    const binding = readDirectiveBinding(marker.sessionFile, marker.id);
+    if (binding === null || binding.agentId !== facts.minionId || binding.identity.jobId !== marker.jobId ||
+        binding.identity.payloadHash !== marker.payloadHash || binding.identity.workRevision !== facts.workRevision) return null;
+    const proof = inspectDirectiveCheckpoint(marker.sessionFile, binding.identity);
+    if (proof.state !== 'terminal' || !proof.ok || !isDeepStrictEqual(proof.binding, binding)) return null;
+    const receipt = readDirectiveCompletion(marker.sessionFile, binding.identity, proof.checkpointId);
+    if (receipt === null || receipt.head !== facts.sha) return null;
+    const header = readDirectiveSessionHeader(marker.sessionFile);
+    if (header.cwd !== lane.path || header.id !== binding.sessionId) return null;
+    const current = this.directiveCurrentAuthority(marker.jobId);
+    if (current.workRevision !== facts.workRevision || current.contractSha256 !== binding.identity.contractSha256 ||
+        current.authorityEpoch !== binding.identity.authorityEpoch) return null;
+    try { this.assertRecoveryJobPermission(marker.jobId); }
+    catch (error) { if (error instanceof DirectiveCheckpointError) return null; throw error; }
+    const git = readGitState(lane.path);
+    if (git.sha !== facts.sha || git.trackedDirty) return null;
+    return { lane_id: lane.id, lane_path: lane.path, sha: facts.sha, identity: binding.identity,
+      checkpoint_id: proof.checkpointId, binding, receipt };
+  }
+
+  /** Reconstruct only explicit ORIGINAL facts. Today's branch or approval
+   * never supplies a historical SHA/revision. Optional current-lane proof
+   * determines candidate eligibility separately, without executing work. */
+  reconstructCompletedRebriefDelivery(expected: readonly PendingRebriefRecord[], currentLane?: WorktreeLane): EventRecord | null {
     return this.transaction(() => {
       const jobId = expected[0]?.jobId;
       if (jobId === undefined || !this.matchesPendingRebriefGeneration(jobId, expected)) throw new PendingRebriefNoLongerCurrent('superseded');
@@ -3853,10 +3882,16 @@ export class LedgerApi {
       if (!this.matchesPendingRebriefGeneration(jobId, expected)) throw new PendingRebriefNoLongerCurrent('superseded');
       const currentJob = this.getJob(jobId);
       if (currentJob === null || isJobTerminal(currentJob.status)) throw new PendingRebriefNoLongerCurrent('terminal');
-      return this.appendEvent({ kind: 'job.delivered', jobId, agentId: facts.minionId,
+      const candidateProof = this.rebriefCurrentCandidateProof(completion, facts, currentLane);
+      const finalBlockers = candidateProof === null ? [] : this.rebriefProgressBlockers(completion.id, jobId);
+      if (finalBlockers.length > 0) throw new DirectiveCheckpointError(`current candidate producer cessation unproven: ${finalBlockers.join('; ')}`);
+      const reconstructed = this.appendEvent({ kind: 'job.delivered', jobId, agentId: facts.minionId,
         payload: { agentId: facts.minionId, source: 'silas-rebrief', sha: facts.sha, work_revision: facts.workRevision,
+          candidate_delivery_proven: candidateProof !== null, historical_bookkeeping_only: true, current_candidate_proof: candidateProof,
           marker_id: delivery.id, payload_hash: delivery.payloadHash, ...(delivery.phaseId === null ? {} : { phase_id: delivery.phaseId }),
           provenance: { kind: 'original-correlated-completion', event_seq: facts.completionSeq } } });
+      this.ensureReportHandback(jobId, reconstructed.seq);
+      return reconstructed;
     });
   }
 
@@ -3864,8 +3899,9 @@ export class LedgerApi {
    * Potentially relevant conflicting receipts remain explicitly unproven;
    * explicit other generations/jobs do not perturb this subject. */
   rebriefReceiptEvidence(markerId: string): RebriefReceiptEvidence {
-    const marker = this.listPendingRebriefs().find((candidate) => candidate.id === markerId);
-    if (marker === undefined) throw new RecordNotFound(`rebrief marker "${markerId}" not found`);
+    const markerRow = this.db.prepare('SELECT * FROM pending_rebriefs WHERE id = ?').get(markerId) as Row | undefined;
+    if (markerRow === undefined) throw new RecordNotFound(`rebrief marker "${markerId}" not found`);
+    const marker = this.pendingRebriefFromRow(markerRow);
     const group = this.listPendingRebriefs({ jobId: marker.jobId });
     const markers = group.map(({ id, jobId, kind, payloadHash, baselineSeq, phaseId, agentId, sessionFile, workRevision }) =>
       ({ id, jobId, kind, payloadHash, baselineSeq, phaseId, agentId, sessionFile, workRevision }));
@@ -3873,14 +3909,29 @@ export class LedgerApi {
     const phase = phaseRow === null ? null : { phaseId: phaseRow.phaseId, jobId: phaseRow.jobId, source: phaseRow.source,
       requestId: phaseRow.requestId, generation: phaseRow.generation, intentSeq: phaseRow.intentSeq, minionId: phaseRow.minionId };
     const ids = group.map((row) => row.id);
-    const rows = this.db.prepare(`SELECT * FROM events WHERE job_id = ? AND seq > ?
+    const evidenceRows = this.db.prepare(`SELECT seq, ts, kind, agent_id, job_id, round_id, lens,
+      CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload ELSE NULL END AS payload
+      FROM events WHERE job_id = ? AND seq > ?
       AND kind IN ('silas.rebrief', 'job.delivered') AND (
         json_extract(payload, '$.marker_id') IN (${ids.map(() => '?').join(',')})
         OR json_extract(payload, '$.request_id') IN (${ids.map(() => '?').join(',')})
         OR json_extract(payload, '$.phase_id') = ?
         OR (json_extract(payload, '$.marker_id') IS NULL AND json_extract(payload, '$.request_id') IS NULL
-          AND json_extract(payload, '$.phase_id') IS NULL)) ORDER BY seq`).all(
-            marker.jobId, Math.min(...group.map((row) => row.baselineSeq)), ...ids, ...ids, marker.phaseId) as Row[];
+          AND json_extract(payload, '$.phase_id') IS NULL)) ORDER BY seq LIMIT ?`).iterate(
+            MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES, marker.jobId, Math.min(...group.map((row) => row.baselineSeq)),
+            ...ids, ...ids, marker.phaseId, MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS + 1);
+    const rows: Row[] = [];
+    let payloadBytes = 0;
+    for (const row of evidenceRows) {
+      if (rows.length === MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS) {
+        throw new DirectiveCheckpointError(`rebrief receipt evidence exceeds the ${MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS}-event inspection limit; complete history cannot be established`);
+      }
+      if (row.payload !== null) payloadBytes += Buffer.byteLength(str(row.payload), 'utf8');
+      if (row.payload === null || payloadBytes > MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES) {
+        throw new DirectiveCheckpointError(`rebrief receipt evidence exceeds the ${MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES}-byte inspection limit; complete history cannot be established`);
+      }
+      rows.push(row);
+    }
     const receipts = rows.map((row) => {
       const event = this.eventFromRow(row);
       return { seq: event.seq, kind: event.kind, jobId: event.jobId, agentId: event.agentId,
@@ -5519,7 +5570,8 @@ export class LedgerApi {
   /** Bounded completion of this protected recovery duty, never a universal receipt. */
   private assertCurrentGateDutyCompleted(row: ObligationRecord, action: ObligationNextAction, evidenceSeq: number): void {
     const refuse = (message: string): never => { throw new DirectiveCheckpointError(`current gate duty ${message}`); };
-    if (this.getEvent(evidenceSeq)?.kind !== 'round.perkins-review') refuse('cannot be discharged by generic evidence, inspection, historical receipts or prose');
+    const citedReview = this.getEvent(evidenceSeq);
+    if (citedReview?.kind !== 'round.perkins-review') refuse('cannot be discharged by generic evidence, inspection, historical receipts or prose');
     this.assertRecoveryJobPermission(row.jobId);
     if (row.state === 'suspended' || row.claim !== null) refuse('retains suspended or claimed ownership');
     const roots = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind IN ('silas.rebrief-current-gates-owed', 'silas.directive-current-gates-owed') ORDER BY seq").all(row.jobId) as Row[];
@@ -5542,6 +5594,7 @@ export class LedgerApi {
     const current = identity === undefined ? null : this.getDirective(identity.requestId);
     const required = requiredWorkRevision(this.listJobAmendments(row.jobId));
     if (candidate === null || typeof facts?.sha !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(facts.sha) || facts.candidate_delivery_proven !== true || facts.work_revision !== required || identity === undefined || current?.deliverySeq !== candidate.seq || current.nativeTarget === null || !isDeepStrictEqual(this.directiveTurnIdentity(current.requestId), identity) || !isDeepStrictEqual(current.nativeBinding, facts.native_completion?.binding)) refuse('requires positively established current native candidate');
+    if (citedReview!.seq <= candidate!.seq) refuse('review evidence predates the current candidate delivery');
     if (candidate!.seq !== delivery!.seq) {
       const starts = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'silas.directive-producer-ceased' AND json_extract(payload, '$.request_id') = ? ORDER BY seq").all(row.jobId, original!.requestId) as Row[];
       const originalCeased = starts.map((event) => this.eventFromRow(event)).find((event) => {
@@ -5573,7 +5626,7 @@ export class LedgerApi {
     if (attempts === undefined) refuse('requires declared full scheduler attempt');
     const requested = this.eventFromRow(attempts!); const request = requested.payload as Record<string, unknown>;
     const amendedAt = this.latestJobEvent(row.jobId, 'job.amendment-accepted')?.seq ?? 0;
-    if (requested.seq <= Math.max(root!.seq, amendedAt) || request['command'] !== command || request['cwd'] !== lane.path || request['head'] !== facts!.sha || typeof request['request_id'] !== 'string' || typeof request['run_id'] !== 'string') refuse('newest full scheduler request has stale or foreign bindings');
+    if (requested.seq <= Math.max(root!.seq, amendedAt, candidate!.seq) || request['command'] !== command || request['cwd'] !== lane.path || request['head'] !== facts!.sha || typeof request['request_id'] !== 'string' || typeof request['run_id'] !== 'string') refuse('newest full scheduler request has stale or foreign bindings or predates the current candidate delivery');
     const latestFull = this.db.prepare("SELECT payload FROM events WHERE job_id = ? AND kind IN ('verification.requested', 'verification.started', 'verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout') AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
     if (latestFull === undefined || (JSON.parse(str(latestFull.payload)) as { run_id?: unknown }).run_id !== request['run_id']) refuse('newer relevant full attempt is failed or UNKNOWN');
     const lifecycle = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind LIKE 'verification.%' AND json_extract(payload, '$.run_id') = ? ORDER BY seq").all(row.jobId, request['run_id'] as string) as Row[];
@@ -5584,9 +5637,9 @@ export class LedgerApi {
     const started = start?.payload as Record<string, unknown> | undefined;
     if (starts.length !== 1 || terminals.length !== 1 || terminal?.kind !== 'verification.completed' || start!.seq <= requested.seq || terminal.seq <= start!.seq || terminal.seq >= evidenceSeq || !Number.isSafeInteger(started?.['pid']) || Number(started?.['pid']) <= 0 || started?.['command'] !== command || started['cwd'] !== lane.path || started['sha'] !== facts!.sha || run?.['command'] !== command || run['scope'] !== 'full' || run['cwd'] !== lane.path || run['sha'] !== facts!.sha || run['tracked_dirty'] !== false || run['ok'] !== true || run['exit_code'] !== 0 || run['signal'] !== null || run['error'] !== null || run['timed_out'] !== false || !Number.isSafeInteger(run['output_bytes']) || Number(run['output_bytes']) < 0 || typeof run['output_sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(run['output_sha256'])) refuse('newest full scheduler start/terminal/output capture is incomplete, failed or UNKNOWN');
     const round = this.listRounds(row.jobId).at(-1);
-    const review = this.getEvent(evidenceSeq);
+    const review = citedReview;
     const reviewed = review?.payload as Record<string, unknown> | undefined;
-    if (round === undefined || round.status !== 'verdict-posted' || round.verdict !== 'approved' || review?.roundId !== round.id || review.jobId !== row.jobId || review.kind !== 'round.perkins-review' || this.latestRoundEvent(round.id, 'round.perkins-review')?.seq !== review.seq || reviewed?.['canonicalVerdict'] !== 'READY TO MERGE' || reviewed['blockers'] !== 0 || reviewed['complete'] !== true || reviewed['headMoved'] !== false || reviewed['reviewScope'] !== 'whole' || reviewed['finalPassRequired'] === true || reviewed['targetSha'] !== facts!.sha || typeof reviewed['artifactDirectory'] !== 'string') refuse('requires newest actual complete approved whole-change review');
+    if (round === undefined || round.status !== 'verdict-posted' || round.verdict !== 'approved' || review === null || review.seq <= candidate!.seq || review.roundId !== round.id || review.jobId !== row.jobId || review.kind !== 'round.perkins-review' || this.latestRoundEvent(round.id, 'round.perkins-review')?.seq !== review.seq || reviewed?.['canonicalVerdict'] !== 'READY TO MERGE' || reviewed['blockers'] !== 0 || reviewed['complete'] !== true || reviewed['headMoved'] !== false || reviewed['reviewScope'] !== 'whole' || reviewed['finalPassRequired'] === true || reviewed['targetSha'] !== facts!.sha || typeof reviewed['artifactDirectory'] !== 'string') refuse('requires newest actual complete approved whole-change review after the current candidate delivery');
     const bytes = readReviewCheckpointBytes(reviewed!['artifactDirectory'] as string, 'manifest.json', FROZEN_MANIFEST_MAX_BYTES);
     const manifest = JSON.parse(bytes.toString('utf8')) as FrozenReviewInputs;
     const receipt = this.latestRoundEvent(round!.id, 'round.freeze-manifest');
@@ -6405,6 +6458,19 @@ export class LedgerApi {
     if (card !== null) this.resolveNotificationById(card.id, by);
   }
 
+  /** Ensure a durable report handback accompanies every correlated report
+   * delivery. Called inside the owning ledger transaction so a failed open
+   * cannot settle the directive while losing the handback. */
+  private ensureReportHandback(jobId: string, deliveredSeq: number): void {
+    const job = this.getJob(jobId);
+    if (job === null || job.deliverable === null || !isReportDeliverable(job.deliverable)) return;
+    const opened = this.openReportObligation({ jobId, observedAtSeq: deliveredSeq });
+    if (opened.created) {
+      this.appendEvent({ kind: 'job.report-handback', jobId,
+        payload: { obligation_id: opened.obligation.id, delivered_seq: deliveredSeq } });
+    }
+  }
+
   /** One job's rowid (keyset pagination anchor). */
   jobRowid(id: string): number | null {
     const row = this.db.prepare('SELECT rowid AS _rowid FROM jobs WHERE id = ?').get(id) as Row | undefined;
@@ -7088,13 +7154,18 @@ export class LedgerApi {
     if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
     }
-    const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null, ...(input.kind === 'rebrief' ? { request_kind: 'rebrief', rule_id: input.sourceContext?.ruleId ?? null, source_round_id: input.sourceContext?.sourceRoundId ?? null } : {}) });
+    const normalizeSourceContext = (context: { readonly ruleId?: string; readonly sourceRoundId?: string } | null | undefined) =>
+      context === null || context === undefined || context.ruleId === undefined && context.sourceRoundId === undefined ? null :
+        { ...(context.ruleId === undefined ? {} : { ruleId: context.ruleId }), ...(context.sourceRoundId === undefined ? {} : { sourceRoundId: context.sourceRoundId }) };
+    const sourceContext = normalizeSourceContext(input.sourceContext);
+    const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null,
+      ...(input.kind === 'rebrief' ? { request_kind: 'rebrief', rule_id: sourceContext?.ruleId ?? null, source_round_id: sourceContext?.sourceRoundId ?? null } : {}) });
     const payloadHash = createHash('sha256').update(payload).digest('hex');
     return this.transaction(() => {
       if (input.requestId !== undefined) {
         const existing = this.getDirective(input.requestId);
         if (existing !== null) {
-          if (existing.payloadHash !== payloadHash) {
+          if (existing.payloadHash !== payloadHash || !isDeepStrictEqual(normalizeSourceContext(existing.sourceContext), sourceContext)) {
             throw new DirectiveConflictError(
               `directive request "${input.requestId}" was accepted with a different payload — ` +
                 'a request id identifies one exact request; submit the changed work under a new id',
@@ -7173,7 +7244,7 @@ export class LedgerApi {
           this.effectiveContract(input.jobId)?.text ?? null,
           this.effectiveContract(input.jobId)?.contractSha256 ?? createHash('sha256').update('').digest('hex'),
           input.kind ?? 'directive',
-          input.sourceContext === undefined ? null : JSON.stringify(input.sourceContext),
+          sourceContext === null ? null : JSON.stringify(sourceContext),
         );
       // A fresh accepted directive is the separately authorized, identity-
       // checked handoff that supersedes an open retirement hold on this
@@ -7850,7 +7921,7 @@ export class LedgerApi {
     const peers = this.listPendingRebriefs({ jobId: marker.jobId }).filter((row) => row.payloadHash === marker.payloadHash && row.baselineSeq === marker.baselineSeq && row.phaseId === marker.phaseId);
     if (marker.agentId === null || marker.sessionFile === null || marker.workRevision === null || peers.some((row) => row.agentId !== marker.agentId || row.sessionFile !== marker.sessionFile)) return [...blockers, 'original historical native session ownership is unbound/UNKNOWN'];
     try {
-      const header = JSON.parse(readFileSync(marker.sessionFile, 'utf8').split('\n')[0]!) as { type?: unknown; id?: unknown };
+      const header = readDirectiveSessionHeader(marker.sessionFile);
       const owners = inspectDirectiveProducers(marker.sessionFile);
       const epoch = Number((this.db.prepare(`SELECT COALESCE(MAX(seq), 0) AS epoch FROM events WHERE job_id = ? AND seq <= ? AND (${DIRECTIVE_CONTROL_SQL})`).get(marker.jobId, marker.baselineSeq) as Row).epoch);
       const original = owners.filter(({ producer }) => peers.some((row) => row.id === producer.identity.requestId) && producer.identity.jobId === marker.jobId &&
@@ -8148,6 +8219,11 @@ export class LedgerApi {
         throw new Error(`delivery for "${input.requestId}" cites an event whose payload is not correlated to this request`);
       }
       if (row.requestKind !== null && (payload['work_revision'] !== row.workRevision || payload['agentId'] !== row.nativeBinding?.agentId)) throw new DirectiveCheckpointError('original delivery revision/minion identity differs from accepted native admission');
+      // A report handback can fail after the delivery event commits. Retry
+      // the obligation open in the same transaction that records this
+      // correlated terminal receipt, including the landed-delivery recovery
+      // path; the active obligation makes this idempotent.
+      this.ensureReportHandback(row.jobId, event.seq);
       this.db
         .prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
         .run(input.eventSeq, nowIso(), input.requestId);

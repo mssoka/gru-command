@@ -3903,9 +3903,9 @@ async function assertSdkOriginalCompletionHead(mode: 'known' | 'missing' | 'null
         if (refused) expect(delivery).toBeNull();
         else {
           const known = mode === 'known';
-          expect(delivery?.payload).toMatchObject({ request_id: row.requestId, work_revision: 1, sha: known ? originalHead : null, candidate_delivery_proven: known, native_completion: { identity: { requestId: row.requestId, workRevision: 1 }, checkpoint_id: completed[0]!.checkpointId, binding: row.nativeBinding } });
-          expect(ledger.workRevisionState(row.jobId)).toEqual({ required: 1, delivered: known ? 1 : 0 });
-          expect(ledger.correctiveVerificationDebt(row.jobId)).toEqual({ revision: 1, head: known ? originalHead : null });
+          expect(delivery?.payload).toMatchObject({ request_id: row.requestId, work_revision: 1, sha: known ? originalHead : null, candidate_delivery_proven: false, native_completion: { identity: { requestId: row.requestId, workRevision: 1 }, checkpoint_id: completed[0]!.checkpointId, binding: row.nativeBinding } });
+          expect(ledger.workRevisionState(row.jobId)).toEqual({ required: 1, delivered: 0 });
+          expect(ledger.correctiveVerificationDebt(row.jobId)).toEqual({ revision: 1, head: null });
           expect(laneIsBusy(ledger, ledger.getJob(row.jobId)!)).toBe(true);
           expect(ledger.listEvents().filter((event) => event.jobId === row.jobId && event.kind === 'job.delivered')).toHaveLength(1);
           if (!known) expect(ledger.listObligations({ jobId: row.jobId }).some((obligation) => obligation.nextAction.kind === 'gru-decision' && obligation.nextAction.decision.includes('completion HEAD is unproven'))).toBe(true);
@@ -3994,7 +3994,7 @@ async function assertGuardedSdkDelivery(resume: boolean) {
 it('production shared executor permits only its exact streaming SDK producer to run two native tools and deliver', () => assertGuardedSdkDelivery(false));
 it('production checkpoint callback permits its exact streaming SDK producer to run two native tools without prompt replay', () => assertGuardedSdkDelivery(true));
 
-async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook') {
+async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook' | 'manifest-execution-mode') {
   const hook = fault === 'prior-hook-await' || fault.endsWith('-hook');
   const manifest = fault.startsWith('manifest-');
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
@@ -4051,6 +4051,7 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
       const session = f.sessions.at(-1)!;
       if (fault.startsWith('manifest-role')) session.agent.state.systemPrompt = 'unapproved live system authority';
       else if (fault.startsWith('manifest-model')) session.agent.state.model = { ...session.model!, maxTokens: session.model!.maxTokens - 1 };
+      else if (fault === 'manifest-execution-mode') session.agent.toolExecution = 'parallel';
       else session.agent.state.tools = session.agent.state.tools.filter((tool) => tool.name !== 'read');
       expect(f.scene.ledger.directiveTurnIdentity(active.requestId)).toEqual(f.scene.identity);
     } else f.scene.ledger.setJobStatus(active.jobId, 'parked');
@@ -4094,6 +4095,33 @@ it('real SDK model authority mutation refuses effects and final-stop delivery ac
 it('real resumed SDK system authority mutation refuses effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(true, 'manifest-role'));
 it('real SDK tool authority mutation after awaited prior hook retains only its permitted first effect across restart', () => assertProductionSdkFence(false, 'manifest-hook'));
 it('real resumed SDK tool authority mutation after awaited prior hook never gains final-stop delivery on restart', () => assertProductionSdkFence(true, 'manifest-hook'));
+it('real SDK execution-mode mutation refuses native effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(false, 'manifest-execution-mode'));
+
+it('restart authority manifest binds closure context for native tools with identical function source', async () => {
+  const f = await fixture([]);
+  const nativeTool = (scope: string, authorityManifest: string) => ({ name: 'scoped_native_tool', description: 'Scoped native tool',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} }, authorityManifest,
+    async execute() { return { text: scope }; } });
+  const first = await f.runtime.spawn('minion', { cwd: f.workspace, nativeTools: [nativeTool('scope-one', 'parent-capability:one')] });
+  const firstManifest = (first as unknown as { directiveAuthorityManifest(): string }).directiveAuthorityManifest();
+  await first.dispose();
+  const second = await f.runtime.spawn('minion', { cwd: f.workspace, nativeTools: [nativeTool('scope-two', 'parent-capability:two')] });
+  const secondManifest = (second as unknown as { directiveAuthorityManifest(): string }).directiveAuthorityManifest();
+  expect(secondManifest).not.toBe(firstManifest);
+  await second.dispose();
+});
+
+it('refuses directive admission when a custom native tool has no explicit closure-authority manifest', async () => {
+  const f = await fixture([]);
+  const handle = await f.runtime.spawn('minion', { cwd: f.workspace, nativeTools: [{ name: 'unbound_native_tool', description: 'Unbound native tool',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} }, async execute() { return { text: 'must not run' }; } }] });
+  const identity = { requestId: 'unbound-native-authority', payloadHash: 'a'.repeat(64), contractSha256: 'b'.repeat(64), jobId: 'native-authority-job', workRevision: 0, authorityEpoch: 0 };
+  if (handle.promptWithVerdict === undefined) throw new Error('Pi runtime must support directive terminal verdicts');
+  await expect(handle.promptWithVerdict('approved task', { directive: { identity, beforeAdmission: () => {}, onAdmitted: () => {} } }))
+    .rejects.toThrow(/lack stable authority manifests/u);
+  expect(f.script.calls).toHaveLength(0);
+  await handle.dispose();
+});
 
 async function actualDirectiveSdkSession(handle: AgentHandle) {
   const { AgentSession } = await import('@earendil-works/pi-coding-agent');

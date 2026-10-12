@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { LockBusyError, LockUnreadableError, SessionStore } from '../src/sessions/store.js';
+import { SessionLockCoordinationError } from '../src/sessions/lock-coordination.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -66,6 +67,33 @@ describe('SessionStore', () => {
       writeFileSync(`${file}.lock`, JSON.stringify(owner)); store.acquireLockAfterHostExit(file, owner.pid, owner);
       expect(store.ownedLockIdentity(file)).toMatchObject({ host: hostname(), pid: process.pid });
     } finally { probe.mockRestore(); store.dispose(); }
+  });
+
+  it('serializes concurrent native lock reclaimers so neither can delete the replacement owner lock', () => {
+    const dataDir = tmpDataDir(); const first = new SessionStore(dataDir); const second = new SessionStore(dataDir);
+    const file = seedSession(first); const lockFile = first.lockFileFor(file);
+    const predecessor = { host: hostname(), pid: 2_000_000_000, bootId: 'reclaim-race-original', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
+    writeFileSync(lockFile, JSON.stringify(predecessor));
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('absent predecessor'), { code: 'ESRCH' }); });
+    const lockFileAccess = first as unknown as { unlinkLockFile(path: string): void };
+    const unlink = lockFileAccess.unlinkLockFile.bind(first);
+    let nested = false; let secondError: unknown = null;
+    const unlinkSpy = vi.spyOn(lockFileAccess, 'unlinkLockFile').mockImplementation((path) => {
+      if (path === lockFile && !nested) {
+        nested = true;
+        try { second.acquireLockAfterHostExit(file, predecessor.pid, predecessor); } catch (error) { secondError = error; }
+      }
+      unlink(path);
+    });
+    try {
+      first.acquireLockAfterHostExit(file, predecessor.pid, predecessor);
+      expect(nested).toBe(true);
+      expect(secondError).toBeInstanceOf(SessionLockCoordinationError);
+      expect(second.isHeld(file)).toBe(false);
+      expect(first.isHeld(file)).toBe(true);
+      const owner = first.ownedLockIdentity(file);
+      expect(JSON.parse(readFileSync(lockFile, 'utf8'))).toMatchObject(owner);
+    } finally { unlinkSpy.mockRestore(); probe.mockRestore(); first.dispose(); second.dispose(); }
   });
 
   it('derives the sessions dir from the instance data dir with pi-standard role/cwd scoping', () => {

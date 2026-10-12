@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { LedgerApi } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, isDirectiveTerminal } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -228,6 +229,38 @@ export function settleNativeDirective(deps: DirectiveProgressDeps, identity: Dir
   const landed = deps.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
   if (landed !== null && row.state === 'admitted') {
     if (deps.ledger.recoveryOwnerBasis('directive', row.requestId).owned) throw new DirectiveCheckpointError('original receipt remains owned by its explicitly transferred owner reservation');
+    if (row.nativeTarget === null) throw new DirectiveCheckpointError('correlated delivery lacks its persisted native target');
+    reconcileNativeProducer(deps, identity);
+    const proof = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, identity);
+    if (proof.state !== 'terminal' || !proof.ok) throw new DirectiveCheckpointError('correlated delivery lacks an exact successful native terminal checkpoint');
+    const completion = readDirectiveCompletion(row.nativeTarget.sessionFile, identity, proof.checkpointId);
+    const owners = inspectDirectiveProducers(row.nativeTarget.sessionFile, identity);
+    const sessionOwners = inspectDirectiveProducers(row.nativeTarget.sessionFile);
+    if (owners.length === 0 || owners.some(({ evidence }) => evidence !== 'ceased') ||
+        sessionOwners.length === 0 || sessionOwners.some(({ evidence, producer }) => evidence !== 'ceased' || directiveProducerLockBlocker(producer) !== null)) {
+      throw new DirectiveCheckpointError('correlated delivery retains UNKNOWN native physical ownership');
+    }
+    const payload = landed.payload as { request_id?: unknown; agentId?: unknown; sha?: unknown; work_revision?: unknown; candidate_delivery_proven?: unknown; native_completion?: unknown };
+    const job = deps.ledger.getJob(identity.jobId);
+    const currentAuthority = deps.ledger.directiveCurrentAuthority(identity.jobId);
+    const historical = job?.status === 'parked' || currentAuthority.workRevision !== identity.workRevision ||
+      currentAuthority.contractSha256 !== identity.contractSha256 || currentAuthority.authorityEpoch !== identity.authorityEpoch;
+    if (historical && payload.request_id === identity.requestId && payload.agentId === proof.binding.agentId && payload.work_revision === 0 &&
+        payload.candidate_delivery_proven !== true && payload.native_completion == null) {
+      checkAdmissionFences(deps, identity, undefined, undefined, undefined, true);
+      deps.ledger.recordDirectiveDelivery({ requestId: row.requestId, eventSeq: landed.seq });
+      return true;
+    }
+    const native = typeof payload.native_completion === 'object' && payload.native_completion !== null
+      ? payload.native_completion as { identity?: unknown; checkpoint_id?: unknown; binding?: unknown; receipt?: unknown }
+      : null;
+    if (payload.request_id !== identity.requestId || payload.agentId !== proof.binding.agentId || payload.work_revision !== identity.workRevision ||
+        payload.sha !== (completion?.head ?? null) || typeof payload.candidate_delivery_proven !== 'boolean' ||
+        payload.candidate_delivery_proven && (completion === null || completion.head === null) ||
+        native === null || !isDeepStrictEqual(native.identity, identity) || native.checkpoint_id !== proof.checkpointId ||
+        !isDeepStrictEqual(native.binding, proof.binding) || !isDeepStrictEqual(native.receipt, completion)) {
+      throw new DirectiveCheckpointError('correlated delivery does not bind the exact native completion receipt and checkpoint');
+    }
     checkAdmissionFences(deps, identity, undefined, undefined, undefined, true);
     deps.ledger.recordDirectiveDelivery({ requestId: row.requestId, eventSeq: landed.seq });
     return true;

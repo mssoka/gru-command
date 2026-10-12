@@ -2692,6 +2692,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/runtime/worker-errors.js",
   "dist/server.js",
   "dist/service-port-guard.js",
+  "dist/sessions/lock-coordination.js",
   "dist/sessions/store.js",
   "dist/static.js",
   "dist/supervision/supervisor.js",

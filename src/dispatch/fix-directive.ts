@@ -13,6 +13,7 @@ import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { promptVerdictFromHealth, promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import type { PromptOptions, PromptTurnVerdict } from '../runtime/types.js';
 import type { WorktreePort } from './worktree-port.js';
+import { readGitState } from '../verify/scheduler.js';
 import { settleRetries, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 
 /**
@@ -467,13 +468,21 @@ export function recordFollowUpDelivery(input: {
     throw new Error(`delivery work revision must be a non-negative integer, got ${String(input.workRevision)}`);
   }
   const jobLanes = input.worktrees.listWorktrees({ jobId: input.jobId }).filter((lane) => lane.kind === 'job');
-  const lane = jobLanes.find((candidate) => candidate.status !== 'swept') ?? jobLanes[0];
+  const liveJobLanes = jobLanes.filter((candidate) => candidate.status !== 'swept');
+  const lane = liveJobLanes[0] ?? jobLanes[0];
   let sha: string | null = null;
   let note: string | null = null;
+  let candidateDeliveryProven = false;
   if (input.nativeCompletion !== undefined) {
     if (!(input.nativeCompletion.sha === null || typeof input.nativeCompletion.sha === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.nativeCompletion.sha))) throw new Error('original native completion HEAD must be an exact 40/64 hex object ID or null');
     sha = input.nativeCompletion.sha;
     if (sha === null) note = 'original native completion HEAD unproven; current candidate delivery/verification/review remain owed';
+    else if (liveJobLanes.length !== 1 || lane === undefined) note = 'original native completion is preserved, but no unique live job lane proves it is the current candidate';
+    else {
+      const current = readGitState(lane.path);
+      if (current.sha !== sha || current.trackedDirty) note = 'original native completion is preserved, but the live job lane HEAD moved or its tracked tree is dirty; current candidate delivery/verification/review remain owed';
+      else candidateDeliveryProven = true;
+    }
   } else if (lane !== undefined) {
     try {
       sha = resolveGitCommit(lane.path, lane.branch !== null && lane.branch !== '' ? lane.branch : 'HEAD');
@@ -496,7 +505,7 @@ export function recordFollowUpDelivery(input: {
       ...(input.phaseId !== undefined ? { phase_id: input.phaseId } : {}),
       ...(input.rebriefMarker === undefined ? {} : { marker_id: input.rebriefMarker.id, payload_hash: input.rebriefMarker.payloadHash }),
       work_revision: input.workRevision,
-      ...(input.nativeCompletion === undefined ? {} : { native_completion: input.nativeCompletion.provenance, candidate_delivery_proven: sha !== null }),
+      ...(input.nativeCompletion === undefined ? {} : { native_completion: input.nativeCompletion.provenance, candidate_delivery_proven: candidateDeliveryProven }),
     },
   });
   // Issue #220: the report handback's commissioner obligation. A failure

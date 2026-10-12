@@ -1,6 +1,7 @@
 import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
@@ -169,9 +170,11 @@ async function seedPendingRebrief(input: {
   ruleId?: string;
   sourceRoundId?: string;
   bindWorker?: { agentId: string; sessionFile: string | null };
+  deliverable?: 'review' | 'artifact' | 'investigation';
 }): Promise<{ path: string; markers: readonly { id: string; kind: string }[] }> {
   const repo = fixtureRepo();
-  input.h.ledger.addJob({ id: input.jobId, repo: 'fixture', title: 'stuck lane', briefing: input.briefing ?? 'the original contract' });
+  input.h.ledger.addJob({ id: input.jobId, repo: 'fixture', title: 'stuck lane', briefing: input.briefing ?? 'the original contract',
+    ...(input.deliverable === undefined ? {} : { deliverable: input.deliverable }) });
   input.h.ledger.setJobStatus(input.jobId, 'working');
   const lane = await input.h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: input.jobId });
   input.h.lanePath = lane.path;
@@ -727,6 +730,23 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(busSettlements).toBe(1);
   });
 
+  it('reconstructed report delivery opens its handback obligation atomically', async () => {
+    const h = makeHarness(); const jobId = 'reconstructed-report-handback';
+    try {
+      await seedPendingRebrief({ h, jobId, deliverable: 'review' });
+      await bindOriginalRebriefSdkOwner(h.ledger, h.ledger.listPendingRebriefs({ jobId }),
+        { cwd: h.lanePath!, dataDir: h.dir, agentId: 'worker-1' });
+      seedCorrelatedReceipt(h, jobId, 'silas.rebrief');
+      const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
+      await report.settled;
+      expect(report.completed).toBe(1);
+      const delivery = h.ledger.latestJobEvent(jobId, 'job.delivered');
+      expect(delivery).not.toBeNull();
+      expect(h.ledger.findReportObligation(jobId)).toMatchObject({ state: 'open', firstOriginSeq: delivery!.seq });
+      expect(h.ledger.listJobEventsByKinds(jobId, ['job.report-handback'])).toHaveLength(1);
+    } finally { h.close(); }
+  });
+
   it('records only the lost delivery when silas.rebrief already landed', async () => {
     const h = makeHarness();
     const jobId = 'delivery-only-job';
@@ -755,6 +775,184 @@ describe('re-brief restart safety (durable markers)', () => {
       h.ledger.latestJobEvent(jobId, 'job.delivered')?.seq ?? 0,
     );
     expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
+  });
+
+  it('legacy reconstructed delivery preserves original SHA/revision without proving a current candidate', async () => {
+    const h = makeHarness(); const jobId = 'legacy-reconstructed-stale-candidate';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      const contract = h.ledger.effectiveContract(jobId)!;
+      expect(h.ledger.addJobAmendment({ jobId, body: 'accepted material requirement', supersedes: [],
+        approval: { by: 'owner', reference: 'GH-286 stale candidate fixture' }, effect: 'material',
+        expectedContractSha256: contract.contractSha256 }).status).toBe('accepted');
+      const markers = h.ledger.beginPendingRebrief({ jobId, note: 'recover original settled work', briefing: 'original contract' });
+      const oldHead = resolveGitCommit(h.lanePath!, 'HEAD');
+      await bindOriginalRebriefSdkOwner(h.ledger, markers, { cwd: h.lanePath!, dataDir: h.dir, agentId: 'worker-1' });
+      seedCorrelatedReceipt(h, jobId, 'silas.rebrief', 'worker-1', { sha: oldHead });
+      writeFileSync(join(h.lanePath!, 'after-original-delivery.txt'), 'new current candidate\n');
+      const git = (args: readonly string[]): void => { execFileSync('git', ['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', ...args], { cwd: h.lanePath!, stdio: 'ignore' }); };
+      git(['add', 'after-original-delivery.txt']); git(['commit', '-m', 'fixture: advance current candidate']);
+      expect(resolveGitCommit(h.lanePath!, 'HEAD')).not.toBe(oldHead);
+
+      const report = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 });
+      await report.settled;
+      expect(report.completed).toBe(1);
+      const delivery = h.ledger.latestCandidateDelivery(jobId)!;
+      expect(delivery.payload).toMatchObject({ sha: oldHead, work_revision: 1, historical_bookkeeping_only: true, candidate_delivery_proven: false });
+      expect(h.ledger.workRevisionState(jobId)).toEqual({ required: 1, delivered: 0 });
+      expect(h.ledger.correctiveVerificationDebt(jobId)).toEqual({ revision: 1, head: null });
+    } finally { h.close(); }
+  });
+
+  async function originalCurrentCandidate(jobId: string) {
+    const h = makeHarness();
+    await seedPendingRebrief({ h, jobId });
+    const contract = h.ledger.effectiveContract(jobId)!;
+    expect(h.ledger.addJobAmendment({ jobId, body: 'approved corrective scope', supersedes: [],
+      approval: { by: 'owner', reference: 'GH-286 current candidate fixture' }, effect: 'material',
+      expectedContractSha256: contract.contractSha256 }).status).toBe('accepted');
+    const markers = h.ledger.beginPendingRebrief({ jobId, note: 'original correction', briefing: 'approved scope' });
+    await bindOriginalRebriefSdkOwner(h.ledger, markers, { cwd: h.lanePath!, dataDir: h.dir, agentId: 'worker-1' });
+    const head = resolveGitCommit(h.lanePath!, 'HEAD');
+    seedCorrelatedReceipt(h, jobId, 'silas.rebrief', 'worker-1', { sha: head });
+    return { h, head, markers: h.ledger.listPendingRebriefs({ jobId }),
+      lane: h.worktrees.listWorktrees({ jobId }).find((row) => row.kind === 'job')! };
+  }
+
+  it('reconstructed delivery establishes current eligibility only with exact native identity and clean original-lane HEAD', async () => {
+    const jobId = 'legacy-current-candidate-proven'; const { h, head, markers, lane } = await originalCurrentCandidate(jobId);
+    try {
+      const delivery = h.ledger.reconstructCompletedRebriefDelivery(markers, lane)!;
+      expect(delivery.payload).toMatchObject({ sha: head, work_revision: 1, historical_bookkeeping_only: true,
+        candidate_delivery_proven: true, current_candidate_proof: { lane_id: lane.id, lane_path: lane.path, sha: head,
+          identity: { jobId, workRevision: 1, requestId: markers.find((row) => row.kind === 'silas.rebrief')!.id } } });
+      expect(h.ledger.workRevisionState(jobId)).toEqual({ required: 1, delivered: 1 });
+      expect(h.ledger.correctiveVerificationDebt(jobId)).toEqual({ revision: 1, head });
+    } finally { h.close(); }
+  });
+
+  it('reconstructed delivery never proves a same-HEAD candidate whose tracked tree is dirty', async () => {
+    const jobId = 'legacy-dirty-current-candidate'; const { h, head, markers, lane } = await originalCurrentCandidate(jobId);
+    try {
+      writeFileSync(join(lane.path, 'README.md'), 'uncommitted current changes\n');
+      const delivery = h.ledger.reconstructCompletedRebriefDelivery(markers, lane)!;
+      expect(delivery.payload).toMatchObject({ sha: head, work_revision: 1, candidate_delivery_proven: false });
+      expect((delivery.payload as { current_candidate_proof?: unknown }).current_candidate_proof ?? null).toBeNull();
+      expect(h.ledger.workRevisionState(jobId)).toEqual({ required: 1, delivered: 0 });
+      expect(h.ledger.correctiveVerificationDebt(jobId)).toEqual({ revision: 1, head: null });
+    } finally { h.close(); }
+  });
+
+  it('reconstructed delivery never proves a same-HEAD candidate under a later changed approved contract', async () => {
+    const jobId = 'legacy-changed-current-contract'; const { h, head, markers, lane } = await originalCurrentCandidate(jobId);
+    try {
+      const contract = h.ledger.effectiveContract(jobId)!;
+      expect(h.ledger.addJobAmendment({ jobId, body: 'updated approved administrative context', supersedes: [],
+        approval: { by: 'owner', reference: 'GH-286 later authority fixture' }, effect: 'administrative',
+        expectedContractSha256: contract.contractSha256 }).status).toBe('accepted');
+      const delivery = h.ledger.reconstructCompletedRebriefDelivery(markers, lane)!;
+      expect(delivery.payload).toMatchObject({ sha: head, work_revision: 1, candidate_delivery_proven: false });
+      expect((delivery.payload as { current_candidate_proof?: unknown }).current_candidate_proof ?? null).toBeNull();
+      expect(h.ledger.workRevisionState(jobId)).toEqual({ required: 1, delivered: 0 });
+      expect(h.ledger.correctiveVerificationDebt(jobId)).toEqual({ revision: 1, head: null });
+    } finally { h.close(); }
+  });
+
+  it('retries a failed historical group on the next bounded pass instead of waiting for cursor wraparound', async () => {
+    const h = makeHarness();
+    try {
+      await seedPendingRebrief({ h, jobId: 'retry-cursor-first' }); seedHistoricalCompletion(h, 'retry-cursor-first');
+      await seedPendingRebrief({ h, jobId: 'retry-cursor-second' }); seedHistoricalCompletion(h, 'retry-cursor-second');
+      const restore = failSettlementPublication(h.ledger, new Error('first historical settlement fails'));
+      try {
+        await expect(reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 1 }))
+          .rejects.toThrow(/first historical settlement fails/);
+      } finally { restore(); }
+
+      h.db.close();
+      const restartedDb = new LedgerDb(h.dir);
+      h.db = restartedDb;
+      h.ledger = new LedgerApi(restartedDb.handle, { bus: h.bus });
+      h.notifications = new NotificationCenter({ ledger: h.ledger, bus: h.bus });
+      h.close = () => restartedDb.close();
+      const retry = await reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 1 });
+      await retry.settled;
+      expect(retry.completed).toBe(2);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'retry-cursor-first' })).toHaveLength(0);
+      expect(h.ledger.listPendingRebriefs({ jobId: 'retry-cursor-second' })).toHaveLength(0);
+    } finally { h.close(); }
+  });
+
+  it('refuses oversized per-job receipt history instead of producing a truncated evidence digest', async () => {
+    const h = makeHarness(); const jobId = 'bounded-rebrief-receipt-evidence';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      for (let index = 0; index < 4_097; index += 1) {
+        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { unmarked_receipt_fixture: index } });
+      }
+      const marker = h.ledger.listPendingRebriefs({ jobId })[0]!;
+      expect(() => h.ledger.rebriefReceiptEvidence(marker.id)).toThrow(/rebrief receipt evidence exceeds the 4096-event inspection limit/);
+    } finally { h.close(); }
+  });
+
+  it('accepts the complete receipt evidence at the event inspection limit', async () => {
+    const h = makeHarness(); const jobId = 'rebrief-receipt-evidence-at-limit';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      for (let index = 0; index < 4_096; index += 1) {
+        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { unmarked_receipt_fixture: index } });
+      }
+      const marker = h.ledger.listPendingRebriefs({ jobId })[0]!;
+      const evidence = h.ledger.rebriefReceiptEvidence(marker.id);
+      expect(evidence.receipts).toHaveLength(4_096);
+      expect(evidence.receipts[0]?.payload).toEqual({ unmarked_receipt_fixture: 0 });
+      expect(evidence.receipts.at(-1)?.payload).toEqual({ unmarked_receipt_fixture: 4_095 });
+      expect(h.ledger.rebriefReceiptEvidence(marker.id).sha256).toBe(evidence.sha256);
+    } finally { h.close(); }
+  });
+
+  it('refuses oversized receipt payloads and cumulative bytes instead of hashing partial evidence', async () => {
+    const h = makeHarness(); const jobId = 'rebrief-receipt-evidence-byte-limit';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { detail: '界'.repeat(3 * 1024 * 1024) } });
+      const marker = h.ledger.listPendingRebriefs({ jobId })[0]!;
+      expect(() => h.ledger.rebriefReceiptEvidence(marker.id)).toThrow(/rebrief receipt evidence exceeds the 8388608-byte inspection limit/);
+
+      const otherJob = 'rebrief-receipt-evidence-cumulative-byte-limit';
+      await seedPendingRebrief({ h, jobId: otherJob });
+      const otherMarker = h.ledger.listPendingRebriefs({ jobId: otherJob })[0]!;
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: otherJob, payload: { detail: 'a'.repeat(5 * 1024 * 1024) } });
+      expect(h.ledger.rebriefReceiptEvidence(otherMarker.id).receipts).toHaveLength(1);
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: otherJob, payload: { detail: 'b'.repeat(5 * 1024 * 1024) } });
+      expect(() => h.ledger.rebriefReceiptEvidence(otherMarker.id)).toThrow(/rebrief receipt evidence exceeds the 8388608-byte inspection limit/);
+    } finally { h.close(); }
+  });
+
+  it('a repeatedly failed historical retry does not starve the bounded main page', async () => {
+    const h = makeHarness();
+    try {
+      for (const jobId of ['failed-retry-first', 'successful-main-second', 'successful-main-third']) {
+        await seedPendingRebrief({ h, jobId }); seedHistoricalCompletion(h, jobId);
+      }
+      const clear = h.ledger.clearPendingRebriefsIfCurrentAndSettle.bind(h.ledger);
+      const fault = vi.spyOn(h.ledger, 'clearPendingRebriefsIfCurrentAndSettle').mockImplementation((markers) => {
+        if (markers[0]?.jobId === 'failed-retry-first') throw new Error('persistent historical settlement failure');
+        return clear(markers);
+      });
+      const deps = { registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications };
+      try {
+        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).rejects.toThrow(/persistent historical settlement failure/);
+        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).rejects.toThrow(/persistent historical settlement failure/);
+        expect(h.ledger.listPendingRebriefs({ jobId: 'successful-main-second' })).toHaveLength(0);
+        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).rejects.toThrow(/persistent historical settlement failure/);
+        expect(h.ledger.listPendingRebriefs({ jobId: 'successful-main-third' })).toHaveLength(0);
+        expect(h.ledger.listPendingRebriefs({ jobId: 'failed-retry-first' })).toHaveLength(2);
+      } finally { fault.mockRestore(); }
+      const recovered = await reconcilePendingRebriefs(deps, { limit: 1 });
+      expect(recovered.completed).toBe(1);
+      expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
+    } finally { h.close(); }
   });
 
   it("historical a recovery turn that resolves with an in-band error records no guarded events and keeps the markers (r4 blocker 1): zero replay and concrete Gru judgment", async () => {

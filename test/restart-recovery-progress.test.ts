@@ -1,6 +1,6 @@
-import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
+import { bindOriginalRebriefSdkOwner, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -11,12 +11,12 @@ import { EventBus } from '../src/events/bus.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { PiAgentHandle, PI_CAPABILITIES } from '../src/runtime/pi-adapter.js';
-import { inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, readDirectiveBinding } from '../src/runtime/directive-checkpoint.js';
+import { inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveCompletion, recordDirectiveProducerCessation, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader } from '../src/runtime/directive-checkpoint.js';
 import { DirectiveProgressService, executeAcceptedDirective, settleNativeDirective, surfaceDirectiveRecovery } from '../src/dispatch/directive-progress.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute } from '../src/dispatch/directive-recovery.js';
-import { reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
+import { reconcilePendingLegacyDirectives, reconcilePendingRebriefs, settleDirectivesFromEvidence } from '../src/dispatch/rebrief-recovery.js';
 import type { AgentHandle, SpawnOptions } from '../src/runtime/types.js';
-import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import { recordFollowUpDelivery, type DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
 import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
@@ -219,6 +219,38 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.getEvent(event.seq)?.payload).toBe('historical opaque delivery'); expect(f.ledger.getDirective(f.intent.requestId)?.nativeBinding).toBeNull();
   });
 
+  it('refuses oversized native transcripts before parsing or checkpointing', async () => {
+    const f = await fixture(); f.seed();
+    truncateSync(f.file, 32 * 1024 * 1024 + 1);
+    expect(() => inspectDirectiveCheckpoint(f.file, f.identity)).toThrow(/native transcript exceeds the .* inspection limit/);
+    expect(() => inspectDirectiveAdmission(f.file, f.identity)).toThrow(/native transcript exceeds the .* inspection limit/);
+    expect(() => readDirectiveSessionHeader(f.file)).toThrow(/native transcript exceeds the .* inspection limit/);
+  });
+
+  it('refuses oversized native association and producer journals before parsing', async () => {
+    const associations = await fixture(); associations.seed();
+    truncateSync(`${associations.file}.directives.jsonl`, 4 * 1024 * 1024 + 1);
+    expect(() => readDirectiveBinding(associations.file, associations.identity.requestId)).toThrow(/directive native association exceeds the .* inspection limit/);
+
+    const producers = await fixture(); producers.seed();
+    truncateSync(`${producers.file}.producers.jsonl`, 4 * 1024 * 1024 + 1);
+    expect(() => inspectDirectiveProducers(producers.file, producers.identity)).toThrow(/native producer journal exceeds the .* inspection limit/);
+  });
+
+  it('refuses excessive JSONL entry counts before splitting the evidence into arrays', async () => {
+    const transcript = await fixture(); transcript.seed();
+    writeFileSync(transcript.file, '{}\n'.repeat(250_001));
+    expect(() => inspectDirectiveCheckpoint(transcript.file, transcript.identity)).toThrow(/native transcript exceeds the entry inspection limit/);
+
+    const association = await fixture(); association.seed();
+    writeFileSync(`${association.file}.directives.jsonl`, '{}\n'.repeat(100_001));
+    expect(() => readDirectiveBinding(association.file, association.identity.requestId)).toThrow(/directive native association exceeds the entry inspection limit/);
+
+    const producer = await fixture(); producer.seed();
+    writeFileSync(`${producer.file}.producers.jsonl`, '{}\n'.repeat(100_001));
+    expect(() => inspectDirectiveProducers(producer.file, producer.identity)).toThrow(/native producer journal exceeds the entry inspection limit/);
+  });
+
   it('an old open owner stop survives 1001 newer unrelated cards without starving another job or automatic acknowledgement', async () => {
     const f = await fixture();
     const stop = f.notifications.postIncident({ kind: 'original-owner-stop', routing: 'needs-owner', severity: 'error', title: 'owner only', agentId: 'logical-minion', dedupe: 'active' });
@@ -312,7 +344,60 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
     expect(readFileSync(f.file, 'utf8')).toBe(bytes);
   }
-  it('rejects a stale terminal before a later user tail', () => assertStaleTerminalTail('user'));
+  it('keeps an exact completed checkpoint readable after a later distinct request is durably admitted on the same session', async () => {
+    const f = await fixture(); f.seed(); f.native.finish();
+    const original = inspectDirectiveCheckpoint(f.file, f.identity);
+    expect(original).toMatchObject({ state: 'terminal', ok: true });
+    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+    const delivery = f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.intent.jobId,
+      payload: { request_id: f.intent.requestId, agentId: 'logical-minion', work_revision: f.identity.workRevision } });
+    f.ledger.recordDirectiveDelivery({ requestId: f.intent.requestId, eventSeq: delivery.seq });
+    const later = f.ledger.beginDirectiveIntent({ jobId: f.intent.jobId, requestId: 'later-bound-native-turn', directive: 'separate accepted turn', holder: 'gru' }).record;
+    const identity = f.ledger.directiveTurnIdentity(later.requestId);
+    f.ledger.prepareDirectiveTarget(later.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+    prepareDirectiveBinding({ identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
+      sessionFile: f.file, text: 'separate accepted turn', authorityManifest: 'separate accepted fixture authority' });
+    f.native.append({ role: 'user', content: [{ type: 'text', text: 'separate accepted turn' }] });
+    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, identity));
+    expect(inspectDirectiveCheckpoint(f.file, f.identity)).toEqual(original);
+    expect(inspectDirectiveCheckpoint(f.file, identity).state).toBe('resumable');
+
+    const gap = await fixture(); gap.seed(); gap.native.finish();
+    gap.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(gap.file, gap.identity));
+    const priorDelivery = gap.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: gap.intent.jobId,
+      payload: { request_id: gap.intent.requestId, agentId: 'logical-minion', work_revision: gap.identity.workRevision } });
+    gap.ledger.recordDirectiveDelivery({ requestId: gap.intent.requestId, eventSeq: priorDelivery.seq });
+    gap.native.append({ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'unbound intervening native turn' }] });
+    const successor = gap.ledger.beginDirectiveIntent({ jobId: gap.intent.jobId, requestId: 'bound-after-unknown-gap', directive: 'later separately accepted turn', holder: 'gru' }).record;
+    const successorIdentity = gap.ledger.directiveTurnIdentity(successor.requestId);
+    gap.ledger.prepareDirectiveTarget(successor.requestId, { agentId: 'logical-minion', sessionFile: gap.file });
+    prepareDirectiveBinding({ identity: successorIdentity, runtime: 'pi', agentId: 'logical-minion', sessionId: gap.native.sessionId,
+      sessionFile: gap.file, text: 'later separately accepted turn', authorityManifest: 'separate accepted fixture authority' });
+    gap.native.append({ role: 'user', content: [{ type: 'text', text: 'later separately accepted turn' }] });
+    gap.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(gap.file, successorIdentity));
+    expect(inspectDirectiveCheckpoint(gap.file, gap.identity).state).toBe('unknown');
+  });
+  it('rejects a native checkpoint with duplicate entry IDs', async () => {
+    const f = await fixture(); f.seed();
+    const user = JSON.parse(readFileSync(f.file, 'utf8').trimEnd().split('\n').at(-1)!) as { id: string };
+    appendFileSync(f.file, `${JSON.stringify({ type: 'message', id: user.id, parentId: user.id,
+      message: { role: 'assistant', stopReason: 'stop', content: [] } })}\n`);
+    expect(inspectDirectiveCheckpoint(f.file, f.identity).state).toBe('unknown');
+  });
+  it('uses the actual Pi ancestry after model and thinking control entries when preparing a directive baseline', async () => {
+    const f = await fixture();
+    const modelChange = { type: 'model_change', id: 'model-change-before-directive', parentId: null, provider: 'fixture', modelId: 'model', timestamp: Date.now() };
+    const thinkingChange = { type: 'thinking_level_change', id: 'thinking-change-before-directive', parentId: modelChange.id, thinkingLevel: 'high', timestamp: Date.now() };
+    appendFileSync(f.file, `${JSON.stringify(modelChange)}\n${JSON.stringify(thinkingChange)}\n`);
+    f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+    const binding = prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
+      sessionFile: f.file, text: 'accepted native prompt', authorityManifest: 'current fixture authority' });
+    expect(binding.baseline).toBe(thinkingChange.id);
+    f.native.append({ role: 'user', content: [{ type: 'text', text: 'accepted native prompt' }] });
+    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+    expect(inspectDirectiveCheckpoint(f.file, f.identity).state).toBe('resumable');
+  });
+  it('rejects a stale terminal before an unbound later user tail', () => assertStaleTerminalTail('user'));
   it('rejects a stale terminal before a later branch tail', () => assertStaleTerminalTail('branch'));
   it('rejects a stale terminal before a later assistant tail', () => assertStaleTerminalTail('assistant'));
   it('rejects a stale terminal before a later partial tail', () => assertStaleTerminalTail('partial'));
@@ -401,6 +486,33 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.latestJobEvent(row.jobId, 'job.delivered')).toBeNull();
   });
 
+  it('correlated job.delivered cannot settle an admitted native turn without a terminal checkpoint', async () => {
+    const f = await fixture(); f.seed();
+    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+    const forged = f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.intent.jobId, payload: { request_id: f.intent.requestId, agentId: 'logical-minion', work_revision: f.identity.workRevision } });
+    expect(() => settleNativeDirective(f.deps, f.identity)).toThrow(/successful native terminal checkpoint/u);
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'admitted', deliverySeq: null });
+    expect(f.ledger.getEvent(forged.seq)).toEqual(forged);
+  });
+
+  it('exact correlated native completion event reconciles idempotently only after terminal and cessation proof', async () => {
+    const f = await fixture(); f.seed(); f.native.finish();
+    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+    const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+    expect(proof.state).toBe('terminal'); if (proof.state !== 'terminal') throw new Error('fixture must produce terminal checkpoint');
+    const producer = inspectDirectiveProducers(f.file, f.identity).at(-1)!.producer;
+    const head = resolveGitCommit(f.lane.path, 'HEAD');
+    recordDirectiveCompletion(producer, proof.checkpointId, head);
+    const receipt = readDirectiveCompletion(f.file, f.identity, proof.checkpointId);
+    expect(receipt).not.toBeNull();
+    const event = recordFollowUpDelivery({ ledger: f.ledger, worktrees: f.worktrees, jobId: f.intent.jobId, agentId: 'logical-minion',
+      source: 'silas-directive', requestId: f.intent.requestId, workRevision: f.identity.workRevision,
+      nativeCompletion: { sha: head, provenance: { identity: f.identity, checkpoint_id: proof.checkpointId, binding: proof.binding,
+        receipt, physical_cessation: inspectDirectiveProducers(f.file, f.identity) } } });
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'settled', deliverySeq: event.eventSeq });
+  });
+
   it('current-protocol event-only sent and delivery cannot bind admission or settle through durable reconciliation', async () => {
     const f = await fixture();
     const sent = f.ledger.appendCustomEvent({ jobId: f.intent.jobId, kind: 'silas.directive-sent', payload: { request_id: f.intent.requestId, minion_id: 'logical-minion' } });
@@ -409,6 +521,34 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const { reconcilePendingDirectives } = await import('../src/dispatch/rebrief-recovery.js');
     reconcilePendingDirectives(f.deps);
     expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'dispatching', nativeBinding: null, admissionSeq: null, deliverySeq: null });
+  });
+  it('durable event-only reconciliation cannot settle a bound current request without native terminal proof', async () => {
+    const f = await fixture();
+    f.seed();
+    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+    f.ledger.appendCustomEvent({ jobId: f.intent.jobId, kind: 'job.delivered', payload: {
+      request_id: f.intent.requestId, agentId: 'logical-minion', work_revision: f.identity.workRevision,
+    } });
+    const report = settleDirectivesFromEvidence({ ledger: f.ledger });
+    expect(report).toMatchObject({ examined: 1, completed: 0, failed: 0 });
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'admitted', deliverySeq: null });
+  });
+  it('boot progress preserves correlated completion recovery for pre-native legacy requests', async () => {
+    const f = await fixture();
+    markHistoricalDirectiveFixture(f.ledger, f.intent.requestId);
+    const sent = f.ledger.appendCustomEvent({ jobId: f.intent.jobId, kind: 'silas.directive-sent',
+      payload: { request_id: f.intent.requestId, minion_id: 'logical-minion' } });
+    const delivered = f.ledger.appendCustomEvent({ jobId: f.intent.jobId, kind: 'job.delivered',
+      payload: { request_id: f.intent.requestId, source: 'silas-directive' } });
+    const bootReport = reconcilePendingLegacyDirectives({ ledger: f.ledger, notifications: f.notifications });
+    expect(bootReport).toMatchObject({ examined: 1, completed: 1, escalated: 0 });
+    const service = new DirectiveProgressService(f.deps);
+    service.reconsider();
+    await service.settled();
+    expect(f.ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'settled', admissionSeq: sent.seq, deliverySeq: delivered.seq });
+    expect(f.ledger.listObligations({ jobId: f.intent.jobId }).filter((row) => row.incidentKey === `directive-recovery:${f.intent.requestId}`)).toEqual([]);
+    expect(f.spawns).toEqual([]);
+    await service.dispose();
   });
   it('actual admitted original host exit continues once on the same persisted native lane, including live and frozen-owner refusals', async () => {
     const f = await fixture();
