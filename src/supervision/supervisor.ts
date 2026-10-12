@@ -374,6 +374,10 @@ export class Supervisor {
   /** Late-bound restart specialization (issue #161; see the option doc). */
   private restartPolicyFor: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined;
   private readonly agents = new Map<string, SupervisedAgent>();
+  /** Rejected replacements are never job-bound/adopted. Their cleanup
+   * ownership must still fence the captured job, including when disposal
+   * rejects after the registry has already removed the handle. */
+  private readonly rejectedRestartCleanup = new Map<AgentHandle, string>();
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
   private restoredStops = new Map<string, AgentSupervisionView>();
@@ -1836,6 +1840,13 @@ export class Supervisor {
           await this.registry.disposeHandle(spawned).catch(() => {});
           return;
         }
+        // Spawn is an authority boundary too: the registry tap has already
+        // observed this handle, but a newer native handoff may have won
+        // during creation. Never bind/adopt it or notify ownership swaps.
+        if (!this.recoveryAuthorityCurrent(agent, agent.pendingRecovery)) {
+          await this.rejectRestartReplacement(agent, spawned, reason);
+          return;
+        }
         if (predecessor !== null) {
           try {
             this.ledger.registerAgent({
@@ -1909,6 +1920,78 @@ export class Supervisor {
       }
     } finally {
       // (the outer restartRung owns inRestart/state settlement)
+    }
+  }
+
+  /** Dispose a replacement that no longer owns its captured job authority.
+   * Registry tap adoption is neutral, not permission. Quarantine that
+   * record before awaiting cleanup so its events cannot start another rung.
+   * Only a resolved disposal acknowledges cessation; even a disposed event
+   * followed by rejection leaves explicit, job-specific ownership debt. */
+  private async rejectRestartReplacement(
+    agent: SupervisedAgent,
+    spawned: AgentHandle,
+    reason: string,
+  ): Promise<void> {
+    const recovery = agent.pendingRecovery;
+    const jobId = recovery?.jobId ?? this.ledger.getAgent(agent.agentId)?.jobId ?? null;
+    if (jobId !== null) this.rejectedRestartCleanup.set(spawned, jobId);
+    const observed = this.agents.get(spawned.id);
+    if (observed?.handle === spawned) {
+      this.clearRateLimitRetry(observed, 'superseded');
+      this.clearRecoveryAdmission(observed);
+      if (observed.backoffTimer !== null) clearTimeout(observed.backoffTimer);
+      this.agents.delete(spawned.id);
+    }
+    let cleanupError: string | null = null;
+    try {
+      await this.registry.disposeHandle(spawned);
+      this.rejectedRestartCleanup.delete(spawned);
+      if (agent.pendingRecovery === recovery) agent.pendingRecovery = null;
+      // Preserve durable history, not a dead in-process recovery owner.
+      if (this.agents.get(agent.agentId) === agent && agent.handle === null) {
+        this.agents.delete(agent.agentId);
+      }
+    } catch (error) {
+      cleanupError = String(error);
+      agent.state = 'stopped';
+      this.log('error', 'superseded restart replacement cleanup unconfirmed', {
+        agent_id: agent.agentId,
+        replacement_agent_id: spawned.id,
+        job_id: jobId,
+        error: cleanupError,
+      });
+    }
+    try {
+      this.ledger.appendCustomEvent({
+        kind: 'supervision.restart-rejected',
+        agentId: agent.agentId,
+        jobId,
+        payload: {
+          reason,
+          replacement_agent_id: spawned.id,
+          authority_epoch: recovery?.authorityEpoch ?? null,
+          disposition: cleanupError === null ? 'disposed' : 'cleanup-unconfirmed',
+          ...(cleanupError !== null ? { error: cleanupError } : {}),
+        },
+      });
+    } catch (error) {
+      this.log('warn', 'restart rejection audit could not be recorded', { agent_id: agent.agentId, error: String(error) });
+    }
+    if (cleanupError !== null) {
+      try {
+        this.notifications.post({
+          kind: 'supervision.restart-cleanup-unconfirmed',
+          routing: 'needs-owner',
+          severity: 'error',
+          title: `Superseded minion ${spawned.id}: cleanup is unconfirmed`,
+          detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused before adoption, but disposal failed: ${cleanupError}. ` +
+            'Producer ownership remains unknown. Confirm cleanup before retiring or resuming the lane; no automatic restart is authorized.',
+          agentId: agent.agentId,
+        });
+      } catch (error) {
+        this.log('error', 'restart cleanup notification could not be posted', { agent_id: agent.agentId, error: String(error) });
+      }
     }
   }
 
@@ -2420,7 +2503,10 @@ export class Supervisor {
    * queued retry or undecided recovery is still producer ownership even
    * while its durable agent row says idle/error/disposed. */
   pendingProducerBlockers(jobId: string): readonly string[] {
-    return this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
+    const rejected = [...this.rejectedRestartCleanup]
+      .filter(([, ownedJobId]) => ownedJobId === jobId)
+      .map(([handle]) => `restart cleanup unconfirmed: ${handle.id}`);
+    const supervised = this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
       const agent = this.agents.get(row.id);
       if (agent === undefined) {
         return this.registry.getHandle(row.id) !== null
@@ -2432,6 +2518,7 @@ export class Supervisor {
       const open = agent.openTurn || agent.openControl || agent.openToolCalls.size > 0;
       return pending || open ? [`supervised producer: ${row.id} (${pending ? 'pending recovery/retry' : 'open turn/control/tool'})`] : [];
     });
+    return [...rejected, ...supervised];
   }
 
   /** Board feed: supervision view for one agent id (or null). */
