@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { isValidSnapshot } from '../web/src/lib/board-protocol.js';
@@ -13,7 +13,11 @@ import {
   type RepoRef,
 } from '../src/dispatch/github-poll.js';
 import { repoRemote } from '../src/dispatch/review-path.js';
-import { gitProbeEnvironment } from '../src/repos/managed-names.js';
+import {
+  gitProbeEnvironment,
+  resolveManagedRepoPath,
+  resolveManagedRepoPathSync,
+} from '../src/repos/managed-names.js';
 import {
   GhRepoOverviewApi,
   ManagedRepoOverviewTracker,
@@ -135,6 +139,7 @@ interface Harness {
   readonly resolveGates: Map<string, Promise<void>>;
   readonly unavailableNames: Set<string>;
   resolveError: boolean;
+  resolveRootError: boolean;
   resolveDelayMs: number;
   readonly clock: { ms: number };
   readonly sleeps: number[];
@@ -168,6 +173,7 @@ function harness(options: {
     resolveGates: new Map<string, Promise<void>>(),
     unavailableNames: new Set<string>(),
     resolveError: false,
+    resolveRootError: false,
     resolveDelayMs: 0,
     clock,
     sleeps,
@@ -179,9 +185,12 @@ function harness(options: {
     managedRepos: names,
     api,
     scanRepos: () => state.names,
-    resolveRepoPath: (_workspaceRoot, name) => state.unavailableNames.has(name)
-      ? { kind: 'unavailable', reason: 'selected repository is unavailable under workspace_root' }
-      : { kind: 'available', path: `/ws/${name}` },
+    resolveRepoPath: (_workspaceRoot, name) => {
+      if (state.resolveRootError) throw new Error('temporary Git root probe failure');
+      return state.unavailableNames.has(name)
+        ? { kind: 'unavailable', reason: 'selected repository is unavailable under workspace_root' }
+        : { kind: 'available', path: `/ws/${name}` };
+    },
     resolveRemote: async (repoPath) => {
       const name = repoPath.split('/').pop() as string;
       const gate = state.resolveGates.get(name);
@@ -280,6 +289,35 @@ describe('managed repo overview tracker — registry and identity', () => {
     expect(entry.link).toBe('https://github.com/acme/alpha');
     expect(entry.linkReason).toBeNull();
     expect(entry.fullName).toBe('acme/alpha');
+  });
+
+  it('preserves cached observations and withholds provider polling after a transient root-probe failure', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 8 });
+    const h = harness({ api });
+    const successful = await h.tracker.refresh();
+    const original = row(successful, 'alpha');
+    const callsBeforeFailure = api.calls.length;
+
+    h.clock.ms += 1_000;
+    h.resolveRootError = true;
+    const failed = await h.tracker.refresh();
+    const stale = row(failed, 'alpha');
+    expect(stale.linked).toBe(true);
+    expect(stale.fullName).toBe(original.fullName);
+    expect(stale.openPrs).toBe(original.openPrs);
+    expect(stale.openIssues).toBe(original.openIssues);
+    expect(stale.run).toEqual(original.run);
+    expect(stale.checkedAt).toBe(original.checkedAt);
+    expect(stale.lastAttemptAt).not.toBe(original.lastAttemptAt);
+    expect(stale.error).toContain('temporary Git root probe failure');
+    expect(stale.freshness).toBe('stale');
+    expect(api.calls).toHaveLength(callsBeforeFailure);
+
+    h.resolveRootError = false;
+    const recovered = await h.tracker.refresh();
+    expect(row(recovered, 'alpha').freshness).toBe('fresh');
+    expect(row(recovered, 'alpha').error).toBeNull();
+    expect(api.calls.length).toBeGreaterThan(callsBeforeFailure);
   });
 
   it('drops the previous observation when the remote identity changes or disappears', async () => {
@@ -1399,7 +1437,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       }).trim();
       expect(redirectedHome).toBe('https://github.com/acme/foreign.git');
       vi.stubEnv('HOME', homeRoot);
-      expect(gitProbeEnvironment()).not.toHaveProperty('HOME');
+      expect(gitProbeEnvironment()).toHaveProperty('HOME', userInfo().homedir);
       await expectSelectedProviderCalls();
       vi.unstubAllEnvs();
 
@@ -1454,6 +1492,129 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       rmSync(root, { recursive: true, force: true });
       rmSync(emptyPath, { recursive: true, force: true });
     }
+  });
+
+  it('preserves trusted global Git config while replacing inherited home and config overrides', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-trusted-git-home-'));
+    const workspace = join(root, 'workspace');
+    const trustedHome = join(root, 'account-home');
+    const inheritedHome = join(root, 'inherited-home');
+    const selected = join(workspace, 'selected');
+    try {
+      mkdirSync(workspace);
+      mkdirSync(trustedHome);
+      mkdirSync(inheritedHome);
+      execFileSync('git', ['init', '-q', selected]);
+      execFileSync('git', ['-C', selected, 'remote', 'add', 'origin', 'https://github.com/acme/selected.git']);
+      const globalConfig = join(trustedHome, '.gitconfig');
+      execFileSync('git', ['config', '--file', globalConfig, 'safe.directory', selected]);
+      execFileSync('git', [
+        'config', '--file', globalConfig,
+        'url.https://github.com/acme/rewritten.git.insteadOf',
+        'https://github.com/acme/selected.git',
+      ]);
+
+      vi.stubEnv('HOME', inheritedHome);
+      vi.stubEnv('XDG_CONFIG_HOME', join(inheritedHome, 'xdg'));
+      vi.stubEnv('GIT_CONFIG_GLOBAL', join(inheritedHome, 'foreign.gitconfig'));
+      vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
+      vi.stubEnv('GIT_TEST_ASSUME_DIFFERENT_OWNER', '1');
+      const environmentForTrustedHome = gitProbeEnvironment as unknown as (
+        home: string,
+      ) => NodeJS.ProcessEnv;
+      const env = environmentForTrustedHome(trustedHome);
+      expect(env.HOME).toBe(trustedHome);
+      expect(env).not.toHaveProperty('XDG_CONFIG_HOME');
+      expect(env).not.toHaveProperty('GIT_CONFIG_GLOBAL');
+      expect(env).not.toHaveProperty('GIT_CONFIG_NOSYSTEM');
+      expect(env.GIT_TEST_ASSUME_DIFFERENT_OWNER).toBe('1');
+
+      const validatedRoot = execFileSync('git', ['-C', selected, 'rev-parse', '--show-toplevel'], {
+        encoding: 'utf8', env,
+      }).trim();
+      expect(validatedRoot).toBe(selected);
+      const rewritten = execFileSync('git', ['-C', selected, 'remote', 'get-url', 'origin'], {
+        encoding: 'utf8', env,
+      }).trim();
+      expect(rewritten).toBe('https://github.com/acme/rewritten.git');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies Git root-probe spawn failures as read errors, not confirmed unavailable roots', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-root-spawn-'));
+    const emptyPath = mkdtempSync(join(tmpdir(), 'gru-repo-overview-root-empty-path-'));
+    const workspace = join(root, 'workspace');
+    const repo = join(workspace, 'alpha');
+    const savedPath = process.env.PATH;
+    try {
+      mkdirSync(workspace);
+      execFileSync('git', ['init', '-q', repo]);
+      process.env.PATH = emptyPath;
+      await expect(resolveManagedRepoPath(workspace, 'alpha')).resolves.toMatchObject({ kind: 'error' });
+      expect(resolveManagedRepoPathSync(workspace, 'alpha')).toMatchObject({ kind: 'error' });
+    } finally {
+      process.env.PATH = savedPath;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(emptyPath, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies Git root-probe timeouts as read errors rather than unavailable roots', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gru-repo-overview-root-timeout-'));
+    const fakeBin = join(root, 'bin');
+    const workspace = join(root, 'workspace');
+    const repo = join(workspace, 'alpha');
+    mkdirSync(fakeBin);
+    mkdirSync(workspace);
+    execFileSync('git', ['init', '-q', repo]);
+    writeFileSync(join(fakeBin, 'git'), '#!/bin/sh\nexec /bin/sleep 5\n', { mode: 0o755 });
+    try {
+      vi.stubEnv('PATH', fakeBin);
+      await expect(resolveManagedRepoPath(workspace, 'alpha')).resolves.toMatchObject({ kind: 'error' });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('coordinates root validation and provider cursors so joint budgets eventually observe every selected root', async () => {
+    const names = Array.from({ length: 60 }, (_value, index) => `repo-${String(index).padStart(2, '0')}`);
+    const api = new FakeApi();
+    const clock = { ms: T0 };
+    const validatedThisRefresh = new Set<string>();
+    const tracker = new ManagedRepoOverviewTracker({
+      workspaceRoot: '/ws',
+      managedRepos: names,
+      api,
+      intervalMs: 0,
+      maxCallsPerRefresh: 100,
+      now: () => clock.ms,
+      sleep: async () => {},
+      resolveRepoPath: (_workspaceRoot, name) => ({ kind: 'available', path: `/ws/${name}` }),
+      resolveRemote: async (path) => {
+        const name = path.split('/').at(-1) as string;
+        validatedThisRefresh.add(name);
+        clock.ms += 2_001;
+        return githubRef(name);
+      },
+    });
+    const providerObserved = new Set<string>();
+    for (let pass = 0; pass < 10 && providerObserved.size < names.length; pass += 1) {
+      validatedThisRefresh.clear();
+      const before = api.calls.length;
+      await tracker.refresh();
+      const calls = api.calls.slice(before);
+      for (const call of calls) {
+        const fullName = call.slice(call.indexOf(':') + 1);
+        const name = fullName.split('/').at(-1) as string;
+        expect(validatedThisRefresh.has(name), `${call} had no same-pass validated root`).toBe(true);
+        if (call.startsWith('fetchRepo:')) providerObserved.add(name);
+      }
+    }
+    expect([...providerObserved].sort()).toEqual(names);
   });
 
   it('rotates the classification start when the resolution budget cuts a pass short', async () => {

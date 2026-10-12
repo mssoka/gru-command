@@ -500,6 +500,36 @@ describe('wizard CLI surface', () => {
     expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual([]);
   });
 
+  it('forced reruns validate an explicitly selected same-name binding in a changed workspace before writing', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const previousWorkspace = tempDir('gru-command-wizard-prior-workspace-');
+    const previousRepo = join(previousWorkspace, 'alpha');
+    mkdirSync(previousRepo);
+    execFileSync('git', ['init', '-q'], { cwd: previousRepo });
+
+    const changedWorkspace = tempDir('gru-command-wizard-changed-workspace-');
+    symlinkSync(previousRepo, join(changedWorkspace, 'alpha'));
+    const home = tempDir('gru-command-wizard-changed-binding-home-');
+    const wizard = join(repoRoot, 'dist/wizard/main.js');
+    const run = (workspace: string, force = false) =>
+      spawnSync(process.execPath, [wizard, ...(force ? ['--force'] : []), '--answers', JSON.stringify({
+        workspace_root: workspace, repos: ['alpha'], port: 0, smoke: false,
+      })], {
+        env: { ...process.env, GRU_COMMAND_HOME: home },
+        encoding: 'utf-8',
+        timeout: 30_000,
+      });
+
+    const first = run(previousWorkspace);
+    expect(first.status, first.stderr).toBe(0);
+    const priorConfig = readFileSync(configPathFor(home), 'utf8');
+
+    const changed = run(changedWorkspace, true);
+    expect(changed.status).toBe(1);
+    expect(changed.stderr).toContain('selected repo is a symlink');
+    expect(readFileSync(configPathFor(home), 'utf8')).toBe(priorConfig);
+  });
+
   it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {
     for (const good of ['::', '::1', 'fe80::1', 'fe80::1%en0', '1:2:3:4:5:6:7:8', '::ffff:127.0.0.1']) {
       expect(parseAnswers(JSON.stringify({ host: good })).host, good).toBe(good);
