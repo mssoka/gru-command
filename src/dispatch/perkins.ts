@@ -2832,6 +2832,9 @@ export class WaveRunner {
    * a current head are NOT authorization: a job that became blocked/parked/
    * cancelled/owner-held/terminal after the durable request was accepted
    * is HELD for reconciliation attention, never auto-reviewed. */
+  /** Recoverable hold statuses that revoke an in-flight fallback review. */
+  private static readonly FALLBACK_REVOKING_STATUSES: ReadonlySet<string> = new Set(['blocked', 'parked']);
+
   private static readonly HANDOFF_AUTHORIZED_STATUSES: ReadonlySet<string> = new Set(['working', 'delivered', 'in-review']);
 
   /** Fence: throws when the CURRENT job state does not authorize this
@@ -3473,6 +3476,15 @@ export class WaveRunner {
     if (jobNow !== null && isJobTerminal(jobNow.status)) {
       throw new FallbackSafetyRefusal(
         `job "${input.jobId}" is ${jobNow.status} — terminal lanes do not continue under fallback review`,
+      );
+    }
+    // Every fallback gate — direct or handoff, forced or not — must stay
+    // review-eligible: a hold (blocked/parked) revokes the review and no
+    // force flag waives it. The handoff's own authorization proof below
+    // is additional, never replaced.
+    if (jobNow !== null && WaveRunner.FALLBACK_REVOKING_STATUSES.has(jobNow.status)) {
+      throw new FallbackSafetyRefusal(
+        `job "${input.jobId}" is ${jobNow.status} — held lanes are not review-eligible, so the fallback gate stops fail-closed`,
       );
     }
     const lane = this.opts.worktrees

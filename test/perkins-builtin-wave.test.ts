@@ -6474,6 +6474,56 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     }
   });
 
+  it.each(['blocked', 'parked'] as const)('a direct fallback gate moved to %s while its reviewer is held never passes (#186)', async (status) => {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    h.ledger.setJobStatus(h.job.id, status);
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain(`is ${status}`);
+    expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+    expect(h.disposed).toHaveLength(1);
+  });
+
+  it.each(['blocked', 'parked'] as const)('a force flag does not waive a %s revocation while the reviewer is held (#186)', async (status) => {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id, force: true });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    h.ledger.setJobStatus(h.job.id, status);
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(false);
+    expect(outcome.note).toContain(`is ${status}`);
+  });
+
+  it.each(['blocked', 'parked'] as const)('a direct fallback request on a %s job is refused at round intake before any reviewer spawns (#186)', async (status) => {
+    const h = await makeProductionGateHarness({ findingToWrite: [] });
+    h.ledger.setJobStatus(h.job.id, status);
+    await expect(h.wave.runRound({ jobId: h.job.id })).rejects.toThrow(`is ${status}`);
+    expect(h.spawnCwds).toEqual([]);
+    expect(h.prompts).toEqual([]);
+  });
+
+  it('an unchanged review-eligible direct gate with a held reviewer still passes (#186 control)', async () => {
+    let release!: () => void;
+    const hold = { release: new Promise<void>((resolve) => { release = resolve; }) };
+    const h = await makeProductionGateHarness({ findingToWrite: [], promptHold: hold });
+    const running = h.wave.runRound({ jobId: h.job.id });
+    await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+    release();
+    const outcome = await running;
+    if (!('route' in outcome)) throw new Error('expected fallback route');
+    expect(outcome.clearToMerge).toBe(true);
+  });
+
   it('the production fallback review takes a worker pacing slot before it spawns', async () => {
     const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
     const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
