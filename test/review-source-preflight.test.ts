@@ -159,7 +159,31 @@ describe('review source preflight (service)', () => {
       expect(prompt).toContain('Required claims input: docs/claims.md');
       const bound = r.ledger.latestJobEvent('rev-1', 'job.review-source-verified')!.payload as Record<string, unknown>;
       expect(bound).toMatchObject({ target_sha: f.target, target_base: f.base, range_commits: 1, source: 'repository' });
-      expect(r.ledger.getJob('rev-1')).toMatchObject({ commissioner: 'gru', targetSha: f.target.slice(0, 12), deliverable: 'review' });
+      // The durable record binds the RESOLVED full oid, never the caller's
+      // abbreviated spelling (durable-reconcile compares target_sha exactly).
+      expect(r.ledger.getJob('rev-1')).toMatchObject({ commissioner: 'gru', targetSha: f.target, deliverable: 'review' });
+    } finally {
+      r.close();
+    }
+  });
+
+  it('stores the resolved full oid for an abbreviated dispatch, and keeps the raw value when no preflight ran', async () => {
+    const f = sharedOriginFixture();
+    const r = rig();
+    try {
+      const abbreviated = f.target.slice(0, 8);
+      expect(abbreviated).not.toBe(f.target);
+      const outcome = await r.service.dispatch(review(f.full.path, abbreviated));
+      expect((await outcome.settled).ok).toBe(true);
+      expect(r.ledger.getJob('rev-1')!.targetSha).toBe(f.target);
+      // An artifact report names a target but runs no review-source preflight:
+      // its raw target_sha is recorded unchanged.
+      const artifact = await r.service.dispatch({
+        jobId: 'art-1', repoPath: f.full.path, title: 'artifact', briefing: 'capture inputs',
+        deliverable: 'artifact', targetRef: PR, targetSha: abbreviated,
+      });
+      expect((await artifact.settled).ok).toBe(true);
+      expect(r.ledger.getJob('art-1')!.targetSha).toBe(abbreviated);
     } finally {
       r.close();
     }
@@ -180,6 +204,20 @@ describe('review source preflight (service)', () => {
       expect(empty.message).toContain('contains no commits to review');
       const loose = await refusal(r.service.dispatch(review(f.full.path, 'main')));
       expect(loose.message).toContain('is not an exact commit id');
+      expect(r.spawns.count).toBe(0);
+      expect(r.ledger.getJob('rev-1')).toBeNull();
+    } finally {
+      r.close();
+    }
+  });
+
+  it('refuses a symbolic target_base before touching the repository', async () => {
+    const f = sharedOriginFixture();
+    const r = rig();
+    try {
+      const error = await refusal(r.service.dispatch(review(f.full.path, f.target, { targetBase: 'main' })));
+      expect(error.message).toMatch(/is not an exact commit id/u);
+      expect(error.problems.join('\n')).toContain('target_base "main" is not an exact commit id');
       expect(r.spawns.count).toBe(0);
       expect(r.ledger.getJob('rev-1')).toBeNull();
     } finally {

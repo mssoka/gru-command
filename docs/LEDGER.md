@@ -164,6 +164,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `round.admission-preflight` | ok, full check list (`head-binding`, `frozen-packet:<file>`, `spec-context`, `verification-evidence`, `ci-evidence`, `evidence:<id>`), and on refusal the exhaustive named missing-input list — recorded after the freeze receipts and BEFORE any lead/child spawn (gh-169) |
 | `round.parent-incident` | exactly ONE per parent-aborted round: note, startedAttempts, startedLenses, notStartedLenses — a lead disconnect is one parent incident; never-started lenses keep their `pending` chip (not-started ≠ failed execution) (gh-169) |
 | `job.review-handoff-conflict` / `job.review-handoff-superseded` | request seq + folded scope; a differing evidence set is recorded as count + opaque request fingerprint, never paths |
+| `job.review-source-verified` | the admission binding recorded AFTER the review-source preflight proves the actual selected object store, BEFORE any job row/worktree/spawn completes: `object_store` (canonical git common dir), `target_sha` (resolved full oid), `target_base`, `range_commits`, `inputs` (path/lens/blob), `source` (`repository`/`source-package`), `package_sha256` — issue #317 |
 
 Events are appended for **state changes**; idempotent enrichment writes
 (re-registering an agent, same-state activity refreshes) update rows

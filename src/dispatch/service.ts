@@ -273,6 +273,12 @@ export class DispatchService {
           })
         : null;
 
+    // The durable record binds the RESOLVED commit the preflight proved,
+    // never the caller's possibly-abbreviated spelling: durable-reconcile
+    // compares the recorded target_sha to full oids by exact string. The
+    // raw value is the fallback only when no preflight ran.
+    const recordedTargetSha = reviewSource?.targetSha ?? targetSha;
+
     // (1) The job row: the briefing IS the contract (recorded verbatim).
     const job = this.opts.ledger.addJob({
       id: input.jobId,
@@ -283,7 +289,7 @@ export class DispatchService {
       ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
       ...(commissioner !== undefined ? { commissioner } : {}),
       ...(targetRef !== undefined ? { targetRef } : {}),
-      ...(targetSha !== undefined ? { targetSha } : {}),
+      ...(recordedTargetSha !== undefined ? { targetSha: recordedTargetSha } : {}),
       ...(input.parentJobId !== undefined ? { parentJobId: input.parentJobId } : {}),
     });
 
