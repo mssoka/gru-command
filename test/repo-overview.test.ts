@@ -1671,7 +1671,11 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       ]);
       execFileSync('git', ['-C', seed, 'remote', 'add', 'origin', 'https://github.com/acme/alpha.git']);
       execFileSync('git', ['-C', seed, 'worktree', 'add', '--detach', repo, 'HEAD']);
-      gitDirPath = execFileSync('git', ['-C', repo, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8' }).trim();
+      gitDirPath = execFileSync(
+        'git',
+        ['-C', repo, 'rev-parse', '--absolute-git-dir'],
+        { encoding: 'utf8' },
+      ).trim();
 
       const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 3 });
       const clock = { ms: T0 };
@@ -1689,9 +1693,15 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       const callsBeforeFailure = api.calls.length;
 
       chmodSync(gitDirPath, 0);
+      expect(resolveManagedRepoPathSync(root, 'alpha')).toMatchObject({ kind: 'error' });
       clock.ms += 1;
       const unreadable = row(await tracker.refresh(), 'alpha');
-      expect(unreadable).toMatchObject({ linked: true, freshness: 'stale', openPrs: 7, openIssues: 3 });
+      expect(unreadable).toMatchObject({
+        linked: true,
+        freshness: 'stale',
+        openPrs: 7,
+        openIssues: 3,
+      });
       expect(unreadable.error).toMatch(/EACCES|permission denied/iu);
       expect(api.calls).toHaveLength(callsBeforeFailure);
 

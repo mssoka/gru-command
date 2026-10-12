@@ -1,8 +1,16 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { accessSync, constants, lstatSync, realpathSync } from 'node:fs';
-import { access, lstat, realpath } from 'node:fs/promises';
+import {
+  accessSync,
+  closeSync,
+  constants,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from 'node:fs';
+import { access, lstat, open, realpath } from 'node:fs/promises';
 import { userInfo } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, sep, win32 } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path';
 
 export type ManagedRepoPath =
   | { readonly kind: 'available'; readonly path: string }
@@ -100,15 +108,80 @@ function rootProbeError(error: unknown): ManagedRepoPath {
   };
 }
 
-/** Check access before Git can collapse permission failures into a generic non-repository diagnostic. */
+const GIT_POINTER_LINE_MAX_BYTES = 4_096;
+
+async function readGitPointerLine(markerPath: string): Promise<string | null> {
+  const file = await open(markerPath, 'r');
+  try {
+    const buffer = Buffer.alloc(GIT_POINTER_LINE_MAX_BYTES + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    const bytes = buffer.subarray(0, bytesRead);
+    const newline = bytes.indexOf(0x0a);
+    if (newline < 0 && bytesRead > GIT_POINTER_LINE_MAX_BYTES) return null;
+    const lineEnd = newline < 0 ? bytesRead : newline;
+    if (lineEnd > GIT_POINTER_LINE_MAX_BYTES) return null;
+    const line = bytes.toString('utf8', 0, lineEnd);
+    return line.endsWith('\r') ? line.slice(0, -1) : line;
+  } finally {
+    await file.close();
+  }
+}
+
+function readGitPointerLineSync(markerPath: string): string | null {
+  const fd = openSync(markerPath, 'r');
+  try {
+    const buffer = Buffer.alloc(GIT_POINTER_LINE_MAX_BYTES + 1);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    const bytes = buffer.subarray(0, bytesRead);
+    const newline = bytes.indexOf(0x0a);
+    if (newline < 0 && bytesRead > GIT_POINTER_LINE_MAX_BYTES) return null;
+    const lineEnd = newline < 0 ? bytesRead : newline;
+    if (lineEnd > GIT_POINTER_LINE_MAX_BYTES) return null;
+    const line = bytes.toString('utf8', 0, lineEnd);
+    return line.endsWith('\r') ? line.slice(0, -1) : line;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function gitDirectoryFromPointer(markerPath: string, line: string | null): string | null {
+  const prefix = 'gitdir: ';
+  if (line === null || !line.startsWith(prefix)) return null;
+  const target = line.slice(prefix.length);
+  if (target === '') return null;
+  return isAbsolute(target) ? target : resolve(dirname(markerPath), target);
+}
+
+async function assertGitDirectoryAccessible(gitDirectory: string): Promise<void> {
+  await access(gitDirectory, constants.R_OK | constants.X_OK);
+  await access(join(gitDirectory, 'HEAD'), constants.R_OK);
+}
+
+function assertGitDirectoryAccessibleSync(gitDirectory: string): void {
+  accessSync(gitDirectory, constants.R_OK | constants.X_OK);
+  accessSync(join(gitDirectory, 'HEAD'), constants.R_OK);
+}
+
+/** Check marker and referenced gitdir access before Git can collapse permission
+ * failures into a generic non-repository diagnostic. */
 async function assertGitMarkerAccessible(markerPath: string, isDirectory: boolean): Promise<void> {
-  await access(markerPath, isDirectory ? constants.R_OK | constants.X_OK : constants.R_OK);
-  if (isDirectory) await access(join(markerPath, 'HEAD'), constants.R_OK);
+  if (isDirectory) {
+    await assertGitDirectoryAccessible(markerPath);
+    return;
+  }
+  await access(markerPath, constants.R_OK);
+  const gitDirectory = gitDirectoryFromPointer(markerPath, await readGitPointerLine(markerPath));
+  if (gitDirectory !== null) await assertGitDirectoryAccessible(gitDirectory);
 }
 
 function assertGitMarkerAccessibleSync(markerPath: string, isDirectory: boolean): void {
-  accessSync(markerPath, isDirectory ? constants.R_OK | constants.X_OK : constants.R_OK);
-  if (isDirectory) accessSync(join(markerPath, 'HEAD'), constants.R_OK);
+  if (isDirectory) {
+    assertGitDirectoryAccessibleSync(markerPath);
+    return;
+  }
+  accessSync(markerPath, constants.R_OK);
+  const gitDirectory = gitDirectoryFromPointer(markerPath, readGitPointerLineSync(markerPath));
+  if (gitDirectory !== null) assertGitDirectoryAccessibleSync(gitDirectory);
 }
 
 async function isGitWorktreeRoot(project: string): Promise<boolean> {
