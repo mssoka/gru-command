@@ -492,6 +492,10 @@ const API_HEADERS = {
   'X-GitHub-Api-Version': '2022-11-28',
 } as const;
 
+/** Minimum remaining installation-token lifetime, checked at mint and again
+ * immediately before the review POST. */
+const TOKEN_MIN_REMAINING_MS = 30_000;
+
 interface TokenGrant {
   readonly token: string;
   readonly expiresAtMs: number;
@@ -727,7 +731,15 @@ export class PerkinsAppPrPoster implements VerdictPoster {
 
   async post(input: VerdictPosterInput): Promise<PostedReviewReceipt> {
     const { grant, botLogin, owner, repo, prNumber, headSha, baseSha } = await this.prepare(input);
+    // The grant was validated when it was minted, but the identity and head
+    // probes since then are network waits: recheck its lifetime against the
+    // CURRENT clock at the irreversible boundary. A stale grant fails loud
+    // here, before any POST — never a blind send that could turn into an
+    // ambiguous outcome. No broader grant is requested to compensate.
     const postStartMs = this.now();
+    if (grant.expiresAtMs <= postStartMs + TOKEN_MIN_REMAINING_MS) {
+      throw new PerkinsAppError('installation token expired or expires too soon before the review POST (it was valid when minted; the pre-POST identity and head probes outlasted it) — review not delivered; no POST was sent');
+    }
     let review: unknown;
     try {
       review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
@@ -993,7 +1005,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       throw new PerkinsAppError('installation token response did not contain a token — review not delivered');
     }
     const expiresAt = typeof parsed?.expires_at === 'string' ? Date.parse(parsed.expires_at) : Number.NaN;
-    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs + 30_000) {
+    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs + TOKEN_MIN_REMAINING_MS) {
       throw new PerkinsAppError('installation token is already expired or expires too soon — review not delivered');
     }
     const granted = parsed?.permissions?.['pull_requests'];

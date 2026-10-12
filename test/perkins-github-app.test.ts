@@ -910,6 +910,32 @@ describe('fail-closed credential and identity checks', () => {
     expect(otherRepo.calls.filter((call) => call.url.endsWith('/reviews'))).toHaveLength(0);
   });
 
+  it('refuses to POST with an installation token that expired during the pre-POST probes, and still posts with a live grant (#185)', async () => {
+    const posts = (calls: readonly RecordedCall[]): number => calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')).length;
+    // Time advances inside the PR-head probe, i.e. after the token was minted.
+    for (const [advanceMs, expectRefusal] of [[3_600_001, true], [3_580_000, true], [60_000, false]] as const) {
+      const fixture = bundleFixture();
+      let clock = NOW;
+      const api = makeApiDouble([
+        { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => {
+          clock += advanceMs;
+          return { status: 200, body: { number: 7, head: { sha: HEAD }, base: { sha: BASE } } };
+        } },
+      ]);
+      const poster = new PerkinsAppPrPoster({ instanceDir: fixture.home, fetchImpl: api.fetchImpl, now: () => clock });
+      const outcome = poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) });
+      if (expectRefusal) {
+        await expect(outcome, String(advanceMs)).rejects.toThrow(/installation token .*(expired|expires too soon).*before the review POST.*not delivered/u);
+        // A stale grant is never used on the wire and never retried.
+        expect(posts(api.calls), String(advanceMs)).toBe(0);
+        expect(api.calls.some((call) => JSON.stringify(call.headers).includes(TOKEN) && call.method === 'POST' && call.url.endsWith('/reviews'))).toBe(false);
+      } else {
+        await expect(outcome).resolves.toEqual(RECEIPT);
+        expect(posts(api.calls)).toBe(1);
+      }
+    }
+  });
+
   it('fails on an expired token grant and maps mint rejections to actionable named errors', async () => {
     const fixture = bundleFixture();
     const expired = posterWith(fixture, [
