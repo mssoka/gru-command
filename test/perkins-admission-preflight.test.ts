@@ -17,6 +17,7 @@ import {
   OWNED_GIT_SEAMS,
   executingMember,
   groupHasLiveMember,
+  groupHasLiveMemberAsync,
   procGroupMembers,
   psGroupMembers,
   refUnresolved,
@@ -1317,6 +1318,51 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(procGroupMembers(10, proc({ 20: stat('Z', 10), 21: 'malformed' }))).toBeNull();
     expect(executingMember(procGroupMembers(10, proc({ 20: stat('Z', 10), 21: errno('EACCES') })))).toBe(true);
     expect(executingMember(procGroupMembers(10, proc({ 20: stat('Z', 10), 21: errno('ESRCH') })))).toBe(false);
+  });
+
+  it('a malformed or truncated /proc or ps record is unknown membership, never a stopped group — parser and settle path alike; kernel-thread group 0 stays legitimate (#263)', async () => {
+    const stat = (state: string, group: string) => `1 (git) ${state} 1 ${group} 1 0 -1`;
+    const proc = (files: Record<string, string>) => ({ list: () => Object.keys(files), read: (path: string) => files[path.split('/')[2]!]! });
+    // Parser: a blank or non-numeric group field is unknown (null), not group 0.
+    expect(procGroupMembers(10, proc({ 20: stat('S', '') }))).toBeNull();
+    expect(procGroupMembers(0, proc({ 20: stat('S', '') }))).toBeNull();
+    expect(procGroupMembers(10, proc({ 20: stat('S', '1x') }))).toBeNull();
+    expect(procGroupMembers(10, proc({ 20: '1 (git) S 1' }))).toBeNull(); // cut before the group field
+    expect(procGroupMembers(10, proc({ 20: stat('Zbroken', '10') }))).toBeNull();
+    expect(procGroupMembers(10, proc({ 20: stat('', '10') }))).toBeNull();
+    // Controls: a kernel thread (group 0) is a valid record; valid zombie / live states parse.
+    expect(procGroupMembers(10, proc({ 20: stat('S', '0') }))).toEqual([]);
+    expect(procGroupMembers(0, proc({ 20: stat('S', '0') }))).toEqual([{ pid: 20, state: 'S' }]);
+    expect(executingMember(procGroupMembers(10, proc({ 20: stat('Z', '10') })))).toBe(false);
+    expect(executingMember(procGroupMembers(10, proc({ 20: stat('R', '10') })))).toBe(true);
+    // ps: pid, group and state-plus-flags are each validated; a malformed state is not a zombie.
+    for (const bad of ['  11    10 Zbroken\n', '  11    1x0 Z\n', '  1x1    10 Z\n', '  11    10\n', '  11    10 Z extra\n', '  11    10 z\n']) {
+      expect(psGroupMembers(bad, 10), bad).toBeNull();
+    }
+    expect(executingMember([{ pid: 11, state: 'Zbroken' }])).toBe(true);
+    expect(executingMember([{ pid: 11, state: 'Z+' }, { pid: 12, state: 'Zs' }])).toBe(false);
+    expect(executingMember([{ pid: 11, state: 'X' }])).toBe(false);
+    expect(psGroupMembers('  0     0 Ss\n  11    10 Z+\n', 10)).toEqual([{ pid: 11, state: 'Z+' }]);
+    // Settle path: the real group liveness check over scripted /proc records.
+    const child = spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' });
+    const pgid = child.pid!;
+    const realPlatform = OWNED_GIT_SEAMS.platform;
+    const realProc = OWNED_GIT_SEAMS.procFs;
+    try {
+      OWNED_GIT_SEAMS.platform = 'linux';
+      const live = async (files: Record<string, string>): Promise<readonly [boolean, boolean]> => {
+        OWNED_GIT_SEAMS.procFs = proc(files);
+        return [groupHasLiveMember(pgid, 1_000), await groupHasLiveMemberAsync(pgid, 1_000)];
+      };
+      expect(await live({ 77: stat('Zbroken', String(pgid)) })).toEqual([true, true]);
+      expect(await live({ 77: stat('S', '') })).toEqual([true, true]);
+      expect(await live({ 77: stat('Z', String(pgid)) })).toEqual([false, false]);
+      expect(await live({ 77: stat('S', String(pgid)) })).toEqual([true, true]);
+    } finally {
+      OWNED_GIT_SEAMS.platform = realPlatform;
+      OWNED_GIT_SEAMS.procFs = realProc;
+      process.kill(-pgid, 'SIGKILL');
+    }
   });
 
   it('a runner that cannot be spawned never signals group 0 — the caller’s own group (R7-1)', () => {

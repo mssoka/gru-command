@@ -235,16 +235,40 @@ export function repositoryGitEnv(cLocale: boolean): NodeJS.ProcessEnv {
 
 export type GroupMember = { readonly pid: number; readonly state: string };
 
+/** Process-state flags `ps` appends to its state letter (macOS and Linux). */
+const PS_STATE = /^[RSDZTIUXWK][<>ANELSsVWXJlp+]*$/u;
+/** A `/proc/<pid>/stat` state is exactly one letter. */
+const PROC_STATE = /^[RSDZTtWXxKPI]$/u;
+/** Only a valid Z or X state — zombie or dead — is a stopped member. */
+const STOPPED_STATE = /^[ZX][<>ANELSsVWXJlp+]*$/u;
+const DIGITS = /^\d+$/u;
+
+/** `state` and group of a `/proc/<pid>/stat` record, or null unless every
+ * token needed is present and well formed (#263): a blank or non-numeric
+ * group is unknown — never converted to 0 — while a legitimate group 0
+ * (a kernel thread) is accepted. */
+function parseProcStat(stat: string): { readonly state: string; readonly group: number } | null {
+  const close = stat.lastIndexOf(')');
+  if (close === -1) return null;
+  const fields = stat.slice(close + 2).split(' ');
+  const [state, parent, groupText] = fields;
+  if (state === undefined || !PROC_STATE.test(state)) return null;
+  if (parent === undefined || !DIGITS.test(parent)) return null;
+  if (groupText === undefined || !DIGITS.test(groupText)) return null;
+  const group = Number(groupText);
+  return Number.isSafeInteger(group) ? { state, group } : null;
+}
+
+export type ProcFs = { readonly list: () => string[]; readonly read: (path: string) => string };
+const REAL_PROC_FS: ProcFs = { list: () => readdirSync('/proc'), read: (path) => readFileSync(path, 'utf8') };
+
 /** Members of process group `pgid` from /proc, or null when membership
  * cannot be established completely: only a process that ENDED while being
  * listed may be skipped — an unreadable or malformed entry might be a live
  * member (R8-3). `fs` is a test seam. */
 export function procGroupMembers(
   pgid: number,
-  fs: { readonly list: () => string[]; readonly read: (path: string) => string } = {
-    list: () => readdirSync('/proc'),
-    read: (path) => readFileSync(path, 'utf8'),
-  },
+  fs: ProcFs = OWNED_GIT_SEAMS.procFs,
 ): GroupMember[] | null {
   let entries: string[];
   try {
@@ -263,10 +287,9 @@ export function procGroupMembers(
       if (code === 'ENOENT' || code === 'ESRCH') continue; // ended while listing
       return null;
     }
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const group = Number(fields[2]);
-    if (stat.lastIndexOf(')') === -1 || !Number.isSafeInteger(group) || (fields[0] ?? '') === '') return null;
-    if (group === pgid) members.push({ pid: Number(entry), state: fields[0]! });
+    const record = parseProcStat(stat);
+    if (record === null) return null; // a record that cannot be read in full might be a live member (#263)
+    if (record.group === pgid) members.push({ pid: Number(entry), state: record.state });
   }
   return members;
 }
@@ -277,9 +300,12 @@ export function psGroupMembers(stdout: string, pgid: number): GroupMember[] | nu
   const members: GroupMember[] = [];
   for (const line of stdout.split('\n')) {
     if (line.trim() === '') continue;
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)/u.exec(line);
-    if (match === null) return null;
-    if (Number(match[2]) === pgid) members.push({ pid: Number(match[1]), state: match[3]! });
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/u.exec(line);
+    if (match === null || !PS_STATE.test(match[3]!)) return null;
+    const pid = Number(match[1]);
+    const group = Number(match[2]);
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(group)) return null;
+    if (group === pgid) members.push({ pid, state: match[3]! });
   }
   return members;
 }
@@ -297,7 +323,7 @@ function groupExists(pgid: number): boolean {
 
 /** Unknown membership, or any member not a zombie (R7-9): still running. */
 export const executingMember = (members: readonly GroupMember[] | null): boolean =>
-  members === null || members.some((member) => !/^[ZX]/u.test(member.state));
+  members === null || members.some((member) => !STOPPED_STATE.test(member.state));
 
 /** Is a member of group `pgid` still EXECUTING — not merely a zombie
  * awaiting its reaper (R7-9)? Membership that cannot be established within
@@ -306,7 +332,7 @@ export const executingMember = (members: readonly GroupMember[] | null): boolean
 export function groupHasLiveMember(pgid: number, budgetMs: number): boolean {
   if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
   if (!groupExists(pgid)) return false;
-  if (process.platform === 'linux') return executingMember(procGroupMembers(pgid));
+  if (OWNED_GIT_SEAMS.platform === 'linux') return executingMember(procGroupMembers(pgid));
   const listed = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], {
     encoding: 'utf8', timeout: Math.max(1, Math.floor(budgetMs)), killSignal: 'SIGKILL',
   });
@@ -319,7 +345,7 @@ export function groupHasLiveMember(pgid: number, budgetMs: number): boolean {
 export async function groupHasLiveMemberAsync(pgid: number, budgetMs: number): Promise<boolean> {
   if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
   if (!groupExists(pgid)) return false;
-  if (process.platform === 'linux') return executingMember(procGroupMembers(pgid));
+  if (OWNED_GIT_SEAMS.platform === 'linux') return executingMember(procGroupMembers(pgid));
   try {
     const { stdout } = await execFileAsPromised('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], {
       encoding: 'utf8', timeout: Math.max(1, Math.floor(budgetMs)), killSignal: 'SIGKILL',
@@ -337,7 +363,11 @@ export const OWNED_GIT_SEAMS: {
   groupHasLiveMember: (pgid: number, budgetMs: number) => boolean;
   groupHasLiveMemberAsync: (pgid: number, budgetMs: number) => Promise<boolean>;
   removePrivateDir: (dir: string) => void;
+  platform: NodeJS.Platform;
+  procFs: ProcFs;
 } = {
+  platform: process.platform,
+  procFs: REAL_PROC_FS,
   groupHasLiveMember,
   groupHasLiveMemberAsync,
   removePrivateDir: (dir) => {
