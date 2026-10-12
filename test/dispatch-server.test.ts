@@ -1250,10 +1250,8 @@ describe('dispatch server (E8)', () => {
         let observedError: unknown;
         try {
           makeFixtureRepo('fixture-init-cleanup-aggregate', (step, tempDir) => {
-            if (step === 'git-init') {
-              aggregateFixtureRoot = tempDir;
-              throw initializationError;
-            }
+            if (step === 'tempdir') aggregateFixtureRoot = tempDir;
+            if (step === 'git-init') throw initializationError;
           }, (tempDir) => {
             cleanupCallbackRoot = tempDir;
             throw cleanupError;

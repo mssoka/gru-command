@@ -219,7 +219,9 @@ describe('suite shape', () => {
           .toContain('silas digest (the four actionable states) does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt');
         expect(source, 'R2 baseline must retain the historical helper implementation')
           .toContain('git show "$base:src/dispatch/publication-evidence.ts"');
-        const baselineOverlayList = source.match(/for f in ([\s\S]+?); do/u)?.[1];
+        const baselineOverlayMatches = [...source.matchAll(/^for f in ([\s\S]+?); do$/gmu)];
+        expect(baselineOverlayMatches, 'R2 baseline overlay loop is missing or ambiguous').toHaveLength(1);
+        const baselineOverlayList = baselineOverlayMatches[0]?.[1];
         expect(baselineOverlayList, 'R2 baseline overlay file list is missing').toBeDefined();
         if (baselineOverlayList === undefined) throw new Error('R2 baseline overlay file list is missing');
         const baselineOverlayFiles = baselineOverlayList.split(/\s+/u);
@@ -233,6 +235,11 @@ describe('suite shape', () => {
           .toContain("export const PUBLICATION_IDENTITY_EVENT = '%s';");
         expect(source, 'R2 baseline does not append the derived identity event')
           .toContain('"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"');
+        const historicalHelperCopy = source.indexOf('git show "$base:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"');
+        const identityEventAppend = source.indexOf('"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"');
+        expect(historicalHelperCopy, 'R2 baseline historical helper copy is missing').toBeGreaterThanOrEqual(0);
+        expect(identityEventAppend, 'R2 baseline appends the identity event before the historical helper copy')
+          .toBeGreaterThan(historicalHelperCopy);
       }
     }
     const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');
