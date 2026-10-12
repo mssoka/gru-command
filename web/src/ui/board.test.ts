@@ -493,6 +493,10 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
       'CREW:strip-group--done',
       'CHILDREN:strip-group--park',
     ]);
+    const groups = [...document.querySelectorAll<HTMLElement>('#chip-rail .strip-group')];
+    expect(groups.map((group) => group.getAttribute('aria-label'))).toEqual(
+      groups.map((group) => group.querySelector('.strip-group__name')?.textContent),
+    );
   });
 
   beforeEach(mountBoardDom);
@@ -509,6 +513,7 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     expect(groups).toHaveLength(3);
     const names = [...groups].map((node) => node.querySelector('.strip-group__name')?.textContent);
     expect(names).toEqual(['HEISTS', 'PRS', 'CREW']);
+    expect([...groups].map((node) => node.getAttribute('aria-label'))).toEqual(names);
     // Group heads are h2 (approved reference heading level, fixes the
     // h3-before-h2 document order).
     for (const head of document.querySelectorAll('.strip-group__head')) {

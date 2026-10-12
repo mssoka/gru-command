@@ -236,3 +236,7 @@ warrants. They are recorded, not dropped:
 - source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
   summary: Pending lesson-proposal rows remain full-detail instead of receiving the compact owner face proposed by R16.
   evidence: The R16 observation at `web/src/ui/board.ts:759-765` is factually visible, but the owner scope-restoration amendment #7 and effective contract v11 exclude this absorbed-later-main proposal UI from the approved SLIM acceptance. The proposal row is already a current-main behavior at integration base `79c032e5`; compacting or otherwise redesigning it is a later feature decision. Preserve its current behavior in this PR rather than broadening the product change.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Defer the inherited uppercase-host GitHub issue-source identity mismatch to a separate intake scope; no intake repair is commissioned by PR #256.
+  evidence: R17 Edge report source-checked `src/intake/sources.ts`: `parseRepoRemote` preserves host spelling while `URL.hostname` canonicalizes case, and later identity comparisons can reject an otherwise valid issue URL. The file is unchanged from PR base `79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37`; this is not a SLIM change.

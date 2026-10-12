@@ -268,6 +268,42 @@ function classifyVitest(report, requireFile, requireFileSubstrs = []) {
         unassertedFailures.map((suite) => `  no assertions: ${suite.name ?? 'unknown suite'}`).join('\n'),
     };
   }
+  // Keep the named instrument's specific collection diagnostic ahead of
+  // aggregate validation: an empty registered file must still say
+  // "registered no tests", not merely report a counter mismatch.
+  const instrumentAssertions = namedInstrument?.assertionResults ?? [];
+  if (requireFile !== null && namedInstrument !== undefined && instrumentAssertions.length === 0) {
+    return { code: 3, out: '', err: `BASELINE SETUP/COLLECTION FAILURE: instrument ${requireFile} registered no tests — not behavioral evidence` };
+  }
+
+  const rawCounters = [report.numTotalTests, report.numPassedTests, report.numFailedTests];
+  if (!rawCounters.every((value) => Number.isSafeInteger(value) && value >= 0)) {
+    return {
+      code: 3,
+      out: '',
+      err: 'BASELINE SETUP FAILURE: Vitest counters must be non-negative safe integers — not behavioral evidence',
+    };
+  }
+  let treeTotal = 0;
+  let treePassed = 0;
+  let treeFailed = 0;
+  for (const suite of suites) {
+    for (const assertion of suite.assertionResults ?? []) {
+      treeTotal += 1;
+      if (assertion.status === 'passed') treePassed += 1;
+      else if (assertion.status === 'failed') treeFailed += 1;
+    }
+  }
+  if (total !== treeTotal || passed !== treePassed || failed !== treeFailed) {
+    return {
+      code: 3,
+      out: '',
+      err:
+        `BASELINE SETUP/COLLECTION FAILURE: Vitest counters disagree with test tree ` +
+        `(reported total=${total}, passed=${passed}, failed=${failed}; ` +
+        `tree total=${treeTotal}, passed=${treePassed}, failed=${treeFailed}) — not behavioral evidence`,
+    };
+  }
   if (failed === 0) {
     return { code: 2, out: '', err: `FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly (${passed}/${total} passed)` };
   }

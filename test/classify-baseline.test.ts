@@ -181,6 +181,31 @@ describe('baseline classifier — vitest (unit) branch', () => {
     expect(result.out).toMatch(/every test failed by AssertionError/u);
   });
 
+  it('rejects malformed or inconsistent Vitest counters before accepting feature absence', () => {
+    const report = vitestReport(instrument);
+    for (const mismatched of [
+      { ...report, numTotalTests: report.numTotalTests + 1 },
+      { ...report, numPassedTests: report.numPassedTests + 1 },
+      { ...report, numFailedTests: report.numFailedTests - 1 },
+    ]) {
+      const result = classifyBaseline(mismatched, { requireFile: 'slim-strip.baseline.test.ts' });
+      expect(result.code).toBe(3);
+      expect(result.out).toBe('');
+      expect(result.err).toMatch(/Vitest counters disagree with test tree/u);
+    }
+
+    for (const malformed of [
+      { ...report, numPassedTests: '0' },
+      { ...report, numFailedTests: -1 },
+      { ...report, numTotalTests: Number.MAX_SAFE_INTEGER + 1 },
+    ]) {
+      const result = classifyBaseline(malformed, { requireFile: 'slim-strip.baseline.test.ts' });
+      expect(result.code).toBe(3);
+      expect(result.out).toBe('');
+      expect(result.err).toMatch(/Vitest counters must be non-negative safe integers/u);
+    }
+  });
+
   it('exits 3 for every failed suite with no assertions, regardless of error wording', () => {
     for (const message of [
       'ReferenceError: fixture helper failed during module initialization',
@@ -345,6 +370,17 @@ describe('baseline classifier — Playwright (browser) branch', () => {
     expect(result.code).toBe(3);
     expect(result.out).toBe('');
     expect(result.err).toMatch(/errors field.*array/u);
+  });
+
+  it('rejects non-empty Playwright global errors even beside matching feature-absence failures', () => {
+    const report = playwrightReport([
+      { title: 'strip is visible', message: "locator('.strip-status') expected 1" },
+    ]);
+    const withGlobalError = { ...report, errors: [{ message: 'webServer failed to start' }] };
+    const result = classifyBaseline(withGlobalError, { playwright: true, substrs });
+    expect(result.code).toBe(3);
+    expect(result.out).toBe('');
+    expect(result.err).toMatch(/reported 1 global error/u);
   });
 
   it('rejects malformed Playwright stats before accepting a matching feature-absence failure', () => {

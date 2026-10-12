@@ -1116,7 +1116,9 @@ export class BoardView {
     groups.title = trackers.titleAttr;
     for (const group of trackers.kpis ?? []) {
       const groupNode = el('section', `strip-group strip-group--${STRIP_GROUP_TONE[group.label] ?? 'park'}`);
-      groupNode.setAttribute('aria-label', group.title);
+      // The visible group heading is also its accessible name; the full
+      // status enumeration remains available through the tooltip below.
+      groupNode.setAttribute('aria-label', group.label);
       const head = el('h2', 'strip-group__head');
       const mark = el('span', 'strip-group__mark');
       mark.setAttribute('aria-hidden', 'true');
