@@ -1848,6 +1848,63 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     }
   });
 
+  it('today\'s contract-2 cap keeps the literal survivors of each pre-year-100 fixture\'s uncapped chapter and the result fits — not just "the old plan is rejected" (#278)', () => {
+    // The fixtures hold only the first release's capped output, so each
+    // uncapped chapter is rebuilt here with the fixture's cap and the same
+    // 0026/1926 handle dates: year 26 is a real year 26 under today's
+    // chronology (older than every 1926 handle), where the first release
+    // read it as 1926.
+    const lesson = (slug: string, refs: readonly (readonly [string, string])[], body: string): string =>
+      `## ${slug}\n\nrecurred: 1\nprovenance: ${refs.map(([id, ts]) => `${id}@${ts}`).join(', ')}\n\n${body}\n`;
+    const chapterText = (...lessons: readonly string[]): string => `# Ops\n\nsummary: Ops.\n\n${lessons.join('\n')}`;
+    const cases: readonly {
+      readonly name: string;
+      readonly cap: number;
+      readonly text: string;
+      readonly expected: readonly (readonly [string, readonly string[]])[];
+    }[] = [
+      {
+        name: 'early-year',
+        cap: 200,
+        text: chapterText(lesson('restart', [
+          ['j-1', '1926-01-01T00:00:00.000Z'], ['j-2', '0026-06-01T00:00:00.000Z'], ['j-3', '1926-03-01T00:00:00.000Z'],
+          ['j-4', '0026-09-01T00:00:00.000Z'], ['j-5', '1926-05-01T00:00:00.000Z'], ['j-6', '0026-12-01T00:00:00.000Z'],
+          ['j-7', '1926-07-01T00:00:00.000Z'],
+        ], 'Drain first.')),
+        expected: [['restart', ['j-1', 'j-3', 'j-5', 'j-7']]],
+      },
+      {
+        name: 'early-drops',
+        cap: 340,
+        text: chapterText(
+          lesson('alpha', [['j-1', '1926-01-01T00:00:00.000Z'], ['j-2', '0026-12-01T00:00:00.000Z']], 'Alpha lesson body that is short.'),
+          lesson('bravo', [['j-4', '1926-06-01T00:00:00.000Z'], ['j-3', '1926-07-01T00:00:00.000Z']], 'Bravo lesson body that is short.'),
+          lesson('charlie', [['j-5', '1926-05-01T00:00:00.000Z'], ['j-6', '0026-08-01T00:00:00.000Z']], 'Charlie lesson body that is short.'),
+        ),
+        expected: [['bravo', ['j-4', 'j-3']], ['archived-provenance', ['j-5']]],
+      },
+      {
+        name: 'early-archive',
+        cap: 340,
+        text: chapterText(
+          lesson('alpha', [['j-1', '1926-01-01T00:00:00.000Z'], ['j-2', '0026-06-01T00:00:00.000Z']], `Alpha lesson body. ${'It runs long enough to need a drop. '.repeat(8).trim()}`),
+          lesson('bravo', [['j-3', '1926-09-01T00:00:00.000Z'], ['j-4', '1926-10-01T00:00:00.000Z']], 'Bravo lesson body that is short.'),
+        ),
+        expected: [['bravo', ['j-3', 'j-4']], ['archived-provenance', ['j-1']]],
+      },
+    ];
+    for (const { name, cap, text, expected } of cases) {
+      const uncapped = parseChapter(text, 'ops');
+      expect(Buffer.byteLength(serializeChapter(uncapped), 'utf8'), name).toBeGreaterThan(cap);
+      const capped = enforceChapterCap(uncapped, cap, undefined, 2);
+      expect(capped.chapter.lessons.map((kept) => [kept.slug, kept.provenance.map((ref) => ref.id)]), name).toEqual(expected);
+      expect(Buffer.byteLength(capped.text, 'utf8'), name).toBeLessThanOrEqual(cap);
+      expect(capped.text, name).toBe(serializeChapter(capped.chapter));
+      // The text reads back as the chapter the cap returned.
+      expect(parseChapter(capped.text, 'ops'), name).toEqual(capped.chapter);
+    }
+  });
+
   it('first-release plans over bare-CR chapters are read with that release\'s line breaks — a CR inside a kept body, CR-ended metadata (R8-01)', () => {
     // A kept lesson body holding a bare CR: the first release read it as one line.
     const kept = firstReleasePlan('lessons-plan-contract-1-cr-body.json');
