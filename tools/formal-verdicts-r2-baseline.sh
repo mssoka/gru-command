@@ -45,7 +45,7 @@ node tools/patch-vitest-rpc-timeout.mjs
 set +e
 npx vitest run --reporter=json --outputFile="$d/wave-results.json" --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts -t "native R2"
 a=$?
-npx vitest run --reporter=json --outputFile="$d/silas-results.json" test/silas-driver.test.ts -t "native R2"
+npx vitest run --reporter=json --outputFile="$d/silas-results.json" test/silas-driver.test.ts -t "native R2|uncredited receipt without its publication attempt"
 b=$?
 set -e
 echo "formal-verdicts-r2-baseline vitest exits: wave=$a silas=$b"
@@ -59,6 +59,7 @@ node "$root/tools/assert-named-red-baseline.mjs" wave "$d/wave-results.json" \
   "formal GitHub publication durability and restart reconciliation holds a restart whose gh lookup met an undecidable review list (native R2 F3)" \
   "GitHub SHA-bound Perkins delivery refuses an undecidable gh review list instead of reporting absence (native R2 F3)" || exit 2
 node "$root/tools/assert-named-red-baseline.mjs" silas "$d/silas-results.json" \
-  "silas digest (the four actionable states) does not offer a clean-abort re-arm after a held recovery whose absence certificate would have been false (native R2 F1/F2)" || exit 2
+  "silas digest (the four actionable states) does not offer a clean-abort re-arm after a held recovery whose absence certificate would have been false (native R2 F1/F2)" \
+  "silas digest (the four actionable states) does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt" || exit 2
 echo "EXPECTED-NONZERO: the native R2 false-absence regressions failed behaviorally against the uncorrected head"
 exit 1

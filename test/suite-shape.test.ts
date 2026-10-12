@@ -212,6 +212,12 @@ describe('suite shape', () => {
       const source = readFileSync(join(tools, script), 'utf-8');
       expect(source, `${script}: wave registration guard is stale`).toContain(`perkins-builtin-wave.test.ts:${wavePin}`);
       expect(source, `${script}: Silas registration guard is stale`).toContain(`silas-driver.test.ts:${silasPin}`);
+      if (script === 'formal-verdicts-r2-baseline.sh') {
+        expect(source, 'R2 baseline filter omits the receipt-only consumer regression')
+          .toContain('uncredited receipt without its publication attempt');
+        expect(source, 'R2 baseline classifier omits the receipt-only consumer regression')
+          .toContain('silas digest (the four actionable states) does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt');
+      }
     }
     const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');
     expect(r5, 'formal-verdicts-r5-baseline.sh: wave registration guard is stale').toContain(`perkins-builtin-wave.test.ts:${wavePin}`);

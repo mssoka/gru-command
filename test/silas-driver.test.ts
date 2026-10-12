@@ -1310,28 +1310,37 @@ describe('silas digest (the four actionable states)', () => {
   it('does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt', async () => {
     const h = makeLedger();
     try {
-      const jobId = 'clean-receipt-only';
-      const sha = 'sha-receipt-only';
       const digestOf = () => computeSilasDigest({ ledger: h.ledger,
         blockersForRound: async () => ({ blockers: [], note: null }),
         config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
-      addJobWithDelivery(h.ledger, jobId, { prUrl: 'https://git.example.invalid/pull/receipt-only' });
-      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha } });
-      const round = h.ledger.addRound({ jobId, targetRef: sha });
-      h.ledger.setRoundStatus(round.id, 'live');
-      h.ledger.setJobStatus(jobId, 'in-review');
-      h.ledger.setRoundStatus(round.id, 'aborted');
-      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId, roundId: round.id,
-        payload: { reason: 'service_restart' } });
-      expect((await digestOf()).prWithoutReview).toMatchObject([
-        { jobId, cleanAbort: { roundId: round.id, ruleId: 'clean-abort-service-restart' } },
-      ]);
+      const addCleanAbort = (jobId: string, sha: string) => {
+        addJobWithDelivery(h.ledger, jobId, { prUrl: `https://git.example.invalid/pull/${jobId}` });
+        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha } });
+        const round = h.ledger.addRound({ jobId, targetRef: sha });
+        h.ledger.setRoundStatus(round.id, 'live');
+        h.ledger.setJobStatus(jobId, 'in-review');
+        h.ledger.setRoundStatus(round.id, 'aborted');
+        h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId, roundId: round.id,
+          payload: { reason: 'service_restart' } });
+        return round;
+      };
+      const controlJobId = 'clean-receipt-control';
+      const controlRound = addCleanAbort(controlJobId, 'sha-receipt-control');
+      const jobId = 'clean-receipt-only';
+      const sha = 'sha-receipt-only';
+      const round = addCleanAbort(jobId, sha);
+      const eligibleBefore = (await digestOf()).prWithoutReview;
+      expect(eligibleBefore).toHaveLength(2);
+      expect(eligibleBefore).toEqual(expect.arrayContaining([
+        expect.objectContaining({ jobId, cleanAbort: { roundId: round.id, ruleId: 'clean-abort-service-restart' } }),
+        expect.objectContaining({ jobId: controlJobId, cleanAbort: { roundId: controlRound.id, ruleId: 'clean-abort-service-restart' } }),
+      ]));
 
       h.ledger.appendCustomEvent({
         kind: PUBLICATION_RECEIPT_EVENT, jobId, roundId: round.id,
         payload: {
           verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
-          url: 'https://git.example.invalid/pull/receipt-only', host: 'git.example.invalid',
+          url: `https://git.example.invalid/pull/${jobId}`, host: 'git.example.invalid',
           targetSha: sha, baseSha: 'b'.repeat(40),
           publicationFile: '/tmp/receipt-only/perkins-report.publication.md', publicationSha256: 'c'.repeat(64),
           reviewEvent: 'APPROVE',
@@ -1343,7 +1352,17 @@ describe('silas digest (the four actionable states)', () => {
         },
       });
       expect(h.ledger.latestRoundEvent(round.id, PUBLICATION_ATTEMPT_EVENT)).toBeNull();
-      expect((await digestOf()).prWithoutReview.filter((row) => row.jobId === jobId)).toEqual([]);
+      const afterReceipt = (await digestOf()).prWithoutReview;
+      expect(afterReceipt.filter((row) => row.jobId === jobId)).toEqual([]);
+      expect(afterReceipt.filter((row) => row.jobId === controlJobId)).toHaveLength(1);
+
+      h.ledger.appendCustomEvent({ kind: PUBLICATION_ABSENT_EVENT, jobId, roundId: round.id,
+        payload: { targetSha: sha, publicationSha256: 'c'.repeat(64), detail: 'contradictory later absence' } });
+      const afterAbsence = (await digestOf()).prWithoutReview;
+      expect(afterAbsence.filter((row) => row.jobId === jobId)).toEqual([]);
+      expect(afterAbsence).toMatchObject([
+        { jobId: controlJobId, cleanAbort: { roundId: controlRound.id, ruleId: 'clean-abort-service-restart' } },
+      ]);
     } finally { h.cleanup(); }
   });
 

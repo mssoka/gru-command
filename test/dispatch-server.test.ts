@@ -1230,10 +1230,10 @@ describe('dispatch server (E8)', () => {
 
   it('refuses a clean-abort re-arm for an uncredited receipt without its publication attempt', async () => {
     const h = await boot();
-    const repo = makeFixtureRepo('fixture-clean-abort-receipt-only');
-    cleanupRepos.push(repo);
-    attachBareOrigin(repo);
     try {
+      const repo = makeFixtureRepo('fixture-clean-abort-receipt-only');
+      cleanupRepos.push(repo);
+      attachBareOrigin(repo);
       const jobId = 'clean-abort-receipt-only';
       const { sha, roundId } = await prepareCleanAbort(h, repo, jobId);
       h.ledger.appendCustomEvent({
