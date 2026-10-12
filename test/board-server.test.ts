@@ -357,6 +357,30 @@ describe('board server — HTTP API', () => {
     ]);
   });
 
+  it('disposition audit records bearer provenance honestly and validates a declared actor (#99)', async () => {
+    const { api, port } = harness;
+    const mk = (id: string) => api.recordNotification({ id, kind: 'test', routing: 'action-required', severity: 'error', title: id });
+    const events = (id: string) => api.listEventsAfter(0, { kinds: ['notification.resolved'] }).filter((e) => (e.payload as { id?: string }).id === id);
+    const undeclared = mk('actor-undeclared');
+    await postJson(port, `/api/notifications/${undeclared.id}/disposition`, 'board-test-token', { detail: 'Handled' });
+    expect(events(undeclared.id)).toMatchObject([
+      { payload: { by: 'gru', credential: 'shared-bearer', declaredActor: null } },
+    ]);
+    const declared = mk('actor-declared');
+    await postJson(port, `/api/notifications/${declared.id}/disposition`, 'board-test-token', { detail: 'Handled', actor: 'gru' });
+    expect(events(declared.id)).toMatchObject([
+      { payload: { by: 'gru', credential: 'shared-bearer', declaredActor: 'gru' } },
+    ]);
+    // A caller declaring itself as something else cannot produce a Gru disposition.
+    const forged = mk('actor-forged');
+    for (const actor of ['owner', 'web', 5]) {
+      const refused = await postJson(port, `/api/notifications/${forged.id}/disposition`, 'board-test-token', { detail: 'x', actor });
+      expect(refused.status).toBe(400);
+    }
+    expect(api.getNotification(forged.id)?.resolvedAt).toBeNull();
+    expect(events(forged.id)).toEqual([]);
+  });
+
   it('validates authenticated Gru owner escalation and places it only in FOR YOU', async () => {
     const { api, port } = harness;
     const path = '/api/notifications/needs-owner';

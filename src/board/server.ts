@@ -626,6 +626,15 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           if (suffix === '/disposition') {
             const detail = strField(body, 'detail');
+            // The board has ONE shared bearer for owner and agent callers, so
+            // the credential proves "a paired caller", not "Gru". A caller may
+            // declare its actor; only 'gru' is a valid declaration for a
+            // machine disposition, and the audit labels it caller-declared.
+            const declaredActor = optStrField(body, 'actor') ?? null;
+            if (declaredActor !== null && declaredActor !== 'gru') {
+              json(res, 400, { error: 'bad_request', detail: `actor "${declaredActor}" cannot produce a Gru disposition; omit actor or declare "gru"` });
+              return;
+            }
             const target = ledger.getNotification(id);
             const closer = target === null ? null : producerResolvedBy(target.kind);
             if (target !== null && closer !== null) {
@@ -636,7 +645,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               });
               return;
             }
-            const row = ledger.disposeMachineNotification(id, detail);
+            const row = ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;

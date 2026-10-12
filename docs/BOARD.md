@@ -41,7 +41,7 @@ restart produce the same truth without data edits.
 | `POST /api/agents/state` | `{id, state}` |
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
 | `POST /api/notifications/:id/ack` | `{by?}` — owner/FYI ack; refuses machine rows (400), and owner ack re-arms an open breaker |
-| `POST /api/notifications/:id/disposition` | `{detail}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops |
+| `POST /api/notifications/:id/disposition` | `{detail, actor?}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops. **Actorship (decision #99, 2026-10-12):** the board has ONE shared bearer for owner and agent callers, so the credential proves a paired caller, not Gru. `by: 'gru'` in the ledger names the disposition *role*; the `notification.resolved` event also records `credential: 'shared-bearer'` and the caller-declared `declaredActor` (`null` when omitted). `actor` may only be omitted or `"gru"` (anything else is 400). Neither value is proof of identity; a separate owner credential is deliberately not introduced (no new auth framework). Owner Ack (`/ack`) is likewise shared-bearer and its `by` is caller-declared, never verified |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
