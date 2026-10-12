@@ -199,6 +199,8 @@ interface RateLimitRetryIncident {
   /** The failed turn's prompt, captured synchronously at error time —
    * before the adapter clears its live-turn snapshot. */
   readonly pending: PendingTurn;
+  /** Exact interrupted-turn ownership transferred into this retry. */
+  readonly recovery: InterruptedTurn;
   /** A delivery attempt is in flight right now. */
   awaitingDelivery: boolean;
   /** Monotonic per-delivery token; only the owning delivery may clear
@@ -826,7 +828,20 @@ export class Supervisor {
           // settling the rung. Defer that exact error, never another spawn.
           const flight = [...this.restartingAgents.values()].find((item) => item.handle === agent.handle);
           if (flight !== undefined) {
-            flight.pendingError = event;
+            // A dead session cannot become a same-session retry because a
+            // later frame is nonfatal. Equally, generic exit noise must not
+            // erase a known provider wall and cause a futile blind restart.
+            const previous = flight.pendingError;
+            const previousClass = previous === null ? null : deterministicFailureClass(previous.error);
+            const nextClass = deterministicFailureClass(event.error);
+            const selected = previous !== null &&
+              (previousClass === 'authentication_wall' || previousClass === 'quota_wall') &&
+              nextClass !== 'authentication_wall' && nextClass !== 'quota_wall' ? previous : event;
+            const fatal = (previous?.fatal ?? false) || event.fatal;
+            const deferred = fatal && !selected.fatal ? { ...selected, fatal: true } : selected;
+            const snapshot = this.restartErrorSnapshots.get(selected);
+            if (deferred !== selected && snapshot !== undefined) this.restartErrorSnapshots.set(deferred, snapshot);
+            flight.pendingError = deferred;
             break;
           }
           if (event.fatal) {
@@ -882,10 +897,13 @@ export class Supervisor {
     if (agentId === undefined || role === undefined) return false;
     let existing = this.agents.get(agentId);
     const flight = existing === undefined ? undefined : this.restartingAgents.get(existing);
-    if (existing !== undefined && flight !== undefined && handle !== null && flight.handle !== handle) {
+    if (existing !== undefined && handle !== null && handle !== existing.handle &&
+      (flight !== undefined ? flight.handle !== handle : existing.backoffTimer !== null)) {
       // A native successor owns a NEW controller even when its logical id
       // is unchanged. The old coroutine must never settle its retry/stop.
-      flight.superseded = true;
+      if (flight !== undefined) flight.superseded = true;
+      if (existing.backoffTimer !== null) clearTimeout(existing.backoffTimer);
+      existing.backoffTimer = null;
       this.clearRateLimitRetry(existing, 'superseded');
       this.clearRecoveryAdmission(existing);
       this.agents.delete(agentId);
@@ -1255,6 +1273,7 @@ export class Supervisor {
       admissionAbort: new AbortController(),
       maxRetries: policy.maxRetries,
       pending: captured.pending,
+      recovery: captured,
       awaitingDelivery: false,
       deliveryToken: 0,
       activeDelivery: null,
@@ -1388,6 +1407,9 @@ export class Supervisor {
           incident.attempts, incident.maxRetries,
         ));
         this.clearRateLimitRetry(agent, 'recovered');
+        // Deferred rung errors transfer a distinct synchronous snapshot.
+        // Consume only that exact ownership, never a newer interruption.
+        if (agent.pendingRecovery === incident.recovery) agent.pendingRecovery = null;
         this.log('info', 'automatic rate-limit retry recovered the turn', {
           agent_id: agent.agentId,
           attempts: incident.attempts,
@@ -1758,7 +1780,8 @@ export class Supervisor {
    * caught, logged, and the rung settles. */
   private async restartRung(agentRef: SupervisedAgent, reason: string): Promise<void> {
     const agent = agentRef;
-    if (this.disposed || !this.cfg.enabled || agent.inRestart || agent.breakerOpen) return;
+    if (this.disposed || !this.cfg.enabled || agent.inRestart || agent.breakerOpen ||
+      this.agents.get(agent.agentId) !== agent) return;
     const recovery = agent.pendingRecovery ?? this.captureInterruptedTurn(agent.handle, agent);
     if (recovery !== null) agent.pendingRecovery = recovery;
     if (!this.recoveryAuthorityCurrent(agent, recovery)) return;
@@ -1981,7 +2004,8 @@ export class Supervisor {
         // Resume (or visibly orphan) the turn this rung interrupted.
         if (flight.pendingError === null) this.recoverInterruptedTurn(agent, spawned, reason);
       } catch (error) {
-        if (restartSlot !== null && restartSlot.generation !== restartGeneration) return;
+        if (flight.superseded || this.disposed || agent.breakerOpen || this.agents.get(agent.agentId) !== agent ||
+          (restartSlot !== null && restartSlot.generation !== restartGeneration)) return;
         // Failed rung: count it, back off, schedule the next.
         agent.consecutiveFailures += 1;
         this.log('error', 'restart rung failed', {
@@ -1997,7 +2021,8 @@ export class Supervisor {
         agent.state = 'watching'; // eligible for the scheduled rung
         agent.backoffTimer = setTimeout(() => {
           agent.backoffTimer = null;
-          if (!this.disposed && !agent.breakerOpen) {
+          if (!this.disposed && !agent.breakerOpen && !flight.superseded && this.agents.get(agent.agentId) === agent &&
+            (restartSlot === null || restartSlot.generation === restartGeneration)) {
             agent.inRestart = false;
             void this.restartRung(agent, reason);
           }

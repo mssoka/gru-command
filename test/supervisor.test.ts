@@ -1104,8 +1104,8 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
-  async function deferredDispatchRestart(sameId = false) {
-    const rig = boot();
+  async function deferredDispatchRestart(sameId = false, options: Parameters<typeof boot>[1] = {}) {
+    const rig = boot(undefined, options);
     const jobId = 'empty-authority-job';
     rig.api.addJob({ id: jobId, repo: 'fixture', title: 'Initially empty native authority' });
     rig.api.setJobStatus(jobId, 'working');
@@ -1116,14 +1116,15 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     hang(original);
     const replacement = new FakeHandle('minion', sameId ? original.id : 'empty-replacement', original.sessionFile);
     let releaseSpawn!: (handle: FakeHandle) => void;
-    rig.registry.spawnImpl = () => new Promise((resolve) => { releaseSpawn = resolve; });
+    let rejectSpawn!: (error: Error) => void;
+    rig.registry.spawnImpl = () => new Promise((resolve, reject) => { releaseSpawn = resolve; rejectSpawn = reject; });
     original.emit({ type: 'error', error: 'dispatch transport died', fatal: true });
     await flushMicrotasks();
     expect(rig.registry.spawnCalls).toHaveLength(1);
     expect(rig.api.directiveRecoveryEpoch(jobId)).toBe(0);
     expect(rig.api.listPendingRebriefs({ jobId })).toEqual([]);
     const register = vi.spyOn(rig.api, 'registerAgent');
-    return { rig, jobId, original, replacement, releaseSpawn, register };
+    return { rig, jobId, original, replacement, releaseSpawn, rejectSpawn, register };
   }
 
   async function completedHandoffDuringSpawn(kind: 'failed-directive' | 'settled-directive' | 'settled-rebrief') {
@@ -1237,6 +1238,57 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(recovery.promptCalls).toEqual([{ text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` }]);
       expect(f.rig.supervisor.viewFor(recovery.id)).toMatchObject({ state: 'watching', breakerOpen: false });
     } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('retains fatal and provider-wall custody across deferred recovered-turn errors in either order', async () => {
+    for (const fatalFirst of [true, false]) {
+      vi.useFakeTimers();
+      const sleeper = new ManualSleeper();
+      const f = await deferredDispatchRestart(true, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep });
+      try {
+        const fatal = { type: 'error', error: 'session transport died', fatal: true } as const;
+        const wall = { type: 'error', error: '429 too many requests', fatal: false } as const;
+        f.replacement.promptHook = (text, options) => {
+          f.replacement.pendingTurnSnapshot = { text, owner: options?.owner ?? null };
+          for (const event of fatalFirst ? [fatal, wall] : [wall, fatal]) f.replacement.emit(event);
+          f.replacement.pendingTurnSnapshot = null;
+          f.replacement.setState('error');
+        };
+        f.rig.registry.spawnImpl = async () => new FakeHandle('minion', 'unnecessary-blind-restart', null);
+        f.releaseSpawn(f.replacement);
+        await flushMicrotasks();
+        expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'quota_wall' });
+        expect(sleeper.delays).toEqual([]); // never retry on a fatal session
+        expect(f.rig.registry.spawnCalls).toHaveLength(1); // never blindly restart past the provider wall
+        expect(f.replacement.disposed).toBe(true);
+      } finally { f.rig.dispose(); vi.useRealTimers(); }
+    }
+  });
+
+  it('never re-arms the prior same-id controller when creation rejects before or after native adoption', async () => {
+    for (const nativeBeforeRejection of [true, false]) {
+      vi.useFakeTimers();
+      const f = await deferredDispatchRestart(true);
+      try {
+        const successor = new FakeHandle('minion', f.original.id, '/fixture/provider-successor.jsonl');
+        f.rig.registry.spawnImpl = async () => { throw new Error('detached controller spent another rung'); };
+        if (!nativeBeforeRejection) {
+          f.rejectSpawn(new Error('obsolete creation rejected'));
+          await flushMicrotasks(); // the first catch has armed its backoff
+        }
+        f.rig.registry.adopt(successor);
+        f.rig.api.registerAgent({ id: successor.id, role: 'minion', jobId: f.jobId, sessionFile: successor.sessionFile });
+        expect(f.rig.api.directiveRecoveryEpoch(f.jobId)).toBe(0);
+        expect(f.rig.api.listPendingRebriefs({ jobId: f.jobId })).toEqual([]);
+        if (nativeBeforeRejection) f.rejectSpawn(new Error('obsolete creation rejected'));
+        await vi.advanceTimersByTimeAsync(100);
+        expect(f.rig.registry.spawnCalls).toHaveLength(1);
+        expect(f.rig.supervisor.viewFor(successor.id)).toMatchObject({ state: 'watching', breakerOpen: false, stopReason: null });
+        expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).filter((event) => event.kind === 'supervision.escalated')).toEqual([]);
+        expect(successor.disposed).toBe(false);
+        expect(successor.promptCalls).toEqual([]);
+      } finally { f.rig.dispose(); vi.useRealTimers(); }
+    }
   });
 
   it('preserves an independently adopted same-id owner stop when the stale rung finishes', async () => {
@@ -2995,6 +3047,34 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     h.dispose();
   });
 
+  it('a same-controller provider wall concludes its pending retry before detaching the handle (GH-280)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep });
+    let finishDispose: (() => void) | undefined;
+    try {
+      const handle = new FakeHandle('minion', 'pending-retry-auth-wall', null);
+      const nativeDispose = handle.dispose.bind(handle);
+      handle.dispose = async () => {
+        await new Promise<void>((resolve) => { finishDispose = resolve; });
+        await nativeDispose();
+      };
+      h.registry.adopt(handle);
+      handle.pendingTurnSnapshot = { text: 'unfinished authorized work', owner: null };
+      emitFailure(handle, '429 too many requests');
+      let settlement: string | null = null;
+      void h.supervisor.awaitRetrySettlement(handle.id).then((value) => { settlement = value; });
+      handle.pendingTurnSnapshot = null;
+      emitFailure(handle, '401 unauthorized invalid API key');
+      await flushMicrotasks();
+      expect(settlement).toBe('superseded');
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+      finishDispose?.();
+      await flushMicrotasks();
+      await sleeper.release();
+      expect(handle.promptCalls).toEqual([]);
+    } finally { finishDispose?.(); h.dispose(); }
+  });
+
   it('quota exhaustion without a rate-limit signature stops instead of retrying', async () => {
     const sleeper = new ManualSleeper();
     const h = boot(undefined, {
@@ -3700,20 +3780,23 @@ describe('pacing settlement across rejection, recovery, and slot retirement', ()
     }
   });
 
-  it('a restart-recovered turn that 429-rejects resumes through its automatic retry instead of escalating', async () => {
+  it('a job-bound restart-recovered 429 retry releases its exact recovery ownership after success (GH-280)', async () => {
     const sleeper = new ManualSleeper();
     const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
     try {
       const handle = new FakeHandle('minion', 'minion-recovery-retry', null);
       h.registry.adopt(handle);
       hang(handle);
+      h.api.addJob({ id: 'job-rec', repo: 'fixture', title: 'Recovered retry ownership' });
+      h.api.setJobStatus('job-rec', 'working');
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'job-rec', sessionFile: handle.sessionFile });
       handle.pendingTurnSnapshot = { text: 'finish the briefing', owner: 'dispatch:job-rec' };
       let promptCalls = 0;
       h.registry.spawnImpl = async (role, options) => {
         const resumed = new FakeHandle(role, 'minion-recovery-retry-resumed', options?.resumeFile ?? null);
         resumed.promptHook = (text, promptOptions) => {
           promptCalls += 1;
-          if (promptCalls > 1) return;
+          if (promptCalls > 1) { resumed.pendingTurnSnapshot = null; return; }
           resumed.pendingTurnSnapshot = { text, owner: promptOptions?.owner ?? null };
           resumed.emit({ type: 'error', error: '429 too many requests', fatal: false });
           throw new Error('429 too many requests');
@@ -3729,6 +3812,7 @@ describe('pacing settlement across rejection, recovery, and slot retirement', ()
       }, { timeout: 5_000 });
       expect(h.notificationsOfKind('supervision.turn-orphaned.minion-recovery-retry')).toHaveLength(0);
       expect(promptCalls).toBe(2);
+      expect(h.supervisor.pendingProducerBlockers('job-rec')).toEqual([]);
     } finally {
       h.dispose();
     }
