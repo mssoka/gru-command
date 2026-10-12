@@ -1325,6 +1325,78 @@ test.describe('notification readability — fixed long-content fixtures', () => 
     }
   });
 
+  test('stale decision conflicts use the HTTP reason and lock mouse/keyboard retries until refresh', async ({ browser }) => {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    let releaseRefresh: (() => void) | null = null;
+    let refreshRequests = 0;
+    let decisionPosts = 0;
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    try {
+      const seed = await seedBoard(page, fixtureSnapshot());
+      await pairAndOpenBoard(page);
+      await page.route('**/api/board', async (route) => {
+        refreshRequests += 1;
+        await refreshGate;
+        await route.fulfill({ json: fixtureSnapshot() });
+      });
+      await page.route('**/api/notifications/*/decision', (route) => {
+        if (route.request().method() !== 'POST') return route.fallback();
+        decisionPosts += 1;
+        return route.fulfill({
+          status: 409,
+          json: {
+            error: 'decision_refused',
+            code: 'decision_recorded',
+            detail: 'the decision was already recorded elsewhere',
+          },
+        });
+      });
+
+      const choice = page.locator('#board-owner [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
+      await choice.click();
+      await expect(page.locator('#board-owner [data-notification-id="decision-1"] .board-notification__submission--reconciling')).toBeVisible();
+      await expect.poll(() => refreshRequests).toBe(1);
+      await expect.poll(() => decisionPosts).toBe(1);
+      const lockedChoice = page.locator('#board-owner [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
+      await expect(lockedChoice).toHaveAttribute('aria-disabled', 'true');
+      // A DOM mouse activation and real keyboard activation both reach the
+      // listener despite aria-disabled; the submission guard must refuse them.
+      await lockedChoice.evaluate((element) => (element as HTMLButtonElement).click());
+      await lockedChoice.focus();
+      await page.keyboard.press('Enter');
+      await page.keyboard.press('Space');
+      expect(decisionPosts).toBe(1);
+      expect(seed.pageErrors).toEqual([]);
+    } finally {
+      releaseRefresh?.();
+      await page.close();
+    }
+  });
+
+  test('Discuss with Gru opens the phone/tablet overlay with the default expanded preference', async ({ browser }) => {
+    for (const width of [390, 768] as const) {
+      const page = await browser.newPage({ viewport: { width, height: 900 } });
+      try {
+        const withDiscussion = fixtureSnapshot({
+          notifications: [...fixtureSnapshot().notifications, discussionNotification()],
+        });
+        const seed = await seedBoard(page, withDiscussion);
+        await pairAndOpenBoard(page);
+        await settled(page);
+        expect(await page.locator('#console').evaluate((element) => element.classList.contains('console--chat-collapsed'))).toBe(false);
+        await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'false');
+        await page.locator('#board-owner [data-notification-id="discuss-1"] .board-notification__discuss-open').click();
+        await expect(page.locator('#chat-sheet')).toHaveAttribute('data-open', 'true');
+        await expect(page.locator('#chat-input')).toBeFocused();
+        expect(seed.pageErrors).toEqual([]);
+      } finally {
+        await page.close();
+      }
+    }
+  });
+
   test('measured settled contrast: live, error and closed-receipt cards meet WCAG AA in both themes', async ({ browser }) => {
     for (const theme of ['light', 'dark'] as const) {
       const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });

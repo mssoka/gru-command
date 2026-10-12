@@ -3570,7 +3570,7 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
     }
   });
 
-  it('a failed fresh-control post survives restart as retry debt and is rebound when posting recovers', async () => {
+  it('a failed fresh-control post survives restart without a live handle, then binds after adoption', async () => {
     const { rig, stop } = directlyStoppedTurn('pending-control-job', 'pending-control-agent');
     let restored: Supervisor | null = null;
     vi.useFakeTimers();
@@ -3605,14 +3605,15 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       });
       restored.start();
       rig.center.post = originalPost;
-      rig.registry.adopt(new FakeHandle('minion', 'pending-control-agent', null));
-      const restoredAgent = (restored as unknown as { agents: Map<string, { breakerNotificationId: string | null; pendingRearmFenceAlert: { reason: string } | null }> }).agents.get('pending-control-agent');
-      expect(restoredAgent?.pendingRearmFenceAlert?.reason).toContain('park appeared');
+      expect((restored as unknown as { agents: Map<string, unknown> }).agents.has('pending-control-agent')).toBe(false);
       (restored as unknown as { tick(): void }).tick();
       const fresh = rig.api.listNotifications({ limit: 50, unackedOnly: true }).find(
         (row) => row.kind === 'supervision.rearm-fenced' && row.resolvedAt === null,
       );
-      expect(fresh).toMatchObject({ routing: 'action-required', resolvedAt: null });
+      expect(fresh).toMatchObject({ routing: 'action-required', ackedAt: null, resolvedAt: null });
+      expect(restored.viewFor('pending-control-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      rig.registry.adopt(new FakeHandle('minion', 'pending-control-agent', null));
+      const restoredAgent = (restored as unknown as { agents: Map<string, { breakerNotificationId: string | null; pendingRearmFenceAlert: { reason: string } | null }> }).agents.get('pending-control-agent');
       expect(restoredAgent).toMatchObject({ breakerNotificationId: fresh!.id, pendingRearmFenceAlert: null });
       expect(rig.api.durableSupervisionStops().get('pending-control-agent')).toMatchObject({
         notificationId: fresh!.id,
@@ -3622,6 +3623,49 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       restored?.dispose();
       rig.dispose();
       vi.useRealTimers();
+    }
+  });
+
+  it('an acknowledged legacy stop control is consumed and replaced after restart', () => {
+    const { rig, stop } = directlyStoppedTurn('legacy-acked-job', 'legacy-acked-agent');
+    let restored: Supervisor | null = null;
+    try {
+      const database = (rig.api as unknown as {
+        readonly db: { prepare(sql: string): { run(...values: unknown[]): unknown } };
+      }).db;
+      database
+        .prepare('UPDATE notifications SET acked_at = ?, acked_by = ? WHERE id = ?')
+        .run('2026-10-12T01:00:00.000Z', 'legacy-owner', stop.id);
+      expect(rig.api.getNotification(stop.id)?.ackedAt).toBe('2026-10-12T01:00:00.000Z');
+      expect(rig.api.durableSupervisionStops().get('legacy-acked-agent')).toMatchObject({ notificationId: null });
+
+      rig.supervisor.dispose();
+      restored = new Supervisor({
+        config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+        registry: rig.registry,
+        ledger: rig.api,
+        notifications: rig.center,
+        tickMs: 5,
+        now: () => rig.nowMs,
+      });
+      restored.start();
+      expect((restored as unknown as { agents: Map<string, unknown> }).agents.has('legacy-acked-agent')).toBe(false);
+      (restored as unknown as { tick(): void }).tick();
+
+      const fresh = rig.api.listNotifications({ limit: 50, unackedOnly: true }).find(
+        (row) => row.agentId === 'legacy-acked-agent' && row.kind === 'supervision.rearm-fenced',
+      );
+      expect(fresh).toMatchObject({ routing: 'action-required', ackedAt: null, resolvedAt: null });
+      expect(fresh?.id).not.toBe(stop.id);
+      expect(restored.viewFor('legacy-acked-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      rig.registry.adopt(new FakeHandle('minion', 'legacy-acked-agent', null));
+      const restoredAgent = (restored as unknown as {
+        agents: Map<string, { breakerNotificationId: string | null; pendingRearmFenceAlert: { reason: string } | null }>;
+      }).agents.get('legacy-acked-agent');
+      expect(restoredAgent).toMatchObject({ breakerNotificationId: fresh!.id, pendingRearmFenceAlert: null });
+    } finally {
+      restored?.dispose();
+      rig.dispose();
     }
   });
 

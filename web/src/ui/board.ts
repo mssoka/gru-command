@@ -2447,7 +2447,9 @@ export class BoardView {
     const client = this.boardClient;
     if (client === null) return;
     const existing = this.decisionSubmissions.get(item.id);
-    if (existing !== undefined && existing.phase === 'submitting') return; // one action, both surfaces
+    if (existing !== undefined && (existing.phase === 'submitting' || existing.phase === 'reconciling')) {
+      return; // one action; no retries until authoritative refresh resolves the conflict
+    }
     const option = item.decision?.options.find((candidate) => candidate.id === optionId);
     if (option === undefined) return; // the card no longer offers this choice
     const submission: DecisionSubmission = {
@@ -2513,12 +2515,12 @@ export class BoardView {
   /** The discussion action: reveal the console/chat pane and focus the
    * composer so the conversation can actually start. */
   private openChatComposer(): void {
-    const consoleRoot = document.getElementById('console');
-    if (consoleRoot instanceof HTMLElement && consoleRoot.classList.contains('console--chat-collapsed')) {
-      // The in-pane head button collapses (or closes the mobile sheet); the
-      // FAB is the actual expand/open control at both breakpoints.
-      const openChat = document.getElementById('gru-fab');
-      if (openChat instanceof HTMLElement) openChat.click();
+    // aria-expanded describes the desktop pane; it is intentionally false
+    // in overlay mode. Clicking the FAB is idempotent there and opens the
+    // sheet even when the persisted desktop preference is already expanded.
+    const openChat = document.getElementById('gru-fab');
+    if (openChat instanceof HTMLElement && openChat.getAttribute('aria-expanded') !== 'true') {
+      openChat.click();
     }
     const input = document.getElementById('chat-input');
     if (input instanceof HTMLElement) {

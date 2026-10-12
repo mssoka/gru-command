@@ -201,6 +201,37 @@ describe('board client', () => {
     await waitFor(() => seen.includes('still-alive'), 'live after noise');
   });
 
+  it('preserves the domain conflict code from a refused owner-decision HTTP response', async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          error: 'decision_refused',
+          code: 'decision_recorded',
+          detail: 'the decision was already recorded elsewhere',
+        }),
+        { status: 409 },
+      ),
+    ) as unknown as typeof fetch;
+    client = new BoardClient(
+      { token: TOKEN, host: `127.0.0.1:${server.port}`, fetchImpl },
+      { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+    );
+
+    await expect(client.decideNotification('decision-1', 'approve')).rejects.toMatchObject({
+      path: '/api/notifications/decision-1/decision',
+      status: 409,
+      code: 'decision_recorded',
+      detail: 'the decision was already recorded elsewhere',
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      '/api/notifications/decision-1/decision',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ authorization: `Bearer ${TOKEN}` }),
+      }),
+    );
+  });
+
   it('posts an authenticated decision recheck and rejects malformed status replies', async () => {
     const ready = { ...snapshotFor('recheck').decisions, enabled: true, status: 'ready' as const, reason: null, credentialPresent: true, credentialSource: 'file' as const, generation: 4 };
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(ready), { status: 200 })) as unknown as typeof fetch;

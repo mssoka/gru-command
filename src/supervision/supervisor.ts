@@ -999,6 +999,7 @@ export class Supervisor {
         void this.evaluateRecovery(agent, reason);
       }
     }
+    this.retryRestoredControlDebt();
   }
 
   /**
@@ -2529,7 +2530,7 @@ export class Supervisor {
         bound = null;
       }
     }
-    if (bound !== null && bound.resolvedAt === null) {
+    if (bound !== null && bound.resolvedAt === null && bound.ackedAt === null) {
       if (agent.pendingRearmFenceAlert !== null && agent.pendingRearmFenceAlert !== undefined) {
         const pendingReason = agent.pendingRearmFenceAlert.reason;
         agent.pendingRearmFenceAlert = null;
@@ -2749,9 +2750,12 @@ export class Supervisor {
     if (!this.cfg.enabled) return stops;
     try {
       for (const [agentId, stop] of this.ledger.durableSupervisionStops()) {
+        const pendingFenceReason =
+          stop.pendingFenceReason ??
+          (stop.notificationId === null ? stop.reason ?? 'restored supervision stop has no open retry control' : null);
         this.restoredRearmControls.set(agentId, {
           notificationId: stop.notificationId,
-          pendingFenceReason: stop.pendingFenceReason,
+          pendingFenceReason,
         });
         stops.set(agentId, {
           agentId,
@@ -2774,9 +2778,70 @@ export class Supervisor {
     return stops;
   }
 
+  /** Retry durable control-post debt even when no runtime handle is currently
+   * adopted for the stopped agent. A restart must not make a fenced stop
+   * invisible merely because the producer has not been reattached yet. */
+  private retryRestoredControlDebt(): void {
+    for (const [agentId, control] of this.restoredRearmControls) {
+      if (this.agents.has(agentId) || control.pendingFenceReason === null) continue;
+      const stop = this.restoredStops.get(agentId);
+      if (stop === undefined || !stop.breakerOpen) continue;
+      const reason = control.pendingFenceReason;
+      let bound: ReturnType<LedgerApi['getNotification']> = null;
+      if (control.notificationId !== null) {
+        try {
+          bound = this.ledger.getNotification(control.notificationId);
+        } catch (error) {
+          this.log('warn', 'restored alert lookup failed — raising a fresh control', {
+            agent_id: agentId,
+            error: String(error),
+          });
+        }
+      }
+      if (bound !== null && bound.resolvedAt === null && bound.ackedAt === null) {
+        this.restoredRearmControls.set(agentId, { notificationId: bound.id, pendingFenceReason: null });
+        this.recordEvent('supervision.rearm-fenced', agentId, {
+          notification_id: bound.id,
+          control_notification_id: bound.id,
+          pending_rearm_fence_reason: null,
+          reason,
+          stop_reason: stop.stopReason,
+          restarts: stop.restarts,
+        });
+        continue;
+      }
+      try {
+        const posted = this.notifications.post({
+          kind: 'supervision.rearm-fenced',
+          routing: 'action-required',
+          severity: 'error',
+          title: `Re-arm fenced: agent ${agentId} stayed stopped`,
+          detail:
+            `The restored supervision stop has no live retry control (${reason}). ` +
+            'Resolve the reported condition, then dispose this alert to retry the re-arm.',
+          agentId,
+        });
+        this.restoredRearmControls.set(agentId, { notificationId: posted.id, pendingFenceReason: null });
+        this.recordEvent('supervision.rearm-fenced', agentId, {
+          notification_id: posted.id,
+          control_notification_id: posted.id,
+          pending_rearm_fence_reason: null,
+          reason,
+          stop_reason: stop.stopReason,
+          restarts: stop.restarts,
+        });
+      } catch (error) {
+        this.log('error', 'restored control post failed — retrying on tick', {
+          agent_id: agentId,
+          error: String(error),
+        });
+      }
+    }
+  }
+
   /** Attach the durable stop and its retry control to a newly adopted agent.
    * A handle arriving for a stopped id is disposed, never treated as an
-   * implicit re-arm. Missing/closed controls become retryable alert debt. */
+   * implicit re-arm. Missing, closed or acknowledged controls become retryable alert debt. */
   private restoreDurableStop(agent: SupervisedAgent): void {
     if (agent.breakerOpen) return;
     const stop = this.restoredStops.get(agent.agentId);
@@ -2784,10 +2849,10 @@ export class Supervisor {
     const control = this.restoredRearmControls.get(agent.agentId);
     let notificationId = control?.notificationId ?? null;
     let pendingFenceReason = control?.pendingFenceReason ?? null;
-    if (notificationId !== null && pendingFenceReason === null) {
+    if (notificationId !== null) {
       try {
         const row = this.ledger.getNotification(notificationId);
-        if (row === null || row.resolvedAt !== null) notificationId = null;
+        if (row === null || row.resolvedAt !== null || row.ackedAt !== null) notificationId = null;
       } catch (error) {
         notificationId = null;
         pendingFenceReason = `restored stop control lookup failed: ${String(error)}`;

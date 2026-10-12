@@ -330,8 +330,12 @@ export class BoardClient {
     let code: string | null = null;
     let detail: string | null = null;
     try {
-      const body = (await res.json()) as { error?: unknown; detail?: unknown };
-      code = typeof body.error === 'string' ? body.error : null;
+      const body = (await res.json()) as { error?: unknown; code?: unknown; detail?: unknown };
+      // Domain refusals carry a transport-level `error` (for example,
+      // `decision_refused`) and a more precise `code` (for example,
+      // `decision_recorded`). Callers need the latter to reconcile stale
+      // owner choices instead of presenting the conflict as retryable.
+      code = typeof body.code === 'string' ? body.code : typeof body.error === 'string' ? body.error : null;
       detail = typeof body.detail === 'string' ? body.detail : null;
     } catch {
       /* a non-JSON error body keeps the status alone */

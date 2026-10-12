@@ -3154,18 +3154,19 @@ export class LedgerApi {
           : typeof payload['notification_id'] === 'string'
             ? payload['notification_id']
             : null;
-      if (notificationId !== null && pendingFenceReason === null) {
+      if (notificationId !== null) {
         const openControl = this.db
-          .prepare('SELECT id FROM notifications WHERE id = ? AND resolved_at IS NULL')
+          .prepare('SELECT id FROM notifications WHERE id = ? AND resolved_at IS NULL AND acked_at IS NULL')
           .get(notificationId) as { id: string } | undefined;
         if (openControl === undefined) notificationId = null;
       }
-      if (notificationId === null && pendingFenceReason === null) {
+      if (notificationId === null) {
         const openControl = this.db
           .prepare(
             `SELECT id FROM notifications
               WHERE agent_id = ?
                 AND resolved_at IS NULL
+                AND acked_at IS NULL
                 AND (
                   kind IN ('supervision.breaker', 'supervision.rearm-fenced')
                   OR kind LIKE 'supervision.provider-wall.%'

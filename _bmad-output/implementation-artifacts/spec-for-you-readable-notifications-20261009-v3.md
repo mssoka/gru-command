@@ -5,7 +5,7 @@ created: '2026-10-11'
 status: 'in-review'
 route: 'dispatch'
 baseline_commit: 'f738b9b1594081cdbb4929af7be256454951eb43'
-review_loop_iteration: 5
+review_loop_iteration: 6
 context:
   - '{project-root}/AGENTS.md'
   - '{project-root}/docs/BOARD.md'
@@ -398,6 +398,28 @@ Round R2 correction review (target `987c5fc2ba9d8689665df974ac80bd6171055123`; d
 - `medium` — edge: enforce-gate notices inherited credential guidance, which cannot repair invalid or failing backtest evidence. Guidance now names the backtest evidence and gated-surface retry; a kind-specific test distinguishes it from provider degradation.
 - `high` — edge: asynchronous re-arm fences persisted stop truth without the active retry-control binding or failed-post debt. Lifecycle events now carry the current control and pending reason; restart hydration restores/binds stopped agents, disposes an adopted handle, and retries missing controls. Tests cover both a live control after restart and failed-post debt recovery.
 - `high` — verification-gap: source-text assembly checks and separate stubs did not drive a real supervisor refusal through authenticated HTTP wiring. The production binding is shared and a board-server integration test asserts the real refusal leaves the machine alert unresolved.
+
+Round 3 tracked whole-change reviews (target `9250cf50d539f408e6f11f77a4c3d12c7950f545`, complete diff base `79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37`, correction delta `987c5fc2ba9d8689665df974ac80bd6171055123..9250cf50d539f408e6f11f77a4c3d12c7950f545`). Reports came from `for-you-readable-r2-blind-9250cf50`, `for-you-readable-r2-edge-9250cf50`, and `for-you-readable-r2-verification-9250cf50`; each reviewer worktree remained unchanged at the base commit. Every report finding is triaged separately below before shared-root grouping; verdict severity is based on inspected impact, not reviewer labels:
+
+- `high` — blind finding 1: the reviewed ledger query and restore path accepted an unresolved but acknowledged legacy control. The owner-facing action surface excludes acknowledged rows, so restart could leave the stopped agent with no usable disposition; the current query excludes `acked_at` rows and restoration treats acknowledged controls as consumed, with a fresh-control restart regression.
+- `medium` — blind finding 2: `BoardView` expected `BoardApiError.code` values `decision_recorded` / `not_open`, but the reviewed HTTP parser copied `body.error` (`decision_refused`) rather than `body.code`; a real stale response therefore took the retryable-refusal path without snapshot reconciliation. The client preserves the structured domain code, with client and browser regressions.
+- `medium` — blind finding 3: the reviewed “Discuss with Gru” path clicked the FAB only for a collapsed desktop pane, while the mobile/tablet FAB opens the overlay independently of that saved preference; discussion could not reveal the composer. The current path opens based on the FAB's `aria-expanded` state, with phone/tablet browser coverage.
+- `medium` — edge finding 1: independently confirmed the same stale-decision parser failure as blind finding 2. The reviewed server response placed `decision_recorded` in `body.code` and the client discarded it; the client and browser regressions now cover the actual response shape.
+- `medium` — edge finding 2: independently confirmed the same mobile/tablet discussion failure as blind finding 3. The reviewed default-expanded desktop preference did not open the closed overlay; the phone/tablet browser regression now verifies opening and composer focus.
+- `high` — edge finding 3: the reviewed startup hydration retained failed alert-post debt but applied/retried it only while iterating live agents. A stopped agent without an adopted handle could therefore have no actionable control until later adoption; the supervisor now retries restored debt without a live handle, with a regression for eventual control binding after adoption.
+- `medium` — verification-gap finding 1: during stale-state reconciliation the reviewed handler blocked only `submitting`, although controls were merely `aria-disabled` during `reconciling`; mouse or keyboard activation could send duplicate decision POSTs and race the refresh. The current guard rejects both phases, with browser coverage for mouse and keyboard activation and a single POST.
+- `medium` — verification-gap finding 2: the unchanged failed-spawn path records an accepted `supervision.rearmed` event before spawn and holds the backoff retry only in a process-local timer, so a service restart before that timer fires can lose the retry/control. This is real but pre-existing; the original acceptance covers unsafe re-arm fences and durable reconstruction of later fenced stops, not durable persistence of every un-fenced failed-spawn retry. It does not show a stop/hold bypass. Routed as a nonblocking follow-up to `deferred-work.md`, without expanding this correction cycle into general retry durability.
+
+Root-cause groups and routes after individual verdicts:
+
+- Acknowledged control handling (blind 1) — `patch`; the confirmed high-impact finding is fixed by the ledger's open-control predicate and restored-stop retry behavior.
+- Structured stale-decision codes (blind 2, edge 1) — `patch`; both reports identify the same lost domain code in the real API client, now preserved with regression coverage.
+- Mobile/tablet discussion opening (blind 3, edge 2) — `patch`; both reports identify the same overlay-state defect, now fixed and covered at phone/tablet widths.
+- Restored alert-post debt without a live handle (edge 3) — `patch`; the confirmed high-impact finding is fixed by tick-time debt reconciliation independent of an adopted agent.
+- Duplicate submissions during reconciliation (verification-gap 1) — `patch`; the action handler now enforces the visible lock for both phases.
+- Failed-spawn retry lost on service restart (verification-gap 2) — `defer`; the behavior is documented in the deferred-work ledger because it predates this story's correction and is outside the accepted durable-stop/fence requirements.
+
+The round-3 findings were fully consumed at `2026-10-12T01:35:09.845Z` (`native2546`) and dispositioned `acted` through this parent: verification event `82013`, obligation settlement `82014`, job completion `82016`; blind `82020`/`82021`/`82023`; edge `82037`/`82038`/`82040`. The disposition events record `directive_job_id` as this parent and `by: gru`; each settlement is an executed-action receipt. The corresponding handback notifications were resolved at `01:36:41.109Z`, `01:36:45.424Z`, and `01:36:50.606Z`. Their original titles/details remain immutable and `ackedAt: null` does not mean an open obligation. Two later blind POST attempts returned 400 because the non-idempotent endpoint correctly refuses re-settlement of an already-done report; the actual disposition/obligation receipts prove those writes changed no state. Do not replay or re-disposition these reports. The development findings were acted in the worktree; exact-head scheduled proofs and a fresh whole-change review remain required, and these reports are not native Perkins clearance.
 
 ## Design Notes
 

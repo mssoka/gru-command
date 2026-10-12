@@ -4404,13 +4404,17 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
   it.each(['decision_recorded', 'not_open'] as const)(
     'a stale %s conflict refreshes shared owner and bell state before choices return',
     async (code) => {
+      let resolveRefresh!: () => void;
+      const refresh = new Promise<void>((resolve) => {
+        resolveRefresh = resolve;
+      });
       const client = {
         ackNotification: vi.fn(() => Promise.resolve()),
         markNotificationShown: vi.fn(() => Promise.resolve(true)),
         decideNotification: vi.fn(() =>
           Promise.reject(new BoardApiError('/decision', 409, code, 'the decision state changed')),
         ),
-        refetchSnapshot: vi.fn(() => Promise.resolve()),
+        refetchSnapshot: vi.fn(() => refresh),
       } as unknown as import('../lib/board-client.js').BoardClient;
       const view = new BoardView(() => {}, client);
       const row = stop();
@@ -4430,12 +4434,16 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       expect(bell.querySelector('.board-notification__submission--reconciling')?.textContent).toContain('Refresh');
       expect(band.textContent).not.toContain('Not recorded');
       expect(bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')?.getAttribute('aria-disabled')).toBe('true');
+      band.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!.click();
+      bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!.click();
+      expect(client.decideNotification).toHaveBeenCalledTimes(1);
 
       const reconciled =
         code === 'decision_recorded'
           ? { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'other-view', decidedOption: 'keep' }
           : { ...row, resolvedAt: '2026-01-01T00:10:00.000Z', resolvedBy: 'producer' };
       view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: 0 }));
+      resolveRefresh();
       expect(band.querySelector('.board-notification__submission--reconciling')).toBeNull();
       expect(band.querySelector('[data-action-id="notif:shared-submit:option:approve"]')).toBeNull();
     },
