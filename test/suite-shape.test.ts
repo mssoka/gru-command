@@ -2,6 +2,67 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+function shellCodeLines(source: string): readonly string[] {
+  let quote: '"' | "'" | undefined;
+  return source.split(/\r?\n/u).map((line) => {
+    const code = [...line];
+    for (let index = 0; index < line.length; index += 1) {
+      const character = line[index] ?? '';
+      if (quote === "'") {
+        code[index] = ' ';
+        if (character === "'") quote = undefined;
+        continue;
+      }
+      if (quote === '"') {
+        code[index] = ' ';
+        if (character === '\\') {
+          if (index + 1 < line.length) code[index + 1] = ' ';
+          index += 1;
+        } else if (character === '"') quote = undefined;
+        continue;
+      }
+      if (character === '\\') {
+        code[index] = ' ';
+        if (index + 1 < line.length) code[index + 1] = ' ';
+        index += 1;
+        continue;
+      }
+      if (character === "'" || character === '"') {
+        quote = character;
+        code[index] = ' ';
+        continue;
+      }
+      if (character === '#' && (index === 0 || /[\s;&|(){}]/u.test(line[index - 1] ?? ''))) {
+        code.fill(' ', index);
+        break;
+      }
+    }
+    return code.join('');
+  });
+}
+
+function r2ShellSyntaxIssues(source: string): readonly string[] {
+  const codeLines = shellCodeLines(source);
+  const issues: string[] = [];
+  if (codeLines.some((line) => /(?:^|[^<])<<-?(?!<)/u.test(line))) issues.push('heredoc');
+  if (codeLines.some((line) => /[;&|]\s*(?:if|for|while|until|case)\b/u.test(line))) issues.push('inline control flow');
+  if (codeLines.some((line) => /(?:^|[;&|])\s*[({]/u.test(line))) issues.push('shell group');
+  if (codeLines.some((line) => /(?:^|[;&|({])\s*(?:function\b|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*(?:\{|$))/u.test(line))) {
+    issues.push('function definition');
+  }
+  return issues;
+}
+
+function shellControlDepthAt(codeLines: readonly string[], lineIndex: number): number {
+  return codeLines.slice(0, lineIndex).reduce((depth, line) => {
+    const command = line.trim();
+    if (command === '') return depth;
+    if (/^(?:if|for|while|until|case)\b/u.test(command)) return depth + 1;
+    if (/^(?:fi|done|esac)\b/u.test(command)) return depth - 1;
+    return depth;
+  }, 0);
+}
+
 /**
  * Phantom-check guard: every test file must register exactly its pinned
  * number of tests. A file that silently collects zero tests (or loses some
@@ -156,7 +217,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'spec-rulings-drift.test.ts': 5,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 3,
+  'suite-shape.test.ts': 4,
   'supervisor.test.ts': 96,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 14,
@@ -203,6 +264,15 @@ describe('suite shape', () => {
     expect(workflow).toContain('run: npm test');
   });
 
+  it('distinguishes unsupported R2 shell wrappers from inert shell text', () => {
+    expect(r2ShellSyntaxIssues('read value <<< "$input"\nprintf "%s" "<<EOF" # << comment')).toEqual([]);
+    expect(r2ShellSyntaxIssues("printf '%s' '<<EOF' # << comment")).toEqual([]);
+    expect(r2ShellSyntaxIssues('cat <<EOF\nfalse\nEOF')).toContain('heredoc');
+    expect(r2ShellSyntaxIssues('( if false; then')).toContain('shell group');
+    expect(r2ShellSyntaxIssues('false; if false; then')).toContain('inline control flow');
+    expect(r2ShellSyntaxIssues('{ function helper() {')).toContain('function definition');
+  });
+
   it('keeps formal fail-before registration guards aligned with suite pins', () => {
     const tools = join(import.meta.dirname, '..', 'tools');
     const wavePin = PINS['perkins-builtin-wave.test.ts'];
@@ -236,14 +306,8 @@ describe('suite shape', () => {
         expect(source, 'R2 baseline does not append the derived identity event')
           .toContain('"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"');
         const baselineLines = source.split(/\r?\n/u);
-        const baselineCodeLines = baselineLines.map((line) => line.trim())
-          .filter((line) => line !== '' && !line.startsWith('#'));
-        expect(baselineCodeLines.some((line) => line.includes('<<')), 'R2 baseline setup must not hide commands in a heredoc')
-          .toBe(false);
-        expect(baselineCodeLines.some((line) => /(?:^|[;&|])\s*(?:function(?:\s|$)|[A-Za-z_][A-Za-z0-9_]*\s*\(\)\s*(?:\{|$))/u.test(line)),
-          'R2 baseline setup commands must not be hidden in a function').toBe(false);
-        expect(baselineCodeLines.some((line) => /[;&|]\s*(?:if|for|while|until|case)\b/u.test(line)),
-          'R2 baseline setup must not open control flow after another same-line command').toBe(false);
+        const baselineCodeLines = shellCodeLines(source);
+        expect(r2ShellSyntaxIssues(source), 'R2 baseline must keep a simple, top-level shell setup contract').toEqual([]);
         const uniqueExecutableLine = (command: string, label: string): number => {
           const matches = baselineLines.flatMap((line, index) => line.trim() === command ? [index] : []);
           expect(matches, `R2 baseline ${label} command must occur exactly once as a whole line`).toHaveLength(1);
@@ -251,13 +315,6 @@ describe('suite shape', () => {
           if (line === undefined) throw new Error(`R2 baseline ${label} command is missing or ambiguous`);
           return line;
         };
-        const shellControlDepthAt = (lineIndex: number): number => baselineLines.slice(0, lineIndex).reduce((depth, line) => {
-          const command = line.trim();
-          if (command === '' || command.startsWith('#')) return depth;
-          if (/^(?:if|for|while|until|case)\b/u.test(command)) return depth + 1;
-          if (/^(?:fi|done|esac)\b/u.test(command)) return depth - 1;
-          return depth;
-        }, 0);
         const historicalHelperCopy = uniqueExecutableLine(
           'git show "$base:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"',
           'historical helper copy',
@@ -266,10 +323,10 @@ describe('suite shape', () => {
           String.raw`printf "\\n/** Test-fixture compatibility marker; keep base helper behavior. */\\nexport const PUBLICATION_IDENTITY_EVENT = '%s';\\n" "$identity_event" >> "$d/src/dispatch/publication-evidence.ts"`,
           'identity event append',
         );
-        expect(shellControlDepthAt(historicalHelperCopy), 'R2 baseline historical helper copy is in a shell control-flow block').toBe(0);
+        expect(shellControlDepthAt(baselineCodeLines, historicalHelperCopy), 'R2 baseline historical helper copy is in a shell control-flow block').toBe(0);
         expect(identityEventAppend, 'R2 baseline appends the identity event before the historical helper copy')
           .toBeGreaterThan(historicalHelperCopy);
-        expect(shellControlDepthAt(identityEventAppend), 'R2 baseline identity append is in a shell control-flow block').toBe(0);
+        expect(shellControlDepthAt(baselineCodeLines, identityEventAppend), 'R2 baseline identity append is in a shell control-flow block').toBe(0);
       }
     }
     const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');
