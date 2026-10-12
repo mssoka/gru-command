@@ -121,7 +121,9 @@ describe('GC intake sources and immutable preview', () => {
     const environments: NodeJS.ProcessEnv[] = [];
     const originalRepoRemote = reviewPath.repoRemote;
     const remote = vi.spyOn(reviewPath, 'repoRemote').mockImplementation((repoPath, gitBinary, env) => {
-      const trusted = env ?? trustedEnv;
+      const trusted = env === undefined
+        ? trustedEnv
+        : { ...env, GIT_TEST_ASSUME_DIFFERENT_OWNER: '1' };
       environments.push(trusted);
       return originalRepoRemote(repoPath, gitBinary, trusted);
     });
