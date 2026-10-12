@@ -227,7 +227,8 @@ async function interactiveAnswers(
   const existingSelection = prior === null ? [...found] : [...prior.managedRepos];
   const missingExisting = existingSelection.filter((name) => !found.includes(name));
   if (missingExisting.length > 0) {
-    out.write(`Configured selections not currently available remain selected on Enter: ${missingExisting.join(', ')}.\n`);
+    const displayMissingExisting = missingExisting.map(displayRepositoryName).join(', ');
+    out.write(`Configured selections not currently available remain selected on Enter: ${displayMissingExisting}.\n`);
   }
   let repos: string[] = [];
   let reposInherited = false;

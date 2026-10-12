@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative } from 'node:path';
 import { assertWorktreeBootstrapSupported, loadWorktreeManifest } from '../worktrees/manifest.js';
-import { gitProbeEnvironment } from '../repos/managed-names.js';
+import { gitProbeEnvironment, stripGitLineEnding } from '../repos/managed-names.js';
 
 /** A read-only GC setup boundary. Independent BMAD files are never inspected. */
 export class RepositorySetupError extends Error {
@@ -62,7 +62,7 @@ export function validateRepositorySetup(workspaceRoot: string, repoName: string)
   if (result.status !== 0) {
     throw new RepositorySetupError(`selected directory is not a usable Git repo: ${repoPath}; inspect the Git diagnostic below and repair the repository before re-running setup:\n${result.stderr.trim()}`);
   }
-  const reportedPath = result.stdout.trim();
+  const reportedPath = stripGitLineEnding(result.stdout);
   if (reportedPath === '') throw new RepositorySetupError(`Git reported no repository root for ${repoPath}; inspect its Git configuration and re-run setup`);
   let reportedRoot: string;
   try {

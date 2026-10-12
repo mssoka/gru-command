@@ -184,6 +184,12 @@ function assertGitMarkerAccessibleSync(markerPath: string, isDirectory: boolean)
   if (gitDirectory !== null) assertGitDirectoryAccessibleSync(gitDirectory);
 }
 
+/** Remove only Git's final record separator; paths may end in Unicode whitespace. */
+export function stripGitLineEnding(output: string): string {
+  if (output.endsWith('\r\n')) return output.slice(0, -2);
+  return output.endsWith('\n') ? output.slice(0, -1) : output;
+}
+
 async function isGitWorktreeRoot(project: string): Promise<boolean> {
   const stdout = await new Promise<string>((resolveOutput, reject) => {
     execFile(
@@ -203,19 +209,22 @@ async function isGitWorktreeRoot(project: string): Promise<boolean> {
       },
     );
   });
-  if (stdout === '') return false;
-  return (await realpath(stdout.trim())) === project;
+  const reportedRoot = stripGitLineEnding(stdout);
+  if (reportedRoot === '') return false;
+  return (await realpath(reportedRoot)) === project;
 }
 
 function isGitWorktreeRootSync(project: string): boolean {
   try {
-    const reportedRoot = execFileSync('git', ['-C', project, 'rev-parse', '--show-toplevel'], {
+    const stdout = execFileSync('git', ['-C', project, 'rev-parse', '--show-toplevel'], {
       encoding: 'utf8',
       env: gitProbeEnvironment(),
       maxBuffer: 16_384,
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 2_000,
-    }).trim();
+    });
+    const reportedRoot = stripGitLineEnding(stdout);
+    if (reportedRoot === '') return false;
     return realpathSync(reportedRoot) === project;
   } catch (error) {
     const stderr = String((error as NodeJS.ErrnoException & { stderr?: Buffer | string }).stderr ?? '');
