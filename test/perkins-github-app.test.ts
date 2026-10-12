@@ -3,7 +3,7 @@ import { createHash, createVerify, generateKeyPairSync } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createGithubVerdictPoster,
   createStartupVerdictPoster,
@@ -176,6 +176,7 @@ function makeApiDouble(overrides: ReadonlyArray<Partial<Route> & { readonly meth
 
 const fixtureStack: BundleFixture[] = [];
 afterEach(() => {
+  vi.unstubAllEnvs();
   while (fixtureStack.length > 0) fixtureStack.pop()!.cleanup();
 });
 
@@ -207,6 +208,24 @@ const PR_INPUT = {
 function repoPathOf(fixture: BundleFixture): string {
   return fixture.repo.path;
 }
+
+describe('Perkins App Git origin isolation (GH-270)', () => {
+  it('posts to the assigned origin under inherited foreign Git routing', async () => {
+    const assigned = bundleFixture();
+    const foreign = bundleFixture(DEFAULT_CONFIG, 'https://github.com/foreign/unrelated.git');
+    const { poster, calls } = posterWith(assigned);
+    vi.stubEnv('GIT_DIR', join(foreign.repo.path, '.git'));
+    vi.stubEnv('GIT_WORK_TREE', foreign.repo.path);
+    vi.stubEnv('GIT_INDEX_FILE', join(foreign.repo.path, '.git', 'index'));
+    await expect(poster.post({ ...PR_INPUT, repoPath: assigned.repo.path }))
+      .resolves.toMatchObject({ reviewId: '987654', headSha: HEAD, commitId: HEAD, actor: 'perkins-review[bot]' });
+    expect(calls.some(({ url, method }) => method === 'POST' && url.endsWith('/repos/acme/widget/pulls/7/reviews'))).toBe(true);
+    const postedCalls = calls.length;
+    await expect(poster.post({ ...PR_INPUT, repoPath: assigned.repo.path, prUrl: 'https://github.com/foreign/unrelated/pull/7' }))
+      .rejects.toThrow('pull request URL does not match the reviewed repository origin');
+    expect(calls).toHaveLength(postedCalls);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Bundle config parsing (literal KEY=VALUE, never shell)

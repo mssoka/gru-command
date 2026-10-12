@@ -7,7 +7,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { branchNameForRef } from '../src/dispatch/branch-idle.js';
 import { repositoryGitEnv } from '../src/dispatch/perkins-review/artifacts.js';
 import { prBranchCandidate, resolveFreshPrHead, type PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
-import { WaveRunner } from '../src/dispatch/perkins.js';
+import { GhPrPoster, GitLabMrPoster, WaveRunner } from '../src/dispatch/perkins.js';
+import { probeGitHubRemote, repoRemote, runReviewPreflight } from '../src/dispatch/review-path.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -129,6 +130,102 @@ describe('review Git repository environment isolation (GH-270)', () => {
     }
     expect(clean).toMatchObject(transport);
     expect(repositoryGitEnv(true)).toMatchObject({ ...transport, LC_ALL: 'C' });
+  });
+
+  it('checks the assigned origin in real code-host preflight and never borrows a foreign origin', async () => {
+    const repo = fixture('assigned-code-host');
+    repo.git(['remote', 'add', 'origin', 'https://github.com/acme/assigned.git']);
+    const noOrigin = fixture('assigned-no-origin');
+    const foreign = fixture('foreign-code-host');
+    foreign.git(['remote', 'add', 'origin', 'https://github.com/foreign/unrelated.git']);
+    const before = foreignState(foreign);
+    const binary = join(directory(), 'gh');
+    writeFileSync(binary, `#!/usr/bin/env node
+const expected = ['api', '--hostname', 'github.com', 'repos/acme/assigned', '--jq', '.full_name'];
+if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) process.exit(1);
+process.stdout.write('acme/assigned');
+`);
+    chmodSync(binary, 0o755);
+    poison(foreign);
+    const result = await runReviewPreflight({
+      'resource-integrity': () => {}, 'model-provider': () => {}, 'review-policy': () => {},
+      'code-host': () => {
+        const remote = repoRemote(repo.path);
+        if (remote === null) throw new Error('assigned origin is unavailable');
+        probeGitHubRemote(remote, binary);
+      },
+    });
+    expect(result).toEqual({ ok: true, failures: [] });
+    expect(repoRemote(repo.path)).toEqual({ host: 'github.com', owner: 'acme', repo: 'assigned' });
+    expect(repoRemote(noOrigin.path)).toBeNull();
+    // Explicit caller-owned environments remain complete, not merged with the service environment.
+    expect(repoRemote(repo.path, 'git', repositoryGitEnv(false)))
+      .toEqual({ host: 'github.com', owner: 'acme', repo: 'assigned' });
+    expect(foreignState(foreign)).toEqual(before);
+  });
+
+  it('posts GitHub verdicts against the assigned origin and still refuses a mismatched PR', async () => {
+    const repo = fixture('assigned-github-post');
+    repo.git(['remote', 'add', 'origin', 'https://github.com/acme/assigned.git']);
+    const foreign = fixture('foreign-github-post');
+    foreign.git(['remote', 'add', 'origin', 'https://github.com/foreign/unrelated.git']);
+    const before = foreignState(foreign);
+    const target = repo.head();
+    const binary = join(directory(), 'gh');
+    writeFileSync(binary, `#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv.includes('POST')) {
+  const body = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+  process.stdout.write(JSON.stringify({ id: 7, user: { login: 'fixture-bot' }, state: 'COMMENTED', commit_id: body.commit_id, body: body.body }));
+} else if (argv.includes('user')) {
+  process.stdout.write('fixture-bot');
+} else {
+  process.stdout.write(${JSON.stringify(`${target}\t${target}\n`)});
+}
+`);
+    chmodSync(binary, 0o755);
+    const poster = new GhPrPoster(binary);
+    const input = {
+      repoPath: repo.path, prUrl: 'https://github.com/acme/assigned/pull/7', host: 'github.com',
+      targetSha: target, baseSha: target, body: 'assigned review\n',
+    };
+    poison(foreign);
+    await expect(poster.post(input)).resolves.toMatchObject({ reviewId: '7', headSha: target, commitId: target });
+    await expect(poster.post({ ...input, prUrl: 'https://github.com/foreign/unrelated/pull/7' }))
+      .rejects.toThrow('pull request URL does not match the reviewed repository origin');
+    expect(foreignState(foreign)).toEqual(before);
+  });
+
+  it('posts GitLab verdicts against the assigned origin and still refuses a mismatched MR', async () => {
+    const repo = fixture('assigned-gitlab-post');
+    repo.git(['remote', 'add', 'origin', 'https://gitlab.example.test/acme/assigned.git']);
+    const foreign = fixture('foreign-gitlab-post');
+    foreign.git(['remote', 'add', 'origin', 'https://gitlab.example.test/foreign/unrelated.git']);
+    const before = foreignState(foreign);
+    const target = repo.head();
+    const calls: string[] = [];
+    const poster = new GitLabMrPoster({
+      token: 'fixture-token',
+      fetchImpl: async (url, init) => {
+        calls.push(url);
+        const body = url.endsWith('/user') ? { username: 'fixture-bot' }
+          : init?.method === 'POST' ? { id: 7, author: { username: 'fixture-bot' }, body: 'assigned review\n' }
+            : { sha: target, diff_refs: { base_sha: target } };
+        return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+      },
+    });
+    const input = {
+      repoPath: repo.path, prUrl: 'https://gitlab.example.test/acme/assigned/-/merge_requests/7',
+      host: 'gitlab.example.test', targetSha: target, baseSha: target, body: 'assigned review\n',
+    };
+    poison(foreign);
+    await expect(poster.post(input)).resolves.toMatchObject({ reviewId: '7', headSha: target, commitId: null });
+    expect(calls).toContain('https://gitlab.example.test/api/v4/projects/acme%2Fassigned/merge_requests/7/notes');
+    const postedCalls = calls.length;
+    await expect(poster.post({ ...input, prUrl: 'https://gitlab.example.test/foreign/unrelated/-/merge_requests/7' }))
+      .rejects.toThrow('merge request URL does not match the reviewed repository origin');
+    expect(calls).toHaveLength(postedCalls);
+    expect(foreignState(foreign)).toEqual(before);
   });
 
   it('discovers the assigned branch instead of a foreign tag or foreign-only branch', () => {
