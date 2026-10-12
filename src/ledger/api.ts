@@ -8280,28 +8280,35 @@ export class LedgerApi {
     const debt = this.findReportObligation(jobId);
     if (current === null || job === null || debt === null) return null;
     const candidates: { readonly item: MailboxItem; readonly seq: number }[] = [];
+    let latestRulingSeq = 0;
     for (const old of previous.values()) {
-      const saved = old.disposition;
-      if (old.kind !== 'incident' || old.notificationIds.length !== 1 || old.subject !== source.subject
-        || saved?.state !== 'waiting' || saved.sourceObligationId !== undefined || saved.basis !== old.basis) continue;
+      if (old.kind !== 'incident' || old.notificationIds.length !== 1 || !old.reasons.some((reason) => reason.label === kind)) continue;
       const row = this.getNotification(old.notificationIds[0]!);
-      if (row === null || row.kind !== kind || row.agentId !== null || row.detail !== current.detail || row.severity !== current.severity) continue;
+      if (row === null || row.kind !== kind || row.agentId !== null) continue;
       const key = `notification:${row.id}`;
-      const legacyReason = mailboxBasis([mailboxBasis([key, mailboxBasis([key, row.kind, row.detail, row.severity])]), null]);
-      const legacyBasis = mailboxBasis([[source.reasons[0]!.signal, legacyReason]]);
-      if (old.id !== `incident:${mailboxBasis(key)}` || old.basis !== legacyBasis) continue;
+      if (old.id !== `incident:${mailboxBasis(key)}`) continue;
       const ruling = this.db.prepare(`SELECT seq, payload FROM events WHERE kind = 'mailbox.disposition'
-        AND json_extract(payload, '$.id') = ? AND json_extract(payload, '$.disposition.basis') = ? ORDER BY seq DESC LIMIT 1`)
-        .get(old.id, old.basis) as Row | undefined;
-      if (ruling === undefined || JSON.stringify((JSON.parse(str(ruling.payload)) as { disposition: MailboxDisposition }).disposition) !== JSON.stringify(saved)) continue;
-      // Without old source fingerprints, any later source write means compatibility is unprovable.
+        AND json_extract(payload, '$.id') = ? ORDER BY seq DESC LIMIT 1`).get(old.id) as Row | undefined;
+      if (ruling === undefined) continue;
+      // Any newer report-wide ruling wins, including explicit needs-gru/resolved rulings.
+      latestRulingSeq = Math.max(latestRulingSeq, Number(ruling.seq));
+      const saved = old.disposition;
+      if (old.subject !== source.subject || saved?.state !== 'waiting' || saved.sourceObligationId !== undefined
+        || saved.basis !== old.basis || row.detail !== current.detail || row.severity !== current.severity) continue;
+      const legacyReason = mailboxBasis([mailboxBasis([key, mailboxBasis([key, row.kind, row.detail, row.severity])]), null]);
+      if (old.basis !== mailboxBasis([[source.reasons[0]!.signal, legacyReason]])) continue;
+      if (JSON.stringify((JSON.parse(str(ruling.payload)) as { disposition: MailboxDisposition }).disposition) !== JSON.stringify(saved)) continue;
+      // Mailbox receipts/dispositions are metadata, never source mutations. Other later job writes
+      // remain unprovable without an old source fingerprint and must restore attention.
       if (Date.parse(job.updatedAt) > Date.parse(saved.recordedAt) || Date.parse(debt.updatedAt) > Date.parse(saved.recordedAt)
-        || this.db.prepare('SELECT 1 FROM events WHERE job_id = ? AND seq > ? LIMIT 1').get(jobId, Number(ruling.seq)) !== undefined) continue;
+        || this.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND seq > ?
+          AND kind NOT IN ('mailbox.disposition', 'mailbox.received', 'mailbox.report-custody-migrated') LIMIT 1`)
+          .get(jobId, Number(ruling.seq)) !== undefined) continue;
       try { validateMailboxDisposition(this, old, saved, now, true); }
       catch (error) { if (!(error instanceof MailboxConflictError)) throw error; continue; }
       candidates.push({ item: old, seq: Number(ruling.seq) });
     }
-    const old = candidates.sort((a, b) => b.seq - a.seq)[0]?.item;
+    const old = candidates.find((candidate) => candidate.seq === latestRulingSeq)?.item;
     if (old === undefined) return null;
     const disposition = { ...old.disposition!, basis: source.basis };
     this.appendEvent({ kind: 'mailbox.report-custody-migrated', payload: {

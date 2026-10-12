@@ -100,7 +100,7 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
     const ordered = reasons.map((reason) => ({ ...reason, basis: mailboxBasis([reason.basis, context]) })).sort((a, b) => a.signal.localeCompare(b.signal) || a.basis.localeCompare(b.basis));
     const basis = mailboxBasis(ordered.map((reason) => [reason.signal, reason.basis]));
     return { id, subject, jobId, title, kind: jobId === null ? 'incident' : 'job', reasons: ordered, basis,
-      severity: rows.some((row) => row.severity === 'error') || ordered.some((reason) => ['blocked', 'worker-error', 'round-aborted', 'lens-failed', 'pr-conflict'].includes(reason.signal)) ? 'error' : 'info',
+      severity: rows.some((row) => (reportSources.get(row.kind) ?? row).severity === 'error') || ordered.some((reason) => ['blocked', 'worker-error', 'round-aborted', 'lens-failed', 'pr-conflict'].includes(reason.signal)) ? 'error' : 'info',
       notificationIds: rows.filter((row) => row.resolvedAt === null && row.ackedAt === null).map((row) => row.id).sort(), producerOwned: rows.some((row) => producerResolvedBy(row.kind) !== null || reportHandbackJobId(row.kind) !== null),
       state: 'needs-gru', owner: 'gru', disposition: null, receipt: null, references, restrictions,
       attentionKey: `${id}@${basis}` };
