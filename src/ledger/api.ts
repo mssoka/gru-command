@@ -8284,7 +8284,7 @@ export class LedgerApi {
     for (const old of previous.values()) {
       if (old.kind !== 'incident' || old.notificationIds.length !== 1 || !old.reasons.some((reason) => reason.label === kind)) continue;
       const row = this.getNotification(old.notificationIds[0]!);
-      if (row === null || row.kind !== kind || row.agentId !== null) continue;
+      if (row === null || row.kind !== kind) continue;
       const key = `notification:${row.id}`;
       if (old.id !== `incident:${mailboxBasis(key)}`) continue;
       const ruling = this.db.prepare(`SELECT seq, payload FROM events WHERE kind = 'mailbox.disposition'
