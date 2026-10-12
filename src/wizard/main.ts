@@ -710,7 +710,8 @@ async function main(argv: readonly string[]): Promise<number> {
       resolveManagedRepoPathSync(workspaceAbs, repo).kind === 'unavailable';
     if (unavailable) {
       stdout.write(
-        `Previously selected repository ${repo} is currently unavailable; keeping it in managed_repos. ` +
+        `Previously selected repository ${displayRepositoryName(repo)} is currently ` +
+          'unavailable; keeping it in managed_repos. ' +
           'Restore it or remove it from config.toml deliberately.\n',
       );
       continue;
@@ -720,7 +721,7 @@ async function main(argv: readonly string[]): Promise<number> {
     } catch (error) {
       fail((error as Error).message);
     }
-    stdout.write(`Repository ready in ${repo}: GC setup validated; project files unchanged.\n`);
+    stdout.write(`Repository ready in ${displayRepositoryName(repo)}: GC setup validated; project files unchanged.\n`);
   }
 
   // Recheck the fixed port immediately

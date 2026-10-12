@@ -336,16 +336,32 @@ const SAFE_HOST = /^[A-Za-z0-9.-]+$/;
  * fail the mirrored web validator and freeze every snapshot, so an
  * invisible-only name is disclosed as visible escapes — never dropped,
  * never used as an identity. Control/format characters (bidi overrides
- * included) are escaped even beside visible text, so a name can never
- * spoof its display; combining marks are escaped only when nothing else
- * is visible (they are legitimate in many scripts). */
+ * included) and leading combining marks are escaped even beside visible
+ * text; combining marks after a visible base remain legitimate in many
+ * scripts. */
 const VISIBLE_CHARACTER = /[^\p{Cf}\p{Cc}\p{M}\s]/u;
+const COMBINING_MARK = /\p{M}/u;
 const CONTROL_OR_FORMAT = /[\p{Cf}\p{Cc}]/u;
 
 export function safeDisplayName(name: string): string {
   const escape = (char: string): string => `\\u{${char.codePointAt(0)?.toString(16) ?? '?'}}`;
   if (VISIBLE_CHARACTER.test(name)) {
-    return [...name].map((char) => (CONTROL_OR_FORMAT.test(char) ? escape(char) : char)).join('');
+    let hasVisibleBase = false;
+    return [...name]
+      .map((char) => {
+        if (CONTROL_OR_FORMAT.test(char)) {
+          hasVisibleBase = false;
+          return escape(char);
+        }
+        if (COMBINING_MARK.test(char)) return hasVisibleBase ? char : escape(char);
+        if (VISIBLE_CHARACTER.test(char)) {
+          hasVisibleBase = true;
+          return char;
+        }
+        hasVisibleBase = false;
+        return char;
+      })
+      .join('');
   }
   const escaped = [...name]
     .map((char) => (VISIBLE_CHARACTER.test(char) ? char : escape(char)))
