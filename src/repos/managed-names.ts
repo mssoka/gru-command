@@ -64,8 +64,13 @@ export function gitProbeEnvironment(trustedHome = trustedAccountHome()): NodeJS.
 
 function confirmedNonRepository(error: unknown, stderr: string): boolean {
   if (error === null || typeof error !== 'object') return false;
-  const detail = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string | null };
-  return typeof detail.code === 'number' && detail.killed !== true &&
+  const detail = error as NodeJS.ErrnoException & {
+    killed?: boolean;
+    signal?: string | null;
+    status?: number | null;
+  };
+  const exitCode = typeof detail.code === 'number' ? detail.code : detail.status;
+  return typeof exitCode === 'number' && exitCode !== 0 && detail.killed !== true &&
     (detail.signal === null || detail.signal === undefined) &&
     /(?:not a git repository|invalid gitfile format|invalid gitdir format)/iu.test(stderr);
 }
