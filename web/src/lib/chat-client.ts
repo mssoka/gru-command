@@ -402,7 +402,13 @@ export class ChatClient {
   private id(): string {
     // uuidV4 falls back to getRandomValues-based v4 minting where
     // crypto.randomUUID is absent (insecure contexts: LAN HTTP origins).
-    return this.options.idgen?.() ?? uuidV4();
+    const id = this.options.idgen?.() ?? uuidV4();
+    // An empty id would be accepted in-session but dropped by the outbox
+    // restore on reload (silent message loss): refuse it at the boundary.
+    if (typeof id !== 'string' || id === '') {
+      throw new Error('idgen returned an empty id; client message ids must be non-empty strings');
+    }
+    return id;
   }
 
   private setState(state: ConnectionState): void {

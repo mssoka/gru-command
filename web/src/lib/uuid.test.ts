@@ -4,8 +4,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { uuidV4 } from './uuid.js';
-
-const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+import { stubInsecureCrypto, UUID_V4_RE } from './uuid-test-support.js';
 
 /** Secure-context-like stub: native randomUUID delegates a sentinel so the
  * test can prove the helper prefers it verbatim. getRandomValues passes
@@ -16,15 +15,6 @@ function stubSecureCrypto(): void {
     randomUUID: () => 'native-was-used-verbatim',
     getRandomValues: <T extends ArrayBufferView>(array: T): T => real.getRandomValues(array),
   });
-}
-
-/** Insecure-context stub: getRandomValues only, randomUUID absent. */
-function stubInsecureCrypto(): void {
-  const real = globalThis.crypto;
-  vi.stubGlobal('crypto', {
-    getRandomValues: <T extends ArrayBufferView>(array: T): T => real.getRandomValues(array),
-  });
-  expect((globalThis.crypto as { randomUUID?: unknown }).randomUUID).toBeUndefined();
 }
 
 describe('uuidV4', () => {
@@ -71,8 +61,30 @@ describe('uuidV4', () => {
     expect(uuidV4()).toBe('00010203-0405-4607-8809-0a0b0c0d0e0f');
   });
 
-  it('throws a named error when no Web Crypto exists at all', () => {
+  it('throws an actionable error when no Web Crypto exists at all', () => {
     vi.stubGlobal('crypto', undefined);
-    expect(() => uuidV4()).toThrow('gru: Web Crypto is unavailable');
+    expect(() => uuidV4()).toThrow('Web Crypto is unavailable in this context; cannot mint message ids');
+  });
+
+  it('throws when crypto exists with neither randomUUID nor getRandomValues', () => {
+    vi.stubGlobal('crypto', {});
+    expect(() => uuidV4()).toThrow('Web Crypto is unavailable');
+  });
+
+  it('does not swallow a native randomUUID that throws (deliberate fail-loud, no entropy swap)', () => {
+    const getRandomValues = vi.fn();
+    vi.stubGlobal('crypto', {
+      randomUUID: () => {
+        throw new Error('native randomUUID exploded');
+      },
+      getRandomValues,
+    });
+    expect(() => uuidV4()).toThrow('native randomUUID exploded');
+    expect(getRandomValues).not.toHaveBeenCalled();
+  });
+
+  it('error messages carry no invented "gru:" namespace prefix (repo idiom: message-named errors)', () => {
+    vi.stubGlobal('crypto', undefined);
+    expect(() => uuidV4()).not.toThrow(/^gru:/);
   });
 });
