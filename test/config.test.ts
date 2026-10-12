@@ -257,6 +257,28 @@ describe('config fail-loud validation', () => {
     }
   });
 
+  it('escapes control and format characters in invalid managed repository names', () => {
+    for (const name of ['alpha\u001b[31m', 'alpha\u202ehidden', 'alpha\u2028hidden']) {
+      const home = tmpHome();
+      const tomlName = name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
+        const codePoint = character.codePointAt(0) ?? 0;
+        return `\\u${codePoint.toString(16).padStart(4, '0')}`;
+      });
+      writeConfig(home, `managed_repos = ["${tomlName}"]`);
+      let message: string | null = null;
+      try {
+        loadConfig({ GRU_COMMAND_HOME: home });
+      } catch (error) {
+        message = (error as ConfigError).message;
+      }
+      expect(message).not.toBeNull();
+      expect(message).not.toContain('\u001b');
+      expect(message).not.toContain('\u202e');
+      expect(message).not.toContain('\u2028');
+      expect(message).toMatch(/\\u\{(?:1b|202e|2028)\}/u);
+    }
+  });
+
   it('rejects empty strings for required paths', () => {
     const home = tmpHome();
     writeConfig(home, 'workspace_root = ""');

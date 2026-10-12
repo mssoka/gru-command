@@ -1234,6 +1234,40 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(after.freshness).toBe('stale');
   });
 
+  it('withholds provider polling and marks cached data stale until origin resolution recovers', async () => {
+    const api = new FakeApi().set('alpha', { openPrs: 7, openIssues: 3 });
+    const h = harness({ names: ['alpha'], api });
+    const initial = await h.tracker.refresh();
+    const before = row(initial, 'alpha');
+    const initialCallCount = h.api.calls.length;
+    expect(before.freshness).toBe('fresh');
+
+    h.resolveError = true;
+    h.api.set('alpha', { openPrs: 99, openIssues: 101 });
+    h.clock.ms += 1;
+    const failed = await h.tracker.refresh();
+    const stale = row(failed, 'alpha');
+    expect(h.api.calls).toHaveLength(initialCallCount);
+    expect(stale.link).toBe(before.link);
+    expect(stale.openPrs).toBe(before.openPrs);
+    expect(stale.openIssues).toBe(before.openIssues);
+    expect(stale.checkedAt).toBe(before.checkedAt);
+    expect(stale.freshness).toBe('stale');
+    expect(stale.error).toContain('origin resolution failed');
+    expect(stale.lastAttemptAt).not.toBeNull();
+
+    h.resolveError = false;
+    h.clock.ms += 1;
+    const recovered = await h.tracker.refresh();
+    const current = row(recovered, 'alpha');
+    expect(h.api.calls.length).toBeGreaterThan(initialCallCount);
+    expect(current.openPrs).toBe(99);
+    expect(current.openIssues).toBe(101);
+    expect(current.freshness).toBe('fresh');
+    expect(current.error).toBeNull();
+    expect(current.checkedAt).not.toBe(before.checkedAt);
+  });
+
   it('discloses a global abort on every repository the pass never reached', async () => {
     const api = new FakeApi()
       .set('alpha', {

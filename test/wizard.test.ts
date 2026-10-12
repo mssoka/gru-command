@@ -6,6 +6,7 @@ import { createServer } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
 import { OwnedCommandTimeoutError, markFixtureStep, runOwnedCommand } from './helpers/harness-diagnostics.mjs';
 import { loadConfig, configPathFor } from '../src/config.js';
+import { gitProbeEnvironment, resolveManagedRepoPathSync } from '../src/repos/managed-names.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
 import { formatHostForUrl, runFirstBootSmoke } from '../src/wizard/main.js';
 import { AnswersError, generateToken, parseAnswers, resolveBindHost, validateHost, validateWorkspaceRoot } from '../src/wizard/answers.js';
@@ -135,6 +136,22 @@ describe('wizard answers', () => {
       /plain directory name/,
     );
     expect(() => parseAnswers(`{"workspace_root":"${workspace}","repos":["*"]}`)).toThrow(/wildcard/);
+  });
+
+  it('escapes rejected control and format characters in repository-name errors', () => {
+    for (const name of ['alpha\u001b[31m', 'alpha\u202ehidden', 'alpha\u2028hidden']) {
+      let message: string | null = null;
+      try {
+        parseAnswers(JSON.stringify({ repos: [name] }));
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).not.toBeNull();
+      expect(message).not.toContain('\u001b');
+      expect(message).not.toContain('\u202e');
+      expect(message).not.toContain('\u2028');
+      expect(message).toMatch(/\\u\{(?:1b|202e|2028)\}/u);
+    }
   });
 });
 
@@ -420,6 +437,30 @@ describe('wizard CLI surface', () => {
     for (const value of [{}, { 'repo-a': 'provision' }, { 'repo-a': 'skip' }, { 'repo-a': 'reuse' }]) {
       expect(() => parseAnswers(JSON.stringify({ bmad: value }))).toThrow(/answers.bmad is retired.*Remove the bmad key/u);
     }
+  });
+
+  it('headless setup rejects a symlinked .git marker that runtime treats as unavailable', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-symlink-git-ws-');
+    const repo = join(workspace, 'alpha');
+    const gitDir = join(workspace, 'alpha-git-dir');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-q', `--separate-git-dir=${gitDir}`], { cwd: repo });
+    rmSync(join(repo, '.git'));
+    symlinkSync(gitDir, join(repo, '.git'), 'dir');
+    expect(execFileSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf-8',
+      env: gitProbeEnvironment(),
+    }).trim()).toBe(repo);
+    expect(resolveManagedRepoPathSync(workspace, 'alpha')).toMatchObject({ kind: 'unavailable' });
+
+    const home = tempDir('gru-command-wizard-symlink-git-home-');
+    const result = spawnSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--answers', JSON.stringify({
+      workspace_root: workspace, repos: ['alpha'], port: 0, smoke: false,
+    })], { env: { ...process.env, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 30_000 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('unsupported .git marker');
+    expect(existsSync(configPathFor(home))).toBe(false);
   });
 
   it('headless setup accepts a wrong-kind user BMAD path without reading or changing it', () => {
