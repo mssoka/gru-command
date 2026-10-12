@@ -893,12 +893,16 @@ export class ManagedRepoOverviewTracker {
     for (const name of classifyOrder) {
       const previous = this.states.get(name);
       const base = previous ?? emptySourceState();
-      const unreadable = (skipProviderPoll = false, detail: string | null = null): void => {
+      const unreadable = (
+        skipProviderPoll = false,
+        detail: string | null = null,
+        failureKind = 'root validation failed',
+      ): void => {
         if (skipProviderPoll) unresolvedThisRefresh.add(name);
         // A read failure (or the resolution budget) is not evidence the
         // remote changed: keep the previous classification and cached
-        // observation when one exists. Root-validation faults disclose an
-        // attempt/error and withhold polling until this root is validated.
+        // observation when one exists. Origin/root-resolution faults disclose
+        // an attempt/error and withhold polling until the identity is validated.
         // A budget skip keeps its prior freshness untouched, but also
         // withholds its cached identity from provider polling. A
         // never-classified entry stays visible with an explicit read-failure
@@ -911,7 +915,7 @@ export class ManagedRepoOverviewTracker {
           const failed = {
             ...previous,
             lastAttemptAt: new Date(this.now()).toISOString(),
-            error: (`root validation failed: ${detail.trim() || 'probe failed without a message'}`).slice(0, 300),
+            error: (`${failureKind}: ${detail.trim() || 'probe failed without a message'}`).slice(0, 300),
           };
           if (previous.ref === null) failed.linkReason = ORIGIN_READ_FAILED_REASON;
           nextStates.set(name, failed);
@@ -921,7 +925,7 @@ export class ManagedRepoOverviewTracker {
         row.linkReason = ORIGIN_READ_FAILED_REASON;
         if (detail !== null) {
           row.lastAttemptAt = new Date(this.now()).toISOString();
-          row.error = (`root validation failed: ${detail.trim() || 'probe failed without a message'}`).slice(0, 300);
+          row.error = (`${failureKind}: ${detail.trim() || 'probe failed without a message'}`).slice(0, 300);
         }
         nextStates.set(name, row);
       };
@@ -995,11 +999,12 @@ export class ManagedRepoOverviewTracker {
         attemptedResolutions += 1;
       } catch (error) {
         attemptedResolutions += 1;
+        const detail = messageOf(error).slice(0, 300);
         this.log('warn', 'repo overview: origin resolution failed — keeping the previous classification', {
           repo: name,
-          error: messageOf(error).slice(0, 300),
+          error: detail,
         });
-        unreadable();
+        unreadable(true, detail, 'origin resolution failed');
         continue;
       }
       const classification = classifyRemoteValue(resolved);

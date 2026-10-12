@@ -47,7 +47,11 @@ import {
   writeConfigText,
 } from './steps.js';
 import { validateRepositorySetup } from './repository-setup.js';
-import { managedRepoNameError, resolveManagedRepoPathSync } from '../repos/managed-names.js';
+import {
+  displayManagedRepoName as displayRepositoryName,
+  managedRepoNameError,
+  resolveManagedRepoPathSync,
+} from '../repos/managed-names.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -55,14 +59,6 @@ const WIZARD_USAGE =
 function fail(message: string, code = 1): never {
   process.stderr.write(`wizard: ${message}\n`);
   process.exit(code);
-}
-
-/** Render untrusted filesystem names without terminal control or bidi effects. */
-function displayRepositoryName(name: string): string {
-  return name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
-    const codePoint = character.codePointAt(0);
-    return codePoint === undefined ? '' : `\\u{${codePoint.toString(16)}}`;
-  });
 }
 
 function workspaceIdentity(workspaceRoot: string, home: string): string {

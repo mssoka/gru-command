@@ -168,6 +168,14 @@ export function managedRepoNameError(name: string): string | null {
   return null;
 }
 
+/** Render untrusted repository names without terminal-control or bidi effects. */
+export function displayManagedRepoName(name: string): string {
+  return name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint === undefined ? '' : `\\u{${codePoint.toString(16)}}`;
+  });
+}
+
 /**
  * Resolve one configured name to its exact direct project root. Missing,
  * symlinked, non-directory, escaped and confirmed non-Git entries stay

@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { parse, type TomlPrimitive } from 'smol-toml';
 import { parseQuietHours } from './chat/wake-policy.js';
 import { DEFAULT_INPUT_PRICE_PER_MTOK, validateProviderProfile } from './decisions/profile.js';
-import { managedRepoNameError } from './repos/managed-names.js';
+import { displayManagedRepoName, managedRepoNameError } from './repos/managed-names.js';
 import type { SurfaceMode } from './decisions/types.js';
 
 /** Roles are product-native and runtime-agnostic (SPEC ruling 15). */
@@ -1038,7 +1038,11 @@ export function loadConfig(
         }
         const problem = managedRepoNameError(entry);
         if (problem !== null) {
-          throw new ConfigError(`${field} ${problem} (got: ${entry})`, file, field);
+          throw new ConfigError(
+            `${field} ${problem} (got: ${JSON.stringify(displayManagedRepoName(entry))})`,
+            file,
+            field,
+          );
         }
         return entry;
       });

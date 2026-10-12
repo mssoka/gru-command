@@ -25,7 +25,26 @@ export function validateRepositorySetup(workspaceRoot: string, repoName: string)
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
     throw new RepositorySetupError(`selected repo escapes the workspace root: ${candidate}`);
   }
-  if (!existsSync(join(repoPath, '.git'))) throw new RepositorySetupError(`selected directory is not a Git repo: ${repoPath}`);
+  const gitMarkerPath = join(repoPath, '.git');
+  let gitMarker: ReturnType<typeof lstatSync>;
+  try {
+    gitMarker = lstatSync(gitMarkerPath);
+  } catch (error) {
+    const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      throw new RepositorySetupError(`selected directory is not a Git repo: ${repoPath}`);
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new RepositorySetupError(
+      `could not inspect the selected repository's Git marker: ${detail}`,
+    );
+  }
+  if (gitMarker.isSymbolicLink() || (!gitMarker.isDirectory() && !gitMarker.isFile())) {
+    throw new RepositorySetupError(
+      `selected directory has an unsupported .git marker at ${gitMarkerPath}; ` +
+        '.git must be a real directory or a worktree-pointer file',
+    );
+  }
 
   // A caller's Git routing/config scope must not turn a ghost .git into another repo.
   // Owner Git config files (including safe.directory) remain authoritative.

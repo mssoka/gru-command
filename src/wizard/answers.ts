@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { DEFAULT_INSTANCE_PORT, expandTilde, ROLES, RUNTIME_IDS, type Role, type RuntimeId } from '../config.js';
-import { managedRepoNameError } from '../repos/managed-names.js';
+import { displayManagedRepoName, managedRepoNameError } from '../repos/managed-names.js';
 
 /**
  * Setup wizard answers (E9): the non-interactive contract. Every field is
@@ -244,7 +244,9 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
       }
       const problem = managedRepoNameError(name);
       if (problem !== null) {
-        throw new AnswersError(`answers.repos entries ${problem} — got: ${name}`);
+        throw new AnswersError(
+          `answers.repos entries ${problem} — got: ${JSON.stringify(displayManagedRepoName(name))}`,
+        );
       }
       return name;
     });
