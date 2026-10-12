@@ -511,7 +511,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(laneSha);
-    expect(manifest.targetRef).toBe('feature/lane');
+    expect(manifest.targetRef).toBe('refs/heads/feature/lane');
   });
 
   it('a non-PR origin/topic target FREEZES the fetched tip, never the stale local tracking ref (Perkins blocker)', async () => {
@@ -712,7 +712,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(laneCommit);
-    expect(manifest.targetRef).toBe('HEAD');
+    expect(manifest.targetRef).toBe('refs/heads/feature/lane');
   });
 
   it('a remote-only origin/topic on a linked PR NEVER bypasses PR-head verification — the PR head is frozen (Perkins R3)', async () => {
@@ -885,7 +885,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(ancestor);
-    expect(manifest.targetRef).toBe('origin/feature/lane~1');
+    expect(manifest.targetRef).toBe(ancestor); // Revision pins bind once in the source lane.
     // gh-169: a revision-expression pin is not a branch spelling — the
     // advertised-branch probe must not false-alarm it into check-failed
     // movement. The round passes admission preflight and finalizes without
@@ -1096,7 +1096,7 @@ describe('freeze-time integration on PR rounds', () => {
       readFileSync(join(artifacts, outcome.round.id, 'manifest.json'), 'utf8'),
     ) as { readonly targetSha: string; readonly targetRef: string };
     expect(manifest.targetSha).toBe(tagSha);
-    expect(manifest.targetRef).toBe('origin/v1');
+    expect(manifest.targetRef).toBe('refs/tags/origin/v1');
   });
 
   it('an explicit TAG pin origin/v1 on a non-PR round freezes the tag — consistent routing', async () => {
