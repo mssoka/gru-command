@@ -143,6 +143,23 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
   }, 90_000);
 
+  it('renders a mark-only repository name as a visible escape in the wizard', () => {
+    const workspace = tempDir('gru-command-pty-mark-only-ws-');
+    const name = '\u0301';
+    const repo = join(workspace, name);
+    mkdirSync(repo);
+    execFileSync('git', ['-C', repo, 'init', '-q']);
+    const instance = tempDir('gru-command-pty-mark-only-home-');
+    const { output, status } = ptyWizard([
+      { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '1' }, ...finishSteps('n'),
+    ], { GRU_COMMAND_HOME: instance });
+
+    expect(status, output).toBe(0);
+    expect(output).toContain('  1. \\u{301}');
+    expect(output).toContain('Managed repositories selected: \\u{301}');
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual([name]);
+  }, 90_000);
+
   it('interactive reruns preserve the prior subset on Enter and persist an explicit changed choice', () => {
     const workspace = fixtureWorkspace();
     const instance = tempDir('gru-command-pty-managed-rerun-');
