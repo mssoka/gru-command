@@ -69,8 +69,8 @@ describe('Silas corrective verification after exact failure dismissals (GH-302)'
     disposition(ledger, 'corrective-job', 'baseline', 'negative-1');
     disposition(ledger, 'corrective-job', 'r2-baseline', 'negative-2');
     const result = await digest(ledger);
-    expect(result.verificationFailures).toEqual([]);
     expect(result.verificationsOwed).toEqual(owed());
+    expect(result.verificationFailures).toEqual([]);
     expect(result.prWithoutReview).toEqual([]);
     expect(result.revisionContinuations).toEqual([]);
     expect(digestActionCount(result)).toBe(1);
