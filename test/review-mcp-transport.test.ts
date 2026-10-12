@@ -176,6 +176,125 @@ describe('review MCP bridge: join, retention and explicit abort', () => {
     expect(executions).toBe(2);
   });
 
+  it('evicts by settlement age: a long-held wave that settles last is still re-attachable after pressure (#174)', async () => {
+    const executions = new Map<string, number>();
+    const gate = deferred();
+    // Default retention (16 MiB): four 5 MiB successes cannot all fit.
+    const big = 'x'.repeat(5 * 1024 * 1024);
+    const tool: NativeAgentTool = {
+      name: 'perkins_probe',
+      description: 'probe',
+      inputSchema: { type: 'object' },
+      execute: async (input) => {
+        const label = String(input['label']);
+        executions.set(label, (executions.get(label) ?? 0) + 1);
+        if (label === 'wave') await gate.promise;
+        return { text: `${label}:${big}`, details: { label } };
+      },
+    };
+    const bridge = await ReviewMcpBridge.start([tool]);
+    bridges.push(bridge);
+    const call = (id: string, label: string) =>
+      callBridge(bridge.socketPath, { id, name: 'perkins_probe', input: { label } });
+    const wave = call('wave-1', 'wave');
+    void wave.promise.catch(() => {});
+    await vi.waitFor(() => expect(executions.get('wave')).toBe(1));
+    // Later-started successes settle first and fill the byte budget.
+    for (const label of ['a', 'b', 'c']) {
+      await expect(call(`${label}-1`, label).promise).resolves.toMatchObject({ ok: true });
+    }
+    // The held-open wave settles LAST (the transport wait ended: socket gone).
+    wave.socket.destroy();
+    const joined = call('wave-2', 'wave');
+    gate.resolve();
+    await expect(joined.promise).resolves.toMatchObject({ ok: true, result: { details: { label: 'wave' } } });
+    // The oldest-SETTLED entries were evicted, not the just-settled wave.
+    const reattach = await call('wave-3', 'wave').promise;
+    expect(reattach).toMatchObject({ ok: true, result: { details: { label: 'wave' } } });
+    expect(reattach.result?.text.startsWith('wave:')).toBe(true);
+    expect(executions.get('wave')).toBe(1);
+    // Pressure really evicted older settled successes: 'a' runs again.
+    await expect(call('a-2', 'a').promise).resolves.toMatchObject({ ok: true });
+    expect(executions.get('a')).toBe(2);
+  });
+
+  it('bounds zero-text successes by entry count and evicts the oldest settled first (#174)', async () => {
+    const executions = new Map<number, number>();
+    const tool: NativeAgentTool = {
+      name: 'perkins_probe',
+      description: 'probe',
+      inputSchema: { type: 'object' },
+      execute: async (input) => {
+        const n = Number(input['n']);
+        executions.set(n, (executions.get(n) ?? 0) + 1);
+        return { text: '' };
+      },
+    };
+    const bridge = await ReviewMcpBridge.start([tool], { retention: { maxBytes: 1024 * 1024, maxEntries: 3 } });
+    bridges.push(bridge);
+    const call = (id: string, n: number) =>
+      callBridge(bridge.socketPath, { id, name: 'perkins_probe', input: { n } }).promise;
+    for (const n of [1, 2, 3, 4]) await expect(call(`first-${n}`, n)).resolves.toMatchObject({ ok: true });
+    // Entry 1 (settled longest ago) was evicted; 2..4 re-attach without work.
+    for (const n of [2, 3, 4]) await expect(call(`again-${n}`, n)).resolves.toMatchObject({ ok: true });
+    expect([2, 3, 4].map((n) => executions.get(n))).toEqual([1, 1, 1]);
+    await expect(call('again-1', 1)).resolves.toMatchObject({ ok: true });
+    expect(executions.get(1)).toBe(2);
+  });
+
+  it('charges structured details and request keys against the byte budget (#174)', async () => {
+    const executions = new Map<string, number>();
+    const tool: NativeAgentTool = {
+      name: 'perkins_probe',
+      description: 'probe',
+      inputSchema: { type: 'object' },
+      execute: async (input) => {
+        const label = String(input['label']);
+        executions.set(label, (executions.get(label) ?? 0) + 1);
+        // Empty text: only the structured details carry weight.
+        return { text: '', details: { payload: 'd'.repeat(2_000) } };
+      },
+    };
+    const bridge = await ReviewMcpBridge.start([tool], { retention: { maxBytes: 5_000, maxEntries: 100 } });
+    bridges.push(bridge);
+    const call = (id: string, label: string) =>
+      callBridge(bridge.socketPath, { id, name: 'perkins_probe', input: { label } }).promise;
+    for (const label of ['a', 'b', 'c']) await expect(call(`first-${label}`, label)).resolves.toMatchObject({ ok: true });
+    // Three ~2.3 KB entries exceed 5 KB: the oldest ('a') was evicted, the rest retained.
+    for (const label of ['b', 'c']) await expect(call(`again-${label}`, label)).resolves.toMatchObject({ ok: true });
+    expect([executions.get('b'), executions.get('c')]).toEqual([1, 1]);
+    await expect(call('again-a', 'a')).resolves.toMatchObject({ ok: true });
+    expect(executions.get('a')).toBe(2);
+  });
+
+  it('retains an oversized newest success, never caches failures, and rejects bad bounds (#174)', async () => {
+    let executions = 0;
+    const tool: NativeAgentTool = {
+      name: 'perkins_probe',
+      description: 'probe',
+      inputSchema: { type: 'object' },
+      execute: async (input) => {
+        if (input['fail'] === true) {
+          throw new Error('boom');
+        }
+        executions += 1;
+        return { text: 'y'.repeat(10_000) };
+      },
+    };
+    const bridge = await ReviewMcpBridge.start([tool], { retention: { maxBytes: 100, maxEntries: 1 } });
+    bridges.push(bridge);
+    const call = (id: string, input: Record<string, unknown>) =>
+      callBridge(bridge.socketPath, { id, name: 'perkins_probe', input }).promise;
+    await expect(call('big-1', {})).resolves.toMatchObject({ ok: true });
+    await expect(call('fail-1', { fail: true })).resolves.toMatchObject({ ok: false, error: 'boom' });
+    await expect(call('fail-2', { fail: true })).resolves.toMatchObject({ ok: false, error: 'boom' });
+    // The failure neither evicted the oversized success nor was retained.
+    await expect(call('big-2', {})).resolves.toMatchObject({ ok: true });
+    expect(executions).toBe(1);
+    await expect(ReviewMcpBridge.start([tool], { retention: { maxBytes: 0, maxEntries: 1 } }))
+      .rejects.toThrow(/retention bounds must be positive safe integers/);
+  });
+
   it('bridge teardown explicitly aborts a pending execution', async () => {
     let started = false;
     let aborted = false;
