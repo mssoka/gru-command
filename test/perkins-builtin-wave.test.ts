@@ -2953,6 +2953,131 @@ describe('WaveRunner built-in Perkins production path', () => {
     expect(pendingRetry).toMatchObject({ jobId: job.id, targetRef: repo.head() }); // the final pass's own target
   }, 120_000);
 
+  it('a final whole pass refused for a stuck git whose rollback sweep pauses raises exactly ONE action-required alert (#269)', async () => {
+    const repo = makeFixtureRepo('perkins-wave-final-pass-stuck');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/final-stuck']);
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-final-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-final-artifacts-'));
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-final-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/final-stuck', repo.head());
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-final-stuck' });
+    const job = ledger.addJob({
+      id: 'job-final-stuck', repo: 'fixture', title: 'final pass', baseBranch: 'main', briefing: 'review',
+    });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
+    attachOrigin(repo, 'feature/final-stuck', root);
+    const receiptPoster = {
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+        reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        headSha: call.targetSha, baseSha: 'b'.repeat(40),
+        bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+      })),
+    };
+    const escalations: string[] = [];
+    const recoveryPreflight = async () => ({
+      ok: true as const, failures: [],
+      reviewModel: { role: 'perkins' as const, modelRef: 'fixture-model-v1', settings: {}, authEnv: {}, routingSha256: 'fixture-safe-route' },
+    });
+    const recoveryRuntime = () => ({ id: 'pi', version: 'test-runtime-v1' });
+
+    // Round 1 (whole): one warning; the round concludes READY.
+    const first = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-stuck'),
+      spawner: fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s1-')), {
+        childAnswer: () => '[]', specialists: [],
+        leadFinding: groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }),
+      }).spawner,
+    }).runRound({ jobId: job.id }));
+    expect(first.canonicalVerdict).toBe('READY TO MERGE');
+
+    // Round 2 (delta): a blocker INSIDE the delta holds the PR.
+    repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/final-stuck']);
+    const secondFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s2-')), {
+      childAnswer: () => '[]', specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:2', title: 'delta blocker' }),
+    });
+    const second = asWave(await new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime,
+      ledger, worktrees: port, spawner: secondFake.spawner, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-stuck'),
+    }).runRound({ jobId: job.id }));
+    expect(second.round.seq).toBe(2);
+    expect(second.canonicalVerdict).toBe('NEEDS CHANGES');
+
+    // Round 3 (delta): every prior and the new blocker sit OUTSIDE this
+    // delta, so the convergence rule files them as follow-ups, recomputes
+    // the verdict to READY, and the wave AUTO-CHAINS the final whole pass
+    // (round 4), which re-holds the untouched blocker.
+    repo.commitFile('src/third.ts', 'export const third = 3;\n');
+    repo.git(['push', '--quiet', 'origin', 'refs/heads/feature/final-stuck']);
+    const thirdFake = fakeWholeSpawner(mkdtempSync(join(tmpdir(), 'perkins-final-s3-')), {
+      childAnswer: () => '[]', specialists: [],
+      leadFinding: groundedFinding('lead', 'blocker', { location: 'src/main.ts:1', title: 'outside delta blocker' }),
+      verdictOverride: 'NEEDS CHANGES',
+    });
+    // The chained final pass's local admission check fails, transiently.
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const shimDir = mkdtempSync(join(tmpdir(), 'perkins-final-stuck-shim-'));
+    dirs.push(shimDir);
+    const stuckFile = join(shimDir, 'groups');
+    writeFileSync(join(shimDir, 'git'), `#!/bin/sh\ncase " $* " in *" status "*) ps -o pgid= -p $$ | tr -d ' ' >> "${stuckFile}"; echo "fatal: index file locked" >&2; exit 128;; esac\nexec "${realGit}" "$@"\n`);
+    chmodSync(join(shimDir, 'git'), 0o755);
+    const oldPath = process.env.PATH;
+    const informs: string[] = [];
+    const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
+    const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+    const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+    const syncSeam = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+    const asyncSeam = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
+    const realRelease = port.release.bind(port);
+    let pausedReleases = 0;
+    const releaseSpy = vi.spyOn(port, 'release').mockImplementation(async (input) => {
+      const real = await realRelease(input);
+      if (!input.worktreeId.includes('-r4')) return real;
+      pausedReleases += 1;
+      return { status: 'paused' as const, processes: [{ pid: 4242, command: 'git ls-remote origin', evidence: 'cwd in review tree' }], preserved: null, note: 'live git' };
+    });
+    const third = new WaveRunner({
+      reviewPreflight: recoveryPreflight, reviewRuntimeIdentity: recoveryRuntime, admissionRetryDelaysMs: [60_000],
+      inform: (title, detail) => informs.push(`${title}: ${detail}`),
+      reviewFreezeObserver: (frozen) => {
+        if (frozen.manifest.roundId.endsWith('-r4')) process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
+      },
+      reconcileReviewAgent: async () => true,
+      ledger, worktrees: port, spawner: thirdFake.spawner, poster: receiptPoster,
+      reviewArtifactRoot: artifacts, prHeadProbe: localHeadProbe('feature/final-stuck'),
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+    });
+    let outcome: WaveOutcome;
+    try {
+      outcome = asWave(await third.runRound({ jobId: job.id }));
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      syncSeam.mockRestore();
+      asyncSeam.mockRestore();
+      releaseSpy.mockRestore();
+      await third.shutdown();
+    }
+    // The delta round's READY stands; the stuck final pass is refused and escalated ONCE.
+    expect(outcome.round.seq).toBe(3);
+    expect(ledger.listJobEventsByKinds(job.id, ['round.final-pass-failed'], { limit: 5 })).toHaveLength(1);
+    expect(pausedReleases).toBeGreaterThan(0); // the paused release really happened
+    // (The delta round's own deferred-follow-ups notice is a separate, ordinary alert.)
+    const stuckAlerts = escalations.filter((line) => line.includes('refused admission') || line.includes('paused on live processes') || line.includes('final whole-change pass'));
+    expect(stuckAlerts, escalations.join('\n')).toHaveLength(1);
+    expect(stuckAlerts[0]).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+    expect(ledger.listJobEventsByKinds(job.id, ['round.admission-retry-scheduled'], { limit: 5 })).toEqual([]);
+  }, 120_000);
 
   it('Stage-5: a delta READY chains the final whole pass; deferred follow-ups are durable', async () => {
     const repo = makeFixtureRepo('perkins-wave-stage5-final-pass');
@@ -9326,6 +9451,71 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       await wave.shutdown();
     }
   }, 120_000);
+
+  it('a stuck-git refusal whose rollback sweep pauses on live processes still raises ONE action-required alert — through a queued handoff (#269)', async () => {
+    const stuckFile = join(mkdtempSync(join(tmpdir(), 'perkins-retry-stuck-')), 'groups');
+    dirs.push(dirname(stuckFile));
+    const f = await transientFixture('stuck-paused-handoff', { stuckFile });
+    const escalations: string[] = [];
+    const stuck = (pgid: number): boolean => existsSync(stuckFile) && readFileSync(stuckFile, 'utf8').split('\n').includes(String(pgid));
+    const realSync = OWNED_GIT_SEAMS.groupHasLiveMember;
+    const realAsync = OWNED_GIT_SEAMS.groupHasLiveMemberAsync;
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation((pgid, budget) => stuck(pgid) || realSync(pgid, budget));
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async (pgid, budget) => stuck(pgid) || realAsync(pgid, budget));
+    // The surviving git is rooted in the review worktree: its release pauses.
+    const realRelease = f.port.release.bind(f.port);
+    const release = vi.spyOn(f.port, 'release').mockImplementation(async (input) => {
+      await realRelease(input);
+      return { status: 'paused' as const, processes: [{ pid: 4242, command: 'git ls-remote origin', evidence: 'cwd in review tree' }], preserved: null, note: 'live git' };
+    });
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts, bus: f.bus,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [0, 0],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      f.ledger.setJobStatus(f.jobId, 'blocked');
+      f.ledger.setJobStatus(f.jobId, 'working');
+      expect((await wave.requestReview({ jobId: f.jobId, handoff: true })).route).toBe('queued');
+      f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.target } });
+      await until(() => f.ledger.latestJobEvent(f.jobId, 'job.review-handoff-failed') !== null, 60_000);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(release).toHaveBeenCalled(); // the safety sweep still ran
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]).toMatch(/refused admission before any specialist started: .*cleanup unconfirmed: process group \d+ still running/u);
+    } finally {
+      sync.mockRestore();
+      async.mockRestore();
+      release.mockRestore();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  }, 120_000);
+
+  it('an UNRELATED paused sweep keeps its own alert beside an ordinary admission refusal (#269)', async () => {
+    const f = await transientFixture('unrelated-paused');
+    const escalations: string[] = [];
+    const realRelease = f.port.release.bind(f.port);
+    const release = vi.spyOn(f.port, 'release').mockImplementation(async (input) => {
+      await realRelease(input);
+      return { status: 'paused' as const, processes: [{ pid: 4242, command: 'sleep', evidence: 'cwd in review tree' }], preserved: null, note: 'live' };
+    });
+    const wave = new WaveRunner({
+      ledger: f.ledger, worktrees: f.port, spawner: makeSpawner(f.sessions, []), reviewArtifactRoot: f.artifacts,
+      prHeadProbe: localHeadProbe(f.branch), admissionRetryDelaysMs: [],
+      escalate: (title: string, detail: string) => escalations.push(`${title}: ${detail}`),
+    });
+    try {
+      // The remote is merely down (a stopped, retryable failure — no retries configured): not a stuck git.
+      await expect(wave.requestReview({ jobId: f.jobId })).rejects.toThrow(/admission preflight refused/u);
+      expect(escalations.filter((line) => line.includes('refused admission'))).toHaveLength(1);
+      expect(escalations.filter((line) => line.includes('paused on live processes'))).toHaveLength(1);
+    } finally {
+      release.mockRestore();
+      f.restorePath();
+      await wave.shutdown();
+    }
+  });
 
   it('a git group that would not stop is escalated naming it even when the branch turned busy during the probe — a busy refusal never masks it (R9-6)', async () => {
     for (const route of ['request', 'forced'] as const) {

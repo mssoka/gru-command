@@ -4481,7 +4481,13 @@ export class WaveRunner {
       }
       if (reviewWorktree !== undefined) {
         try {
-          await this.sweepReviewWorktree(reviewWorktree.id);
+          // #269: a cleanup-unconfirmed refusal already escalated naming its
+          // process group — its rollback sweep must not alert again for the
+          // same event.
+          await this.sweepReviewWorktree(reviewWorktree.id, {
+            alreadyNotified: error instanceof ReviewAdmissionError &&
+              error.missing.some((entry) => entry.cleanupUnconfirmed === true),
+          });
         } catch (cleanupError) {
           failures.push(cleanupError);
         }
@@ -5993,10 +5999,18 @@ export class WaveRunner {
     }
   }
 
-  private async sweepReviewWorktree(worktreeId: string): Promise<void> {
+  /** `alreadyNotified`: the owner was already alerted about this very event
+   * (#269). A paused release keeps its safety pause and evidence (the
+   * worktree manager's own needs-owner confirmation) but raises no second
+   * action-required alert; unrelated sweep failures still alert. */
+  private async sweepReviewWorktree(worktreeId: string, context: { readonly alreadyNotified?: boolean } = {}): Promise<void> {
     try {
       const result = await this.opts.worktrees.release({ worktreeId });
-      if (result.status === 'paused') {
+      if (result.status === 'paused' && context.alreadyNotified === true) {
+        this.log('warn', 'review worktree release paused on live processes; the refusal already escalated', {
+          round: worktreeId, processes: result.processes.map((entry) => entry.pid),
+        });
+      } else if (result.status === 'paused') {
         this.escalate(
           `Review worktree for round ${worktreeId} paused on live processes`,
           'the sweep found live processes rooted in the review tree — acknowledge to finish cleanup',

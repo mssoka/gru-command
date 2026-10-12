@@ -244,11 +244,12 @@ export function admissionPreflight(review: FrozenReview, movementRef: string, op
   if (probes.length === 0) pass('head-binding');
   else {
     const groups = [...new Set(vetoes.flatMap((entry) => entry.processGroup === undefined ? [] : [entry.processGroup]))];
-    const text = reported.map((entry) => `${entry.cause}: ${entry.detail}`).join('; ');
     // The group ids lead: the detail text is cut downstream, they are not.
+    // Each veto's own leading verdict is folded into that one prefix.
     const detail = groups.length > 0
-      ? `cleanup unconfirmed: process group${groups.length === 1 ? '' : 's'} ${groups.join(', ')} still running — ${text}`
-      : text;
+      ? `cleanup unconfirmed: process group${groups.length === 1 ? '' : 's'} ${groups.join(', ')} still running — ${
+        reported.map((entry) => `${entry.cause}: ${entry.detail.replace(/^cleanup unconfirmed: process group \d+ still running — /u, '')}`).join('; ')}`
+      : reported.map((entry) => `${entry.cause}: ${entry.detail}`).join('; ');
     fail('head-binding', detail,
       vetoes.length === 0 && moves.length === 0 && probes.every((entry) => entry.stopped === true),
       vetoes.length > 0 ? groups : false);
