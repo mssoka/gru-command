@@ -17,7 +17,7 @@ import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
-import { PUBLICATION_ABSENT_EVENT, PUBLICATION_ATTEMPT_EVENT, PUBLICATION_IDENTITY_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT, pendingPublicationAttempt } from '../src/dispatch/publication-evidence.js';
+import { PUBLICATION_ABSENT_EVENT, PUBLICATION_ATTEMPT_EVENT, PUBLICATION_IDENTITY_EVENT, PUBLICATION_RECEIPT_EVENT, PUBLICATION_REBIND_UNRESOLVED_EVENT, pendingPublicationAttempt } from '../src/dispatch/publication-evidence.js';
 import { NotificationCenter } from '../src/notifications/center.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 
@@ -1225,6 +1225,41 @@ describe('dispatch server (E8)', () => {
       });
       expect(h.ledger.latestJobEvent('clean-abort-r2-attempt', 'silas.review-triggered')).toBeNull();
       expect(h.ledger.listRounds('clean-abort-r2-attempt')).toHaveLength(1);
+    } finally { await h.close(); }
+  }, 90_000);
+
+  it('refuses a clean-abort re-arm for an uncredited receipt without its publication attempt', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-clean-abort-receipt-only');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      const jobId = 'clean-abort-receipt-only';
+      const { sha, roundId } = await prepareCleanAbort(h, repo, jobId);
+      h.ledger.appendCustomEvent({
+        kind: PUBLICATION_RECEIPT_EVENT, jobId, roundId,
+        payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
+          targetSha: sha, baseSha: 'b'.repeat(40),
+          publicationFile: '/tmp/receipt-only/perkins-report.publication.md', publicationSha256: 'c'.repeat(64),
+          reviewEvent: 'APPROVE',
+          receipt: {
+            reviewId: '9003', actor: 'gru-bot', event: 'APPROVED', commitId: sha,
+            headSha: sha, baseSha: 'b'.repeat(40), bodySha256: 'c'.repeat(64),
+          },
+          credited: false, reason: 'finality checks remain unresolved',
+        },
+      });
+      expect(h.ledger.latestRoundEvent(roundId, PUBLICATION_ATTEMPT_EVENT)).toBeNull();
+      const refused = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: jobId, by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: roundId,
+      }, TOKEN);
+      expect(refused).toMatchObject({
+        status: 400,
+        json: { error: 'bad_request', detail: expect.stringMatching(/uncredited provider receipt.*9003/u) },
+      });
+      expect(h.ledger.latestJobEvent(jobId, 'silas.review-triggered')).toBeNull();
+      expect(h.ledger.listRounds(jobId)).toHaveLength(1);
     } finally { await h.close(); }
   }, 90_000);
 

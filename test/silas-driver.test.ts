@@ -50,6 +50,7 @@ import {
   PUBLICATION_ABSENT_EVENT,
   PUBLICATION_ATTEMPT_EVENT,
   PUBLICATION_IDENTITY_EVENT,
+  PUBLICATION_RECEIPT_EVENT,
   PUBLICATION_REBIND_UNRESOLVED_EVENT,
 } from '../src/dispatch/publication-evidence.js';
 import { GhPrPoster, WaveRunner } from '../src/dispatch/perkins.js';
@@ -1303,6 +1304,46 @@ describe('silas digest (the four actionable states)', () => {
         reconciled: false,
       } });
       expect((await digestOf()).prWithoutReview).toEqual([]);
+    } finally { h.cleanup(); }
+  });
+
+  it('does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt', async () => {
+    const h = makeLedger();
+    try {
+      const jobId = 'clean-receipt-only';
+      const sha = 'sha-receipt-only';
+      const digestOf = () => computeSilasDigest({ ledger: h.ledger,
+        blockersForRound: async () => ({ blockers: [], note: null }),
+        config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
+      addJobWithDelivery(h.ledger, jobId, { prUrl: 'https://git.example.invalid/pull/receipt-only' });
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha } });
+      const round = h.ledger.addRound({ jobId, targetRef: sha });
+      h.ledger.setRoundStatus(round.id, 'live');
+      h.ledger.setJobStatus(jobId, 'in-review');
+      h.ledger.setRoundStatus(round.id, 'aborted');
+      h.ledger.appendCustomEvent({ kind: 'round.perkins-incomplete', jobId, roundId: round.id,
+        payload: { reason: 'service_restart' } });
+      expect((await digestOf()).prWithoutReview).toMatchObject([
+        { jobId, cleanAbort: { roundId: round.id, ruleId: 'clean-abort-service-restart' } },
+      ]);
+
+      h.ledger.appendCustomEvent({
+        kind: PUBLICATION_RECEIPT_EVENT, jobId, roundId: round.id,
+        payload: {
+          verdict: 'approved', canonicalVerdict: 'READY TO MERGE',
+          url: 'https://git.example.invalid/pull/receipt-only', host: 'git.example.invalid',
+          targetSha: sha, baseSha: 'b'.repeat(40),
+          publicationFile: '/tmp/receipt-only/perkins-report.publication.md', publicationSha256: 'c'.repeat(64),
+          reviewEvent: 'APPROVE',
+          receipt: {
+            reviewId: '9003', actor: 'gru-bot', event: 'APPROVED', commitId: sha,
+            headSha: sha, baseSha: 'b'.repeat(40), bodySha256: 'c'.repeat(64),
+          },
+          credited: false, reason: 'finality checks remain unresolved',
+        },
+      });
+      expect(h.ledger.latestRoundEvent(round.id, PUBLICATION_ATTEMPT_EVENT)).toBeNull();
+      expect((await digestOf()).prWithoutReview.filter((row) => row.jobId === jobId)).toEqual([]);
     } finally { h.cleanup(); }
   });
 
