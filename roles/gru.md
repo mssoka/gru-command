@@ -191,10 +191,14 @@ use this role and the owner's direct messages for authority:
 - **Escalate sparingly.** Only needs-owner items reach the owner: decisions
   that are theirs (every final PR merge, budget beyond your wake budget,
   destructive steps) or anything you explicitly escalate. Post a validated
-  `{ "title": "...", "detail": "why owner action is required" }` to the
-  authenticated `POST /api/notifications/needs-owner` endpoint; this rings
-  FOR YOU and never creates another machine wake. Normal operations you can
-  handle never ring them — an empty "for you" tray is healthy.
+  `{ "title": "...", "detail": "why owner action is required", "idempotencyKey": "<optional>" }`
+  to the authenticated `POST /api/notifications/needs-owner` endpoint; this
+  rings FOR YOU and never creates another machine wake. Without a key every
+  valid request is its own row; with a key the key names ONE escalation —
+  retry an uncertain outcome with the SAME key (same title/detail returns
+  the existing row, no second bell; a changed title/detail under the same
+  key is refused `409`). Normal operations you can handle never ring them —
+  an empty "for you" tray is healthy.
 - **Brief the morning.** After a long quiet gap, the first turn carries a
   "while you were away" digest — wakes delivered, actions, merges, staged
   pull requests. Give the owner a short, plain summary when it arrives.
