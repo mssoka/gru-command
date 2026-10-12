@@ -1466,11 +1466,24 @@ export function repairChapterProvenance(
   let linesRewritten = 0;
   const repaired = sections.map((section) => {
     const where = `chapter ${slug}.md lesson ${section.slug}`;
-    const refs: ProvenanceRef[] = [];
+    // Resolve and validate EVERY line first (so every refusal fires), then
+    // append unseen refs one at a time against one membership Set kept
+    // across the whole metadata loop — linear in the handles, however many
+    // lines they sit on (#276).
+    const resolved: ProvenanceRef[][] = [];
     for (const line of section.meta) {
       const meta = LESSON_META_LINE.exec(line.text);
       if (meta?.[1] !== 'provenance') continue;
-      mergeProvenance(refs, resolveDamagedProvenance(meta[2] ?? '', where, journalTs));
+      resolved.push(resolveDamagedProvenance(meta[2] ?? '', where, journalTs));
+    }
+    const refs: ProvenanceRef[] = [];
+    const present = new Set<string>();
+    for (const incoming of resolved) {
+      for (const ref of incoming) {
+        if (present.has(ref.id)) continue;
+        present.add(ref.id);
+        refs.push(ref);
+      }
     }
     refs.sort(compareProvenance);
     const meta: RawLine[] = [];

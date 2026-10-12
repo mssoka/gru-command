@@ -2088,6 +2088,54 @@ describe('fifth review round of #253 — follow-up (bmad-code-review, 2026-10-08
     expect(readFileSync(join(report.backupDir!, 'chapters', 'busy.md'), 'utf8')).toBe(text);
   });
 
+  it('many one-handle provenance lines of ONE lesson merge linearly through the repair path — doubling the lines does not quadruple the work (#276)', () => {
+    /** Elements visited by Array scans and per-element iterations while `run` executes. */
+    const visits = (run: () => void): number => {
+      const scans = ['some', 'every', 'find', 'findIndex', 'includes', 'indexOf', 'filter', 'map', 'forEach', 'reduce'] as const;
+      const arrays = Array.prototype as unknown as Record<string, unknown>;
+      const originals = scans.map((name) => arrays[name]);
+      let visited = 0;
+      scans.forEach((name, index) => {
+        arrays[name] = function (this: unknown[], ...args: unknown[]) {
+          visited += this.length;
+          return (originals[index] as (...rest: unknown[]) => unknown).apply(this, args);
+        };
+      });
+      try {
+        run();
+      } finally {
+        scans.forEach((name, index) => {
+          arrays[name] = originals[index];
+        });
+      }
+      return visited;
+    };
+    const lines = 10_004;
+    const journal = new Map(Array.from({ length: lines * 2 }, (_, index) => [`j-${index + 1}`, at(index + 1)] as const));
+    const chapterOf = (count: number): string =>
+      `# Busy\n\n## busy\n\nrecurred: 1\n${Array.from({ length: count }, (_, index) => `provenance: j-${index + 1}`).join('\n')}\n\nBody.\n`;
+    const repairedVisits = (count: number): number => {
+      const bible = tmpBible(512);
+      bible.ensureSeeded();
+      writeFileSync(join(bible.chaptersDir, 'busy.md'), chapterOf(count));
+      let report: ReturnType<BibleStore['repairProvenance']> | null = null;
+      const visited = visits(() => { report = bible.repairProvenance(journal, { write: true }); });
+      expect(report!.chapters[0]).toMatchObject({ changed: true });
+      // First-seen dedup and chronological order survive: the newest handles are kept, oldest to newest.
+      const kept = bible.readChapters()[0]!.lessons[0]!.provenance.map((ref) => ref.id);
+      expect(kept).toEqual(Array.from({ length: kept.length }, (_, index) => `j-${count - kept.length + index + 1}`));
+      return visited;
+    };
+    const single = repairedVisits(lines);
+    expect(single).toBeLessThan(lines * 100);
+    expect(repairedVisits(lines * 2)).toBeLessThan(single * 2.5);
+    // Refusals are unchanged: a line the journal contradicts still aborts, wherever it sits.
+    expect(() => repairChapterProvenance(chapterOf(5).replace('provenance: j-5', 'provenance: j-5@2000-01-01T00:00:00.000Z'), 'busy', journal))
+      .toThrowError(/cites j-5@2000-01-01T00:00:00.000Z, but the journal records j-5/);
+    expect(() => repairChapterProvenance(chapterOf(3).replace('provenance: j-3', 'provenance: j-999999'), 'busy', journal))
+      .toThrowError(/cites journal id j-999999, which is not in the journal/);
+  });
+
   it('the body floor is 160 code units even when an emoji straddles it — never 159 plus the marker (R7-09)', () => {
     const marker = ' … [trimmed to fit the chapter cap]';
     const body = `${'a'.repeat(159)}😀${'b'.repeat(300)}`;
