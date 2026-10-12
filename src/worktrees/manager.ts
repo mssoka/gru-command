@@ -1155,7 +1155,7 @@ export class WorktreeManager {
     if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
     const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
     if (dirname(admin) !== join(common, 'worktrees') ||
-      realpathSync(readFileSync(join(admin, 'gitdir'), 'utf8').trim()) !== realpathSync(join(path, '.git')) ||
+      realpathSync(resolve(admin, readFileSync(join(admin, 'gitdir'), 'utf8').trim())) !== realpathSync(join(path, '.git')) ||
       readFileSync(join(admin, 'locked'), 'utf8').trim() !== custody.token) {
       throw new Error('linked-worktree custody receipt does not match this invocation');
     }
@@ -1195,13 +1195,19 @@ export class WorktreeManager {
       const ownedPath = custody.addAttempted && existsSync(path) ? path : null;
       if (ownedPath !== null) this.assertCreationCustody(repoPath, path, custody);
       this.assertBranchCreationCustody(repoPath, custody, ownedPath);
+      if (custody.branchCreated && custody.branch !== null) {
+        // Keep the invocation-owned checkout holding this branch until its
+        // compare-and-delete finishes. Dropping the checkout first opens a
+        // window for an ordinary external worktree to adopt the same tip.
+        // No owned holder means no destructive authority: retain the ref.
+        if (ownedPath === null || runGit(ownedPath, ['symbolic-ref', 'HEAD']) !== `refs/heads/${custody.branch}`) {
+          throw new Error(`created branch ${custody.branch} has no invocation-owned checkout reservation`);
+        }
+        runGit(repoPath, ['update-ref', '-d', `refs/heads/${custody.branch}`, custody.sha]);
+      }
       if (ownedPath !== null) {
         // Git protects locked lanes even against a single --force.
         runGit(repoPath, ['worktree', 'remove', '--force', '--force', path]);
-      }
-      if (custody.branchCreated && custody.branch !== null) {
-        this.assertBranchCreationCustody(repoPath, custody, null);
-        runGit(repoPath, ['update-ref', '-d', `refs/heads/${custody.branch}`, custody.sha]);
       }
     } catch (error) {
       this.log('error', 'creation rollback custody unconfirmed; resources retained', { path, error: String(error) });

@@ -9,6 +9,7 @@ import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
 import { isJobTerminal, isRoundTerminal } from '../ledger/states.js';
+import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import {
   BranchBusyError,
@@ -2751,8 +2752,7 @@ export class WaveRunner {
     const fallbackBaseline = {
       targetBranch,
       branchOwners,
-      busyJobIds: findBusyLanes({ ledger: this.opts.ledger, lanes: lanesAtArm, targetBranch })
-        .map((blocker) => blocker.jobId),
+      forceAuthority,
       markerIds: this.opts.ledger.listPendingRebriefs({ jobId: input.jobId }).map((marker) => marker.id),
       deliverySeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0,
       statusSeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0,
@@ -3139,7 +3139,7 @@ export class WaveRunner {
       directiveSeq: this.opts.ledger.latestJobEvent(id, 'silas.directive-sent')?.seq ?? 0,
       recoverySeq: this.opts.ledger.latestJobEvent(id, 'provider.recovery-claimed')?.seq ?? 0,
       markers: this.opts.ledger.listPendingRebriefs({ jobId: id }).map((marker) => marker.id).sort(),
-      directives: this.opts.ledger.listPendingDirectives({ jobId: id }).map((directive) => directive.requestId).sort(),
+      directives: this.opts.ledger.listPendingDirectives({ jobId: id, states: LIVE_DIRECTIVE_STATES }).map((directive) => directive.requestId).sort(),
       verificationRun: this.opts.ledger.hasUnsettledVerificationRun(id),
       verificationRequestedSeq: this.opts.ledger.latestJobEvent(id, 'verification.requested')?.seq ?? 0,
       verificationStartedSeq: this.opts.ledger.latestJobEvent(id, 'verification.started')?.seq ?? 0,
@@ -3510,7 +3510,7 @@ export class WaveRunner {
       readonly deliverySeq: number;
       readonly markerIds: readonly string[];
     }[];
-    readonly busyJobIds: readonly string[];
+    readonly forceAuthority: readonly string[];
     readonly markerIds: readonly string[];
     readonly deliverySeq: number;
     readonly statusSeq: number;
@@ -3592,7 +3592,9 @@ export class WaveRunner {
       );
     }
     const busyNow = findBusyLanes({ ledger: this.opts.ledger, lanes: lanesNow, targetBranch: admission.targetBranch });
-    if (busyNow.some((blocker) => input.force !== true || !admission.busyJobIds.includes(blocker.jobId))) {
+    if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined ||
+      this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
+      !admission.forceAuthority.includes(this.branchIdleAuthority(blocker)))) {
       throw new FallbackSafetyRefusal(
         `a new busy lane owns branch "${admission.targetBranch}" — the fallback gate stops before the next review round`,
       );
