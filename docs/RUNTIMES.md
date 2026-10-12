@@ -214,6 +214,10 @@ runs at wizard/boot time, never on a hot path.
   3. `[models.roles]` / `[thinking.roles]`
   4. `[runtimes.<id>]` per-runtime `model` / `thinking_level`
   5. `[models] default` / `[thinking] default`
+- **Known limit — resumed sessions (issue #24).** A resumed session's
+  persisted model outranks the settings default, so a saved model whose
+  provider has no credentials fails at prompt time instead of falling back
+  to the default.
 
 See [CONFIG.md](./CONFIG.md) for the exact schema and examples.
 

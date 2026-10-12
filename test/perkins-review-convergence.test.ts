@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { readFileSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -263,6 +264,35 @@ describe('deltaSince (bounded git delta)', () => {
       { path: 'src/script.sh', kind: 'metadata', startLine: 0, endLine: Number.MAX_SAFE_INTEGER },
     ]);
     expect(findingIntersectsDelta('src/script.sh:1', delta.hunks)).toBe(true);
+  });
+
+  it('reads the intended repository under a poisoned GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE (R9-17)', () => {
+    const repo = makeFixtureRepo('perkins-convergence-delta-env');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/env']);
+    const first = repo.commitFile('src/first.ts', 'export const first = 1;\n');
+    const second = repo.commitFile('src/second.ts', 'export const second = 2;\n');
+    // An unrelated repository the poisoned environment points at: it has
+    // neither commit, so honouring the routing variables cannot succeed.
+    const decoy = makeFixtureRepo('perkins-convergence-delta-decoy');
+    repos.push(decoy);
+    const poisoned = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'] as const;
+    const saved = poisoned.map((name) => [name, process.env[name]] as const);
+    process.env.GIT_DIR = join(decoy.path, '.git');
+    process.env.GIT_WORK_TREE = decoy.path;
+    process.env.GIT_INDEX_FILE = join(decoy.path, '.git', 'index');
+    try {
+      // The control: the same call without the env isolation would fail here.
+      expect(() => execFileSync('git', ['-C', repo.path, 'diff', '--no-color', first, second, '--'], { stdio: 'ignore' })).toThrow();
+      const delta = deltaSince(repo.path, first, second);
+      expect(delta.touchedPaths).toEqual(new Set(['src/second.ts']));
+      expect(delta.diff).toContain('+++ b/src/second.ts');
+    } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   it('refuses non-SHA endpoints and unreadable revisions', () => {

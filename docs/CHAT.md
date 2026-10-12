@@ -43,7 +43,7 @@ never logged or replayed.
 | `delta` | `text`, `seq` | streamed reply chunk |
 | `tool` | `name`, `state: start\|end`, `seq` | live tool activity |
 | `turn` | `state: start\|end`, `seq` | reply lifecycle |
-| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13; routing split 2026-09-23): needs-owner items ("🔔 For you: …") and supervisor restart notices. Logged + replayed; never fatal, never a turn |
+| `notice` | `text`, `seq` | product notice surfaced in chat (E7, SPEC ruling 13; routing split 2026-09-23): needs-owner items ("🔔 For you: …" — the only *notification-routing* kind) and operational service events (supervisor restart, vision-unavailable, rejected-input notices; see "Notice routing" below). Logged + replayed; never fatal, never a turn |
 | `error` | `message`, `fatal?`, `seq?` | see the error classes below |
 | `context` | `epoch`, `replay_floor_seq`, `state: idle\|busy\|compacting\|resetting`, `usage`, `compact_supported`, `session_active`, `writer` | fresh server-owned snapshot after auth and on every control/writer/runtime-state transition. `usage` is provider-owned or `null`, never a frontend estimate |
 | `control_result` | `action`, `request_id`, `ok`, `epoch`, `code?`, `message?` | terminal result for exactly one request; failures distinguish `busy`, `unsupported`, `read_only`, `no_session`, and runtime/persistence `failed` |
@@ -343,7 +343,12 @@ relaying it. Two mechanisms share one boundary:
   a separate owner cursor, so autonomous turns cannot consume it. Capped
   counts are shown as lower bounds (e.g. `100+`).
 
-The client-facing `notice` frame is now the needs-owner channel only:
+**Notice routing.** The client-facing `notice` frame carries two distinct
+things: (1) *notification routing* — needs-owner is the only notification
+channel, and (2) operational service events (e.g. the supervisor-restart
+notice) that are not notifications and never ring the bell. The rest of this
+paragraph is about (1) only: the `notice` frame is now the needs-owner
+notification channel only:
 action-required rows never render in a human-facing band or ring the owner
 bell — they wake Gru and live in the board's NEEDS GRU machine queue
 (live rows only: rows bound to a terminal merged/done/binned lane are
@@ -356,6 +361,26 @@ collapsed band — "⚙️ N service events — expand" — while conversation
 frames (user messages, reply deltas, errors) stay visible and close the
 run. The session/turn mechanism is unchanged: single stream, single pen,
 and the ledger remains the durable log.
+
+## Untrusted metadata: acceptance record (#126)
+
+Question: will a model obey malicious notification metadata despite the
+data-only boundary? A live-model answer needs authorized adversarial
+evidence against a real model and is **not** produced here. What is proven
+offline (`test/awareness-adversarial.test.ts`, plus the metadata fixtures in
+`test/awareness.test.ts`): hostile titles/details (instruction text, forged
+service headers, forged owner lines, CR/LF and U+2028/2029 separators,
+embedded quotes) render as one JSON-quoted, line-escaped string on a single
+bullet line of the wake block and can never open a line of their own or
+forge the `[gru awareness …]` header; and `roles/gru.md` names notification
+titles, details, check names and digest text as UNTRUSTED DATA that is never
+followed. **Decision (recorded 2026-10-12, Gru; owner to confirm):** accept
+the current controls — quoting/escaping, the role's data-only clause, and the
+action boundary that destructive or approval-bearing steps need owner
+authority — as sufficient. Residual risk is model compliance under a
+quoted-data block; it is not an established defect. Revisit only with
+authorized live adversarial evidence; content redaction is the separate
+defect g26.
 
 ## Limits and notes
 

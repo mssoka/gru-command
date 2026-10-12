@@ -14,7 +14,17 @@ terminal agents. Use `POST /api/dispatch` with `deliverable: "review"`,
 `parent_job_id: "{{context.jobId}}"`, `target_ref` naming this job's ordinary PR and
 `target_sha` naming the exact committed candidate head. If needed, commit the
 verified candidate and publish its reviewable ordinary PR before commissioning;
-never merge it. Retain each reviewer job identity and its recorded findings
+never merge it. Name the exact source for the review (issue #317): optional
+`target_base` (focused-delta base; the range reviewed is
+`target_base..target_sha`), `required_inputs` (`[{path, lens}]` content the
+review needs — only the `claims` lens accepts inputs, a `blind` lens is a 400)
+and `source_package` (`{path, sha256}` of a hash-pinned git bundle authorizing a
+repair). The service proves the actual selected object store holds the named
+target/base/range/inputs before the reviewer spawns; if it cannot, the dispatch
+is refused `422 review_source_unavailable` (`problems`, `retry_authorized:false`)
+— a refusal, not a report, and never an automatic retry. Dispatch to the
+repository that holds the commits, or re-dispatch with an explicit
+`source_package`. Retain each reviewer job identity and its recorded findings
 handback/disposition using the shipped minion playbook.
 
 Independent terminal sessions are permitted only for explicit owner-directed

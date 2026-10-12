@@ -134,6 +134,63 @@ function seedPersistedSlot(storageDir: string, slot: Record<string, unknown>): v
   writeFileSync(join(storageDir, 'scheduler.json'), `${JSON.stringify({ version: 1, slots: [slot] })}\n`);
 }
 
+/** Persist one completed request record (with its outcome payload) verbatim. */
+function seedPersistedAttempt(storageDir: string, attempt: Record<string, unknown>): void {
+  mkdirSync(storageDir, { recursive: true });
+  writeFileSync(
+    join(storageDir, 'scheduler.json'),
+    `${JSON.stringify({ version: 1, slots: [], attempts: [attempt] })}\n`,
+  );
+}
+
+/** A completed persisted attempt whose outcome payload the caller supplies. */
+function completedAttempt(
+  requestId: string,
+  cwd: string,
+  outcome: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    request_id: requestId,
+    run_id: `run-${requestId}`,
+    job_id: 'job-checks',
+    scope: 'docs',
+    command: 'npm run build && npm run config:docs',
+    cwd,
+    head: 'a'.repeat(40),
+    tracked_dirty: false,
+    started: true,
+    state: 'completed',
+    completed_at: 1,
+    error: null,
+    outcome: {
+      scope: 'docs',
+      command: 'npm run build && npm run config:docs',
+      cwd,
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      queuedMs: 3,
+      durationMs: 15,
+      workers: 2,
+      outputBytes: 7,
+      outputSha256: 'b'.repeat(64),
+      outputTail: 'step ok',
+      error: null,
+      ...outcome,
+    },
+  };
+}
+
+function loadedScheduler(storageDir: string): VerificationScheduler {
+  const scheduler = new VerificationScheduler({
+    storageDir,
+    limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 5_000, runTimeoutMs: 20_000 },
+    sweepIntervalMs: 20,
+  });
+  scheduler.start();
+  return scheduler;
+}
+
 describe('verification scheduler — global budget', () => {
   it('grants the budget immediately, queues past it, and releases FIFO', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });
@@ -875,6 +932,60 @@ describe('verification scheduler — global budget', () => {
     expect(status.runId).toBe(outcome.runId);
     expect(status.outcome?.outputSha256).toBe(outcome.outputSha256);
     await second.dispose();
+  });
+
+  it('round-trips persisted per-step checks through a reload', async () => {
+    const storageDir = join(tempDir(), 'verify');
+    const cwd = tempDir();
+    const checks = [
+      {
+        command: 'npm run build',
+        status: 'reused',
+        ran: false,
+        exitCode: null,
+        signal: null,
+        durationMs: 0,
+        reusedFromRunId: 'run-prior',
+        reuseRefusal: null,
+      },
+      {
+        command: 'npm run config:docs',
+        status: 'passed',
+        ran: true,
+        exitCode: 0,
+        signal: null,
+        durationMs: 12,
+        reusedFromRunId: null,
+        reuseRefusal: null,
+      },
+    ];
+    seedPersistedAttempt(storageDir, completedAttempt('req-checks', cwd, { checks }));
+    const scheduler = loadedScheduler(storageDir);
+    const status = scheduler.attemptStatus({ requestId: 'req-checks' });
+    expect(status.state).toBe('completed');
+    expect(status.runId).toBe('run-req-checks');
+    expect(status.outcome?.checks).toEqual(checks);
+    await scheduler.dispose();
+  });
+
+  it('drops a checks list with one malformed entry, keeping the outcome', async () => {
+    const storageDir = join(tempDir(), 'verify');
+    const cwd = tempDir();
+    seedPersistedAttempt(
+      storageDir,
+      completedAttempt('req-bad-checks', cwd, {
+        checks: [
+          { command: 'npm run build', status: 'reused', ran: false, durationMs: 0 },
+          { command: 7, status: 'passed', ran: true, durationMs: 1 },
+        ],
+      }),
+    );
+    const scheduler = loadedScheduler(storageDir);
+    const status = scheduler.attemptStatus({ requestId: 'req-bad-checks' });
+    expect(status.state).toBe('completed');
+    expect(status.outcome?.command).toBe('npm run build && npm run config:docs');
+    expect(status.outcome?.checks).toBeUndefined();
+    await scheduler.dispose();
   });
 
   it('rejects a malformed request_id loud, before any admission', async () => {

@@ -4564,8 +4564,17 @@ export class LedgerApi {
   }
 
   /** Explicit machine disposition, distinct from the owner's Ack.
-   * A successful wake prompt by itself never calls this method. */
-  disposeMachineNotification(id: string, detail: string): NotificationRecord | null {
+   * A successful wake prompt by itself never calls this method.
+   *
+   * `by: 'gru'` names the disposition ROLE (machine rows are Gru's to
+   * dispose); it is NOT proof of who held the pen. The audit event carries
+   * the credential class that authorised the call and any caller-declared
+   * actor so the record never claims provenance it cannot prove (#99). */
+  disposeMachineNotification(
+    id: string,
+    detail: string,
+    provenance: { readonly credential: string; readonly declaredActor: string | null } = { credential: 'internal', declaredActor: null },
+  ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('machine disposition detail must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
@@ -4580,7 +4589,7 @@ export class LedgerApi {
       if (current.resolvedAt !== null || current.ackedAt !== null) return current;
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
         .run(nowIso(), 'gru', id);
-      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'gru', detail } });
+      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'gru', detail, credential: provenance.credential, declaredActor: provenance.declaredActor } });
       return this.getNotification(id) as NotificationRecord;
     });
   }

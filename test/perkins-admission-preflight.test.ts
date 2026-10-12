@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -33,7 +33,14 @@ import { appendCiEvidence, renderRecordedCiEvidence } from '../src/review-inputs
 import { appendRecordedVerification } from '../src/verify/evidence.js';
 import { minimalPng } from './helpers/images.js';
 import { attachBareOrigin, makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { discoverOwnGroup, reapShimRegistries } from './helpers/shim-reaper.js';
+import {
+  createFixtureCleanup,
+  discoverOwnGroup,
+  reapShimRegistries,
+  type FixtureCleanup,
+  type ProcessIdentity,
+  type ReapSeams,
+} from './helpers/shim-reaper.js';
 
 /**
  * Admission preflight (gh-169 Stage 4): the read-only gate between the
@@ -47,49 +54,27 @@ import { discoverOwnGroup, reapShimRegistries } from './helpers/shim-reaper.js';
  * sources (module missing) and pins the honest shapes after.
  */
 
-const repos: FixtureRepo[] = [];
-const dirs: string[] = [];
-/** Pid files of fixture processes (R6-7): whatever an assertion skipped,
- * each recorded process is killed here BEFORE its file is deleted. */
-const pidFiles: string[] = [];
-/** R7-19: every git-shim invocation appends "<pid> <pgid>" here, so its
- * wrapper, group and same-group descendants are reaped — and proven gone —
- * even when an assertion failed first; never this worker's own group,
- * which must be known first (R8-23). */
-const shimRegistries: string[] = [];
+/** One cleanup hook (R7-19, R8-23, R9-13): shim registries, pid files, repos
+ * and directories. Survivors are proven stopped BEFORE any marker, directory
+ * or registration goes; when they cannot be, all are kept and the failure
+ * names them. */
 const ownGroup = discoverOwnGroup();
+const fixtures = createFixtureCleanup({ ownGroup });
 
 afterEach(() => {
-  const survivors = reapShimRegistries(shimRegistries.splice(0), ownGroup);
-  for (const pidFile of pidFiles.splice(0)) {
-    let pid = Number.NaN;
-    try {
-      pid = Number(readFileSync(pidFile, 'utf8').trim());
-    } catch {
-      /* never written */
-    }
-    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      /* already gone */
-    }
-  }
-  while (repos.length > 0) repos.pop()?.cleanup();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  if (survivors.length > 0) throw new Error(`git-shim fixtures still running after the reaper: ${survivors.join(', ')}`);
+  fixtures.run();
 });
 
 /** A fresh pid-file path the afterEach reaper owns. */
 function pidFileFor(prefix: string, name: string): string {
   const pidFile = join(temp(prefix), name);
-  pidFiles.push(pidFile);
+  fixtures.trackPidFile(pidFile);
   return pidFile;
 }
 
 function temp(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), `${prefix}-`));
-  dirs.push(dir);
+  fixtures.trackDir(dir);
   return dir;
 }
 
@@ -115,7 +100,7 @@ interface PreflightHarness {
  * manifest, and one private evidence attachment. */
 function preflightHarness(options: { readonly withEvidence?: boolean } = {}): PreflightHarness {
   const repo = makeFixtureRepo('admission-preflight');
-  repos.push(repo);
+  fixtures.trackRepo(repo);
   const base = repo.head();
   repo.git(['checkout', '-b', 'feature/admission']);
   const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
@@ -272,7 +257,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('refuses a supplied spec that carries no verification section — absence must be explicit, never silent', () => {
     const repo = makeFixtureRepo('admission-no-verification');
-    repos.push(repo);
+    fixtures.trackRepo(repo);
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/no-verification']);
     const target = repo.commitFile('src/main.ts', 'export const x = 1;\n');
@@ -303,7 +288,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('exempts explicit no-spec rounds from the spec sections while keeping every other check', () => {
     const repo = makeFixtureRepo('admission-nospec');
-    repos.push(repo);
+    fixtures.trackRepo(repo);
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/nospec']);
     const target = repo.commitFile('src/main.ts', 'export const y = 2;\n');
@@ -452,7 +437,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('bounds the advertised-remote probe at admission: a stalled remote refuses fail-closed in seconds, never stalls (P5)', () => {
     const repo = makeFixtureRepo('admission-stalled-remote');
-    repos.push(repo);
+    fixtures.trackRepo(repo);
     const base = repo.head();
     repo.git(['checkout', '-b', 'feature/stalled']);
     const target = repo.commitFile('src/main.ts', 'export const s = 1;\n');
@@ -501,7 +486,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('probes the advertised tip OFF the event loop: unrelated work completes while a stalled remote waits (R4-6)', async () => {
     const repo = makeFixtureRepo('admission-async-probe');
-    repos.push(repo);
+    fixtures.trackRepo(repo);
     repo.git(['checkout', '-b', 'feature/asyncprobe']);
     const target = repo.commitFile('src/main.ts', 'export const a = 1;\n');
     attachBareOrigin(repo);
@@ -554,7 +539,7 @@ describe('Perkins admission preflight (gh-169)', () => {
 
   it('enforces ONE cumulative budget: slow identification then a stalled remote refuse within the single deadline (R7-3)', async () => {
     const repo = makeFixtureRepo('admission-cumulative-budget');
-    repos.push(repo);
+    fixtures.trackRepo(repo);
     repo.git(['checkout', '-b', 'feature/cumulative']);
     const target = repo.commitFile('src/main.ts', 'export const c = 1;\n');
     attachBareOrigin(repo);
@@ -607,7 +592,7 @@ describe('Perkins admission preflight (gh-169)', () => {
    * the full identification + advertised-tip probe against a real remote. */
   function branchTargetReview(name: string, options: { readonly qualified?: boolean } = {}) {
     const repo = makeFixtureRepo(`admission-${name}`);
-    repos.push(repo);
+    fixtures.trackRepo(repo);
     repo.git(['checkout', '-b', `feature/${name}`]);
     const target = repo.commitFile('src/main.ts', `export const s = '${name}';\n`);
     attachBareOrigin(repo);
@@ -996,9 +981,9 @@ describe('Perkins admission preflight (gh-169)', () => {
     const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
     const shimDir = temp('admission-git-shim-');
     const registry = join(shimDir, 'invocations');
-    shimRegistries.push(registry);
+    fixtures.trackRegistry(registry);
     writeFileSync(join(shimDir, 'git'),
-      `#!/bin/sh\necho "$$ $(ps -o pgid= -p $$ | tr -d ' ')" >> "${registry}"\ncase " $* " in *" ${step} "*) ${script};; esac\nexec "${realGit}" "$@"\n`);
+      `#!/bin/sh\necho "$$ $(ps -o pgid= -p $$ | tr -d ' ') $(ps -o lstart= -p $$ | tr -d ' ')" >> "${registry}"\ncase " $* " in *" ${step} "*) ${script};; esac\nexec "${realGit}" "$@"\n`);
     chmodSync(join(shimDir, 'git'), 0o755);
     const oldPath = process.env.PATH;
     process.env.PATH = `${shimDir}:${oldPath ?? ''}`;
@@ -1516,7 +1501,7 @@ describe('Perkins admission preflight (gh-169)', () => {
   it('git runs in the repository it was given — an inherited GIT_DIR or GIT_WORK_TREE never routes a step elsewhere (R8-22)', async () => {
     const review = branchTargetReview('routed');
     const other = makeFixtureRepo('admission-routed-other');
-    repos.push(other);
+    fixtures.trackRepo(other);
     other.commitFile('elsewhere.txt', 'another repository\n');
     const ours = execFileSync('git', ['-C', review.manifest.repoPath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
     const theirs = execFileSync('git', ['-C', other.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
@@ -1547,45 +1532,282 @@ describe('Perkins admission preflight (gh-169)', () => {
     expect(() => reapShimRegistries([], 0)).toThrow(/unknown own group/);
     const registry = join(temp('admission-reaper-'), 'invocations');
     // A shim that ran in THIS group (a plain, non-owned step) and one in its own.
-    writeFileSync(registry, `111 ${ownGroup}\n222 333\n`);
+    writeFileSync(registry, `111 ${ownGroup} t111\n222 333 t222\n`);
+    const live = new Map<number, ProcessIdentity>([[111, { pgid: ownGroup, started: 't111' }], [222, { pgid: 333, started: 't222' }]]);
     const sent: number[] = [];
-    const left = reapShimRegistries([registry], ownGroup, {
+    const outcome = reapShimRegistries([registry], ownGroup, {
       kill: (target) => {
         sent.push(target);
       },
       exists: () => false,
       sleep: () => {},
+      identity: (pid) => live.get(pid) ?? null,
     });
-    expect(left).toEqual([]);
+    expect(outcome).toEqual({ survivors: [], unproven: [] });
     expect(sent.sort((a, b) => a - b)).toEqual([-333, 111, 222]);
     expect(sent).not.toContain(-ownGroup);
   });
 
-  it('a fixture that fails early is still reaped — wrapper, group and same-group helper proven stopped before its registry goes (R7-19, R8-20)', async () => {
-    const dir = temp('admission-early-failure-');
-    const registry = join(dir, 'invocations');
-    const helperFile = join(dir, 'helper.pid');
-    // A wrapper in its own group (like a runner's git), NOT this process's
-    // child, registers itself and leaves a same-group helper running...
-    const script = `echo "$$ $(ps -o pgid= -p $$ | tr -d ' ')" >> "${registry}"; sleep 30 & echo $! > "${helperFile}"; exec sleep 30`;
-    spawnSync(process.execPath, ['-e', `require('node:child_process').spawn('/bin/sh', ['-c', ${JSON.stringify(script)}], { detached: true, stdio: 'ignore' }).unref()`]);
-    for (let attempt = 0; attempt < 100 && !existsSync(helperFile); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 20));
-    const [wrapper, group] = readFileSync(registry, 'utf8').trim().split(/\s+/u).map(Number);
-    const helper = Number(readFileSync(helperFile, 'utf8').trim());
-    const present = (target: number): boolean => {
+  describe('retired shim records are never signalled by number alone — mocked PID/PGID replacement (R9-19)', () => {
+    /** A mocked process table: who is alive at each pid, and which groups
+     * still have members. Every signal is recorded; none is real. */
+    function table(alive: ReadonlyMap<number, ProcessIdentity>, groups: readonly number[]): { seams: ReapSeams; sent: number[] } {
+      const sent: number[] = [];
+      return {
+        sent,
+        seams: {
+          kill: (target) => {
+            sent.push(target);
+          },
+          exists: (target) => (target > 0 ? alive.has(target) : groups.includes(-target)),
+          sleep: () => {},
+          identity: (pid) => alive.get(pid) ?? null,
+        },
+      };
+    }
+    function recorded(...lines: string[]): string {
+      const registry = join(temp('admission-reaper-reuse-'), 'invocations');
+      writeFileSync(registry, `${lines.join('\n')}\n`);
+      return registry;
+    }
+
+    it('control: a wrapper still live with the same start time and group is the owner — wrapper and group are signalled', () => {
+      const registry = recorded('501 501 Mon1');
+      const { seams, sent } = table(new Map([[501, { pgid: 501, started: 'Mon1' }]]), [501]);
+      const outcome = reapShimRegistries([registry], ownGroup, { ...seams, exists: () => false }, 10);
+      expect(sent.sort((a, b) => a - b)).toEqual([-501, 501]);
+      expect(outcome).toEqual({ survivors: [], unproven: [] });
+    });
+
+    it('control: a signalled owner that does not stop is reported as a survivor', () => {
+      const registry = recorded('501 501 Mon1');
+      const { seams } = table(new Map([[501, { pgid: 501, started: 'Mon1' }]]), [501]);
+      expect(reapShimRegistries([registry], ownGroup, seams, 10).survivors).toEqual([501, -501]);
+    });
+
+    it('the pid was reused by an unrelated process (new start time): nothing is signalled, the group is unproven', () => {
+      const registry = recorded('501 501 Mon1');
+      const { seams, sent } = table(new Map([[501, { pgid: 501, started: 'Tue9' }]]), [501]);
+      const outcome = reapShimRegistries([registry], ownGroup, seams, 10);
+      expect(sent).toEqual([]);
+      expect(outcome.survivors).toEqual([]);
+      expect(outcome.unproven).toEqual([expect.stringContaining('group 501 (wrapper id reused by another process; pid 501)')]);
+    });
+
+    it('the pid was reused by a process in a different group: nothing is signalled', () => {
+      const registry = recorded('501 777 Mon1');
+      const { seams, sent } = table(new Map([[501, { pgid: 888, started: 'Mon1' }]]), [777]);
+      const outcome = reapShimRegistries([registry], ownGroup, seams, 10);
+      expect(sent).toEqual([]);
+      expect(outcome.unproven).toHaveLength(1);
+    });
+
+    it('the wrapper ended but its group id is now populated (reused or a stray descendant): never signalled, reported with the registry path', () => {
+      const registry = recorded('501 501 Mon1');
+      const { seams, sent } = table(new Map(), [501]);
+      const outcome = reapShimRegistries([registry], ownGroup, seams, 10);
+      expect(sent).toEqual([]);
+      expect(outcome.unproven).toEqual([expect.stringContaining(registry)]);
+      expect(outcome.unproven[0]).toContain('wrapper ended');
+    });
+
+    it('the wrapper ended and nothing is left in its group: nothing to signal, nothing unproven', () => {
+      const registry = recorded('501 501 Mon1');
+      const { seams, sent } = table(new Map(), []);
+      expect(reapShimRegistries([registry], ownGroup, seams, 10)).toEqual({ survivors: [], unproven: [] });
+      expect(sent).toEqual([]);
+    });
+
+    it('a retired group that empties within the settle window is proven, not reported', () => {
+      const registry = recorded('501 501 Mon1');
+      let polls = 0;
+      const outcome = reapShimRegistries([registry], ownGroup, {
+        kill: () => {
+          throw new Error('must not signal');
+        },
+        exists: () => (polls += 1) <= 2,
+        sleep: () => {},
+        identity: () => null,
+      }, 1_000);
+      expect(outcome).toEqual({ survivors: [], unproven: [] });
+    });
+
+    it('a record without an owner stamp is unreadable: fails loudly, signals nothing', () => {
+      const registry = recorded('501 501');
+      const { seams, sent } = table(new Map([[501, { pgid: 501, started: 'Mon1' }]]), [501]);
+      const outcome = reapShimRegistries([registry], ownGroup, seams, 10);
+      expect(sent).toEqual([]);
+      expect(outcome.unproven).toEqual([expect.stringContaining('unreadable record "501 501"')]);
+    });
+
+    it('this worker\'s own group and pid are never signalled, even when the record is a live match', () => {
+      const registry = recorded(`${process.pid} ${ownGroup} Mon1`);
+      const { seams, sent } = table(new Map([[process.pid, { pgid: ownGroup, started: 'Mon1' }]]), [ownGroup]);
+      reapShimRegistries([registry], ownGroup, { ...seams, exists: () => false }, 10);
+      expect(sent).toEqual([]);
+    });
+  });
+
+  describe('the cleanup hook proves survivors gone BEFORE deleting markers, directories or registrations (R9-13)', () => {
+    function mocked(aliveTargets: number[], identity: ReapSeams['identity']): { cleanup: FixtureCleanup; sent: number[] } {
+      const sent: number[] = [];
+      const cleanup = createFixtureCleanup({
+        ownGroup,
+        settleMs: 10,
+        killPid: () => {},
+        seams: {
+          kill: (target) => {
+            sent.push(target);
+          },
+          exists: (target) => aliveTargets.includes(target),
+          sleep: () => {},
+          identity,
+        },
+      });
+      return { cleanup, sent };
+    }
+
+    it('a survivor that will not die keeps its marker, directory, repository and registration, and the failure names them', () => {
+      const dir = temp('admission-hook-order-');
+      const registry = join(dir, 'invocations');
+      writeFileSync(registry, '501 501 Mon1\n');
+      const alive = [501];
+      const { cleanup, sent } = mocked(alive, () => ({ pgid: 501, started: 'Mon1' }));
+      const repoCleanup = vi.fn();
+      cleanup.trackRegistry(registry);
+      cleanup.trackDir(dir);
+      cleanup.trackRepo({ cleanup: repoCleanup } as unknown as FixtureRepo);
+      expect(() => cleanup.run()).toThrow(new RegExp(`survivors \\[501\\].*${registry.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}`, 'u'));
+      expect(existsSync(registry)).toBe(true);
+      expect(existsSync(dir)).toBe(true);
+      expect(repoCleanup).not.toHaveBeenCalled();
+      // The registration survived: the next hook run signals it again...
+      const firstSignals = sent.length;
+      expect(() => cleanup.run()).toThrow(/survivors/);
+      expect(sent.length).toBeGreaterThan(firstSignals);
+      // ...and once it is finally gone, everything is released.
+      alive.length = 0;
+      cleanup.run();
+      expect(existsSync(dir)).toBe(false);
+      expect(repoCleanup).toHaveBeenCalledTimes(1);
+      cleanup.run(); // registration retired: idempotent
+    });
+
+    it('an unprovable owner keeps everything and signals nothing', () => {
+      const dir = temp('admission-hook-unproven-');
+      const registry = join(dir, 'invocations');
+      writeFileSync(registry, '501 501 Mon1\n');
+      const { cleanup, sent } = mocked([-501], () => null);
+      cleanup.trackRegistry(registry);
+      cleanup.trackDir(dir);
+      expect(() => cleanup.run()).toThrow(/unproven \[.*group 501 \(wrapper ended; pid 501\)/);
+      expect(sent).toEqual([]);
+      expect(existsSync(registry)).toBe(true);
+      expect(existsSync(dir)).toBe(true);
+    });
+
+    it('pid-file children are killed through the seam before the reaper looks', () => {
+      const dir = temp('admission-hook-pidfile-');
+      const pidFile = join(dir, 'child.pid');
+      writeFileSync(pidFile, '999999\n');
+      const killed: number[] = [];
+      const cleanup = createFixtureCleanup({ ownGroup, killPid: (pid) => void killed.push(pid) });
+      cleanup.trackPidFile(pidFile);
+      cleanup.trackDir(dir);
+      cleanup.run();
+      expect(killed).toEqual([999999]);
+      expect(existsSync(dir)).toBe(false);
+    });
+  });
+
+  describe('the real hook under a deliberate early failure (R9-18, R7-19, R8-20)', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const FIXTURE = `
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, test } from 'vitest';
+import { createFixtureCleanup, discoverOwnGroup } from ${JSON.stringify(join(repoRoot, 'test/helpers/shim-reaper.ts'))};
+
+const fixtures = createFixtureCleanup({ ownGroup: discoverOwnGroup() });
+afterEach(() => {
+  fixtures.run();
+});
+
+test('fails before its own assertions', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hook-fixture-'));
+  writeFileSync(join(process.env.HOOK_OUT!, 'dir.txt'), dir);
+  const registry = join(dir, 'invocations');
+  const helperFile = join(dir, 'helper.pid');
+  fixtures.trackDir(dir);
+  fixtures.trackRegistry(registry); // registered BEFORE anything is spawned
+  const stamp = \`echo "$$ $(ps -o pgid= -p $$ | tr -d ' ') $(ps -o lstart= -p $$ | tr -d ' ')" >> "\${registry}"\`;
+  const script = process.env.HOOK_MODE === 'live'
+    ? \`\${stamp}; sleep 30 & echo $! > "\${helperFile}"; exec sleep 30\`
+    : \`\${stamp}; sleep 30 & echo $! > "\${helperFile}"; exit 0\`;
+  spawnSync(process.execPath, ['-e', \`require('node:child_process').spawn('/bin/sh', ['-c', \${JSON.stringify(script)}], { detached: true, stdio: 'ignore' }).unref()\`]);
+  for (let attempt = 0; attempt < 200 && !(existsSync(helperFile) && /\\d/.test(readFileSync(helperFile, 'utf8'))); attempt += 1) spawnSync('/bin/sleep', ['0.05']);
+  writeFileSync(join(process.env.HOOK_OUT!, 'records.txt'), readFileSync(registry, 'utf8') + '\\n' + readFileSync(helperFile, 'utf8'));
+  throw new Error('deliberate early failure');
+});
+`;
+    function alive(pid: number): boolean {
       try {
-        process.kill(target, 0);
-        return true;
+        process.kill(pid, 0);
       } catch {
         return false;
       }
-    };
-    expect([wrapper!, helper, -group!].every(present)).toBe(true);
-    // ...then the test fails at its first assertion; the reaper still runs.
-    expect(() => expect('early assertion').toBe('never reached')).toThrow();
-    expect(reapShimRegistries([registry], ownGroup)).toEqual([]);
-    expect(existsSync(registry)).toBe(true); // the marker outlives the proof
-    expect([wrapper!, helper, -group!].filter(present)).toEqual([]);
+      return processRunning(pid);
+    }
+    function runFixture(mode: 'live' | 'retired'): { status: number | null; output: string; dir: string; wrapper: number; group: number; helper: number } {
+      const out = temp('admission-hook-out-');
+      writeFileSync(join(out, 'hook.test.ts'), FIXTURE);
+      writeFileSync(join(out, 'vitest.config.mjs'), "export default { test: { include: ['hook.test.ts'] } };\n");
+      symlinkSync(join(repoRoot, 'node_modules'), join(out, 'node_modules'));
+      const run = spawnSync(process.execPath, [join(repoRoot, 'node_modules/vitest/vitest.mjs'), 'run', '--config', 'vitest.config.mjs'], {
+        cwd: out,
+        encoding: 'utf8',
+        env: { ...process.env, HOOK_OUT: out, HOOK_MODE: mode },
+        timeout: 90_000,
+      });
+      const [registryText = '', helperText = ''] = readFileSync(join(out, 'records.txt'), 'utf8').split('\n\n');
+      const [wrapper = Number.NaN, group = Number.NaN] = registryText.trim().split(/\s+/u).map(Number);
+      return {
+        status: run.status,
+        output: `${run.stdout}${run.stderr}`,
+        dir: readFileSync(join(out, 'dir.txt'), 'utf8'),
+        wrapper,
+        group,
+        helper: Number(helperText.trim()),
+      };
+    }
+
+    it('a live fixture is killed and proven stopped, then its marker and directory go', () => {
+      const result = runFixture('live');
+      try {
+        expect(result.status).not.toBe(0);
+        expect(result.output).toContain('deliberate early failure');
+        expect(result.output).not.toContain('not proven stopped');
+        expect([result.wrapper, result.helper].filter(alive)).toEqual([]);
+        expect(existsSync(result.dir)).toBe(false);
+      } finally {
+        for (const pid of [result.wrapper, result.helper]) if (alive(pid)) process.kill(pid, 'SIGKILL');
+      }
+    }, 120_000);
+
+    it('a fixture whose wrapper already ended but left a group member is NOT signalled by number: kept and reported (R9-13, R9-19)', () => {
+      const result = runFixture('retired');
+      try {
+        expect(result.status).not.toBe(0);
+        expect(result.output).toContain('git-shim fixtures not proven stopped');
+        expect(result.output).toContain('wrapper ended');
+        expect(alive(result.helper)).toBe(true); // never signalled
+        expect(existsSync(join(result.dir, 'invocations'))).toBe(true); // marker kept
+      } finally {
+        if (alive(result.helper)) process.kill(result.helper, 'SIGKILL');
+      }
+    }, 120_000);
   });
 
   it('a timed-out step leaves no timer behind, and the sync probe returns at its own bound (R6-6)', async () => {

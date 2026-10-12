@@ -112,6 +112,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'silas-followthrough.test.ts',
     workload: 'event-driven follow-through over real git/service state',
   },
+  {
+    file: 'specialist-dispose-bounded.test.ts',
+    workload: 'real CLI child process plus review bridge teardown held to its 5s cap',
+  },
   { file: 'uploads-dir.test.ts', workload: 'real service boot against real filesystem state' },
   { file: 'verification-server.test.ts', workload: 'verification runner spawning real declared commands' },
   { file: 'wake-e2e.test.ts', workload: 'real service wake-on-alert flow' },
