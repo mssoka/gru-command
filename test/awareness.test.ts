@@ -2718,3 +2718,55 @@ describe('GH-305 awareness repair regressions', () => {
     } finally { r.close(); vi.useRealTimers(); }
   });
 });
+
+/**
+ * PR71 review follow-up queue (awareness). Each block names the issue it
+ * proves; the decisions (g7, g15) are recorded in docs/decisions.
+ */
+describe('GH-110 (g13): the morning digest is rendered or not consumed under the byte cap', () => {
+  function overnight(limits?: Partial<AwarenessLimits>): Rig {
+    vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+    const rig = boot({ now: () => Date.now(), ...(limits !== undefined ? { limits } : {}) });
+    rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+    rig.awareness.commit(rig.awareness.prepare()!);
+    vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+    rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+    return rig;
+  }
+
+  it('reserves digest budget so multibyte notes cannot exhaust the default cap first', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = overnight();
+      for (let i = 0; i < 8; i += 1) {
+        rig.notifications.post({
+          kind: `test.machine.${i}`, routing: 'action-required', severity: 'error',
+          title: `${'漢'.repeat(150)}-${i}`,
+        });
+      }
+      const block = rig.awareness.prepare()!;
+      expect(Buffer.byteLength(block.text, 'utf8')).toBeLessThanOrEqual(4_096 + 64);
+      expect(block.text).toContain('While you were away');
+      expect(block.text).toContain('- fires: 1 wake delivered');
+      rig.awareness.commit(block);
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('preserves the owner watermark when the digest could not be fully rendered', () => {
+    vi.useFakeTimers();
+    try {
+      // A cap too small for the digest itself: it cannot be reserved in full.
+      const rig = overnight({ maxBytes: 130 });
+      const first = rig.awareness.prepare()!;
+      expect(first.text).not.toContain('- fires: 1 wake delivered');
+      rig.awareness.commit(first);
+      // Not consumed: the digest is still owed on the next block.
+      rig.awareness.dispose();
+      const state = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+        digest: { lastOwnerAt: number };
+      };
+      expect(state.digest.lastOwnerAt).toBe(Date.parse('2026-09-22T21:00:00Z'));
+    } finally { vi.useRealTimers(); }
+  });
+});

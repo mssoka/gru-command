@@ -140,6 +140,10 @@ export interface AwarenessInjection {
   /** Domain-qualified identities and immutable evidence from the actual rendered rows. */
   readonly attentionKeys?: readonly string[];
   readonly mailboxDeliveries?: readonly MailboxDelivery[];
+  /** GH-110: false when a morning digest was owed but did not fully render
+   * (byte cap). commit() then leaves the owner watermark untouched so the
+   * digest is preserved for the next block instead of consumed unseen. */
+  readonly digestDelivered?: boolean;
 }
 
 /** The chat server's narrow view of the awareness layer (injection provider
@@ -1026,7 +1030,8 @@ export class GruAwareness {
     const rows = rendered.ids.flatMap((id) => renderedRows.has(id) ? [renderedRows.get(id)!] : []);
     return { text: rendered.text, coveredThroughSeq: latest,
       notificationIds: rendered.ids.map((id) => renderedRows.get(id)?.id ?? id),
-      attentionKeys: rendered.ids, mailboxDeliveries: this.mailbox?.captureDelivery(rows) ?? [] };
+      attentionKeys: rendered.ids, mailboxDeliveries: this.mailbox?.captureDelivery(rows) ?? [],
+      ...(morning !== null && !rendered.digestDelivered ? { digestDelivered: false } : {}) };
 
   }
 
@@ -1050,7 +1055,7 @@ export class GruAwareness {
     }
     this.cursor = Math.max(this.cursor, injection.coveredThroughSeq);
     this.lastDeliveredAt = this.now();
-    if (source === 'chat') {
+    if (source === 'chat' && injection.digestDelivered !== false) {
       this.lastOwnerAt = this.lastDeliveredAt;
       this.lastOwnerSeq = Math.max(this.lastOwnerSeq, injection.coveredThroughSeq);
     }
@@ -1531,17 +1536,32 @@ export class GruAwareness {
     digestLines: readonly string[],
     overflow: boolean,
     morning: readonly string[] | null,
-  ): { text: string; ids: readonly string[] } | null {
+  ): { text: string; ids: readonly string[]; digestDelivered: boolean } | null {
     const parts: string[] = [AWARENESS_BLOCK_HEADER];
     const ids: string[] = [];
     let bytes = Buffer.byteLength(AWARENESS_BLOCK_HEADER, 'utf8');
     let truncated = overflow;
     let exhausted = false;
+    // GH-110: the morning digest is owner-directed catch-up whose watermark
+    // advances at commit, so notes (rendered first) must not be able to
+    // spend its bytes. Reserve what the digest lines need (greedy, in
+    // order, up to the cap); the reservation is released as the digest
+    // renders. A digest that cannot fit whole is reported undelivered.
+    let reserved = 0;
+    let reservable = 0;
+    if (morning !== null) {
+      for (const line of morning) {
+        const size = Buffer.byteLength(clampLine(line, this.limits.maxLineChars), 'utf8') + 1;
+        if (bytes + reserved + size > this.limits.maxBytes) break;
+        reserved += size;
+        reservable += 1;
+      }
+    }
     const push = (line: string, force = false, mailbox = false): boolean => {
       if (exhausted && !force) return false;
       const sized = clampLine(line, mailbox ? Number.MAX_SAFE_INTEGER : this.limits.maxLineChars);
       const size = Buffer.byteLength(sized, 'utf8') + 1; // newline
-      if (bytes + size > this.limits.maxBytes) {
+      if (bytes + size + reserved > this.limits.maxBytes) {
         truncated = true;
         if (mailbox) return false; // another item can still fit; never let one large thread hide the tail
         exhausted = true;
@@ -1564,14 +1584,20 @@ export class GruAwareness {
         if (push(note.line, false, note.mailbox) && parts.at(-1)?.includes(`[${note.displayId}]`)) ids.push(note.id);
       }
     }
-    if (morning !== null) for (const line of morning) push(line);
+    let digestDelivered = true;
+    if (morning !== null) {
+      reserved = 0; // released: the reserved bytes are spent right here
+      digestDelivered = reservable === morning.length;
+      exhausted = false;
+      for (const line of morning) if (!push(line)) digestDelivered = false;
+    }
     if (digestLines.length > 0) {
       push('Since your last turn:');
       for (const line of digestLines) push(line);
     }
     if (parts.length === 1) return null;
     if (truncated) push('- (further context omitted…)', true);
-    return { text: parts.join('\n'), ids };
+    return { text: parts.join('\n'), ids, digestDelivered };
   }
 
   /**
