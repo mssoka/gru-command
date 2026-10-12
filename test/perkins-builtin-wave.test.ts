@@ -8555,21 +8555,29 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
       prHeadProbe: localHeadProbe(branch), admissionRetryDelaysMs: [0, 600],
       escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
     });
+    // This case is specifically a fresh refusal BEFORE the pending retry is due.
+    // Real Git/rollback work can exceed 600 ms under suite load; control only the
+    // clock/timers, leaving subprocess I/O real. The following R9-8 case covers
+    // the distinct due-during-rollback transition with an explicit release gate.
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
     try {
       await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 1 of 2 is scheduled/u);
       // Retry 1 runs at once and is refused: retry 2 now waits.
       await until(() => kinds(ledger, jobId, 'round.admission-retry-scheduled').length === 2);
       const waiting = kinds(ledger, jobId, 'round.admission-retry-scheduled')[1]!;
       expect(waiting.payload).toMatchObject({ attempt: 2 });
+      expect(Date.now()).toBeLessThan(Date.parse((waiting.payload as { dueAt: string }).dueAt));
       // A fresh request refused meanwhile keeps THAT retry — attempt 2, same due time.
       await expect(wave.requestReview({ jobId })).rejects.toThrow(/automatic retry 2 of 2 is scheduled/u);
       const taken = kinds(ledger, jobId, 'round.admission-retry-scheduled')[2]!;
       expect(taken.roundId).toBe(ledger.listRounds(jobId)[2]!.id);
       expect(taken.payload).toMatchObject({ attempt: 2, dueAt: (waiting.payload as { dueAt: string }).dueAt });
+      await vi.advanceTimersByTimeAsync(600);
       await until(() => escalations.length === 1);
     } finally {
       restorePath();
-      await wave.shutdown();
+      try { await wave.shutdown(); }
+      finally { vi.useRealTimers(); }
     }
     expect(ledger.listRounds(jobId)).toHaveLength(4); // request, retry 1, fresh request, retry 2
     expect(escalations[0]).toContain('automatic retry 2 of 2 was refused too — no retries remain');
