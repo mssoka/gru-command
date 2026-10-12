@@ -27,3 +27,13 @@ the digest's existing 101-row caps ("100+") and time filters.
 Rationale: a fresh install otherwise never gets a catch-up for its first
 unattended interval. Install time (not process start) keeps a mid-night restart
 from erasing that interval.
+
+## Watermark rules that follow (g13 #110, g23 #119, g6 #103)
+
+- The morning digest's bytes are reserved before notes render; a digest that
+  still cannot fit whole leaves the owner watermark untouched (preserved, not
+  consumed).
+- An accepted owner turn with no awareness block records presence
+  (`recordOwnerPresence`) through the seq that block-free prepare saw; it never
+  moves the event cursor or wake claims and never fabricates a digest.
+- "Staged PRs" means a `job.pr` link event after the owner watermark.
