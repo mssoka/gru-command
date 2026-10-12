@@ -2741,20 +2741,26 @@ describe('GH-110 (g13): the morning digest is rendered or not consumed under the
     return rig;
   }
 
-  it('reserves digest budget so multibyte notes cannot exhaust the default cap first', () => {
+  it('reserves digest budget so a full page of multibyte notes cannot spend the morning catch-up', () => {
     vi.useFakeTimers();
     try {
-      const rig = overnight();
+      // Cap sized so a full 8-note page of multibyte notes would consume it:
+      // each rendered note line is 110 bytes and the two morning lines need
+      // 80, so without the reservation the digest lines miss the cap and are
+      // shed. Reserving instead sheds the note and keeps the catch-up.
+      const rig = overnight({ maxBytes: 1_000, maxActionNotes: 8 });
       for (let i = 0; i < 8; i += 1) {
         rig.notifications.post({
           kind: `test.machine.${i}`, routing: 'action-required', severity: 'error',
-          title: `${'漢'.repeat(150)}-${i}`,
+          title: '漢'.repeat(10),
         });
       }
       const block = rig.awareness.prepare()!;
-      expect(Buffer.byteLength(block.text, 'utf8')).toBeLessThanOrEqual(4_096 + 64);
+      expect(Buffer.byteLength(block.text, 'utf8')).toBeLessThanOrEqual(1_000);
       expect(block.text).toContain('While you were away');
       expect(block.text).toContain('- fires: 1 wake delivered');
+      // The digest kept its bytes: the note page is the part that was shed.
+      expect(block.notificationIds).toHaveLength(7);
       rig.awareness.commit(block);
       rig.awareness.dispose();
     } finally { vi.useRealTimers(); }
