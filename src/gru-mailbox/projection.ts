@@ -3,15 +3,31 @@ import { createHash } from 'node:crypto';
 import type { DecisionRecord, LedgerApi, NotificationRecord, ObligationRecord } from '../ledger/api.js';
 import { producerResolvedBy } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
+import { isReportDeliverable } from '../ledger/obligations.js';
 import type { MailboxDisposition, MailboxItem, MailboxReason, MailboxReference } from '../ledger/mailbox.js';
 import { incidentSignalOf, incidentSubjectOf } from '../chat/incident.js';
 
+function reportHandbackJobId(kind: string): string | null {
+  return /^silas\.report-handback\.(.+)$/u.exec(kind)?.[1] ?? null;
+}
+
 function notificationIdentity(row: NotificationRecord): string {
-  return row.kind.includes(':') || producerResolvedBy(row.kind) !== null
+  return row.kind.includes(':') || producerResolvedBy(row.kind) !== null || reportHandbackJobId(row.kind) !== null
     ? `${row.kind}:${row.agentId ?? 'service'}` : `notification:${row.id}`;
 }
-function notificationBasis(row: NotificationRecord): string {
-  return mailboxBasis([notificationIdentity(row), row.kind, row.detail, row.severity]);
+function notificationBasis(ledger: LedgerApi, row: NotificationRecord): string {
+  const evidence = [notificationIdentity(row), row.kind, row.detail, row.severity];
+  const jobId = reportHandbackJobId(row.kind);
+  if (jobId === null) return mailboxBasis(evidence);
+  const job = ledger.getJob(jobId);
+  const debt = ledger.findReportObligation(jobId);
+  const delivery = ledger.latestJobEvent(jobId, 'job.delivered');
+  // Transport replacements are not new reports. Actual source/plan/receipt changes are.
+  return mailboxBasis([...evidence,
+    job === null ? null : [job.id, job.status, job.deliverable, job.commissioner, job.targetRef, job.targetSha],
+    debt === null ? null : [debt.id, debt.firstOriginSeq, debt.planRevision, debt.state, debt.nextAction,
+      debt.wakeCondition, debt.authority, debt.dueAt, debt.deadlineAt, debt.receiptKind, debt.receiptCorrelation, debt.recordedReceipts],
+    delivery === null ? null : [delivery.seq, delivery.payload]]);
 }
 
 export function mailboxBasis(value: unknown): string {
@@ -30,6 +46,22 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
     const page = ledger.listNotifications({ routing: 'action-required', unackedOnly: true, limit: 500, offset });
     notifications.push(...page);
     if (page.length < 500) break;
+  }
+  // A resolved transport card is not closure of the commissioner's report debt.
+  // Retain only already-surfaced report sources across replacement gaps; no new watcher or debt.
+  for (const item of surfaced.values()) {
+    const kinds = item.kind === 'job' && item.jobId !== null ? [`silas.report-handback.${item.jobId}`]
+      : item.reasons.map((reason) => reason.label).filter((kind) => reportHandbackJobId(kind) !== null);
+    for (const kind of kinds) {
+      if (notifications.some((row) => row.kind === kind)) continue;
+      const jobId = reportHandbackJobId(kind)!;
+      const job = ledger.getJob(jobId);
+      if (job?.status !== 'delivered' || job.deliverable === null || !isReportDeliverable(job.deliverable)) continue;
+      const debt = ledger.findReportObligation(jobId);
+      if (debt === null || !['open', 'waiting'].includes(debt.state)) continue;
+      const row = ledger.findNotificationByKind(kind, 'any');
+      if (row !== null && row.routing === 'action-required') notifications.push(row);
+    }
   }
   const bound = new Map<string, NotificationRecord[]>();
   const incidents = new Map<string, NotificationRecord[]>();
@@ -51,7 +83,7 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
     const basis = mailboxBasis(ordered.map((reason) => [reason.signal, reason.basis]));
     return { id, subject, jobId, title, kind: jobId === null ? 'incident' : 'job', reasons: ordered, basis,
       severity: rows.some((row) => row.severity === 'error') || ordered.some((reason) => ['blocked', 'worker-error', 'round-aborted', 'lens-failed', 'pr-conflict'].includes(reason.signal)) ? 'error' : 'info',
-      notificationIds: rows.map((row) => row.id).sort(), producerOwned: rows.some((row) => producerResolvedBy(row.kind) !== null),
+      notificationIds: rows.filter((row) => row.resolvedAt === null && row.ackedAt === null).map((row) => row.id).sort(), producerOwned: rows.some((row) => producerResolvedBy(row.kind) !== null),
       state: 'needs-gru', owner: 'gru', disposition: null, receipt: null, references, restrictions,
       attentionKey: `${id}@${basis}` };
   };
@@ -112,8 +144,8 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
       }
     }
     const rows = bound.get(job.id) ?? [];
-    const distinctNotifications = new Map(rows.map((row) => [`${notificationIdentity(row)}:${notificationBasis(row)}`, row]));
-    for (const row of distinctNotifications.values()) add(incidentSignalOf(row), 'action-required', [notificationIdentity(row), notificationBasis(row)]);
+    const distinctNotifications = new Map(rows.map((row) => [`${notificationIdentity(row)}:${notificationBasis(ledger, row)}`, row]));
+    for (const row of distinctNotifications.values()) add(incidentSignalOf(row), 'action-required', [notificationIdentity(row), notificationBasis(ledger, row)]);
     const independentlyEligible = reasons.length > 0;
     let obligationError = false;
     let owesAnyGru = false;
@@ -232,7 +264,7 @@ export function projectMailbox(ledger: LedgerApi, now = Date.now(), onNextRechec
       if (page.length < 200) break;
     }
     items.push({ ...make(`incident:${mailboxBasis(key)}`, subject, null, row.title,
-      [...new Set(rows.map((source) => notificationBasis(source)))].map((basis) => ({ signal: incidentSignalOf(row), label: row.kind, basis: mailboxBasis([key, basis]) })), rows, references, restrictions), followUpAt });
+      [...new Set(rows.map((source) => notificationBasis(ledger, source)))].map((basis) => ({ signal: incidentSignalOf(row), label: row.kind, basis: mailboxBasis([key, basis]) })), rows, references, restrictions), followUpAt });
   }
   return items.sort((a, b) => a.id.localeCompare(b.id));
 }
