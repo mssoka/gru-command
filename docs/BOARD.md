@@ -232,9 +232,11 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   projection as the board's permanent FOR YOU band — pending acks AND
   ready PRs, so the two surfaces never disagree about what the owner
   owes (the badge and toasts still count needs-owner notifications
-  only); opening it never completes an obligation. A machine
-  alert left unresolved 30 minutes after delivery opens a separate
-  owner-only follow-up in FOR YOU; Gru's later disposition resolves it. The badge and live
+  only); opening it never completes an obligation. There is no
+  timed escalation: a machine alert is never promoted to the owner by age
+  (docs/FLOW.md forbids promotion by age). It stays in NEEDS GRU for Gru to
+  triage and dispose; only genuine owner decisions are posted to FOR YOU, and
+  those rows persist until the owner's Ack. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
   per surface (a display receipt is not an acknowledgement); acking an
   owner row clears it where an ack has meaning (a breaker row re-arms
