@@ -27,7 +27,7 @@ git archive "$base" -o "$d/base.tar"
 tar -xf "$d/base.tar" -C "$d"
 rm -f "$d/base.tar"
 for f in test/perkins-builtin-wave.test.ts test/silas-driver.test.ts; do
-  mkdir -p "$d/$(dirname "$f")"
+  mkdir -p "$d/${f%/*}"
   git show "$headrev:$f" > "$d/$f"
 done
 git show "$base:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"
@@ -63,13 +63,13 @@ if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then
   echo "FAILS-BEFORE CLAIM BROKEN: an uncorrected-head leg passed the native R2 regressions unexpectedly" >&2
   exit 2
 fi
-node "$root/tools/assert-named-red-baseline.mjs" wave "$d/wave-results.json" \
-  "formal GitHub publication durability and restart reconciliation never certifies absence when the canonical publication bytes changed after the intent (native R2 F1)" \
-  "formal GitHub publication durability and restart reconciliation requires provable posting-identity continuity before certifying absence (native R2 F2)" \
-  "formal GitHub publication durability and restart reconciliation holds a restart whose gh lookup met an undecidable review list (native R2 F3)" \
-  "GitHub SHA-bound Perkins delivery refuses an undecidable gh review list instead of reporting absence (native R2 F3)" || exit 2
-node "$root/tools/assert-named-red-baseline.mjs" silas "$d/silas-results.json" \
-  "silas digest (the four actionable states) does not offer a clean-abort re-arm after a held recovery whose absence certificate would have been false (native R2 F1/F2)" \
-  "silas digest (the four actionable states) does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt" || exit 2
+wave_failure_1='formal GitHub publication durability and restart reconciliation never certifies absence when the canonical publication bytes changed after the intent (native R2 F1)'
+wave_failure_2='formal GitHub publication durability and restart reconciliation requires provable posting-identity continuity before certifying absence (native R2 F2)'
+wave_failure_3='formal GitHub publication durability and restart reconciliation holds a restart whose gh lookup met an undecidable review list (native R2 F3)'
+wave_failure_4='GitHub SHA-bound Perkins delivery refuses an undecidable gh review list instead of reporting absence (native R2 F3)'
+node "$root/tools/assert-named-red-baseline.mjs" wave "$d/wave-results.json" "$wave_failure_1" "$wave_failure_2" "$wave_failure_3" "$wave_failure_4" || exit 2
+silas_failure_1='silas digest (the four actionable states) does not offer a clean-abort re-arm after a held recovery whose absence certificate would have been false (native R2 F1/F2)'
+silas_failure_2='silas digest (the four actionable states) does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt'
+node "$root/tools/assert-named-red-baseline.mjs" silas "$d/silas-results.json" "$silas_failure_1" "$silas_failure_2" || exit 2
 echo "EXPECTED-NONZERO: the native R2 false-absence regressions failed behaviorally against the uncorrected head"
 exit 1

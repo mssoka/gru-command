@@ -2,10 +2,20 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-function shellCodeLines(source: string): readonly string[] {
+interface R2ShellAnalysis {
+  readonly codeLines: readonly string[];
+  readonly issues: readonly string[];
+}
+
+function analyzeR2ShellSource(source: string): R2ShellAnalysis {
   let quote: '"' | "'" | undefined;
-  return source.split(/\r?\n/u).map((line) => {
-    const code = [...line];
+  let lineContinuation = false;
+  let multilineQuote = false;
+  let doubleQuotedCommandSubstitution = false;
+  let backtickCommandSubstitution = false;
+  const codeLines = source.split(/\r?\n/u).map((line) => {
+    const code = line.split('');
+    let atWordStart = true;
     for (let index = 0; index < line.length; index += 1) {
       const character = line[index] ?? '';
       if (quote === "'") {
@@ -16,50 +26,119 @@ function shellCodeLines(source: string): readonly string[] {
       if (quote === '"') {
         code[index] = ' ';
         if (character === '\\') {
-          if (index + 1 < line.length) code[index + 1] = ' ';
-          index += 1;
-        } else if (character === '"') quote = undefined;
+          if (index + 1 < line.length) {
+            code[index + 1] = ' ';
+            index += 1;
+          } else {
+            lineContinuation = true;
+          }
+        } else if (character === '$' && line[index + 1] === '(') {
+          doubleQuotedCommandSubstitution = true;
+        } else if (character === '`') {
+          backtickCommandSubstitution = true;
+        } else if (character === '"') {
+          quote = undefined;
+        }
         continue;
       }
       if (character === '\\') {
         code[index] = ' ';
-        if (index + 1 < line.length) code[index + 1] = ' ';
-        index += 1;
+        if (index + 1 < line.length) {
+          code[index + 1] = ' ';
+          index += 1;
+          atWordStart = false;
+        } else {
+          lineContinuation = true;
+        }
         continue;
       }
       if (character === "'" || character === '"') {
         quote = character;
         code[index] = ' ';
+        atWordStart = false;
         continue;
       }
-      if (character === '#' && (index === 0 || /[\s;&|(){}]/u.test(line[index - 1] ?? ''))) {
+      if (character === '#' && atWordStart) {
         code.fill(' ', index);
         break;
       }
+      if (character === '`') backtickCommandSubstitution = true;
+      if (/\s/u.test(character) || /[;&|(){}<>]/u.test(character)) {
+        atWordStart = true;
+        continue;
+      }
+      atWordStart = false;
     }
+    if (quote !== undefined) multilineQuote = true;
     return code.join('');
   });
-}
-
-function r2ShellSyntaxIssues(source: string): readonly string[] {
-  const codeLines = shellCodeLines(source);
   const issues: string[] = [];
-  if (codeLines.some((line) => /(?:^|[^<])<<-?(?!<)/u.test(line))) issues.push('heredoc');
-  if (codeLines.some((line) => /[;&|]\s*(?:if|for|while|until|case)\b/u.test(line))) issues.push('inline control flow');
-  if (codeLines.some((line) => /(?:^|[;&|])\s*[({]/u.test(line))) issues.push('shell group');
+  if (hasShellHereDocument(codeLines)) issues.push('heredoc');
+  if (codeLines.some((line) => /[;&|]\s*(?:if|for|while|until|select|case)\b/u.test(line))) issues.push('inline control flow');
+  if (codeLines.some((line) => /(?:^|[;&|])\s*[({]|\b(?:if|then|else|elif|do|while|until)\s*[({]|!\s*[({]/u.test(line))) {
+    issues.push('shell group');
+  }
   if (codeLines.some((line) => /(?:^|[;&|({])\s*(?:function\b|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*(?:\{|$))/u.test(line))) {
     issues.push('function definition');
   }
-  return issues;
+  if (lineContinuation) issues.push('line continuation');
+  if (multilineQuote) issues.push('multiline quoted text');
+  if (doubleQuotedCommandSubstitution) issues.push('double-quoted command substitution');
+  if (backtickCommandSubstitution) issues.push('backtick command substitution');
+  return { codeLines, issues };
+}
+
+function hasShellHereDocument(codeLines: readonly string[]): boolean {
+  let arithmeticDepth = 0;
+  for (const line of codeLines) {
+    for (let index = 0; index < line.length; index += 1) {
+      if (arithmeticDepth > 0) {
+        if (line.startsWith('$((', index)) {
+          arithmeticDepth += 1;
+          index += 2;
+        } else if (line.startsWith('))', index)) {
+          arithmeticDepth -= 1;
+          index += 1;
+        }
+        continue;
+      }
+      if (line.startsWith('$((', index)) {
+        arithmeticDepth = 1;
+        index += 2;
+      } else if (line[index] === '<' && line[index + 1] === '<' && line[index - 1] !== '<' && line[index + 2] !== '<') {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function r2ShellSyntaxIssues(source: string): readonly string[] {
+  return analyzeR2ShellSource(source).issues;
 }
 
 function shellControlDepthAt(codeLines: readonly string[], lineIndex: number): number {
   return codeLines.slice(0, lineIndex).reduce((depth, line) => {
     const command = line.trim();
     if (command === '') return depth;
-    if (/^(?:if|for|while|until|case)\b/u.test(command)) return depth + 1;
+    if (/^(?:if|for|while|until|select|case)\b/u.test(command)) return depth + 1;
     if (/^(?:fi|done|esac)\b/u.test(command)) return depth - 1;
     return depth;
+  }, 0);
+}
+
+function shellCommandSubstitutionDepthAt(codeLines: readonly string[], lineIndex: number): number {
+  return codeLines.slice(0, lineIndex).reduce((depth, line) => {
+    let current = depth;
+    for (let index = 0; index < line.length; index += 1) {
+      if (line[index] === '$' && line[index + 1] === '(') {
+        current += 1;
+        index += 1;
+      } else if (line[index] === ')' && current > 0) {
+        current -= 1;
+      }
+    }
+    return current;
   }, 0);
 }
 
@@ -268,9 +347,21 @@ describe('suite shape', () => {
     expect(r2ShellSyntaxIssues('read value <<< "$input"\nprintf "%s" "<<EOF" # << comment')).toEqual([]);
     expect(r2ShellSyntaxIssues("printf '%s' '<<EOF' # << comment")).toEqual([]);
     expect(r2ShellSyntaxIssues('cat <<EOF\nfalse\nEOF')).toContain('heredoc');
+    expect(r2ShellSyntaxIssues('value=$((1 << 2))')).not.toContain('heredoc');
+    expect(r2ShellSyntaxIssues('printf "\u{1F680}" <<EOF')).toContain('heredoc');
+    expect(r2ShellSyntaxIssues(String.raw`printf '%s' "$(false; if false; then :; fi)"`)).toContain('double-quoted command substitution');
+    expect(r2ShellSyntaxIssues(String.raw`printf '%s' "$(cat <<EOF)"`)).toContain('double-quoted command substitution');
     expect(r2ShellSyntaxIssues('( if false; then')).toContain('shell group');
     expect(r2ShellSyntaxIssues('false; if false; then')).toContain('inline control flow');
+    expect(r2ShellSyntaxIssues(String.raw`echo foo\ #; if false; then :; fi`)).toContain('inline control flow');
+    const continuedLine = ['false; \\', 'if false; then :; fi'].join('\n');
+    expect(r2ShellSyntaxIssues(continuedLine)).toContain('line continuation');
+    const continuedComment = ['echo foo\\', '#; if false; then :; fi'].join('\n');
+    expect(r2ShellSyntaxIssues(continuedComment)).toContain('line continuation');
     expect(r2ShellSyntaxIssues('{ function helper() {')).toContain('function definition');
+    expect(r2ShellSyntaxIssues('if test; then ( cd snapshot ); fi')).toContain('shell group');
+    const substitutionLines = analyzeR2ShellSource('setup=$(\n  git show target:file\n)').codeLines;
+    expect(shellCommandSubstitutionDepthAt(substitutionLines, 1)).toBe(1);
   });
 
   it('keeps formal fail-before registration guards aligned with suite pins', () => {
@@ -306,8 +397,9 @@ describe('suite shape', () => {
         expect(source, 'R2 baseline does not append the derived identity event')
           .toContain('"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"');
         const baselineLines = source.split(/\r?\n/u);
-        const baselineCodeLines = shellCodeLines(source);
-        expect(r2ShellSyntaxIssues(source), 'R2 baseline must keep a simple, top-level shell setup contract').toEqual([]);
+        const baselineAnalysis = analyzeR2ShellSource(source);
+        const baselineCodeLines = baselineAnalysis.codeLines;
+        expect(baselineAnalysis.issues, 'R2 baseline must keep a simple, top-level shell setup contract').toEqual([]);
         const uniqueExecutableLine = (command: string, label: string): number => {
           const matches = baselineLines.flatMap((line, index) => line.trim() === command ? [index] : []);
           expect(matches, `R2 baseline ${label} command must occur exactly once as a whole line`).toHaveLength(1);
@@ -319,14 +411,19 @@ describe('suite shape', () => {
           'git show "$base:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"',
           'historical helper copy',
         );
+        const changeToSnapshot = uniqueExecutableLine('cd "$d"', 'change to archived snapshot');
         const identityEventAppend = uniqueExecutableLine(
           String.raw`printf "\\n/** Test-fixture compatibility marker; keep base helper behavior. */\\nexport const PUBLICATION_IDENTITY_EVENT = '%s';\\n" "$identity_event" >> "$d/src/dispatch/publication-evidence.ts"`,
           'identity event append',
         );
         expect(shellControlDepthAt(baselineCodeLines, historicalHelperCopy), 'R2 baseline historical helper copy is in a shell control-flow block').toBe(0);
+        expect(shellControlDepthAt(baselineCodeLines, changeToSnapshot), 'R2 baseline snapshot change is in a shell control-flow block').toBe(0);
+        expect(shellCommandSubstitutionDepthAt(baselineCodeLines, changeToSnapshot), 'R2 baseline snapshot change is inside a command substitution').toBe(0);
+        expect(shellCommandSubstitutionDepthAt(baselineCodeLines, historicalHelperCopy), 'R2 baseline historical helper copy is inside a command substitution').toBe(0);
         expect(identityEventAppend, 'R2 baseline appends the identity event before the historical helper copy')
           .toBeGreaterThan(historicalHelperCopy);
         expect(shellControlDepthAt(baselineCodeLines, identityEventAppend), 'R2 baseline identity append is in a shell control-flow block').toBe(0);
+        expect(shellCommandSubstitutionDepthAt(baselineCodeLines, identityEventAppend), 'R2 baseline identity append is inside a command substitution').toBe(0);
       }
     }
     const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');
