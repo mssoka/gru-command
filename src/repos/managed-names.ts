@@ -254,10 +254,12 @@ export function managedRepoNameError(name: string): string | null {
 
 /** Render untrusted repository names without terminal-control or bidi effects. */
 export function displayManagedRepoName(name: string): string {
-  return name.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
-    const codePoint = character.codePointAt(0);
-    return codePoint === undefined ? '' : `\\u{${codePoint.toString(16)}}`;
-  });
+  return name.replace(/^[\p{M}]+|[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (characters) =>
+    Array.from(characters, (character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint === undefined ? '' : `\\u{${codePoint.toString(16)}}`;
+    }).join(''),
+  );
 }
 
 /**
