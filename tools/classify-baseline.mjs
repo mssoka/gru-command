@@ -68,23 +68,48 @@ function classifyPlaywright(report, substrs) {
     };
   }
   const results = [];
+  let observedUnexpected = 0;
+  const failureStatuses = new Set(['failed', 'timedOut', 'interrupted', 'unexpected']);
+  const failureMessage = (result) => {
+    const messages = [result?.error?.message, ...(Array.isArray(result?.errors) ? result.errors.map((error) => error?.message) : [])]
+      .filter((message) => message !== null && message !== undefined && message !== '')
+      .map(String);
+    return messages.join('\n');
+  };
   const walk = (suite) => {
     for (const spec of Array.isArray(suite?.specs) ? suite.specs : []) {
-      if (spec.ok === false || (spec.tests ?? []).some((t) => t.status === 'unexpected')) {
-        const bad = (Array.isArray(spec.tests) ? spec.tests : [])
-          .flatMap((t) => (Array.isArray(t?.results) ? t.results : []))
+      const tests = Array.isArray(spec?.tests) ? spec.tests : [];
+      const unexpectedTests = tests.filter((test) => test?.status === 'unexpected');
+      observedUnexpected += unexpectedTests.length;
+      for (const test of unexpectedTests) {
+        const testLabel = [test?.projectName, test?.title]
+          .filter((value) => typeof value === 'string' && value.trim() !== '')
+          .join(' — ');
+        const title = `${spec?.title ?? spec?.file ?? 'unknown'}${testLabel === '' ? '' : ` — ${testLabel}`}`;
+        const failures = (Array.isArray(test?.results) ? test.results : [])
           // Playwright result statuses: passed/failed/timedOut/interrupted/
           // skipped. A test-level timeout carries the locator in its message,
           // so it must be read, not silently mapped to an empty string.
-          .find((r) => r.status === 'failed' || r.status === 'timedOut' || r.status === 'interrupted' || r.status === 'unexpected');
-        const message =
-          (bad?.error?.message ?? '') + '\n' + String(bad?.errors?.map((e) => e.message).join('\n') ?? '');
-        results.push({ title: spec.title ?? spec.file ?? 'unknown', message });
+          .filter((result) => failureStatuses.has(result?.status));
+        if (failures.length === 0) results.push({ title, message: '' });
+        else for (const failure of failures) results.push({ title, message: failureMessage(failure) });
+      }
+      if (unexpectedTests.length === 0 && spec?.ok === false) {
+        // A failing spec with no unexpected test record is malformed or
+        // incomplete; retain an unclassified failure rather than dropping it.
+        results.push({ title: spec?.title ?? spec?.file ?? 'unknown', message: '' });
       }
     }
     for (const child of Array.isArray(suite?.suites) ? suite.suites : []) walk(child);
   };
   for (const suite of Array.isArray(report?.suites) ? report.suites : []) walk(suite);
+  if (observedUnexpected !== unexpected) {
+    return {
+      code: 3,
+      out: '',
+      err: `BASELINE SETUP FAILURE: Playwright stats report ${unexpected} unexpected test(s), but the report tree contains ${observedUnexpected} — not behavioral evidence`,
+    };
+  }
   if (unexpected === 0) {
     const ran = (stats.expected ?? 0) + (stats.flaky ?? 0);
     if (ran === 0) {
@@ -312,6 +337,14 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   const playwright = args.includes('--playwright');
   const substrs = requiredList('--require-substr');
   const requireFileSubstrs = requiredList('--require-file-substr');
+  if (requireFile !== null && requireFileSubstrs.length === 0) {
+    fail('BASELINE SETUP FAILURE: --require-file requires --require-file-substr to preserve cause checks — refusing to classify a malformed invocation');
+    process.exit(3);
+  }
+  if (requireFile === null && requireFileSubstrs.length > 0) {
+    fail('BASELINE SETUP FAILURE: --require-file-substr requires --require-file — refusing to ignore the instrument cause allowlist');
+    process.exit(3);
+  }
 
   let report = null;
   try {
@@ -321,7 +354,15 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     process.exit(3);
   }
 
-  const { code, out, err } = classifyBaseline(report, { playwright, requireFile, substrs, requireFileSubstrs });
+  let classification;
+  try {
+    classification = classifyBaseline(report, { playwright, requireFile, substrs, requireFileSubstrs });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    fail(`BASELINE SETUP/COLLECTION FAILURE: invalid report shape (${detail}) — not behavioral evidence`);
+    process.exit(3);
+  }
+  const { code, out, err } = classification;
   if (err !== '') fail(err);
   if (out !== '') say(out);
   process.exit(code);

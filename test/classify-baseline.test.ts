@@ -92,6 +92,40 @@ describe('baseline classifier CLI — required option values fail closed', () =>
       expect(result.stderr).toMatch(/--require-file-substr requires/u);
     }
   });
+
+  it('classifies a malformed nested Vitest report as setup failure instead of a false RED', () => {
+    const result = runClassifierCli(
+      ['--require-file', 'slim-strip.baseline.test.ts', '--require-file-substr', 'slim strip labelled status pairs'],
+      { numTotalTests: 1, numPassedTests: 0, numFailedTests: 1, testResults: [null] },
+    );
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/invalid report shape/u);
+  });
+
+  it('requires a cause allowlist when a named instrument is selected', () => {
+    const result = runClassifierCli(
+      ['--require-file', 'slim-strip.baseline.test.ts'],
+      vitestReport([{ name: 'slim-strip.baseline.test.ts', status: 'failed', message: '', assertionResults: [
+        assertion('setup guard', 'failed', ['AssertionError: board sections rendered']),
+      ] }]),
+    );
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--require-file requires --require-file-substr/u);
+  });
+
+  it('rejects a cause allowlist without its named instrument instead of ignoring it', () => {
+    const result = runClassifierCli(
+      ['--require-file-substr', 'slim strip labelled status pairs'],
+      vitestReport([{ name: 'board.test.ts', status: 'failed', message: '', assertionResults: [
+        assertion('unrelated setup assertion', 'failed', ['AssertionError: fixture setup guard failed']),
+      ] }]),
+    );
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toMatch(/--require-file-substr requires --require-file/u);
+  });
 });
 
 describe('baseline classifier — setup/collection failures are never behavioral evidence', () => {
@@ -258,6 +292,29 @@ describe('baseline classifier — Playwright (browser) branch', () => {
     );
     expect(result.code).toBe(1);
     expect(result.out).toMatch(/per-test cause established/u);
+  });
+
+  it('checks every unexpected project in one spec instead of accepting its first feature failure', () => {
+    const report = {
+      stats: { expected: 0, unexpected: 2, skipped: 0, flaky: 0 },
+      suites: [{ specs: [{
+        title: 'strip is visible',
+        file: 'dashboard-strip.spec.ts',
+        ok: false,
+        tests: [
+          { projectName: 'chromium', title: 'strip is visible', status: 'unexpected', results: [
+            { status: 'failed', error: { message: "locator('.strip-status') expected 1" } },
+          ] },
+          { projectName: 'webkit', title: 'strip is visible', status: 'unexpected', results: [
+            { status: 'failed', error: { message: 'ReferenceError: fixture helper failed' } },
+          ] },
+        ],
+      }] }],
+    };
+    const result = classifyBaseline(report, { playwright: true, substrs });
+    expect(result.code).toBe(3);
+    expect(result.err).toMatch(/name NO slim surface/u);
+    expect(result.err).toContain('ReferenceError: fixture helper failed');
   });
 
   it('exits 3 when an unexpected failure names NO slim surface (unclassified cause)', () => {
