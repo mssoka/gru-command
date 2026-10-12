@@ -5,6 +5,7 @@ import { performance } from 'node:perf_hooks';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { AssertionError as ChaiAssertionError } from 'chai';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AutoVerdictPoster,
@@ -51,7 +52,7 @@ async function assertFormalEventAssertion(tag: string, assertion: () => unknown)
   try {
     await assertion();
   } catch (error) {
-    if (!(error instanceof Error) || error.name !== 'AssertionError') throw error;
+    if (!(error instanceof ChaiAssertionError)) throw error;
     throw new Error(`FORMAL_EVENT_ASSERTION:${tag}\n${error.message}`, { cause: error });
   }
 }
@@ -434,6 +435,9 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     const unrelated = new TypeError('fixture evaluation failed before the matcher');
     await expect(assertFormalEventAssertion('wave-marker-regression', () => { throw unrelated; }))
       .rejects.toBe(unrelated);
+    const namedOnly = Object.assign(new Error('not a Vitest matcher failure'), { name: 'AssertionError' });
+    await expect(assertFormalEventAssertion('wave-marker-regression', () => { throw namedOnly; }))
+      .rejects.toBe(namedOnly);
     await expect(assertFormalEventAssertion('wave-marker-regression', () => expect(1).toBe(2)))
       .rejects.toThrow(/FORMAL_EVENT_ASSERTION:wave-marker-regression/u);
   });
