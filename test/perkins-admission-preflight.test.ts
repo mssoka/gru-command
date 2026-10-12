@@ -1365,6 +1365,131 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
+  it('the Linux /proc scan is asynchronous, charged to the remaining budget, and an expired or incomplete scan is unknown — live (#264)', async () => {
+    const stat = (state: string, group: number) => `1 (git) ${state} 1 ${group} 1 0 -1`;
+    const entries = (count: number): string[] => Array.from({ length: count }, (_, index) => String(100 + index));
+    const child = spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' });
+    const pgid = child.pid!;
+    const realPlatform = OWNED_GIT_SEAMS.platform;
+    const realProc = OWNED_GIT_SEAMS.procFs;
+    const realProcAsync = OWNED_GIT_SEAMS.procFsAsync;
+    let syncReads = 0;
+    let asyncReads = 0;
+    let gap = 0;
+    let last = performance.now();
+    const heartbeat = setInterval(() => {
+      const now = performance.now();
+      gap = Math.max(gap, now - last);
+      last = now;
+    }, 5);
+    try {
+      OWNED_GIT_SEAMS.platform = 'linux';
+      // Every entry costs 10 ms to read; all of them are zombies of the group.
+      OWNED_GIT_SEAMS.procFs = {
+        list: () => entries(40),
+        read: () => {
+          syncReads += 1;
+          const until = performance.now() + 10;
+          while (performance.now() < until) { /* a slow synchronous read */ }
+          return stat('Z', pgid);
+        },
+      };
+      OWNED_GIT_SEAMS.procFsAsync = {
+        list: async () => entries(40),
+        read: async () => {
+          asyncReads += 1;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return stat('Z', pgid);
+        },
+      };
+      // Acquisition: with a generous budget the async scan completes, entirely through the async view, without starving the loop.
+      const full = performance.now();
+      expect(await groupHasLiveMemberAsync(pgid, 5_000)).toBe(false);
+      expect(performance.now() - full).toBeGreaterThanOrEqual(300);
+      expect(asyncReads).toBe(40);
+      expect(syncReads).toBe(0);
+      expect(gap).toBeLessThan(100); // the unbounded synchronous walk blocked for the whole scan
+      // Deadline: the scan stops once the remaining budget is spent — unknown, so live.
+      const bounded = performance.now();
+      expect(await groupHasLiveMemberAsync(pgid, 100)).toBe(true);
+      expect(performance.now() - bounded).toBeLessThan(250);
+      expect(asyncReads).toBeLessThan(80);
+      // The synchronous inspector is bounded independently.
+      syncReads = 0;
+      const syncStarted = performance.now();
+      expect(groupHasLiveMember(pgid, 50)).toBe(true);
+      expect(performance.now() - syncStarted).toBeLessThan(200);
+      expect(syncReads).toBeLessThan(40);
+      expect(groupHasLiveMember(pgid, 5_000)).toBe(false); // unexpired: the same records read as stopped
+    } finally {
+      clearInterval(heartbeat);
+      OWNED_GIT_SEAMS.platform = realPlatform;
+      OWNED_GIT_SEAMS.procFs = realProc;
+      OWNED_GIT_SEAMS.procFsAsync = realProcAsync;
+      process.kill(-pgid, 'SIGKILL');
+    }
+  });
+
+  it('a "stopped" answer observed at or after the 1,000 ms settle deadline is never published — async and sync alike; one inside it is (#264)', async () => {
+    const review = branchTargetReview('settle-deadline');
+    const repo = review.manifest.repoPath;
+    const realNow = OWNED_GIT_SEAMS.now;
+    let clock = 0;
+    OWNED_GIT_SEAMS.now = () => clock;
+    try {
+      // Each inspection advances the clock by `cost` and then reports the group stopped.
+      for (const [cost, published] of [[999, true], [1_000, false], [1_001, false]] as const) {
+        const calls = { sync: 0, async: 0 };
+        const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation(() => {
+          calls.sync += 1;
+          clock += cost;
+          return false;
+        });
+        const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async () => {
+          calls.async += 1;
+          clock += cost;
+          return false;
+        });
+        try {
+          clock = 0;
+          if (published) {
+            expect(runOwnedGitSync(repo, ['rev-parse', 'HEAD'], 5_000), `${cost} sync`).toMatch(/^[0-9a-f]{40}/u);
+            expect(await runOwnedGit(repo, ['rev-parse', 'HEAD'], 5_000), `${cost} async`).toMatch(/^[0-9a-f]{40}/u);
+          } else {
+            expect(() => runOwnedGitSync(repo, ['rev-parse', 'HEAD'], 5_000), `${cost} sync`).toThrow(/cleanup unconfirmed: process group \d+ still running/);
+            await expect(runOwnedGit(repo, ['rev-parse', 'HEAD'], 5_000), `${cost} async`).rejects.toThrow(/cleanup unconfirmed: process group \d+ still running/);
+          }
+          expect(calls, String(cost)).toEqual({ sync: 1, async: 1 });
+        } finally {
+          sync.mockRestore();
+          async.mockRestore();
+        }
+      }
+      // The deadline is checked BEFORE an inspection too: once spent, no further inspection starts.
+      const calls = { sync: 0, async: 0 };
+      const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockImplementation(() => {
+        calls.sync += 1;
+        clock += 1_500;
+        return true;
+      });
+      const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockImplementation(async () => {
+        calls.async += 1;
+        clock += 1_500;
+        return true;
+      });
+      try {
+        expect(() => runOwnedGitSync(repo, ['rev-parse', 'HEAD'], 5_000)).toThrow(/cleanup unconfirmed/);
+        await expect(runOwnedGit(repo, ['rev-parse', 'HEAD'], 5_000)).rejects.toThrow(/cleanup unconfirmed/);
+        expect(calls).toEqual({ sync: 1, async: 1 });
+      } finally {
+        sync.mockRestore();
+        async.mockRestore();
+      }
+    } finally {
+      OWNED_GIT_SEAMS.now = realNow;
+    }
+  });
+
   it('a runner that cannot be spawned never signals group 0 — the caller’s own group (R7-1)', () => {
     const review = branchTargetReview('no-runner');
     const realKill = process.kill.bind(process);

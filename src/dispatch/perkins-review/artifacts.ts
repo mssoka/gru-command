@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, execFileSync, spawn, spawnSync, type SpawnSyncOptions } from 'node:child_process';
-import { readFile as readFileAsync } from 'node:fs/promises';
+import { readFile as readFileAsync, readdir as readdirAsync } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
 const execFileAsPromised = promisify(execFileCallback);
@@ -256,6 +256,9 @@ function parseProcStat(stat: string): { readonly state: string; readonly group: 
 
 export type ProcFs = { readonly list: () => string[]; readonly read: (path: string) => string };
 const REAL_PROC_FS: ProcFs = { list: () => readdirSync('/proc'), read: (path) => readFileSync(path, 'utf8') };
+/** The same /proc view without blocking the event loop (#264). */
+export type ProcFsAsync = { readonly list: () => Promise<string[]>; readonly read: (path: string) => Promise<string> };
+const REAL_PROC_FS_ASYNC: ProcFsAsync = { list: () => readdirAsync('/proc'), read: (path) => readFileAsync(path, 'utf8') };
 
 /** Members of process group `pgid` from /proc, or null when membership
  * cannot be established completely: only a process that ENDED while being
@@ -264,6 +267,7 @@ const REAL_PROC_FS: ProcFs = { list: () => readdirSync('/proc'), read: (path) =>
 export function procGroupMembers(
   pgid: number,
   fs: ProcFs = OWNED_GIT_SEAMS.procFs,
+  expired: () => boolean = () => false,
 ): GroupMember[] | null {
   let entries: string[];
   try {
@@ -274,6 +278,7 @@ export function procGroupMembers(
   const members: GroupMember[] = [];
   for (const entry of entries) {
     if (!/^\d+$/u.test(entry)) continue;
+    if (expired()) return null; // an expired scan is incomplete, so unknown (#264)
     let stat: string;
     try {
       stat = fs.read(`/proc/${entry}/stat`);
@@ -286,7 +291,39 @@ export function procGroupMembers(
     if (record === null) return null; // a record that cannot be read in full might be a live member (#263)
     if (record.group === pgid) members.push({ pid: Number(entry), state: record.state });
   }
-  return members;
+  return expired() ? null : members;
+}
+
+/** procGroupMembers without blocking the event loop (#264): every entry is
+ * read asynchronously, and the scan stops — unknown — once `expired()`. */
+export async function procGroupMembersAsync(
+  pgid: number,
+  fs: ProcFsAsync = OWNED_GIT_SEAMS.procFsAsync,
+  expired: () => boolean = () => false,
+): Promise<GroupMember[] | null> {
+  let entries: string[];
+  try {
+    entries = await fs.list();
+  } catch {
+    return null;
+  }
+  const members: GroupMember[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/u.test(entry)) continue;
+    if (expired()) return null;
+    let stat: string;
+    try {
+      stat = await fs.read(`/proc/${entry}/stat`);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ESRCH') continue; // ended while listing
+      return null;
+    }
+    const record = parseProcStat(stat);
+    if (record === null) return null;
+    if (record.group === pgid) members.push({ pid: Number(entry), state: record.state });
+  }
+  return expired() ? null : members;
 }
 
 /** Members of group `pgid` from `ps -A -o pid=,pgid=,stat=` output, or null
@@ -327,7 +364,11 @@ export const executingMember = (members: readonly GroupMember[] | null): boolean
 export function groupHasLiveMember(pgid: number, budgetMs: number): boolean {
   if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
   if (!groupExists(pgid)) return false;
-  if (OWNED_GIT_SEAMS.platform === 'linux') return executingMember(procGroupMembers(pgid));
+  if (OWNED_GIT_SEAMS.platform === 'linux') {
+    // The synchronous scan is bounded on its own (#264): out of budget, membership is unknown, so live.
+    const until = OWNED_GIT_SEAMS.now() + budgetMs;
+    return executingMember(procGroupMembers(pgid, OWNED_GIT_SEAMS.procFs, () => OWNED_GIT_SEAMS.now() >= until));
+  }
   const listed = spawnSync('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], {
     encoding: 'utf8', timeout: Math.max(1, Math.floor(budgetMs)), killSignal: 'SIGKILL',
   });
@@ -340,7 +381,11 @@ export function groupHasLiveMember(pgid: number, budgetMs: number): boolean {
 export async function groupHasLiveMemberAsync(pgid: number, budgetMs: number): Promise<boolean> {
   if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
   if (!groupExists(pgid)) return false;
-  if (OWNED_GIT_SEAMS.platform === 'linux') return executingMember(procGroupMembers(pgid));
+  if (OWNED_GIT_SEAMS.platform === 'linux') {
+    // Asynchronous and charged to the remaining settle budget (#264).
+    const until = OWNED_GIT_SEAMS.now() + budgetMs;
+    return executingMember(await procGroupMembersAsync(pgid, OWNED_GIT_SEAMS.procFsAsync, () => OWNED_GIT_SEAMS.now() >= until));
+  }
   try {
     const { stdout } = await execFileAsPromised('/bin/ps', ['-A', '-o', 'pid=,pgid=,stat='], {
       encoding: 'utf8', timeout: Math.max(1, Math.floor(budgetMs)), killSignal: 'SIGKILL',
@@ -360,9 +405,14 @@ export const OWNED_GIT_SEAMS: {
   removePrivateDir: (dir: string) => void;
   platform: NodeJS.Platform;
   procFs: ProcFs;
+  procFsAsync: ProcFsAsync;
+  /** Monotonic milliseconds: the settle deadline's clock. */
+  now: () => number;
 } = {
   platform: process.platform,
   procFs: REAL_PROC_FS,
+  procFsAsync: REAL_PROC_FS_ASYNC,
+  now: () => performance.now(),
   groupHasLiveMember,
   groupHasLiveMemberAsync,
   removePrivateDir: (dir) => {
@@ -572,13 +622,17 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
         try {
           const report = readRunnerReport(launch.resultFile);
           if (pid !== null) {
-            const until = performance.now() + KILL_SETTLE_MS;
+            const until = OWNED_GIT_SEAMS.now() + KILL_SETTLE_MS;
+            const unconfirmed = (): Error =>
+              cleanupUnconfirmed(pid, `${command} did not stop after SIGKILL (${String(report?.outcome ?? 'runner ended')})`);
             for (;;) {
-              const remaining = until - performance.now();
-              if (!(await OWNED_GIT_SEAMS.groupHasLiveMemberAsync(pid, remaining))) break;
-              if (performance.now() >= until) {
-                throw cleanupUnconfirmed(pid, `${command} did not stop after SIGKILL (${String(report?.outcome ?? 'runner ended')})`);
-              }
+              // The absolute deadline is checked before every inspection and
+              // after its answer: a "stopped" observed late is never published (#264).
+              const before = OWNED_GIT_SEAMS.now();
+              if (before >= until) throw unconfirmed();
+              const live = await OWNED_GIT_SEAMS.groupHasLiveMemberAsync(pid, until - before);
+              if (OWNED_GIT_SEAMS.now() >= until) throw unconfirmed();
+              if (!live) break;
               await new Promise((wait) => setTimeout(wait, 25));
             }
           }
@@ -638,12 +692,15 @@ export function runOwnedGitSync(
     // R7-1: a failed spawn reports pid 0 — never a group to observe.
     const pid = typeof result.pid === 'number' && Number.isSafeInteger(result.pid) && result.pid > 0 ? result.pid : null;
     if (pid !== null) {
-      const until = performance.now() + KILL_SETTLE_MS;
+      const until = OWNED_GIT_SEAMS.now() + KILL_SETTLE_MS;
+      const unconfirmed = (): Error =>
+        cleanupUnconfirmed(pid, `${command} did not stop after SIGKILL (${String(report?.outcome ?? 'runner ended')})`);
       for (;;) {
-        if (!OWNED_GIT_SEAMS.groupHasLiveMember(pid, until - performance.now())) break;
-        if (performance.now() >= until) {
-          throw cleanupUnconfirmed(pid, `${command} did not stop after SIGKILL (${String(report?.outcome ?? 'runner ended')})`);
-        }
+        const before = OWNED_GIT_SEAMS.now();
+        if (before >= until) throw unconfirmed();
+        const live = OWNED_GIT_SEAMS.groupHasLiveMember(pid, until - before);
+        if (OWNED_GIT_SEAMS.now() >= until) throw unconfirmed();
+        if (!live) break;
         sleepSync(25);
       }
     }
