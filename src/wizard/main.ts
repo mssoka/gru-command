@@ -704,6 +704,9 @@ async function main(argv: readonly string[]): Promise<number> {
   const workspaceAbs = expandTilde(answers.workspaceRoot, homedir());
   const samePriorWorkspace = prior !== null &&
     workspaceIdentity(answers.workspaceRoot, homedir()) === workspaceIdentity(prior.workspaceRoot, homedir());
+  if (reposInherited && prior !== null && prior.managedRepos.length > 0 && !samePriorWorkspace) {
+    fail('workspace_root changed; explicitly select managed_repos for the new workspace binding');
+  }
   for (const repo of answers.repos) {
     const inheritedBinding = reposInherited && samePriorWorkspace &&
       prior?.managedRepos.includes(repo) === true;

@@ -500,6 +500,43 @@ describe('wizard CLI surface', () => {
     expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual([]);
   });
 
+  it('forced reruns require explicit managed repositories after changing the workspace binding', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const previousWorkspace = tempDir('gru-command-wizard-inherited-prior-workspace-');
+    const previousRepo = join(previousWorkspace, 'alpha');
+    mkdirSync(previousRepo);
+    execFileSync('git', ['init', '-q'], { cwd: previousRepo });
+
+    const changedWorkspace = tempDir('gru-command-wizard-inherited-changed-workspace-');
+    const changedRepo = join(changedWorkspace, 'alpha');
+    mkdirSync(changedRepo);
+    execFileSync('git', ['init', '-q'], { cwd: changedRepo });
+
+    const home = tempDir('gru-command-wizard-inherited-changed-binding-home-');
+    const wizard = join(repoRoot, 'dist/wizard/main.js');
+    const run = (answers: Record<string, unknown>, force = false) =>
+      spawnSync(process.execPath, [wizard, ...(force ? ['--force'] : []), '--answers', JSON.stringify({
+        port: 0, smoke: false, ...answers,
+      })], {
+        env: { ...process.env, GRU_COMMAND_HOME: home },
+        encoding: 'utf-8',
+        timeout: 30_000,
+      });
+
+    const first = run({ workspace_root: previousWorkspace, repos: ['alpha'] });
+    expect(first.status, first.stderr).toBe(0);
+    const priorConfig = readFileSync(configPathFor(home), 'utf8');
+
+    const changed = run({ workspace_root: changedWorkspace }, true);
+    expect(changed.status).toBe(1);
+    expect(changed.stderr).toContain('workspace_root changed; explicitly select managed_repos');
+    expect(readFileSync(configPathFor(home), 'utf8')).toBe(priorConfig);
+
+    const explicitlySelected = run({ workspace_root: changedWorkspace, repos: ['alpha'] }, true);
+    expect(explicitlySelected.status, explicitlySelected.stderr).toBe(0);
+    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha']);
+  });
+
   it('forced reruns validate an explicitly selected same-name binding in a changed workspace before writing', () => {
     const repoRoot = join(import.meta.dirname, '..');
     const previousWorkspace = tempDir('gru-command-wizard-prior-workspace-');
