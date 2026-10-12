@@ -5,6 +5,7 @@ import type { AgentHandle, AgentState, PendingTurn, SpawnOptions } from '../runt
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
+import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DecisionService } from '../decisions/types.js';
 import {
@@ -216,8 +217,15 @@ interface RateLimitRetryIncident {
   resolveSettled: (disposition: Exclude<RetrySettlement, 'none'>) => void;
 }
 
+interface RecoveryAuthority {
+  readonly jobId: string | null;
+  readonly authorityEpoch: number | null;
+  /** Native request identities also change when no retirement ever occurred. */
+  readonly producerIdentity: string | null;
+}
+
 /** What a restart rung must know to recover a killed open turn. */
-interface InterruptedTurn {
+interface InterruptedTurn extends RecoveryAuthority {
   /** The prompt to re-deliver, when the runtime could describe it. */
   readonly pending: PendingTurn | null;
   /** The supervisor observed an open turn/control at kill time. */
@@ -226,8 +234,14 @@ interface InterruptedTurn {
    * fresh-mint restart may retire the record's current id, but the job /
    * branch / phase context lives under this one. */
   readonly originAgentId: string;
+}
+
+interface RejectedRestartCleanup {
   readonly jobId: string | null;
-  readonly authorityEpoch: number | null;
+  readonly agent: SupervisedAgent;
+  readonly recovery: InterruptedTurn | null;
+  disposalAcknowledged: boolean;
+  notificationId: string | null;
 }
 
 /** Structured provider identity from a runtime error, when the runtime
@@ -377,7 +391,7 @@ export class Supervisor {
   /** Rejected replacements are never job-bound/adopted. Their cleanup
    * ownership must still fence the captured job, including when disposal
    * rejects after the registry has already removed the handle. */
-  private readonly rejectedRestartCleanup = new Map<AgentHandle, string>();
+  private readonly rejectedRestartCleanup = new Map<AgentHandle, RejectedRestartCleanup>();
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
   private restoredStops = new Map<string, AgentSupervisionView>();
@@ -707,6 +721,9 @@ export class Supervisor {
     if (this.disposed) return;
     try {
       if (envelope.phase === 'spawned') {
+        // A resumed same-id tap is observation, not slot authorization.
+        // The rung alone may restore its handle after the authority fence.
+        if (this.agents.get(envelope.agentId)?.inRestart) return;
         const handle = this.registry.getHandle(envelope.agentId);
         this.adopt(handle ?? null, null, envelope.sessionFile, envelope);
         return;
@@ -1812,6 +1829,7 @@ export class Supervisor {
       // Snapshot the explicit durable association BEFORE spawning: the tap
       // carries no job context and a resumed spawn may reuse this row's id.
       const predecessor = this.ledger.getAgent(agent.agentId);
+      const restartAuthority = agent.pendingRecovery ?? this.captureJobAuthority(predecessor?.jobId ?? null, agent.agentId);
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
@@ -1843,8 +1861,8 @@ export class Supervisor {
         // Spawn is an authority boundary too: the registry tap has already
         // observed this handle, but a newer native handoff may have won
         // during creation. Never bind/adopt it or notify ownership swaps.
-        if (!this.recoveryAuthorityCurrent(agent, agent.pendingRecovery)) {
-          await this.rejectRestartReplacement(agent, spawned, reason);
+        if (!this.recoveryAuthorityCurrent(agent, restartAuthority)) {
+          await this.rejectRestartReplacement(agent, spawned, reason, restartAuthority);
           return;
         }
         if (predecessor !== null) {
@@ -1926,16 +1944,19 @@ export class Supervisor {
   /** Dispose a replacement that no longer owns its captured job authority.
    * Registry tap adoption is neutral, not permission. Quarantine that
    * record before awaiting cleanup so its events cannot start another rung.
-   * Only a resolved disposal acknowledges cessation; even a disposed event
-   * followed by rejection leaves explicit, job-specific ownership debt. */
+   * Disposal fulfillment and adapter-owned cessation proof are both required;
+   * even a disposed event followed by rejection leaves ownership debt. */
   private async rejectRestartReplacement(
     agent: SupervisedAgent,
     spawned: AgentHandle,
     reason: string,
+    authority: RecoveryAuthority,
   ): Promise<void> {
     const recovery = agent.pendingRecovery;
-    const jobId = recovery?.jobId ?? this.ledger.getAgent(agent.agentId)?.jobId ?? null;
-    if (jobId !== null) this.rejectedRestartCleanup.set(spawned, jobId);
+    // Captured before spawn: failed authority reads must not lose cleanup's job.
+    const { jobId } = authority;
+    const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, disposalAcknowledged: false, notificationId: null };
+    this.rejectedRestartCleanup.set(spawned, cleanup);
     const observed = this.agents.get(spawned.id);
     if (observed?.handle === spawned) {
       this.clearRateLimitRetry(observed, 'superseded');
@@ -1946,15 +1967,14 @@ export class Supervisor {
     let cleanupError: string | null = null;
     try {
       await this.registry.disposeHandle(spawned);
-      this.rejectedRestartCleanup.delete(spawned);
-      if (agent.pendingRecovery === recovery) agent.pendingRecovery = null;
-      // Preserve durable history, not a dead in-process recovery owner.
-      if (this.agents.get(agent.agentId) === agent && agent.handle === null) {
-        this.agents.delete(agent.agentId);
-      }
+      cleanup.disposalAcknowledged = true;
+      if (!this.restartCessationConfirmed(spawned)) throw new Error('adapter-owned cessation evidence is unknown after disposal');
+      this.settleRejectedRestartCleanup(spawned, cleanup);
     } catch (error) {
       cleanupError = String(error);
       agent.state = 'stopped';
+      agent.stopReason = `restart cleanup unconfirmed: ${spawned.id}`;
+      agent.stoppedAt = this.now();
       this.log('error', 'superseded restart replacement cleanup unconfirmed', {
         agent_id: agent.agentId,
         replacement_agent_id: spawned.id,
@@ -1970,7 +1990,7 @@ export class Supervisor {
         payload: {
           reason,
           replacement_agent_id: spawned.id,
-          authority_epoch: recovery?.authorityEpoch ?? null,
+          authority_epoch: authority.authorityEpoch,
           disposition: cleanupError === null ? 'disposed' : 'cleanup-unconfirmed',
           ...(cleanupError !== null ? { error: cleanupError } : {}),
         },
@@ -1980,17 +2000,43 @@ export class Supervisor {
     }
     if (cleanupError !== null) {
       try {
-        this.notifications.post({
+        const notice = this.notifications.post({
           kind: 'supervision.restart-cleanup-unconfirmed',
           routing: 'needs-owner',
           severity: 'error',
           title: `Superseded minion ${spawned.id}: cleanup is unconfirmed`,
-          detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused before adoption, but disposal failed: ${cleanupError}. ` +
+          detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused before adoption, but cleanup is unconfirmed: ${cleanupError}. ` +
             'Producer ownership remains unknown. Confirm cleanup before retiring or resuming the lane; no automatic restart is authorized.',
           agentId: agent.agentId,
         });
+        cleanup.notificationId = notice.id;
       } catch (error) {
         this.log('error', 'restart cleanup notification could not be posted', { agent_id: agent.agentId, error: String(error) });
+      }
+    }
+  }
+
+  private restartCessationConfirmed(handle: AgentHandle): boolean {
+    try { return handle.cessationEvidence?.() === 'ceased'; }
+    catch (error) {
+      this.log('warn', 'restart cessation evidence unavailable', { agent_id: handle.id, error: String(error) });
+      return false;
+    }
+  }
+
+  private settleRejectedRestartCleanup(handle: AgentHandle, cleanup: RejectedRestartCleanup): void {
+    this.rejectedRestartCleanup.delete(handle);
+    const { agent, recovery, notificationId } = cleanup;
+    if (agent.pendingRecovery === recovery) agent.pendingRecovery = null;
+    // Preserve durable history, not a dead in-process recovery owner.
+    if (this.agents.get(agent.agentId) === agent && agent.handle === null) this.agents.delete(agent.agentId);
+    if (notificationId !== null) {
+      try {
+        this.ledger.resolveNotificationById(notificationId, 'supervision-cleanup-confirmed');
+        this.ledger.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: cleanup.jobId,
+          agentId: agent.agentId, payload: { replacement_agent_id: handle.id } });
+      } catch (error) {
+        this.log('warn', 'restart cleanup confirmation audit failed', { agent_id: handle.id, error: String(error) });
       }
     }
   }
@@ -2041,27 +2087,40 @@ export class Supervisor {
     }
     if (pending === null && !hadOpenTurn) return null;
     const jobId = this.ledger.getAgent(agent.agentId)?.jobId ?? null;
-    let authorityEpoch: number | null = null;
-    if (jobId !== null) {
-      try {
-        authorityEpoch = this.ledger.directiveRecoveryEpoch(jobId);
-      } catch (error) {
-        this.log('warn', 'interrupted turn authority unavailable — automatic recovery fenced', { agent_id: agent.agentId, job_id: jobId, error: String(error) });
-      }
-    }
-    return { pending, hadOpenTurn, originAgentId: agent.agentId, jobId, authorityEpoch };
+    return { pending, hadOpenTurn, originAgentId: agent.agentId, ...this.captureJobAuthority(jobId, agent.agentId) };
   }
 
-  /** A notification ACK is not a new job authority handoff. The native
-   * epoch captured with the old turn must survive every restart await. */
-  private recoveryAuthorityCurrent(agent: SupervisedAgent, recovery: InterruptedTurn | null): boolean {
-    const jobId = recovery?.jobId ?? this.ledger.getAgent(agent.agentId)?.jobId ?? null;
-    if (jobId === null) return true;
+  private nativeProducerIdentity(jobId: string): string {
+    return JSON.stringify([
+      this.ledger.listPendingRebriefs({ jobId }).map((row) => row.id).sort(),
+      this.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).map((row) => row.requestId).sort(),
+    ]);
+  }
+
+  private captureJobAuthority(jobId: string | null, agentId: string): RecoveryAuthority {
+    if (jobId === null) return { jobId, authorityEpoch: null, producerIdentity: null };
     try {
+      return { jobId, authorityEpoch: this.ledger.directiveRecoveryEpoch(jobId), producerIdentity: this.nativeProducerIdentity(jobId) };
+    } catch (error) {
+      this.log('warn', 'interrupted turn authority unavailable — automatic recovery fenced', { agent_id: agentId, job_id: jobId, error: String(error) });
+      return { jobId, authorityEpoch: null, producerIdentity: null };
+    }
+  }
+
+  /** A notification ACK is not a new job authority handoff. Captured native
+   * retirement AND request identities must survive every restart await. */
+  private recoveryAuthorityCurrent(agent: SupervisedAgent, recovery: RecoveryAuthority | null): boolean {
+    let jobId = recovery?.jobId ?? null;
+    try {
+      const currentJobId = this.ledger.getAgent(agent.agentId)?.jobId ?? null;
+      if (recovery !== null && recovery.jobId !== currentJobId) return false;
+      jobId = recovery?.jobId ?? currentJobId;
+      if (jobId === null) return true;
       const job = this.ledger.getJob(jobId);
       if (job === null || isJobTerminal(job.status) || this.ledger.hasOpenDirectiveRecoveryHold(jobId)) return false;
       const epoch = this.ledger.directiveRecoveryEpoch(jobId);
-      const current = recovery?.authorityEpoch === epoch || (epoch === 0 && recovery?.authorityEpoch == null);
+      const current = (recovery?.authorityEpoch === epoch || (epoch === 0 && recovery === null)) &&
+        (recovery === null || recovery.producerIdentity === this.nativeProducerIdentity(jobId));
       if (!current) this.log('info', 'interrupted turn superseded — automatic recovery fenced', { agent_id: agent.agentId, job_id: jobId });
       return current;
     } catch (error) {
@@ -2503,9 +2562,14 @@ export class Supervisor {
    * queued retry or undecided recovery is still producer ownership even
    * while its durable agent row says idle/error/disposed. */
   pendingProducerBlockers(jobId: string): readonly string[] {
-    const rejected = [...this.rejectedRestartCleanup]
-      .filter(([, ownedJobId]) => ownedJobId === jobId)
-      .map(([handle]) => `restart cleanup unconfirmed: ${handle.id}`);
+    const rejected = [...this.rejectedRestartCleanup].flatMap(([handle, cleanup]) => {
+      if (cleanup.jobId !== jobId) return [];
+      if (cleanup.disposalAcknowledged && this.restartCessationConfirmed(handle)) {
+        this.settleRejectedRestartCleanup(handle, cleanup);
+        return [];
+      }
+      return [`restart cleanup unconfirmed: ${handle.id}`];
+    });
     const supervised = this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
       const agent = this.agents.get(row.id);
       if (agent === undefined) {

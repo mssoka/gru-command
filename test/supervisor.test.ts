@@ -148,6 +148,7 @@ class FakeHandle implements AgentHandle {
     }
     return this.healthBase();
   }
+  cessationEvidence: (() => 'ceased' | 'unknown') | undefined = () => this.disposed ? 'ceased' : 'unknown';
   async dispose(): Promise<void> {
     this.disposed = true;
     this.setState('disposed');
@@ -996,19 +997,22 @@ describe('supervisor — durable restart association', () => {
 });
 
 describe('supervisor — post-spawn recovery authority (GH-280)', () => {
-  async function deferredRestart(sameId = false) {
+  async function deferredRestart(sameId = false, retirementHistory = true) {
     const rig = boot(undefined, { maxRestarts: 1 });
     try {
       const jobId = 'deferred-restart-job';
       rig.api.addJob({ id: jobId, repo: 'fixture', title: 'Deferred replacement' });
       rig.api.setJobStatus(jobId, 'working');
-      const retired = rig.api.beginDirectiveIntent({ jobId, directive: 'retired work', holder: 'silas-ops', requestId: 'deferred-retired' });
-      rig.api.retireInterruptedDirective({ requestId: retired.record.requestId, expectedJobId: jobId, expectedState: 'dispatching',
-        expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40), lane: { id: 'fixture-lane', resolvedHead: 'a'.repeat(40) },
-        reason: 'fixture has no active producer', by: 'silas-ops' });
+      if (retirementHistory) {
+        const retired = rig.api.beginDirectiveIntent({ jobId, directive: 'retired work', holder: 'silas-ops', requestId: 'deferred-retired' });
+        rig.api.retireInterruptedDirective({ requestId: retired.record.requestId, expectedJobId: jobId, expectedState: 'dispatching',
+          expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40), lane: { id: 'fixture-lane', resolvedHead: 'a'.repeat(40) },
+          reason: 'fixture has no active producer', by: 'silas-ops' });
+      }
       const fresh = rig.api.beginPendingRebrief({ jobId, note: 'fresh authorized work', briefing: null });
       const epoch = rig.api.directiveRecoveryEpoch(jobId);
-      expect(epoch).toBeGreaterThan(0);
+      if (retirementHistory) expect(epoch).toBeGreaterThan(0);
+      else expect(epoch).toBe(0);
       expect(rig.api.hasOpenDirectiveRecoveryHold(jobId)).toBe(false);
       const original = new FakeHandle('minion', 'deferred-original', '/fixture/deferred.jsonl');
       original.pendingTurnSnapshot = { text: 'fresh authorized work', owner: `rebrief:${fresh[0]!.id}` };
@@ -1058,6 +1062,12 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(f.swapped).not.toHaveBeenCalled();
       expect(f.replacement.promptCalls).toEqual([]);
       expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).not.toEqual([]);
+      // Quarantine precedes the disposal await, not merely its settlement.
+      expect(f.rig.supervisor.viewFor(f.replacement.id)).toBeNull();
+      f.replacement.emit({ type: 'error', error: 'session stream died during cleanup', fatal: true });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(f.rig.registry.spawnCalls).toHaveLength(3);
+      expect(f.register).not.toHaveBeenCalled();
       releaseDispose();
       await flushMicrotasks();
       expect(f.replacement.disposed).toBe(true);
@@ -1070,6 +1080,156 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(rejected[0]?.payload).toMatchObject({ replacement_agent_id: f.replacement.id, disposition: 'disposed', authority_epoch: f.epoch });
       expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).filter((event) =>
         ['supervision.turn-recovery', 'job.delivered', 'silas.directive-sent', 'silas.directive-settled', 'silas.directive-failed'].includes(event.kind))).toEqual([]);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('rejects rebrief supersession even without retirement history', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart(false, false);
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer native request', briefing: null });
+      expect(f.rig.api.directiveRecoveryEpoch(f.jobId)).toBe(0);
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.replacement.disposed).toBe(true);
+      expect(f.register).not.toHaveBeenCalled();
+      expect(f.swapped).not.toHaveBeenCalled();
+      expect(f.slot.current()).toBeNull();
+      expect(f.replacement.promptCalls).toEqual([]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('rejects a new native directive identity without retirement history', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart(false, false);
+    try {
+      f.rig.api.clearPendingRebriefs(f.rig.api.listPendingRebriefs({ jobId: f.jobId }).map((row) => row.id));
+      f.rig.api.beginDirectiveIntent({ jobId: f.jobId, directive: 'new directive', holder: 'silas-ops', requestId: 'new-native-request' });
+      expect(f.rig.api.directiveRecoveryEpoch(f.jobId)).toBe(0);
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.replacement.disposed).toBe(true);
+      expect(f.register).not.toHaveBeenCalled();
+      expect(f.swapped).not.toHaveBeenCalled();
+      expect(f.replacement.promptCalls).toEqual([]);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('recovers unchanged native authority without retirement history', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart(false, false);
+    try {
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.replacement.disposed).toBe(false);
+      expect(f.slot.current()).toBe(f.replacement);
+      expect(f.swapped).toHaveBeenCalledExactlyOnceWith(f.replacement);
+      expect(f.replacement.promptCalls).toEqual([f.original.pendingTurnSnapshot]);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('keeps a same-id replacement out of current and ensure inside its spawned tap', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart(true);
+    let currentAtTap: AgentHandle | null | undefined;
+    let ensured: Promise<AgentHandle | Error> | null = null;
+    const unsubscribe = f.rig.registry.onAgentEvent((event) => {
+      if (event.phase !== 'spawned' || event.agentId !== f.replacement.id) return;
+      currentAtTap = f.slot.current();
+      ensured = f.slot.ensure().catch((error: unknown) => error as Error);
+    });
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'superseded during creation', briefing: null });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(currentAtTap).toBeNull();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(await ensured).toBeInstanceOf(Error);
+      expect(f.replacement.disposed).toBe(true);
+      expect(f.register).not.toHaveBeenCalled();
+      expect(f.swapped).not.toHaveBeenCalled();
+      expect(f.replacement.promptCalls).toEqual([]);
+      expect(f.rig.registry.spawnCalls).toHaveLength(3);
+    } finally { unsubscribe(); f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('fails closed on an idle restart job lookup failure using the captured job for cleanup', async () => {
+    for (const cleanupFails of [false, true]) {
+      vi.useFakeTimers();
+      const rig = boot(undefined, { maxRestarts: 1 });
+      try {
+        const jobId = 'idle-lookup-job';
+        rig.api.addJob({ id: jobId, repo: 'fixture', title: 'Idle restart ownership' });
+        rig.api.setJobStatus(jobId, 'working');
+        const original = new FakeHandle('minion', 'idle-lookup-original', null);
+        rig.registry.adopt(original);
+        rig.api.registerAgent({ id: original.id, role: 'minion', jobId });
+        const replacement = new FakeHandle('minion', 'idle-lookup-replacement', null);
+        if (cleanupFails) replacement.dispose = async () => { throw new Error('idle replacement cleanup failed'); };
+        let releaseSpawn!: (handle: FakeHandle) => void;
+        rig.registry.spawnImpl = () => new Promise((resolve) => { releaseSpawn = resolve; });
+        original.emit({ type: 'error', error: 'idle session stream died', fatal: true });
+        await flushMicrotasks();
+        expect(rig.registry.spawnCalls).toHaveLength(1);
+        const register = vi.spyOn(rig.api, 'registerAgent');
+        const lookup = vi.spyOn(rig.api, 'getAgent').mockImplementation(() => { throw new Error('agent store unavailable'); });
+        releaseSpawn(replacement);
+        await flushMicrotasks();
+        lookup.mockRestore();
+        expect(register).not.toHaveBeenCalled();
+        expect(replacement.promptCalls).toEqual([]);
+        expect(rig.supervisor.viewFor(replacement.id)).toBeNull();
+        expect(rig.supervisor.pendingProducerBlockers(jobId).join(' ')).toBe(cleanupFails ? `restart cleanup unconfirmed: ${replacement.id}` : '');
+        expect(rig.supervisor.pendingProducerBlockers('unrelated-job')).toEqual([]);
+        expect(rig.api.listJobEvents(jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-rejected')?.payload)
+          .toMatchObject({ disposition: cleanupFails ? 'cleanup-unconfirmed' : 'disposed' });
+        await vi.advanceTimersByTimeAsync(100);
+        expect(rig.registry.spawnCalls).toHaveLength(1);
+      } finally { rig.dispose(); vi.useRealTimers(); }
+    }
+  });
+
+  it('retains ownership for fulfilled disposal with unknown, missing or throwing cessation evidence', async () => {
+    for (const evidence of [() => 'unknown' as const, undefined, () => { throw new Error('cessation probe unavailable'); }]) {
+      vi.useFakeTimers();
+      const f = await deferredRestart();
+      try {
+        f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer work', briefing: null });
+        f.replacement.cessationEvidence = evidence;
+        f.releaseSpawn(f.replacement);
+        await flushMicrotasks();
+        expect(f.replacement.disposed).toBe(true);
+        expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain(`cleanup unconfirmed: ${f.replacement.id}`);
+        expect(f.rig.supervisor.pendingProducerBlockers('unrelated-job')).toEqual([]);
+        expect(f.rig.supervisor.viewFor(f.replacement.id)).toBeNull();
+        expect(f.register).not.toHaveBeenCalled();
+        expect(f.swapped).not.toHaveBeenCalled();
+        expect(f.replacement.promptCalls).toEqual([]);
+        expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')).toHaveLength(1);
+        expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-rejected')?.payload)
+          .toMatchObject({ disposition: 'cleanup-unconfirmed' });
+      } finally { f.rig.dispose(); vi.useRealTimers(); }
+    }
+  });
+
+  it('releases obsolete cleanup ownership only after a fulfilled disposal later proves cessation', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer work', briefing: null });
+      f.replacement.cessationEvidence = () => 'unknown';
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain(`cleanup unconfirmed: ${f.replacement.id}`);
+      f.replacement.cessationEvidence = () => 'ceased';
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')[0]?.resolvedBy).toBe('supervision-cleanup-confirmed');
+      expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-cleanup-confirmed')?.payload)
+        .toMatchObject({ replacement_agent_id: f.replacement.id });
+      expect(f.register).not.toHaveBeenCalled();
+      expect(f.swapped).not.toHaveBeenCalled();
+      expect(f.replacement.promptCalls).toEqual([]);
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
