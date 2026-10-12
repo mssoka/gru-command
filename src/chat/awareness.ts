@@ -18,6 +18,7 @@ import {
   incidentSubjectOf,
   isHardFloorRow,
 } from './incident.js';
+import { redactedText } from '../decisions/questions.js';
 import { WakePolicy, type WakeCandidate, type WakeDecision } from './wake-policy.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -375,6 +376,15 @@ function textOf(value: unknown): string | null {
 
 function numberOf(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** GH-122: notification title/detail is external data that can echo a
+ * credential (a provider error quoting a token). The block rides a
+ * tool-capable model turn, so redact with the same pass as the event-triage
+ * transcript tail. The stored row, and every owner-facing surface, keep the
+ * original text. */
+function promptSafe(value: string): string {
+  return redactedText(value, 2_000);
 }
 
 function clampLine(line: string, max: number): string {
@@ -998,7 +1008,7 @@ export class GruAwareness {
       // A stop reclassified while a wake was waiting must never ride a
       // machine-only turn; all mode explicitly opts into owner context.
       if (exclusiveWake && this.wakeMode === 'action-required' && row.routing !== 'action-required') return;
-      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(row.detail)}` : '';
+      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(promptSafe(row.detail))}` : '';
       const icon = row.routing === 'action-required' ? '⚠' : row.routing === 'needs-owner' ? '🔔' : 'ℹ';
       renderedRows.set(id, row);
       if (this.mailbox?.captureRow(row) != null) {
@@ -1006,16 +1016,16 @@ export class GruAwareness {
         notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map((reason) => reason.label), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` })}` });
         return;
       }
-      notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(row.title)}${detail} (routing: ${row.routing})` });
+      notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (routing: ${row.routing})` });
     };
     const addReceipt = (id: string): void => {
       if (receiptNotes.length >= this.limits.maxActionNotes) return;
       const row = this.attentionRow(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
-      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(row.detail)}` : '';
+      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(promptSafe(row.detail))}` : '';
       receiptNotes.push({
         id, displayId: row.id, mailbox: false,
-        line: `- 🧾 [${row.id}] title=${JSON.stringify(row.title)}${detail} (closed receipt — no action required)`,
+        line: `- 🧾 [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (closed receipt — no action required)`,
       });
     };
     if (exclusiveWake) {

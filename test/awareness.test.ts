@@ -2959,3 +2959,32 @@ describe('GH-116 (g20): all-mode FYI backlog cannot outrank machine stops', () =
     expect(active.wakeBlocks[0]).toContain(machine.id);
   });
 });
+
+describe('GH-122 (g26): credential-bearing detail never reaches an autonomous prompt verbatim', () => {
+  const TOKEN = 'sk-ant-abcdefghijklmnop0123456789';
+  const GH = 'ghp_abcdefghijklmnopqrstuvwxyz0123';
+
+  it('redacts secret-shaped detail in the wake block while the owner-visible row keeps it', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    const row = rig.notifications.post({
+      kind: 'agent.runtime', routing: 'action-required', severity: 'error', title: `Agent m1 failed with ${GH}`,
+      detail: `provider rejected key ${TOKEN}; Authorization: Bearer ${GH}`,
+    });
+    expect(rig.wakeBlocks).toHaveLength(1);
+    const block = rig.wakeBlocks[0]!;
+    expect(block).toContain(row.id);
+    expect(block).toContain('[redacted]');
+    expect(block).not.toContain(TOKEN);
+    expect(block).not.toContain(GH);
+    // The stored record (owner-visible policy) is not rewritten.
+    expect(rig.api.getNotification(row.id)?.detail).toContain(TOKEN);
+  });
+
+  it('also redacts a derived agent-error detail and passive blocks', () => {
+    const rig = boot({ wakeMode: 'all' });
+    rig.api.appendCustomEvent({ kind: 'agent.error', agentId: 'm1', payload: { error: `401 invalid key ${TOKEN}` } });
+    const text = [...rig.wakeBlocks, rig.awareness.prepare('chat')?.text ?? ''].join('\n');
+    expect(text).toContain('runtime error');
+    expect(text).not.toContain(TOKEN);
+  });
+});
