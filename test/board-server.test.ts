@@ -399,6 +399,39 @@ describe('board server — HTTP API', () => {
     expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
   });
 
+  it('needs-owner escalation retries with the same idempotency key yield one row; distinct escalations stay distinct (#100)', async () => {
+    const { api, port } = harness;
+    const path = '/api/notifications/needs-owner';
+    const count = () => api.listNotifications({ limit: 500 }).filter((n) => n.kind === 'gru.owner-escalation').length;
+    const start = count();
+    const body = { title: 'Retry call', detail: 'Approve merge', idempotencyKey: 'esc-1' };
+    const first = await postJson(port, path, 'board-test-token', body);
+    const retry = await postJson(port, path, 'board-test-token', body);
+    expect(first.status).toBe(201);
+    expect(retry.status).toBe(200);
+    expect((retry.body as { id: string }).id).toBe((first.body as { id: string }).id);
+    expect(count()).toBe(start + 1);
+    // Same key, changed request: refused, the recorded one is never overwritten.
+    const changed = await postJson(port, path, 'board-test-token', { ...body, detail: 'Different decision' });
+    expect(changed.status).toBe(409);
+    expect(count()).toBe(start + 1);
+    // A different key is a genuinely new decision, even with identical text.
+    const other = await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'esc-2' });
+    expect(other.status).toBe(201);
+    expect((other.body as { id: string }).id).not.toBe((first.body as { id: string }).id);
+    // No key: every valid request is its own row (unchanged behavior).
+    const a = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same' });
+    const b = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same' });
+    expect([a.status, b.status]).toEqual([201, 201]);
+    expect((a.body as { id: string }).id).not.toBe((b.body as { id: string }).id);
+    expect(count()).toBe(start + 4);
+    // Malformed keys fail loud.
+    for (const key of ['', 'has space', 'x'.repeat(129), 7]) {
+      expect((await postJson(port, path, 'board-test-token', { title: 't', detail: 'd', idempotencyKey: key })).status).toBe(400);
+    }
+    expect(count()).toBe(start + 4);
+  });
+
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {
     expect((await getJson(harness.port, '/api/decisions/status', null)).status).toBe(401);
     expect((await postJson(harness.port, '/api/decisions/recheck', null, {})).status).toBe(401);
