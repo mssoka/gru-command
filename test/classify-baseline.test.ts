@@ -81,6 +81,24 @@ describe('baseline classifier — vitest (unit) branch', () => {
     expect(result.out).toMatch(/every test failed by AssertionError/u);
   });
 
+  it('exits 3 for every failed suite with no assertions, regardless of error wording', () => {
+    for (const message of [
+      'ReferenceError: fixture helper failed during module initialization',
+      'Failed to resolve import "../lib/mailbox-fixture.test-support.js"',
+    ]) {
+      const result = classifyBaseline(
+        vitestReport([
+          ...instrument,
+          { name: 'board.test.ts', status: 'failed', message, assertionResults: [] },
+        ]),
+        { requireFile: 'slim-strip.baseline.test.ts' },
+      );
+      expect(result.code).toBe(3);
+      expect(result.err).toMatch(/failed suite\(s\) have no assertions/u);
+      expect(result.err).toContain('board.test.ts');
+    }
+  });
+
   it('reports non-assertion overlay failures separately and never claims them as behavioral', () => {
     const result = classifyBaseline(
       vitestReport([

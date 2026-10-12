@@ -2,7 +2,7 @@
 title: 'Dashboard slim strip — current-main continuation (approved Sample2 port)'
 type: 'feature'
 created: '2026-10-07'
-status: 'in-review'
+status: 'in-progress'
 route: 'dispatch'
 baseline_commit: '49b558f243c7bacbfb46c7bc04f749bf131cefea'
 review_loop_iteration: 10
@@ -80,6 +80,7 @@ Port map (source `4de42d9` → destination current main `49b558f`):
 - [x] `web/e2e/dashboard-strip.spec.ts` — port the synthetic suite; extend silas fixtures to main's protocol; add CHILDREN present/absent and deferred-wakes cases; keep 1440/1200/768/360 × light/dark captures.
 - [x] `web/e2e/smoke.spec.ts`, `web/playwright.config.ts` — selector migration + mock testMatch union.
 - [x] `.gru-command/worktree.toml`, `.gitignore` — union scopes (`strip-browser`, `dashboard-slim-strip-unit` (board.test.ts, board-rail.test.ts, owner-band.test.ts, slim-strip.baseline.test.ts), `dashboard-slim-strip-baseline` base-pinned, `strip-browser-baseline` base-pinned) + `web/e2e-artifacts/`.
+- [ ] Perkins r6 baseline follow-through — overlay the test-only helper required by integrated `board.test.ts`, and classify every failed zero-assertion suite as setup/collection failure.
 - [ ] Commit, then built-in independent whole-change review via `POST /api/dispatch` (`deliverable: review`) on the exact head; fix findings; re-verify.
 
 **Acceptance Criteria:**
@@ -488,3 +489,9 @@ Three fresh tracked reviewers inspected the frozen `49b558f243c7bacbfb46c7bc04f7
 | R13-V1 — signal-less GET can turn a received HTTP 401 into status-0 timeout | defer / integrated-main follow-up | The GET refusal path is existing `BoardClient` behavior from integrated main; the SLIM branch's prior fix addressed the POST race only. This is not required to render the strip and is recorded as a separate `deferred-work.md` follow-up. |
 
 The full review texts are `review-reports/step04-r13-blind-hunter.txt`, `review-reports/step04-r13-edge-case-hunter.txt`, and `review-reports/step04-r13-verification-gap.txt`; hashes and transcript counts are in `review-reports/STEP04-R13-INDEX.json`. Root-cause group G1 is the timezone-less `Date.parse` local-time path; patch the validator and regression test. Other reports are carried or explicitly deferred as above. No `intent_gap` or `bad_spec` remains; no Step 3 loopback is triggered.
+
+### Native Perkins r6 follow-through at `bf18b63a`
+
+The native r6 report required a correction to the historical unit-baseline overlay and separately warned that failed suites with zero assertions can be misclassified when their error text is not recognized. The pre-fix scheduled run `3673c3de-46f3-4d65-b58e-177fcfc3527d` at `bf18b63a48f5f5f2dff32c69ec0d586085bbef51` is preserved: its Vitest report shows `board.test.ts` failed collection with zero assertions (`Failed to resolve import "../lib/mailbox-fixture.test-support.js"`), while the classifier incorrectly emitted `BASELINE RED CLASSIFIED`. Treat that run as invalid baseline evidence; do not relabel, delete, or replay it.
+
+This follow-through overlays the test-only mailbox fixture helper with the integrated tests and makes any failed zero-assertion Vitest suite a code-3 setup/collection failure independent of its message. Regression coverage includes both an unrecognized `ReferenceError` and the recorded Vite import-resolution wording. The head-side board suite and accepted feature-absence instrument remain present and unchanged. The GET-401 follow-up and wake/deferred numeric-width coverage remain carried under R13-V1 and R13-B4; no new product gate is added.

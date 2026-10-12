@@ -7,9 +7,9 @@
 //   2  — FAILS-BEFORE CLAIM BROKEN: the baseline passed unexpectedly, or
 //        the named instrument file did not fail.
 //   3  — BASELINE SETUP/COLLECTION FAILURE: unreadable report, zero tests
-//        collected, module load errors, unidentified failure causes. This
-//        is NEVER behavioral evidence and must never be read as a
-//        feature-absence RED.
+//        collected, module load errors, failed suites with no assertions, or
+//        unidentified failure causes. This is NEVER behavioral evidence and
+//        must never be read as a feature-absence RED.
 //
 // The producer's own exit code is never swallowed or rewritten: the scope
 // runs the producer first, keeps its real exit, then classifies.
@@ -155,6 +155,18 @@ function classifyVitest(report, requireFile, requireFileSubstrs = []) {
       code: 3,
       out: '',
       err: `BASELINE SETUP/COLLECTION FAILURE: module load errors in ${loadErrors.length} suite(s) — not behavioral evidence\n${loadErrors.map((n) => `  load error: ${n}`).join('\n')}`,
+    };
+  }
+  const unassertedFailures = suites.filter(
+    (suite) => suite.status === 'failed' && (Array.isArray(suite.assertionResults) ? suite.assertionResults : []).length === 0,
+  );
+  if (unassertedFailures.length > 0) {
+    return {
+      code: 3,
+      out: '',
+      err:
+        `BASELINE SETUP/COLLECTION FAILURE: ${unassertedFailures.length} failed suite(s) have no assertions — not behavioral evidence\n` +
+        unassertedFailures.map((suite) => `  no assertions: ${suite.name ?? 'unknown suite'}`).join('\n'),
     };
   }
   if (failed === 0) {
