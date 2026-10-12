@@ -5,7 +5,8 @@ import { join } from 'node:path';
 /**
  * Installer-candidate discovery only: scan the configured workspace root
  * for depth-1 entries carrying a `.git` (directory OR worktree-pointer
- * file). Dot-directories are skipped; symlinked repo directories count
+ * file). Dot-prefixed repository candidates are returned so setup can show
+ * the name-policy reason that excludes them; symlinked repo directories count
  * (statSync follows the link) so callers can explain/exclude them as
  * appropriate. Runtime management comes only from config.managedRepos.
  *
@@ -20,7 +21,6 @@ export function discoverManagedRepos(workspaceRoot: string): string[] {
   }
   return entries
     .filter((entry) => {
-      if (entry.name.startsWith('.')) return false;
       if (entry.isDirectory()) return true;
       if (!entry.isSymbolicLink()) return false;
       try {
@@ -48,7 +48,6 @@ export async function discoverManagedReposAsync(workspaceRoot: string): Promise<
   }
   const names: string[] = [];
   for (const entry of entries) {
-    if (entry.name.startsWith('.')) continue;
     if (entry.isSymbolicLink()) {
       try {
         if (!(await stat(join(workspaceRoot, entry.name))).isDirectory()) continue;

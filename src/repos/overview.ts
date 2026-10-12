@@ -833,13 +833,13 @@ export class ManagedRepoOverviewTracker {
         link: state.ref !== null ? githubRepoLink(state.ref) : null,
         linkReason: state.ref !== null ? null : state.linkReason,
         fullName: state.ref !== null ? repoFullName(state.ref) : null,
-        openPrs: state.counts?.openPrs ?? null,
-        openIssues: state.counts?.openIssues ?? null,
-        run: state.run,
+        openPrs: linked ? state.counts?.openPrs ?? null : null,
+        openIssues: linked ? state.counts?.openIssues ?? null : null,
+        run: linked ? state.run : null,
         freshness,
-        checkedAt: state.checkedAt,
-        lastAttemptAt: state.lastAttemptAt,
-        error: state.error,
+        checkedAt: linked ? state.checkedAt : null,
+        lastAttemptAt: linked ? state.lastAttemptAt : null,
+        error: linked ? state.error : null,
       } satisfies RepoOverviewRowView;
     });
     return { rows };
