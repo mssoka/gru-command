@@ -103,6 +103,27 @@ interface RecordedCall {
   readonly redirect?: string;
 }
 
+async function assertFormalAppReview<T>(
+  tag: string,
+  publication: Promise<T>,
+  calls: readonly RecordedCall[],
+  expectedRequest: { readonly body: string; readonly event: 'APPROVE' | 'REQUEST_CHANGES'; readonly commit_id: string },
+  expectedReceipt: T,
+): Promise<void> {
+  const outcome = await publication.then(
+    (receipt) => ({ kind: 'receipt' as const, receipt }),
+    (error: unknown) => ({ kind: 'error' as const, error }),
+  );
+  const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'));
+  if (post === undefined) {
+    if (outcome.kind === 'error') throw outcome.error;
+    throw new Error('formal GitHub review POST was not recorded');
+  }
+  await assertFormalEventAssertion(tag, () => expect(JSON.parse(post.body!)).toEqual(expectedRequest));
+  if (outcome.kind === 'error') throw outcome.error;
+  await assertFormalEventAssertion(tag, () => expect(outcome.receipt).toEqual(expectedReceipt));
+}
+
 type RouteHandler = (call: RecordedCall) => Promise<{ status: number; body?: unknown; rawText?: string; headers?: Headers | Record<string, string>; stream?: ReadableStream<Uint8Array> }>;
 
 interface Route {
@@ -3406,6 +3427,14 @@ describe('formal GitHub verdict publication', () => {
     const namedOnly = Object.assign(new Error('not a Vitest matcher failure'), { name: 'AssertionError' });
     await expect(assertFormalEventAssertion('app-marker-regression', () => { throw namedOnly; }))
       .rejects.toBe(namedOnly);
+    const preparationFailure = new PerkinsAppError('fixture preparation failed');
+    await expect(assertFormalAppReview(
+      'app-marker-regression',
+      Promise.reject(preparationFailure),
+      [],
+      { body: 'review body\n', event: 'APPROVE', commit_id: HEAD },
+      { ...RECEIPT, event: 'APPROVED' },
+    )).rejects.toBe(preparationFailure);
     await expect(assertFormalEventAssertion('app-marker-regression', () => expect(true).toBe(false)))
       .rejects.toThrow(/FORMAL_EVENT_ASSERTION:app-marker-regression/u);
   });
@@ -3427,15 +3456,13 @@ describe('formal GitHub verdict publication', () => {
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('APPROVED') }) },
     ]);
-    const outcome = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' }).then(
-      (receipt) => ({ kind: 'receipt' as const, receipt }),
-      (error: unknown) => ({ kind: 'error' as const, error }),
+    await assertFormalAppReview(
+      'app-approve-receipt',
+      poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' }),
+      calls,
+      { body: 'review body\n', event: 'APPROVE', commit_id: HEAD },
+      { ...RECEIPT, event: 'APPROVED' },
     );
-    const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
-    await assertFormalEventAssertion('app-approve-receipt', () =>
-      expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'APPROVE', commit_id: HEAD }));
-    if (outcome.kind === 'error') throw outcome.error;
-    await assertFormalEventAssertion('app-approve-receipt', () => expect(outcome.receipt).toEqual({ ...RECEIPT, event: 'APPROVED' }));
   });
 
   it('delivers a formal REQUEST_CHANGES bound to the frozen head and proves the CHANGES_REQUESTED state (formal GitHub)', async () => {
@@ -3443,15 +3470,13 @@ describe('formal GitHub verdict publication', () => {
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('CHANGES_REQUESTED') }) },
     ]);
-    const outcome = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' }).then(
-      (receipt) => ({ kind: 'receipt' as const, receipt }),
-      (error: unknown) => ({ kind: 'error' as const, error }),
+    await assertFormalAppReview(
+      'app-request-changes-receipt',
+      poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' }),
+      calls,
+      { body: 'review body\n', event: 'REQUEST_CHANGES', commit_id: HEAD },
+      { ...RECEIPT, event: 'CHANGES_REQUESTED' },
     );
-    const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
-    await assertFormalEventAssertion('app-request-changes-receipt', () =>
-      expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'REQUEST_CHANGES', commit_id: HEAD }));
-    if (outcome.kind === 'error') throw outcome.error;
-    await assertFormalEventAssertion('app-request-changes-receipt', () => expect(outcome.receipt).toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' }));
   });
 
   it('never credits a COMMENTED review beside an approval intent and never re-posts (formal GitHub)', async () => {
