@@ -105,6 +105,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     workload: 'whole-review engine over real worktrees and git',
   },
   { file: 'rehearsal.test.ts', workload: 'package/build/install rehearsal with real npm' },
+  { file: 'review-git-environment.test.ts', workload: 'real review admission, Git remotes, worktree lifecycle and environment isolation' },
   { file: 'service-port-guard.test.ts', workload: 'real service spawns and port behavior' },
   { file: 'shutdown.test.ts', workload: 'real service signal lifecycle' },
   {

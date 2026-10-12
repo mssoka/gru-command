@@ -5,6 +5,9 @@ command = "npm ci"
 [verify]
 full = "npm test"
 typecheck = "npm run typecheck"
+# GH-270: repository-routing regressions, through the authenticated scheduler.
+review-git-environment-red = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-git-environment.test.ts"
+review-git-environment = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/review-git-environment.test.ts test/perkins-freeze-freshhead.test.ts test/branch-idle-guard.test.ts test/worktree-manager.test.ts test/perkins-builtin-wave.test.ts && npx vitest run test/suite-shape.test.ts test/test-budgets.test.ts"
 # GH-313 report custody: focused and fail-before scopes use the authenticated scheduler.
 report-handback = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/report-handback-mailbox.test.ts test/gru-mailbox.test.ts test/awareness.test.ts test/durable-reconcile.test.ts test/incident.test.ts test/ledger-obligations.test.ts test/suite-shape.test.ts test/test-budgets.test.ts"
 report-handback-red = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/report-handback-mailbox.test.ts"
