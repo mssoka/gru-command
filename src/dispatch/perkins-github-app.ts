@@ -1330,14 +1330,19 @@ export class PerkinsAppPrPoster implements VerdictPoster {
         // Never report "searched and not found" when no usable list was read.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
-      if (list.some((entry) => !isDecidableReviewEntry(entry, notBeforeMs !== null))) {
-        // A null, primitive, array-valued or otherwise undecidable entry is
-        // a broken list, not absence: a lookup we cannot trust must never
-        // become a certificate.
+      // Positive evidence first: a predicate-complete, receiptable review is
+      // credited even when an unrelated sibling entry is malformed — the
+      // match proves delivery on its own. Only plain records are searched;
+      // the predicates re-check every field they read.
+      const records = list.filter((entry): entry is ProviderReview => entry !== null && typeof entry === 'object' && !Array.isArray(entry));
+      const match = records.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
+      if (match === undefined && list.some((entry) => !isDecidableReviewEntry(entry, notBeforeMs !== null))) {
+        // No provable match, and a null, primitive, array-valued or
+        // otherwise undecidable entry is a broken list, not absence: a
+        // lookup we cannot trust must never become a certificate.
         throw new PerkinsAppError('review reconciliation lookup returned a malformed list body — delivery stays unresolved; never assume absence');
       }
-      const reviews = list as readonly ProviderReview[];
-      const match = reviews.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, notBeforeMs));
+      const reviews = records;
       if (match !== undefined) {
         return { matched: match, provablyAbsent: false, matchedButUnreceiptable: false };
       }

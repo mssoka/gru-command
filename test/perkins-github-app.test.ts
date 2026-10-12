@@ -1407,7 +1407,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
     const fixture = bundleFixture();
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
-      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW, null] }) },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [null] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/malformed list body/u);
@@ -1527,6 +1527,37 @@ describe('bounded ambiguous-POST reconciliation', () => {
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/did not land/u);
     await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toBeNull();
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('credits a predicate-complete match even when a sibling entry is malformed, at either position, without a second POST (#184)', async () => {
+    const siblings: ReadonlyArray<unknown> = [null, 42, [], {}, { ...MATCHING_REVIEW, id: 'bad id', user: { login: [], type: 'Bot' } }];
+    for (const sibling of siblings) {
+      for (const body of [[MATCHING_REVIEW, sibling], [sibling, MATCHING_REVIEW]]) {
+        const fixture = bundleFixture();
+        const { poster, calls } = posterWith(fixture, [
+          { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+          { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body }) },
+        ]);
+        await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+        await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+        expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+      }
+    }
+  });
+
+  it('keeps a malformed-only short page unresolved when no entry matches — never absence, no second POST (#184)', async () => {
+    for (const body of [[null], [{}], [{ ...MATCHING_REVIEW, user: { login: 'other-user', type: 'User' } }, null]]) {
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '').not.toMatch(/did not land/u);
+      await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/malformed list body/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
   });
 
   it('never credits an older round\u2019s identical bytes: stale submitted_at is not a match', async () => {
