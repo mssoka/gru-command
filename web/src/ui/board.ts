@@ -298,16 +298,9 @@ export class BoardView {
     this.notificationBell.addEventListener('click', () => {
       this.notificationPanel.hidden = !this.notificationPanel.hidden;
       this.notificationBell.dataset.open = String(!this.notificationPanel.hidden);
-      if (!this.notificationPanel.hidden && this.snapshotIsCurrent) {
-        // Opening the panel proves display of every current row: mark
-        // seen (badge) AND send one receipt per surface (shown:true).
-        for (const notification of this.snapshot?.notifications ?? []) {
-          if (notification.routing === 'needs-owner') {
-            this.seenOwnerIds.add(notification.id);
-          }
-          this.sendShown(notification, 'web-panel');
-        }
-        this.updateBadge(this.snapshot?.notifications ?? []);
+      if (!this.notificationPanel.hidden) {
+        // Opening the panel proves display only against a current snapshot.
+        this.markNotificationPanelShown(this.snapshot?.notifications ?? []);
       }
     });
   }
@@ -324,6 +317,7 @@ export class BoardView {
   bindClient(client: BoardClient): void {
     this.boardClient = client;
     this.clientGeneration += 1;
+    for (const state of this.proposalStates.values()) this.invalidateProposalState(state);
     this.proposalStates.clear();
     this.decisionSubmissions.clear();
     this.decisionOverrides.clear();
@@ -353,7 +347,27 @@ export class BoardView {
     if (!this.snapshotIsCurrent) return;
     this.snapshotIsCurrent = false;
     this.snapshotFreshnessGeneration += 1;
+    for (const state of this.proposalStates.values()) {
+      // A submitted decision stays locked; a review GET or an action still
+      // waiting on that GET must be retired so reconnect can fetch fresh text.
+      if (!state.decisionSubmitting) this.invalidateProposalState(state);
+    }
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
+  }
+
+  private invalidateProposalState(state: ProposalRowState): void {
+    state.loadGeneration += 1;
+    state.actionGeneration += 1;
+    state.loadController?.abort();
+    state.loadController = null;
+    state.loading = null;
+    state.review = null;
+    state.inFlight = null;
+    state.decisionSubmitting = false;
+    state.loadFailed = false;
+    if (state.recorded === null) state.message = null;
+    state.open = false;
+    state.nested.clear();
   }
 
   private renderSnapshot(snapshot: BoardSnapshot, source: BoardSnapshotSource | 'local' = 'local'): void {
@@ -379,7 +393,12 @@ export class BoardView {
     const pendingProposals = new Set(
       ownerRows(effective).filter((row) => row.kind === 'proposal').map((row) => row.notification.id),
     );
-    for (const id of this.proposalStates.keys()) if (!pendingProposals.has(id)) this.proposalStates.delete(id);
+    for (const [id, state] of this.proposalStates) {
+      if (!pendingProposals.has(id)) {
+        this.invalidateProposalState(state);
+        this.proposalStates.delete(id);
+      }
+    }
     // Focus preservation across live pushes: the control the operator was
     // on keeps its place (stable focus keys), so a snapshot update never
     // steals focus or resets a disclosure mid-interaction.
@@ -664,7 +683,20 @@ export class BoardView {
     const item = row.notification;
     let state = this.proposalStates.get(item.id);
     if (state === undefined) {
-      state = { open: false, review: null, loading: null, inFlight: null, recorded: null, message: null, loadFailed: false, nested: new Set() };
+      state = {
+        open: false,
+        review: null,
+        loading: null,
+        loadController: null,
+        loadGeneration: 0,
+        actionGeneration: 0,
+        inFlight: null,
+        decisionSubmitting: false,
+        recorded: null,
+        message: null,
+        loadFailed: false,
+        nested: new Set(),
+      };
       this.proposalStates.set(item.id, state);
     }
     const current = state;
@@ -698,11 +730,14 @@ export class BoardView {
       if (current.loading !== null) return current.loading;
       const client = this.boardClient;
       const freshnessGeneration = this.snapshotFreshnessGeneration;
+      const loadGeneration = ++current.loadGeneration;
+      const controller = new AbortController();
+      current.loadController = controller;
       const pending: Promise<LessonProposalView> =
         client === null
           ? Promise.reject(new Error('board is not connected'))
-          : client.getLessonProposal().then((proposal) => {
-            if (freshnessGeneration !== this.snapshotFreshnessGeneration) {
+          : client.getLessonProposal(controller.signal).then((proposal) => {
+            if (freshnessGeneration !== this.snapshotFreshnessGeneration || loadGeneration !== current.loadGeneration) {
               throw new Error('the board went stale while the proposal was loading; wait for a fresh review');
             }
             if (proposal.notificationId !== item.id) {
@@ -713,8 +748,12 @@ export class BoardView {
       current.loading = pending.then(
         (proposal) => {
           if (!live()) throw new Error('re-paired');
+          if (freshnessGeneration !== this.snapshotFreshnessGeneration || loadGeneration !== current.loadGeneration) {
+            throw new Error('the board went stale while the proposal was loading; wait for a fresh review');
+          }
           current.review = proposal;
           current.loading = null;
+          current.loadController = null;
           if (current.loadFailed) {
             // A retry that worked: the earlier failure no longer applies.
             current.loadFailed = false;
@@ -731,8 +770,11 @@ export class BoardView {
           return proposal;
         },
         (error: unknown) => {
-          if (!live()) throw error;
+          if (!live() || freshnessGeneration !== this.snapshotFreshnessGeneration || loadGeneration !== current.loadGeneration) {
+            throw error;
+          }
           current.loading = null; // a later open/decision retries the fetch
+          current.loadController = null;
           current.loadFailed = true;
           if (error instanceof BoardApiError && error.status === 404) {
             // Decided elsewhere before this page loaded it: an unknown
@@ -784,28 +826,34 @@ export class BoardView {
       const client = this.boardClient;
       if (client === null) return;
       const freshnessGeneration = this.snapshotFreshnessGeneration;
+      const actionGeneration = ++current.actionGeneration;
+      const currentAction = (): boolean => live() && actionGeneration === current.actionGeneration;
       current.inFlight = decision;
+      current.decisionSubmitting = false;
       current.message = null;
       this.rerenderOwner();
       void load()
         .then((proposal) => {
-          if (!live()) throw new Error('re-paired');
+          if (!currentAction()) return null;
           if (!this.snapshotIsCurrent || freshnessGeneration !== this.snapshotFreshnessGeneration) {
             current.message = 'The board is catching up; your choice was not sent. Wait for a fresh snapshot and review it again.';
             return null;
           }
           if (current.recorded !== null && current.recorded !== decision) return null; // never flip a recorded decision
+          current.decisionSubmitting = true;
           return client.decideLessonProposal(proposal.id, decision);
         })
         .then((result) => {
-          if (!live()) return;
+          if (!currentAction()) return;
           if (result === null) {
             current.inFlight = null;
+            current.decisionSubmitting = false;
             this.rerenderOwner();
             return;
           }
           if (result.incomplete === true) {
             current.inFlight = null;
+            current.decisionSubmitting = false;
             current.recorded = decision;
             current.message =
               `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded, but finishing it hit a problem` +
@@ -819,11 +867,13 @@ export class BoardView {
           client.wake();
         })
         .catch((error: unknown) => {
-          if (!live()) return;
+          if (!currentAction()) return;
           current.inFlight = null;
-          // Decided elsewhere: drop the cached review so the next load
-          // brings the recorded decision (and its lock) with it.
-          if (error instanceof BoardApiError && error.code === 'proposal_decided') current.review = null;
+          current.decisionSubmitting = false;
+          // A changed or decided proposal must be loaded again before any
+          // retry can rely on its previously displayed text.
+          if (error instanceof BoardApiError &&
+            ['proposal_stale', 'proposal_decided', 'proposal_mismatch'].includes(error.code ?? '')) current.review = null;
           // Gone, or an outcome nobody confirmed: maybe decided here (a
           // lost reply) or on another device — refresh, so the snapshot
           // shows what actually happened. A recorded intent is kept.
@@ -2197,6 +2247,18 @@ export class BoardView {
       }
     }
     if (listFocusKey !== null) this.restoreListFocus(list, listFocusKey);
+    this.markNotificationPanelShown(notifications);
+  }
+
+  private markNotificationPanelShown(notifications: readonly NotificationView[]): void {
+    if (this.notificationPanel.hidden || this.notificationPanel.closest('[hidden]') !== null || !this.snapshotIsCurrent) return;
+    // An open panel can start displaying new current rows after a reconnect;
+    // receipt that render just as we do an explicit open.
+    for (const notification of notifications) {
+      if (notification.routing === 'needs-owner') this.seenOwnerIds.add(notification.id);
+      this.sendShown(notification, 'web-panel');
+    }
+    this.updateBadge(notifications);
   }
 
   private restoreListFocus(list: HTMLElement, key: string): void {
@@ -2858,7 +2920,11 @@ interface ProposalRowState {
   open: boolean;
   review: LessonProposalView | null;
   loading: Promise<LessonProposalView> | null;
+  loadController: AbortController | null;
+  loadGeneration: number;
+  actionGeneration: number;
   inFlight: 'accept' | 'reject' | null;
+  decisionSubmitting: boolean;
   /** A decision the server recorded but has not finished (202). */
   recorded: 'accept' | 'reject' | null;
   message: string | null;

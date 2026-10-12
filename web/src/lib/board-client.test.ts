@@ -987,6 +987,56 @@ describe('board client', () => {
     }
   });
 
+  it('a lesson proposal review fetch honors cancellation from a stale owner row', async () => {
+    const controller = new AbortController();
+    const requestSignals: AbortSignal[] = [];
+    const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal === undefined || signal === null) throw new Error('review request did not carry its abort signal');
+        requestSignals.push(signal);
+        signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      }),
+    ) as unknown as typeof fetch;
+    const client = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl },
+      { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+    );
+    const pending = client.getLessonProposal(controller.signal);
+    expect(requestSignals[0]?.aborted).toBe(false);
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    expect(requestSignals[0]?.aborted).toBe(true);
+    client.stop();
+  });
+
+  it('a hung lesson proposal review is abandoned at the bounded request deadline', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const requestSignals: AbortSignal[] = [];
+      const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal === undefined || signal === null) throw new Error('review request did not carry its deadline signal');
+          requestSignals.push(signal);
+          signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+        }),
+      ) as unknown as typeof fetch;
+      const client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      const pending = client.getLessonProposal();
+      const timedOut = expect(pending).rejects.toThrow('lesson proposal review timed out after 15 seconds');
+      await vi.advanceTimersByTimeAsync(15_000);
+      await timedOut;
+      expect(requestSignals[0]?.aborted).toBe(true);
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a malformed review is refused before anything renders it — a valid one passes', async () => {
     const review = (removed: unknown) => ({
       id: 'prop-1',

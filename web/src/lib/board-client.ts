@@ -69,8 +69,8 @@ export interface BoardClientOptions {
 const BACKOFF_MS = [800, 1_600, 3_200, 6_400, 12_000] as const;
 const DEFAULT_LIVENESS_WINDOW_MS = 75_000;
 const DEFAULT_LIVENESS_CHECK_MS = 5_000;
-/** R7-05: a snapshot request (fetch AND body) that outlives this is abandoned. */
-const SNAPSHOT_DEADLINE_MS = 15_000;
+/** R7-05: board snapshots and owner-review GETs are bounded across fetch and body reads. */
+const HTTP_REQUEST_DEADLINE_MS = 15_000;
 /** R7-04: trailing refetches run back to back this many times in a chain... */
 const TRAILING_BURST = 2;
 /** ...then wait, capped — owed demand is kept, never dropped. */
@@ -394,7 +394,7 @@ export class BoardClient {
     const expired = new Promise<never>((_, reject) => {
       request.signal.addEventListener('abort', () => reject(new Error('board snapshot request abandoned')), { once: true });
     });
-    const timer = setTimeout(() => request.abort(), SNAPSHOT_DEADLINE_MS);
+    const timer = setTimeout(() => request.abort(), HTTP_REQUEST_DEADLINE_MS);
     try {
       return await Promise.race([this.api<unknown>('/api/board', request.signal), expired]);
     } finally {
@@ -485,10 +485,29 @@ export class BoardClient {
   }
 
   /** The pending Book of Lessons proposal, for the owner's review. */
-  async getLessonProposal(): Promise<LessonProposalView> {
-    const proposal = await this.api<unknown>('/api/lessons/proposal');
-    if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
-    return proposal;
+  async getLessonProposal(signal?: AbortSignal): Promise<LessonProposalView> {
+    const request = new AbortController();
+    const abortFromCaller = (): void => request.abort();
+    if (signal?.aborted) request.abort();
+    else signal?.addEventListener('abort', abortFromCaller, { once: true });
+    let deadlineExpired = false;
+    const deadline = setTimeout(() => {
+      deadlineExpired = true;
+      request.abort();
+    }, HTTP_REQUEST_DEADLINE_MS);
+    try {
+      const proposal = await this.api<unknown>('/api/lessons/proposal', request.signal);
+      if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
+      return proposal;
+    } catch (error) {
+      if (deadlineExpired) {
+        throw new Error(`lesson proposal review timed out after ${HTTP_REQUEST_DEADLINE_MS / 1000} seconds`, { cause: error });
+      }
+      throw error;
+    } finally {
+      clearTimeout(deadline);
+      signal?.removeEventListener('abort', abortFromCaller);
+    }
   }
 
   /** The owner's decision on a lesson proposal — the ONLY way it closes

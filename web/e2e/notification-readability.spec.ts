@@ -1596,12 +1596,13 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       expect(decisionPosts).toBe(0);
       expect(acknowledgementPosts).toBe(0);
       expect(refreshRequests).toBeGreaterThan(0);
-      expect(panelShownPosts).toEqual([]); // the stale opening did not consume this surface's receipt
-      await page.locator('#notification-bell').click(); // close, then reopen with a current snapshot
+      await expect.poll(() => panelShownPosts.length).toBeGreaterThan(0); // the open panel renders the fresh snapshot
+      const freshPanelReceipts = panelShownPosts.length;
+      await page.locator('#notification-bell').click();
       await expect(page.locator('#notification-panel')).toBeHidden();
       await page.locator('#notification-bell').click();
       await expect(page.locator('#notification-panel')).toBeVisible();
-      await expect.poll(() => panelShownPosts.length).toBeGreaterThan(0);
+      expect(panelShownPosts).toHaveLength(freshPanelReceipts); // reopening does not duplicate the idempotent surface receipt
       expect(seed.pageErrors).toEqual([]);
     } finally {
       for (const release of releases) release?.();

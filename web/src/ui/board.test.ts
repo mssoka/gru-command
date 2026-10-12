@@ -192,7 +192,7 @@ function mountBoardDom(): void {
     <section id="board-repos" data-rail-panel="agents"></section>
     <span id="rail-agents-count">0</span>
     <button id="notification-bell"><span id="notification-badge">0</span></button>
-    <div id="notification-panel"><div id="notification-list"></div></div>
+    <div id="notification-panel" hidden><div id="notification-list"></div></div>
   `;
 }
 
@@ -3456,10 +3456,34 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(newClient.markNotificationShown).toHaveBeenCalled();
   });
 
-  it('a same-client disconnect invalidates a pending proposal fetch even after the reconnect snapshot arrives', async () => {
+  it('a submitted proposal decision remains locked across a same-client disconnect', async () => {
+    let release!: (result: unknown) => void;
+    const client = proposalClient(() => new Promise((resolve) => { release = resolve; }));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+
+    view.markSnapshotStale();
+    view.render(snapshot({ notifications: [proposalNotice] }), 'http');
+    const accept = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.textContent, accept.disabled]).toEqual(['accepting…', true]);
+
+    release({ id: 'prop-1', decision: 'accepted' });
+    await flush();
+    expect(client.wake).toHaveBeenCalled();
+    expect(document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(true);
+  });
+
+  it('a same-client reconnect retires a hung proposal fetch and allows a fresh review decision', async () => {
     let release!: (review: ReturnType<typeof proposalReview>) => void;
+    let staleSignal: AbortSignal | undefined;
     const client = proposalClient();
-    client.getLessonProposal.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    client.getLessonProposal.mockImplementationOnce((signal?: AbortSignal) => {
+      staleSignal = signal;
+      return new Promise((resolve) => { release = resolve; });
+    });
     const view = new BoardView(() => {}, client);
     view.render(snapshot({ notifications: [proposalNotice] }));
     document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
@@ -3467,18 +3491,23 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
 
     view.markSnapshotStale();
+    expect(staleSignal?.aborted).toBe(true);
     expect(document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(true);
-    // A later snapshot restores controls, but cannot bless the proposal GET
-    // that was already in flight when the same client disconnected.
+    // The fresh snapshot restores controls and a new review request even
+    // though the abandoned GET is still unresolved.
     view.render(snapshot({ notifications: [proposalNotice] }), 'http');
-    release(proposalReview());
-    await flush();
-    expect(client.decideLessonProposal).not.toHaveBeenCalled();
-
-    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    const accept = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect(accept.disabled).toBe(false);
+    accept.click();
     await flush();
     expect(client.getLessonProposal).toHaveBeenCalledTimes(2);
     expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+
+    // A late completion from before disconnect cannot replace the fresh review
+    // or send a duplicate decision.
+    release(proposalReview());
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
   });
 
   it('the phone layout keeps the proposal review inside the single column', async () => {
@@ -3739,6 +3768,15 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.markNotificationShown).toHaveBeenCalledTimes(1);
     expect(client.markNotificationShown).toHaveBeenCalledWith('show-me', 'web-board');
 
+    // Re-pair renders retained content while stale, but only a fresh snapshot
+    // may prove that the replacement client displayed the notification.
+    const replacement = stubClient();
+    view.bindClient(replacement);
+    expect(replacement.markNotificationShown).not.toHaveBeenCalled();
+    view.render(snapshot({ notifications: [stop] }));
+    expect(replacement.markNotificationShown).toHaveBeenCalledTimes(1);
+    expect(replacement.markNotificationShown).toHaveBeenCalledWith('show-me', 'web-board');
+
     // Hidden ancestor (pre-pairing board) → nothing was displayed.
     const client2 = stubClient();
     document.body.innerHTML = `<div hidden><section id="board-owner"></section></div>
@@ -3746,10 +3784,28 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       <div id="board-jobs"></div><div id="board-agents"></div><section id="board-repos" data-rail-panel="agents"></section><span id="rail-agents-count">0</span>
       <nav id="board-nav" hidden></nav>
       <button id="notification-bell"><span id="notification-badge">0</span></button>
-      <div id="notification-panel"><div id="notification-list"></div></div>`;
+      <div id="notification-panel" hidden><div id="notification-list"></div></div>`;
     const view2 = new BoardView(() => {}, client2);
     view2.render(snapshot({ notifications: [stop] }));
     expect(client2.markNotificationShown).not.toHaveBeenCalled();
+  });
+
+  it('an open stale panel records receipts when a fresh snapshot updates what it displays', () => {
+    const client = stubClient();
+    const stop = notification('panel-show-me', { routing: 'needs-owner' });
+    const view = new BoardView(() => {}, client);
+    document.getElementById('notification-panel')!.hidden = true;
+    view.render(snapshot({ notifications: [stop] }));
+    view.markSnapshotStale();
+
+    // Opening the retained stale panel is not a receipt for the new client truth.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    expect(client.markNotificationShown).not.toHaveBeenCalledWith('panel-show-me', 'web-panel');
+
+    // The panel stays open; rendering the authoritative snapshot displays the
+    // current row and should record it without requiring close/reopen.
+    view.render(snapshot({ notifications: [stop] }), 'http');
+    expect(client.markNotificationShown).toHaveBeenCalledWith('panel-show-me', 'web-panel');
   });
 });
 
