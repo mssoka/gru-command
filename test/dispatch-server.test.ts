@@ -1276,21 +1276,27 @@ describe('dispatch server (E8)', () => {
       attachBareOrigin(repo);
       const jobId = 'clean-abort-receipt-only';
       const { sha, roundId } = await prepareCleanAbort(h, repo, jobId);
+      const publicationSha256 = 'c'.repeat(64);
       h.ledger.appendCustomEvent({
         kind: PUBLICATION_RECEIPT_EVENT, jobId, roundId,
         payload: {
           verdict: 'approved', canonicalVerdict: 'READY TO MERGE', url: PR_URL, host: new URL(PR_URL).host,
           targetSha: sha, baseSha: 'b'.repeat(40),
-          publicationFile: '/tmp/receipt-only/perkins-report.publication.md', publicationSha256: 'c'.repeat(64),
+          publicationFile: '/tmp/receipt-only/perkins-report.publication.md', publicationSha256,
           reviewEvent: 'APPROVE',
           receipt: {
             reviewId: '9003', actor: 'gru-bot', event: 'APPROVED', commitId: sha,
-            headSha: sha, baseSha: 'b'.repeat(40), bodySha256: 'c'.repeat(64),
+            headSha: sha, baseSha: 'b'.repeat(40), bodySha256: publicationSha256,
           },
           credited: false, reason: 'finality checks remain unresolved',
         },
       });
+      h.ledger.appendCustomEvent({
+        kind: PUBLICATION_ABSENT_EVENT, jobId, roundId,
+        payload: { targetSha: sha, publicationSha256, detail: 'contradictory later absence without an attempt' },
+      });
       expect(h.ledger.latestRoundEvent(roundId, PUBLICATION_ATTEMPT_EVENT)).toBeNull();
+      expect(h.ledger.latestRoundEvent(roundId, PUBLICATION_ABSENT_EVENT)).not.toBeNull();
       const refused = await call(h.port, 'POST', '/api/dispatch/review', {
         job_id: jobId, by: 'silas', rule_id: 'clean-abort-service-restart', source_round_id: roundId,
       }, TOKEN);

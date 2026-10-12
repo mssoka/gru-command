@@ -235,11 +235,33 @@ describe('suite shape', () => {
           .toContain("export const PUBLICATION_IDENTITY_EVENT = '%s';");
         expect(source, 'R2 baseline does not append the derived identity event')
           .toContain('"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"');
-        const historicalHelperCopy = source.indexOf('git show "$base:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"');
-        const identityEventAppend = source.indexOf('"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"');
-        expect(historicalHelperCopy, 'R2 baseline historical helper copy is missing').toBeGreaterThanOrEqual(0);
+        const baselineLines = source.split(/\r?\n/u);
+        const uniqueExecutableLine = (command: string, label: string): number => {
+          const matches = baselineLines.flatMap((line, index) => line.trim() === command ? [index] : []);
+          expect(matches, `R2 baseline ${label} command must occur exactly once as a whole line`).toHaveLength(1);
+          const line = matches[0];
+          if (line === undefined) throw new Error(`R2 baseline ${label} command is missing or ambiguous`);
+          return line;
+        };
+        const shellControlDepthAt = (lineIndex: number): number => baselineLines.slice(0, lineIndex).reduce((depth, line) => {
+          const command = line.trim();
+          if (command === '' || command.startsWith('#')) return depth;
+          if (/^(?:if|for|while|until|case)\b/u.test(command)) return depth + 1;
+          if (/^(?:fi|done|esac)\b/u.test(command)) return depth - 1;
+          return depth;
+        }, 0);
+        const historicalHelperCopy = uniqueExecutableLine(
+          'git show "$base:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"',
+          'historical helper copy',
+        );
+        const identityEventAppend = uniqueExecutableLine(
+          '"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"',
+          'identity event append',
+        );
+        expect(shellControlDepthAt(historicalHelperCopy), 'R2 baseline historical helper copy is in a shell control-flow block').toBe(0);
         expect(identityEventAppend, 'R2 baseline appends the identity event before the historical helper copy')
           .toBeGreaterThan(historicalHelperCopy);
+        expect(shellControlDepthAt(identityEventAppend), 'R2 baseline identity append is in a shell control-flow block').toBe(0);
       }
     }
     const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');

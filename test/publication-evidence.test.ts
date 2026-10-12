@@ -95,6 +95,7 @@ describe('publication re-arm guard', () => {
     ]), 'markerless-receipt-before-absence');
     expect(markerlessReceiptThenAbsence?.kind).toBe('uncredited-receipt');
     expect(markerlessReceiptThenAbsence?.detail).toContain('9001');
+    expect(markerlessReceiptThenAbsence?.detail).toContain(TARGET);
 
     const markerlessMalformedThenAbsence = pendingPublicationAttempt(ledgerWith([
       { kind: PUBLICATION_RECEIPT_EVENT, seq: 1, payload: { credited: false, reason: 'malformed' } },
