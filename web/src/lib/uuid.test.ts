@@ -85,6 +85,13 @@ describe('uuidV4', () => {
 
   it('error messages carry no invented "gru:" namespace prefix (repo idiom: message-named errors)', () => {
     vi.stubGlobal('crypto', undefined);
-    expect(() => uuidV4()).not.toThrow(/^gru:/);
+    let message: string | undefined;
+    try {
+      uuidV4();
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe('Web Crypto is unavailable in this context; cannot mint message ids');
+    expect(message?.startsWith('gru:')).toBe(false);
   });
 });
