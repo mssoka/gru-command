@@ -147,7 +147,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
-| `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail |
+| `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail, per-check status (`passed`/`failed`/`reused`/`not-run`). A `reused` build step never ran; a same-lane build already in flight is refused as `build-in-flight` |
 | `verification.requested` / `verification.attached` | admitted single-flight attempt: request id, run id, dedupe key (job+lane+scope+head+command) / a duplicate submission attached to that producer |
 | `verification.reconciled` | a completed request identity replayed its recorded outcome — no rerun |
 | `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts + request id / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age, interrupted request ids |

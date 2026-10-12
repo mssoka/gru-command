@@ -7,7 +7,7 @@ import type { Readable } from 'node:stream';
 import type { LogLevel } from '../logger.js';
 import {
   BuildRecords,
-  DEFAULT_BUILD_OUTPUTS,
+  DEFAULT_BUILD_OUTPUT_ROOTS,
   inspectReuse,
   observeBuildInputs,
   planCommand,
@@ -437,9 +437,11 @@ export interface VerificationSchedulerOptions {
   readonly now?: () => number;
   /**
    * Narrow build reuse (issue #318). Default: enabled with the default
-   * outputs; `false` runs every declared command exactly as written.
+   * output root (`dist/`); `false` runs every declared command exactly as
+   * written. There is no config-file off-switch — disabling is this
+   * code-level option only.
    */
-  readonly buildReuse?: false | { readonly outputs?: readonly string[] };
+  readonly buildReuse?: false | { readonly roots?: readonly string[] };
 }
 
 const STATE_FILE = 'scheduler.json';
@@ -663,7 +665,7 @@ export class VerificationScheduler {
   private disposed = false;
   private readonly buildRecords = new BuildRecords();
   /** Null = reuse disabled. */
-  private readonly buildReuseOutputs: readonly string[] | null;
+  private readonly buildReuseRoots: readonly string[] | null;
 
   constructor(opts: VerificationSchedulerOptions) {
     this.opts = opts;
@@ -691,8 +693,8 @@ export class VerificationScheduler {
     this.sweepIntervalMs = opts.sweepIntervalMs ?? 15_000;
     this.stateFile = join(opts.storageDir, STATE_FILE);
     this.requestLogFile = join(opts.storageDir, REQUEST_LOG_FILE);
-    this.buildReuseOutputs =
-      opts.buildReuse === false ? null : (opts.buildReuse?.outputs ?? DEFAULT_BUILD_OUTPUTS);
+    this.buildReuseRoots =
+      opts.buildReuse === false ? null : (opts.buildReuse?.roots ?? DEFAULT_BUILD_OUTPUT_ROOTS);
   }
 
   /** Total workers allowed across all concurrent runs. */
@@ -1678,7 +1680,7 @@ export class VerificationScheduler {
       scope: lease.scope,
       workers,
     });
-    const plan = this.buildReuseOutputs === null ? null : planCommand(lease.command);
+    const plan = this.buildReuseRoots === null ? null : planCommand(lease.command);
     const planned = plan !== null && plan.buildIndex !== null && plan.refusal === null;
     const steps: readonly string[] = planned ? plan.steps : [lease.command];
     const checks: VerificationCheck[] = [];
@@ -1837,9 +1839,9 @@ export class VerificationScheduler {
 
         const isBuild = planned && index === plan.buildIndex;
         let reuseRefusal: string | null = null;
-        if (isBuild && this.buildReuseOutputs !== null) {
+        if (isBuild && this.buildReuseRoots !== null) {
           const records = this.buildRecords;
-          const before = observeBuildInputs(lease.cwd, env, this.buildReuseOutputs);
+          const before = observeBuildInputs(lease.cwd, env, this.buildReuseRoots);
           reuseRefusal = records.isBuilding(lease.cwd)
             ? 'build-in-flight'
             : inspectReuse(records.get(lease.cwd), before, lease.head);
@@ -1876,11 +1878,11 @@ export class VerificationScheduler {
             }),
           );
         }
-        if (isBuild && ok && this.buildReuseOutputs !== null && !this.buildRecords.isBuilding(lease.cwd)) {
+        if (isBuild && ok && this.buildReuseRoots !== null && !this.buildRecords.isBuilding(lease.cwd)) {
           this.buildRecords.remember(
             lease.cwd,
             lease.runId,
-            observeBuildInputs(lease.cwd, env, this.buildReuseOutputs),
+            observeBuildInputs(lease.cwd, env, this.buildReuseRoots),
             lease.head,
           );
         }

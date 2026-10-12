@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -21,8 +21,16 @@ import { join } from 'node:path';
  * (`npm run build`) in a single, exact lane directory may be satisfied by
  * the immediately preceding successful execution of that same step when —
  * and only when — every input is provably identical right now (see
- * {@link inspectReuse}). Reuse only ever replaces the build step; every
+ * {@link inspectReuse}). The proof boundary is the recursive digest of the
+ * whole build output tree: every file under `dist/`, by sorted relative
+ * path and content digest. Reuse only ever replaces the build step; every
  * gate-specific check still executes and is reported separately.
+ *
+ * A donor needs only its BUILD step to have passed: the record is taken the
+ * moment `npm run build` exits 0, so a run whose later step failed still
+ * donates its build (per-step truth, intentional). Reuse is on by default
+ * with no configuration off-switch — disabling it is code-level only
+ * (`new VerificationScheduler({ buildReuse: false })`).
  */
 
 /** The one step that may be reused. */
@@ -39,11 +47,22 @@ export const BUILD_NEUTRAL_PREREQUISITES: ReadonlySet<string> = new Set([
   'npm run typecheck',
 ]);
 
-/** Files whose presence proves the build outputs exist (and are unchanged). */
-export const DEFAULT_BUILD_OUTPUTS: readonly string[] = [
-  'dist/build-rev.json',
-  'dist/runtime/review-mcp-server.mjs',
-];
+/** The build output trees whose whole-tree digest is the reuse proof. */
+export const DEFAULT_BUILD_OUTPUT_ROOTS: readonly string[] = ['dist'];
+
+/** One file inside a build output tree, named relative to that tree's root. */
+export interface OutputFile {
+  readonly path: string;
+  readonly digest: string;
+}
+
+/** The proven state of the build output trees. */
+export interface OutputFingerprint {
+  /** Stable digest over every output file (sorted path + content digest). */
+  readonly digest: string;
+  /** The sorted file listing the digest covers. */
+  readonly files: readonly OutputFile[];
+}
 
 /** Environment keys that legitimately differ between compatible gates. */
 const VOLATILE_ENV_KEYS: ReadonlySet<string> = new Set(['GRU_VERIFY_RUN_ID', 'GRU_VERIFY_SCOPE']);
@@ -103,7 +122,7 @@ export interface BuildInputs {
   readonly clean: boolean;
   readonly config: string;
   readonly env: string;
-  readonly outputs: string | null;
+  readonly outputs: OutputFingerprint | null;
 }
 
 export interface BuildRecord extends BuildInputs {
@@ -158,18 +177,51 @@ function envFingerprint(env: NodeJS.ProcessEnv): string {
   );
 }
 
-/** Digest of every output, or null when any output is missing. */
-function outputsFingerprint(cwd: string, outputs: readonly string[]): string | null {
-  const digests = outputs.map((output) => [output, fileDigest(join(cwd, output))] as const);
-  if (digests.some(([, digest]) => digest === 'absent')) return null;
-  return sha(digests.map(([output, digest]) => `${output}=${digest}`));
+const byRelativePath = (left: OutputFile, right: OutputFile): number =>
+  left.path < right.path ? -1 : left.path > right.path ? 1 : 0;
+
+/** Every file under `root` (POSIX-relative paths), or null when unreadable. */
+function outputFiles(root: string): OutputFile[] | null {
+  const files: OutputFile[] = [];
+  const walk = (dir: string, prefix: string): boolean => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      const relative = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (!walk(join(dir, entry.name), relative)) return false;
+      } else if (entry.isFile()) {
+        const digest = fileDigest(join(dir, entry.name));
+        if (digest === 'absent') return false;
+        files.push({ path: relative, digest });
+      }
+    }
+    return true;
+  };
+  return walk(root, '') ? files.sort(byRelativePath) : null;
+}
+
+/** Whole-tree digest of every output root, or null when any root is missing. */
+function outputsFingerprint(cwd: string, roots: readonly string[]): OutputFingerprint | null {
+  const files: OutputFile[] = [];
+  for (const root of roots) {
+    const listing = outputFiles(join(cwd, root));
+    if (listing === null) return null;
+    for (const file of listing) files.push({ path: `${root}/${file.path}`, digest: file.digest });
+  }
+  files.sort(byRelativePath);
+  return { digest: sha(files.map((file) => `${file.path}=${file.digest}`)), files };
 }
 
 /** Observe the inputs of a build in `cwd` right now. */
 export function observeBuildInputs(
   cwd: string,
   env: NodeJS.ProcessEnv,
-  outputs: readonly string[],
+  roots: readonly string[],
 ): BuildInputs {
   const head = git(cwd, ['rev-parse', 'HEAD']);
   // Tracked AND untracked (non-ignored) changes are input: unknown = dirty.
@@ -179,7 +231,7 @@ export function observeBuildInputs(
     clean: status === '',
     config: configFingerprint(cwd),
     env: envFingerprint(env),
-    outputs: outputsFingerprint(cwd, outputs),
+    outputs: outputsFingerprint(cwd, roots),
   };
 }
 
@@ -200,7 +252,22 @@ export function inspectReuse(
   if (now.config !== record.config) return 'config-changed';
   if (now.env !== record.env) return 'env-changed';
   if (now.outputs === null) return 'outputs-missing';
-  if (now.outputs !== record.outputs) return 'outputs-changed';
+  if (record.outputs === null) return 'outputs-changed';
+  if (now.outputs.digest !== record.outputs.digest) {
+    const changed = firstOutputDifference(record.outputs, now.outputs);
+    return changed === null ? 'outputs-changed' : `outputs-changed: ${changed}`;
+  }
+  return null;
+}
+
+/** First output file, by sorted path, that differs between two fingerprints. */
+function firstOutputDifference(record: OutputFingerprint, now: OutputFingerprint): string | null {
+  const recordByPath = new Map(record.files.map((file) => [file.path, file.digest] as const));
+  const nowByPath = new Map(now.files.map((file) => [file.path, file.digest] as const));
+  const paths = [...new Set([...recordByPath.keys(), ...nowByPath.keys()])].sort();
+  for (const path of paths) {
+    if (recordByPath.get(path) !== nowByPath.get(path)) return path;
+  }
   return null;
 }
 

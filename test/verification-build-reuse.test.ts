@@ -293,14 +293,20 @@ describe('verification build reuse (#318)', () => {
 
     it('missing outputs', async () => {
       const { lane, scheduler } = await warm();
-      unlinkSync(join(lane.repo.path, 'dist', 'build-rev.json'));
+      rmSync(join(lane.repo.path, 'dist'), { recursive: true, force: true });
       await expectRebuild(lane, scheduler, 'outputs-missing');
     });
 
-    it('altered outputs', async () => {
+    it('altered outputs names the first changed file', async () => {
       const { lane, scheduler } = await warm();
       writeFileSync(join(lane.repo.path, 'dist', 'build-rev.json'), '{"tampered":true}');
-      await expectRebuild(lane, scheduler, 'outputs-changed');
+      await expectRebuild(lane, scheduler, 'outputs-changed: dist/build-rev.json');
+    });
+
+    it('an unsampled new output file also refuses reuse', async () => {
+      const { lane, scheduler } = await warm();
+      writeFileSync(join(lane.repo.path, 'dist', 'unsampled-output.js'), '// not one of the old samples\n');
+      await expectRebuild(lane, scheduler, 'outputs-changed: dist/unsampled-output.js');
     });
 
     it('a different lane directory', async () => {
