@@ -104,11 +104,14 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
   }, 90_000);
 
-  it('installer default excludes Git candidates rejected by managed-name validation', () => {
+  it('installer defaults exclude unsupported names and unusable Git roots', () => {
     const workspace = fixtureWorkspace();
     const invalid = join(workspace, 'repo*');
     mkdirSync(invalid);
     execFileSync('git', ['-C', invalid, 'init', '-q']);
+    const stale = join(workspace, 'repo-stale');
+    mkdirSync(stale);
+    writeFileSync(join(stale, '.git'), 'gitdir: ../missing-worktree\n');
     const instance = tempDir('gru-command-pty-invalid-candidate-');
     const { output, status } = ptyWizard([
       { expect: WS_PROMPT, send: workspace }, { expect: REPOS_PROMPT, send: '' }, ...finishSteps('n'),
@@ -116,6 +119,7 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
 
     expect(status, output).toBe(0);
     expect(output).toContain('"repo*": must not contain wildcard characters');
+    expect(output).toContain('"repo-stale": .git does not identify this exact usable repository root');
     expect(output).toContain('Managed repositories selected: repo-a, repo-b');
     expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', 'repo-b']);
   }, 90_000);

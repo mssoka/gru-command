@@ -156,17 +156,30 @@ async function interactiveAnswers(
   const discovered = discoverManagedRepos(workspaceAbs);
   // Discovery supplies installer candidates only. Reject names that runtime
   // management cannot safely represent before offering the default-all choice.
-  const invalidCandidates = discovered.flatMap((name) => {
+  const invalidNameCandidates = discovered.flatMap((name) => {
     const reason = managedRepoNameError(name);
     return reason === null ? [] : [{ name, reason }];
   });
   const validCandidates = discovered.filter((name) => managedRepoNameError(name) === null);
   // Symlink entries stay excluded, matching repository setup's real-root boundary.
-  const found = validCandidates.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
-  const linked = validCandidates.filter((name) => !found.includes(name));
-  if (invalidCandidates.length > 0) {
+  const realCandidates = validCandidates.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
+  const linked = validCandidates.filter((name) => !realCandidates.includes(name));
+  const unusableGitRoots = realCandidates.filter(
+    (name) => resolveManagedRepoPathSync(workspaceAbs, name).kind === 'unavailable',
+  );
+  const found = realCandidates.filter((name) => !unusableGitRoots.includes(name));
+  if (invalidNameCandidates.length > 0) {
     out.write('\nGit repository entries excluded from installer choices because their names are unsupported:\n');
-    for (const { name, reason } of invalidCandidates) out.write(`  ${JSON.stringify(name)}: ${reason}\n`);
+    for (const { name, reason } of invalidNameCandidates) out.write(`  ${JSON.stringify(name)}: ${reason}\n`);
+  }
+  if (unusableGitRoots.length > 0) {
+    out.write('\nGit repository entries excluded from installer choices because their Git roots are unusable:\n');
+    for (const name of unusableGitRoots) {
+      out.write(
+        `  ${JSON.stringify(name)}: .git does not identify this exact usable repository root; ` +
+          'repair Git metadata and rerun setup.\n',
+      );
+    }
   }
   if (linked.length > 0) {
     out.write(`\nLinked repo entries excluded from installer choices: ${linked.join(', ')}.\n` +
