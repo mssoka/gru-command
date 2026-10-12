@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { BoardEngine } from '../src/board/engine.js';
 import { createBoardServer } from '../src/board/server.js';
@@ -18,6 +18,9 @@ import { DecisionRuntime } from '../src/decisions/runtime.js';
 import { DREAM_FAILED_KIND, dreamFailureIncidents } from '../src/lessons/dream.js';
 import { ROLE_DEFINITIONS } from '../src/roles.js';
 import type { RepoOverviewView } from '../src/repos/overview.js';
+import type { DecisionRecord } from '../src/ledger/decision-memory.js';
+import type { MailboxItem } from '../src/ledger/mailbox.js';
+import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1174,6 +1177,184 @@ describe('board server — empty token config locks every door', () => {
     } finally {
       await harness.close();
     }
+  });
+});
+
+describe('board server — report-handback decision signals (issue #314)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2029-12-31T23:59:59.000Z'));
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  function publishReport(harness: Awaited<ReturnType<typeof boot>>, jobId: string): string {
+    harness.api.addJob({ id: jobId, repo: 'r', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
+    harness.api.setJobStatus(jobId, 'working');
+    harness.api.setJobStatus(jobId, 'delivered');
+    harness.api.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+    const result = reconcileReportClosures({
+      ledger: harness.api,
+      notifications: new NotificationCenter({ ledger: harness.api, bus: harness.bus }),
+    });
+    expect(result).toMatchObject({ opened: 1, published: 1, failed: 0 });
+    return harness.api.findNotificationByKind(`silas.report-handback.${jobId}`, 'active')!.id;
+  }
+
+  async function reportItem(harness: Awaited<ReturnType<typeof boot>>, notificationId: string): Promise<MailboxItem> {
+    const page = await getJson(harness.port, '/api/mailbox', 'report-signal-token');
+    expect(page.status).toBe(200);
+    const item = (page.body as { items: MailboxItem[] }).items.find((row) => row.notificationIds.includes(notificationId));
+    expect(item).toBeDefined();
+    return item!;
+  }
+
+  function holdInput(item: MailboxItem) {
+    return { subject: item.subject, decision: 'hold', covers: item.reasons.map((reason) => reason.signal),
+      basis_fingerprint: item.basis, reason: 'Await the correlated report disposition', by: 'gru',
+      recheck_at: '2030-01-01T00:00:00.000Z', client_key: `hold-${item.id}` };
+  }
+
+  async function roundTrip(jobId: string): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const signal = `report-handback.${jobId}`;
+      expect(item.reasons.map((reason) => reason.signal)).toEqual([signal]);
+      expect(item.state).toBe('needs-gru');
+      const input = holdInput(item);
+      expect((await postJson(harness.port, '/api/decisions', null, input)).status).toBe(401);
+      expect((await postJson(harness.port, '/api/decisions', 'wrong-token', input)).status).toBe(401);
+      expect(harness.api.listDecisions()).toHaveLength(0);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      expect(decision).toMatchObject({ subject: item.subject, covers: [signal], basisFingerprint: item.basis });
+      const retry = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(retry.body).toEqual(decision);
+      const listed = await getJson(harness.port, `/api/decisions?subject=${encodeURIComponent(item.subject)}`, 'report-signal-token');
+      expect(listed.body).toMatchObject({ decisions: [decision] });
+      const query = { subject: item.subject, signal, basis: item.basis, now: '2029-12-31T23:59:59.000Z' };
+      expect(harness.api.coveringDecision(query)?.id).toBe(decision.id);
+      expect(harness.api.coveringDecision({ ...query, basis: 'changed-basis' })).toBeNull();
+      expect(harness.api.coveringDecision({ ...query, now: input.recheck_at })).toBeNull();
+      const disposition = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Hold on this exact report',
+        dependency: 'owner authorization for report disposition', recheckAt: input.recheck_at,
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      expect(disposition.status).toBe(200);
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'waiting' });
+      expect(harness.api.reconcileMailbox(input.recheck_at).find((row) => row.id === item.id)?.state).toBe('needs-gru');
+      // New source evidence invalidates the exact-basis disposition, not its durable history.
+      harness.api.updateNotificationDetail(notificationId, 'Changed report evidence');
+      const changed = await reportItem(harness, notificationId);
+      expect(changed.basis).not.toBe(item.basis);
+      expect(changed.state).toBe('needs-gru');
+      expect(harness.api.coveringDecision({ ...query, basis: changed.basis })).toBeNull();
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+      expect(harness.api.findReportObligation(jobId)?.state).toBe('open');
+    } finally { await harness.close(); }
+  }
+
+  it('round-trips the 59-character reported fixture through the authenticated API', () => roundTrip(`review-${'a'.repeat(52)}`));
+  it('round-trips the 128-character job boundary through the authenticated API', () => roundTrip(`review-${'a'.repeat(120)}a`));
+  it('round-trips the case-sensitive and punctuation job boundary through the authenticated API', () => roundTrip(`Review-${'a'.repeat(117)}A._9`));
+  it('round-trips the existing short signal through the authenticated API', () => roundTrip('review-old'));
+
+  async function sharedPrefix(suffix: string): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const prefix = `review-${'a'.repeat(120)}`;
+      const firstNotice = publishReport(harness, `${prefix}a`);
+      const secondNotice = publishReport(harness, `${prefix}${suffix}`);
+      const first = await reportItem(harness, firstNotice);
+      const second = await reportItem(harness, secondNotice);
+      expect(first.subject).not.toBe(second.subject);
+      expect(first.reasons[0]!.signal).not.toBe(second.reasons[0]!.signal);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', holdInput(first));
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      const query = { subject: first.subject, signal: first.reasons[0]!.signal, basis: first.basis };
+      expect(harness.api.coveringDecision(query)?.id).toBe(decision.id);
+      expect(harness.api.coveringDecision({ ...query, subject: second.subject })).toBeNull();
+      expect(harness.api.coveringDecision({ ...query, signal: second.reasons[0]!.signal })).toBeNull();
+      expect(harness.api.coveringDecision({ subject: second.subject, signal: second.reasons[0]!.signal, basis: second.basis })).toBeNull();
+      expect((await reportItem(harness, secondNotice)).state).toBe('needs-gru');
+    } finally { await harness.close(); }
+  }
+
+  it('keeps long shared-prefix identities independent', () => sharedPrefix('b'));
+  it('keeps case-distinct shared-prefix identities independent', () => sharedPrefix('A'));
+
+  it('clearing a long mixed-case decision preserves history and reopens its waiting mailbox item', async () => {
+    const harness = await boot('report-signal-token');
+    try {
+      const jobId = `Review-${'A'.repeat(121)}`;
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const input = holdInput(item);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', input);
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      const disposition = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Await owner authorization',
+        dependency: 'owner authorization for report disposition', recheckAt: input.recheck_at,
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      expect(disposition.status).toBe(200);
+      expect((await reportItem(harness, notificationId)).state).toBe('waiting');
+      const clear = await postJson(harness.port, `/api/decisions/${decision.id}/clear`, 'report-signal-token', { by: 'owner', reason: 'Authorization granted' });
+      expect(clear.status).toBe(200);
+      expect(harness.api.getDecision(decision.id)).toMatchObject({ subject: item.subject, covers: decision.covers,
+        basisFingerprint: item.basis, clearedAt: '2029-12-31T23:59:59.000Z', clearedBy: 'owner' });
+      expect(harness.api.coveringDecision({ subject: item.subject, signal: decision.covers[0]!, basis: item.basis })).toBeNull();
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'needs-gru' });
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+    } finally { await harness.close(); }
+  });
+
+  async function resolveReport(decisionKind: 'acted' | 'dismissed'): Promise<void> {
+    const harness = await boot('report-signal-token');
+    try {
+      const jobId = `Review-${'A'.repeat(121)}`;
+      const notificationId = publishReport(harness, jobId);
+      const item = await reportItem(harness, notificationId);
+      const written = await postJson(harness.port, '/api/decisions', 'report-signal-token', { ...holdInput(item), decision: decisionKind });
+      expect(written.status).toBe(201);
+      const decision = written.body as DecisionRecord;
+      expect(decision.covers).toEqual([`report-handback.${jobId}`]);
+      const resolved = await postJson(harness.port, `/api/mailbox/${encodeURIComponent(item.id)}/disposition`, 'report-signal-token', {
+        basis: item.basis, state: 'resolved', owner: 'gru', detail: 'Exact report attention accounted',
+        references: [{ kind: 'decision', id: decision.id }],
+      });
+      expect(resolved.status).toBe(200);
+      expect(await reportItem(harness, notificationId)).toMatchObject({ basis: item.basis, state: 'resolved' });
+      expect(harness.api.getJob(jobId)?.status).toBe('delivered');
+      expect(harness.api.findReportObligation(jobId)?.state).toBe('open');
+    } finally { await harness.close(); }
+  }
+
+  it('an acted decision accounts long mixed-case report attention without settling its work', () => resolveReport('acted'));
+  it('a dismissed decision accounts long mixed-case report attention without settling its work', () => resolveReport('dismissed'));
+
+  it('rejects malformed and oversized signals without persisting a decision', async () => {
+    const harness = await boot('report-signal-token');
+    try {
+      const item = await reportItem(harness, publishReport(harness, 'review-validation'));
+      for (const signal of ['', 'a'.repeat(65), `report-handback.${'a'.repeat(129)}`, 'Report-handback.valid',
+        `report-handback._${'a'.repeat(100)}`, `report-handback..${'a'.repeat(100)}`, 'report-handback.Unsafe/Path',
+        'report-handback.unsafe id', 'report-handback.bad\nvalue', 'report-handback.bad\n', 'report-handback.é', 'PR-CONFLICT']) {
+        const rejected = await postJson(harness.port, '/api/decisions', 'report-signal-token', { ...holdInput(item), covers: [signal] });
+        expect(rejected.status, signal).toBe(400);
+        expect(rejected.body).toMatchObject({ error: 'bad_request', detail: expect.stringContaining('decision signal') });
+        if (signal === 'report-handback.Unsafe/Path') {
+          expect(rejected.body).toMatchObject({ detail: expect.stringContaining('suffix must be a safe job id') });
+        }
+      }
+      expect(harness.api.listDecisions()).toHaveLength(0);
+      expect((await reportItem(harness, item.notificationIds[0]!)).state).toBe('needs-gru');
+    } finally { await harness.close(); }
   });
 });
 

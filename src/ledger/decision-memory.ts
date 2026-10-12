@@ -1,4 +1,5 @@
 import { canonicalIsoTimestamp } from './obligations.js';
+import { isSafePipelineRecordId } from './pipeline.js';
 
 /**
  * Decision memory (issue #218): typed holds and dispositions stored as
@@ -71,6 +72,9 @@ export const DECISION_SUBJECT_MAX_LENGTH = 256;
 export const DECISION_REASON_MAX_LENGTH = 2_000;
 export const DECISION_FINGERPRINT_MAX_LENGTH = 256;
 export const DECISION_SIGNAL_MAX_LENGTH = 64;
+const REPORT_HANDBACK_SIGNAL_PREFIX = 'report-handback.';
+/** Preserve the complete generated signal for every supported 128-character job id. */
+const REPORT_HANDBACK_SIGNAL_MAX_LENGTH = REPORT_HANDBACK_SIGNAL_PREFIX.length + 128;
 export const DECISION_SIGNALS_MAX_COUNT = 16;
 
 /** The subject kinds the issue enumerates — 'job:<id>',
@@ -102,14 +106,23 @@ export function validateDecisionSubject(value: string): string {
   return value;
 }
 
-/** Signal kinds are canonical lowercase tokens (`pr-conflict`,
- * `ci-failed`); a whitespace-bearing or mixed-case near-miss would be
- * stored but never match the trigger's signal — reject it here. */
+/** Signal families are canonical lowercase tokens (`pr-conflict`,
+ * `ci-failed`). The report-handback suffix is an exact, case-sensitive
+ * job identity, not a family to lowercase or truncate. */
 export function validateDecisionSignal(value: string): string {
-  if (value.length === 0 || value.length > DECISION_SIGNAL_MAX_LENGTH) {
-    throw new Error(`decision signal must be 1-${DECISION_SIGNAL_MAX_LENGTH} characters`);
+  const reportHandback = value.startsWith(REPORT_HANDBACK_SIGNAL_PREFIX);
+  const maxLength = reportHandback ? REPORT_HANDBACK_SIGNAL_MAX_LENGTH : DECISION_SIGNAL_MAX_LENGTH;
+  if (value.length === 0 || value.length > maxLength) {
+    throw new Error(`decision signal must be 1-${maxLength} characters`);
+  }
+  if (reportHandback && isSafePipelineRecordId(value.slice(REPORT_HANDBACK_SIGNAL_PREFIX.length))) return value;
+  // Keep every formerly valid short token readable. Only a complete safe
+  // report job identity grants the larger bound or a case-sensitive suffix.
+  if (value.length > DECISION_SIGNAL_MAX_LENGTH) {
+    throw new Error(`decision signal longer than ${DECISION_SIGNAL_MAX_LENGTH} characters must be report-handback.<safe job id>, got "${value}"`);
   }
   if (!/^[a-z0-9][a-z0-9._-]*$/u.test(value)) {
+    if (reportHandback) throw new Error(`decision signal report-handback suffix must be a safe job id (case preserved), got "${value}"`);
     throw new Error(`decision signal must be a lowercase token of [a-z0-9._-], got "${value}"`);
   }
   return value;
