@@ -131,6 +131,10 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     const whitespaceMark = join(workspace, whitespaceMarkName);
     mkdirSync(whitespaceMark);
     execFileSync('git', ['-C', whitespaceMark, 'init', '-q']);
+    const nbspName = 'repo-nbsp\u00a0';
+    const nbsp = join(workspace, nbspName);
+    mkdirSync(nbsp);
+    execFileSync('git', ['-C', nbsp, 'init', '-q']);
     const bidi = join(workspace, 'repo\u202ehidden');
     mkdirSync(bidi);
     execFileSync('git', ['-C', bidi, 'init', '-q']);
@@ -149,12 +153,14 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(output).toContain('repo\\\\u{1}\\\\u{301}hidden');
     expect(output).toContain('repo\\\\u{202e}hidden');
     expect(output).toContain('repo \\u{301}hidden');
+    expect(output).toContain('repo-nbsp\\u{a0}');
     expect(output).toContain('Managed repositories selected:');
     const selected = loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos;
-    expect(selected).toHaveLength(3);
+    expect(selected).toHaveLength(4);
     expect(selected).toContain('repo-a');
     expect(selected).toContain('repo-b');
     expect(selected).toContain(whitespaceMarkName);
+    expect(selected).toContain(nbspName);
   }, 90_000);
 
   it('renders a mark-only repository name as a visible escape in the wizard', () => {

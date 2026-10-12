@@ -1318,7 +1318,7 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     }
   });
 
-  it('renders an invisible-only registry name as visible escapes the web validator accepts', async () => {
+  it('renders invisible-only names and separator spaces as visible escapes the web validator accepts', async () => {
     const h = harness({ names: ['\u200b'] });
     const view = await h.tracker.refresh();
     expect(isValidSnapshot(validBoardSnapshot(view))).toBe(true);
@@ -1337,6 +1337,16 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(row(second, 'repo\u202E').displayName).toBe('repo\\u{202e}');
     expect(row(second, 'caf\u0065\u0301').displayName).toBe('caf\u0065\u0301');
     expect(row(second, leadingMarkName).displayName).toBe('\\u{301}alpha');
+
+    const thinSpaceName = 'alpha\u2009';
+    const nbspName = 'alpha\u00a0';
+    h.names.splice(0, h.names.length, thinSpaceName, nbspName);
+    h.refs.set(thinSpaceName, githubRef('alpha-thin'));
+    h.refs.set(nbspName, githubRef('alpha-nbsp'));
+    const third = await h.tracker.refresh();
+    expect(isValidSnapshot(validBoardSnapshot(third))).toBe(true);
+    expect(row(third, thinSpaceName).displayName).toBe('alpha\\u{2009}');
+    expect(row(third, nbspName).displayName).toBe('alpha\\u{a0}');
   });
 
   it('leaves a .github-suffixed host with unsafe characters unlinked instead of freezing the board', async () => {
