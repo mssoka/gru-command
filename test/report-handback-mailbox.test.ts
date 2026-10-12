@@ -377,6 +377,33 @@ describe('GH-313 report-handback custody', () => {
     expect(r.ledger.latestEventOfKind('mailbox.report-custody-migrated')).toBeNull();
   });
 
+  it('honors a newer legacy needs-gru ruling even on an unbound transport card', () => {
+    const r = fixture();
+    seedLegacyWait(r);
+    const original = r.ledger.getNotification(r.original.notificationIds[0]!)!;
+    const replacement = r.ledger.recordNotification({ id: 'newer-unbound-ruling', kind: KIND, title: original.title,
+      detail: original.detail, routing: 'action-required', severity: original.severity, agentId: 'unbound-transport' });
+    const later = seedLegacyWait(r, true, replacement.id);
+    const disposition = { ...later.disposition, state: 'needs-gru', owner: 'gru', detail: 'explicitly reevaluate report now',
+      dependency: null, recheckAt: null, references: [] };
+    r.ledger.appendCustomEvent({ kind: 'mailbox.disposition', payload: { id: later.id, disposition } });
+    r.db.handle.prepare('UPDATE gru_mailbox SET item = ? WHERE id = ?').run(JSON.stringify({ ...later, state: 'needs-gru', disposition }), later.id);
+    expect(r.mailbox.snapshot().items.find((row) => row.id === r.original.id)?.state).toBe('needs-gru');
+    expect(r.ledger.latestEventOfKind('mailbox.report-custody-migrated')).toBeNull();
+  });
+
+  it('authenticates unchanged legacy incident custody carried by an unbound transport', () => {
+    const r = fixture();
+    const original = r.ledger.getNotification(r.original.notificationIds[0]!)!;
+    const transport = r.ledger.recordNotification({ id: 'legacy-unbound-wait', kind: KIND, title: original.title,
+      detail: original.detail, routing: 'action-required', severity: original.severity, agentId: 'unbound-transport' });
+    const legacy = seedLegacyWait(r, true, transport.id);
+    const upgraded = r.mailbox.snapshot().items.find((row) => row.id === r.original.id)!;
+    expect(upgraded.state).toBe('waiting');
+    expect(upgraded.disposition).toEqual({ ...legacy.disposition, basis: upgraded.basis });
+    expect(r.ledger.latestEventOfKind('mailbox.report-custody-migrated')).not.toBeNull();
+  });
+
   it('refuses legacy metadata that has no original durable disposition ruling', () => {
     const r = fixture();
     seedLegacyWait(r, false);
@@ -397,6 +424,19 @@ describe('GH-313 report-handback custody', () => {
     vi.advanceTimersByTime(1000);
     expect(turns).toBe(0);
     expect(r.mailbox.snapshot().items.find((row) => row.id === r.original.id)?.state).toBe('needs-gru');
+  });
+
+  it('admits an authoritative report error through the error-only wake floor', () => {
+    const r = fixture('error');
+    const original = r.ledger.getNotification(r.original.notificationIds[0]!)!;
+    r.ledger.recordNotification({ id: 'current-error', kind: KIND, title: original.title, detail: 'current report delivery failure',
+      routing: 'action-required', severity: 'error' });
+    expect(r.mailbox.snapshot().items.find((row) => row.id === r.original.id)?.severity).toBe('error');
+    let turns = 0;
+    r.awareness.setWakeSink(() => { turns += 1; });
+    vi.advanceTimersByTime(1000);
+    expect(turns).toBe(1);
+    expect(r.mailbox.snapshot().items.find((row) => row.id === r.original.id)?.severity).toBe('error');
   });
 
   it('loads retained custody from a separately reopened durable ledger connection', () => {
