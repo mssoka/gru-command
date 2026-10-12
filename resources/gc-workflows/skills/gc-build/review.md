@@ -33,11 +33,22 @@ minion must not use this exception. The normal route uses all three lenses in
 parallel when the runtime supports it:
 
 - [[gc-resource:skills/gc-build/review-prompts/adversarial.md]] — diff and repository,
-  without the author's explanation or self-review.
+  without the author's explanation or self-review. This is the BLIND lens: commission it
+  with `"review_role": "blind"`, an `"input_package"` (`base_sha`, `target_sha`, the
+  base-to-target `diff` and/or exact target `files`) and `"parent_contract_sha256"` read
+  from `GET /api/dispatch/jobs/{{context.jobId}}/contract`. The service validates the package
+  against this job's effective `blind-isolation:` rule (administrative clarifications
+  included) BEFORE any reviewer spawns, and refuses task specs, prior assessments and
+  deferred/triage text carried by a document-like file (extensionless or `.md`/`.markdown`/
+  `.txt`/`.rst`/`.adoc`, whatever it is named) with a correction path; other file types are
+  path-checked only. Never hand a
+  blind reviewer an unfiltered historical diff, and never count a blind report as
+  independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` says
+  `qualifying`; settling a report is not validity.
 - [[gc-resource:skills/gc-build/review-prompts/edge-cases.md]] — diff, relevant code and
-  acceptance scenarios; boundary/failure paths.
+  acceptance scenarios; boundary/failure paths. Claims-needed lens: `"review_role": "claims"`.
 - [[gc-resource:skills/gc-build/review-prompts/verification.md]] — diff, approved intent,
-  tests and exact executed verification evidence.
+  tests and exact executed verification evidence. Claims-needed lens: `"review_role": "claims"`.
 
 The small-change route requires the fresh adversarial reviewer; add the other
 lenses when warranted. Never substitute author self-review for a reviewer. If
