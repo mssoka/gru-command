@@ -2638,15 +2638,21 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
     const store = new SessionStore(config.dataDir);
     const logs: Array<{ level: string; msg: string; fields?: Record<string, unknown> }> = [];
+    const staleModelRuntime = await makeStubModelRuntime(new StubScript([{ deltas: ['settings default'] }]), {
+      refreshAuthCache: false,
+    });
     const runtime = new PiRuntime({
       config,
       store,
       agentDir,
-      modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['settings default'] }]), {
-        refreshAuthCache: false,
-      }),
+      modelRuntime: staleModelRuntime,
       log: (level, msg, fields) => logs.push({ level, msg, fields }),
     });
+    // Cold-cache PRECONDITION (Perkins r1 W6): the regression guard is only
+    // meaningful while pi's own auth-gated path would reject this default.
+    // If an SDK timing change ever warms the cache, fail here, loudly,
+    // instead of silently defanging the test.
+    expect(staleModelRuntime.hasConfiguredAuth('gru-stub')).toBe(false);
     const handle = await runtime.spawn('gru');
     try {
       const events = collect(handle);
@@ -2696,6 +2702,163 @@ describe('PiRuntime over the stub model (offline SDK round-trip)', () => {
     expect(error.message).toContain('catalog refresh attempted — failed (no network in tests)');
     expect(error.message).toContain('provider "nope" is not registered');
     expect(error.message).toContain(join(agentDir, 'settings.json'));
+  });
+
+  describe('settings default sentinel resolution (Perkins r1 follow-ups, issue #24)', () => {
+    interface SentinelFx {
+      readonly runtime: PiRuntime;
+      readonly home: string;
+      readonly workspace: string;
+      readonly agentDir: string;
+      readonly logs: Array<{ level: string; msg: string; fields?: Record<string, unknown> }>;
+    }
+
+    async function sentinelFx(
+      globalSettings: string | Buffer | undefined,
+      projectSettings?: string,
+    ): Promise<SentinelFx> {
+      const home = mkdtempSync(join(tmpdir(), 'gru-command-pi-'));
+      const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
+      const agentDir = mkdtempSync(join(tmpdir(), 'gru-command-agentdir-'));
+      cleanupDirs.push(home, workspace, agentDir);
+      writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+      if (globalSettings !== undefined) writeFileSync(join(agentDir, 'settings.json'), globalSettings);
+      if (projectSettings !== undefined) {
+        mkdirSync(join(workspace, '.pi'), { recursive: true });
+        writeFileSync(join(workspace, '.pi', 'settings.json'), projectSettings, 'utf-8');
+      }
+      const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
+      const logs: SentinelFx['logs'] = [];
+      const runtime = new PiRuntime({
+        config,
+        store: new SessionStore(config.dataDir),
+        agentDir,
+        modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['ok'] }]), {
+          refreshAuthCache: false,
+        }),
+        log: (level, msg, fields) => logs.push({ level, msg, fields }),
+      });
+      return { runtime, home, workspace, agentDir, logs };
+    }
+
+    const stubDefault = JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 'stub-model' });
+    const resolvedModel = (fx: SentinelFx): unknown =>
+      fx.logs.find((l) => l.msg === 'spawn: model resolved')?.fields?.['model'];
+
+    it('throws naming the file when settings.json is corrupt (W2), not the cryptic No API key', async () => {
+      const fx = await sentinelFx('{ "defaultProvider": "gru-stub", oops');
+      const error = await rejection(fx.runtime.spawn('gru'));
+      expect(error.message).toContain(join(fx.agentDir, 'settings.json'));
+      expect(error.message).toMatch(/unreadable or corrupt/);
+      expect(error.message).not.toMatch(/No API key/);
+    });
+
+    it('treats an ABSENT settings.json as naming nothing and logs the undefined-model branch honestly (W2/N3/N4)', async () => {
+      const fx = await sentinelFx(undefined);
+      const handle = await fx.runtime.spawn('gru');
+      await handle.dispose();
+      expect(resolvedModel(fx)).toBe('pi default resolution (no settings default named)');
+    });
+
+    it('tolerates a UTF-8 BOM (N2)', async () => {
+      const fx = await sentinelFx(`\uFEFF${stubDefault}`);
+      const handle = await fx.runtime.spawn('gru');
+      await handle.dispose();
+      expect(resolvedModel(fx)).toBe('gru-stub/stub-model');
+    });
+
+    it('a partial default (provider only, or model only) names nothing (W5)', async () => {
+      for (const partial of [
+        JSON.stringify({ defaultProvider: 'gru-stub' }),
+        JSON.stringify({ defaultModel: 'stub-model' }),
+      ]) {
+        const fx = await sentinelFx(partial);
+        const handle = await fx.runtime.spawn('gru');
+        await handle.dispose();
+        expect(resolvedModel(fx)).toBe('pi default resolution (no settings default named)');
+      }
+    });
+
+    it('empty or whitespace defaults name nothing instead of a confusing "/x" error (N1)', async () => {
+      for (const body of [
+        { defaultProvider: '', defaultModel: 'stub-model' },
+        { defaultProvider: 'gru-stub', defaultModel: '   ' },
+        { defaultProvider: null, defaultModel: null },
+      ]) {
+        const fx = await sentinelFx(JSON.stringify(body));
+        const handle = await fx.runtime.spawn('gru');
+        await handle.dispose();
+        expect(resolvedModel(fx)).toBe('pi default resolution (no settings default named)');
+      }
+    });
+
+    it('a non-string default throws naming the key (N2)', async () => {
+      const fx = await sentinelFx(JSON.stringify({ defaultProvider: 'gru-stub', defaultModel: 42 }));
+      const error = await rejection(fx.runtime.spawn('gru'));
+      expect(error.message).toContain('defaultModel must be a string, got number');
+      expect(error.message).toContain(join(fx.agentDir, 'settings.json'));
+    });
+
+    it('honours a project-scope .pi/settings.json default, which wins over global (W4)', async () => {
+      const onlyProject = await sentinelFx(undefined, stubDefault);
+      const a = await onlyProject.runtime.spawn('gru');
+      await a.dispose();
+      expect(resolvedModel(onlyProject)).toBe('gru-stub/stub-model');
+
+      const both = await sentinelFx(
+        JSON.stringify({ defaultProvider: 'nope', defaultModel: 'no-such-model' }),
+        stubDefault,
+      );
+      const b = await both.runtime.spawn('gru');
+      await b.dispose();
+      expect(resolvedModel(both)).toBe('gru-stub/stub-model');
+    });
+
+    it('a resumed session keeps its persisted model over the settings default (W1)', async () => {
+      // Settings name an UNREGISTERED model: if the settings default were
+      // eagerly resolved on resume the spawn would throw. Session restore
+      // must outrank settings (pi's documented order).
+      const fx = await fixture([{ deltas: ['first'] }, { deltas: ['second'] }]);
+      const first = await fx.runtime.spawn('gru');
+      await first.prompt('remember', { owner: 'alice' });
+      const file = first.sessionFile!;
+      await first.dispose();
+      writeFileSync(
+        join(fx.agentDir, 'settings.json'),
+        JSON.stringify({ defaultProvider: 'nope', defaultModel: 'no-such-model' }),
+        'utf-8',
+      );
+      const config = loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester');
+      const logs: SentinelFx['logs'] = [];
+      const second = new PiRuntime({
+        config,
+        store: new SessionStore(config.dataDir),
+        agentDir: fx.agentDir,
+        modelRuntime: await makeStubModelRuntime(new StubScript([{ deltas: ['again'] }]), {
+          refreshAuthCache: false,
+        }),
+        log: (level, msg, fields) => logs.push({ level, msg, fields }),
+      });
+      const resumed = await second.spawn('gru', { resumeFile: file, model: 'default' });
+      try {
+        expect(logs.find((l) => l.msg === 'spawn: model resolved')?.fields?.['model']).toBe(
+          'gru-stub/stub-model',
+        );
+      } finally {
+        await resumed.dispose();
+      }
+    });
+
+    it('a resume with an unresolvable settings default and no persisted model still fails loud and is not marked down (W1)', async () => {
+      const fx = await sentinelFx(JSON.stringify({ defaultProvider: 'nope', defaultModel: 'x' }));
+      const store = new SessionStore(loadConfig({ GRU_COMMAND_HOME: fx.home }, '/home/tester').dataDir);
+      const empty = join(store.sessionsDir, 'empty-resume.jsonl');
+      mkdirSync(store.sessionsDir, { recursive: true });
+      writeFileSync(empty, '', 'utf-8');
+      const error = await rejection(fx.runtime.spawn('gru', { resumeFile: empty }));
+      expect(error.message).toContain('settings default "nope/x" is not a registered model');
+      expect(fx.runtime.health().state).toBe('ok');
+    });
   });
 
   it('dispose releases the session lock', async () => {
