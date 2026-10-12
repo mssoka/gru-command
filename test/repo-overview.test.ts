@@ -1597,11 +1597,21 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
       vi.stubEnv('GIT_CONFIG_GLOBAL', join(inheritedHome, 'foreign.gitconfig'));
       vi.stubEnv('GIT_CONFIG_NOSYSTEM', '1');
       vi.stubEnv('GIT_TEST_ASSUME_DIFFERENT_OWNER', '1');
+      vi.stubEnv('LANG', 'fr_FR.UTF-8');
+      vi.stubEnv('LC_ALL', 'fr_FR.UTF-8');
       const environmentForTrustedHome = gitProbeEnvironment as unknown as (
         home: string,
       ) => NodeJS.ProcessEnv;
       const env = environmentForTrustedHome(trustedHome);
       expect(env.HOME).toBe(trustedHome);
+      const invalidRepo = join(workspace, 'invalid-marker');
+      mkdirSync(invalidRepo);
+      writeFileSync(join(invalidRepo, '.git'), 'not-a-gitdir\n');
+      const invalidRepoResolution = resolveManagedRepoPathSync(workspace, 'invalid-marker');
+      expect({ locale: env.LC_ALL, invalidRepoKind: invalidRepoResolution.kind }).toEqual({
+        locale: 'C',
+        invalidRepoKind: 'unavailable',
+      });
       expect(env).not.toHaveProperty('XDG_CONFIG_HOME');
       expect(env).not.toHaveProperty('GIT_CONFIG_GLOBAL');
       expect(env).not.toHaveProperty('GIT_CONFIG_NOSYSTEM');
