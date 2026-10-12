@@ -18,6 +18,7 @@ import {
   type ContextControlState,
   type ContextEventFrame,
   type ContextFrame,
+  type ControlAction,
   type ControlFrame,
   type ControlResultCode,
   type ErrorFrame,
@@ -42,6 +43,14 @@ const CHAT_OWNER = 'chat';
 const MAX_CONTROL_MESSAGE_CHARS = 240;
 const MAX_DEFERRED_CONTROL_FRAMES = 128;
 const MAX_PENDING_NOTICES = 128;
+/** Wording shared (byte for byte) with the web view's immediate band line,
+ * which uses it to dedupe the logged echo (GH-105). */
+function failedControlNoticeText(action: ControlAction, code: ControlResultCode | undefined, message: string | undefined): string {
+  const label = action === 'compact' ? 'compact context' : 'new chat';
+  const detail = message !== undefined && message !== '' ? boundedControlMessage(message) : code ?? 'unknown error';
+  return `⚠️ ${label} failed: ${detail}`;
+}
+
 /** Bound on the wake context a replayable service notice carries (GH-114). */
 const WAKE_CONTEXT_NOTICE_CHARS = 1_500;
 
@@ -687,6 +696,19 @@ export function createChatServer(options: ChatServerOptions): ChatServer {
         ? { message: boundedControlMessage(message) }
         : {}),
     });
+    // GH-105: the requester's result is ephemeral, but a failed control is
+    // durable service machinery — log the outcome as a typed `notice` so a
+    // reload or full replay rebuilds the failed-control band. The live
+    // requester keeps its immediate result; its view dedupes this echo.
+    // A read-only client's refused attempt is its own, not conversation
+    // history: it stays ephemeral.
+    if (!ok && code !== 'read_only') {
+      try {
+        emitLogged({ type: 'notice', text: failedControlNoticeText(frame.action, code, message) });
+      } catch (error) {
+        log('error', 'failed to log a failed control outcome', { error: errorMessage(error) });
+      }
+    }
   }
 
   // -----------------------------------------------------------------------

@@ -336,3 +336,44 @@ describe('service band — replayable wake context (GH-114)', () => {
     expect(log().querySelector('.msg--gru')?.textContent).toContain('On it.');
   });
 });
+
+describe('service band — failed control outcome is replayable (GH-105)', () => {
+  const failed = {
+    type: 'control_result',
+    action: 'compact',
+    request_id: 'control-x',
+    ok: false,
+    epoch: 0,
+    code: 'failed',
+    message: 'provider failure',
+  } as const;
+
+  it('rebuilds the failed-control band line from the logged notice on replay', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(notice('⚠️ compact context failed: provider failure'), false);
+    const lines = log().querySelectorAll('.service-band .notice-line');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.textContent).toBe('⚠️ compact context failed: provider failure');
+  });
+
+  it('shows the immediate result once: the live logged echo does not duplicate the band line', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.showControlResult(failed);
+    expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(1);
+    view.addFrame(notice('⚠️ compact context failed: provider failure'), true);
+    expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(1);
+    // A second identical failure is a new event and still renders.
+    view.showControlResult(failed);
+    view.addFrame(notice('⚠️ compact context failed: provider failure'), true);
+    expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(2);
+  });
+
+  it('another client (no local result) renders the live logged notice', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(notice('⚠️ compact context failed: provider failure'), true);
+    expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(1);
+  });
+});

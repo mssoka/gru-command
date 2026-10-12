@@ -124,6 +124,8 @@ export class ChatView {
    * reads as conversation, machinery one tap away. A conversation frame
    * (user message, reply delta, error) closes the run. */
   private serviceBand: ServiceBand | null = null;
+  /** Failed-control band lines already shown locally awaiting their logged echo. */
+  private pendingControlEchoes: string[] = [];
   private unread = 0;
   /** Auto-follow engages while the reader is near the log's bottom; a
    * user scroll away disengages until they return or jump-to-latest. */
@@ -444,6 +446,9 @@ export class ChatView {
       // the same view stay readable. appendServiceLine never appends
       // before intervening conversation (reset rollback covered above).
       this.appendServiceLine(el('div', 'notice-line', `⚠️ ${message}`));
+      // The server also LOGS this outcome as a notice (GH-105) so replay can
+      // rebuild it; remember the line so its live echo is not shown twice.
+      this.pendingControlEchoes.push(`⚠️ ${message}`);
       this.announceContextOutcome(message);
       this.followContent(true);
     } else if (result.action === 'compact') {
@@ -896,6 +901,7 @@ export class ChatView {
     this.activeTool = null;
     this.activeToolBand = null;
     this.serviceBand = null;
+    this.pendingControlEchoes = [];
     this.cancelSettleScroll();
     this.stickToBottom = true;
     this.jumpButton.hidden = true;
@@ -1039,6 +1045,11 @@ export class ChatView {
         break;
       }
       case 'notice': {
+        const echo = live ? this.pendingControlEchoes.indexOf(frame.text) : -1;
+        if (echo >= 0) {
+          this.pendingControlEchoes.splice(echo, 1);
+          break;
+        }
         // E7: product notices (wake failures, supervisor restarts, control
         // outcomes) are service machinery — they join the collapsed
         // service band so the conversation stays readable.

@@ -1616,6 +1616,40 @@ describe('chat server (real sockets, stub Gru)', () => {
   });
 });
 
+describe('chat server — failed control outcomes are durable (GH-105)', () => {
+  it('logs a failed compact as a replayable notice while the requester keeps its immediate result', async () => {
+    const h = await makeHarness();
+    try {
+      const writer = await authedClient(h.port);
+      writer.send('establish', 'establish-g8');
+      await writer.waitFor(isTurnEndFrame, 'established turn');
+      h.handle.nextCompactError = 'provider failure: quota exhausted';
+      writer.control('compact', 'failed-compact-g8');
+      const result = await writer.waitFor(
+        (frame) => frame.type === 'control_result' && frame.request_id === 'failed-compact-g8',
+        'compact failure result',
+      );
+      expect(result).toMatchObject({ ok: false, code: 'failed' });
+      await pollUntil(
+        () => h.frameLog.history.some((frame) => frame.type === 'notice'),
+        'logged failed-control notice',
+      );
+      const logged = h.frameLog.history.find((frame) => frame.type === 'notice') as { text: string };
+      expect(logged.text).toBe('⚠️ compact context failed: provider failure: quota exhausted');
+      // Reload / full replay rebuilds it from the durable log.
+      const replay = await authedClient(h.port);
+      await replay.waitForCount(1 + h.frameLog.highWaterSeq);
+      expect(replay.frames.some((f) => f.type === 'notice' && String((f as { text?: string }).text).includes('compact context failed'))).toBe(true);
+      // The result itself stays ephemeral (never replayed).
+      expect(replay.frames.some((f) => f.type === 'control_result')).toBe(false);
+      await writer.close();
+      await replay.close();
+    } finally {
+      await h.close();
+    }
+  });
+});
+
 describe('chat server — supervision integration (E7)', () => {
   it('surfaceNotice logs + broadcasts a notice frame the web validator accepts', async () => {
     const harness = await makeHarness();
