@@ -3423,8 +3423,14 @@ describe('formal GitHub verdict publication', () => {
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('APPROVED') }) },
     ]);
-    const receipt = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' });
-    await assertFormalEventAssertion('app-approve-receipt', () => expect(receipt).toEqual({ ...RECEIPT, event: 'APPROVED' }));
+    const outcome = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' }).then(
+      (receipt) => ({ ok: true as const, receipt }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    await assertFormalEventAssertion('app-approve-receipt', () => expect(outcome).toEqual({
+      ok: true,
+      receipt: { ...RECEIPT, event: 'APPROVED' },
+    }));
     const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
     await assertFormalEventAssertion('app-approve-receipt', () =>
       expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'APPROVE', commit_id: HEAD }));
@@ -3435,8 +3441,14 @@ describe('formal GitHub verdict publication', () => {
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('CHANGES_REQUESTED') }) },
     ]);
-    const receipt = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' });
-    await assertFormalEventAssertion('app-request-changes-receipt', () => expect(receipt).toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' }));
+    const outcome = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' }).then(
+      (receipt) => ({ ok: true as const, receipt }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    await assertFormalEventAssertion('app-request-changes-receipt', () => expect(outcome).toEqual({
+      ok: true,
+      receipt: { ...RECEIPT, event: 'CHANGES_REQUESTED' },
+    }));
     const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
     await assertFormalEventAssertion('app-request-changes-receipt', () =>
       expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'REQUEST_CHANGES', commit_id: HEAD }));
