@@ -160,10 +160,11 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
     expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual([name]);
   }, 90_000);
 
-  it('interactive reruns preserve the prior subset on Enter and persist an explicit changed choice', () => {
+  it('interactive reruns preserve unavailable names safely and persist an explicit changed choice', () => {
     const workspace = fixtureWorkspace();
     const instance = tempDir('gru-command-pty-managed-rerun-');
-    const prior = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['repo-a'] }));
+    const unavailableName = '\u0301missing';
+    const prior = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['repo-a', unavailableName] }));
     writeInstanceConfig({ instanceDir: instance, answers: prior });
 
     const preserved = ptyWizard(
@@ -172,8 +173,14 @@ describe.skipIf(!ptyCapable || ptySkipOptOut)('interactive wizard under a pty (P
       ['--force'],
     );
     expect(preserved.status, preserved.output).toBe(0);
-    expect(preserved.output).toContain('Managed repositories selected: repo-a');
-    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a']);
+    expect(preserved.output).toContain(
+      'Configured selections not currently available remain selected on Enter: \\u{301}missing.',
+    );
+    expect(preserved.output).toContain('Managed repositories selected: repo-a, \\u{301}missing');
+    expect(preserved.output).toContain(
+      'Previously selected repository \\u{301}missing is currently unavailable; keeping it in managed_repos.',
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: instance }).managedRepos).toEqual(['repo-a', unavailableName]);
 
     const changed = ptyWizard(
       [{ expect: WS_PROMPT, send: '' }, { expect: REPOS_PROMPT, send: '2' }, ...finishSteps('n')],

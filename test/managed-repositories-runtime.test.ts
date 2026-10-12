@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -9,6 +9,7 @@ import {
   writeConfigText,
 } from '../src/wizard/steps.js';
 import { parseAnswers } from '../src/wizard/answers.js';
+import { validateRepositorySetup } from '../src/wizard/repository-setup.js';
 import type { RepoRef } from '../src/dispatch/github-poll.js';
 import {
   createManagedRepoOverviewTracker,
@@ -196,23 +197,30 @@ describe('managed repository config-to-runtime wiring', () => {
     expect(emptyPaths).toEqual([]);
   });
 
-  it('keeps missing and symlinked selected entries unavailable without widening to siblings', async () => {
+  it('keeps unavailable selections fenced and resolves accepted Unicode trailing spaces consistently', async () => {
     const root = tempDir('gru-managed-repositories-unavailable-');
     const workspace = join(root, 'workspace');
     mkdirSync(workspace);
     makeRepo(workspace, 'alpha');
     makeRepo(workspace, 'beta');
+    const unicodeSpaceName = 'unicode\u00a0';
+    const unicodeSpaceRepo = join(workspace, unicodeSpaceName);
+    mkdirSync(unicodeSpaceRepo);
+    execFileSync('git', ['-C', unicodeSpaceRepo, 'init', '-q']);
+    const canonicalUnicodeSpaceRepo = realpathSync(unicodeSpaceRepo);
     const outside = join(root, 'outside');
     mkdirSync(outside);
     makeRepo(outside, 'outside-project');
     symlinkSync(join(workspace, 'alpha'), join(workspace, 'alias-alpha'));
     symlinkSync(join(outside, 'outside-project'), join(workspace, 'outside-link'));
 
+    expect(parseAnswers(JSON.stringify({ workspace_root: workspace, repos: [unicodeSpaceName] })).repos)
+      .toEqual([unicodeSpaceName]);
     const instance = join(root, 'instance');
     mkdirSync(instance);
     const configText = [
       `workspace_root = ${JSON.stringify(workspace)}`,
-      'managed_repos = ["alpha", "alias-alpha", "missing", "outside-link"]',
+      `managed_repos = ${JSON.stringify(['alpha', 'alias-alpha', 'missing', 'outside-link', unicodeSpaceName])}`,
       '',
     ].join('\n');
     writeFileSync(configPathFor(instance), configText);
@@ -228,15 +236,36 @@ describe('managed repository config-to-runtime wiring', () => {
       sleep: async () => {},
       resolveRemote: async (path) => {
         resolvedPaths.push(path);
-        return defaultRemoteResolver(path);
+        return path === canonicalUnicodeSpaceRepo ? null : defaultRemoteResolver(path);
       },
     });
+    const syncResolution = resolveManagedRepoPathSync(workspace, unicodeSpaceName);
+    let setupPath: string | null = null;
+    let setupError: string | null = null;
+    try {
+      setupPath = validateRepositorySetup(workspace, unicodeSpaceName);
+    } catch (error) {
+      setupError = error instanceof Error ? error.message : String(error);
+    }
     const view = await tracker.refresh();
-    expect(view?.rows.map((row) => row.key)).toEqual(['alias-alpha', 'alpha', 'missing', 'outside-link']);
+    expect({
+      syncKind: syncResolution.kind,
+      syncPath: syncResolution.kind === 'available' ? syncResolution.path : null,
+      setupPath,
+      setupError,
+      asyncResolvedNames: resolvedPaths.map((path) => path.split('/').at(-1)),
+      rowKeys: view?.rows.map((row) => row.key),
+    }).toEqual({
+      syncKind: 'available',
+      syncPath: canonicalUnicodeSpaceRepo,
+      setupPath: canonicalUnicodeSpaceRepo,
+      setupError: null,
+      asyncResolvedNames: ['alpha', unicodeSpaceName],
+      rowKeys: ['alias-alpha', 'alpha', 'missing', 'outside-link', unicodeSpaceName],
+    });
     expect(rowByKey(view, 'missing')?.linkReason).toContain('unavailable');
     expect(rowByKey(view, 'alias-alpha')?.linkReason).toContain('unavailable');
     expect(rowByKey(view, 'outside-link')?.linkReason).toContain('unavailable');
-    expect(resolvedPaths.map((path) => path.split('/').at(-1))).toEqual(['alpha']);
     expect(api.calls.every((call) => call.endsWith('/alpha'))).toBe(true);
     expect(api.calls.some((call) => call.includes('/beta') || call.includes('/outside-project'))).toBe(false);
   });
