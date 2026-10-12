@@ -157,8 +157,14 @@ function classifyVitest(report, requireFile, requireFileSubstrs = []) {
       err: `BASELINE SETUP/COLLECTION FAILURE: module load errors in ${loadErrors.length} suite(s) — not behavioral evidence\n${loadErrors.map((n) => `  load error: ${n}`).join('\n')}`,
     };
   }
+  // Preserve the named instrument's more specific "registered no tests"
+  // report below; every failed companion suite without assertions is setup.
+  const namedInstrument = requireFile === null ? null : suites.find((suite) => String(suite.name).includes(requireFile));
   const unassertedFailures = suites.filter(
-    (suite) => suite.status === 'failed' && (Array.isArray(suite.assertionResults) ? suite.assertionResults : []).length === 0,
+    (suite) =>
+      suite !== namedInstrument &&
+      suite.status === 'failed' &&
+      (Array.isArray(suite.assertionResults) ? suite.assertionResults : []).length === 0,
   );
   if (unassertedFailures.length > 0) {
     return {
@@ -176,7 +182,6 @@ function classifyVitest(report, requireFile, requireFileSubstrs = []) {
   // defines the behavioral claim, assertions from its companion suites are
   // context only: a pre-existing unrelated assertion must never be counted
   // as feature-absence evidence.
-  const namedInstrument = requireFile === null ? null : suites.find((suite) => String(suite.name).includes(requireFile));
   let assertions = 0;
   let excludedAssertions = 0;
   let otherFailures = 0;
