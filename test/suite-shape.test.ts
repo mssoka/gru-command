@@ -217,8 +217,17 @@ describe('suite shape', () => {
           .toContain('test/silas-driver.test.ts -t "native R2|uncredited receipt without its publication attempt"');
         expect(source, 'R2 baseline classifier omits the receipt-only consumer regression')
           .toContain('silas digest (the four actionable states) does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt');
-        expect(source, 'R2 baseline overlays the current helper and masks the fail-before behavior')
+        expect(source, 'R2 baseline must retain the historical helper implementation')
           .toContain('git show "$base:src/dispatch/publication-evidence.ts"');
+        const baselineOverlayFiles = source.match(/for f in ([^\n]+); do/u)?.[1]?.split(/\s+/u) ?? [];
+        expect(baselineOverlayFiles, 'R2 baseline overlays the current helper and masks the fail-before behavior')
+          .not.toContain('src/dispatch/publication-evidence.ts');
+        expect(source, 'R2 baseline directly copies the current helper into the snapshot')
+          .not.toContain('git show "$headrev:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"');
+        expect(source, 'R2 baseline does not derive the compatibility marker from the pinned source')
+          .toContain('git show "$headrev:src/dispatch/publication-evidence.ts"');
+        expect(source, 'R2 baseline hardcodes rather than emits the derived identity event')
+          .toContain("export const PUBLICATION_IDENTITY_EVENT = '%s';");
       }
     }
     const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');

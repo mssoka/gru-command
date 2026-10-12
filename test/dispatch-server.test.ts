@@ -1242,6 +1242,32 @@ describe('dispatch server (E8)', () => {
       if (failedFixtureRoot === undefined) throw new Error('fixture initialization probe did not expose its temp root');
       expect(existsSync(failedFixtureRoot)).toBe(false);
 
+      const initializationError = new Error('controlled initialization error');
+      const cleanupError = new Error('controlled cleanup error');
+      let aggregateFixtureRoot: string | undefined;
+      try {
+        let observedError: unknown;
+        try {
+          makeFixtureRepo('fixture-init-cleanup-aggregate', (step, tempDir) => {
+            if (step === 'git-init') {
+              aggregateFixtureRoot = tempDir;
+              throw initializationError;
+            }
+          }, () => { throw cleanupError; });
+        } catch (error) {
+          observedError = error;
+        }
+        expect(observedError).toBeInstanceOf(AggregateError);
+        if (!(observedError instanceof AggregateError)) throw new Error('fixture cleanup failure did not aggregate');
+        expect(observedError.errors).toHaveLength(2);
+        expect(observedError.errors[0]).toBe(initializationError);
+        expect(observedError.errors[1]).toBe(cleanupError);
+      } finally {
+        if (aggregateFixtureRoot !== undefined) rmSync(aggregateFixtureRoot, { recursive: true, force: true });
+      }
+      if (aggregateFixtureRoot === undefined) throw new Error('aggregate cleanup probe did not expose its temp root');
+      expect(existsSync(aggregateFixtureRoot)).toBe(false);
+
       const repo = makeFixtureRepo('fixture-clean-abort-receipt-only');
       cleanupRepos.push(repo);
       attachBareOrigin(repo);

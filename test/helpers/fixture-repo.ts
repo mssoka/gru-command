@@ -42,13 +42,14 @@ export type FixtureRepoStep = 'tempdir' | 'git-init' | 'seed-files' | 'initial-c
 export function makeFixtureRepo(
   name = 'fixture-app',
   onStep?: (step: FixtureRepoStep, tempDir: string) => void,
+  cleanupTempDir: (tempDir: string) => void = (tempDir) => rmSync(tempDir, { recursive: true, force: true }),
 ): FixtureRepo {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-fixture-'));
   try {
     return initializeFixtureRepo(dir, name, onStep);
   } catch (error) {
     try {
-      rmSync(dir, { recursive: true, force: true });
+      cleanupTempDir(dir);
     } catch (cleanupError) {
       throw new AggregateError([error, cleanupError], `failed to initialize and clean up fixture repository ${name}`);
     }

@@ -31,7 +31,14 @@ for f in test/perkins-builtin-wave.test.ts test/silas-driver.test.ts; do
   git show "$headrev:$f" > "$d/$f"
 done
 git show "$base:src/dispatch/publication-evidence.ts" > "$d/src/dispatch/publication-evidence.ts"
-printf "\\n/** Test-fixture compatibility marker; keep base helper behavior. */\\nexport const PUBLICATION_IDENTITY_EVENT = 'round.publication-identity';\\n" >> "$d/src/dispatch/publication-evidence.ts"
+identity_event=$(git show "$headrev:src/dispatch/publication-evidence.ts" |
+  sed -n "s/^export const PUBLICATION_IDENTITY_EVENT = '\\([^']*\\)';$/\\1/p")
+identity_event_count=$(printf '%s\n' "$identity_event" | grep -c . || true)
+if [ "$identity_event_count" -ne 1 ]; then
+  echo "formal-verdicts-r2 compatibility marker missing or ambiguous at $headrev" >&2
+  exit 2
+fi
+printf "\\n/** Test-fixture compatibility marker; keep base helper behavior. */\\nexport const PUBLICATION_IDENTITY_EVENT = '%s';\\n" "$identity_event" >> "$d/src/dispatch/publication-evidence.ts"
 ln -s "$root/node_modules" "$d/node_modules"
 printf '%s base=%s head=%s\n' "$d" "$base" "$headrev" > "$prep/formal-verdicts-r2-baseline.last-snapshot.txt"
 cd "$d"

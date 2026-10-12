@@ -89,12 +89,19 @@ describe('publication re-arm guard', () => {
     expect(malformed?.kind).toBe('uncredited-receipt');
     expect(malformed?.detail).toContain('unknown');
 
-    const laterAbsence = pendingPublicationAttempt(ledgerWith([
+    const receiptThenAbsence = pendingPublicationAttempt(ledgerWith([
+      { kind: PUBLICATION_RECEIPT_EVENT, seq: 1, payload: { ...attempt, receipt, credited: false, reason: 'recovered receipt' } },
+      { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'contradictory later absence' } },
+    ]), 'receipt-before-absence');
+    expect(receiptThenAbsence?.kind).toBe('uncredited-receipt');
+    expect(receiptThenAbsence?.detail).toContain('9001');
+
+    const malformedThenAbsence = pendingPublicationAttempt(ledgerWith([
       { kind: PUBLICATION_RECEIPT_EVENT, seq: 1, payload: { credited: false, reason: 'malformed' } },
       { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'contradictory later absence' } },
     ]), 'malformed-receipt-before-absence');
-    expect(laterAbsence?.kind).toBe('uncredited-receipt');
-    expect(laterAbsence?.detail).toContain('unknown');
+    expect(malformedThenAbsence?.kind).toBe('uncredited-receipt');
+    expect(malformedThenAbsence?.detail).toContain('unknown');
   });
 
   it('holds an uncredited receipt as a provider write that must be reconciled first', () => {
