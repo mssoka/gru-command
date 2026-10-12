@@ -1413,6 +1413,46 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
+  it('only the bytes available when git exits can complete its answer: a detached writer finishing afterwards is refused whether the runner’s event-loop turns are fast or stalled, async and sync alike; an ordinary buffered answer stays usable (#262)', async () => {
+    const review = branchTargetReview('post-exit-drain');
+    const repo = review.manifest.repoPath;
+    // Stalled turns: every setImmediate in the runner is delayed 25 ms (the
+    // reviewer's repro); inherited by the runner through NODE_OPTIONS.
+    const preload = join(temp('admission-slow-turns-'), 'slow-turns.cjs');
+    writeFileSync(preload, 'globalThis.setImmediate = (fn, ...args) => setTimeout(fn, 25, ...args);\n');
+    const oldOptions = process.env.NODE_OPTIONS;
+    try {
+      for (const turns of ['fast', 'stalled'] as const) {
+        if (turns === 'stalled') process.env.NODE_OPTIONS = `--require ${preload}`;
+        const helperFile = pidFileFor('admission-post-exit-', `helper-${turns}.pid`);
+        // git prints a prefix and exits 0; a helper in its OWN session writes the rest 100 ms later.
+        const writer = `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sh', ['-c', 'sleep 0.1; printf in/feature/post-exit'], { detached: true, stdio: 'inherit' }); require('node:fs').writeFileSync('${helperFile}', String(c.pid)); c.unref()"`;
+        let restore = gitShim('rev-parse', `printf 'refs/remotes/orig'; ${writer}; exit 0`);
+        try {
+          await expect(defaultProbeExec(repo, ['rev-parse', 'x'], 5_000), turns).rejects.toThrow(/output was still held open — the answer is incomplete/);
+          expect(() => runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000), turns).toThrow(/the answer is incomplete/);
+        } finally {
+          restore();
+        }
+        // The helper is left alone: it was not signalled by the step.
+        const helper = Number(readFileSync(helperFile, 'utf8'));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(() => process.kill(helper, 0), turns).toThrow(/ESRCH/); // it ended by itself
+        // An ordinary, already-buffered, complete answer is accepted under the same conditions.
+        restore = gitShim('rev-parse', `printf 'refs/remotes/origin/feature/post-exit\\n'; head -c 200000 /dev/zero | tr '\\0' x; exit 0`);
+        try {
+          expect((await defaultProbeExec(repo, ['rev-parse', 'x'], 5_000)).length, turns).toBe(200_000 + 'refs/remotes/origin/feature/post-exit\n'.length);
+          expect(runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000).length, turns).toBe(200_000 + 'refs/remotes/origin/feature/post-exit\n'.length);
+        } finally {
+          restore();
+        }
+      }
+    } finally {
+      if (oldOptions === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = oldOptions;
+    }
+  });
+
   it('the sync runner’s report lives in a private 0700 directory, removed afterwards (R7-4)', () => {
     const review = branchTargetReview('private-report');
     const modes = join(temp('admission-report-modes-'), 'modes');

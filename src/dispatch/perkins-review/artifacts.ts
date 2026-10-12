@@ -201,11 +201,6 @@ const PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
 /** Diagnostics kept per step; anything longer is marked truncated. */
 const STDERR_MAX_BYTES = 64 * 1024;
 
-/** Once git exits, output already in its pipes is read within a few event-
- * loop turns. Pipes still open after them are held by another process —
- * possibly still writing — so the answer is incomplete (R7-3, R8-1). No
- * writer, owned or not, is waited for. */
-const DRAIN_TURNS = 10;
 /** After the group was SIGKILLed, how long its cessation may take to
  * observe before the step is refused as "cleanup unconfirmed" (owner
  * decision 2026-10-07, R6-5: bounded refusal — never an unbounded wait).
@@ -397,15 +392,15 @@ function cleanupUnconfirmed(pgid: number, message: string): Error {
  * can hold the parent's pipes. */
 const OWNED_GROUP_RUNNER = `
 const { spawn } = require('node:child_process');
-const { writeFileSync } = require('node:fs');
-const [resultFile, limit, maxBytes, maxErrBytes, drainTurns, file, ...args] = process.argv.slice(1);
+const { writeFileSync, readSync } = require('node:fs');
+const [resultFile, limit, maxBytes, maxErrBytes, file, ...args] = process.argv.slice(1);
 const self = process.pid;
 try { process.kill(-self, 0); } catch {
   writeFileSync(resultFile, JSON.stringify({ outcome: 'spawn-error', message: 'the probe runner does not lead its own process group' }), { mode: 0o600 });
   process.exit(127);
 }
 const child = spawn(file, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-const out = []; const err = []; let outBytes = 0; let errBytes = 0; let done = false; let closed = false;
+const out = []; const err = []; let outBytes = 0; let errBytes = 0; let done = false;
 const report = (result) => {
   if (done) return; done = true;
   const stderr = Buffer.concat(err).toString('utf8');
@@ -417,11 +412,32 @@ setTimeout(() => report({ outcome: 'timeout' }), Number(limit));
 child.stdout.on('data', (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else out.push(chunk); });
 child.stderr.on('data', (chunk) => { errBytes += chunk.length; if (errBytes <= Number(maxErrBytes)) err.push(chunk); });
 child.on('error', (error) => report({ outcome: 'spawn-error', message: String(error) }));
-child.on('exit', () => {
-  const drain = (turns) => { if (done || closed) return; if (turns === 0) return report({ outcome: 'incomplete' }); setImmediate(() => drain(turns - 1)); };
-  drain(Number(drainTurns));
+child.on('exit', (code, signal) => {
+  if (done) return;
+  // Only what is already in the pipes when git exits can complete its
+  // answer (#262): read it synchronously, without ever waiting. A pipe that
+  // is not at end-of-file by the first would-block is still held open by
+  // another process, possibly still writing — the answer is incomplete, and
+  // later data or EOF can never revive it. No writer is waited for or signalled.
+  const drain = (stream, take) => {
+    if (stream.destroyed || stream.readableEnded) return true;
+    const fd = stream._handle && stream._handle.fd;
+    if (typeof fd !== 'number' || fd < 0) return false;
+    const buffer = Buffer.allocUnsafe(65536);
+    for (;;) {
+      let n;
+      try { n = readSync(fd, buffer, 0, buffer.length, null); } catch { return false; }
+      if (n === 0) return true;
+      take(Buffer.from(buffer.subarray(0, n)));
+      if (done) return true;
+    }
+  };
+  const outEof = drain(child.stdout, (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else out.push(chunk); });
+  const errEof = drain(child.stderr, (chunk) => { errBytes += chunk.length; if (errBytes <= Number(maxErrBytes)) err.push(chunk); });
+  if (done) return;
+  if (!outEof || !errEof) return report({ outcome: 'incomplete' });
+  report({ outcome: code === 0 ? 'ok' : 'failed', code, signal, stdout: code === 0 ? Buffer.concat(out).toString('utf8') : '' });
 });
-child.on('close', (code, signal) => { closed = true; report({ outcome: code === 0 ? 'ok' : 'failed', code, signal, stdout: code === 0 ? Buffer.concat(out).toString('utf8') : '' }); });
 `;
 
 /** Block for `ms` without spinning (the sync probe's bounded settle). */
@@ -435,7 +451,7 @@ function runnerLaunch(repoPath: string, args: readonly string[], timeoutMs: numb
   const privateDir = mkdtempSync(join(tmpdir(), 'gru-probe-'));
   const resultFile = join(privateDir, 'result.json');
   const argv = ['-e', OWNED_GROUP_RUNNER, resultFile, String(timeoutMs), String(maxBytes), String(STDERR_MAX_BYTES),
-    String(DRAIN_TURNS), 'git', '-C', repoPath, ...args];
+    'git', '-C', repoPath, ...args];
   return { privateDir, resultFile, argv, env: repositoryGitEnv(true) };
 }
 
