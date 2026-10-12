@@ -6040,6 +6040,8 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
     /** Hold every fallback minion turn open until the test releases it, so a
      * transport wait slice can expire while the review is genuinely live. */
     promptHold?: { readonly release: Promise<void> };
+    /** Live session health, read at every wait slice (default idle). */
+    healthState?: () => 'idle' | 'disposed' | 'error';
   }): Promise<{
     wave: WaveRunner;
     job: { readonly id: string };
@@ -6107,7 +6109,7 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
         async steer() {},
         async followUp() {},
         subscribe() { return () => {}; },
-        health() { return { state: options.inBandError === true ? 'error' : 'idle', lastActivity: null, sessionFile: file,
+        health() { return { state: options.healthState?.() ?? (options.inBandError === true ? 'error' : 'idle'), lastActivity: null, sessionFile: file,
           ...(options.inBandError === true ? { error: 'review turn failed in-band after submitting' } : {}) }; },
         async dispose() { disposed.push(`prod-minion-${spawnCwds.length}`); },
       };
@@ -6379,6 +6381,48 @@ describe('production defaultFallbackReview (BLOCKER-1 fix)', () => {
       // The SAME session delivered the review; it was disposed only after.
       expect(h.prompts).toHaveLength(1);
       expect(h.disposed).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+      rmSync(h.root, { recursive: true, force: true });
+      rmSync(h.artifacts, { recursive: true, force: true });
+      rmSync(h.sessions, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['disposed', 'error'] as const)('keeps the first diagnosed %s terminal error when the held prompt rejects late during retry settlement (#176)', async (terminal) => {
+    let rejectPrompt!: (reason: Error) => void;
+    const hold = { release: new Promise<void>((_resolve, reject) => { rejectPrompt = reject; }) };
+    let state: 'idle' | 'disposed' | 'error' = 'idle';
+    let openSettlement!: () => void;
+    const settlementOpen = new Promise<void>((resolve) => { openSettlement = resolve; });
+    let settlementEntered = false;
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const h = await makeProductionGateHarness({
+      findingToWrite: [], promptHold: hold, workerGate: gate, healthState: () => state,
+      retrySettlement: async () => { settlementEntered = true; await settlementOpen; return 'none'; },
+    });
+    vi.useFakeTimers();
+    try {
+      const running = h.wave.runRound({ jobId: h.job.id });
+      await vi.waitFor(() => expect(h.prompts).toHaveLength(1));
+      state = terminal;
+      await vi.advanceTimersByTimeAsync(FALLBACK_REVIEW_TIMEOUT_MS + 1);
+      // Diagnosed, lease released, session still awaiting retry settlement.
+      expect(settlementEntered).toBe(true);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      expect(h.disposed).toEqual([]);
+      // The still-pending prompt now rejects LATE: it must not replace the diagnosis.
+      rejectPrompt(new Error('LATE-PROMPT-REJECTION'));
+      await vi.advanceTimersByTimeAsync(0);
+      openSettlement();
+      const outcome = await running;
+      if (!('route' in outcome)) throw new Error('expected fallback route');
+      expect(outcome.clearToMerge).toBe(false);
+      expect(outcome.note).toContain(`entered terminal state "${terminal}"`);
+      expect(outcome.note).not.toContain('LATE-PROMPT-REJECTION');
+      expect(h.ledger.listEvents({ limit: 100 }).some((event) => (event.payload as { phase?: string }).phase === 'pass')).toBe(false);
+      expect(h.disposed).toHaveLength(1);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
     } finally {
       vi.useRealTimers();
       rmSync(h.root, { recursive: true, force: true });

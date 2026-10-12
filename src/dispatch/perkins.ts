@@ -3926,7 +3926,9 @@ export class WaveRunner {
           const settled = new Promise<PromptTurnVerdict | null>((resolve) => {
             void promptWithTerminalVerdict(session, prompt, { owner: 'bmad-review-gate' }).then(
               resolve,
-              (error) => { promptError = error; resolve(null); },
+              // First diagnosis wins: a rejection that lands after the wait
+              // loop already diagnosed a terminal failure must not replace it.
+              (error) => { if (promptError === null) promptError = error; resolve(null); },
             );
           });
           const aborted = new Promise<never>((_resolve, reject) => {
@@ -3969,7 +3971,7 @@ export class WaveRunner {
           if (abortListener !== null) input.signal.removeEventListener('abort', abortListener);
         }
       } catch (error) {
-        promptError = error;
+        if (promptError === null) promptError = error;
       } finally {
         // Release before the settlement wait: the retry reacquires the slot.
         lease?.release();
