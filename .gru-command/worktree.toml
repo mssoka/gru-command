@@ -495,14 +495,21 @@ perkins-stage1-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest 
 perkins-stage1-adapters = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts && npx vitest run test/supervisor.test.ts test/review-path.test.ts test/verify-perkins-resource.test.ts"
 
 # Stage 1 fails-before baseline: the pinned pre-change head 9bb51b0 source
-# with the IDENTICAL final behavioral tests overlaid (the new transport
-# suite copied in), dependencies linked by symlink, the approved RPC patch
+# with the IDENTICAL final transport suite overlaid (copied in; the
+# perkins-whole-review / perkins-builtin-wave suites cannot be overlaid any
+# more: current main imports helpers and modules that do not exist at the
+# pinned base, so they fail at collection and prove nothing), dependencies linked by symlink, the approved RPC patch
 # prerequisite and the unchanged Vitest config/budgets. Expected RED: the
-# retired lifetime and the wait/reattach contracts the baseline lacks. The
-# Vitest exit status is echoed intact and never masked into a PASS; a
-# baseline that passes is called out as a broken fail-before claim. The
-# snapshot directory and ignored pointer file are preserved for inspection.
-perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reliability-stage1; mkdir -p "$prep"; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; headrev=$(git rev-parse HEAD); d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-reliability-stage1.XXXXXX"); git archive "$base" | tar -x -C "$d" || { echo "baseline archive failed"; exit 3; }; cp test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts "$d/test/"; ln -s "$root/node_modules" "$d/node_modules"; printf "perkins-reliability-stage1-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-reliability-stage1-baseline.last-snapshot.txt"; ( cd "$d" && node tools/patch-vitest-rpc-timeout.mjs >/dev/null 2>&1; npx vitest run test/review-mcp-transport.test.ts test/perkins-whole-review.test.ts test/perkins-builtin-wave.test.ts -t "count-bounded|crossing the retired|open at the transport wait|join an identical|wait-expired|malformed wait" ); a=$?; echo "baseline pre-change $base + current tests exit=$a EXPECTED-NONZERO"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; fi; exit 1'
+# retired lifetime and the wait/reattach contracts the baseline lacks.
+# Distinct exits (GH-175): 3 = a setup/prerequisite step (archive, overlay,
+# link, snapshot pointer, RPC patch) failed, diagnostic printed and Vitest
+# NOT run; 4 = the baseline passed unexpectedly (broken fail-before claim);
+# 5 = Vitest failed without a failing selected test (collection/infra);
+# 6 = a -t fragment matched no executed test (vacuous selection, checked
+# against the JSON report by tools/stage1-baseline-verdict.mjs); 1 = the
+# genuine, verified assertion RED the scheduler expects. The Vitest exit is
+# echoed intact; the snapshot directory and ignored pointer file are kept.
+perkins-stage1-baseline = 'root="$PWD"; prep=_bmad-output/gate-prep/perkins-reliability-stage1; base=9bb51b05af5d8f0a0cd389788d1d3f19607d5361; fail() { printf "BASELINE PREREQUISITE FAILED (exit 3): %s; vitest was NOT run\n" "$1"; exit 3; }; mkdir -p "$prep" || fail "cannot create $prep"; headrev=$(git rev-parse HEAD) || fail "cannot resolve HEAD"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-perkins-reliability-stage1.XXXXXX") || fail "cannot create snapshot directory"; git archive "$base" -o "$d/base.tar" || fail "git archive of $base failed (is the pinned base fetched?)"; tar -x -C "$d" -f "$d/base.tar" || fail "cannot extract the $base archive into $d"; rm -f "$d/base.tar"; cp test/review-mcp-transport.test.ts "$d/test/" || fail "cannot overlay the final tests into $d/test"; ln -s "$root/node_modules" "$d/node_modules" || fail "cannot link node_modules into $d"; printf "perkins-reliability-stage1-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/perkins-reliability-stage1-baseline.last-snapshot.txt" || fail "cannot write the snapshot pointer"; cd "$d" || fail "cannot enter $d"; node tools/patch-vitest-rpc-timeout.mjs > "$d/rpc-patch.log" 2>&1 || { cat "$d/rpc-patch.log"; fail "RPC patch exited non-zero (diagnostic above, also $d/rpc-patch.log)"; }; npx vitest run test/review-mcp-transport.test.ts -t "joins an identical|wait-expired|malformed wait" --reporter=default --reporter=json --outputFile.json="$d/baseline-report.json"; a=$?; echo "baseline pre-change $base + current tests vitest exit=$a"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN (exit 4): baseline passed unexpectedly; not accepted as fail-before evidence"; exit 4; fi; node "$root/tools/stage1-baseline-verdict.mjs" "$d/baseline-report.json" "joins an identical" "wait-expired" "malformed wait"; v=$?; if [ "$v" -ne 0 ]; then exit "$v"; fi; echo "EXPECTED-NONZERO: genuine pre-change assertion RED"; exit 1'
 
 # Verification single-flight + exclusive capture (issue #159): the
 # scheduler's single-flight/reconcile/attach admission suites, the capture
