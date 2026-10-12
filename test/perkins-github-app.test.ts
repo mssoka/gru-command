@@ -3492,3 +3492,64 @@ describe('startup wiring pin (src/main.ts)', () => {
     expect(main).not.toMatch(/poster:\s*new GhPrPoster\(/u);
   });
 });
+
+describe('App contract baseline scope (#190)', () => {
+  const script = join(import.meta.dirname, '..', 'tools', 'app-contract-baseline.sh');
+  const repoRoot = join(import.meta.dirname, '..');
+
+  /** A shared-object clone of this repository at its HEAD, so the script's
+   * `git archive`/`git show` run for real without touching this checkout. */
+  function scopeClone(): { readonly dir: string; readonly tmp: string } {
+    const tmp = mkdtempSync(join(tmpdir(), 'app-baseline-scope-'));
+    const dir = join(tmp, 'clone');
+    execFileSync('git', ['clone', '--quiet', '--shared', repoRoot, dir], { stdio: 'ignore' });
+    execFileSync('git', ['-C', dir, 'checkout', '--quiet', '--detach', execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()], { stdio: 'ignore' });
+    return { dir, tmp };
+  }
+
+  function runScope(dir: string, tmp: string, env: Record<string, string> = {}): { status: number; out: string } {
+    try {
+      const out = execFileSync('sh', [script, '--scope-only'], {
+        cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, TMPDIR: tmp, ...env },
+      });
+      return { status: 0, out };
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: string; stderr?: string };
+      return { status: failure.status ?? -1, out: `${failure.stdout ?? ''}${failure.stderr ?? ''}` };
+    }
+  }
+
+  it('accepts the committed current contract, labels an older overlay as a historical subset, and fails when the exercised file or pin disagrees with the checkout', () => {
+    const { dir, tmp } = scopeClone();
+    try {
+      const current = runScope(dir, tmp);
+      expect(current.status, current.out).toBe(0);
+      expect(current.out).toMatch(/match the current pin/u);
+      expect(current.out).not.toMatch(/HISTORICAL/u);
+
+      const historical = runScope(dir, tmp, { APP_BASELINE_HEADREV: '0c4e129725eb1b8f5af0ee40b14ecdbf5bd33221' });
+      expect(historical.status, historical.out).toBe(0);
+      expect(historical.out).toMatch(/HISTORICAL SUBSET/u);
+
+      // The checkout's test file drifts from the committed overlay.
+      const testFile = join(dir, 'test', 'perkins-github-app.test.ts');
+      const original = readFileSync(testFile, 'utf8');
+      writeFileSync(testFile, `${original}\n// drift\n`, 'utf8');
+      const driftedTest = runScope(dir, tmp);
+      expect(driftedTest.status).toBe(3);
+      expect(driftedTest.out).toMatch(/app scope check failed: test\/perkins-github-app\.test\.ts/u);
+      writeFileSync(testFile, original, 'utf8');
+
+      // The checkout's pin drifts from the committed overlay.
+      const pinFile = join(dir, 'test', 'suite-shape.test.ts');
+      const pins = readFileSync(pinFile, 'utf8');
+      writeFileSync(pinFile, pins.replace(/('perkins-github-app\.test\.ts': )\d+/u, '$1999'), 'utf8');
+      const driftedPin = runScope(dir, tmp);
+      expect(driftedPin.status).toBe(3);
+      expect(driftedPin.out).toMatch(/app scope check failed: test\/suite-shape\.test\.ts/u);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
