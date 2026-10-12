@@ -1,7 +1,6 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, readdirSync } from 'node:fs';
 import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { TextDecoder } from 'node:util';
-import { devNull } from 'node:os';
 import { defaultGhRunner, ghApiJson, GhRateLimitedError, type GhCommandRunner } from '../dispatch/github-poll.js';
 import { isGitHubRemote, repoRemote, type RepoRemote } from '../dispatch/review-path.js';
 import { readServiceUploadIdentity } from '../review-inputs/evidence.js';
@@ -268,7 +267,7 @@ export async function captureSources(repo: string, source: IntakeSource, ports: 
     let coordinates: ReturnType<typeof issueCoordinates>;
     try {
       const remote = ports.remote === undefined
-        ? repoRemote(repo, 'git', { PATH: process.env.PATH, LC_ALL: 'C', GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1' })
+        ? repoRemote(repo)
         : ports.remote(repo);
       coordinates = issueCoordinates(source.reference, remote);
     }
