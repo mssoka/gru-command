@@ -9,15 +9,11 @@
  * regression below must therefore fail BEHAVIORALLY — for a formal-event
  * reason, not because the overlay could not be imported or collected.
  *
- * What counts as behavioral RED: a failed named assertion whose message
- * carries a Vitest/Chai assertion frame (`AssertionError` / `_Assertion`),
- * Vitest's resolved-instead-of-rejected matcher phrase, or the state-mismatch
- * refusal the base poster itself raises. Import/collection/setup signatures
- * (`Cannot find module`, missing exports, syntax/reference errors, unloadable
- * urls, empty suites) are never accepted, and the named titles are pinned so
- * the claim cannot drift to unrelated failures. A leg that passes, an
- * unparseable report, or a named regression that failed for a non-behavioral
- * reason breaks the fails-before claim (exit 2) instead of proving it.
+ * The strict formal-event classifier requires each pinned test's unique
+ * FORMAL_EVENT_ASSERTION marker, emitted only around its intended contract
+ * assertion. A generic assertion elsewhere in that test is not proof. The
+ * separate named-red classifier retains the historical shared behavior for
+ * R2-R6 baselines. Import/collection/setup signatures are rejected by both.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -40,6 +36,24 @@ export const EXPECTED_FORMAL_EVENT_ASSERTIONS = Object.freeze({
   ]),
 });
 
+/** Unique tags emitted only when the contract assertion in each pinned test
+ * fails. A different assertion in the same test cannot prove fail-before. */
+export const EXPECTED_FORMAL_EVENT_FAILURE_MARKERS = Object.freeze({
+  app: Object.freeze([
+    'FORMAL_EVENT_ASSERTION:app-approve-receipt',
+    'FORMAL_EVENT_ASSERTION:app-request-changes-receipt',
+    'FORMAL_EVENT_ASSERTION:app-wrong-state-refusal',
+    'FORMAL_EVENT_ASSERTION:app-approval-reconciliation',
+    'FORMAL_EVENT_ASSERTION:app-gitlab-formal-intent-refusal',
+  ]),
+  wave: Object.freeze([
+    'FORMAL_EVENT_ASSERTION:wave-wrong-state-reconciliation',
+    'FORMAL_EVENT_ASSERTION:wave-native-event-lifecycle',
+    'FORMAL_EVENT_ASSERTION:wave-host-wrong-state-refusal',
+    'FORMAL_EVENT_ASSERTION:wave-github-commit-binding',
+  ]),
+});
+
 /** Import/collection/setup signatures an overlay failure must never carry. */
 export const NON_BEHAVIORAL_FAILURE_SIGNATURES = Object.freeze([
   /Cannot find module/u,
@@ -52,19 +66,20 @@ export const NON_BEHAVIORAL_FAILURE_SIGNATURES = Object.freeze([
   /ERR_MODULE_NOT_FOUND/u,
 ]);
 
-/** Behavioral markers: a real assertion frame, Vitest's rejection matcher,
- * or the formal-state mismatch the COMMENT-only base itself enforces. */
+/** Behavioral markers for the legacy shared named-red classifier. Formal
+ * verdict baselines additionally require their per-test assertion marker. */
 export const BEHAVIORAL_FAILURE_MARKERS = Object.freeze([
   /AssertionError/u,
   /_Assertion/u,
   /instead of rejecting|instead of resolving/u,
   /state mismatch|enacted (?:APPROVED|CHANGES_REQUESTED|COMMENTED) instead of/u,
+  /FORMAL_EVENT_ASSERTION:/u,
 ]);
 
 /** Verify one leg: parseable report, no collection/setup failures, and every
  * required formal-event assertion failed behaviorally. Returns the proof
  * line; throws with the observed failed titles when the claim is broken. */
-export function assertFormalVerdictsBaselineLeg(label, report, requiredTitles) {
+export function assertNamedRedBaselineLeg(label, report, requiredTitles) {
   if (report === null || typeof report !== 'object' || report.numFailedTests < 1 || !Array.isArray(report.testResults)) {
     throw new Error(`${label}: no failed tests in a parseable Vitest report; import/setup failure is not behavioral RED`);
   }
@@ -114,6 +129,31 @@ export function assertFormalVerdictsBaselineLeg(label, report, requiredTitles) {
     (result) => result.status === 'failed' && !required.has(nameOf(result)),
   ).length;
   return `${label}: formal-event absence proven — ${requiredTitles.length} named assertion(s) RED behaviorally; ${excluded} unrelated failure(s) excluded from the claim`;
+}
+
+/** Strict classifier for the formal-event baseline only: every pinned test
+ * must fail through its designated contract assertion, not merely any
+ * assertion somewhere in the same test body. */
+export function assertFormalVerdictsBaselineLeg(label, report, requiredTitles) {
+  const expectedTitles = EXPECTED_FORMAL_EVENT_ASSERTIONS[label];
+  const expectedMarkers = EXPECTED_FORMAL_EVENT_FAILURE_MARKERS[label];
+  if (expectedTitles === undefined || expectedMarkers === undefined ||
+    requiredTitles.length !== expectedTitles.length || requiredTitles.some((title, index) => title !== expectedTitles[index])) {
+    throw new Error(`${label}: formal-event baseline does not match its pinned assertion titles`);
+  }
+  const proof = assertNamedRedBaselineLeg(label, report, requiredTitles);
+  const results = report.testResults.flatMap((file) => file.assertionResults ?? []);
+  for (const [index, title] of requiredTitles.entries()) {
+    const assertion = results.find((result) =>
+      (typeof result.fullName === 'string' && result.fullName !== '' ? result.fullName : result.title) === title &&
+      result.status === 'failed');
+    const marker = expectedMarkers[index];
+    if (assertion === undefined || marker === undefined || !Array.isArray(assertion.failureMessages) ||
+      !assertion.failureMessages.some((message) => typeof message === 'string' && message.includes(marker))) {
+      throw new Error(`${label}: ${title} failed without its intended formal-event assertion marker ${marker ?? '(missing marker)'}`);
+    }
+  }
+  return proof;
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {

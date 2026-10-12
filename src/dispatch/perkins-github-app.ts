@@ -751,7 +751,6 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // provider's enacted state is verified against exactly this below.
     const wantedState = enactedStateFor(input.reviewEvent);
     const { grant, botLogin, owner, repo, prNumber, headSha, baseSha } = await this.prepare(input);
-    const postStartMs = this.now();
     // The round may have been cancelled/superseded while the preparation
     // probes were outstanding: never start the irreversible POST for an
     // already-cancelled round (the round signal is combined with every
@@ -761,7 +760,14 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     }
     // Bind the prepared App-bot identity durably BEFORE the write so a
     // restart can prove the reconciliation lookup ran as the same account.
+    // This synchronous journal boundary can take time; re-check cancellation
+    // after it and anchor the ambiguous-POST recency window immediately
+    // before the provider request, not before the durable callback.
     input.onPreparedIdentity?.(botLogin);
+    if (input.signal?.aborted) {
+      throw new PerkinsAppError('review delivery cancelled before the irreversible POST — no review was created');
+    }
+    const postStartMs = this.now();
     let review: unknown;
     try {
       review = (await this.callApi('POST review delivery', `${API_ROOT}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {

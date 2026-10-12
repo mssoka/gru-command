@@ -20,6 +20,15 @@ import {
 import { AutoVerdictPoster, GhPrPoster, GitLabMrPoster, type VerdictPoster, type VerdictPosterInput } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
+async function assertFormalEventAssertion(tag: string, assertion: () => unknown): Promise<void> {
+  try {
+    await assertion();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`FORMAL_EVENT_ASSERTION:${tag}\n${detail}`, { cause: error });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures: synthetic keys, fixture homes, fixture repo, mocked api.github.com
 // ---------------------------------------------------------------------------
@@ -1464,6 +1473,32 @@ describe('bounded ambiguous-POST reconciliation', () => {
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/NOT re-posted/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('anchors ambiguous-post recency after the prepared-identity callback returns', async () => {
+    const fixture = bundleFixture();
+    let now = NOW;
+    // The matching review predates the actual POST by more than the 60 s
+    // clock-skew allowance, but would fit if the window were captured before
+    // the synchronous identity-journal callback stalled for ten seconds.
+    const older = {
+      ...MATCHING_REVIEW,
+      id: 111223,
+      state: 'APPROVED',
+      submitted_at: new Date(NOW - 59_000).toISOString(),
+    };
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [older] }) },
+    ], { now: () => now });
+    await expect(poster.post({
+      ...PR_INPUT,
+      repoPath: repoPathOf(fixture),
+      reviewEvent: 'APPROVE',
+      onPreparedIdentity: () => { now += 10_000; },
+    })).rejects.toThrow(/proved no matching App review/u);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    expect(calls.filter((call) => call.method === 'GET' && call.url.includes('/reviews?'))).toHaveLength(1);
   });
 
   it('a post-failure reconciliation fails closed: no second lookup, no credit, never absence', async () => {
@@ -3381,9 +3416,10 @@ describe('formal GitHub verdict publication', () => {
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('APPROVED') }) },
     ]);
     const receipt = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'APPROVE' });
-    expect(receipt).toEqual({ ...RECEIPT, event: 'APPROVED' });
+    await assertFormalEventAssertion('app-approve-receipt', () => expect(receipt).toEqual({ ...RECEIPT, event: 'APPROVED' }));
     const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
-    expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'APPROVE', commit_id: HEAD });
+    await assertFormalEventAssertion('app-approve-receipt', () =>
+      expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'APPROVE', commit_id: HEAD }));
   });
 
   it('delivers a formal REQUEST_CHANGES bound to the frozen head and proves the CHANGES_REQUESTED state (formal GitHub)', async () => {
@@ -3392,9 +3428,10 @@ describe('formal GitHub verdict publication', () => {
       { method: 'POST', test: /\/repos\/acme\/widget\/pulls\/7\/reviews$/, handler: async () => ({ status: 200, body: botReview('CHANGES_REQUESTED') }) },
     ]);
     const receipt = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture), reviewEvent: 'REQUEST_CHANGES' });
-    expect(receipt).toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' });
+    await assertFormalEventAssertion('app-request-changes-receipt', () => expect(receipt).toEqual({ ...RECEIPT, event: 'CHANGES_REQUESTED' }));
     const post = calls.find((call) => call.method === 'POST' && call.url.endsWith('/reviews'))!;
-    expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'REQUEST_CHANGES', commit_id: HEAD });
+    await assertFormalEventAssertion('app-request-changes-receipt', () =>
+      expect(JSON.parse(post.body!)).toEqual({ body: 'review body\n', event: 'REQUEST_CHANGES', commit_id: HEAD }));
   });
 
   it('never credits a COMMENTED review beside an approval intent and never re-posts (formal GitHub)', async () => {
@@ -3408,7 +3445,7 @@ describe('formal GitHub verdict publication', () => {
       .then(() => null, (cause: unknown) => cause as Error);
     // The wrong-state delivery MUST be refused: an unresolved (or resolved)
     // publication here means the false absence or a credited comment.
-    expect(error, 'the wrong-state delivery must be refused as an error').toBeInstanceOf(PerkinsAppError);
+    await assertFormalEventAssertion('app-wrong-state-refusal', () => expect(error).toBeInstanceOf(PerkinsAppError));
     // The submission time IS parseable here, so the wrong-state branch must
     // be the one that refuses — never the false "did not land" certificate.
     expect(error!.message).toMatch(/found in state COMMENTED instead of the intended APPROVED/u);
@@ -3440,7 +3477,7 @@ describe('formal GitHub verdict publication', () => {
     }
   });
 
-  it('cancels before the irreversible POST when the round aborts during a suspended preparation probe (formal GitHub)', async () => {
+  it('cancels before the irreversible POST when abort occurs during preparation or identity journaling (formal GitHub)', async () => {
     const fixture = bundleFixture();
     const controller = new AbortController();
     let releaseMint: (() => void) | null = null;
@@ -3476,6 +3513,23 @@ describe('formal GitHub verdict publication', () => {
     expect(error?.message).toMatch(/cancelled before the irreversible POST/u);
     expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
     expect(calls.some((call) => call.url.endsWith('/reviews'))).toBe(false);
+
+    // The durable identity callback is synchronous and sits between the
+    // first cancellation check and the POST. Cancellation during that
+    // boundary must be checked again before calling the provider.
+    const callbackFixture = bundleFixture();
+    const callbackController = new AbortController();
+    const callbackPoster = posterWith(callbackFixture);
+    const callbackError = await callbackPoster.poster.post({
+      ...PR_INPUT,
+      repoPath: repoPathOf(callbackFixture),
+      reviewEvent: 'APPROVE',
+      signal: callbackController.signal,
+      onPreparedIdentity: () => callbackController.abort(),
+    }).then(() => null, (cause: unknown) => cause as Error);
+    expect(callbackError).toBeInstanceOf(PerkinsAppError);
+    expect(callbackError?.message).toMatch(/cancelled before the irreversible POST/u);
+    expect(callbackPoster.calls.some((call) => call.url.endsWith('/reviews'))).toBe(false);
   });
 
   it('starts no provider work at all when the round is already cancelled (formal GitHub)', async () => {
@@ -3495,8 +3549,9 @@ describe('formal GitHub verdict publication', () => {
     const approved = posterWith(approvedFixture, [
       { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [botReview('COMMENTED'), botReview('APPROVED')] }) },
     ]);
-    await expect(approved.poster.reconcile({ ...PR_INPUT, repoPath: repoPathOf(approvedFixture), reviewEvent: 'APPROVE' }))
-      .resolves.toEqual({ ...RECEIPT, event: 'APPROVED' });
+    await assertFormalEventAssertion('app-approval-reconciliation', () =>
+      expect(approved.poster.reconcile({ ...PR_INPUT, repoPath: repoPathOf(approvedFixture), reviewEvent: 'APPROVE' }))
+        .resolves.toEqual({ ...RECEIPT, event: 'APPROVED' }));
 
     // A covered list with only a comment review is an explicit UNRESOLVED,
     // never a null absence certificate for an intended approval.
@@ -3538,10 +3593,10 @@ describe('formal GitHub verdict publication', () => {
           return { ok: true, status: 200, text: async () => JSON.stringify({ sha: HEAD, diff_refs: { base_sha: BASE } }) };
         },
       });
-      await expect(poster.post({
+      await assertFormalEventAssertion('app-gitlab-formal-intent-refusal', () => expect(poster.post({
         prUrl: 'https://gitlab.example.test/acme/widget/-/merge_requests/7', host: 'gitlab.example.test', repoPath,
         body: 'review body\n', targetSha: HEAD, baseSha: BASE, reviewEvent: 'APPROVE',
-      })).rejects.toThrow(/cannot enact review event APPROVE/u);
+      })).rejects.toThrow(/cannot enact review event APPROVE/u));
       expect(calls.filter((call) => call.method === 'POST')).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });

@@ -10,7 +10,7 @@
  */
 import { readFileSync } from 'node:fs';
 import process from 'node:process';
-import { assertFormalVerdictsBaselineLeg } from './assert-formal-verdicts-baseline.mjs';
+import { assertNamedRedBaselineLeg } from './assert-formal-verdicts-baseline.mjs';
 
 const [label, path, ...titles] = process.argv.slice(2);
 if (label === undefined || path === undefined || titles.length === 0) {
@@ -19,7 +19,7 @@ if (label === undefined || path === undefined || titles.length === 0) {
 } else {
   try {
     const report = JSON.parse(readFileSync(path, 'utf8'));
-    process.stdout.write(`${assertFormalVerdictsBaselineLeg(label, report, titles)}\n`);
+    process.stdout.write(`${assertNamedRedBaselineLeg(label, report, titles)}\n`);
   } catch (error) {
     process.stderr.write(`FAILS-BEFORE CLAIM BROKEN: ${String(error)}\n`);
     process.exitCode = 2;

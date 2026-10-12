@@ -743,9 +743,10 @@ formal-verdicts-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lin
 # no download/install, no branch mutation, approved RPC patch prerequisite,
 # unchanged Vitest configs/budgets. The new regressions import only APIs the
 # base already exposes, and their fixture posters enact the intent they are
-# handed (the base passes none), so every selected case REDs by BEHAVIORAL
-# assertion: the old host sends `event: "COMMENT"` and records no wanted
-# formal event. A collection/setup/import failure is not RED evidence. The
+# handed (the base passes none), so every selected case REDs at its specific
+# formal-event contract assertion, identified by a unique marker; a generic
+# assertion elsewhere in the same test is not RED evidence. A collection/
+# setup/import failure is not RED evidence. The
 # vitest exit is echoed intact and never masked; the snapshot directory and
 # the ignored pointer file are preserved for inspection; nothing is deleted
 # or checked out and no branch/worktree holds the sha.

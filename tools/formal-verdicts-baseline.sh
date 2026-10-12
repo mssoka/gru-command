@@ -5,13 +5,12 @@
 # Runs the FINAL committed behavioral suites (the two files that carry the
 # formal-event regressions) against an isolated git-archive snapshot of the
 # recorded pre-change base d0e6389 — the COMMENT-only publisher that sends
-# `event: "COMMENT"` and enforces `COMMENTED`. Expected result is RED by
-# BEHAVIORAL ASSERTION: the named regressions assert that an eligible native
-# judgment publishes a real APPROVED/CHANGES_REQUESTED event and that a
-# wrong-state receipt is refused, none of which the base can do. The vitest
-# exits are echoed intact; a pass on either leg, a collection/setup/import
-# failure, or a named regression that did not fail as an AssertionError is
-# classified by tools/assert-formal-verdicts-baseline.mjs and exits 2. The
+# `event: "COMMENT"` and enforces `COMMENTED`. Expected result is RED at the
+# specific formal-event contract assertions, each carrying its unique
+# FORMAL_EVENT_ASSERTION marker; an unrelated assertion in the same test is
+# not evidence. The vitest exits are echoed intact; a pass on either leg, a
+# collection/setup/import failure, or a missing contract marker is classified
+# by tools/assert-formal-verdicts-baseline.mjs and exits 2. The
 # snapshot directory and the ignored pointer file are preserved for
 # inspection; nothing is deleted or checked out; no branch/worktree holds
 # the base sha; dependencies are only symlinked, never installed; the lane

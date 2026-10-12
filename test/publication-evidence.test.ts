@@ -4,6 +4,7 @@ import {
   PUBLICATION_ATTEMPT_EVENT,
   PUBLICATION_REBIND_UNRESOLVED_EVENT,
   PUBLICATION_RECEIPT_EVENT,
+  parsePublicationAbsentPayload,
   parsePublicationAttemptPayload,
   parsePublicationIdentityPayload,
   pendingPublicationAttempt,
@@ -161,6 +162,18 @@ describe('publication re-arm guard', () => {
       { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
       { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET } },
     ]), 'r1')?.kind).toBe('unresolved-attempt');
+
+    // Matching arbitrary strings are not publication-digest evidence. Both
+    // the intent and the absence marker must carry canonical SHA-256 hex.
+    const malformedDigests = ['x', 'a'.repeat(63), 'g'.repeat(64), 'A'.repeat(64), 'a'.repeat(65)];
+    for (const [index, digest] of malformedDigests.entries()) {
+      expect(parsePublicationAttemptPayload({ ...attempt, publicationSha256: digest })).toBeNull();
+      expect(parsePublicationAbsentPayload({ targetSha: TARGET, publicationSha256: digest, detail: 'bounded absence' })).toBeNull();
+      expect(pendingPublicationAttempt(ledgerWith([
+        { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: { ...attempt, publicationSha256: digest } },
+        { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: digest, detail: 'bounded absence' } },
+      ]), `malformed-digest-${index}`)?.kind).toBe('unresolved-attempt');
+    }
   });
 
   it('holds a recorded delivery that predates the attempt as recorded-but-uncredited', () => {

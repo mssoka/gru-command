@@ -47,6 +47,15 @@ import {
 } from '../web/src/lib/board-protocol.js';
 import { terminalBoundNotificationIds } from '../web/src/lib/board-signals.js';
 
+async function assertFormalEventAssertion(tag: string, assertion: () => unknown): Promise<void> {
+  try {
+    await assertion();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`FORMAL_EVENT_ASSERTION:${tag}\n${detail}`, { cause: error });
+  }
+}
+
 /** These suites exercise the Perkins route (no pre-flight configured), so
  * every runRound result must be a wave outcome; the helper pins that. */
 function asWave(outcome: WaveOutcome | FallbackGateOutcome): WaveOutcome {
@@ -693,7 +702,8 @@ describe('GitHub SHA-bound Perkins delivery', () => {
     };
     // The COMMENTED review cannot be credited as an approval, and it also
     // forbids an absence certificate: the lookup stays openly unresolved.
-    await expect(poster.reconcile!(input)).rejects.toThrow(/wrong state|instead of the required APPROVED|unresolved/u);
+    await assertFormalEventAssertion('wave-wrong-state-reconciliation', () =>
+      expect(poster.reconcile!(input)).rejects.toThrow(/wrong state|instead of the required APPROVED|unresolved/u));
     rmSync(root, { recursive: true, force: true });
   });
 });
@@ -4219,15 +4229,15 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     };
   }
 
-  it('refuses a GitHub receipt with no commit binding at the host boundary (formal GitHub)', () => {
+  it('refuses a GitHub receipt with no commit binding at the host boundary (formal GitHub)', async () => {
     const bodySha256 = createHash('sha256').update('review body\n', 'utf8').digest('hex');
     const receipt = {
       reviewId: '9001', actor: 'gru-bot', event: 'APPROVED', commitId: null,
       headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), bodySha256,
     };
-    expect(() => verifyPostedReceipt(receipt, {
+    await assertFormalEventAssertion('wave-github-commit-binding', () => expect(() => verifyPostedReceipt(receipt, {
       targetSha: receipt.headSha, bodySha256, event: receipt.event, providerKind: 'github',
-    })).toThrow(/missing the reviewed commit binding/);
+    })).toThrow(/missing the reviewed commit binding/));
     // GitLab notes are not server-side commit-bound; the host's confirmed
     // head probe remains their binding and a null commit id stays valid.
     expect(verifyPostedReceipt({ ...receipt, event: 'note' }, {
@@ -6902,6 +6912,14 @@ describe('repair pass 3: GitLab note reconciliation fails closed (R3/T7)', () =>
     }));
     const { poster, repoPath } = gitlabDouble({ notePages: [filler, []] });
     await expect(poster.reconcile!(input(repoPath))).resolves.toBeNull();
+
+    // An entry whose body is absent or not provider-typed cannot be excluded
+    // from a complete list's absence proof: it may be an undecidable note.
+    for (const malformed of [null, {}, { id: 81, body: 42, author: { username: 'someone-else' } }]) {
+      const undecidable = gitlabDouble({ notePages: [[malformed]] });
+      await expect(undecidable.poster.reconcile!(input(undecidable.repoPath)))
+        .rejects.toThrow(/undecidable note record.*never assume absence/u);
+    }
   });
 
   it('treats an exhausted pagination bound as unresolved, never as absence (R4)', async () => {
@@ -9245,14 +9263,16 @@ describe('formal GitHub verdict publication from native judgments', () => {
     // REAL approval bound to the frozen head.
     const first = asWave(await runner(fix, poster, groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }), {}, escalations).runRound({ jobId: 'job-formal-lifecycle' }));
     expect(first.canonicalVerdict, escalations.join('\n')).toBe('READY TO MERGE');
-    expect(postedIntent(fix.ledger, first.round.id)).toEqual({ reviewEvent: 'APPROVE', enacted: 'APPROVED', reconciled: false });
+    await assertFormalEventAssertion('wave-native-event-lifecycle', () =>
+      expect(postedIntent(fix.ledger, first.round.id)).toEqual({ reviewEvent: 'APPROVE', enacted: 'APPROVED', reconciled: false }));
 
     // Round 2 — a confirmed blocker inside the delta: a REAL change request.
     fix.repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 44;\n}\n');
     fix.repo.git(['push', '--quiet', 'origin', 'feature/formal-scenario']);
     const second = asWave(await runner(fix, poster, groundedFinding('lead', 'blocker', { location: 'src/main.ts:2', title: 'delta blocker' }), {}, escalations).runRound({ jobId: 'job-formal-lifecycle' }));
     expect(second.canonicalVerdict, escalations.join('\n')).toBe('NEEDS CHANGES');
-    expect(postedIntent(fix.ledger, second.round.id)).toEqual({ reviewEvent: 'REQUEST_CHANGES', enacted: 'CHANGES_REQUESTED', reconciled: false });
+    await assertFormalEventAssertion('wave-native-event-lifecycle', () =>
+      expect(postedIntent(fix.ledger, second.round.id)).toEqual({ reviewEvent: 'REQUEST_CHANGES', enacted: 'CHANGES_REQUESTED', reconciled: false }));
 
     // Round 3 — the blocker is corrected in the delta and the lead confirms
     // it fixed: a delta READY that still owes its final whole-change pass.
@@ -9271,13 +9291,15 @@ describe('formal GitHub verdict publication from native judgments', () => {
     const deltaRound = rounds.find((round) => round.seq === 3)!;
     expect(fix.ledger.latestRoundEvent(deltaRound.id, 'round.perkins-review')?.payload)
       .toMatchObject({ canonicalVerdict: 'READY TO MERGE', reviewScope: 'delta', finalPassRequired: true });
-    expect(postedIntent(fix.ledger, deltaRound.id)).toEqual({ reviewEvent: 'COMMENT', enacted: 'COMMENTED', reconciled: false });
+    await assertFormalEventAssertion('wave-native-event-lifecycle', () =>
+      expect(postedIntent(fix.ledger, deltaRound.id)).toEqual({ reviewEvent: 'COMMENT', enacted: 'COMMENTED', reconciled: false }));
 
     // Round 4 — the eligible final whole-change READY publishes a real
     // approval, clearing the bot's earlier change-request state on the
     // provider while both rounds keep their truthful review history.
     expect(outcome.canonicalVerdict).toBe('READY TO MERGE');
-    expect(postedIntent(fix.ledger, outcome.round.id)).toEqual({ reviewEvent: 'APPROVE', enacted: 'APPROVED', reconciled: false });
+    await assertFormalEventAssertion('wave-native-event-lifecycle', () =>
+      expect(postedIntent(fix.ledger, outcome.round.id)).toEqual({ reviewEvent: 'APPROVE', enacted: 'APPROVED', reconciled: false }));
     // No round ever recorded a formal event its receipt did not prove.
     for (const round of rounds) {
       const recorded = postedIntent(fix.ledger, round.id);
@@ -9305,7 +9327,8 @@ describe('formal GitHub verdict publication from native judgments', () => {
     const outcome = asWave(await runner(fix, poster, groundedFinding('lead', 'warning', { location: 'src/main.ts:1', evidence: 'export function answer(): number {' }), {}, escalations).runRound({ jobId: 'job-formal-wrong-state' }));
     // The lead judged READY, but an unproven delivery is never a completed
     // formal approval: the round terminalizes honestly as INCOMPLETE.
-    expect(outcome.canonicalVerdict, escalations.join('\n')).toBe('INCOMPLETE');
+    await assertFormalEventAssertion('wave-host-wrong-state-refusal', () =>
+      expect(outcome.canonicalVerdict, escalations.join('\n')).toBe('INCOMPLETE'));
     expect(outcome.verdict).toBeNull();
     expect(outcome.posted).toBe(false);
     expect(outcome.round.status).toBe('aborted');

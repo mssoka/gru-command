@@ -103,6 +103,10 @@ function boundedString(value: unknown, max: number): value is string {
   return nonEmptyString(value) && value.length <= max;
 }
 
+function isSha256Digest(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/u.test(value);
+}
+
 function parseCommon(payload: unknown): PublicationAttemptPayload | null {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
   const value = payload as Record<string, unknown>;
@@ -118,7 +122,7 @@ function parseCommon(payload: unknown): PublicationAttemptPayload | null {
   if (!reviewEventMatchesVerdict(verdict, reviewEvent)) return null;
   if (!boundedString(value['url'], 2_000) || !boundedString(value['host'], 255)) return null;
   if (!boundedString(value['targetSha'], 200) || !boundedString(value['baseSha'], 200)) return null;
-  if (!boundedString(value['publicationFile'], 4_096) || !boundedString(value['publicationSha256'], 128)) return null;
+  if (!boundedString(value['publicationFile'], 4_096) || !isSha256Digest(value['publicationSha256'])) return null;
   return {
     verdict,
     canonicalVerdict: canonicalVerdict as CanonicalReviewVerdict,
@@ -169,7 +173,7 @@ export function parsePublicationReceiptEvidencePayload(payload: unknown): Public
 export function parsePublicationAbsentPayload(payload: unknown): PublicationAbsentPayload | null {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
   const value = payload as Record<string, unknown>;
-  if (!boundedString(value['targetSha'], 200) || !boundedString(value['publicationSha256'], 128) ||
+  if (!boundedString(value['targetSha'], 200) || !isSha256Digest(value['publicationSha256']) ||
     !boundedString(value['detail'], 1_000)) return null;
   return { targetSha: value['targetSha'], publicationSha256: value['publicationSha256'], detail: value['detail'] };
 }

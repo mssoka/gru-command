@@ -1279,9 +1279,14 @@ export class GitLabMrPoster implements VerdictPoster {
       // Body matches are classified by author, not filtered away: an
       // identical note by ANOTHER account is ambiguity (R35), never
       // absence. A body match with an unusable author is unattributed and
-      // therefore also ambiguity, not proof this service posted.
+      // therefore also ambiguity, not proof this service posted. A record
+      // without a provider-typed body is undecidable: it cannot safely be
+      // skipped into an absence certificate for the whole list.
       for (const note of notes) {
-        if (typeof note.body !== 'string' || receiptDigest(note.body) !== receiptDigest(input.body)) continue;
+        if (typeof note !== 'object' || note === null || Array.isArray(note) || typeof note.body !== 'string') {
+          throw new Error('GitLab note reconciliation returned an undecidable note record — delivery stays unresolved; never assume absence');
+        }
+        if (receiptDigest(note.body) !== receiptDigest(input.body)) continue;
         const noteAuthor = typeof note.author?.username === 'string' ? note.author.username.trim() : '';
         if (noteAuthor !== '' && noteAuthor.toLowerCase() === author.toLowerCase()) {
           authoredMatches.push(note);
