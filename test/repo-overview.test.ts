@@ -1327,12 +1327,16 @@ describe('managed repo overview tracker — round-2 guarantees', () => {
     expect(entry.displayName.length).toBeGreaterThan(0);
     // A bidi override beside visible text is escaped, so the name cannot
     // spoof its display; combining marks in a visible name survive.
-    h.names.splice(0, h.names.length, 'repo\u202E', 'caf\u0065\u0301');
+    const leadingMarkName = '\u0301alpha';
+    h.names.splice(0, h.names.length, 'repo\u202E', 'caf\u0065\u0301', leadingMarkName);
     h.refs.set('repo\u202E', githubRef('repo-e'));
     h.refs.set('caf\u0065\u0301', githubRef('cafe'));
+    h.refs.set(leadingMarkName, githubRef('marked'));
     const second = await h.tracker.refresh();
+    expect(isValidSnapshot(validBoardSnapshot(second))).toBe(true);
     expect(row(second, 'repo\u202E').displayName).toBe('repo\\u{202e}');
     expect(row(second, 'caf\u0065\u0301').displayName).toBe('caf\u0065\u0301');
+    expect(row(second, leadingMarkName).displayName).toBe('\\u{301}alpha');
   });
 
   it('leaves a .github-suffixed host with unsafe characters unlinked instead of freezing the board', async () => {

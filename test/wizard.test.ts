@@ -526,7 +526,8 @@ describe('wizard CLI surface', () => {
   it('unattended repeats preserve and deliberately replace the configured selection', () => {
     const repoRoot = join(import.meta.dirname, '..');
     const workspace = tempDir('gru-command-wizard-headless-managed-ws-');
-    for (const name of ['alpha', 'beta', 'gamma']) {
+    const gammaName = '\u0301gamma';
+    for (const name of ['alpha', 'beta', gammaName]) {
       const repo = join(workspace, name);
       mkdirSync(repo);
       execFileSync('git', ['init', '-q'], { cwd: repo });
@@ -540,16 +541,21 @@ describe('wizard CLI surface', () => {
         timeout: 30_000,
       });
 
-    const first = run({ workspace_root: workspace, repos: ['alpha', 'gamma'] });
+    const first = run({ workspace_root: workspace, repos: ['alpha', gammaName] });
     expect(first.status, first.stderr).toBe(0);
-    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', 'gamma']);
+    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', gammaName]);
 
-    rmSync(join(workspace, 'gamma', '.git'), { recursive: true, force: true });
-    writeFileSync(join(workspace, 'gamma', '.git'), 'gitdir: ../missing-worktree\n');
+    rmSync(join(workspace, gammaName, '.git'), { recursive: true, force: true });
+    writeFileSync(join(workspace, gammaName, '.git'), 'gitdir: ../missing-worktree\n');
     const repeated = run({}, true);
     expect(repeated.status, repeated.stderr).toBe(0);
-    expect(repeated.stdout).toContain('Previously selected repository gamma is currently unavailable; keeping it in managed_repos.');
-    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', 'gamma']);
+    expect(repeated.stdout).toContain(
+      'Previously selected repository \\u{301}gamma is currently unavailable; keeping it in managed_repos.',
+    );
+    expect(first.stdout).toContain(
+      'Repository ready in \\u{301}gamma: GC setup validated; project files unchanged.',
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', gammaName]);
 
     // The prior custom workspace is used while validating the explicit new
     // choice, even though workspace_root is omitted from these answers.
