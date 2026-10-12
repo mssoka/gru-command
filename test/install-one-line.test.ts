@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -217,43 +217,51 @@ function expectAvailable(): boolean {
   }
 }
 
-function python3Available(): boolean {
-  try {
-    execFileSync('which', ['python3'], { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
-  }
+const ptyPlatform = process.platform === 'darwin' || process.platform === 'linux';
+const ptySkipOptOut = process.env['GRU_TEST_SKIP_PTY'] === '1';
+const ptyCapable = expectAvailable() && ptyPlatform && !ptySkipOptOut;
+
+/** The unit path install.sh writes under a sandbox HOME. run() and every
+ * launcher pin XDG_CONFIG_HOME to HOME/.config, so a runner-set
+ * XDG_CONFIG_HOME can never redirect the real unit write (#36). */
+function sandboxUnitPath(home: string): string {
+  return process.platform === 'darwin'
+    ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
+    : join(home, '.config', 'systemd', 'user', 'gru-command.service');
 }
 
-/** Sandbox service-manager seam: a fake launchctl/systemctl that logs its
- * argv. Real unit files still land under the sandbox HOME — assertions
- * check those REAL effects, never echo text alone. */
-function serviceManagerSeam(home: string): {
+interface ManagerSeam {
   manager: string;
   managerLog: string;
   unit: string;
   env: NodeJS.ProcessEnv;
-} {
-  const managerLog = join(home, 'manager.log');
-  const manager = join(home, 'service-manager');
-  writeFileSync(manager, '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"\nexit 0\n', {
-    encoding: 'utf-8',
-    mode: 0o755,
-  });
-  const unit = process.platform === 'darwin'
-    ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
-    : join(home, '.config', 'systemd', 'user', 'gru-command.service');
+}
+
+/** One fake launchctl/systemctl that logs its argv; `body` adds behaviour.
+ * Real unit files still land under the sandbox HOME — assertions check
+ * those REAL effects, never echo text alone. */
+function fakeManagerSeam(home: string, name: string, body: readonly string[]): ManagerSeam {
+  const managerLog = join(home, `${name}.log`);
+  const manager = join(home, name);
+  writeFileSync(
+    manager,
+    ['#!/usr/bin/env bash', 'printf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"', ...body, 'exit 0', ''].join('\n'),
+    { encoding: 'utf-8', mode: 0o755 },
+  );
   return {
     manager,
     managerLog,
-    unit,
+    unit: sandboxUnitPath(home),
     env: {
       GRU_MANAGER_LOG: managerLog,
       GRU_COMMAND_LAUNCHCTL: manager,
       GRU_COMMAND_SYSTEMCTL: manager,
     },
   };
+}
+
+function serviceManagerSeam(home: string): ManagerSeam {
+  return fakeManagerSeam(home, 'service-manager', []);
 }
 
 /** Fake service manager that reports THE CALLER'S PROCESS GROUP as the
@@ -261,42 +269,14 @@ function serviceManagerSeam(home: string): {
  * the managed service (the agent-owned shape). On macOS `launchctl list`
  * carries `<pid>\t<status>\t<label>`; on Linux `systemctl show -p MainPID`
  * answers the pid. Everything else is logged like the plain seam. */
-function inServiceManagerSeam(home: string): {
-  manager: string;
-  managerLog: string;
-  unit: string;
-  env: NodeJS.ProcessEnv;
-} {
-  const managerLog = join(home, 'in-service-manager.log');
-  const manager = join(home, 'in-service-manager');
-  writeFileSync(
-    manager,
-    [
-      '#!/usr/bin/env bash',
-      'printf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"',
-      'pgid="$(ps -o pgid= -p "$PPID" | tr -d " ")"',
-      'case "$*" in',
-      '  *"show -p MainPID"*) printf "%s" "$pgid" ;;',
-      '  list*) printf "%s\\t0\\tcom.gru-command.service\\n" "$pgid" ;;',
-      'esac',
-      'exit 0',
-      '',
-    ].join('\n'),
-    { encoding: 'utf-8', mode: 0o755 },
-  );
-  const unit = process.platform === 'darwin'
-    ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
-    : join(home, '.config', 'systemd', 'user', 'gru-command.service');
-  return {
-    manager,
-    managerLog,
-    unit,
-    env: {
-      GRU_MANAGER_LOG: managerLog,
-      GRU_COMMAND_LAUNCHCTL: manager,
-      GRU_COMMAND_SYSTEMCTL: manager,
-    },
-  };
+function inServiceManagerSeam(home: string): ManagerSeam {
+  return fakeManagerSeam(home, 'in-service-manager', [
+    'pgid="$(ps -o pgid= -p "$PPID" | tr -d " ")"',
+    'case "$*" in',
+    '  *"show -p MainPID"*) printf "%s" "$pgid" ;;',
+    '  list*) printf "%s\\t0\\tcom.gru-command.service\\n" "$pgid" ;;',
+    'esac',
+  ]);
 }
 
 /** True when the manager log holds no unit-registration/restart calls —
@@ -350,26 +330,92 @@ function stageConfiguredAbsentUnit(): { fixture: string; home: string; target: s
   return { fixture, home, target, instance, seam: serviceManagerSeam(home) };
 }
 
-function ptyUpdaterLauncher(home: string, target: string, instance: string, seam: ReturnType<typeof serviceManagerSeam>): string {
-  const launcher = join(home, 'launch-updater.sh');
+interface LauncherOptions {
+  readonly home: string;
+  readonly instance: string;
+  readonly cwd: string;
+  /** Final shell command, e.g. `exec bash ./install.sh`. */
+  readonly command: string;
+  readonly seam?: ManagerSeam;
+  readonly extraExports?: Readonly<Record<string, string>>;
+  readonly name?: string;
+}
+
+/** The ONE launcher template (#36 dedupe): sandboxed HOME/XDG/instance and
+ * optional service-manager seam, then a caller-chosen final command. */
+function writeLauncher(options: LauncherOptions): string {
+  const launcher = join(options.home, options.name ?? 'launcher.sh');
+  const exports: Record<string, string> = {
+    HOME: options.home,
+    XDG_CONFIG_HOME: join(options.home, '.config'),
+    GRU_COMMAND_HOME: options.instance,
+    ...(options.seam === undefined
+      ? {}
+      : {
+          GRU_MANAGER_LOG: options.seam.managerLog,
+          GRU_COMMAND_LAUNCHCTL: options.seam.manager,
+          GRU_COMMAND_SYSTEMCTL: options.seam.manager,
+        }),
+    ...options.extraExports,
+  };
   writeFileSync(
     launcher,
     [
       '#!/usr/bin/env bash',
       'set -euo pipefail',
-      `export HOME=${shellQuote(home)}`,
-      `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
-      `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
-      `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
-      `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
-      `export GRU_COMMAND_SYSTEMCTL=${shellQuote(seam.manager)}`,
-      `cd ${shellQuote(target)}`,
-      'exec bash ./install.sh',
+      ...Object.entries(exports).map(([key, value]) => `export ${key}=${shellQuote(value)}`),
+      `cd ${shellQuote(options.cwd)}`,
+      options.command,
       '',
     ].join('\n'),
     { encoding: 'utf-8', mode: 0o755 },
   );
   return launcher;
+}
+
+function ptyUpdaterLauncher(home: string, target: string, instance: string, seam: ManagerSeam): string {
+  return writeLauncher({ home, instance, seam, cwd: target, command: 'exec bash ./install.sh' });
+}
+
+/** Drive a launcher on a REAL pty: optionally answer the register prompt
+ * with `send` (Tcl-escaped text, e.g. "n\\r" or "\\004" for Ctrl-D). */
+function ptyRun(launcher: string, send: string | null, promptText = 'register one now'): string {
+  const expectScript = [
+    'set timeout 300',
+    `spawn bash ${launcher}`,
+    ...(send === null ? [] : [`expect "${promptText}"`, `send -- "${send}"`]),
+    'expect eof',
+    'set result [wait]',
+    'exit [lindex $result 3]',
+  ].join('\n');
+  return execFileSync('expect', ['-c', expectScript], {
+    encoding: 'utf-8',
+    timeout: 360_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).replace(/\r/g, '');
+}
+
+/** Run a command in its OWN session (setsid via detached) so /dev/tty is
+ * unreachable — the cron/CI shape, deterministically, on any machine and
+ * without python3. */
+function runDetached(
+  command: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv,
+): Promise<{ stdout: string; stderr: string; status: number | null }> {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(command, [...args], { detached: true, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8'); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf-8'); });
+    const timer = setTimeout(() => {
+      try { process.kill(-(child.pid ?? 0), 'SIGKILL'); } catch { /* already gone */ }
+      rejectRun(new Error(`detached run timed out\n${stdout}\n${stderr}`));
+    }, 300_000);
+    child.on('error', (error) => { clearTimeout(timer); rejectRun(error); });
+    child.on('close', (status) => { clearTimeout(timer); resolveRun({ stdout, stderr, status }); });
+  });
 }
 
 describe('install.sh setup mode (one-line path)', () => {
@@ -456,29 +502,22 @@ describe('install.sh setup mode (one-line path)', () => {
     expectRegisteredUnit(seam.managerLog, seam.unit, join(home, 'gru-command'), instance);
   });
 
-  it.skipIf(!expectAvailable())('literal cat|bash install keeps prompts on /dev/tty and completes in one invocation', () => {
+  it.skipIf(!ptyCapable)('literal cat|bash install keeps prompts on /dev/tty and completes in one invocation', () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const bare = tempDir('gru-command-pipe-pty-bare-');
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
     const instance = join(home, '.gru-command');
-    const launcher = join(bare, 'launch.sh');
-    writeFileSync(
-      launcher,
-      [
-        '#!/usr/bin/env bash',
-        'set -euo pipefail',
-        `export HOME=${shellQuote(home)}`,
-        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
-        `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
-        `export GRU_COMMAND_ORIGIN=${shellQuote(`file://${fixture}`)}`,
-        `export GRU_COMMAND_TARGET=${shellQuote(join(home, 'gru-command'))}`,
-        `cd ${shellQuote(bare)}`,
-        'cat install.sh | bash',
-        '',
-      ].join('\n'),
-      { encoding: 'utf-8', mode: 0o755 },
-    );
+    const launcher = writeLauncher({
+      home,
+      instance,
+      cwd: bare,
+      command: 'cat install.sh | bash',
+      extraExports: {
+        GRU_COMMAND_ORIGIN: `file://${fixture}`,
+        GRU_COMMAND_TARGET: join(home, 'gru-command'),
+      },
+    });
     const expectScript = [
       'set timeout 120',
       `spawn bash ${launcher}`,
@@ -645,15 +684,8 @@ describe('install.sh setup mode (one-line path)', () => {
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
     const target = join(home, 'gru-command');
     const instance = join(home, '.gru-command');
-    const managerLog = join(home, 'manager.log');
-    const manager = join(home, 'service-manager');
-    writeFileSync(manager, '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"\nexit 0\n', {
-      encoding: 'utf-8',
-      mode: 0o755,
-    });
-    const unit = process.platform === 'darwin'
-      ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
-      : join(home, '.config', 'systemd', 'user', 'gru-command.service');
+    const { manager, managerLog } = serviceManagerSeam(home);
+    const unit = sandboxUnitPath(home);
     const env = {
       HOME: home,
       GRU_COMMAND_HOME: instance,
@@ -695,15 +727,8 @@ describe('install.sh setup mode (one-line path)', () => {
     copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
     const target = join(home, 'gru-command');
     const instance = join(home, '.gru-command');
-    const managerLog = join(home, 'manager.log');
-    const manager = join(home, 'service-manager');
-    writeFileSync(manager, '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"\nexit 0\n', {
-      encoding: 'utf-8',
-      mode: 0o755,
-    });
-    const unit = process.platform === 'darwin'
-      ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
-      : join(home, '.config', 'systemd', 'user', 'gru-command.service');
+    const { manager, managerLog } = serviceManagerSeam(home);
+    const unit = sandboxUnitPath(home);
     const env = {
       HOME: home,
       GRU_COMMAND_HOME: instance,
@@ -878,46 +903,18 @@ describe('install.sh setup mode (one-line path)', () => {
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
   });
 
-  it.skipIf(!expectAvailable())('interactive + absent unit + default answer: prompts, then REGISTERS the service', () => {
+  it.skipIf(!ptyCapable)('interactive + absent unit + default answer: prompts, then REGISTERS the service', () => {
     const { home, target, instance, seam } = stageConfiguredAbsentUnit();
-    const launcher = ptyUpdaterLauncher(home, target, instance, seam);
-    const expectScript = [
-      'set timeout 300',
-      `spawn bash ${launcher}`,
-      'expect "register one now"',
-      'send -- "\\r"',
-      'expect eof',
-      'set result [wait]',
-      'exit [lindex $result 3]',
-    ].join('\n');
-    const output = execFileSync('expect', ['-c', expectScript], {
-      encoding: 'utf-8',
-      timeout: 360_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).replace(/\r/g, '');
+    const output = ptyRun(ptyUpdaterLauncher(home, target, instance, seam), '\\r');
     expect(output).toContain('register one now');
     expect(output).toContain('installed:');
     expect(output).toContain('update complete; existing config preserved');
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
   }, 400_000);
 
-  it.skipIf(!expectAvailable())('interactive + absent unit + decline: NO install, recovery hint, exit success', () => {
+  it.skipIf(!ptyCapable)('interactive + absent unit + decline: NO install, recovery hint, exit success', () => {
     const { home, target, instance, seam } = stageConfiguredAbsentUnit();
-    const launcher = ptyUpdaterLauncher(home, target, instance, seam);
-    const expectScript = [
-      'set timeout 300',
-      `spawn bash ${launcher}`,
-      'expect "register one now"',
-      'send -- "n\\r"',
-      'expect eof',
-      'set result [wait]',
-      'exit [lindex $result 3]',
-    ].join('\n');
-    const output = execFileSync('expect', ['-c', expectScript], {
-      encoding: 'utf-8',
-      timeout: 360_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).replace(/\r/g, '');
+    const output = ptyRun(ptyUpdaterLauncher(home, target, instance, seam), 'n\\r');
     expect(output).toContain('register one now');
     expect(output).toContain('update complete; existing config preserved');
     expect(output).toContain('no service installed or running — ./install.sh --service registers it later');
@@ -928,40 +925,44 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(noRegistrationCalls(seam.managerLog)).toBe(true);
   }, 400_000);
 
-  it.skipIf(!expectAvailable())('piped cat|bash updater + absent unit: prompt reads the TTY, not the script pipe (decline)', () => {
+  it.skipIf(!ptyCapable)('interactive + absent unit + UNRECOGNIZED answer: err-and-decline, nothing registered (#36)', () => {
     const { home, target, instance, seam } = stageConfiguredAbsentUnit();
-    const launcher = join(home, 'launch-piped-updater.sh');
-    writeFileSync(
-      launcher,
-      [
-        '#!/usr/bin/env bash',
-        'set -euo pipefail',
-        `export HOME=${shellQuote(home)}`,
-        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
-        `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
-        `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
-        `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
-        `export GRU_COMMAND_SYSTEMCTL=${shellQuote(seam.manager)}`,
-        `cd ${shellQuote(target)}`,
-        'cat ./install.sh | bash',
-        '',
-      ].join('\n'),
-      { encoding: 'utf-8', mode: 0o755 },
-    );
-    const expectScript = [
-      'set timeout 300',
-      `spawn bash ${launcher}`,
-      'expect "register one now"',
-      'send -- "n\\r"',
-      'expect eof',
-      'set result [wait]',
-      'exit [lindex $result 3]',
-    ].join('\n');
-    const output = execFileSync('expect', ['-c', expectScript], {
-      encoding: 'utf-8',
-      timeout: 360_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).replace(/\r/g, '');
+    const output = ptyRun(ptyUpdaterLauncher(home, target, instance, seam), 'maybe\\r');
+    expect(output).toContain("unrecognized answer 'maybe' — not registering");
+    expect(output).toContain('update complete; existing config preserved');
+    expect(output).toContain('no service installed or running — ./install.sh --service registers it later');
+    expect(existsSync(seam.unit)).toBe(false);
+    expect(noRegistrationCalls(seam.managerLog)).toBe(true);
+  }, 400_000);
+
+  it.skipIf(!ptyCapable)('interactive + absent unit + mixed-case answers: yEs registers, nO declines (#36)', () => {
+    const registered = stageConfiguredAbsentUnit();
+    const yes = ptyRun(ptyUpdaterLauncher(registered.home, registered.target, registered.instance, registered.seam), 'yEs\\r');
+    expect(yes).not.toContain('unrecognized answer');
+    expectRegisteredUnit(registered.seam.managerLog, registered.seam.unit, registered.target, registered.instance);
+
+    const declined = stageConfiguredAbsentUnit();
+    const no = ptyRun(ptyUpdaterLauncher(declined.home, declined.target, declined.instance, declined.seam), 'nO\\r');
+    expect(no).not.toContain('unrecognized answer');
+    expect(no).toContain('--service registers it later');
+    expect(existsSync(declined.seam.unit)).toBe(false);
+    expect(noRegistrationCalls(declined.seam.managerLog)).toBe(true);
+  }, 800_000);
+
+  it.skipIf(!ptyCapable)('interactive + absent unit + EOF (Ctrl-D) at the prompt: declines instead of auto-registering (#36)', () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const output = ptyRun(ptyUpdaterLauncher(home, target, instance, seam), '\\004');
+    expect(output).toContain('no answer (end of input) — not registering');
+    expect(output).toContain('update complete; existing config preserved');
+    expect(output).toContain('--service registers it later');
+    expect(existsSync(seam.unit)).toBe(false);
+    expect(noRegistrationCalls(seam.managerLog)).toBe(true);
+  }, 400_000);
+
+  it.skipIf(!ptyCapable)('piped cat|bash updater + absent unit: prompt reads the TTY, not the script pipe (decline)', () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const launcher = writeLauncher({ home, instance, seam, cwd: target, command: 'cat ./install.sh | bash' });
+    const output = ptyRun(launcher, 'n\\r');
     // The prompt reached the controlling terminal and the answer was read
     // from it — the piped SCRIPT was never consumed as the reply.
     expect(output).toContain('register one now');
@@ -972,38 +973,64 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(noRegistrationCalls(seam.managerLog)).toBe(true);
   }, 400_000);
 
-  it.skipIf(!python3Available())('headless run (no terminal, no --no-interact): defaults to REGISTER with a stderr notice', () => {
+  it.skipIf(!ptyCapable)('decline from a DIFFERENT directory prints the absolute --service hint (launch cwd, not checkout cwd) (#36)', () => {
     const { home, target, instance, seam } = stageConfiguredAbsentUnit();
-    const launcher = join(home, 'launch-headless-updater.sh');
+    const elsewhere = tempDir('gru-command-hint-cwd-');
+    const launcher = writeLauncher({ home, instance, seam, cwd: elsewhere, command: `exec bash ${shellQuote(join(target, 'install.sh'))}` });
+    const output = ptyRun(launcher, 'n\\r');
+    // A relative ./install.sh would not exist in the operator's directory.
+    expect(output).toMatch(/no service installed or running — \/\S+\/gru-command\/install\.sh --service registers it later/);
+    expect(output).not.toContain('— ./install.sh --service');
+    expect(existsSync(seam.unit)).toBe(false);
+  }, 400_000);
+
+  it.skipIf(!ptyCapable)('prompt_register_service leaves a caller-held fd 3 intact (#36)', () => {
+    const home = tempDir('gru-command-fd3-');
+    const keep = join(home, 'fd3-keep.txt');
+    writeFileSync(keep, 'fd3-still-open\n');
+    const installScript = join(repoRoot, 'install.sh');
+    const body = join(home, 'fd3-body.sh');
     writeFileSync(
-      launcher,
+      body,
       [
-        '#!/usr/bin/env bash',
-        'set -euo pipefail',
-        `export HOME=${shellQuote(home)}`,
-        `export XDG_CONFIG_HOME=${shellQuote(join(home, '.config'))}`,
-        `export GRU_COMMAND_HOME=${shellQuote(instance)}`,
-        `export GRU_MANAGER_LOG=${shellQuote(seam.managerLog)}`,
-        `export GRU_COMMAND_LAUNCHCTL=${shellQuote(seam.manager)}`,
-        `export GRU_COMMAND_SYSTEMCTL=${shellQuote(seam.manager)}`,
-        `cd ${shellQuote(target)}`,
-        // Detach from the controlling terminal so /dev/tty is unreachable
-        // — the cron/CI shape, deterministically, on any test machine.
-        `exec ${shellQuote(execFileSync('which', ['python3']).toString().trim())} -c 'import os\nos.setsid()\nos.execvp("bash", ["bash", "./install.sh"])'`,
+        'set +e',
+        `eval "$(sed -n '/^err()/p' ${shellQuote(installScript)}; sed -n '/^classify_register_reply()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^prompt_register_service()/,/^}/p' ${shellQuote(installScript)})"`,
+        'inside_managed_service_pgroup() { return 1; }',
+        `exec 3< ${shellQuote(keep)}`,
+        'prompt_register_service',
+        'echo "PROMPT-RC=$?"',
+        'IFS= read -r line <&3 && echo "FD3:$line" || echo "FD3:CLOBBERED"',
         '',
       ].join('\n'),
-      { encoding: 'utf-8', mode: 0o755 },
+      'utf-8',
     );
-    const proc = spawnSync('bash', [launcher], {
-      encoding: 'utf-8',
-      timeout: 300_000,
-      env: {
-        ...process.env,
-        HOME: home,
-        XDG_CONFIG_HOME: join(home, '.config'),
-        GRU_COMMAND_HOME: instance,
-      },
-    });
+    // stdin is /dev/null (not a tty) so the /dev/tty branch runs; the pty
+    // still provides the controlling terminal to answer on.
+    const launcher = writeLauncher({ home, instance: join(home, 'i'), cwd: home, command: `bash ${shellQuote(body)} < /dev/null` });
+    const output = ptyRun(launcher, 'n\\r');
+    expect(output).toContain('PROMPT-RC=1');
+    expect(output).toContain('FD3:fd3-still-open');
+    expect(output).not.toContain('CLOBBERED');
+  });
+
+  it('classify_register_reply: empty/y/yes any case register; n/no any case decline; the rest unrecognized (#36)', () => {
+    const installScript = join(repoRoot, 'install.sh');
+    const table: ReadonlyArray<readonly [string, string]> = [
+      ['', 'register'], ['y', 'register'], ['Y', 'register'], ['yes', 'register'], ['Yes', 'register'],
+      ['YES', 'register'], ['yEs', 'register'], ['yeS', 'register'], ['YEs', 'register'],
+      ['n', 'decline'], ['N', 'decline'], ['no', 'decline'], ['No', 'decline'], ['nO', 'decline'], ['NO', 'decline'],
+      ['maybe', 'unrecognized'], ['yy', 'unrecognized'], ['yes please', 'unrecognized'], ['0', 'unrecognized'],
+    ];
+    for (const [reply, expected] of table) {
+      const out = execFileSync('bash', ['-c', `eval "$(sed -n '/^classify_register_reply()/,/^}/p' ${shellQuote(installScript)})"; classify_register_reply "$1"`, 'bash', reply], { encoding: 'utf-8' }).trim();
+      expect(out, `reply ${JSON.stringify(reply)}`).toBe(expected);
+    }
+  });
+
+  it('headless run (no terminal, no --no-interact): defaults to REGISTER with a stderr notice', async () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const launcher = writeLauncher({ home, instance, seam, cwd: target, command: 'exec bash ./install.sh' });
+    const proc = await runDetached('bash', [launcher], { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), GRU_COMMAND_HOME: instance });
     expect(proc.status, `${proc.stdout}\n${proc.stderr}`).toBe(0);
     // The no-terminal outcome is announced, never silent, and the prompt
     // itself is not shown (there is no terminal to show it on).
@@ -1013,6 +1040,56 @@ describe('install.sh setup mode (one-line path)', () => {
     expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
   }, 400_000);
 
+  it('--update + absent unit routes through the same registration path (no terminal: default register, announced) (#36)', async () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const launcher = writeLauncher({ home, instance, seam, cwd: target, command: 'exec bash ./install.sh --update' });
+    const proc = await runDetached('bash', [launcher], { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), GRU_COMMAND_HOME: instance });
+    expect(proc.status, `${proc.stdout}\n${proc.stderr}`).toBe(0);
+    expect(proc.stdout).toContain('updating source with git pull --ff-only');
+    expect(proc.stderr).toContain('no terminal for the register prompt');
+    expect(proc.stdout).not.toContain('WIZARD-RAN');
+    expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
+  }, 400_000);
+
+  it('--update --no-interact + absent unit registers without prompting (#36)', async () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const result = await run(join(target, 'install.sh'), ['--update', '--no-interact'], { HOME: home, GRU_COMMAND_HOME: instance, ...seam.env });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('updating source with git pull --ff-only');
+    expect(result.stdout).not.toContain('register one now');
+    expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
+  });
+
+  it('updater never consults --answers register_service: --update rejects --answers, and --answers routes to the wizard (#36 deliberate routing)', async () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const env = { HOME: home, GRU_COMMAND_HOME: instance, ...seam.env };
+    const rejected = await run(join(target, 'install.sh'), ['--update', '--answers', '{"register_service":true}'], env);
+    expect(rejected.status).toBe(2);
+    expect(rejected.stderr).toContain('--update preserves config and cannot be combined with --answers or --force');
+    // --answers (+ --force over the existing config) goes to the wizard, which
+    // owns register_service; the updater's absent-unit branch never runs.
+    const routed = await run(join(target, 'install.sh'), ['--answers', '{"register_service":false}', '--force'], env);
+    expect(routed.status, `${routed.stdout}\n${routed.stderr}`).toBe(0);
+    expect(routed.stdout).toContain('WIZARD-RAN');
+    expect(routed.stdout).not.toContain('update complete; existing config preserved');
+    expect(existsSync(seam.unit)).toBe(false);
+    expect(noRegistrationCalls(seam.managerLog)).toBe(true);
+  });
+
+  it('a runner-set XDG_CONFIG_HOME can never redirect the unit write outside the sandbox HOME (#36)', async () => {
+    const { home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const outside = tempDir('gru-command-ambient-xdg-');
+    const result = await run(join(target, 'install.sh'), ['--no-interact'], {
+      HOME: home,
+      XDG_CONFIG_HOME: outside,
+      GRU_COMMAND_HOME: instance,
+      ...seam.env,
+    });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expectRegisteredUnit(seam.managerLog, seam.unit, target, instance);
+    expect(existsSync(join(outside, 'systemd'))).toBe(false);
+  });
+
   it('in-service restart delegates to gru-service roll and never unload/loads', async () => {
     // Function-level pin for the delegation branch: the in-service process
     // group IS detected (fake manager reports our own pgid), the unit IS
@@ -1021,23 +1098,7 @@ describe('install.sh setup mode (one-line path)', () => {
     // exercises the branch on every pty-less machine (Linux CI included).
     const home = tempDir('gru-command-in-service-fn-');
     const instance = join(home, '.gru-command');
-    const managerLog = join(home, 'manager.log');
-    const manager = join(home, 'service-manager');
-    writeFileSync(
-      manager,
-      [
-        '#!/usr/bin/env bash',
-        'printf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"',
-        'pgid="$(ps -o pgid= -p "$PPID" | tr -d " ")"',
-        'case "$*" in',
-        '  *"show -p MainPID"*) printf "%s" "$pgid" ;;',
-        '  list*) printf "%s\\t0\\tcom.gru-command.service\\n" "$pgid" ;;',
-        'esac',
-        'exit 0',
-        '',
-      ].join('\n'),
-      { encoding: 'utf-8', mode: 0o755 },
-    );
+    const { manager, managerLog } = inServiceManagerSeam(home);
     const rollLog = join(home, 'roll.log');
     const repoRoot = tempDir('gru-command-in-service-repo-');
     const installScript = join(import.meta.dirname, '..', 'install.sh');
@@ -1062,9 +1123,8 @@ describe('install.sh setup mode (one-line path)', () => {
       `GRU_MANAGER_LOG=${shellQuote(managerLog)}`,
       `GRU_ROLL_LOG=${shellQuote(rollLog)}`,
       `export GRU_MANAGER_LOG GRU_ROLL_LOG`,
-      `eval "$(sed -n '/^managed_service_pid()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^inside_managed_service_pgroup()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service_in_service()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service_if_present()/,/^}/p' ${shellQuote(installScript)})"`,
-      `service_ownership() { echo owned; }`,
-      `restart_owned_service_if_present`,
+      `eval "$(sed -n '/^managed_service_pid()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^inside_managed_service_pgroup()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service_in_service()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^install_service()/,/^}/p' ${shellQuote(installScript)}; sed -n '/^restart_owned_service()/,/^}/p' ${shellQuote(installScript)})"`,
+      `restart_owned_service`,
       '',
     ].join('\n');
     const stdout = execFileSync('bash', ['-c', script], {
@@ -1080,7 +1140,7 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(calls).not.toContain('restart gru-command');
   });
 
-  it.skipIf(!expectAvailable())('in-service pty update (absent unit): no prompt hang — auto-registers with a notice', () => {
+  it.skipIf(!ptyCapable)('in-service pty update (absent unit): no prompt hang — auto-registers with a notice', () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const target = join(home, 'gru-command');
@@ -1092,18 +1152,7 @@ describe('install.sh setup mode (one-line path)', () => {
     const launcher = ptyUpdaterLauncher(home, target, instance, seam);
     // A REAL pty (no human on it): the exact shape that used to block the
     // register prompt forever on /dev/tty reads.
-    const expectScript = [
-      'set timeout 240',
-      `spawn bash ${launcher}`,
-      'expect eof',
-      'set result [wait]',
-      'exit [lindex $result 3]',
-    ].join('\n');
-    const output = execFileSync('expect', ['-c', expectScript], {
-      encoding: 'utf-8',
-      timeout: 300_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).replace(/\r/g, '');
+    const output = ptyRun(launcher, null);
     expect(output).toContain('running inside the managed service');
     expect(output).not.toContain('register one now');
     expect(output).toContain('update complete; existing config preserved');
@@ -1114,12 +1163,7 @@ describe('install.sh setup mode (one-line path)', () => {
     const { fixture, home } = buildFixtureRepo();
     gitInitCommit(fixture);
     const instance = join(home, '.gru-command');
-    const managerLog = join(home, 'manager.log');
-    const manager = join(home, 'service-manager');
-    writeFileSync(manager, '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$GRU_MANAGER_LOG"\nexit 0\n', {
-      encoding: 'utf-8',
-      mode: 0o755,
-    });
+    const { manager, managerLog } = serviceManagerSeam(home);
     const env = {
       HOME: home,
       GRU_COMMAND_HOME: instance,
@@ -1128,9 +1172,7 @@ describe('install.sh setup mode (one-line path)', () => {
       GRU_COMMAND_SYSTEMCTL: manager,
     };
     expect((await run(join(fixture, 'install.sh'), ['--answers', '{"smoke":false}'], env)).status).toBe(0);
-    const unit = process.platform === 'darwin'
-      ? join(home, 'Library', 'LaunchAgents', 'com.gru-command.service.plist')
-      : join(home, '.config', 'systemd', 'user', 'gru-command.service');
+    const unit = sandboxUnitPath(home);
     mkdirSync(dirname(unit), { recursive: true });
     writeFileSync(unit, 'foreign-user-unit\n');
     const refusedRegister = await run(join(fixture, 'install.sh'), ['--service'], env);
@@ -1368,5 +1410,12 @@ describe('node version gate (>= 22.19) — Perkins r1 W11', () => {
     expect(status).toBe(1);
     expect(stderr).toContain('node >= 22.19 required');
     expect(existsSync(join(shim, '..', 'never-created'))).toBe(false);
+  });
+});
+
+describe('pty gate (no silent PTY skips)', () => {
+  it('expect(1) is present on pty platforms, or the run explicitly opts out', () => {
+    if (!ptyPlatform || ptySkipOptOut) return;
+    expect(expectAvailable(), 'expect(1) is missing — install expect or set GRU_TEST_SKIP_PTY=1 to opt out explicitly.').toBe(true);
   });
 });
