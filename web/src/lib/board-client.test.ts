@@ -216,8 +216,17 @@ describe('board client', () => {
       { token: TOKEN, host: `127.0.0.1:${server.port}`, fetchImpl },
       { connection: () => {}, snapshot: () => {}, fatal: () => {} },
     );
+    const expectedDecision = {
+      question: 'Approve the merge?',
+      context: 'It needs an owner choice.',
+      recommendation: null,
+      reservedClass: 'merge',
+      whyNotDelegable: 'The merge remains owner-controlled.',
+      options: [{ id: 'approve', label: 'Approve', consequence: 'Prepare the merge.' }],
+      discussion: false,
+    } as const;
 
-    await expect(client.decideNotification('decision-1', 'approve')).rejects.toMatchObject({
+    await expect(client.decideNotification('decision-1', 'approve', expectedDecision)).rejects.toMatchObject({
       path: '/api/notifications/decision-1/decision',
       status: 409,
       code: 'decision_recorded',
@@ -228,6 +237,7 @@ describe('board client', () => {
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({ authorization: `Bearer ${TOKEN}` }),
+        body: JSON.stringify({ optionId: 'approve', by: 'web', expectedDecision }),
       }),
     );
   });
@@ -502,6 +512,45 @@ describe('board client', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(delivered).toEqual(['second', 'pushed']);
+    tracked.stop();
+  });
+
+  it('drops a pre-disconnect HTTP snapshot and only delivers a post-disconnect refresh', async () => {
+    const answers: Array<(response: Response) => void> = [];
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null; onclose: (() => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() { sockets.push(this); }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const ok = (snapshot: BoardSnapshot) => new Response(JSON.stringify(snapshot), { status: 200 });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const tracked = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+    );
+    tracked.connect();
+    answers[0]!(ok(tagged('boot')));
+    await tick();
+    const socket = sockets[0]!;
+    socket.onopen!();
+    socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+
+    const beforeDisconnect = tracked.refetchSnapshot();
+    socket.onclose!();
+    answers[1]!(ok(tagged('pre-disconnect')));
+    await beforeDisconnect;
+    await tick();
+    expect(answers).toHaveLength(3); // the invalidated answer owed a fresh HTTP request
+    answers[2]!(ok(tagged('post-disconnect')));
+    await tick();
+    expect(delivered).toEqual(['boot', 'post-disconnect']);
     tracked.stop();
   });
 

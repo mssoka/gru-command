@@ -2553,7 +2553,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:keep"]')!.disabled).toBe(true);
     expect(band.querySelector('.board-notification__submission--submitting')?.textContent).toContain('ecording');
     busy.click(); // duplicate click on the in-flight option: no second request
-    await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve'));
+    await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve', stop.decision));
     expect(failing.decideNotification).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(band.querySelector('.board-notification__submission--unconfirmed')).not.toBeNull());
     // Ambiguous transport failure → the copy must NOT claim nothing was
@@ -3454,6 +3454,31 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
     expect([accept.textContent, accept.disabled]).toEqual(['Accept', false]);
     expect(newClient.markNotificationShown).toHaveBeenCalled();
+  });
+
+  it('a same-client disconnect invalidates a pending proposal fetch even after the reconnect snapshot arrives', async () => {
+    let release!: (review: ReturnType<typeof proposalReview>) => void;
+    const client = proposalClient();
+    client.getLessonProposal.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+
+    view.markSnapshotStale();
+    expect(document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(true);
+    // A later snapshot restores controls, but cannot bless the proposal GET
+    // that was already in flight when the same client disconnected.
+    view.render(snapshot({ notifications: [proposalNotice] }), 'http');
+    release(proposalReview());
+    await flush();
+    expect(client.decideLessonProposal).not.toHaveBeenCalled();
+
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(2);
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
   });
 
   it('the phone layout keeps the proposal review inside the single column', async () => {
@@ -4420,7 +4445,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
     );
   });
 
-  it.each(['decision_recorded', 'not_open', 'unknown_option'] as const)(
+  it.each(['decision_recorded', 'decision_changed', 'not_open', 'unknown_option'] as const)(
     'a stale %s conflict refreshes shared owner and bell state before choices return',
     async (code) => {
       let resolveRefresh!: () => void;
@@ -4469,7 +4494,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
                   options: [{ id: 'revised', label: 'Revised choice', consequence: 'Use the authoritative choices.' }],
                 },
               };
-      if (code === 'unknown_option') {
+      if (code === 'unknown_option' || code === 'decision_changed') {
         // A WebSocket push may have been queued before the refusal; it is
         // not the post-conflict authoritative HTTP refresh we are awaiting.
         view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: 1 }), 'push');
@@ -4479,7 +4504,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       resolveRefresh();
       expect(band.querySelector('.board-notification__submission--reconciling')).toBeNull();
       expect(band.querySelector('[data-action-id="notif:shared-submit:option:approve"]')).toBeNull();
-      if (code === 'unknown_option') {
+      if (code === 'unknown_option' || code === 'decision_changed') {
         expect(band.querySelector('[data-action-id="notif:shared-submit:option:revised"]')).not.toBeNull();
         expect(band.textContent).toContain('Revised choice');
       }
@@ -4506,7 +4531,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
     });
     const notificationId = 'joined-stale-options';
     const optionA = { id: 'alpha', label: 'Keep Alpha', consequence: 'Leave the current plan in place.' };
-    const optionB = { id: 'beta', label: 'Choose Beta', consequence: 'Use the revised plan.' };
+    const optionB = { id: 'alpha', label: 'Choose Beta', consequence: 'Use the revised plan.' };
     const notification = server.notifications.post({
       id: notificationId,
       kind: 'gru.owner-escalation',
@@ -4577,14 +4602,19 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       expect(panel.querySelector(action)?.textContent).toBe('Keep Alpha');
       await vi.waitFor(() => expect(server.api.getNotification(notificationId)?.shownAt).not.toBeNull());
 
-      // The client still holds A while the authoritative server has B. The
-      // stale submission gets the real HTTP 400, and its post-refusal GET is
-      // paused so the server can return to A before that snapshot is served.
+      // The client still holds option id alpha with label A while the
+      // authoritative server reuses alpha for B. The stale submission must
+      // be refused, and its post-refusal GET is paused so the server can
+      // return to A before that snapshot is served.
       await attachOptions([optionB]);
       pauseNextBoardRead = true;
       band.querySelector<HTMLButtonElement>(action)!.click();
       await vi.waitFor(() => expect(refreshPausedObserved).toBe(true));
       await refreshPaused;
+      expect(server.api.getNotification(notificationId)).toMatchObject({
+        decidedAt: null,
+        decision: { options: [{ id: 'alpha', label: 'Choose Beta', consequence: 'Use the revised plan.' }] },
+      });
       expect(band.querySelector('.board-notification__submission--reconciling')).not.toBeNull();
       expect(panel.querySelector('.board-notification__submission--reconciling')).not.toBeNull();
       expect(band.querySelector<HTMLButtonElement>(action)?.getAttribute('aria-disabled')).toBe('true');
@@ -4643,6 +4673,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-decision-id:option:approve"]')!;
     staleChoice.click();
     await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+    expect(oldClient.decideNotification).toHaveBeenCalledTimes(1);
 
     view.bindClient(newClient);
     expect(staleChoice.isConnected).toBe(false);
@@ -4655,6 +4686,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       document.getElementById('notification-list')!.querySelector('[data-action-id="notif:shared-decision-id:option:approve"]'),
     ).toBeNull();
     staleChoice.click();
+    expect(oldClient.decideNotification).toHaveBeenCalledTimes(1); // detached button issued no second POST through its former client
     expect(newClient.decideNotification).not.toHaveBeenCalled();
 
     view.render(snapshot({ notifications: [replacement] }));
@@ -4669,7 +4701,7 @@ describe('R1: shared decision submissions, read-only gating and focus', () => {
       )?.textContent,
     ).toBe('Approve the replacement route');
     currentChoice?.click();
-    expect(newClient.decideNotification).toHaveBeenCalledWith('shared-decision-id', 'approve');
+    expect(newClient.decideNotification).toHaveBeenCalledWith('shared-decision-id', 'approve', replacement.decision);
   });
 
   it('a re-pair drops in-flight work begun for the old client (late replies change nothing)', async () => {

@@ -638,12 +638,25 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           const id = decodeURIComponent(path.slice('/api/notifications/'.length, -suffix.length));
           const body = (await readBody(req)) as Record<string, unknown>;
           if (suffix === '/decision') {
-            // Owner decision submission: the server validates the option
-            // against the STORED typed decision and records the choice.
-            // Recording never resolves the row — follow-through stays a
-            // distinct, separately evidenced state.
+            // Owner decision submission: the displayed typed decision is
+            // part of the request so a reused option id cannot make a stale
+            // label record a different current choice. Recording never
+            // resolves the row — follow-through stays separately evidenced.
+            if (!Object.prototype.hasOwnProperty.call(body, 'expectedDecision')) {
+              json(res, 400, {
+                error: 'bad_request',
+                detail: 'expectedDecision must echo the typed decision shown to the owner',
+              });
+              return;
+            }
+            const expectedDecision = parseNotificationDecision(body['expectedDecision']);
             const optionId = strField(body, 'optionId');
-            const row = notifications.decide(id, optionId, optStrField(body, 'by') ?? 'web');
+            const row = notifications.decide(
+              id,
+              optionId,
+              optStrField(body, 'by') ?? 'web',
+              expectedDecision,
+            );
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;

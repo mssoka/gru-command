@@ -276,8 +276,13 @@ export class NotificationCenter {
   }
 
   /** Record the owner's typed decision (see LedgerApi.recordNotificationDecision). */
-  decide(id: string, optionId: string, by: string): NotificationRecord | null {
-    return this.ledger.recordNotificationDecision(id, optionId, by);
+  decide(
+    id: string,
+    optionId: string,
+    by: string,
+    expectedDecision?: NotificationDecision,
+  ): NotificationRecord | null {
+    return this.ledger.recordNotificationDecision(id, optionId, by, expectedDecision);
   }
 
   /** Attach agreed options to a discussion-only decision (see

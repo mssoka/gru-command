@@ -403,19 +403,32 @@ describe('board server — HTTP API', () => {
     const row = created.body as { id: string };
     expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
     expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
-    // Decision submission: the server validates the option against the
-    // STORED typed decision, records it idempotently, and never resolves
-    // the row — a decision receipt is not follow-through.
-    const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'approve', by: 'web' });
+    // Decision submission carries the displayed decision snapshot so a
+    // reused option id cannot silently bind an old label to new meaning.
+    // Recording remains idempotent and never resolves the row — a decision
+    // receipt is not follow-through.
+    const missingDisplayedDecision = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'approve', by: 'web' });
+    expect(missingDisplayedDecision).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+    const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+      optionId: 'approve', by: 'web', expectedDecision: decision,
+    });
     expect(decided).toMatchObject({ status: 200, body: { decidedOption: 'approve', decidedBy: 'web', resolvedAt: null, ackedAt: null } });
     expect((decided.body as { decidedAt: string | null }).decidedAt).not.toBeNull();
-    const replay = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'approve' });
+    const replay = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+      optionId: 'approve', expectedDecision: decision,
+    });
     expect(replay.status).toBe(200); // idempotent replay
-    const changed = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'keep' });
+    const changed = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+      optionId: 'keep', expectedDecision: decision,
+    });
     expect(changed).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'decision_recorded' } });
-    const unknownOption = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'nope' });
+    const unknownOption = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+      optionId: 'nope', expectedDecision: decision,
+    });
     expect(unknownOption).toMatchObject({ status: 400, body: { error: 'decision_refused', code: 'unknown_option' } });
-    const notOwner = await postJson(port, '/api/notifications/does-not-exist/decision', 'board-test-token', { optionId: 'approve' });
+    const notOwner = await postJson(port, '/api/notifications/does-not-exist/decision', 'board-test-token', {
+      optionId: 'approve', expectedDecision: decision,
+    });
     expect(notOwner.status).toBe(404);
     const decisionEvents = api
       .listEvents({ limit: 100 })
@@ -1702,10 +1715,12 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
         },
       });
       expect(created.status).toBe(201);
-      const row = created.body as { id: string };
+      const row = created.body as { id: string; decision: Record<string, unknown> };
       // No option exists yet: the typed path cannot invent an approval.
       expect(
-        (await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'go' })).status,
+        (await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+          optionId: 'go', expectedDecision: row.decision,
+        })).status,
       ).toBe(400);
       const attached = await postJson(port, `/api/notifications/${row.id}/decision-options`, 'board-test-token', {
         options: [
@@ -1716,15 +1731,38 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       });
       expect(attached).toMatchObject({ status: 200, body: { decidedAt: null, resolvedAt: null } });
       expect((attached.body as { decision: { options: readonly unknown[] } }).decision.options).toHaveLength(2);
+      const staleDisplayedDecision = (attached.body as { decision: Record<string, unknown> }).decision;
+      const refreshed = await postJson(port, `/api/notifications/${row.id}/decision-options`, 'board-test-token', {
+        options: [
+          { id: 'go', label: 'Go with shape B', consequence: 'Gru commissions shape B.' },
+          { id: 'stop', label: 'Stop here', consequence: 'Nothing moves.' },
+        ],
+        by: 'gru',
+      });
+      expect(refreshed.status).toBe(200);
+      const currentDisplayedDecision = (refreshed.body as { decision: Record<string, unknown> }).decision;
+      const staleChoice = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+        optionId: 'go', by: 'web', expectedDecision: staleDisplayedDecision,
+      });
+      expect(staleChoice).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'decision_changed' } });
+      expect(api.getNotification(row.id)).toMatchObject({
+        decidedAt: null,
+        decision: { options: [
+          { id: 'go', label: 'Go with shape B' },
+          { id: 'stop', label: 'Stop here' },
+        ] },
+      });
       // Attaching options records NO choice: follow-through stays refused
       // until the owner decides.
       expect(
         (await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'premature' })).status,
       ).toBe(409);
       const events = api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.decision-options');
-      expect(events).toHaveLength(1);
+      expect(events).toHaveLength(2);
       expect(events[0]?.payload).toMatchObject({ id: row.id, by: 'gru', option_ids: ['go', 'stop'] });
-      const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'go', by: 'web' });
+      const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+        optionId: 'go', by: 'web', expectedDecision: currentDisplayedDecision,
+      });
       expect(decided).toMatchObject({ status: 200, body: { decidedOption: 'go', resolvedAt: null } });
       expect((await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'executed' })).status).toBe(200);
       // Refusal shapes: a typed (non-discussion) decision keeps its

@@ -7,8 +7,8 @@
  * diagnostics behind a disclosure. The metadata is supplied by the
  * producer as a typed object, validated at the server write boundary and
  * rendered as data — NEVER extracted from, or executed from, notification
- * prose. The browser only submits an option id; the server validates it
- * against the stored decision.
+ * prose. The browser submits the displayed typed decision alongside its
+ * option id; the server rejects the choice if the stored decision changed.
  *
  * `reservedClass` records which reserved owner boundary the question
  * falls under, and `whyNotDelegable` records why Silas/Gru cannot safely

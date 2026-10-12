@@ -1504,7 +1504,7 @@ test.describe('notification readability — fixed long-content fixtures', () => 
     }
   });
 
-  test('a board disconnect keeps stale owner choices read-only until a fresh production snapshot', async ({ browser }) => {
+  test('a board disconnect keeps stale owner actions and panel receipts fenced until a fresh production snapshot', async ({ browser }) => {
     const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     const base = fixtureSnapshot();
     const initial = fixtureSnapshot({ notifications: [...base.notifications, feedNotification()] });
@@ -1512,12 +1512,18 @@ test.describe('notification readability — fixed long-content fixtures', () => 
     let refreshRequests = 0;
     let decisionPosts = 0;
     let acknowledgementPosts = 0;
+    const panelShownPosts: string[] = [];
     try {
       const seed = await seedBoard(page, initial);
+      await page.route('**/api/notifications/*/shown', async (route) => {
+        if (route.request().method() !== 'POST') return route.fallback();
+        const body = route.request().postDataJSON() as { surface?: unknown };
+        if (body.surface === 'web-panel') panelShownPosts.push(route.request().url());
+        return route.fulfill({ status: 200, json: { ok: true } });
+      });
       await pairAndOpenBoard(page);
       await seed.socketReady;
       await settled(page);
-      await clickBell(page);
 
       const ownerChoice = page.locator('#board-owner [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
       const bellChoice = page.locator('#notification-list [data-notification-id="decision-1"] [data-action-id$=":option:approve"]');
@@ -1577,6 +1583,8 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       });
       expect(decisionPosts).toBe(0);
       expect(acknowledgementPosts).toBe(0);
+      await clickBell(page);
+      expect(panelShownPosts).toEqual([]); // stale panel opening is display, not a shown receipt
 
       // The reconnection itself is not enough: only its new board snapshot
       // restores the options, on both production-rendered owner surfaces.
@@ -1588,6 +1596,12 @@ test.describe('notification readability — fixed long-content fixtures', () => 
       expect(decisionPosts).toBe(0);
       expect(acknowledgementPosts).toBe(0);
       expect(refreshRequests).toBeGreaterThan(0);
+      expect(panelShownPosts).toEqual([]); // the stale opening did not consume this surface's receipt
+      await page.locator('#notification-bell').click(); // close, then reopen with a current snapshot
+      await expect(page.locator('#notification-panel')).toBeHidden();
+      await page.locator('#notification-bell').click();
+      await expect(page.locator('#notification-panel')).toBeVisible();
+      await expect.poll(() => panelShownPosts.length).toBeGreaterThan(0);
       expect(seed.pageErrors).toEqual([]);
     } finally {
       for (const release of releases) release?.();

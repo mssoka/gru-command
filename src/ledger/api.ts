@@ -505,6 +505,7 @@ export type NotificationDecisionRefusalCode =
   | 'not_owner_decision'
   | 'no_decision'
   | 'unknown_option'
+  | 'decision_changed'
   | 'decision_recorded'
   | 'not_open'
   | 'undecided'
@@ -4762,8 +4763,15 @@ export class LedgerApi {
    * supported effect of a recorded option is the durable decision itself
    * (plus its audit event): follow-through stays with Gru/Silas and the
    * row remains visible with `decidedAt` set until its producer resolves
-   * it — recording a decision never resolves, acks or hides the row. */
-  recordNotificationDecision(id: string, optionId: string, by: string): NotificationRecord | null {
+   * it — recording a decision never resolves, acks or hides the row.
+   * Browser callers supply the displayed decision so a reused option id
+   * cannot silently bind an old label to a new consequence. */
+  recordNotificationDecision(
+    id: string,
+    optionId: string,
+    by: string,
+    expectedDecision?: NotificationDecision,
+  ): NotificationRecord | null {
     if (by.trim() === '') throw new Error('decision by must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
@@ -4778,6 +4786,15 @@ export class LedgerApi {
         throw new NotificationDecisionRefusal(
           'no_decision',
           `notification "${id}" carries no typed decision — no option can be recorded`,
+        );
+      }
+      if (
+        expectedDecision !== undefined &&
+        serializeNotificationDecision(current.decision) !== serializeNotificationDecision(expectedDecision)
+      ) {
+        throw new NotificationDecisionRefusal(
+          'decision_changed',
+          `notification "${id}" no longer carries the decision that was displayed; refresh before choosing`,
         );
       }
       if (current.decidedAt !== null) {

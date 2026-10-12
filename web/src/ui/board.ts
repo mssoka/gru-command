@@ -202,6 +202,9 @@ export class BoardView {
   private snapshot: BoardSnapshot | null = null;
   /** Actions and receipts are live only for a snapshot from the currently bound client. */
   private snapshotIsCurrent = false;
+  /** Invalidates work started before a same-client disconnect, even if the
+   * reconnect snapshot arrives before that work's HTTP reply. */
+  private snapshotFreshnessGeneration = 0;
   private snapshotRevision = 0;
   private unavailableReason: string | null = null;
   /** ONE sections derivation per render (classification truth is shared
@@ -349,6 +352,7 @@ export class BoardView {
   markSnapshotStale(): void {
     if (!this.snapshotIsCurrent) return;
     this.snapshotIsCurrent = false;
+    this.snapshotFreshnessGeneration += 1;
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
@@ -360,8 +364,8 @@ export class BoardView {
     const previous = this.snapshot;
     this.snapshot = snapshot;
     // Submissions end only when an authoritative snapshot carries an
-    // outcome, removes the row, or an HTTP refresh after unknown_option proves
-    // the current option state (even when its content matches the old set).
+    // outcome, removes the row, or an HTTP refresh after an option-state refusal
+    // proves the current state (even when it matches the old content).
     for (const [id, submission] of [...this.decisionSubmissions]) {
       const row = snapshot.notifications.find((notification) => notification.id === id);
       const optionsReconciled =
@@ -693,10 +697,14 @@ export class BoardView {
       if (current.review !== null) return Promise.resolve(current.review);
       if (current.loading !== null) return current.loading;
       const client = this.boardClient;
+      const freshnessGeneration = this.snapshotFreshnessGeneration;
       const pending: Promise<LessonProposalView> =
         client === null
           ? Promise.reject(new Error('board is not connected'))
           : client.getLessonProposal().then((proposal) => {
+            if (freshnessGeneration !== this.snapshotFreshnessGeneration) {
+              throw new Error('the board went stale while the proposal was loading; wait for a fresh review');
+            }
             if (proposal.notificationId !== item.id) {
               throw new Error('this notice belongs to an older proposal — the next snapshot retires it');
             }
@@ -775,13 +783,14 @@ export class BoardView {
       if (!this.snapshotIsCurrent || current.inFlight !== null) return;
       const client = this.boardClient;
       if (client === null) return;
+      const freshnessGeneration = this.snapshotFreshnessGeneration;
       current.inFlight = decision;
       current.message = null;
       this.rerenderOwner();
       void load()
         .then((proposal) => {
           if (!live()) throw new Error('re-paired');
-          if (!this.snapshotIsCurrent) {
+          if (!this.snapshotIsCurrent || freshnessGeneration !== this.snapshotFreshnessGeneration) {
             current.message = 'The board is catching up; your choice was not sent. Wait for a fresh snapshot and review it again.';
             return null;
           }
@@ -2483,7 +2492,9 @@ export class BoardView {
     if (existing !== undefined && (existing.phase === 'submitting' || existing.phase === 'reconciling')) {
       return; // one action; no retries until authoritative refresh resolves the conflict
     }
-    const option = item.decision?.options.find((candidate) => candidate.id === optionId);
+    const expectedDecision = item.decision;
+    if (expectedDecision === undefined || expectedDecision === null) return;
+    const option = expectedDecision.options.find((candidate) => candidate.id === optionId);
     if (option === undefined) return; // the card no longer offers this choice
     const submission: DecisionSubmission = {
       optionId,
@@ -2496,7 +2507,7 @@ export class BoardView {
     this.decisionSubmissions.set(item.id, submission);
     this.rerenderNotifications();
     void client
-      .decideNotification(item.id, optionId)
+      .decideNotification(item.id, optionId, expectedDecision)
       .then((row) => {
         if (submission.generation !== this.clientGeneration) return; // re-paired: old work is dropped
         this.decisionSubmissions.delete(item.id);
@@ -2513,10 +2524,10 @@ export class BoardView {
         // transport failures are still ambiguous and same-option retry-safe.
         if (
           error instanceof BoardApiError &&
-          (error.code === 'decision_recorded' || error.code === 'not_open' || error.code === 'unknown_option')
+          (error.code === 'decision_recorded' || error.code === 'decision_changed' || error.code === 'not_open' || error.code === 'unknown_option')
         ) {
           submission.phase = 'reconciling';
-          if (error.code === 'unknown_option') {
+          if (error.code === 'unknown_option' || error.code === 'decision_changed') {
             // Only a post-refusal HTTP snapshot can discharge this lock. A
             // changed content signature is not proof: options may change
             // A→B→A while the authoritative refresh is in flight.

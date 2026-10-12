@@ -18,6 +18,7 @@ import {
   type DecisionStatusView,
   type LessonProposalDecisionView,
   type LessonProposalView,
+  type NotificationDecisionView,
   type NotificationView,
   type TranscriptInfo,
   type TranscriptPage,
@@ -93,7 +94,7 @@ export class BoardClient {
   private readonly options: BoardClientOptions;
   private readonly webSocketCtor: new (url: string) => WebSocket;
   private readonly fetchImpl: typeof fetch;
-  /** Pushed snapshots seen: an HTTP answer asked for before a push is stale. */
+  /** Pushes and connection loss invalidate HTTP snapshots requested before them. */
   private snapshotEpoch = 0;
   /** The newest HTTP snapshot request; older answers are dropped. */
   private fetchSeq = 0;
@@ -220,6 +221,7 @@ export class BoardClient {
    * `fromStale` is set the 'stale' state persists through the backoff so
    * the dot shows why the board is behind. */
   private forceReopen(fromStale = false): void {
+    this.snapshotEpoch += 1; // A pre-disconnect HTTP answer cannot clear the stale fence.
     const socket = this.socket;
     this.socket = null;
     if (socket !== null) {
@@ -282,6 +284,7 @@ export class BoardClient {
     };
     ws.onclose = () => {
       if (this.socket !== ws) return; // already force-reopened
+      this.snapshotEpoch += 1; // A pre-disconnect HTTP answer cannot restore stale actions.
       this.socket = null;
       if (this.stopped) return;
       this.scheduleReconnect();
@@ -509,13 +512,18 @@ export class BoardClient {
   }
 
   /** Record the owner's typed decision (owner release 2026-10-11). The
-   * server validates the option against the STORED decision; the returned
-   * row carries the authoritative decided state. Recording a decision is
-   * not completion — the row stays until its producer resolves it. */
-  async decideNotification(id: string, optionId: string): Promise<NotificationView> {
+   * server validates both the option and the displayed decision snapshot;
+   * the returned row carries the authoritative decided state. Recording a
+   * decision is not completion — the row stays until its producer resolves it. */
+  async decideNotification(
+    id: string,
+    optionId: string,
+    expectedDecision: NotificationDecisionView,
+  ): Promise<NotificationView> {
     const { body } = await this.postApiWithStatus(`/api/notifications/${encodeURIComponent(id)}/decision`, {
       optionId,
       by: 'web',
+      expectedDecision,
     });
     if (!isNotificationView(body)) throw new Error('decision reply is malformed');
     return body;
