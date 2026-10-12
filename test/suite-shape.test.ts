@@ -255,7 +255,7 @@ describe('suite shape', () => {
           'historical helper copy',
         );
         const identityEventAppend = uniqueExecutableLine(
-          '"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"',
+          String.raw`printf "\\n/** Test-fixture compatibility marker; keep base helper behavior. */\\nexport const PUBLICATION_IDENTITY_EVENT = '%s';\\n" "$identity_event" >> "$d/src/dispatch/publication-evidence.ts"`,
           'identity event append',
         );
         expect(shellControlDepthAt(historicalHelperCopy), 'R2 baseline historical helper copy is in a shell control-flow block').toBe(0);
