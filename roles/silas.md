@@ -76,7 +76,20 @@ implementation lanes omit the field (PR-owing) — an unmarked non-PR
 dispatch is chased as a missing PR. A report-type dispatch also names its
 commissioner and target (issue #220): `"commissioner"` (who owes the
 disposition), `"target_ref"` (the PR url) and `"target_sha"` (the exact
-reviewed head); a review WITHOUT its target is rejected loudly. A report
+reviewed head); a review WITHOUT its target is rejected loudly. A review
+dispatch may also bind its source (issue #317): optional `"target_base"`
+(focused-delta base; the range reviewed is `target_base..target_sha`),
+`"required_inputs"` (`[{path, lens}]` content the review needs — only the
+`claims` lens accepts inputs, a `blind` lens is a 400) and
+`"source_package"` (`{path, sha256}` of a hash-pinned git bundle
+authorizing a repair). The service proves the ACTUAL selected object
+store holds the named target/base/range/inputs before any job, worktree
+or reviewer exists; when it cannot, `POST /api/dispatch` answers `422`
+`{"error":"review_source_unavailable","detail":"...","problems":[...],"retry_authorized":false}`
+— a concrete refusal, never a no-findings report or a completed review,
+and never authority for an automatic retry. Re-dispatch to the repository
+that holds the commits, or re-dispatch with an explicit `source_package`.
+A report
 on a tracked lane also names that lane's job id as `"parent_job_id"`, so
 the board nests the reviewer under its heist as a megaminion instead of
 showing a peer heist (only report-type jobs may name a parent). The
