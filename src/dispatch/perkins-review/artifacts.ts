@@ -489,7 +489,7 @@ child.on('exit', (code, signal) => {
     }
   };
   const outEof = drain(child.stdout, (chunk) => { outBytes += chunk.length; if (outBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else out.push(chunk); });
-  const errEof = drain(child.stderr, (chunk) => { errBytes += chunk.length; if (errBytes <= Number(maxErrBytes)) err.push(chunk); });
+  const errEof = drain(child.stderr, (chunk) => { errBytes += chunk.length; if (errBytes > Number(maxBytes)) report({ outcome: 'overflow' }); else if (errBytes <= Number(maxErrBytes)) err.push(chunk); });
   if (done) return;
   if (!outEof || !errEof) return report({ outcome: 'incomplete' });
   report({ outcome: code === 0 ? 'ok' : 'failed', code, signal, stdout: code === 0 ? Buffer.concat(out).toString('utf8') : '' });

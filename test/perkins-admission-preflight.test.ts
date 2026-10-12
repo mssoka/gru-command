@@ -1657,6 +1657,22 @@ describe('Perkins admission preflight (gh-169)', () => {
     }
   });
 
+  it('a same-group writer holding stderr open and flooding past the output bound when git exits is overflow — not a drain that spins and a wedged runner (#262)', async () => {
+    const review = branchTargetReview('stderr-flood');
+    const repo = review.manifest.repoPath;
+    // git prints a normal answer and exits 0, but same-group writers keep
+    // stderr non-empty past the exit: the post-exit drain can never reach
+    // end-of-file, so only the output bound can end it — and it must
+    // classify exactly as a flooded stdout does.
+    const restore = gitShim('ls-remote', `printf '%s\\trefs/heads/feature/stderr-flood\\n' "${review.manifest.targetSha}"; yes x >&2 & yes x >&2 & yes x >&2 & sleep 0.5; exit 0`);
+    try {
+      await expect(defaultProbeExec(repo, ['ls-remote', 'origin'], 5_000)).rejects.toThrow(/printed more than/);
+      expect(() => runOwnedGitSync(repo, ['ls-remote', 'origin'], 5_000)).toThrow(/printed more than/);
+    } finally {
+      restore();
+    }
+  });
+
   it('the sync runner’s report lives in a private 0700 directory, removed afterwards (R7-4)', () => {
     const review = branchTargetReview('private-report');
     const modes = join(temp('admission-report-modes-'), 'modes');
