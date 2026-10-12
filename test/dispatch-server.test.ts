@@ -1245,6 +1245,7 @@ describe('dispatch server (E8)', () => {
       const initializationError = new Error('controlled initialization error');
       const cleanupError = new Error('controlled cleanup error');
       let aggregateFixtureRoot: string | undefined;
+      let cleanupCallbackRoot: string | undefined;
       try {
         let observedError: unknown;
         try {
@@ -1253,7 +1254,10 @@ describe('dispatch server (E8)', () => {
               aggregateFixtureRoot = tempDir;
               throw initializationError;
             }
-          }, () => { throw cleanupError; });
+          }, (tempDir) => {
+            cleanupCallbackRoot = tempDir;
+            throw cleanupError;
+          });
         } catch (error) {
           observedError = error;
         }
@@ -1262,6 +1266,7 @@ describe('dispatch server (E8)', () => {
         expect(observedError.errors).toHaveLength(2);
         expect(observedError.errors[0]).toBe(initializationError);
         expect(observedError.errors[1]).toBe(cleanupError);
+        expect(cleanupCallbackRoot).toBe(aggregateFixtureRoot);
       } finally {
         if (aggregateFixtureRoot !== undefined) rmSync(aggregateFixtureRoot, { recursive: true, force: true });
       }

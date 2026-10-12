@@ -90,15 +90,17 @@ describe('publication re-arm guard', () => {
     expect(malformed?.detail).toContain('unknown');
 
     const receiptThenAbsence = pendingPublicationAttempt(ledgerWith([
-      { kind: PUBLICATION_RECEIPT_EVENT, seq: 1, payload: { ...attempt, receipt, credited: false, reason: 'recovered receipt' } },
-      { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'contradictory later absence' } },
+      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
+      { kind: PUBLICATION_RECEIPT_EVENT, seq: 2, payload: { ...attempt, receipt, credited: false, reason: 'recovered receipt' } },
+      { kind: PUBLICATION_ABSENT_EVENT, seq: 3, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'contradictory later absence' } },
     ]), 'receipt-before-absence');
     expect(receiptThenAbsence?.kind).toBe('uncredited-receipt');
     expect(receiptThenAbsence?.detail).toContain('9001');
 
     const malformedThenAbsence = pendingPublicationAttempt(ledgerWith([
-      { kind: PUBLICATION_RECEIPT_EVENT, seq: 1, payload: { credited: false, reason: 'malformed' } },
-      { kind: PUBLICATION_ABSENT_EVENT, seq: 2, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'contradictory later absence' } },
+      { kind: PUBLICATION_ATTEMPT_EVENT, seq: 1, payload: attempt },
+      { kind: PUBLICATION_RECEIPT_EVENT, seq: 2, payload: { credited: false, reason: 'malformed' } },
+      { kind: PUBLICATION_ABSENT_EVENT, seq: 3, payload: { targetSha: TARGET, publicationSha256: attempt.publicationSha256, detail: 'contradictory later absence' } },
     ]), 'malformed-receipt-before-absence');
     expect(malformedThenAbsence?.kind).toBe('uncredited-receipt');
     expect(malformedThenAbsence?.detail).toContain('unknown');

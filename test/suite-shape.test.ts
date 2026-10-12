@@ -219,7 +219,10 @@ describe('suite shape', () => {
           .toContain('silas digest (the four actionable states) does not offer a clean-abort re-arm for an uncredited receipt without its publication attempt');
         expect(source, 'R2 baseline must retain the historical helper implementation')
           .toContain('git show "$base:src/dispatch/publication-evidence.ts"');
-        const baselineOverlayFiles = source.match(/for f in ([^\n]+); do/u)?.[1]?.split(/\s+/u) ?? [];
+        const baselineOverlayList = source.match(/for f in ([\s\S]+?); do/u)?.[1];
+        expect(baselineOverlayList, 'R2 baseline overlay file list is missing').toBeDefined();
+        if (baselineOverlayList === undefined) throw new Error('R2 baseline overlay file list is missing');
+        const baselineOverlayFiles = baselineOverlayList.split(/\s+/u);
         expect(baselineOverlayFiles, 'R2 baseline overlays the current helper and masks the fail-before behavior')
           .not.toContain('src/dispatch/publication-evidence.ts');
         expect(source, 'R2 baseline directly copies the current helper into the snapshot')
@@ -228,6 +231,8 @@ describe('suite shape', () => {
           .toContain('git show "$headrev:src/dispatch/publication-evidence.ts"');
         expect(source, 'R2 baseline hardcodes rather than emits the derived identity event')
           .toContain("export const PUBLICATION_IDENTITY_EVENT = '%s';");
+        expect(source, 'R2 baseline does not append the derived identity event')
+          .toContain('"$identity_event" >> "$d/src/dispatch/publication-evidence.ts"');
       }
     }
     const r5 = readFileSync(join(tools, 'formal-verdicts-r5-baseline.sh'), 'utf-8');
