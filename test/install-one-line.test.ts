@@ -731,6 +731,63 @@ describe('install.sh setup mode (one-line path)', () => {
     expect(readFileSync(unit, 'utf-8')).toContain(`${target}/dist/main.js`);
   });
 
+  it('owned unit SUCCESS through the public one-line wrapper: ff-only update, rebuild, exact manager calls (#20)', async () => {
+    // The wrapper (bare/install.sh) is what `curl | bash` runs. It must pull
+    // the existing checkout fast-forward-only, re-exec the checkout's
+    // installer, rebuild, and restart the OWNED unit through the manager —
+    // never the wizard, never a re-clone.
+    const { fixture, home, target, instance, seam } = stageConfiguredAbsentUnit();
+    const bare = tempDir('gru-command-wrapper-owned-bare-');
+    copyFileSync(join(repoRoot, 'install.sh'), join(bare, 'install.sh'));
+    // Upstream advances so the update has something to fast-forward to.
+    writeFileSync(join(fixture, 'upstream-change.txt'), 'new upstream commit\n');
+    execFileSync('git', ['-C', fixture, 'add', '-A']);
+    execFileSync('git', [
+      '-C', fixture, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=fixture',
+      'commit', '-qm', 'upstream advance',
+    ]);
+    const env = {
+      HOME: home,
+      GRU_COMMAND_HOME: instance,
+      GRU_COMMAND_ORIGIN: `file://${fixture}`,
+      GRU_COMMAND_TARGET: target,
+      ...seam.env,
+    };
+    const rendered = await run(join(target, 'install.sh'), ['--print'], env);
+    expect(rendered.status, rendered.stderr).toBe(0);
+    mkdirSync(dirname(seam.unit), { recursive: true });
+    writeFileSync(seam.unit, rendered.stdout);
+    expect(existsSync(seam.managerLog)).toBe(false);
+
+    const result = await run(join(bare, 'install.sh'), [], env);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain('reusing existing checkout');
+    expect(result.stdout).toContain('updating source with git pull --ff-only');
+    expect(result.stdout).toContain('restarting owned Gru Command service');
+    expect(result.stdout).toContain('update complete; existing config preserved');
+    expect(result.stdout).not.toContain('WIZARD-RAN');
+    expect(result.stdout).not.toContain('cloning');
+    // Fast-forward landed, deps/build ran in the checkout.
+    expect(readFileSync(join(target, 'upstream-change.txt'), 'utf-8')).toBe('new upstream commit\n');
+    expect(existsSync(join(target, 'dist', 'main.js'))).toBe(true);
+    // Config untouched; unit still names this checkout.
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toBe('preserved\n');
+    expect(readFileSync(seam.unit, 'utf-8')).toContain(`${target}/dist/main.js`);
+    // Deterministic manager-call assertions: the owned restart sequence,
+    // in order, exactly once, with no stop/disable/uninstall side calls.
+    const calls = readFileSync(seam.managerLog, 'utf-8').trim().split('\n');
+    const lifecycle = calls.filter((call) => !/^(list|--user show -p MainPID)/.test(call));
+    if (process.platform === 'darwin') {
+      expect(lifecycle).toEqual([`unload ${seam.unit}`, `load ${seam.unit}`]);
+    } else {
+      expect(lifecycle).toEqual([
+        '--user daemon-reload',
+        '--user enable gru-command.service',
+        '--user restart gru-command.service',
+      ]);
+    }
+  }, 120_000);
+
   it.skipIf(process.platform !== 'linux')('systemd unit retains stable Node/npm PATH after a version-manager session expires', async () => {
     const { fixture, home } = buildFixtureRepo();
     // Direct --service requires an already-built service entrypoint.
