@@ -1753,8 +1753,14 @@ export class GruAwareness {
       `${ids.slice(0, 3).join(', ')}${ids.length > 3 ? ` +${ids.length - 3} more` : ''}`;
     const merges = jobs.filter((job) => job.status === 'merged' && Date.parse(job.updatedAt) > since);
     if (merges.length > 0) push(`- merges: ${list(merges.map((job) => job.id))}`);
+    // GH-103: staged during the away window means a `job.pr` link event
+    // after the owner watermark; a PR open since before it is not news.
+    const linkedAway = new Set(
+      this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['job.pr'], limit: 101 })
+        .flatMap((event) => event.jobId === null || event.jobId === undefined ? [] : [event.jobId]),
+    );
     const staged = jobs.filter(
-      (job) => job.prUrl !== null && !isJobTerminal(job.status),
+      (job) => job.prUrl !== null && !isJobTerminal(job.status) && linkedAway.has(job.id),
     );
     if (staged.length > 0) push(`- staged PRs: ${list(staged.map((job) => job.id))}`);
     if (lines.length === 0) return null;

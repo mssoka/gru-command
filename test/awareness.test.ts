@@ -2770,3 +2770,26 @@ describe('GH-110 (g13): the morning digest is rendered or not consumed under the
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe('GH-103 (g6): the staged-PRs line is limited to PRs linked during the away window', () => {
+  it('omits a PR open since before the owner left and lists one linked after', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T20:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.addJob({ id: 'j-old', repo: 'demo', title: 'Old PR' });
+      rig.api.setJobStatus('j-old', 'working');
+      rig.api.setJobPr('j-old', 'https://example.invalid/pr/old');
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      rig.awareness.commit(rig.awareness.prepare()!); // owner leaves here
+      vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+      rig.api.addJob({ id: 'j-new', repo: 'demo', title: 'New PR' });
+      rig.api.setJobStatus('j-new', 'working');
+      rig.api.setJobPr('j-new', 'https://example.invalid/pr/new');
+      const line = rig.awareness.prepare()?.text.split('\n').find((l) => l.startsWith('- staged PRs:')) ?? '';
+      expect(line).toContain('j-new');
+      expect(line).not.toContain('j-old');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
