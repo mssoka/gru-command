@@ -13,6 +13,7 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import type { ObservedToolResult } from '../src/dispatch/blind-input.js';
+import { BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import type { Role } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtime/types.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
@@ -344,6 +345,25 @@ describe('blind review commissioning (issue #316)', () => {
     expect(h.ledger.latestJobEvent('rev-settled', 'job.delivered')).not.toBeNull();
     const record = h.ledger.latestJobEvent('rev-settled', 'review.blind-access-observed')?.payload;
     expect(JSON.stringify(record)).not.toContain('R7 findings: foo');
+  });
+
+  it('keeps a prohibited read invalidating coverage however many later clean posts age past the old 500 window (review fix)', async () => {
+    const h = await boot();
+    await dispatchParent(h);
+    const created = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-aging', { repo_path: h.repo.path, input_package: validPackage() }));
+    expect(created.status).toBe(202);
+    const prohibited = await call(h.port, 'POST', '/api/dispatch/blind-access', {
+      job_id: 'rev-aging',
+      tool_results: [{ tool_name: 'bash', text: 'docs/issues/305-review.md:1:prior assessment' }],
+    });
+    expect(prohibited.json).toMatchObject({ state: 'invalidated', qualifying: false, prohibitedAccess: 1 });
+    // Past the ledger's newest-500 read window: the observation must not age out.
+    for (let index = 0; index < 501; index += 1) {
+      h.ledger.appendCustomEvent({ kind: BLIND_ACCESS_EVENT, jobId: 'rev-aging', payload: { source: 'operator', scanned: 1, rule_sha256: null, prohibited: [] } });
+    }
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-aging/blind-coverage')).json).toMatchObject({
+      state: 'invalidated', qualifying: false, prohibitedAccess: 1, accessObserved: true,
+    });
   });
 
   it('observes the finished reviewer session automatically at turn settle', async () => {

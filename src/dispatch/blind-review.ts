@@ -329,18 +329,15 @@ export function blindCoverageOf(ledger: LedgerApi, jobId: string): BlindCoverage
       reasons: ['no blind-input admission was recorded for this job (historical or unclassified review)'],
     };
   }
-  const observations = ledger.listJobEventsByKinds(jobId, [BLIND_ACCESS_EVENT], { limit: 500 });
-  const prohibited = observations.reduce(
-    (sum, event) => sum + ((event.payload as { prohibited?: readonly unknown[] }).prohibited?.length ?? 0),
-    0,
-  );
+  const access = ledger.countJobEventsAndArrayFieldLength(jobId, BLIND_ACCESS_EVENT, 'prohibited');
+  const prohibited = access.total;
   const base = {
     jobId,
     role: admitted.role,
     targetSha: admitted.target_sha,
     packageSha256: admitted.package?.packageSha256 ?? null,
     ruleSha256: admitted.rule?.sha256 ?? null,
-    accessObserved: observations.length > 0,
+    accessObserved: access.events > 0,
     prohibitedAccess: prohibited,
     reportPreserved: true as const,
   };

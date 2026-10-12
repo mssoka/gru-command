@@ -380,10 +380,12 @@ lifecycle fact — so a settled report read as independent coverage.
   names private job material (`_bmad-output/**`, `docs/issues/**`,
   `investigations/**`, `.gru-command/{jobs,reports,reviews,artifacts,journal}/**`,
   plus anything the parent excludes), carries task-spec / prior-assessment /
-  deferred-work / triage text under ANY file name or embedded in a larger
-  document (structure-anchored; a source line merely mentioning a planning path
-  is not exposure), mismatches its declared digests or git blob ids, or targets
-  another sha. An unfiltered diff is judged per file section.
+  deferred-work / triage text in a document-like file (extensionless or
+  `.md`/`.markdown`/`.txt`/`.rst`/`.adoc`), or embedded in a larger such document
+  (structure-anchored). Other file types are not content-scanned: they are
+  judged by path only, and a source line merely mentioning a planning path is
+  not exposure. It is also refused when it mismatches its declared digests or git
+  blob ids, or targets another sha. An unfiltered diff is judged per file section.
 - `parent_contract_sha256`: the parent contract hash the package was built
   against. A stale hash answers `409 stale_parent_contract` with the current hash.
 

@@ -9,7 +9,6 @@ import {
   deriveBlindIsolationRule,
   evaluateBlindBriefing,
   evaluateBlindPackage,
-  filterBlindDiff,
   gitBlobSha,
   parseBlindInputPackage,
   reviewRoleFor,
@@ -205,40 +204,6 @@ describe('blind package evaluation', () => {
       DEFAULT_BLIND_ISOLATION_RULE,
     );
     expect(traversal.violations[0]).toMatchObject({ code: 'excluded-path' });
-  });
-
-  it('filters or refuses an unfiltered diff that carries planning artifacts, per file section', () => {
-    const diffText = [
-      'diff --git a/src/a.ts b/src/a.ts',
-      '--- a/src/a.ts',
-      '+++ b/src/a.ts',
-      '@@ -1 +1 @@',
-      '-old',
-      '+new',
-      'diff --git a/_bmad-output/implementation-artifacts/deferred-work.md b/_bmad-output/implementation-artifacts/deferred-work.md',
-      '--- a/_bmad-output/implementation-artifacts/deferred-work.md',
-      '+++ b/_bmad-output/implementation-artifacts/deferred-work.md',
-      '@@ -1 +1 @@',
-      '-x',
-      '+y',
-      'diff --git a/docs/accepted-spec.md b/docs/accepted-spec.md',
-      '--- a/docs/accepted-spec.md',
-      '+++ b/docs/accepted-spec.md',
-      '@@ -1,3 +1,4 @@',
-      ...HISTORY_NOTE.split('\n').map((line) => `+${line}`),
-      '',
-    ].join('\n');
-    const filtered = filterBlindDiff(diffText, DEFAULT_BLIND_ISOLATION_RULE);
-    expect(filtered.text).toContain('diff --git a/src/a.ts b/src/a.ts');
-    expect(filtered.text).not.toContain('deferred-work');
-    expect(filtered.text).not.toContain('Prior replacement-blind');
-    expect(filtered.removed.map((v) => v.where).sort()).toEqual([
-      '_bmad-output/implementation-artifacts/deferred-work.md',
-      'docs/accepted-spec.md',
-    ]);
-    const refused = evaluateBlindPackage({ baseSha: base, targetSha: target, diff: { text: diffText } }, DEFAULT_BLIND_ISOLATION_RULE);
-    expect(refused.ok).toBe(false);
-    expect(refused.violations).toHaveLength(2);
   });
 
   it('refuses history-bearing prose embedded in the briefing itself', () => {

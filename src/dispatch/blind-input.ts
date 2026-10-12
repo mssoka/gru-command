@@ -7,9 +7,12 @@ import { amendmentSupersessions } from '../review-inputs/amendments.js';
  *
  * A blind reviewer is only independent if the INPUT it can read carries no
  * task specification, prior assessment, deferred-work or triage text. A clean
- * checkout and a reproducible diff do not prove that: renamed or embedded
- * history, an unfiltered historical diff, or a grep that lands in a planning
- * file all defeat it. Root cause this module closes: the child's briefing was
+ * checkout and a reproducible diff do not prove that: history embedded in a
+ * document-like file (extensionless or .md/.markdown/.txt/.rst/.adoc), an
+ * unfiltered historical diff, or a grep that lands in a planning file all
+ * defeat it. Content scanning is gated to those document-like files; every
+ * other file type is judged by path alone, so a source line that merely names a
+ * planning path is not exposure. Root cause this module closes: the child's briefing was
  * free-form text composed by the parent from its ORIGINAL contract; nothing at
  * commissioning consulted the parent's EFFECTIVE contract (amendments,
  * including administrative clarifications) or inspected the input the child
@@ -426,22 +429,6 @@ function sectionViolations(section: DiffSection, rule: BlindIsolationRule): read
     });
   }
   return out;
-}
-
-/** Drop every diff file section that would hand a blind reviewer excluded
- * material. The removed list names what was dropped (never its text). */
-export function filterBlindDiff(
-  diffText: string,
-  rule: BlindIsolationRule,
-): { readonly text: string; readonly removed: readonly BlindViolation[] } {
-  const kept: string[] = [];
-  const removed: BlindViolation[] = [];
-  for (const section of splitDiff(diffText)) {
-    const violations = sectionViolations(section, rule);
-    if (violations.length > 0) removed.push(violations[0]!);
-    else kept.push(section.text);
-  }
-  return { text: kept.length === 0 ? '' : `${kept.join('\n')}${kept.at(-1)!.endsWith('\n') ? '' : '\n'}`, removed };
 }
 
 export function evaluateBlindPackage(pkg: BlindInputPackage, rule: BlindIsolationRule): BlindPackageEvaluation {

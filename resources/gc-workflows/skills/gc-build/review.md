@@ -39,7 +39,9 @@ parallel when the runtime supports it:
   from `GET /api/dispatch/jobs/{{context.jobId}}/contract`. The service validates the package
   against this job's effective `blind-isolation:` rule (administrative clarifications
   included) BEFORE any reviewer spawns, and refuses task specs, prior assessments and
-  deferred/triage text — however the file is named — with a correction path. Never hand a
+  deferred/triage text carried by a document-like file (extensionless or `.md`/`.markdown`/
+  `.txt`/`.rst`/`.adoc`, whatever it is named) with a correction path; other file types are
+  path-checked only. Never hand a
   blind reviewer an unfiltered historical diff, and never count a blind report as
   independent coverage unless `GET /api/dispatch/jobs/<review job>/blind-coverage` says
   `qualifying`; settling a report is not validity.

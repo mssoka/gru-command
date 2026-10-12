@@ -25,8 +25,8 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'awareness-adversarial.test.ts': 2,
 
 
-  'blind-input-dispatch.test.ts': 11,
-  'blind-input.test.ts': 17,
+  'blind-input-dispatch.test.ts': 12,
+  'blind-input.test.ts': 16,
   'bmad-legacy-retirement.test.ts': 5,
   'bmad-onboarding.test.ts': 13,
   'gc-bootstrap-retirement.test.ts': 6,
