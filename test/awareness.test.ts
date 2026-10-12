@@ -921,7 +921,8 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       expect(morning).not.toBeNull();
       expect(morning?.text).toContain('While you were away (since 2026-09-22T');
       expect(morning?.text).toContain('- fires: 1 wake delivered');
-      expect(morning?.text).toContain('- actions:');
+      expect(morning?.text).toContain('- activity: ');
+      expect(morning?.text).not.toContain('- actions:'); // traffic is not Gru action (GH-104)
       expect(morning?.text).toContain('- merges: j-merge');
       const stagedLine = morning?.text.split('\n').find((line) => line.startsWith('- staged PRs:')) ?? '';
       expect(stagedLine).toContain('j-staged');
@@ -964,7 +965,8 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       const morning = next.prepare();
       expect(morning?.text).toContain('While you were away (since 2026-09-22T21:00:00.000Z)');
       expect(morning?.text).toContain('- fires: 1 wake delivered');
-      expect(morning?.text).toContain('- actions: 1 board event');
+      expect(morning?.text).toContain('- activity: 1 board event');
+      expect(morning?.text).not.toContain('- actions:');
       next.commit(morning!, 'chat');
       api.disposeMachineNotification(alert.id, 'Night alert fixed');
       expect(next.prepare()).toBeNull();
@@ -2789,6 +2791,48 @@ describe('GH-103 (g6): the staged-PRs line is limited to PRs linked during the a
       const line = rig.awareness.prepare()?.text.split('\n').find((l) => l.startsWith('- staged PRs:')) ?? '';
       expect(line).toContain('j-new');
       expect(line).not.toContain('j-old');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-104 (g7): Gru actions are labeled apart from passive board activity', () => {
+  function away(): Rig {
+    vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+    const rig = boot({ now: () => Date.now() });
+    rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+    rig.awareness.commit(rig.awareness.prepare()!);
+    vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+    return rig;
+  }
+
+  it('traffic alone reads as activity and never as Gru actions', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = away();
+      rig.api.appendCustomEvent({ kind: 'job.delivered', jobId: 'j1', payload: { agentId: 'm1' } });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      rig.api.appendCustomEvent({ kind: 'round.verdict', jobId: 'j1', payload: { verdict: 'approve' } });
+      const text = rig.awareness.prepare()!.text;
+      expect(text).toContain('- activity: 3 board events');
+      expect(text).not.toContain('actions');
+      expect(text).not.toContain('Gru disposition');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a Gru disposition is an action; traffic plus disposition shows both lines', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = away();
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      const alert = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Fix' });
+      rig.api.disposeMachineNotification(alert.id, 'Repaired the lane');
+      const text = rig.awareness.prepare()!.text;
+      expect(text).toContain('- activity: 1 board event');
+      expect(text).toContain('- Gru actions: 1 disposition');
+      expect(text).toContain('Gru disposition');
+      expect(text).toContain('Repaired the lane');
       rig.awareness.dispose();
     } finally { vi.useRealTimers(); }
   });

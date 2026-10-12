@@ -337,6 +337,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 /** Default morning-digest gap (8 h): first block after a quiet night. */
 export const DEFAULT_MORNING_DIGEST_GAP_MS = 28_800_000;
 /** Morning-digest kernel kinds — the "actions" count. */
+/** Passive board traffic counted as digest ACTIVITY (not Gru action, GH-104). */
 const MORNING_ACTION_KINDS = ['job.delivered', 'job.status', 'round.verdict'] as const;
 /** Bounded morning-digest lines (fires/actions/merges/staged PRs). */
 const MAX_MORNING_LINES = 6;
@@ -1736,8 +1737,16 @@ export class GruAwareness {
     capped('fires', wakes.length, 'wake delivered');
     const boardActions = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: [...MORNING_ACTION_KINDS], limit: 101 });
     const resolutions = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['notification.resolved'], limit: 101, order: 'desc' });
-    const actionCount = boardActions.length + resolutions.length;
-    if (actionCount > 0) push(`- actions: ${boardActions.length >= 101 || resolutions.length >= 101 ? '100+' : actionCount} board event${actionCount === 1 ? '' : 's'}`);
+    // Decision (GH-104, docs/decisions/awareness-digest-semantics.md): only
+    // durable `notification.resolved` rows attributed `by: 'gru'` are Gru
+    // ACTIONS. Deliveries, status changes, verdicts and non-Gru resolutions
+    // are passive board ACTIVITY and are labeled separately.
+    const gruResolutions = resolutions.filter((event) => payloadOf(event)['by'] === 'gru');
+    const activityCount = boardActions.length + (resolutions.length - gruResolutions.length);
+    const bound = (count: number, capped: boolean): string => (capped ? '100+' : String(count));
+    const anyCapped = boardActions.length >= 101 || resolutions.length >= 101;
+    if (activityCount > 0) push(`- activity: ${bound(activityCount, anyCapped)} board event${activityCount === 1 ? '' : 's'}`);
+    if (gruResolutions.length > 0) push(`- Gru actions: ${bound(gruResolutions.length, resolutions.length >= 101)} disposition${gruResolutions.length === 1 ? '' : 's'}`);
     const latestDisposition = resolutions.find((event) => payloadOf(event)['by'] === 'gru');
     if (latestDisposition !== undefined) {
       const disposition = payloadOf(latestDisposition);
