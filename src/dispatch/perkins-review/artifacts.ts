@@ -1,4 +1,4 @@
-import { execFile as execFileCallback, execFileSync, spawn, spawnSync, type SpawnSyncOptions } from 'node:child_process';
+import { execFile as execFileCallback, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { readFile as readFileAsync, readdir as readdirAsync } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
@@ -408,7 +408,13 @@ export const OWNED_GIT_SEAMS: {
   procFsAsync: ProcFsAsync;
   /** Monotonic milliseconds: the settle deadline's clock. */
   now: () => number;
+  /** How a runner is started (a test can stand in a child that never exits). */
+  spawn: typeof spawn;
+  /** Grace past a step's own bound before the outer guard acts on a runner that has not exited. */
+  guardSlackMs: number;
 } = {
+  spawn,
+  guardSlackMs: 5_000,
   platform: process.platform,
   procFs: REAL_PROC_FS,
   procFsAsync: REAL_PROC_FS_ASYNC,
@@ -596,21 +602,27 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
   const command = `git ${args.join(' ')}`;
   const launch = runnerLaunch(repoPath, args, timeoutMs, maxBytes);
   return new Promise<string>((resolve, reject) => {
-    const runner = spawn(process.execPath, launch.argv, { detached: true, stdio: 'ignore', env: launch.env });
+    const runner = OWNED_GIT_SEAMS.spawn(process.execPath, launch.argv, { detached: true, stdio: 'ignore', env: launch.env });
     // R7-1: only a real process id names a group; 0 or absent never does.
     const pid = runner.pid !== undefined && Number.isSafeInteger(runner.pid) && runner.pid > 0 ? runner.pid : null;
     let spawnError: string | undefined;
     let ended = false;
-    // A wedged runner: still unreaped (no 'exit' yet), so the group id is ours.
+    let exited = false;
+    // The outer guard (#265): a runner that has not exited by now — stuck in
+    // uninterruptible I/O, say — is SIGKILLed while still unreaped (its group
+    // id is still ours), and cleanup is observed WITHOUT waiting for an
+    // `exit` that may never come. Once the runner has exited, ownership of the
+    // group id is lost and nothing is ever signalled.
     const guard = setTimeout(() => {
-      if (pid !== null && !ended) {
+      if (pid !== null && !exited) {
         try {
           process.kill(-pid, 'SIGKILL');
         } catch {
           /* already gone */
         }
+        settle();
       }
-    }, timeoutMs + 5_000);
+    }, timeoutMs + OWNED_GIT_SEAMS.guardSlackMs);
     const settle = (): void => {
       if (ended) return;
       ended = true;
@@ -655,16 +667,22 @@ export function runOwnedGit(repoPath: string, args: readonly string[], timeoutMs
       spawnError = error.message;
       if (pid === null) settle();
     });
-    runner.on('exit', settle);
+    runner.on('exit', () => {
+      exited = true;
+      settle();
+    });
   });
 }
 
 /** runOwnedGit, synchronously (the submission gate and the admission's
- * local checks run inside synchronous code). The runner is reaped before
- * spawnSync returns, so this side never signals its group (R8-6): it only
- * observes it stop within KILL_SETTLE_MS, or refuses the step as "cleanup
- * unconfirmed". The outer guard is a backstop for a wedged runner only —
- * the runner's own timer bounds the step. */
+ * local checks run inside synchronous code). The runner is STARTED and
+ * OBSERVED, never waited on to die (#265): it stays unreaped here, so its
+ * process group is still provably ours, but this side never signals the
+ * GROUP (R8-6) — it only observes the group stop within KILL_SETTLE_MS,
+ * or refuses the step as "cleanup unconfirmed". The outer guard is a
+ * backstop for a wedged runner only: it cuts off that runner alone, then
+ * the group is observed the same way. The runner's own timer bounds the
+ * step. */
 export function runOwnedGitSync(
   repoPath: string,
   args: readonly string[],
@@ -676,21 +694,41 @@ export function runOwnedGitSync(
   const launch = runnerLaunch(repoPath, args, timeoutMs, maxBytes);
   let outcome: StepOutcome<string>;
   try {
-    // `detached` makes the runner lead its own process group. Node honors
-    // it for spawnSync (libuv UV_PROCESS_DETACHED) although its type
-    // definitions omit it; the runner refuses to run git if it does not
-    // lead a group.
-    const options: SpawnSyncOptions & { readonly detached: boolean } = {
-      detached: true,
-      stdio: 'ignore',
-      timeout: outerTimeoutMs,
-      killSignal: 'SIGKILL',
-      env: launch.env,
-    };
-    const result = spawnSync(process.execPath, launch.argv, options);
-    const report = readRunnerReport(launch.resultFile);
-    // R7-1: a failed spawn reports pid 0 — never a group to observe.
-    const pid = typeof result.pid === 'number' && Number.isSafeInteger(result.pid) && result.pid > 0 ? result.pid : null;
+    // `detached` makes the runner lead its own process group; it refuses to
+    // run git if it does not. The runner is STARTED here and observed, never
+    // waited on to die (#265): its unreaped corpse keeps the group id ours
+    // until control returns to the event loop, where Node reaps it.
+    const runner = OWNED_GIT_SEAMS.spawn(process.execPath, launch.argv, { detached: true, stdio: 'ignore', env: launch.env });
+    runner.on('error', () => { /* a failed start leaves no pid; the step reports it */ });
+    // R7-1: a failed spawn has no pid — never a group to observe.
+    const pid = typeof runner.pid === 'number' && Number.isSafeInteger(runner.pid) && runner.pid > 0 ? runner.pid : null;
+    let report: RunnerReport | null = null;
+    if (pid !== null) {
+      const guardUntil = performance.now() + outerTimeoutMs;
+      let nextLiveness = performance.now() + 250;
+      for (;;) {
+        report = readRunnerReport(launch.resultFile);
+        if (report !== null) break;
+        const now = performance.now();
+        if (now >= guardUntil) {
+          // The runner is wedged: only the runner is cut off, as before — its
+          // group is then observed, refused if still running, never signalled.
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            /* already gone */
+          }
+          break;
+        }
+        // A runner that died without a report is a group with nothing executing.
+        if (now >= nextLiveness) {
+          if (!OWNED_GIT_SEAMS.groupHasLiveMember(pid, 250)) break;
+          nextLiveness = performance.now() + 250;
+        }
+        sleepSync(2);
+      }
+      report = report ?? readRunnerReport(launch.resultFile);
+    }
     if (pid !== null) {
       const until = OWNED_GIT_SEAMS.now() + KILL_SETTLE_MS;
       const unconfirmed = (): Error =>
@@ -704,9 +742,7 @@ export function runOwnedGitSync(
         sleepSync(25);
       }
     }
-    outcome = { ok: true, value: runnerAnswer(report, command, timeoutMs, maxBytes, {
-      started: pid !== null, ...(result.error !== undefined ? { error: result.error.message } : {}),
-    }) };
+    outcome = { ok: true, value: runnerAnswer(report, command, timeoutMs, maxBytes, { started: pid !== null }) };
   } catch (error) {
     outcome = { ok: false, error };
   }

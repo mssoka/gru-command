@@ -1,8 +1,9 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { admissionPreflight, ReviewAdmissionError } from '../src/dispatch/perkins-review/admission.js';
 import {
@@ -62,7 +63,11 @@ import {
 const ownGroup = discoverOwnGroup();
 const fixtures = createFixtureCleanup({ ownGroup });
 
-afterEach(() => {
+afterEach(async () => {
+  // A synchronous owned step starts its runner and never waits for its death
+  // (#265): the runner's corpse is reaped when control returns to the event
+  // loop, so yield once before the reaper looks for survivors.
+  await new Promise((resolve) => setTimeout(resolve, 50));
   fixtures.run();
 });
 
@@ -1348,10 +1353,12 @@ describe('Perkins admission preflight (gh-169)', () => {
     const pgid = child.pid!;
     const realPlatform = OWNED_GIT_SEAMS.platform;
     const realProc = OWNED_GIT_SEAMS.procFs;
+    const realProcAsync = OWNED_GIT_SEAMS.procFsAsync;
     try {
       OWNED_GIT_SEAMS.platform = 'linux';
       const live = async (files: Record<string, string>): Promise<readonly [boolean, boolean]> => {
         OWNED_GIT_SEAMS.procFs = proc(files);
+        OWNED_GIT_SEAMS.procFsAsync = { list: async () => Object.keys(files), read: async (path) => files[path.split('/')[2]!]! };
         return [groupHasLiveMember(pgid, 1_000), await groupHasLiveMemberAsync(pgid, 1_000)];
       };
       expect(await live({ 77: stat('Zbroken', String(pgid)) })).toEqual([true, true]);
@@ -1361,6 +1368,7 @@ describe('Perkins admission preflight (gh-169)', () => {
     } finally {
       OWNED_GIT_SEAMS.platform = realPlatform;
       OWNED_GIT_SEAMS.procFs = realProc;
+      OWNED_GIT_SEAMS.procFsAsync = realProcAsync;
       process.kill(-pgid, 'SIGKILL');
     }
   });
@@ -1487,6 +1495,77 @@ describe('Perkins admission preflight (gh-169)', () => {
       }
     } finally {
       OWNED_GIT_SEAMS.now = realNow;
+    }
+  });
+
+  it('a runner that never exits is refused as cleanup-unconfirmed naming its group — async and sync alike; the guard, exit and report paths are idempotent and nothing is signalled once ownership is lost (#265)', async () => {
+    const review = branchTargetReview('wedged-runner');
+    const repo = review.manifest.repoPath;
+    const PGID = 2_000_000_001; // never a real process: every signal to it is recorded and swallowed
+    const signals: { target: number; signal: string | number | undefined }[] = [];
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: string | number) => {
+      signals.push({ target, signal });
+      return true;
+    }) as typeof process.kill);
+    const launched: { child: EventEmitter; resultFile: string }[] = [];
+    const realSpawn = OWNED_GIT_SEAMS.spawn;
+    const realSlack = OWNED_GIT_SEAMS.guardSlackMs;
+    // A runner stuck in uninterruptible I/O: it has a pid and a group, and never emits `exit`.
+    OWNED_GIT_SEAMS.spawn = ((_file: string, argv: readonly string[]) => {
+      const child = Object.assign(new EventEmitter(), { pid: PGID });
+      launched.push({ child, resultFile: argv[2]! });
+      return child;
+    }) as unknown as typeof OWNED_GIT_SEAMS.spawn;
+    OWNED_GIT_SEAMS.guardSlackMs = 20;
+    const sync = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMember').mockReturnValue(true);
+    const async = vi.spyOn(OWNED_GIT_SEAMS, 'groupHasLiveMemberAsync').mockResolvedValue(true);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      // Async: the guard fires, SIGKILLs the still-unreaped group once, and observation starts without an `exit`.
+      const started = performance.now();
+      await expect(runOwnedGit(repo, ['rev-parse', 'HEAD'], 50)).rejects.toMatchObject({
+        message: expect.stringMatching(new RegExp(`^cleanup unconfirmed: process group ${PGID} still running — git rev-parse HEAD did not stop after SIGKILL`, 'u')),
+        cleanupUnconfirmed: true, pgid: PGID,
+      });
+      expect(performance.now() - started).toBeLessThan(50 + 20 + 1_000 + 1_500);
+      expect(signals).toEqual([{ target: -PGID, signal: 'SIGKILL' }]);
+      expect(existsSync(dirname(launched[0]!.resultFile))).toBe(false); // the private directory is still cleaned up
+      // The runner finally dies: every path is idempotent — no second settlement, no signal, no rejection.
+      launched[0]!.child.emit('exit', 137, null);
+      launched[0]!.child.emit('exit', 137, null);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(signals).toHaveLength(1);
+
+      // Sync: bounded start-and-observe — never waits for the runner to die.
+      signals.length = 0;
+      const syncStarted = performance.now();
+      expect(() => runOwnedGitSync(repo, ['rev-parse', 'HEAD'], 50, 100))
+        .toThrow(new RegExp(`^cleanup unconfirmed: process group ${PGID} still running — git rev-parse HEAD did not stop after SIGKILL`, 'u'));
+      expect(performance.now() - syncStarted).toBeLessThan(100 + 1_000 + 1_500);
+      expect(signals).toEqual([{ target: PGID, signal: 'SIGKILL' }]); // the runner alone — its group is observed, never signalled
+      expect(existsSync(dirname(launched[1]!.resultFile))).toBe(false);
+
+      // Once the runner HAS exited, ownership is lost: the guard never signals the group.
+      signals.length = 0;
+      sync.mockReturnValue(false);
+      async.mockResolvedValue(false);
+      const pending = runOwnedGit(repo, ['rev-parse', 'HEAD'], 50).catch((error: unknown) => error);
+      launched[2]!.child.emit('exit', 0, null);
+      expect(await pending).toMatchObject({ ownedStopped: true, message: expect.stringContaining('ended without a result') });
+      await new Promise((resolve) => setTimeout(resolve, 150)); // well past the guard
+      expect(signals).toEqual([]);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      sync.mockRestore();
+      async.mockRestore();
+      kill.mockRestore();
+      OWNED_GIT_SEAMS.spawn = realSpawn;
+      OWNED_GIT_SEAMS.guardSlackMs = realSlack;
     }
   });
 
