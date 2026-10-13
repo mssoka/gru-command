@@ -14,7 +14,7 @@ import { claudeTurnArgs, claudePromptFrame } from '../../dist/runtime/claude-ada
 
 const executable = process.argv[2];
 if (!executable || !isAbsolute(executable)) throw new Error('Qualification requires the explicit installed absolute Claude executable path');
-const root = mkdtempSync(join(tmpdir(), 'gru-gh315-native-'));
+const root = mkdtempSync(join(tmpdir(), 'gru gh315 native-'));
 const home = join(root, 'home'); const lane = join(root, 'lane'); const bin = join(root, 'bin');
 for (const dir of [home, lane, bin, join(lane, 'web'), join(lane, '.gru-command')]) mkdirSync(dir, { recursive: true });
 const starts = join(root, 'producer-starts');
@@ -30,13 +30,16 @@ for (const base of [lane, join(lane, 'web')]) {
   mkdirSync(join(base, 'node_modules/.bin'), { recursive: true });
   for (const name of ['vitest', 'jest', 'tsc', 'eslint', 'vite', 'playwright']) writeFileSync(join(base, 'node_modules/.bin', name), `#!/bin/sh\nprintf '%s\\n' '${name}' >> '${starts}'\n`, { mode: 0o700 });
 }
+writeFileSync(join(lane, '.gru-command/worktree.toml'), `[verify]\nfull = "npm test"\nquality = "CI=1 npm run quality"\ncustom = 'npm run "check build"'\n`);
 const policy = workerVerificationPolicy({ id: 'native-fixture', jobId: 'native-fixture', kind: 'job', status: 'active', path: lane }, join(home, 'config.toml'));
 const settings = privateClaudeVerificationSettings(policy);
 // Explicitly unavailable hook, so only the independent native deny can refuse.
 const data = JSON.parse(readFileSync(settings.file, 'utf8')); delete data.hooks;
 writeFileSync(settings.file, JSON.stringify(data));
-const corpus = process.argv[3] === 'early' ? nativeCorpus.filter(({ raw }) => ['npm test', 'npm run lint && npm run typecheck && npm run build && npm run build:web', 'tsc src/index.ts', "printf '%s' 'X=1 npm test -- --help'", 'tsc --pretty false --showConfig'].includes(raw)) : nativeCorpus;
-const cases = corpus.map(({ raw, refused }) => [raw, refused]);
+const completeCorpus = [...nativeCorpus, { raw: 'npm run "check build"', refused: true }, { raw: `'${join(lane, 'node_modules/.bin/tsc')}' src/index.ts`, refused: true }];
+const corpus = process.argv[3] === 'early' ? completeCorpus.filter(({ raw }) => ['npm test', 'npm run lint && npm run typecheck && npm run build && npm run build:web', 'tsc src/index.ts', "printf '%s' 'X=1 npm test -- --help'", 'tsc --pretty false --showConfig'].includes(raw)) : completeCorpus;
+const cases = corpus.map(({ raw, refused }) => [raw, refused, false]);
+if (process.argv[3] !== 'early') cases.push(['npm test', true, true]);
 const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'),
   XDG_CONFIG_HOME: join(home, 'config'), XDG_CACHE_HOME: join(home, 'cache'), XDG_DATA_HOME: join(home, 'data'), XDG_STATE_HOME: join(home, 'state'),
   TMPDIR: root, ANTHROPIC_API_KEY: 'fake-owned-fixture-key', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -70,7 +73,7 @@ await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${server.address().port}`;
 process.stdout.write(JSON.stringify({ identity, root, settings: data, boundary: 'actual vendor permission engine; deterministic fake upstream; no paid model/Perkins READY' }) + '\n');
 try {
-  for (const [raw, refused] of cases) {
+  for (const [raw, refused, hostUnavailable] of cases) {
     command = raw; sent = false;
     const before = existsSync(starts) ? readFileSync(starts, 'utf8') : '';
     const args = [...claudeTurnArgs({ sessionId: randomUUID(), tools: ['Bash'], systemPrompt: 'Owned deterministic component fixture.', cwd: lane, binary: executable, verificationSettingsFile: settings.file, workerVerification: policy, model: identity.nativeModel, thinkingLevel: identity.effort }, false), '--setting-sources', '', '--strict-mcp-config', '--no-chrome', '--disable-slash-commands', '--no-session-persistence'];
@@ -86,7 +89,9 @@ try {
       while ((at = pending.indexOf('\n')) >= 0) {
         const line = pending.slice(0, at); pending = pending.slice(at + 1);
         if (!line.trim()) continue;
-        const frame = JSON.parse(line); channel.ingest(frame);
+        const frame = JSON.parse(line);
+        if (hostUnavailable && frame.type === 'control_request') child.stdin.end();
+        else channel.ingest(frame);
         if (frame.type === 'result') child.stdin.end();
       }
     });
@@ -95,11 +100,11 @@ try {
     let spawnError;
     const code = await new Promise((resolve) => { child.once('error', (error) => { spawnError = error; }); child.once('close', resolve); });
     const after = existsSync(starts) ? readFileSync(starts, 'utf8') : '';
-    process.stdout.write(JSON.stringify({ raw, expectedRefused: refused, args, code, stdout, stderr, producerStarts: after.slice(before.length), upstream }) + '\n');
-    if (protocolError || spawnError || code !== 0 || !sent) throw new Error('Native identity/wire qualification failed; stop for supervisor');
+    process.stdout.write(JSON.stringify({ raw, expectedRefused: refused, hostUnavailable, args, code, stdout, stderr, producerStarts: after.slice(before.length), upstream }) + '\n');
+    if (protocolError || spawnError || (!hostUnavailable && code !== 0) || !sent) throw new Error('Native identity/wire qualification failed; stop for supervisor');
     const terminal = stdout.trim().split('\n').map((line) => JSON.parse(line)).findLast((frame) => frame.type === 'result');
     const denied = terminal?.permission_denials?.some((entry) => entry.tool_name === 'Bash' && entry.tool_input.command === raw) === true;
-    if (denied !== refused) throw new Error(`Native disposition mismatch: ${raw} expected refused=${refused} actual=${denied}`);
+    if (!hostUnavailable && denied !== refused) throw new Error(`Native disposition mismatch: ${raw} expected refused=${refused} actual=${denied}`);
     if (refused && after !== before) throw new Error('Native deny failed: fake producer started');
     if (!refused && /permission.*denied|not allowed|denied.*permission/i.test(stdout)) throw new Error('Native deny incorrectly refused an ordinary read');
     if (!refused) {

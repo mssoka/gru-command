@@ -431,7 +431,7 @@ verification budget.
   `npx vitest run …`, declared `npm run …` scripts, or their bare/local-bin
   equivalents) is refused BEFORE any child process starts: the pi runtime
   blocks the SDK `tool_call`, and claude-code loads a private PreToolUse
-  hook plus native `permissions.deny` rules. The refusal names the declared
+  hook plus native Bash ask routing to the host policy. The refusal names the declared
   scopes and the authenticated capture helper's `run`/`status` actions, so
   the supported path and the timeout-reconcile step are always one message
   away. The guard never rewrites the command string, never submits a run
@@ -440,38 +440,31 @@ verification budget.
   conventional producer forms, NOT a general-purpose shell sandbox — opaque
   scripts, interpreters and adversarial evasion are out of scope.
 
-  The claude-code native `permissions.deny` rules are an independent fallback
-  for when the explanatory hook fails or is unavailable. Because a deny-glob
-  language cannot exclude a read from a broader producer pattern, the fallback
-  names the executable/verb/option positions literally: it covers `npm test`
-  and its conventional aliases/options/`command`/`!` wrappers (including the
-  short npm verbs `t`, `rum`, `urn`, `run-script`), the `npx <tool>` forms such
-  as `npx --yes vitest run`, and the bare/local-bin spellings. A stem is
-  emitted only when the classifier also refuses the complete form, so a read
-  such as `npm run` (script listing) or `npx vite` (dev server) is never
-  denied. It deliberately emits no blanket `Bash(tsc *)`/`Bash(eslint
-  *)`/`Bash(vite build *)` wildcard, because that would deny the inspection
-  reads the classifier permits (`tsc --showConfig`, `eslint --help`, `vite
-  build --help`). The version exemption is subcommand-aware: `vite build
-  --version` still builds (the vendored CLI only suppresses `--version` when
-  no subcommand matched), so it is refused, while `vite build --help` stays a
-  read. Executable substitutions are classified wherever they execute — in
-  expanding double quotes, in unquoted positions and command-word tails, in
-  redirect targets and here strings, and in unquoted heredoc bodies even when
-  they span lines — while single-quoted and escaped text stays literal source.
+  Claude's private native `permissions.ask: ["Bash"]` routes each Bash
+  permission to an original-child-bound host stdio handler, including in
+  bypass mode and when the explanatory hook fails or is unavailable. The host
+  applies the immutable manifest policy, returning unchanged valid input for
+  source/Git/helper/diagnostic reads and denying known producers; malformed,
+  foreign or failed permission transport fails closed. No MCP authority or new
+  tools are granted. Private files survive disposal until every original
+  policy child actually closes. Error settlement and deadlines are not close.
 
-  The residual native-only gaps are enforced by the classifier/hook and are
-  documented here rather than bridged with a wildcard that would over-block
-  quoted read data: a bare assignment prefix (`CI=1 npm test`), an arbitrary
-  positional operand of a bare tool (`tsc src/index.ts`), and an argument tail
-  the classifier would refuse under a producing verb. One bounded over-block
-  is accepted for the same reason: `vitest run --help` is refused by both the
-  classifier and the native catalogue, because the `Bash(npx vitest run *)`
-  wildcard that must retain the original incident forms under an unavailable
-  hook cannot exclude that help read. The native catalogue is also not
-  qualified against an installed vendor CLI in this revision; the vendor
-  consumer's handling of the enumerated rules remains a separate, unclaimed
-  qualification scope.
+  Supported conventional normalization includes assignments, nested simple
+  env/command/time/exec/nohup/nice wrappers, npm aliases/options/workspace
+  operands, npx flags and known lane-local tool paths. Literal quoted text and
+  plaintext heredoc bodies remain data; supported executable substitutions in
+  expanding text are checked. Help/config inspection (including `vitest run
+  --help`) remains an ordinary read; `--` ends option interpretation. This
+  bounded grammar does not inspect arbitrary script/interpreter bodies.
+
+  The independent offline CLI double proves raw corpus dispositions, settings
+  and stdio wiring, not execution by a vendor CLI or paid model. The declared
+  native component scope exercises installed Claude 2.1.296 with the configured
+  `gpt-6-luna`/`max`, isolated state, fake credentials and deterministic
+  loopback upstream; it verifies matching successful Bash read results and
+  zero refused producer starts. That is actual vendor permission-engine
+  evidence for its captured exact head, not paid-model behavior or native
+  Perkins READY. Final integrated/FULL/remote CI acceptance remains separate.
 
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a

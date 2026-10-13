@@ -40,3 +40,22 @@ for (const row of nativeCorpus) {
   else if (row.raw.startsWith('command printf')) row.output = 'npm test example';
   else row.output = 'npm test';
 }
+
+export function nativeRuleMatches(rule, raw) {
+  if (!rule.startsWith('Bash(')) return false;
+  const pattern = rule.slice(5, -1);
+  let expression = '^';
+  for (let i = 0; i < pattern.length; i += 1) {
+    const char = pattern[i];
+    if (char === '\\' && i + 1 < pattern.length) expression += pattern[++i].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    else expression += char === '*' ? '.*' : char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(expression + '$', 's').test(raw);
+}
+
+export function simulatedNativeDenial(command, rules) {
+  const row = nativeCorpus.find((entry) => entry.raw === command);
+  // Unknown raw input remains raw: no production normalization, no guessed
+  // recursive shell evaluation. The explanatory hook has separate coverage.
+  return (row?.subjects ?? [command]).some((subject) => rules.some((rule) => nativeRuleMatches(rule, subject)));
+}

@@ -914,7 +914,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       // deadline; keep a LATE latch on the ORIGINAL child so a real close
       // after deadline settlement still upgrades the evidence later.
       let exitKind: 'close-observed' | 'error' | null =
-        live.exitCode !== null || live.signalCode !== null ? 'close-observed' : null;
+        live.exitCode !== null || live.signalCode !== null || this.closedVerificationChildren.has(live) ? 'close-observed' : null;
       const childExited =
         exitKind !== null
           ? Promise.resolve()
@@ -935,12 +935,12 @@ export class ClaudeCodeHandle implements AgentHandle {
       // forced kill prevents a broken ChildProcess implementation from
       // retaining the transcript and session lock forever.
       try {
-        if (!originals.includes(live)) live.kill('SIGTERM');
+        if (!originals.includes(live) && !this.closedVerificationChildren.has(live)) live.kill('SIGTERM');
       } catch {
         /* already gone */
       }
       killTimer = setTimeout(() => {
-        if (this.live !== null && !originals.includes(this.live)) {
+        if (this.live !== null && !originals.includes(this.live) && !this.closedVerificationChildren.has(this.live)) {
           try {
             this.live.kill('SIGKILL');
           } catch {

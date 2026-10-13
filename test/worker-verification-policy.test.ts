@@ -1,12 +1,17 @@
-import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { promisify } from 'node:util';
+import { exec, spawnSync, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { nativeCorpus } from './helpers/verification-native-corpus.mjs';
+import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { PACKAGE_ROOT } from '../src/bmad/runtime.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { claudeTurnArgs } from '../src/runtime/claude-adapter.js';
-import { claudeVerificationDenyRules, privateClaudeVerificationSettings } from '../src/runtime/claude-verification-settings.js';
+import { ClaudeVerificationPermissionChannel, privateClaudeVerificationSettings } from '../src/runtime/claude-verification-settings.js';
 import { workerVerificationExtension } from '../src/runtime/pi-adapter.js';
 import { workerVerificationHook } from '../src/runtime/worker-verification-hook.js';
 import {
@@ -204,19 +209,9 @@ describe('worker verification policy: bounded producer classification', () => {
 
   it('keeps the native deny catalogue precise for reads and broad for conventional variants (H3/H4)', () => {
     const policy = policyFixture();
-    const rules = claudeVerificationDenyRules(policy);
-    for (const rule of [
-      'Bash(npm test)', 'Bash(npm tst)', 'Bash(npm --workspace web test)', 'Bash(npx --yes vitest run)',
-      'Bash(command npm test)', 'Bash(! npm test)', 'Bash(npx vitest run *)',
-    ]) {
-      expect(rules, rule).toContain(rule);
-    }
-    // Blanket tool wildcards would override a hook allow for inspection reads.
-    for (const rule of ['Bash(tsc *)', 'Bash(eslint *)', 'Bash(vite build *)', 'Bash(playwright test *)']) {
-      expect(rules, rule).not.toContain(rule);
-    }
-    expect(rules).toContain('Bash(tsc)');
-    expect(rules).toContain('Bash(vite build)');
+    const rules = ['Bash'];
+    expect(rules).toEqual(['Bash']);
+    for (const row of nativeCorpus) expect(nativeHostDenial(row.raw, policy), row.raw).toBe(row.refused);
   });
 
   it('writes a private settings artifact the CLI can actually consume (M5)', () => {
@@ -224,15 +219,24 @@ describe('worker verification policy: bounded producer classification', () => {
     const settings = privateClaudeVerificationSettings(policy);
     try {
       const parsed = JSON.parse(readFileSync(settings.file, 'utf8')) as {
-        permissions?: { deny?: string[] };
+        permissions?: { ask?: string[] };
         hooks?: { PreToolUse?: { matcher?: string; hooks?: { type?: string; command?: string }[] }[] };
       };
-      expect(parsed.permissions?.deny).toEqual(settings.denyRules);
-      expect(parsed.permissions?.deny?.length ?? 0).toBeGreaterThan(0);
+      expect(parsed.permissions?.ask).toEqual(['Bash']);
+      expect(parsed.permissions?.ask?.length ?? 0).toBeGreaterThan(0);
       const entry = parsed.hooks?.PreToolUse?.[0];
       expect(entry?.matcher).toBe('Bash');
       expect(entry?.hooks?.[0]?.type).toBe('command');
       expect(entry?.hooks?.[0]?.command).toContain('worker-verification-hook.js');
+      for (const [command, denied] of [['npm test', true], ['git status', false]] as const) {
+        const execution = spawnSync('/bin/sh', ['-c', entry!.hooks![0]!.command!], {
+          input: JSON.stringify({ tool_name: 'Bash', tool_input: { command } }), encoding: 'utf8',
+        });
+        expect(execution.status, execution.stderr).toBe(0);
+        expect(JSON.parse(execution.stdout)).toEqual(denied ? { hookSpecificOutput: {
+          hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: workerVerificationRefusal(policy),
+        } } : {});
+      }
       // The hook reads the sibling policy file, not the settings file.
       const policyFile = join(dirname(settings.file), 'policy.json');
       expect(JSON.parse(readFileSync(policyFile, 'utf8'))).toMatchObject({ jobId: policy.jobId });
@@ -270,7 +274,7 @@ describe('worker verification policy: bounded producer classification', () => {
       expect(isVerificationProducer(form, policy), form).toBe(false);
     }
     // The help read stays a read: no blanket wildcard may deny it.
-    expect(claudeVerificationDenyRules(policy)).not.toContain('Bash(vite build *)');
+    expect(nativeHostDenial('vite build --help', policy)).toBe(false);
   });
 
   it('classifies executable substitutions in redirect targets, herestrings and unquoted positions (N2/N3/N9)', () => {
@@ -296,13 +300,8 @@ describe('worker verification policy: bounded producer classification', () => {
 
   it('omits native stems the classifier itself treats as reads (N5)', () => {
     const policy = policyFixture();
-    const rules = claudeVerificationDenyRules(policy);
-    for (const rule of ['Bash(npm run)', 'Bash(npx vite)', 'Bash(npx playwright)']) {
-      expect(rules, rule).not.toContain(rule);
-    }
-    for (const rule of ['Bash(npm run lint)', 'Bash(tsc)', 'Bash(vite build)', 'Bash(npx vitest run)']) {
-      expect(rules, rule).toContain(rule);
-    }
+    const rules = ['Bash'];
+    expect(rules).toEqual(['Bash']);
     // The classifier agrees: script listing and the dev server are reads.
     for (const form of ['npm run', 'npx vite', 'npx playwright', 'npx vite dev']) {
       expect(isVerificationProducer(form, policy), form).toBe(false);
@@ -339,10 +338,7 @@ describe('worker verification policy: bounded producer classification', () => {
     for (const form of ['npm t', 'npm rum build', 'npm urn build', 'npm run-script build']) {
       expect(isVerificationProducer(form, policy), form).toBe(true);
     }
-    const rules = claudeVerificationDenyRules(policy);
-    for (const rule of ['Bash(npm t)', 'Bash(npm rum build)', 'Bash(npm urn build)']) {
-      expect(rules, rule).toContain(rule);
-    }
+    for (const form of ['npm t', 'npm rum build', 'npm urn build']) expect(nativeHostDenial(form, policy)).toBe(true);
   });
 
   it('runs the shipped hook CLI as a subprocess and denies a producer (N4)', () => {
@@ -406,7 +402,7 @@ describe('worker verification policy: runtime enforcement seams', () => {
     const policy = policyFixture();
     const settings = privateClaudeVerificationSettings(policy);
     try {
-      expect(claudeVerificationDenyRules(policy)).toContain(`Bash(npm test *)`);
+      expect(nativeHostDenial('npm test', policy)).toBe(true);
       const base = {
         sessionId: '11111111-1111-1111-1111-111111111111', sessionFile: '/tmp/s.jsonl', cwd: '/tmp',
         binary: 'claude', tools: ['Bash', 'Read'], systemPrompt: 'role', killGraceMs: 2_000, resume: false,
@@ -418,5 +414,216 @@ describe('worker verification policy: runtime enforcement seams', () => {
     } finally {
       settings.dispose();
     }
+  });
+});
+
+function nativeHostDenial(command: string, policy: WorkerVerificationPolicy): boolean {
+  const child = Object.assign(new EventEmitter(), { stdin: new PassThrough() }) as unknown as ChildProcess;
+  const frames: Record<string, unknown>[] = [];
+  child.stdin!.on('data', (chunk: Buffer) => frames.push(JSON.parse(chunk.toString())));
+  const channel = new ClaudeVerificationPermissionChannel(child, policy, (message) => { throw new Error(message); }, () => {});
+  channel.start();
+  channel.ingest({ type: 'control_response', response: { subtype: 'success', request_id: frames[0]!['request_id'] } });
+  channel.ingest({ type: 'control_request', request_id: 'owned-request', request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'owned-tool', input: { command } } });
+  return (frames.at(-1)!['response'] as { response: { behavior: string } }).response.behavior === 'deny';
+}
+function retainedFixture(quality = false) { const f = verificationLane(quality); roots.push(f.root); return { ...f, policy: f.session.workerVerification! }; }
+
+describe('worker verification policy', () => {
+  it('classifies all exact incident forms and simple compounds as whole-call refusals', () => {
+    const { policy } = retainedFixture();
+    for (const command of [WEB_INCIDENT, FULL_INCIDENT, BUILD_INCIDENT, 'git status; npm test', 'printf ok | npx vitest run', 'X=1 npm test', 'env X=1 npm test', 'command npm test']) {
+      expect(isVerificationProducer(command, policy), command).toBe(true);
+    }
+  });
+  it('leaves source/Git and quoted producer read arguments alone', () => {
+    const { policy } = retainedFixture();
+    for (const command of ['git status && git diff', "printf '%s' 'npm test && npx vitest run'", 'rg "npm run lint; npm test" src', 'cat package.json', '# npm test\ngit status']) {
+      expect(isVerificationProducer(command, policy), command).toBe(false);
+    }
+  });
+  it('leaves capture helper and opaque script/interpreter execution outside the bounded classifier', () => {
+    const { policy } = retainedFixture();
+    for (const command of [`node ${policy.helper} status --request-id existing`, 'node tools/private-script.mjs', 'sh opaque-script.sh']) expect(isVerificationProducer(command, policy)).toBe(false);
+  });
+  it('snapshots declared scopes from the lane, not its source repo or environment', () => {
+    const f = retainedFixture();
+    expect(f.policy).toMatchObject({ cwd: f.lane.path, laneId: f.lane.id, jobId: f.lane.jobId, scopes: ['focused', 'full'] });
+    writeFileSync(join(f.lane.path, '.gru-command/worktree.toml'), '[verify]\ncustom = "npm run quality"\n');
+    expect(f.policy.scopes).toEqual(['focused', 'full']);
+    const next = workerVerificationPolicy(f.lane, f.policy.configFile)!;
+    expect(isVerificationProducer('npm run quality', next)).toBe(true);
+    expect(next.scopes).toEqual(['custom']);
+    expect(Object.isFrozen(next)).toBe(true);
+    expect(Object.isFrozen(next.producerPrefixes[0])).toBe(true);
+  });
+  it('excludes child lanes and absent/empty declarations, and keeps malformed declarations loud', () => {
+    const f = retainedFixture();
+    expect(workerVerificationPolicy({ ...f.lane, kind: 'child' }, f.policy.configFile)).toBeUndefined();
+    const path = join(f.lane.path, '.gru-command/worktree.toml');
+    rmSync(path);
+    expect(workerVerificationPolicy(f.lane, f.policy.configFile)).toBeUndefined();
+    writeFileSync(path, '[verify]\n');
+    expect(workerVerificationPolicy(f.lane, f.policy.configFile)).toBeUndefined();
+    writeFileSync(path, 'invalid = [');
+    expect(() => workerVerificationPolicy(f.lane, f.policy.configFile)).toThrow(/not valid TOML/);
+  });
+  it('names authenticated helper/scopes and reconciliation without admitting or mapping coverage', () => {
+    const { policy } = retainedFixture();
+    const reason = workerVerificationRefusal(policy);
+    expect(reason).toContain('focused, full');
+    expect(reason).toContain('capture-cli.js');
+    expect(reason).toContain('--config');
+    expect(reason).toContain('--request-id');
+    expect(reason).toContain('No run was submitted and no receipt was created');
+    expect(reason).toContain('timeout is not termination or PASS');
+    expect(reason).toContain('never rerun unchanged proof');
+  });
+  it('private hook/settings expose no MCP/auth or tools and carry independent native denies', () => {
+    const { policy } = retainedFixture();
+    const settings = privateClaudeVerificationSettings(policy);
+    try {
+      expect(statSync(settings.file).mode & 0o077).toBe(0);
+      const data = JSON.parse(readFileSync(settings.file, 'utf8'));
+      expect(data.permissions.ask).toEqual(['Bash']);
+      expect(nativeHostDenial(WEB_INCIDENT, policy)).toBe(true);
+      expect(nativeHostDenial(FULL_INCIDENT, policy)).toBe(true);
+      expect(data.hooks.PreToolUse[0].matcher).toBe('Bash');
+      expect(Object.keys(data).sort()).toEqual(['hooks', 'permissions']);
+    } finally { settings.dispose(); }
+    expect(existsSync(settings.file)).toBe(false);
+  });
+  it('hook returns private actionable denial for Bash only, never grants permission', () => {
+    const { policy } = retainedFixture();
+    expect(workerVerificationHook({ tool_name: 'Bash', tool_input: { command: WEB_INCIDENT } }, policy)).toMatchObject({ hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: workerVerificationRefusal(policy) } });
+    expect(workerVerificationHook({ tool_name: 'Read', tool_input: { command: FULL_INCIDENT } }, policy)).toEqual({});
+    expect(workerVerificationHook({ tool_name: 'Bash', tool_input: { command: 'git diff' } }, policy)).toEqual({});
+  });
+  it('review-1 independently recognizes every standalone npm check script', () => {
+    const { policy } = retainedFixture();
+    for (const script of ['lint', 'typecheck', 'build', 'build:web', 'test:backend', 'test:backend:heavy', 'test:heavy', 'test:web', 'e2e']) {
+      expect(isVerificationProducer(`npm run ${script}`, policy), script).toBe(true);
+    }
+  });
+  it('review-1 normalizes conventional wrappers and package-manager flags', () => {
+    const { policy } = retainedFixture();
+    for (const command of ['npm --prefix web test', 'npm --prefix=web run build:web', 'npx --no-install vitest run', 'command -p env -i PATH=/bin npm test', 'env -u UNUSED command -- env --chdir web npm test', 'env --unset=UNUSED -- npm test']) expect(isVerificationProducer(command, policy), command).toBe(true);
+    expect(isVerificationProducer('command -v npm test', policy)).toBe(false);
+  });
+  it('review-1 shares normalization for assignment-prefixed custom declarations', () => {
+    const f = retainedFixture();
+    writeFileSync(join(f.lane.path, '.gru-command/worktree.toml'), '[verify]\nquality = "CI=1 command -p env -- npm --prefix web run quality"\n');
+    const policy = workerVerificationPolicy(f.lane, f.policy.configFile)!;
+    for (const command of ['npm run quality', 'CI=1 npm run quality', 'env -i CI=1 command npm --prefix web run quality']) expect(isVerificationProducer(command, policy), command).toBe(true);
+    expect(nativeHostDenial('npm run quality', policy)).toBe(true);
+  });
+  it('review-1 recognizes only known local producer paths including native prefixes', () => {
+    const { policy } = retainedFixture();
+    for (const base of ['./node_modules/.bin/', '../node_modules/.bin/', `${policy.cwd}/node_modules/.bin/`, `${policy.cwd}/web/node_modules/.bin/`]) {
+      for (const producer of ['vitest run', 'jest', 'eslint .', 'tsc --noEmit', 'vite build', 'playwright test']) {
+        expect(isVerificationProducer(base + producer, policy), base + producer).toBe(true);
+        expect(nativeHostDenial(base + producer, policy)).toBe(true);
+      }
+    }
+    expect(isVerificationProducer('/opaque/vitest run', policy)).toBe(false);
+    expect(isVerificationProducer('./scripts/vitest run', policy)).toBe(false);
+  });
+  it('review-1 delimits redirections without changing producer classification', () => {
+    const { policy } = retainedFixture();
+    for (const command of ['npm test>test.log', 'npm test>>test.log', 'npm test 2>test.log', '>test.log npm test', 'npm test<input', 'printf ok; npm test>test.log']) expect(isVerificationProducer(command, policy), command).toBe(true);
+    expect(isVerificationProducer('printf npm >test', policy)).toBe(false);
+  });
+  it('review-1 quoted literal heredoc bodies are data but executable neighbors still refuse', () => {
+    const { policy } = retainedFixture();
+    for (const command of ["cat <<'EOF'\nnpm test\nnpx vitest run\nEOF", 'cat >source.ts <<"EOF"\nnpm test && npm run build\nEOF\ngit status', "cat <<-'EOF'\n\tnpm test\n\tEOF"]) expect(isVerificationProducer(command, policy), command).toBe(false);
+    for (const command of ["npm test; cat <<'EOF'\nnpm test\nEOF", "cat <<'EOF'\nnpm test\nEOF\nnpm run build:web", "cat <<'A' <<'B'\nnpm test\nA\nnpx vitest run\nB\nnpm test"]) expect(isVerificationProducer(command, policy), command).toBe(true);
+  });
+  it('review-1 development servers and browser installation are not producers', () => {
+    const { policy } = retainedFixture();
+    for (const command of ['vite', 'vite dev', 'vite serve', 'vite preview', 'npx vite dev', 'playwright install', 'playwright install-deps', 'npx playwright install', './node_modules/.bin/vite dev', '../node_modules/.bin/playwright install']) expect(isVerificationProducer(command, policy), command).toBe(false);
+    for (const command of ['vite build', 'npx vite build', 'playwright test', 'npx playwright test']) expect(isVerificationProducer(command, policy), command).toBe(true);
+  });
+  it('review-1 config authority is required and never inferred from dataDir or environment', () => {
+    const f = retainedFixture();
+    expect(() => workerVerificationPolicy(f.lane)).toThrow(/host-loaded absolute instance config path/);
+    expect(f.policy.configFile).toBe(join(f.config.instanceDir, 'config.toml'));
+    expect(f.config.dataDir).not.toBe(f.config.instanceDir);
+    expect(JSON.stringify(f.policy)).not.toContain('isolated-verification-fixture-token');
+  });
+
+  it('review-2 advertised shell-safe status action authenticates literal dollar/backtick host config paths', async () => {
+    const f = retainedFixture(); const status = await authenticatedCaptureStatus(f);
+    try {
+      const reason = workerVerificationRefusal(f.policy);
+      const command = reason.split('reconcile that existing request identity: ')[1]!.split('. A timeout')[0]!
+        .replace('<existing-id>', 'existing').replace('<ops-url>', status.url);
+      expect(f.policy.configFile).toContain('$literal-`literal`');
+      const execution = promisify(exec)(command, { cwd: f.policy.cwd });
+      await expect(execution).resolves.toMatchObject({ stdout: expect.stringContaining('existing') });
+      expect(status.requests).toEqual(['GET /api/verify/status?request_id=existing']);
+      expect(existsSync(f.starts)).toBe(false);
+    } finally { await status.close(); }
+  });
+  it('review-2 conventional aliases/options/control/path forms classify without data-position inference', () => {
+    const { policy } = retainedFixture(true);
+    for (const row of nativeCorpus) expect(isVerificationProducer(row.raw, policy), row.raw).toBe(row.refused);
+    for (const command of ['! printf ok | npm test', '( npm test )', '{ npm test; }', 'while npm test; do printf ok; done']) expect(isVerificationProducer(command, policy), command).toBe(true);
+  });
+  it('review-2 exact declared npm script words survive normalization', () => {
+    const f = retainedFixture();
+    writeFileSync(join(f.lane.path, '.gru-command/worktree.toml'), '[verify]\nunit = "CI=1 npm run-script test.unit"\ncheck = "npm run check/unit"\n');
+    const policy = workerVerificationPolicy(f.lane, f.policy.configFile)!;
+    for (const command of ['npm run test.unit', 'npm run-script check/unit']) expect(isVerificationProducer(command, policy), command).toBe(true);
+    expect(isVerificationProducer('npm run testXunit', policy)).toBe(false);
+  });
+  it('review-2 plain unquoted heredoc bodies are data, actual expansions and executable neighbors still refuse', () => {
+    const { policy } = retainedFixture();
+    for (const command of ['cat <<EOF\nnpm test\nEOF', 'cat <<A <<B\nnpm test\nA\nnpx vitest run\nB']) expect(isVerificationProducer(command, policy), command).toBe(false);
+    for (const command of ['cat <<EOF\n$(npm test)\nEOF', 'cat <<EOF\n`npm test`\nEOF', 'cat <<EOF\nnpm test\nEOF\nnpm test']) expect(isVerificationProducer(command, policy), command).toBe(true);
+  });
+  it('review-2 independent raw native corpus refuses producers and allows meaningful reads without hooks', () => {
+    const { policy } = retainedFixture(true); const rules = ['Bash'];
+    for (const row of nativeCorpus) expect(nativeHostDenial(row.raw, policy), row.raw).toBe(row.refused);
+    expect(rules.some((rule) => rule.includes('*=*'))).toBe(false);
+    expect(rules.some((rule) => rule.includes('npm *test'))).toBe(false);
+  });
+
+});
+
+describe('strict repair native host identity and failure fences', () => {
+  function channelFixture() {
+    const child = Object.assign(new EventEmitter(), { stdin: new PassThrough() }) as unknown as ChildProcess;
+    const frames: Record<string, unknown>[] = []; const failures: string[] = [];
+    child.stdin!.on('data', (chunk: Buffer) => frames.push(JSON.parse(chunk.toString())));
+    const channel = new ClaudeVerificationPermissionChannel(child, policyFixture(), (message) => failures.push(message), () => {});
+    channel.start(); channel.ingest({ type: 'control_response', response: { subtype: 'success', request_id: frames[0]!['request_id'] } });
+    return { child, channel, frames, failures };
+  }
+  it('strict repair host returns original valid read input unchanged without permission updates', () => {
+    const f = channelFixture(); const input = { command: "printf '%s' 'npm test'", timeout: 17, description: 'literal' };
+    f.channel.ingest({ type: 'control_request', request_id: 'r', request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 't', input } });
+    expect(f.frames.at(-1)).toEqual({ type: 'control_response', response: { subtype: 'success', request_id: 'r', response: { behavior: 'allow', updatedInput: input } } });
+    expect(f.failures).toEqual([]);
+  });
+  it('strict repair malformed and unrelated-tool permission requests deny and fail loud', () => {
+    for (const request of [{ subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 't', input: {} }, { subtype: 'can_use_tool', tool_name: 'mcp__foreign', tool_use_id: 't', input: { command: 'git status' } }]) {
+      const f = channelFixture(); f.channel.ingest({ type: 'control_request', request_id: 'r', request });
+      expect(f.frames.at(-1)).toMatchObject({ response: { request_id: 'r', response: { behavior: 'deny' } } });
+      expect(f.failures).toEqual(['malformed or foreign worker verification permission request']);
+    }
+  });
+  it('strict repair repeated request or tool-use identity cannot acquire host approval', () => {
+    const f = channelFixture(); const request = { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 't', input: { command: 'git status' } };
+    f.channel.ingest({ type: 'control_request', request_id: 'r', request });
+    f.channel.ingest({ type: 'control_request', request_id: 'different', request });
+    expect(f.frames.at(-1)).toMatchObject({ response: { response: { behavior: 'deny' } } });
+    expect(f.failures).toHaveLength(1);
+  });
+  it('strict repair only original-child cessation invalidates its host transport', () => {
+    const f = channelFixture(); new EventEmitter().emit('close');
+    f.child.emit('close', 0, null);
+    const before = f.frames.length;
+    f.channel.ingest({ type: 'control_request', request_id: 'r', request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 't', input: { command: 'git status' } } });
+    expect(f.frames).toHaveLength(before); expect(f.failures).toHaveLength(1);
   });
 });

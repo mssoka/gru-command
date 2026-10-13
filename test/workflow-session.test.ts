@@ -1,9 +1,10 @@
+import { verificationLane } from './helpers/worker-verification.js';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { createBmadRuntimeBinder, readBmadRuntimeBinding } from '../src/bmad/runtime.js';
-import { loadConfig } from '../src/config.js';
+import { configPathFor, loadConfig } from '../src/config.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { rebriefFreshMinion, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
@@ -400,4 +401,66 @@ describe('production owned workflow session binding', () => {
     expect(() => registeredWorkflowLane({ agentId: 'worker', resumeFile: '/owner.jsonl' }, port, ledger)).toThrow(/does not belong/u);
     expect(registeredWorkflowLane({ agentId: 'child', resumeFile: '/child.jsonl' }, port, ledger)).toBeNull();
   });
+});
+describe('registered scheduled verification policy transport', () => {
+  it('historical resume-file-only workers on both runtimes retain exact package, identity and cwd with the host policy', async () => {
+    for (const runtimeId of ['pi', 'claude-code'] as const) {
+      const f = verificationLane(); roots.push(f.root);
+      const old = createBmadRuntimeBinder(join(f.dataDir, 'bmad-runtime'))(f.lane.path);
+      const binding = readBmadRuntimeBinding(f.lane.path, join(f.dataDir, 'bmad-runtime'));
+      const file = join(f.dataDir, 'worker.jsonl'); writeFileSync(file, '');
+      const owner = { id: 'retained-owner', jobId: f.lane.id, sessionFile: file, role: 'minion' as const, parentage: 'top-level' as const };
+      const records = { getAgent: () => owner, listAgents: () => [owner],
+        getJob: () => ({ id: f.lane.id, deliverable: 'pr' as const }),
+        getWorktree: (id: string) => id === f.lane.id ? f.lane : null, listWorktrees: () => [f.lane] };
+      const h = host(runtimeId, f, serviceWorkflowAuthority(f.dataDir, () => records, undefined, f.session.workerVerification!.configFile));
+      try {
+        const handle = await h.registry.spawn('minion', { resumeFile: `file://${file}` });
+        expect(handle.id).toBe(owner.id);
+        expect(h.seen[0]).toMatchObject({ cwd: f.lane.path, agentId: owner.id, managedSkills: old,
+          workerVerification: { jobId: f.lane.id, cwd: f.lane.path, scopes: ['focused', 'full'] } });
+        expect(readBmadRuntimeBinding(f.lane.path, join(f.dataDir, 'bmad-runtime'))).toEqual(binding);
+        await handle.dispose();
+      } finally { await h.registry.dispose(); }
+    }
+  });
+  it('policy transport never widens narrower tools or enters isolated review or child lanes', async () => {
+    const f = verificationLane(); roots.push(f.root);
+    const h = host('pi', f, undefined, f.session.workerVerification!.configFile);
+    try {
+      const narrow = await h.registry.spawn('minion', { cwd: f.lane.path, roleTools: ['read'] });
+      expect(h.seen[0]!.roleTools).toEqual(['read']);
+      expect(h.seen[0]!.workerVerification!.scopes).toEqual(['focused', 'full']);
+      await narrow.dispose();
+      const review = await h.registry.spawn('minion', { cwd: f.lane.path, workerVerification: f.session.workerVerification,
+        isolatedReview: { systemPrompt: 'isolated', tools: ['read'] } });
+      expect(h.seen[1]!.workerVerification).toBeUndefined();
+      await review.dispose();
+      const child = createWorkflowSessionBinder(f.dataDir, () => ({ ...f.lane, kind: 'child' }))({ roleTools: ['read'] });
+      expect(child.workerVerification).toBeUndefined();
+    } finally { await h.registry.dispose(); }
+  });
+  it('review-1 production registry binder carries loaded instance config independently of relocated data', () => {
+    const f = verificationLane(); roots.push(f.root);
+    const options = serviceRegistryOptions({ config: f.config, store: new SessionStore(f.dataDir),
+      verificationConfigFile: configPathFor(f.config.instanceDir), workflowLaneFor: () => f.lane, workflowBuildFor: () => false });
+    const session = options.workflowRuntime!({ agentId: 'original-worker' });
+    expect(session.workerVerification!.configFile).toBe(f.session.workerVerification!.configFile);
+    expect(session.workerVerification!.configFile).not.toBe(join(f.dataDir, 'config.toml'));
+    expect(session.cwd).toBe(f.lane.path);
+    expect(session.agentId).toBe('original-worker');
+    expect(JSON.stringify(session)).not.toContain(f.config.auth.token);
+  });
+
+  it('review-1 owned fallback resource resolution retains config authority on declared-scope lanes', () => {
+    const f = verificationLane(); roots.push(f.root);
+    const records = { getAgent: () => null, listAgents: () => [], getJob: () => ({ id: f.lane.id, deliverable: 'pr' as const }),
+      getWorktree: () => f.lane, listWorktrees: () => [f.lane] };
+    const authority = serviceWorkflowAuthority(f.dataDir, () => records, undefined, configPathFor(f.config.instanceDir));
+    const resources = authority.resolveReviewResources(f.lane.id);
+    expect(resources.skillContent).toContain('adversarial');
+    expect(resources.artifactRoot).not.toContain(f.lane.path);
+    expect(resources).not.toHaveProperty('workerVerification');
+  });
+
 });
