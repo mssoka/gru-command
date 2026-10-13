@@ -16,6 +16,7 @@ import { DEFAULT_DECISIONS_CONFIG, type Role } from '../src/config.js';
 import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
 import { RestartCleanupJournal } from '../src/supervision/restart-cleanup.js';
 import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
+import { notifyDisposalSettlement } from '../src/runtime/disposal-observation.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
 import type {
@@ -162,6 +163,7 @@ class FakeRegistry implements SupervisorRegistry {
   readonly handlesById = new Map<string, FakeHandle>();
   private readonly liveHandles = new Set<FakeHandle>();
   private readonly unpublished = new Set<FakeHandle>();
+  private readonly quarantined = new Set<FakeHandle>();
   readonly spawnCalls: { role: Role; resumeFile: string | null; cwd?: string }[] = [];
   /** Monotonic: a disposed handle's id is never re-minted. */
   private nextId = 0;
@@ -185,8 +187,17 @@ class FakeRegistry implements SupervisorRegistry {
   }
 
   getHandle(agentId: string): AgentHandle | null {
-    return [...this.liveHandles].find((handle) => handle.id === agentId && !this.unpublished.has(handle)) ?? null;
+    return [...this.liveHandles].find((handle) => handle.id === agentId && !this.unpublished.has(handle) && !this.quarantined.has(handle)) ?? null;
   }
+
+  quarantineHandle(handle: AgentHandle): void {
+    this.quarantineCalls.push(handle);
+    if (this.liveHandles.has(handle as FakeHandle)) this.quarantined.add(handle as FakeHandle);
+  }
+
+  /** Every quarantine request, in order (membership itself is dropped by
+   * removeHandle, mirroring the real registry's release-on-dispose). */
+  readonly quarantineCalls: AgentHandle[] = [];
 
   async spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle> {
     this.spawnCalls.push({ role, resumeFile: options?.resumeFile ?? null, ...(options?.cwd !== undefined ? { cwd: options.cwd } : {}) });
@@ -228,6 +239,7 @@ class FakeRegistry implements SupervisorRegistry {
   private removeHandle(handle: FakeHandle): void {
     this.liveHandles.delete(handle);
     this.unpublished.delete(handle);
+    this.quarantined.delete(handle);
     if (this.handlesById.get(handle.id) !== handle) return;
     this.handlesById.delete(handle.id);
     const other = [...this.liveHandles].find((candidate) => candidate.id === handle.id);
@@ -1956,6 +1968,32 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
+  it('replays a persisted cleanup-unjournaled audit as debt across a reopen (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    let reopened: ReturnType<typeof reopenedSupervisor> | null = null;
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer authorized work', briefing: null });
+      const append = f.rig.api.appendCustomEvent.bind(f.rig.api);
+      vi.spyOn(f.rig.api, 'appendCustomEvent').mockImplementation((fields) => {
+        if (fields.kind === 'supervision.restart-cleanup-pending') throw new Error('pending custody storage unavailable');
+        return append(fields);
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      // Disposal succeeded but the pending entry could not be written, so the
+      // audit is the ONLY durable record of the unconfirmed producer.
+      expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-rejected')?.payload)
+        .toMatchObject({ disposition: 'cleanup-unjournaled', generation: null, origin_seq: null });
+      // The process dies before the journal can recover; the surviving audit
+      // must still fence retirement after the reopen.
+      f.rig.dispose(); reopened = reopenedSupervisor(f.rig.dir);
+      const blockers = reopened.supervisor.pendingProducerBlockers(f.jobId);
+      expect(blockers).toHaveLength(1);
+      expect(blockers[0]).toContain(f.replacement.id);
+    } finally { reopened?.close(); f.rig.dispose(); vi.useRealTimers(); }
+  });
+
   it('retains exact cleanup custody when a replacement binding failure and its disposal both reject (GH-280)', async () => {
     vi.useFakeTimers();
     const f = await deferredDispatchRestart();
@@ -2073,6 +2111,143 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       await vi.advanceTimersByTimeAsync(50);
       expect(rig.registry.spawnCalls).toHaveLength(1);
     } finally { rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('never mints permanent debt from a failed pending write settled during a deferred disposal (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    let reopened: ReturnType<typeof reopenedSupervisor> | null = null;
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer authorized work', briefing: null });
+      const append = f.rig.api.appendCustomEvent.bind(f.rig.api);
+      let pendingFails = true;
+      vi.spyOn(f.rig.api, 'appendCustomEvent').mockImplementation((fields) => {
+        if (fields.kind === 'supervision.restart-cleanup-pending' && pendingFails) throw new Error('pending custody storage unavailable');
+        return append(fields);
+      });
+      let releaseDispose!: () => void;
+      const dispose = f.replacement.dispose.bind(f.replacement);
+      f.replacement.dispose = () => new Promise<void>((resolve) => { releaseDispose = () => { void dispose().then(resolve); }; });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      // The pending write failed, so only in-memory custody survives.
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('pending journal write failed');
+      // The journal recovers; a synchronous custody query retries the exact
+      // pending entry while the disposal is still outstanding.
+      pendingFails = false;
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain(`restart cleanup unconfirmed: ${f.replacement.id}`);
+      // The real registry reports disposal settlement before its await
+      // resolves, and cessation is already proven: custody settles and the
+      // originating pending entry is dropped WHILE disposal is still pending.
+      f.replacement.cessationEvidence = () => 'ceased';
+      notifyDisposalSettlement(f.replacement, true);
+      await flushMicrotasks();
+      // Custody settled: the durable debt is gone even though the rung itself
+      // is still awaiting the disposal promise.
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).not.toContain('restart cleanup unconfirmed');
+      releaseDispose();
+      await flushMicrotasks();
+      // The historical failed write must never classify the settled result as
+      // unconfirmed: replay would find no origin and classify it as permanent
+      // generation-null debt that blocks retirement of a ceased replacement.
+      const rejected = f.rig.api.listJobEvents(f.jobId, { limit: 100 }).filter((event) => event.kind === 'supervision.restart-rejected');
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0]?.payload).toMatchObject({ disposition: 'disposed' });
+      expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')).toEqual([]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      f.rig.dispose(); reopened = reopenedSupervisor(f.rig.dir);
+      expect(reopened.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+    } finally { reopened?.close(); f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('quarantines a published replacement the moment it rejects it, before awaiting cleanup (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart();
+    try {
+      let releaseDispose!: () => void;
+      const dispose = f.replacement.dispose.bind(f.replacement);
+      f.replacement.dispose = () => new Promise<void>((resolve) => { releaseDispose = () => { void dispose().then(resolve); }; });
+      f.rig.registry.onAgentEvent((envelope) => {
+        if (envelope.phase === 'spawned' && envelope.handle === f.replacement)
+          f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'synchronous native supersession', briefing: null });
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      // The replacement was published before the post-publication authority
+      // fence rejected it; lookup eligibility is revoked synchronously, before
+      // the still-pending disposal can leave it dispatchable (#280 AC1).
+      expect(f.rig.registry.quarantineCalls).toContain(f.replacement);
+      expect(f.rig.supervisor.viewFor(f.replacement.id)).toBeNull();
+      releaseDispose();
+      await flushMicrotasks();
+      expect(f.replacement.promptCalls).toEqual([]);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('resumes the interrupted turn when a restart replay takes no custody for a generic nonfatal startup error (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart(true);
+    try {
+      const create = f.rig.registry.adopt.bind(f.rig.registry);
+      vi.spyOn(f.rig.registry, 'adopt').mockImplementation((handle, options) => {
+        create(handle, options);
+        if (handle !== f.replacement) return;
+        handle.emit({ type: 'error', error: 'ordinary startup tool exception', fatal: false });
+        handle.setState('error');
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      // A generic nonfatal error takes no restart/wall/retry custody, so the
+      // rung must still resume (or visibly orphan) the turn it interrupted —
+      // never strand it behind a phantom pending-recovery blocker.
+      expect(f.replacement.promptCalls).toEqual([{ text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` }]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('tells the truth about retry in the unbound-custody cleanup notice (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart();
+    try {
+      f.register.mockImplementation(() => { throw new Error('binding store unavailable'); });
+      f.replacement.dispose = async () => { throw new Error('binding cleanup refused'); };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      const notice = f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')[0]!;
+      // An unbound replacement's rung stays retryable (superseded=false), so
+      // the shared needs-owner text must not claim automatic restart is off.
+      expect(notice.detail).toContain('still retries this binding after its backoff');
+      expect(notice.detail).not.toContain('No automatic restart is authorized');
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('clears the exact restart recovery ownership when a restart-recovered 429 is superseded during backoff (GH-280)', async () => {
+    vi.useFakeTimers();
+    const sleeper = new ManualSleeper();
+    const f = await deferredDispatchRestart(true, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const create = f.rig.registry.adopt.bind(f.rig.registry);
+      vi.spyOn(f.rig.registry, 'adopt').mockImplementation((handle, options) => {
+        create(handle, options);
+        if (handle !== f.replacement) return;
+        handle.pendingTurnSnapshot = { text: 'recovered 429 turn', owner: `dispatch:${f.jobId}` };
+        handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+        handle.setState('error');
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(sleeper.delays).toEqual([100]);
+      // A newer native authority supersedes the captured turn DURING backoff.
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer native authority', briefing: null });
+      await sleeper.release();
+      await flushMicrotasks();
+      // The stale retry is never re-delivered AND its exact recovery ownership
+      // is consumed: no phantom pending-recovery blocker survives.
+      expect(f.replacement.promptCalls).toEqual([]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.supervisor.viewFor(f.replacement.id)?.breakerOpen).toBe(false);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 });
 
@@ -4153,6 +4328,38 @@ describe('supervisor pacing admission and workflow boundary', () => {
     } finally { h.dispose(); }
   });
 
+  it('re-checks authority after a queued admission and releases the lease when superseded (GH-280 verification gap)', async () => {
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    try {
+      const jobId = 'job-429-admission';
+      h.api.addJob({ id: jobId, repo: 'fixture', title: 'Queued admission fence' });
+      h.api.setJobStatus(jobId, 'working');
+      const handle = new FakeHandle('minion', 'minion-429-admission', null);
+      handle.pendingTurnSnapshot = { text: 'resume authorized work', owner: `dispatch:${jobId}` };
+      h.registry.adopt(handle);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId });
+      emitFailure(handle, '429 too many requests');
+      const settled = h.supervisor.awaitRetrySettlement(handle.id);
+      await sleeper.release();
+      // The retry queues behind the capacity-one holder: the post-backoff fence
+      // passed because authority was still current when the backoff elapsed.
+      expect(handle.promptCalls).toEqual([]);
+      expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual([handle.id]);
+      // A newer native rebrief supersedes the captured authority WHILE queued.
+      h.api.beginPendingRebrief({ jobId, note: 'newer native authority', briefing: null });
+      holder.release();
+      // The post-admission fence must re-check authority: no prompt delivered,
+      // the incident settles as superseded, and the lease is released.
+      await expect(settled).resolves.toBe('superseded');
+      expect(handle.promptCalls).toEqual([]);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
+      expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+    } finally { h.dispose(); }
+  });
+
   it('non-rate-limit isolated failures still abort even when backoff is enabled', async () => {
     const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy() });
     try {
@@ -4706,6 +4913,24 @@ describe('restart cleanup journal conservative replay (GH-280)', () => {
       expect(h.journal.unresolved('custody-job').map((debt) => debt.originSeq)).toEqual([futureSeq, two.originSeq]);
       h.journal.confirm(two);
       expect(h.journal.unresolved('custody-job')).toHaveLength(1);
+    } finally { h.db.close(); }
+  });
+
+  it('replays a cleanup-unjournaled audit as debt cleared only by a bound pair for the same replacement', () => {
+    const h = journalFixture();
+    try {
+      const audit = h.api.appendCustomEvent({ kind: 'supervision.restart-rejected', jobId: 'custody-job', agentId: 'origin',
+        payload: { disposition: 'cleanup-unjournaled', replacement_agent_id: 'same-id' } });
+      const reader = new RestartCleanupJournal(h.api);
+      expect(reader.unresolved('custody-job')).toMatchObject([{ originSeq: audit.seq, generation: null, replacementAgentId: 'same-id' }]);
+      // A confirmed pair for a DIFFERENT replacement does not clear it.
+      const other = reader.begin(new FakeHandle('minion', 'other-id', null), 'custody-job', 'origin');
+      reader.confirm(other);
+      expect(reader.unresolved('custody-job').map((debt) => debt.originSeq)).toEqual([audit.seq]);
+      // A later bound pending+confirmed pair for the SAME replacement does.
+      const same = reader.begin(new FakeHandle('minion', 'same-id', null), 'custody-job', 'origin');
+      reader.confirm(same);
+      expect(reader.unresolved('custody-job')).toEqual([]);
     } finally { h.db.close(); }
   });
 });
