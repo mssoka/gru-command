@@ -838,7 +838,7 @@ describe('pr-review-trigger (rule hit and rule miss)', () => {
     const sha = 'e'.repeat(40);
     const ledger = new FakeLedger().job('job-review', 'delivered');
     ledger.record('job-review', 'job.delivered', { sha });
-    ledger.record('job-review', 'github.ci-green', { sha });
+    ledger.record('job-review', 'github.ci-green', { sha, repo: 'mssoka/gru-command' });
     const { ops, calls } = fakeOps();
     const result = await runSilasAutopilot({
       digest: digest({ prWithoutReview: [prWithoutReviewRow()] }),
@@ -2593,10 +2593,32 @@ describe('F-M2 the newest CI observation governs green-only review eligibility',
     const A = 'e'.repeat(40);
     const ledger = new FakeLedger().job('job-review', 'delivered');
     ledger.record('job-review', 'job.delivered', { sha: A });
-    ledger.record('job-review', 'github.ci-green', { sha: A });
+    ledger.record('job-review', 'github.ci-green', { sha: A, repo: 'mssoka/gru-command' });
     const { result, calls } = await armReview(ledger);
     expect(result.decisions).toBe(1);
     expect(calls[0]?.method).toBe('triggerReview');
+  });
+
+  it('refuses a green that carries NO repository binding (issue #243 M2)', async () => {
+    const A = 'e'.repeat(40);
+    const ledger = new FakeLedger().job('job-review', 'delivered');
+    ledger.record('job-review', 'job.delivered', { sha: A });
+    ledger.record('job-review', 'github.ci-green', { sha: A });
+    const { result, calls } = await armReview(ledger);
+    expect(result.decisions).toBe(0);
+    expect(result.refusals).toBe(1);
+    expect(calls).toEqual([]);
+  });
+
+  it('refuses a green observed on a DIFFERENT repository (issue #243 M2)', async () => {
+    const A = 'e'.repeat(40);
+    const ledger = new FakeLedger().job('job-review', 'delivered');
+    ledger.record('job-review', 'job.delivered', { sha: A });
+    ledger.record('job-review', 'github.ci-green', { sha: A, repo: 'other-owner/other-repo' });
+    const { result, calls } = await armReview(ledger);
+    expect(result.decisions).toBe(0);
+    expect(result.refusals).toBe(1);
+    expect(calls).toEqual([]);
   });
 
   it('refuses when a NEWER failed observation lands on the same head', async () => {
@@ -2750,7 +2772,7 @@ describe('F-H2 the admission boundary re-proves a hold that lands after planning
     });
     await ops.sendDirective({ jobId: job.id, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'round-late', hold });
     await vi.waitFor(() => expect(held).toBe(true));
-    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await ops.drain();
     expect(ledger.latestJobEvent(job.id, 'silas.directive-sent')).toBeNull();
     expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).not.toBe('settled');
   });
@@ -2791,7 +2813,7 @@ describe('F-H3 verification ownership is re-proved after the pacing wait', () =>
     });
     holder.release();
     await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(0));
-    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await ops.drain();
     expect(prompted).toBe(0);
     expect(ledger.latestJobEvent(job.id, 'silas.directive-sent')).toBeNull();
     expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).not.toBe('settled');
@@ -3091,7 +3113,7 @@ describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief 
     });
     holder.release();
     await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(0));
-    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await ops.drain();
     expect(spawns).toBe(0);
     expect(ledger.latestJobEvent(job.id, 'silas.directive-sent')).toBeNull();
   }, 30_000);
@@ -3135,7 +3157,7 @@ describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief 
     });
     holder.release();
     await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(0));
-    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await ops.drain();
     expect(spawns).toBe(0);
   }, 30_000);
 });
