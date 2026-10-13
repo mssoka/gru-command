@@ -396,6 +396,27 @@ export function isAdmittedBlind(ledger: LedgerApi, jobId: string): boolean {
   return admittedOf(ledger, jobId)?.role === 'blind';
 }
 
+/**
+ * Record the observed tool access of a FINISHED blind reviewer session
+ * against the rule the job was admitted under. This is the one seam shared by
+ * the initial dispatch settle (issue #316) and the resume/re-brief settle
+ * (issue #339): a prohibited read performed during a continuation therefore
+ * invalidates coverage exactly like one at the first briefing. A non-blind
+ * job is a no-op, and an unreadable session (`readResults` returns null)
+ * records nothing rather than inventing a clean pass.
+ */
+export function observeBlindSessionAccess(
+  ledger: LedgerApi,
+  jobId: string,
+  sessionFile: string | null,
+  readResults: (sessionFile: string | null) => readonly ObservedToolResult[] | null = readSessionToolResults,
+): void {
+  if (!isAdmittedBlind(ledger, jobId)) return;
+  const results = readResults(sessionFile);
+  if (results === null) return;
+  recordObservedAccess(ledger, jobId, results, 'session');
+}
+
 const MAX_SESSION_BYTES = 64 * 1024 * 1024;
 
 function blockText(content: unknown): string {

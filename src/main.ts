@@ -1187,6 +1187,12 @@ async function main(): Promise<number> {
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
+  // Issue #339: a prohibited read during a resume/re-brief invalidates blind
+  // coverage — the same observation the dispatch settle seam runs. One wiring
+  // for every resume/re-brief path (boot re-brief, silas re-brief, provider
+  // recovery), so none can bypass it.
+  const observeBlindTurn = (jobId: string, sessionFile: string | null): void =>
+    dispatcher.observeBlindSession(jobId, sessionFile);
   // The durable queue's mechanical consumer: one shared-budget-aware
   // reconsider pass over the ledger-backed pipeline, triggered by enqueue,
   // bus transitions and runtime capacity events. No timer, no second
@@ -1298,6 +1304,7 @@ async function main(): Promise<number> {
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     parentTools: parentToolsFor,
     stopSignal: serviceStop.signal,
+    observeBlindTurn,
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });
@@ -1448,6 +1455,7 @@ async function main(): Promise<number> {
     workerGate: pacing.gate,
     pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+    observeBlindTurn,
     ...(pipeline !== null ? { pipeline } : {}),
     ...(config.silas.enabled && silasSlot !== null
       ? {
@@ -1464,6 +1472,7 @@ async function main(): Promise<number> {
                     ledger,
                     worktrees: worktreeManager,
                     slotReArm: slotReArmPort,
+                    observeBlindTurn,
                     log: (level, msg, fields) => logger.log(level, msg, fields),
                   },
                   waitId,

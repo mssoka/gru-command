@@ -538,6 +538,12 @@ export async function rebriefFreshMinion(
     /** Recheck request ownership and terminality at the last asynchronous
      * admission boundaries; a running prompt is allowed to settle. */
     beforeTurnSideEffect?: () => void;
+    /** Issue #339: observe the settled continuation session's tool access so
+     * a prohibited read during a resume/re-brief invalidates blind coverage
+     * exactly like one at the first briefing. The observer owns its own error
+     * handling (a bookkeeping failure must not fail a delivered turn); absent
+     * = no observation (non-review re-briefs, tests). */
+    observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   },
 ): Promise<{
   minionId: string;
@@ -657,6 +663,13 @@ export async function rebriefFreshMinion(
     if (disposition === 'exhausted' || disposition === 'superseded') {
       throw new Error(`re-brief turn failed on ${handle.id}: automatic rate-limit retry ${disposition} before delivery`);
     }
+    // Issue #339: observe the continuation turn's own tool results at THIS
+    // settle seam (before the in-band-error return too), so a prohibited read
+    // performed during a resume/re-brief invalidates blind coverage exactly
+    // like one at the first briefing. `handle.sessionFile` is the resumed
+    // session (the whole file, cumulative), read-only with respect to the
+    // review inputs.
+    input.observeBlindTurn?.(input.jobId, handle.sessionFile);
     if (promptError !== null && disposition !== 'recovered') {
       throw new Error(`re-brief turn failed on ${handle.id}: ${String(promptError)}`);
     }

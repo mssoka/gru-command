@@ -13,6 +13,13 @@ import {
   claimProviderRecoveryContinuation,
   type RecoveryClaimDeps,
 } from '../src/provider-recovery/resume.js';
+import {
+  admitBlindReview,
+  blindCoverageOf,
+  observeBlindSessionAccess,
+  recordBlindAdmission,
+  BLIND_ACCESS_EVENT,
+} from '../src/dispatch/blind-review.js';
 import type {
   AgentCapabilities,
   AgentHandle,
@@ -37,6 +44,13 @@ const FAKE_CAPABILITIES: AgentCapabilities = {
   thinkingLevelControl: false,
   followUp: false,
 };
+
+const TARGET = 'f'.repeat(40);
+const BASE = 'a'.repeat(40);
+
+/** A pi-session toolResult line (what the reviewer's session jsonl holds). */
+const sessionToolResult = (text: string): string =>
+  `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: text } })}\n`;
 
 const cleanupDirs: string[] = [];
 let sharedRepo: FixtureRepo | null = null;
@@ -149,6 +163,9 @@ class ClaimHarness {
       registry: this.registry as unknown as RecoveryClaimDeps['registry'],
       ledger: this.ledger,
       worktrees: this.worktrees,
+      // Issue #339: the same blind-coverage observation the dispatch settle
+      // seam runs, wired to the resume settle seam.
+      observeBlindTurn: (jobId, sessionFile) => observeBlindSessionAccess(this.ledger, jobId, sessionFile),
       slotReArm: {
         ownedProviderReArm: (agentId, waitId) => {
           this.slotReArmCalls.push({ agentId, waitId });
@@ -156,6 +173,24 @@ class ClaimHarness {
         },
       },
     };
+  }
+
+  /** Admit `jobId` as a blind review (issue #316) so the resume settle seam
+   * has an isolation rule to judge the resumed session's tool access
+   * against. */
+  admitBlind(jobId: string, repoName: string): void {
+    const admission = admitBlindReview({
+      ledger: this.ledger,
+      jobId,
+      title: 'review (blind)',
+      deliverable: 'review',
+      briefing: 'Review the immutable package read-only.',
+      targetSha: TARGET,
+      repoName,
+      inputPackage: { baseSha: BASE, targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+    });
+    if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+    recordBlindAdmission(this.ledger, jobId, admission);
   }
 
   /** A job with a lane, a minion agent, and a recovered wait on it. Each
@@ -534,6 +569,46 @@ describe('guarded claim — every recheck fails visible', () => {
     const h = new ClaimHarness();
     const result = await claimProviderRecoveryContinuation(h.deps(), 'missing', 'silas');
     expect(result).toMatchObject({ outcome: 'not-found' });
+  });
+});
+
+describe('guarded claim — blind coverage scan at the resume settle seam (issue #339)', () => {
+  it('a prohibited read during a resume invalidates blind coverage instead of leaving it qualifying', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-prohibited-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    writeFileSync(sessionFile, sessionToolResult('docs/issues/305-review.md:1:prior assessment'));
+    const jobId = 'j-blind-prohibited';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId, writeSession: false });
+    h.admitBlind(jobId, fixtureRepo().path);
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).toMatchObject({ outcome: 'continued', path: 'resumed' });
+    // The prohibited read happened during THIS resumed turn's session: the
+    // resume settle seam must scan it and invalidate the coverage.
+    expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
+  });
+
+  it('a clean resume keeps blind coverage qualifying (and is still observed)', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-clean-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    writeFileSync(sessionFile, sessionToolResult('src/feature.ts:1:export const feature = 1;'));
+    const jobId = 'j-blind-clean';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId, writeSession: false });
+    h.admitBlind(jobId, fixtureRepo().path);
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result).toMatchObject({ outcome: 'continued', path: 'resumed' });
+    // The scan ran (an observation is recorded) and found nothing prohibited.
+    expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+      state: 'qualifying', qualifying: true, accessObserved: true, prohibitedAccess: 0,
+    });
   });
 });
 

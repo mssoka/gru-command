@@ -41,6 +41,10 @@ export interface RecoveryClaimDeps {
   readonly worktrees: WorktreePort;
   readonly slotReArm?: SlotReArmPort;
   readonly log?: Log;
+  /** Issue #339: observe the resumed continuation session's tool access so a
+   * prohibited read during a resume invalidates blind coverage. Wired by the
+   * service to `DispatchService.observeBlindSession`; absent = no observation. */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
 /** The fresh provider-recovery worker's contract half: the effective
@@ -306,6 +310,7 @@ async function claimJobMinion(
         ? withRevisionContinuation(continuationPrompt ?? job.briefing ?? '', pendingCorrection) || null
         : freshBriefing(deps.ledger.effectiveContract(job.id)?.text ?? job.briefing, continuationPrompt, revisionState),
       ...(resumeFile !== null ? { resumeFile } : {}),
+      ...(deps.observeBlindTurn !== undefined ? { observeBlindTurn: deps.observeBlindTurn } : {}),
       beforeTurnSideEffect: () => {
         // A hold or terminal disposition may land during the awaited
         // worker gate/spawn. Never prompt the replacement against it;
