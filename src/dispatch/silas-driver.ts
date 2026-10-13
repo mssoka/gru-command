@@ -2094,7 +2094,15 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
   const verificationFailures = digest.verificationFailures.filter(continuationAllowed).flatMap(failureAttention);
   return {
     ...digest,
-    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
+    // Issue #243 original-M2 carry-forward: the publish boundary must not
+    // offer a verdict row while a verification owns the lane. The digest
+    // computed the row before that verification settled in; without this
+    // fence a verdict row leaks to LLM Silas (a model wake) even though
+    // every autopilot verdict planner refuses it. Re-read at this final,
+    // no-await boundary like the sibling fences.
+    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(
+      (row) => continuationAllowed(row) && !verificationInFlight(input.ledger, row.jobId),
+    ),
     verificationFailures,
     verificationWaits: digest.verificationWaits.filter(continuationAllowed),
     minionErrors: digest.minionErrors.filter(continuationAllowed),

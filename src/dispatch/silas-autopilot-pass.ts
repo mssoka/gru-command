@@ -41,7 +41,10 @@ export function createSilasAutopilotHook(deps: SilasAutopilotPassDeps): Determin
         ...(deps.log === undefined ? {} : { log: deps.log }),
       });
       return {
-        ok: true,
+        // A failed action is an incomplete pass (issue #243 R2-M2): the
+        // driver records `silas.reconcile-failed`, never a completed
+        // reconciliation that hides the failure behind `ok: true`.
+        ok: result.ok,
         autopilot: {
           enabled: true,
           decisions: result.decisions,

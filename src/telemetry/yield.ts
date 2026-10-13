@@ -582,21 +582,25 @@ export interface GruWakeCauses {
 
 /** One autopilot rule family's decisions over the window, with the
  * agreement measure the rollout reads (issue #243). Agreement is measured
- * over `dry-run` decisions only: an `enforce` decision already performed
- * the action, so there is nothing for the model to agree with. A decision
- * AGREES when a receipt of the family's own action kinds lands for the
- * same job AFTER the decision — the model read the same row and did the
- * same thing. It is UNOBSERVABLE when no `silas.wake` landed after it in
- * the window: the model was never given the row again. Everything else is
- * a disagreement; a reviewer reading the raw events decides whether a
- * specific disagreement was harmful. */
+ * over `dry-run` decisions only: an `enforce` decision already acted, so
+ * there is nothing for the model to agree with. A decision AGREES when a
+ * receipt of the family's own action kinds lands for the same job AFTER the
+ * decision, names the SAME predicted debt identity (round/run/head/url),
+ * carries a `rule_id` that names the decision's family (a receipt of a kind
+ * shared across families carries no weight without it, H6), and is NOT the
+ * autopilot's own machine receipt (`source: 'silas-autopilot'`) — the model
+ * read the same row and did the same thing. It is UNOBSERVABLE when no
+ * `silas.wake` landed after it in the window: the model was never given the
+ * row again. Everything else is a disagreement; a reviewer reading the raw
+ * events decides whether a specific disagreement was harmful. */
 export interface AutopilotFamilyMeasure {
   readonly ruleId: string;
   /** The mode every decision of this family carried, or 'mixed'. */
   readonly mode: string;
   /** Dry-run decisions: the agreement sample. */
   readonly decisions: number;
-  /** Enforced decisions: the action was performed, nothing to agree with. */
+  /** Enforce-mode decisions: the action was attempted (a failed enforcement
+   * still counts here), so there is nothing for the model to agree with. */
   readonly enforced: number;
   readonly agreed: number;
   readonly unobservable: number;
@@ -1204,7 +1208,10 @@ const AUTOPILOT_FAMILY_RECEIPTS: Readonly<Record<string, readonly string[]>> = {
   'pr-conflict-rebase': ['silas.directive-sent'],
   'clean-abort-service-restart': ['silas.review-triggered'],
   'sweep-ack': ['silas.lane-released'],
-  'delivered-pr-register': ['silas.pr-registered', 'job.pr-linked'],
+  // Issue #243 R2-H8: the bare, untagged `job.pr-linked` the service emits
+  // for ANY caller (including the autopilot's own `recordPr`) is NOT model
+  // evidence. Only the attributable `silas.pr-registered` receipt counts.
+  'delivered-pr-register': ['silas.pr-registered'],
   'pr-review-trigger': ['silas.review-triggered'],
 };
 
@@ -1222,23 +1229,51 @@ function eventPayload(event: LedgerEventRecord): Record<string, unknown> {
     : {};
 }
 
+/** The per-row debt identity a decision predicted, from its `would_call`
+ * (issue #243 R2-H7): the round, verification run, conflicting head or PR
+ * url the decision named. A family with no per-row key (sweep-ack,
+ * pr-review-trigger) returns `{}` and is matched on job + kind + rule only. */
+function decisionDebtIdentity(payload: Record<string, unknown>): Record<string, string> {
+  const wouldCall = payload['would_call'];
+  const call = wouldCall !== null && typeof wouldCall === 'object'
+    ? (wouldCall as Record<string, unknown>)
+    : {};
+  const identity: Record<string, string> = {};
+  for (const key of ['blocker_fingerprint', 'source_round_id', 'url'] as const) {
+    const value = call[key];
+    if (typeof value === 'string' && value !== '') identity[key] = value;
+  }
+  return identity;
+}
+
+/** A receipt counts for a decision's debt only when it names the SAME
+ * identity (issue #243 R2-H7) — the exact blocked fingerprint, source round
+ * or PR url. A receipt that names a different run/round/head never credits
+ * the prediction, and one that omits the identity never credits a
+ * prediction that named it. */
+function receiptMatchesDebt(identity: Record<string, string>, receipt: Record<string, unknown>): boolean {
+  const keys = Object.keys(identity);
+  if (keys.length === 0) return true;
+  return keys.every((key) => receipt[key] === identity[key]);
+}
+
 /**
  * Autopilot decisions and their agreement with what LLM Silas actually did
  * (issue #243, the rollout's `dry-run` read).
  *
- * An `enforce` decision already acted, so it is reported as `enforced` and
- * excluded from the agreement sample. A `dry-run` decision AGREES when a
+ * An `enforce` decision is reported as `enforced` and excluded from the
+ * agreement sample — the machine took the action (or attempted it); there is
+ * nothing for the model to agree with. A `dry-run` decision AGREES when a
  * receipt of the family's own action kinds lands for the same job AFTER the
- * decision, carries a `rule_id` that names the decision's family (a receipt
+ * decision, names the SAME predicted debt identity (round/run/head/url,
+ * R2-H7), carries a `rule_id` that names the decision's family (a receipt
  * of a kind shared across families carries no weight without it, H6), and is
  * NOT the autopilot's own machine receipt (`source: 'silas-autopilot'`) —
  * the model read the same row and did the same thing. It is UNOBSERVABLE
  * when no `silas.wake` landed after it in the window, so the model was
  * never handed the row again; everything else is a disagreement. The
  * agreement share is computed over the OBSERVABLE decisions only (L1), and
- * is null when none is observable. The split is deliberately coarse — the
- * rollout's gate (≥95% agreement, zero harmful disagreements) is a human
- * read of these counts plus the raw events.
+ * is null when none is observable.
  */
 export function computeAutopilotMeasures(
   events: readonly LedgerEventRecord[],
@@ -1273,18 +1308,24 @@ export function computeAutopilotMeasures(
     }
     entry.decisions += 1;
     const kinds = AUTOPILOT_FAMILY_RECEIPTS[ruleId] ?? [];
+    const debt = decisionDebtIdentity(payload);
     const agreed = familyActions.some((event) => {
       if (event.seq <= decision.seq) return false;
       if (event.jobId === null || event.jobId !== decision.jobId) return false;
       if (!kinds.includes(event.kind)) return false;
-      const payload = eventPayload(event);
+      const eventBody = eventPayload(event);
       // The autopilot's own action is not the model's agreement (H6).
-      if (payload['source'] === AUTOPILOT_SOURCE) return false;
-      const receiptRuleId = typeof payload['rule_id'] === 'string' ? payload['rule_id'] : undefined;
-      if (receiptRuleId !== undefined) return receiptRuleId === ruleId;
-      // A receipt that names no rule is only attributable to a family whose
-      // action kind is unique (H6).
-      return !SHARED_RECEIPT_KINDS.has(event.kind);
+      if (eventBody['source'] === AUTOPILOT_SOURCE) return false;
+      const receiptRuleId = typeof eventBody['rule_id'] === 'string' ? eventBody['rule_id'] : undefined;
+      if (receiptRuleId !== undefined) {
+        if (receiptRuleId !== ruleId) return false;
+      } else if (SHARED_RECEIPT_KINDS.has(event.kind)) {
+        // A receipt that names no rule is only attributable to a family whose
+        // action kind is unique (H6).
+        return false;
+      }
+      // Issue #243 R2-H7: the debt identity must match too.
+      return receiptMatchesDebt(debt, eventBody);
     });
     if (agreed) entry.agreed += 1;
     else if (decision.seq > newestWakeSeq) entry.unobservable += 1;
