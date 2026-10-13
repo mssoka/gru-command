@@ -43,6 +43,7 @@ import { makeFixtureRepo } from './helpers/fixture-repo.js';
 
 const DOUBLE = join(import.meta.dirname, 'helpers', 'claude-double.mjs');
 const DOUBLE_ENV_KEYS = [
+  'CLAUDE_DOUBLE_PERMISSION_MALFORMED',
   'CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL',
   'CLAUDE_DOUBLE_COMPACT_VERIFICATION',
   'CLAUDE_DOUBLE_LOG',
@@ -2898,6 +2899,17 @@ describe('scheduled verification ordinary Claude Bash', () => {
       expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toEqual(['tsc', 'npx']);
       expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused'); await handle.dispose();
     } finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
+  it('strict repair malformed native permission transport fails ordinary Claude closed with zero starts', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const f = fixture(); process.env['CLAUDE_DOUBLE_PERMISSION_MALFORMED'] = '1'; process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await expect(handle.prompt('verification-bash:npm test')).rejects.toThrow(/malformed or foreign worker verification permission request/);
+      expect(existsSync(lane.starts)).toBe(false); await handle.dispose();
+      expect(handle.cessationEvidence!()).toBe('ceased');
+    } finally { delete process.env['CLAUDE_DOUBLE_PERMISSION_MALFORMED']; delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; await f.runtime.dispose(); }
   });
 
 });

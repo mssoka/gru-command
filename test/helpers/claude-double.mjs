@@ -424,7 +424,7 @@ async function run() {
         const requestId = 'owned-permission';
         const decision = await new Promise((resolve) => {
           responses.set(requestId, resolve);
-          out({ type: 'control_request', request_id: requestId, request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'verification-call', input: { command } } });
+          out({ type: 'control_request', request_id: requestId, request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'verification-call', input: process.env.CLAUDE_DOUBLE_PERMISSION_MALFORMED === '1' ? {} : { command } } });
         });
         if (decision?.behavior !== 'allow') reason = decision?.message ?? 'native host denied';
         else if (decision.updatedInput.command !== command) throw new Error('host rewrote command');

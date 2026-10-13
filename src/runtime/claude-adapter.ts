@@ -434,7 +434,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     let verificationSettings: ReturnType<typeof privateClaudeVerificationSettings> | undefined;
     try {
       // Issue #315: an ordinary worker session on a lane that declares
-      // verification scopes carries private deny/hook settings, so the
+      // verification scopes carries private native ask/hook settings, so the
       // known direct producer commands are refused before they start.
       // Isolated review sessions keep their ambient-free settings.
       if (reviewMode === undefined && options.workerVerification !== undefined && fileTools.includes('Bash')) {

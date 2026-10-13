@@ -43,7 +43,9 @@ writeFileSync(settings.file, JSON.stringify(data));
 const completeCorpus = [...nativeCorpus, { raw: 'npm run "check build"', refused: true }, { raw: `'${join(lane, 'node_modules/.bin/tsc')}' src/index.ts`, refused: true }];
 const corpus = process.argv[3] === 'early' ? completeCorpus.filter(({ raw }) => ['npm test', 'npm run lint && npm run typecheck && npm run build && npm run build:web', 'tsc src/index.ts', "printf '%s' 'X=1 npm test -- --help'", 'tsc --pretty false --showConfig'].includes(raw)) : completeCorpus;
 const cases = corpus.map(({ raw, refused }) => [raw, refused, false]);
-if (process.argv[3] !== 'early') cases.push(['npm test', true, true]);
+if (process.argv[3] !== 'early') {
+  cases.push(['npm test', true, true, false], ['npm test', true, false, true], ["printf '%s' 'X=1 npm test -- --help'", false, false, true]);
+}
 const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'),
   XDG_CONFIG_HOME: join(home, 'config'), XDG_CACHE_HOME: join(home, 'cache'), XDG_DATA_HOME: join(home, 'data'), XDG_STATE_HOME: join(home, 'state'),
   TMPDIR: root, ANTHROPIC_API_KEY: 'fake-owned-fixture-key', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -88,8 +90,10 @@ if (process.argv[3] !== 'early') {
 }
 process.stdout.write(JSON.stringify({ identity, root, settings: data, boundary: 'actual vendor permission engine; deterministic fake upstream; no paid model/Perkins READY' }) + '\n');
 try {
-  for (const [raw, refused, hostUnavailable] of cases) {
+  for (const [raw, refused, hostUnavailable, hookFailed] of cases) {
     command = raw; sent = false;
+    const caseSettings = hookFailed ? { ...data, hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'exit 1' }] }] } } : data;
+    writeFileSync(settings.file, JSON.stringify(caseSettings));
     const before = existsSync(starts) ? readFileSync(starts, 'utf8') : '';
     const args = [...claudeTurnArgs({ sessionId: randomUUID(), tools: ['Bash'], systemPrompt: 'Owned deterministic component fixture.', cwd: lane, binary: executable, verificationSettingsFile: settings.file, workerVerification: policy, model: identity.nativeModel, thinkingLevel: identity.effort }, false), '--setting-sources', '', '--strict-mcp-config', '--no-chrome', '--disable-slash-commands', '--no-session-persistence'];
     const child = spawn(executable, args, { env, cwd: lane, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -115,7 +119,7 @@ try {
     let spawnError;
     const code = await new Promise((resolve) => { child.once('error', (error) => { spawnError = error; }); child.once('close', resolve); });
     const after = existsSync(starts) ? readFileSync(starts, 'utf8') : '';
-    process.stdout.write(JSON.stringify({ raw, expectedRefused: refused, hostUnavailable, args, code, stdout, stderr, producerStarts: after.slice(before.length), upstream }) + '\n');
+    process.stdout.write(JSON.stringify({ raw, expectedRefused: refused, hostUnavailable, hookFailed: !!hookFailed, settings: caseSettings, args, code, stdout, stderr, producerStarts: after.slice(before.length), upstream }) + '\n');
     if (protocolError || spawnError || (!hostUnavailable && code !== 0) || !sent) throw new Error('Native identity/wire qualification failed; stop for supervisor');
     const terminal = stdout.trim().split('\n').map((line) => JSON.parse(line)).findLast((frame) => frame.type === 'result');
     const denied = terminal?.permission_denials?.some((entry) => entry.tool_name === 'Bash' && entry.tool_input.command === raw) === true;
