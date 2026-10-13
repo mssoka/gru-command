@@ -466,6 +466,82 @@ describe('verification single-flight + reconcile (issue #159)', () => {
     } finally { const exit = once(live, 'exit'); live.kill('SIGKILL'); await exit; await harness.close(); }
   });
 
+  async function assertOriginalStepReadback(mode: 'decomposed' | 'reused-build', receiptFault?: 'missing-first' | 'wrong-step' | 'event-overflow' | 'byte-overflow'): Promise<void> {
+    const h = await boot({ manifest: '[verify]\nprime = "npm run lint && npm run typecheck && npm run build"\ndocs = "npm run build && npm run config:docs"\n', files: {
+      '.gitignore': 'dist/\n',
+      'package.json': JSON.stringify({ type: 'module', scripts: {
+        lint: 'node step.mjs lint', typecheck: 'node step.mjs typecheck', build: 'node step.mjs build', 'config:docs': 'node step.mjs docs',
+      } }),
+      'step.mjs': 'import { mkdirSync, writeFileSync } from "node:fs"; if (process.argv[2] === "build") { mkdirSync("dist", { recursive: true }); writeFileSync("dist/output.js", "// original isolated fixture build\\n"); } console.log(process.argv[2]);\n',
+    } });
+    const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+    // Original lane facts precede any acceptance or native process registration.
+    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
+      sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    if (mode === 'reused-build') {
+      const prime = await call(h.port, { job_id: h.jobId, scope: 'prime', request_id: 'r15-original-prime' });
+      expect(outcomeOf(completedFrame(prime.frames))['ok']).toBe(true);
+    }
+    const originalRecord = h.ledger.recordWorktreeProcesses.bind(h.ledger);
+    const publication = vi.spyOn(h.ledger, 'recordWorktreeProcesses').mockImplementation((input) => {
+      if (input.state === 'killed') throw new Error('R15 original callback interrupted before its killed-row publication');
+      return originalRecord(input);
+    });
+    const append = h.ledger.appendCustomEvent.bind(h.ledger);
+    const nativeReceipt = receiptFault === undefined ? null : vi.spyOn(h.ledger, 'appendCustomEvent').mockImplementation((input) => {
+      if (input.kind !== 'verification.process-started' || (input.payload as { step_index?: unknown }).step_index !== 0) return append(input);
+      if (receiptFault === 'missing-first') throw new Error('R15 original native-step publisher failed before its first receipt');
+      if (receiptFault === 'byte-overflow') return append({ ...input, payload: { ...(input.payload as Record<string, unknown>), untrusted_padding: 'x'.repeat(8 * 1024 * 1024) } });
+      if (receiptFault === 'event-overflow') {
+        const original = append(input);
+        for (let duplicate = 0; duplicate < 4096; duplicate += 1) append({ ...input, payload: { ...(input.payload as Record<string, unknown>), duplicate_claim: duplicate } });
+        return original;
+      }
+      return append({ ...input, payload: { ...(input.payload as Record<string, unknown>), step_command: 'npm run foreign-step' } });
+    });
+    const requestId = `r15-original-${mode}`;
+    let first: Awaited<ReturnType<typeof call>>;
+    try { first = await call(h.port, { job_id: h.jobId, scope: 'docs', request_id: requestId }); }
+    finally { publication.mockRestore(); nativeReceipt?.mockRestore(); }
+    const outcome = outcomeOf(completedFrame(first.frames));
+    expect(outcome['ok']).toBe(true);
+    const runId = String(outcome['runId']);
+    if (mode === 'reused-build') expect(outcome['checks']).toEqual(expect.arrayContaining([expect.objectContaining({ status: 'reused', ran: false })]));
+    const originalRows = h.ledger.listWorktreeProcesses(lane.id).filter((row) => row.state === 'live');
+    expect(originalRows).toHaveLength(mode === 'decomposed' ? 2 : 1);
+    const originalStarts = h.ledger.listJobEventsByKinds(h.jobId, ['verification.started', 'verification.process-started'], { limit: 4100 });
+    const logical = originalStarts.filter((event) => event.kind === 'verification.started' && (event.payload as { run_id?: unknown }).run_id === runId);
+    expect(logical).toHaveLength(1);
+    expect(logical[0]?.payload).toMatchObject({ pid: originalRows[0]?.pid, command: 'npm run build && npm run config:docs', cwd: lane.path });
+    if (receiptFault === undefined) {
+      const native = originalStarts.filter((event) => event.kind === 'verification.process-started' && (event.payload as { run_id?: unknown }).run_id === runId);
+      expect(native).toHaveLength(originalRows.length);
+      for (const row of originalRows) expect(native).toEqual(expect.arrayContaining([expect.objectContaining({ payload: expect.objectContaining({ pid: row.pid, process_command: row.command, cwd: lane.path }) })]));
+    }
+    const completed = h.ledger.latestJobEvent(h.jobId, 'verification.completed');
+    // These rows were published by actual onSpawn. Reconciliation never adds a
+    // PID, cwd, command, admission or completion fact to make them qualify.
+    if (receiptFault === 'event-overflow' || receiptFault === 'byte-overflow') {
+      expect(() => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId, requestId, command: 'npm run build && npm run config:docs', cwd: lane.path, worktreeId: lane.id }))
+        .toThrow('inspection exceeds the original complete-evidence bounds; physical ownership remains UNKNOWN');
+    }
+    const replay = await call(h.port, { job_id: h.jobId, scope: 'docs', request_id: requestId });
+    expect(replay.frames[0]).toMatchObject({ type: 'completed', reconciled: true });
+    expect(outcomeOf(replay.frames[0]!)).toEqual(outcome);
+    for (const row of originalRows) expect(h.ledger.listWorktreeProcesses(lane.id)).toEqual(expect.arrayContaining([expect.objectContaining({ pid: row.pid, command: row.command, state: receiptFault === undefined ? 'killed' : 'live' })]));
+    expect(h.ledger.latestJobEvent(h.jobId, 'verification.completed')).toEqual(completed);
+    expect(h.ledger.listJobEventsByKinds(h.jobId, ['verification.started', 'verification.process-started'], { limit: 4100 })).toEqual(originalStarts);
+    expect(h.ledger.listJobEventsByKinds(h.jobId, ['verification.process-reconciled']).filter((event) => (event.payload as { run_id?: unknown }).run_id === runId)).toHaveLength(receiptFault === undefined ? originalRows.length : 0);
+    await h.close();
+  }
+
+  it('R15 received terminal readback qualifies only the original actually spawned decomposed verification steps', () => assertOriginalStepReadback('decomposed'));
+  it('R15 received first-build reuse preserves exact later spawned verification-step reconciliation', () => assertOriginalStepReadback('reused-build'));
+  it('R15 post-source coverage retains original ownership when first native-step publication failed', () => assertOriginalStepReadback('decomposed', 'missing-first'));
+  it('R15 post-source coverage refuses an original native receipt whose step command does not bind the declared plan', () => assertOriginalStepReadback('decomposed', 'wrong-step'));
+  it('R15 post-source coverage retains complete overflowing native-step event history and UNKNOWN ownership', () => assertOriginalStepReadback('decomposed', 'event-overflow'));
+  it('R15 post-source coverage retains an oversized original native-step receipt and UNKNOWN ownership', () => assertOriginalStepReadback('decomposed', 'byte-overflow'));
+
   async function assertProcessIdentityRefusal(fault: 'unbound' | 'conflicting-start' | 'unbound-reused-pid' | 'reused-pid' | 'foreign-command' | 'foreign-terminal' | 'EPERM' | 'live-original') {
     const h = await boot(); const requestId = `process-negative-${fault}`;
     const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });

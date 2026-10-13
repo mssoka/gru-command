@@ -1793,6 +1793,7 @@ export class VerificationScheduler {
     let startedAt = 0;
     let queuedMs = 0;
     let startedEmitted = false;
+    let clockStarted = false;
     let timeoutTimer: NodeJS.Timeout | null = null;
     let current: ChildProcess | null = null;
     let exitCode: number | null = null;
@@ -1803,16 +1804,34 @@ export class VerificationScheduler {
     let outputTail = '';
     let runError: Error | null = null;
 
-    const emitStarted = async (): Promise<void> => {
-      startedEmitted = true;
+    const startClock = (): void => {
+      if (clockStarted) return;
+      clockStarted = true;
       startedAt = this.now();
       queuedMs = startedAt - lease.queuedAt;
+      // ONE unchanged wall-clock bound includes reuse output, without
+      // manufacturing a physical started receipt before any child exists.
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        const live = current;
+        if (live === null) return;
+        signalGroup(live, 'SIGTERM');
+        const killTimer = setTimeout(() => signalGroup(live, 'SIGKILL'), this.killGraceMs);
+        killTimer.unref?.();
+      }, this.opts.limits.runTimeoutMs);
+      timeoutTimer.unref?.();
+    };
+
+    const emitStarted = async (): Promise<void> => {
+      if (current?.pid === undefined) throw new Error('verification started receipt requires its genuine spawned PID');
+      startClock();
+      startedEmitted = true;
       this.safeRecord({
         kind: 'verification.started',
         jobId: lease.jobId,
         payload: {
           run_id: lease.runId,
-          pid: current?.pid ?? null,
+          pid: current.pid,
           scope: lease.scope,
           command: lease.command,
           cwd: lease.cwd,
@@ -1828,16 +1847,6 @@ export class VerificationScheduler {
         sha: git.sha,
         queuedMs,
       });
-      // ONE wall-clock bound for the whole run, whichever step is live.
-      timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        const live = current;
-        if (live === null) return;
-        signalGroup(live, 'SIGTERM');
-        const killTimer = setTimeout(() => signalGroup(live, 'SIGKILL'), this.killGraceMs);
-        killTimer.unref?.();
-      }, this.opts.limits.runTimeoutMs);
-      timeoutTimer.unref?.();
     };
 
     // Every byte the caller sees is hashed here, so the exact-output proof
@@ -1861,6 +1870,7 @@ export class VerificationScheduler {
     /** Spawn one shell, stream it to EOF, and report how it ended. */
     const runStep = async (
       command: string,
+      index: number,
     ): Promise<{ readonly exitCode: number | null; readonly signal: string | null }> => {
       const child = spawn('/bin/sh', ['-c', command], {
         cwd: lease.cwd,
@@ -1890,6 +1900,12 @@ export class VerificationScheduler {
         throw spawnResult;
       }
       if (child.pid === undefined) throw new Error('native spawn event has no bound PID; verification ownership is UNKNOWN');
+      startClock();
+      this.safeRecord({ kind: 'verification.process-started', jobId: lease.jobId, payload: {
+        run_id: lease.runId, pid: child.pid, scope: lease.scope, command: lease.command,
+        process_command: child.spawnargs.join(' '), step_command: command, step_index: index, step_count: steps.length,
+        cwd: lease.cwd, sha: git.sha,
+      } });
       this.callbackSafe('onSpawn', () =>
         this.opts.onSpawn?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
       );
@@ -1959,7 +1975,7 @@ export class VerificationScheduler {
             : inspectReuse(records.get(lease.cwd), before, lease.head);
           const prior = records.get(lease.cwd);
           if (reuseRefusal === null && prior !== undefined) {
-            if (!startedEmitted) await emitStarted();
+            startClock();
             await emit(
               'stdout',
               `[gru-verify] ${step} reused (not executed) from run ${prior.runId}: head, clean tree, configuration, environment and build outputs are unchanged.\n`,
@@ -1973,7 +1989,7 @@ export class VerificationScheduler {
         const stepStarted = this.now();
         let result: { exitCode: number | null; signal: string | null };
         try {
-          result = await runStep(step);
+          result = await runStep(step, index);
         } finally {
           if (isBuild) this.buildRecords.endBuild(lease.cwd);
         }
@@ -2004,7 +2020,7 @@ export class VerificationScheduler {
       if (timeoutTimer !== null) clearTimeout(timeoutTimer);
     }
 
-    const durationMs = startedEmitted ? this.now() - startedAt : 0;
+    const durationMs = clockStarted ? this.now() - startedAt : 0;
     const ok = !halted && !timedOut && runError === null;
     const outcome: VerificationOutcome = {
       runId: lease.runId,

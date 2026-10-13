@@ -198,6 +198,10 @@ function outputFiles(root: string): OutputFile[] | null {
         const digest = fileDigest(join(dir, entry.name));
         if (digest === 'absent') return false;
         files.push({ path: relative, digest });
+      } else {
+        // A link or other nonregular entry is not a complete output proof.
+        // Refuse reuse rather than silently omit bytes the build may import.
+        return false;
       }
     }
     return true;

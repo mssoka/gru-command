@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { loadWorktreeManifest, resolveVerifyCommand } from '../worktrees/manifest.js';
 import { readGitState } from '../verify/scheduler.js';
+import { planCommand } from '../verify/build-reuse.js';
 import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
 import { canonicalRebriefEvidence, type RebriefReceiptEvidence } from './rebrief-evidence.js';
 import type { RecoverySubject, RecoverySubjectKind, RecoveryOwnerTransfer, RecoveryDecisionHistory, RecoveryOwnerActionInput } from './recovery-owner.js';
@@ -148,6 +149,9 @@ import {
 const VERIFICATION_KIND = 'verification.completed';
 const MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS = 4_096;
 const MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES = 8 * 1024 * 1024;
+// Native process readback retains the same complete-receipt inspection bounds.
+const MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS = MAX_REBRIEF_RECEIPT_EVIDENCE_EVENTS;
+const MAX_VERIFICATION_PROCESS_RECEIPT_BYTES = MAX_REBRIEF_RECEIPT_EVIDENCE_BYTES;
 export type { JobStatus, RoundStatus, RoundVerdict, LensState } from './states.js';
 export type { DirectiveRecoveryHold, DirectiveRequestRecord, DirectiveRetirementRefusalCode, DirectiveState } from './directives.js';
 export { DirectiveRetirementError } from './directives.js';
@@ -1339,25 +1343,68 @@ export class LedgerApi {
       if (conflictingTerminal !== undefined) return;
       if (terminal === undefined || !this.hasJobEventWithPayloadValues(input.jobId, ['verification.requested', 'verification.attached'],
         [{ key: 'run_id', value: input.runId }, { key: 'request_id', value: input.requestId }], 0)) return;
-      const starts = this.db.prepare(`SELECT seq, payload FROM events WHERE job_id = ? AND kind = 'verification.started'
-        AND json_extract(payload, '$.run_id') = ? ORDER BY seq`).all(input.jobId, input.runId) as Row[];
+      const receipts = this.db.prepare(`SELECT seq, kind,
+        CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload ELSE NULL END AS payload,
+        length(CAST(payload AS BLOB)) AS payload_bytes FROM events WHERE job_id = ?
+        AND kind IN ('verification.started', 'verification.process-started')
+        AND json_extract(payload, '$.run_id') = ? ORDER BY seq LIMIT ?`)
+        .all(MAX_VERIFICATION_PROCESS_RECEIPT_BYTES, input.jobId, input.runId, MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS + 1) as Row[];
+      if (receipts.length > MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS || receipts.some((row) => row.payload === null) ||
+          receipts.reduce((bytes, row) => bytes + Number(row.payload_bytes), 0) > MAX_VERIFICATION_PROCESS_RECEIPT_BYTES) {
+        throw new DirectiveCheckpointError('verification process receipt inspection exceeds the original complete-evidence bounds; physical ownership remains UNKNOWN');
+      }
+      const starts = receipts.filter((row) => row.kind === 'verification.started');
       const started = starts[0];
       if (started === undefined || Number(started.seq) >= Number(terminal.seq)) return;
-      const physical = JSON.parse(str(started.payload)) as { pid?: unknown; command?: unknown; cwd?: unknown };
+      const physical = JSON.parse(str(started.payload)) as { pid?: unknown; command?: unknown; cwd?: unknown; sha?: unknown };
       if (!Number.isSafeInteger(physical.pid) || Number(physical.pid) <= 0 || physical.command !== input.command || physical.cwd !== input.cwd ||
           starts.some((event) => { const facts = JSON.parse(str(event.payload)) as typeof physical;
             return Number(event.seq) >= Number(terminal.seq) || facts.pid !== physical.pid || facts.command !== input.command || facts.cwd !== input.cwd; })) return;
-      // A PID reused by another recorded run cannot identify this registry row.
-      const conflicting = this.db.prepare(`SELECT 1 FROM events WHERE kind = 'verification.started' AND json_extract(payload, '$.pid') = ?
-        AND (job_id IS NOT ? OR json_extract(payload, '$.run_id') IS NOT ?) LIMIT 1`).get(Number(physical.pid), input.jobId, input.runId);
-      if (conflicting !== undefined) return;
-      for (const row of this.listWorktreeProcesses(input.worktreeId)) {
-        if (row.pid !== physical.pid || row.state !== 'live' || row.evidence !== 'registry' || row.command !== `/bin/sh -c ${input.command}` || !absent(row.pid) || !absent(-row.pid)) continue;
-        this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
-        this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
-          request_id: input.requestId, run_id: input.runId, started_event_seq: Number(started.seq), terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,
-          pid: row.pid, command: row.command, evidence: 'original-pid-and-process-group-absent',
-        } });
+      const nativeStarts = receipts.filter((row) => row.kind === 'verification.process-started');
+      const identities: Array<{ readonly seq: number; readonly pid: number; readonly command: string }> = [];
+      if (nativeStarts.length === 0) {
+        // Prior whole-command receipts stay valid exactly as recorded. A null
+        // reuse start never gets today's PID or step facts backfilled here.
+        identities.push({ seq: Number(started.seq), pid: Number(physical.pid), command: `/bin/sh -c ${input.command}` });
+      } else {
+        const plan = planCommand(input.command);
+        const steps = plan.buildIndex !== null && plan.refusal === null ? plan.steps : [input.command];
+        const indices = new Set<number>();
+        const pids = new Set<number>();
+        let stepCount: number | null = null;
+        for (const event of nativeStarts) {
+          const facts = JSON.parse(str(event.payload)) as { pid?: unknown; command?: unknown; cwd?: unknown; sha?: unknown;
+            process_command?: unknown; step_command?: unknown; step_index?: unknown; step_count?: unknown };
+          const index = Number(facts.step_index);
+          const count = Number(facts.step_count);
+          const pid = Number(facts.pid);
+          const monolithic = count === 1 && index === 0 && facts.step_command === input.command;
+          if (!Number.isSafeInteger(facts.pid) || pid <= 0 || !Number.isSafeInteger(facts.step_index) || !Number.isSafeInteger(facts.step_count) ||
+              index < 0 || count <= 0 || index >= count || indices.has(index) || pids.has(pid) ||
+              Number(event.seq) >= Number(terminal.seq) || facts.command !== input.command || facts.cwd !== input.cwd || facts.sha !== physical.sha ||
+              facts.process_command !== `/bin/sh -c ${String(facts.step_command)}` ||
+              (!monolithic && (count !== steps.length || facts.step_command !== steps[index])) ||
+              (stepCount !== null && count !== stepCount)) return;
+          stepCount = count;
+          indices.add(index); pids.add(pid);
+          identities.push({ seq: Number(event.seq), pid, command: String(facts.process_command) });
+        }
+        if (identities[0]?.pid !== physical.pid) return;
+      }
+      for (const identity of identities) {
+        // Both old and per-step receipts of another run fence PID reuse.
+        const conflicting = this.db.prepare(`SELECT 1 FROM events WHERE kind IN ('verification.started', 'verification.process-started')
+          AND json_extract(payload, '$.pid') = ? AND (job_id IS NOT ? OR json_extract(payload, '$.run_id') IS NOT ?) LIMIT 1`)
+          .get(identity.pid, input.jobId, input.runId);
+        if (conflicting !== undefined) continue;
+        for (const row of this.listWorktreeProcesses(input.worktreeId)) {
+          if (row.pid !== identity.pid || row.state !== 'live' || row.evidence !== 'registry' || row.command !== identity.command || !absent(row.pid) || !absent(-row.pid)) continue;
+          this.db.prepare(`UPDATE worktree_processes SET state = 'killed', last_seen = ? WHERE worktree_id = ? AND pid = ? AND state = 'live'`).run(nowIso(), input.worktreeId, row.pid);
+          this.appendEvent({ kind: 'verification.process-reconciled', jobId: input.jobId, payload: {
+            request_id: input.requestId, run_id: input.runId, started_event_seq: identity.seq, terminal_event_seq: Number(terminal.seq), worktree_id: input.worktreeId,
+            pid: row.pid, command: row.command, evidence: 'original-pid-and-process-group-absent',
+          } });
+        }
       }
     });
   }

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -175,6 +175,22 @@ describe('verification build reuse (#318)', () => {
     // Queue time and execution time are separate numbers on every outcome.
     expect(typeof second.queuedMs).toBe('number');
     expect(typeof second.durationMs).toBe('number');
+  });
+
+  it('R15 received unsupported generated-output symlink cannot qualify whole-output build reuse', async () => {
+    const lane = makeLane();
+    const scheduler = makeScheduler();
+    const first = await run(scheduler, lane, 'static', STATIC);
+    expect(first.ok).toBe(true);
+    const externalOutput = join(lane.ctl, 'original-output.js');
+    writeFileSync(externalOutput, '// original fixture output\n');
+    symlinkSync(externalOutput, join(lane.repo.path, 'dist', 'linked-output.js'));
+    writeFileSync(externalOutput, '// changed fixture output behind the original link\n');
+    const docs = await run(scheduler, lane, 'docs', DOCS);
+    expect(docs.ok).toBe(true);
+    expect(docs.checks?.[0]).toMatchObject({ status: 'passed', ran: true, reuseRefusal: 'outputs-missing', reusedFromRunId: null });
+    expect(count(lane.steps(), 'build')).toBe(2);
+    expect(count(lane.steps(), 'config-docs')).toBe(1);
   });
 
   it('works in the other order (docs first, static reuses the build)', async () => {
