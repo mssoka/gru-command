@@ -14,12 +14,14 @@ import {
 } from '../src/dispatch/silas-autopilot.js';
 import { createSilasAutopilotOps, type SilasAutopilotOpsDeps } from '../src/dispatch/silas-autopilot-ops.js';
 import { createSilasAutopilotHook } from '../src/dispatch/silas-autopilot-pass.js';
-import { ReviewInProgressError } from '../src/dispatch/perkins.js';
+import { ReviewInProgressError, WaveRunner } from '../src/dispatch/perkins.js';
+import type { AgentSpawner } from '../src/dispatch/service.js';
 import { SilasDriver } from '../src/dispatch/silas-driver.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import type { WorktreeSweepResult } from '../src/dispatch/worktree-port.js';
 import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { GitReviewPort } from './helpers/git-review-port.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import type { SilasAutopilotConfig } from '../src/config.js';
 import {
@@ -2285,4 +2287,117 @@ describe('sweep-ack custody: the autopilot mints no fabricated preservation evid
       .filter((event) => event.kind === 'silas.lane-released');
     expect(receipts).toHaveLength(1);
   });
+});
+
+// ------------------------------------------------------------------
+// R2-M4: the production ops + REAL WaveRunner admission/freeze seam
+// ------------------------------------------------------------------
+
+describe('R2-M4 production ops drive a REAL WaveRunner admission/freeze', () => {
+  const makeRealWaveFixture = async (name: string): Promise<{
+    readonly jobId: string;
+    readonly deliveredSha: string;
+    readonly liveHeadB: string;
+    readonly artifacts: string;
+    readonly ledger: LedgerApi;
+    readonly port: GitReviewPort;
+  }> => {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/r2m4']);
+    // A = the delivered/green head; B = the branch head it must NOT silently
+    // freeze instead. A real branch advance is the exact "live head moved"
+    // shape the ops forwarding must pin past.
+    const deliveredSha = repo.commitFile('src/a.ts', 'export const a = 1;\n');
+    const liveHeadB = repo.commitFile('src/b.ts', 'export const b = 2;\n');
+    const root = mkdtempSync(join(tmpdir(), `r2m4-${name}-port-`));
+    dirs.push(root);
+    const artifacts = mkdtempSync(join(tmpdir(), `r2m4-${name}-art-`));
+    dirs.push(artifacts);
+    const ledger = newRealLedger();
+    const port = new GitReviewPort(root, 'feature/r2m4', deliveredSha);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: name });
+    const job = ledger.addJob({ id: name, repo: 'fixture', title: name, baseBranch: 'main', briefing: 'review this' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: deliveredSha } });
+    return { jobId: name, deliveredSha, liveHeadB, artifacts, ledger, port };
+  };
+
+  const opsFor = (f: { readonly ledger: LedgerApi; readonly port: GitReviewPort }, wave: WaveRunner) =>
+    createSilasAutopilotOps({
+      ledger: f.ledger,
+      wave,
+      registry: {} as never,
+      worktrees: f.port,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+
+  it('freezes the ops-supplied head A through real admission (positive control)', async () => {
+    const f = await makeRealWaveFixture('r2m4-positive');
+    const wave = new WaveRunner({
+      ledger: f.ledger,
+      worktrees: f.port,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: f.artifacts,
+      reviewPreflight: async () => ({ ok: true as const, failures: [] }),
+    });
+    await opsFor(f, wave).triggerReview({
+      jobId: f.jobId,
+      ruleId: 'pr-review-trigger',
+      targetRef: f.deliveredSha,
+      boundDeliveredSha: f.deliveredSha,
+    });
+    const rounds = f.ledger.listRounds(f.jobId);
+    expect(rounds).toHaveLength(1);
+    expect(rounds[0]?.targetRef).toBe(f.deliveredSha);
+    expect(rounds[0]?.targetRef).not.toBe(f.liveHeadB);
+    expect(f.ledger.latestJobEvent(f.jobId, 'silas.review-triggered')?.payload).toMatchObject({ route: 'perkins' });
+    await wave.shutdown();
+  }, 60_000);
+
+  it('refuses a delivered-head drift to B during real admission, arming no round (negative control)', async () => {
+    const f = await makeRealWaveFixture('r2m4-stale');
+    let releasePreflight!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releasePreflight = resolve;
+    });
+    let preflightCalls = 0;
+    const wave = new WaveRunner({
+      ledger: f.ledger,
+      worktrees: f.port,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: f.artifacts,
+      reviewPreflight: async () => {
+        preflightCalls += 1;
+        await gate;
+        return { ok: true as const, failures: [] };
+      },
+    });
+    const call = opsFor(f, wave).triggerReview({
+      jobId: f.jobId,
+      ruleId: 'pr-review-trigger',
+      targetRef: f.deliveredSha,
+      boundDeliveredSha: f.deliveredSha,
+    });
+    await vi.waitFor(() => expect(preflightCalls).toBe(1));
+    // A newer delivery lands while the request sits inside the awaited
+    // pre-flight — the controlled boundary immediately before the freeze.
+    f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.jobId, payload: { sha: f.liveHeadB } });
+    releasePreflight();
+    await expect(call).rejects.toThrow(/delivered head moved during review setup/);
+    // The freeze-bound check runs after the round row exists, so the row is
+    // created and then ABORTED — it is never armed, and its target is the
+    // PROVED head A, never the drifted B. No suppression receipt lands.
+    const rounds = f.ledger.listRounds(f.jobId);
+    expect(rounds.length).toBeGreaterThanOrEqual(1);
+    for (const round of rounds) {
+      expect(round.status).toBe('aborted');
+      expect(round.targetRef).toBe(f.deliveredSha);
+    }
+    expect(rounds.some((round) => round.targetRef === f.liveHeadB)).toBe(false);
+    expect(f.ledger.latestJobEvent(f.jobId, 'silas.review-triggered')).toBeNull();
+    await wave.shutdown();
+  }, 60_000);
 });
