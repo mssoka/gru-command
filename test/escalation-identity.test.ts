@@ -202,7 +202,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // 32 of 35 sites carry the bounded context; the three null rows are the
+    // 33 of 36 sites carry the bounded context; the three null rows are the
     // sanctioned residuals (shutdown deadline, live-process pause, sweep
     // error) that stay deliberately context-free and live (A7 rejection
     // stands; a worktree id is never coerced into a round identity).
@@ -238,6 +238,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review round ${round.id} disposal failed after completion`', '{ jobId: job.id, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE`', '{ jobId: job.id, roundId: round.id }'],
       ['`Perkins report for round ${round.id} reconciled a provider review but did NOT record it`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins report for round ${round.id} was recorded and provably NOT posted to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but NOT posted safely to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but has NO pull request to publish to`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Perkins report for round ${round.id} was recorded but NOT posted to the pull request`', '{ jobId: round.jobId, roundId: round.id }'],
@@ -250,7 +251,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(35);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(32);
+    expect(sites).toHaveLength(36);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(33);
   });
 });

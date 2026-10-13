@@ -8,6 +8,7 @@ import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AutoVerdictPoster,
+  DefiniteNonDeliveryError,
   GhPrPoster,
   publicationProviderKindFor,
   GitLabMrPoster,
@@ -4323,6 +4324,98 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     // caution: a just-created review can lag a provider listing, so null
     // absence is not permission to retry blindly (R31).
     expect(escalations.some((line) => line.includes('verify manually before any retry'))).toBe(true);
+  });
+
+  it('skips the ambiguous lookup and duplication caution for a provable non-delivery (#340)', async () => {
+    const repo = makeFixtureRepo('perkins-definite-nondelivery');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/definite-nondelivery']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-dnd-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-dnd-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-dnd-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-dnd-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/definite-nondelivery', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-dnd' });
+    const job = ledger.addJob({ id: 'job-dnd', repo: 'fixture', title: 'definite non-delivery', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/38');
+    attachOrigin(repo, 'feature/definite-nondelivery', root);
+    // A failure that PROVES no POST was sent (the stale-token refusal).
+    const post = vi.fn(async () => {
+      throw new DefiniteNonDeliveryError('installation token expired or expires too soon before the review POST (it was valid when minted; the pre-POST identity and head probes outlasted it) — review not delivered; no POST was sent');
+    });
+    // A MATCHING review: if the code wrongly consulted the lookup it would be
+    // credited, so the assertions below fail loudly instead of silently.
+    const reconcile = vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
+      reviewId: '9009', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      headSha: call.targetSha, baseSha: 'b'.repeat(40),
+      bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
+    }));
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post, reconcile }, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/definite-nondelivery'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.verdict).toBeNull();
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    // No POST was sent, so the ambiguous-publication lookup is skipped.
+    expect(reconcile).not.toHaveBeenCalled();
+    const escalation = escalations.find((line) => line.includes('provably NOT posted')) ?? '';
+    expect(escalation).toContain('no POST was sent');
+    expect(escalation).toContain('a retry cannot duplicate a publication');
+    // The false duplication caution is never attached.
+    expect(escalation).not.toContain('verify manually before any retry');
+    expect(escalation).not.toContain('could duplicate a real publication');
+    const incomplete = ledger.latestRoundEvent(outcome.round.id, 'round.perkins-incomplete')?.payload as { reason?: string; error?: string };
+    expect(incomplete?.reason).toBe('report_not_posted');
+    expect(incomplete?.error).toContain('no POST was sent');
+    expect(incomplete?.error).not.toContain('could duplicate a real publication');
+  });
+
+  it('keeps an ordinary transport failure on the ambiguous path: lookup plus duplication caution (#340)', async () => {
+    const repo = makeFixtureRepo('perkins-transport-ambiguous');
+    repos.push(repo);
+    repo.git(['checkout', '-b', 'feature/transport-ambiguous']);
+    const target = repo.commitFile('src/main.ts', 'export function answer(): number {\n  return 43;\n}\n');
+    const root = mkdtempSync(join(tmpdir(), 'perkins-tamb-port-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'perkins-tamb-artifacts-'));
+    const sessions = mkdtempSync(join(tmpdir(), 'perkins-tamb-sessions-'));
+    dirs.push(root, artifacts, sessions);
+    const db = new LedgerDb(mkdtempSync(join(tmpdir(), 'perkins-tamb-db-')));
+    dbs.push(db);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    const port = new GitReviewPort(root, 'feature/transport-ambiguous', target);
+    await port.createJobWorktree({ repoPath: repo.path, jobId: 'job-tamb' });
+    const job = ledger.addJob({ id: 'job-tamb', repo: 'fixture', title: 'transport ambiguous', baseBranch: 'main', briefing: 'review' });
+    ledger.setJobStatus(job.id, 'working');
+    settleLane(ledger, job.id);
+    ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
+    attachOrigin(repo, 'feature/transport-ambiguous', root);
+    // A client timeout is an UNKNOWN outcome, not definite non-delivery.
+    const post = vi.fn(async () => { throw new Error('review POST timed out after the request left the client'); });
+    const reconcile = vi.fn(async () => null);
+    const escalations: string[] = [];
+    const wave = new WaveRunner({
+      ledger, worktrees: port, spawner: makeSpawner(sessions, []), poster: { post, reconcile }, reviewArtifactRoot: artifacts,
+      escalate: (title, detail) => escalations.push(`${title}: ${detail}`),
+      prHeadProbe: localHeadProbe('feature/transport-ambiguous'),
+    });
+    const outcome = asWave(await wave.runRound({ jobId: job.id }));
+    expect(outcome.posted).toBe(false);
+    expect(outcome.canonicalVerdict).toBe('INCOMPLETE');
+    // The ambiguous path still reconciles once and keeps the caution.
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    const escalation = escalations.find((line) => line.includes('NOT posted safely')) ?? '';
+    expect(escalation).toContain('verify manually before any retry');
+    expect(escalation).toContain('could duplicate a real publication');
   });
 
   it('refuses a provider receipt without a base binding and stays honestly unposted (R34)', async () => {

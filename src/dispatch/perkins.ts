@@ -472,6 +472,20 @@ export interface VerdictPosterInput {
  * backward-compatible. */
 export type VerdictReconcileContext = { readonly reason: 'post-failure' };
 
+/** A publication failure that PROVES no POST reached the provider — e.g. an
+ * installation token that went stale at the pre-POST boundary, before any
+ * bytes were sent. Distinct from an unknown outcome (a timeout or a lost
+ * response AFTER the request left the client): because nothing was sent, a
+ * retry cannot duplicate a publication, so the WaveRunner failure path skips
+ * the ambiguous-publication lookup and its duplication caution and reports a
+ * definite non-delivery instead. */
+export class DefiniteNonDeliveryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DefiniteNonDeliveryError';
+  }
+}
+
 export interface VerdictPoster {
   post(input: VerdictPosterInput): Promise<PostedReviewReceipt>;
   /** Idempotent reconciliation for an ambiguous post (e.g. a timeout after
@@ -5299,6 +5313,13 @@ export class WaveRunner {
         if (duringDelivery !== null) throw new Error(`source changed while the report was being delivered (${duringDelivery.cause}: ${duringDelivery.detail})`);
         recordDelivery(delivered, publicationFile, publicationSha256, false);
       } catch (error) {
+        // A failure that PROVES no POST was sent (e.g. a stale installation
+        // token refused at the pre-POST boundary) is NOT an ambiguous
+        // publication: there is nothing to reconcile and a retry cannot
+        // duplicate a publication, so both the bounded lookup and the
+        // duplication caution are skipped in favour of a definite
+        // non-delivery outcome.
+        const definiteNonDelivery = error instanceof DefiniteNonDeliveryError;
         // Ambiguous publication (the provider may have committed our POST
         // before the failure): reconcile once against provider evidence
         // bound to the frozen head and the exact published body. A verified
@@ -5307,7 +5328,7 @@ export class WaveRunner {
         let reconciledDelivery: PostedReviewReceipt | null = null;
         let reconciliationFailure: unknown;
         let recordFailure: unknown;
-        if (typeof poster.reconcile === 'function' && !signal.aborted) {
+        if (!definiteNonDelivery && typeof poster.reconcile === 'function' && !signal.aborted) {
           try {
             const { prUrl, publicationBody } = deliveryInput();
             const publicationSha256 = createHash('sha256').update(publicationBody).digest('hex');
@@ -5390,7 +5411,20 @@ export class WaveRunner {
             this.log('error', 'Perkins report delivery reconciliation failed', { round: round.id, error: String(reconcileError) });
           }
         }
-        if (reconciledDelivery === null) {
+        if (definiteNonDelivery) {
+          // Provable non-delivery: no POST was sent, so the ambiguous-post
+          // caution below would be false. Surface the refusal directly —
+          // remediation is fixing the credential and re-publishing.
+          deliveryError = new Error(
+            `${String(error)}; the failure proved no POST was sent, so a retry cannot duplicate a publication — fix the credential and re-publish`,
+          );
+          this.escalate(
+            `Perkins report for round ${round.id} was recorded and provably NOT posted to the pull request`,
+            String(deliveryError),
+            { jobId: round.jobId, roundId: round.id },
+          );
+          this.log('error', 'Perkins report delivery was provably never sent', { round: round.id, error: String(deliveryError) });
+        } else if (reconciledDelivery === null) {
           // R31: an unresolved ambiguous post must always carry the
           // manual-verification warning — a following lookup that found
           // nothing, could not run, or could not be recorded does not make
