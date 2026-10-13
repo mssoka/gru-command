@@ -411,6 +411,10 @@ export function isAdmittedBlind(ledger: LedgerApi, jobId: string): boolean {
  * prohibited arrays across every observation event, so the informational
  * `prohibitedAccess` count is cumulative, not distinct reads (issue #339,
  * accepted tradeoff: a delta scan would need persisted per-job offset state).
+ * The same session can therefore be observed MORE THAN ONCE (a settle scan plus
+ * a chained or independent physical-completion scan): scan scheduling is NOT
+ * exactly-once. The single owner of the scan/classification logic is this
+ * helper; the summoning schedule is not deduplicated.
  */
 export function observeBlindSessionAccess(
   ledger: LedgerApi,
