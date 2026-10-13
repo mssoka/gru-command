@@ -25,6 +25,7 @@ import type { NativeAgentTool } from '../runtime/types.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
 import type { LogLevel } from '../logger.js';
 import type { GhApiPort, RepoRef } from './github-poll.js';
+import { BranchBusyError } from './branch-idle.js';
 import {
   flipJobToWorking,
   rebriefFreshMinion,
@@ -34,7 +35,18 @@ import {
 } from './fix-directive.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type ReviewRequestInput, type ReviewRequestOutcome } from './perkins.js';
 import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from './rebrief-recovery.js';
-import { AUTOPILOT_SOURCE, type AutopilotPull, type SilasAutopilotOps } from './silas-autopilot.js';
+import { deliveredTargetSha } from './silas-driver.js';
+import {
+  AUTOPILOT_SOURCE,
+  decisionHold,
+  deliveredPrRegisterHold,
+  fencesHold,
+  reviewEligible,
+  sweepAckHold,
+  type AutopilotPull,
+  type DecisionHoldTriple,
+  type SilasAutopilotOps,
+} from './silas-autopilot.js';
 import { renderFreshRevisionNote, renderRevisionContinuation } from './work-revision.js';
 import { amendmentSupersessions, pendingMaterialAmendments } from '../review-inputs/amendments.js';
 import type { SilasAutopilotRuleId } from './silas-rules.js';
@@ -77,7 +89,21 @@ export interface SilasAutopilotOpsDeps {
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   readonly lessons?: LessonsReferencePort;
+  /** Service-stopping signal: aborts QUEUED directive/re-brief admission
+   * waits (a producer whose seat is taken after stop never starts) and lets
+   * a running prompt settle. Absent = no stop ownership (unit tests). */
+  readonly stopSignal?: AbortSignal;
   readonly log?: Log;
+}
+
+/** The production ops object plus the shutdown drain the assembly owns. */
+export interface SilasAutopilotOpsHandle extends SilasAutopilotOps {
+  /** Join the in-flight background producers. The service-stop signal aborts
+   * queued admission waits (a producer whose seat is not yet taken never
+   * starts) and lets running prompts settle. This is a JOIN, never a
+   * cessation claim: an unsettled producer is reported, never fabricated
+   * away. */
+  drain(): Promise<{ readonly settled: boolean; readonly pending: number }>;
 }
 
 /** The extension of a `silas.*` receipt payload that marks it as the
@@ -89,7 +115,7 @@ export function autopilotReceiptFields(ruleId: SilasAutopilotRuleId): {
   return { rule_id: ruleId, source: AUTOPILOT_SOURCE };
 }
 
-export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutopilotOps {
+export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutopilotOpsHandle {
   const log = deps.log ?? ((): void => {});
 
   /** Run a long worker turn in the background, exactly as the endpoints do
@@ -103,6 +129,43 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
         error: String(error).slice(0, 300),
       });
     });
+  };
+
+  // The in-flight background producers the assembly drains at shutdown
+  // (issue #243 R2-H9). A producer is registered here and removed when it
+  // settles; `drain` joins them, it never asserts they ceased.
+  const producers = new Set<Promise<unknown>>();
+  const ownProducer = (run: Promise<unknown>): void => {
+    const settled = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    producers.add(settled);
+    void settled.then(() => producers.delete(settled));
+  };
+  const drain = async (): Promise<{ readonly settled: boolean; readonly pending: number }> => {
+    while (producers.size > 0) {
+      await Promise.allSettled([...producers]);
+    }
+    return { settled: producers.size === 0, pending: producers.size };
+  };
+
+  /** A stopped service never starts a new producer (issue #243 R2-H9). The
+   * stop signal is what aborts a producer already queued in the pacing gate;
+   * this is the synchronous refusal at the accepted boundary. */
+  const requireNotStopping = (label: string): void => {
+    if (deps.stopSignal?.aborted === true) {
+      throw new Error(`the service is stopping — the ${label} is left for LLM Silas`);
+    }
+  };
+
+  /** Verification ownership re-read at the writer's own boundary (issue #243
+   * R2-H2): digest publication can be stale by the time a directive or
+   * re-brief is admitted. */
+  const requireNoUnsettledVerification = (jobId: string, label: string): void => {
+    if (deps.ledger.hasUnsettledVerificationRun(jobId)) {
+      throw new Error(`a verification is already in flight on this lane — the ${label} is left for LLM Silas`);
+    }
   };
 
   /** Owner rules 3/5 writer admission: a live review whose candidate is
@@ -140,12 +203,28 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly jobId: string;
     readonly url: string;
     readonly ruleId: SilasAutopilotRuleId;
+    readonly hold?: DecisionHoldTriple;
   }): Promise<void> => {
-    const job = deps.dispatch.recordPr(input.jobId, input.url);
+    requireNotStopping('PR registration');
+    // The FINAL conditional mutation boundary (issue #243 R2-H5): re-prove
+    // eligibility, ownership fences, the decision-hold coverage and the
+    // absent link after every awaited lookup/admission seam. The service's
+    // recordPr/setJobPr would otherwise overwrite a link a concurrent writer
+    // landed while this decision was in flight.
+    const job = deps.ledger.getJob(input.jobId);
+    if (job === null) throw new Error(`job "${input.jobId}" not found`);
+    const eligible = reviewEligible(deps.ledger, input.jobId);
+    if (eligible !== null) throw new Error(eligible);
+    if (job.prUrl !== null) throw new Error(`job "${input.jobId}" already carries a PR — refusing to overwrite the link`);
+    const hold = input.hold ?? deliveredPrRegisterHold(deps.ledger, input.jobId);
+    const fence = fencesHold(deps.ledger, input.jobId, hold);
+    if (fence !== null) throw new Error(fence);
+    requireNoUnsettledVerification(input.jobId, 'PR registration');
+    const linked = deps.dispatch.recordPr(input.jobId, input.url);
     deps.ledger.appendCustomEvent({
       kind: 'silas.pr-registered',
       jobId: input.jobId,
-      payload: { url: job.prUrl, ...autopilotReceiptFields(input.ruleId) },
+      payload: { url: linked.prUrl, ...autopilotReceiptFields(input.ruleId) },
     });
   };
 
@@ -156,43 +235,79 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly targetRef?: string;
     readonly boundDeliveredSha?: string;
   }): Promise<void> => {
-    // The request may not wait out the review setup: the endpoint answers
-    // 202 and tracks the run; so does this.
-    const run = (async (): Promise<void> => {
-      // The clean-abort re-arm freezes the PROVED delivered head: the
-      // endpoint re-derives it from the round's target and the newest
-      // delivery, and refuses a stale bind. The pr-review-trigger family
-      // binds the sha its green proved instead (issue #187); in both cases
-      // the request carries target_ref + bound_delivered_sha so the awaited
-      // setup cannot re-resolve a newer live PR head and the freeze
-      // boundary re-proves the same delivered sha.
-      const deliverEvent = deps.ledger.latestJobEvent(input.jobId, 'job.delivered');
-      const deliveredSha =
-        deliverEvent !== null && typeof deliverEvent.payload === 'object' && deliverEvent.payload !== null
-          ? (deliverEvent.payload as { sha?: unknown }).sha
-          : null;
-      const rebindFromDelivery = input.sourceRoundId !== undefined && typeof deliveredSha === 'string';
-      const targetRef = input.targetRef ?? (rebindFromDelivery ? deliveredSha : undefined);
-      const boundDeliveredSha = input.boundDeliveredSha ?? (rebindFromDelivery ? deliveredSha : undefined);
-      const requestInput: ReviewRequestInput = {
-        jobId: input.jobId,
-        ...(targetRef === undefined ? {} : { targetRef }),
-        ...(boundDeliveredSha === undefined ? {} : { boundDeliveredSha }),
-      };
-      const outcome = await deps.wave.requestReview(requestInput);
-      const armed = outcome.route === 'perkins';
-      deps.ledger.appendCustomEvent({
-        kind: armed ? 'silas.review-triggered' : 'silas.review-deferred',
-        jobId: input.jobId,
-        payload: {
-          route: outcome.route,
-          ...(armed && outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
-          ...(input.sourceRoundId === undefined ? {} : { source_round_id: input.sourceRoundId }),
-          ...autopilotReceiptFields(input.ruleId),
-        },
-      });
-    })();
-    background('review trigger', input.jobId, run);
+    requireNotStopping('review request');
+    let targetRef = input.targetRef;
+    let boundDeliveredSha = input.boundDeliveredSha;
+    if (input.sourceRoundId !== undefined) {
+      // Re-prove the clean-abort proof at the request boundary exactly as the
+      // HTTP endpoint does, and bind the ORIGINALLY proved head A (issue #243
+      // R2-H4). A newer delivery B must never be re-read and bound under A's
+      // abort provenance — the freeze guard then validates A, not B.
+      const round = deps.ledger.getRound(input.sourceRoundId);
+      const proof = deps.ledger.latestRoundEvent(input.sourceRoundId, 'round.perkins-incomplete');
+      const reason = typeof proof?.payload === 'object' && proof.payload !== null
+        ? (proof.payload as { reason?: unknown }).reason
+        : null;
+      const newestRound = deps.ledger.listRounds(input.jobId).at(-1);
+      const deliveredEvent = deps.ledger.latestJobEvent(input.jobId, 'job.delivered');
+      const sha = deliveredEvent === null ? null : deliveredTargetSha(deliveredEvent);
+      if (
+        round?.jobId !== input.jobId || round.status !== 'aborted' || newestRound?.id !== input.sourceRoundId ||
+        sha === null || sha !== round.targetRef ||
+        (reason !== 'service_restart' && reason !== 'service_restart_missing_review_lane')
+      ) {
+        throw new Error(
+          'the clean-abort source round is not the latest service-restart abort on the unchanged delivered head — re-arm refused',
+        );
+      }
+      if (input.targetRef !== undefined && input.targetRef !== sha) {
+        throw new Error('the proved clean-abort head moved during admission — refusing to bind a different head');
+      }
+      targetRef = sha;
+      boundDeliveredSha = sha;
+    }
+    const requestInput: ReviewRequestInput = {
+      jobId: input.jobId,
+      ...(targetRef === undefined ? {} : { targetRef }),
+      ...(boundDeliveredSha === undefined ? {} : { boundDeliveredSha }),
+    };
+    // Issue #243 R2-M1: await ADMISSION (the same await the HTTP endpoint
+    // performs), never the long review turn. The suppression receipt lands
+    // before this pass returns, so the recomputed digest no longer offers the
+    // row and no fallback/model wake burns on an already-admitted round.
+    let outcome: ReviewRequestOutcome;
+    try {
+      outcome = await deps.wave.requestReview(requestInput);
+    } catch (error) {
+      if (error instanceof BranchBusyError) {
+        deps.ledger.appendCustomEvent({
+          kind: 'silas.review-deferred',
+          jobId: input.jobId,
+          payload: {
+            phase: error.phase,
+            blockers: error.refusal().blockers,
+            ...(input.sourceRoundId === undefined ? {} : { source_round_id: input.sourceRoundId }),
+            ...autopilotReceiptFields(input.ruleId),
+          },
+        });
+        return;
+      }
+      throw error;
+    }
+    const armed = outcome.route === 'perkins';
+    deps.ledger.appendCustomEvent({
+      kind: armed ? 'silas.review-triggered' : 'silas.review-deferred',
+      jobId: input.jobId,
+      payload: {
+        route: outcome.route,
+        ...(armed && outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
+        ...(input.sourceRoundId === undefined ? {} : { source_round_id: input.sourceRoundId }),
+        ...autopilotReceiptFields(input.ruleId),
+      },
+    });
+    // The long review turn stays backgrounded exactly as the endpoint's
+    // tracked run does: the pass is bounded after admission.
+    background('review turn', input.jobId, outcome.run);
   };
 
   const sendDirective = async (input: {
@@ -209,7 +324,9 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     // current must refuse the writer here (the row then stays for LLM
     // Silas). A review made obsolete by a pending material correction is
     // admitted by this same gate.
+    requireNotStopping('directive');
     requireWriterAdmissible(input.jobId, 'directive');
+    requireNoUnsettledVerification(input.jobId, 'directive');
     const begun = deps.ledger.beginDirectiveIntent({
       jobId: input.jobId,
       directive: input.directive,
@@ -245,29 +362,43 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
         });
         return;
       }
-      const delivery = await routeFixDirectiveToMinion({
-        registry: deps.registry,
-        ledger: deps.ledger,
-        worktrees: deps.worktrees,
-        jobId: input.jobId,
-        directive: input.directive,
-        contract,
-        // Owner rule 4: a live or resumed session receives the pending
-        // amendment bodies; a fresh session reads them in its effective
-        // contract and receives the revision note instead.
-        ...(continuation === ''
-          ? {}
-          : { continuation: { block: continuation, freshNote: renderFreshRevisionNote(workRevision) } }),
-        // The autopilot has no caller to cancel the turn: the signal is
-        // never aborted, and the dirty turn runs to settlement exactly as
-        // the endpoint's own controller does until its request ends.
-        signal: new AbortController().signal,
-        owner: 'silas-ops',
-        ...(deps.workerGate === undefined ? {} : { workerGate: deps.workerGate }),
-        ...(deps.retrySettlement === undefined ? {} : { retrySettlement: deps.retrySettlement }),
-        ...(deps.lessons === undefined ? {} : { lessons: deps.lessons }),
-        ...(deps.parentTools === undefined ? {} : { parentTools: deps.parentTools }),
-      });
+      let delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>;
+      try {
+        delivery = await routeFixDirectiveToMinion({
+          registry: deps.registry,
+          ledger: deps.ledger,
+          worktrees: deps.worktrees,
+          jobId: input.jobId,
+          directive: input.directive,
+          contract,
+          // Owner rule 4: a live or resumed session receives the pending
+          // amendment bodies; a fresh session reads them in its effective
+          // contract and receives the revision note instead.
+          ...(continuation === ''
+            ? {}
+            : { continuation: { block: continuation, freshNote: renderFreshRevisionNote(workRevision) } }),
+          // Service-stop ownership (issue #243 R2-H9): the stop signal aborts
+          // a QUEUED admission wait so a stopped service never starts this
+          // producer, and lets a running prompt settle. It never claims
+          // cessation — an aborted turn reports unknown admission below.
+          signal: deps.stopSignal ?? new AbortController().signal,
+          owner: 'silas-ops',
+          ...(deps.workerGate === undefined ? {} : { workerGate: deps.workerGate }),
+          ...(deps.retrySettlement === undefined ? {} : { retrySettlement: deps.retrySettlement }),
+          ...(deps.lessons === undefined ? {} : { lessons: deps.lessons }),
+          ...(deps.parentTools === undefined ? {} : { parentTools: deps.parentTools }),
+        });
+      } catch (error) {
+        // The turn errored with no positive outcome (a stop-abort of a queued
+        // admission seat, a runtime interruption). The prompt may or may not
+        // have been handed to a worker: keep the request live for
+        // reconciliation, never fabricate a no-effect failure.
+        deps.ledger.recordDirectiveReconcile({
+          requestId: intent.requestId,
+          note: `turn interrupted before admission evidence: ${String(error).slice(0, 300)}`,
+        });
+        return;
+      }
       if (!delivery.delivered) {
         if (delivery.admission === 'unknown') {
           // The prompt may already have run (cancellation or a spent retry
@@ -340,6 +471,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       deps.ledger.recordDirectiveDelivery({ requestId: intent.requestId, eventSeq: followUp.eventSeq });
     })();
     background('directive', input.jobId, run);
+    ownProducer(run);
     run.finally(() => releaseAdmission()).catch(() => {});
   };
 
@@ -356,12 +488,23 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     // `clearLaneForWriter` supersedes unconditionally; it does NOT establish
     // permission, so a live review whose candidate is still current must
     // refuse the writer here (the row then stays for LLM Silas).
+    requireNotStopping('re-brief');
     requireWriterAdmissible(input.jobId, 're-brief');
     await deps.wave.clearLaneForWriter({ jobId: input.jobId, writer: `re-brief for job ${input.jobId}` });
     // Re-prove admission after the awaited supersession (the endpoint does
     // the same): a review that armed in the window between the gate and the
     // marker write must refuse the re-brief, never run alongside it.
     requireWriterAdmissible(input.jobId, 're-brief');
+    requireNoUnsettledVerification(input.jobId, 're-brief');
+    requireNotStopping('re-brief');
+    // Issue #243 R2-H3: a newer re-brief admitted during the awaited
+    // supersession must NEVER be replaced by this stale request. The marker
+    // upsert would otherwise overwrite the newer generation; refuse instead.
+    if (deps.ledger.listPendingRebriefs({ jobId: input.jobId }).length > 0) {
+      throw new Error(
+        `job "${input.jobId}" already has a newer re-brief request pending — refusing to replace it`,
+      );
+    }
     const contract = deps.ledger.effectiveContract(input.jobId)?.text ?? job.briefing;
     // The markers are durable BEFORE any worker exists (restart-safe), and
     // they carry the firing rule AND the autopilot source (issue #243 M3),
@@ -398,6 +541,10 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
           ...(deps.retrySettlement === undefined ? {} : { retrySettlement: deps.retrySettlement }),
           ...(deps.lessons === undefined ? {} : { lessons: deps.lessons }),
           ...(deps.parentTools === undefined ? {} : { parentTools: deps.parentTools }),
+          // Service-stop ownership (issue #243 R2-H9): the stop signal aborts
+          // a QUEUED re-brief admission wait so a stopped service never starts
+          // this producer.
+          ...(deps.stopSignal === undefined ? {} : { signal: deps.stopSignal }),
         });
         if (result.outcome === 'error') {
           deps.ledger.appendCustomEvent({
@@ -433,17 +580,24 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       }
     })();
     background('re-brief', input.jobId, run);
+    ownProducer(run);
   };
 
   const releaseLane = async (input: {
     readonly jobId: string;
     readonly ruleId: SilasAutopilotRuleId;
+    readonly hold?: DecisionHoldTriple;
   }): Promise<void> => {
+    requireNotStopping('sweep-ack release');
     const job = deps.ledger.getJob(input.jobId);
     if (job === null) throw new Error(`job "${input.jobId}" not found`);
     if (!isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — sweep-ack releases only terminal lanes`);
     }
+    // Final mutation boundary (issue #243 R2-H1): re-prove the decision-hold
+    // coverage immediately before the release, after every awaited seam.
+    const covered = decisionHold(deps.ledger, input.jobId, input.hold ?? sweepAckHold(job));
+    if (covered !== null) throw new Error(covered);
     const outstanding = deps.ledger.listChildWorkers({ jobId: input.jobId }).filter((child) => child.resultState === null);
     if (outstanding.length > 0) {
       throw new Error(
@@ -472,5 +626,5 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     });
   };
 
-  return { listOpenPrsForHead, registerPr, triggerReview, sendDirective, sendRebrief, releaseLane };
+  return { listOpenPrsForHead, registerPr, triggerReview, sendDirective, sendRebrief, releaseLane, drain };
 }

@@ -28,7 +28,7 @@ import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
 import { createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
-import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
+import { createSilasAutopilotOps, type SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
@@ -344,6 +344,8 @@ async function main(): Promise<number> {
     bob?: BobScheduler;
     dream?: DreamScheduler;
     silas?: SilasDriver;
+    /** Issue #243: the autopilot ops the shutdown drains. */
+    autopilot?: SilasAutopilotOpsHandle;
     providerRecovery?: ProviderRecoverySensor;
     wave?: WaveRunner;
     childWorkers?: ChildWorkerService;
@@ -436,6 +438,19 @@ async function main(): Promise<number> {
             state.silas.stop();
           } catch (error) {
             logger.error('silas driver stop failed', { error: String(error) });
+          }
+        }
+        // Issue #243 R2-H9: join the autopilot's in-flight producers. The
+        // service-stop signal already aborts QUEUED admissions; this awaits
+        // settlement and reports (never fabricates) anything still running.
+        if (state.autopilot !== undefined) {
+          try {
+            const drained = await state.autopilot.drain();
+            if (!drained.settled) {
+              logger.warn('silas autopilot producers still running at shutdown', { pending: drained.pending });
+            }
+          } catch (error) {
+            logger.error('silas autopilot drain failed', { error: String(error) });
           }
         }
         if (state.providerRecovery !== undefined) {
@@ -1654,23 +1669,30 @@ async function main(): Promise<number> {
     // are the rows Silas was about to read. `enabled` is the owner's kill
     // switch (default off); every family defaults to dry-run.
     const autopilotGh = new GhCliApi();
+    const autopilotOps = createSilasAutopilotOps({
+      ledger,
+      wave,
+      registry,
+      worktrees: worktreeManager,
+      dispatch: dispatcher,
+      gh: autopilotGh,
+      resolveRemote: resolveLaneRemote,
+      workerGate: pacing.gate,
+      retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+      parentTools: parentToolsFor,
+      ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
+      // Service-stop ownership (issue #243 R2-H9): the shutdown signal aborts
+      // a QUEUED directive/re-brief admission so a stopped service never
+      // starts one; `drain` joins the in-flight producers without claiming
+      // cessation.
+      stopSignal: serviceStop.signal,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    state.autopilot = autopilotOps;
     const autopilotHook = createSilasAutopilotHook({
       ledger,
       config: config.silas.autopilot,
-      ops: createSilasAutopilotOps({
-        ledger,
-        wave,
-        registry,
-        worktrees: worktreeManager,
-        dispatch: dispatcher,
-        gh: autopilotGh,
-        resolveRemote: resolveLaneRemote,
-        workerGate: pacing.gate,
-        retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
-        parentTools: parentToolsFor,
-        ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
-        log: (level, msg, fields) => logger.log(level, msg, fields),
-      }),
+      ops: autopilotOps,
       digest: (trigger) =>
         computeSilasDigest({
           ledger,

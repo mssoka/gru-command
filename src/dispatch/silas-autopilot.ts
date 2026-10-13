@@ -88,11 +88,14 @@ export interface SilasAutopilotOps {
     readonly repoPath: string;
     readonly branch: string;
   }) => Promise<readonly AutopilotPull[]>;
-  /** The function `POST /api/dispatch/pr` calls. */
+  /** The function `POST /api/dispatch/pr` calls. `hold` carries the row's
+   * #218 coverage identity so the mutation boundary re-proves it after every
+   * awaited seam (issue #243 R2-H1/H5). */
   readonly registerPr: (input: {
     readonly jobId: string;
     readonly url: string;
     readonly ruleId: SilasAutopilotRuleId;
+    readonly hold?: DecisionHoldTriple;
   }) => Promise<void>;
   /** The function `POST /api/dispatch/review` calls. `targetRef`/
    * `boundDeliveredSha` bind the reviewed head to the sha the green proved
@@ -120,10 +123,13 @@ export interface SilasAutopilotOps {
     readonly ruleId: SilasAutopilotRuleId;
     readonly sourceRoundId: string;
   }) => Promise<void>;
-  /** The function `POST /api/dispatch/release` calls for a sweep-ack. */
+  /** The function `POST /api/dispatch/release` calls for a sweep-ack.
+   * `hold` carries the row's #218 coverage identity for the final mutation
+   * boundary (issue #243 R2-H1). */
   readonly releaseLane: (input: {
     readonly jobId: string;
     readonly ruleId: SilasAutopilotRuleId;
+    readonly hold?: DecisionHoldTriple;
   }) => Promise<void>;
 }
 
@@ -240,19 +246,36 @@ export function renderRebriefNote(row: VerdictAwaitingDirectiveRow): string {
 // ------------------------------------------------------------------
 
 /** One row's #218 coverage identity: the signal family it raises and the
- * basis fingerprint the decision must have been made against. */
-interface DecisionHoldTriple {
+ * basis fingerprint the decision must have been made against. Exported so
+ * the ops mutation boundary can re-prove the SAME identity after its
+ * awaited seams (issue #243 R2-H1/H5). */
+export interface DecisionHoldTriple {
   readonly signal: string;
   readonly basis: string;
 }
 
+/** The coverage triple `sweep-ack` raises. The released lane's identity is
+ * its terminal status, so a basis-specific hold on that state defers the
+ * release (an any-basis hold defers regardless). */
+export function sweepAckHold(job: { readonly status: string }): DecisionHoldTriple {
+  return { signal: 'sweep-ack', basis: `status:${job.status}` };
+}
+
+/** The coverage triple `delivered-pr-register` raises: the delivered head
+ * the registration would link. Derived from the ledger alone so the planner
+ * and the ops mutation boundary always agree on the identity. */
+export function deliveredPrRegisterHold(ledger: AutopilotLedger, jobId: string): DecisionHoldTriple {
+  const delivered = ledger.latestJobEvent(jobId, 'job.delivered');
+  const sha = delivered === null ? null : deliveredTargetSha(delivered);
+  return { signal: 'delivered-pr-register', basis: `delivered:${sha ?? 'none'}` };
+}
+
 /** The #218 coverage query for one row (issue #218): does an active decision
  * hold actually cover this row's (subject, signal, basis)? The subject is
- * always the job — the mailbox vocabulary. A malformed decision row must
- * never take the pass down: the read fails loud in the log and the row is
- * treated as UNCOVERED (the autopilot may act), matching the awareness
- * layer's fail-toward-waking posture. */
-function decisionHold(ledger: AutopilotLedger, jobId: string, triple: DecisionHoldTriple): string | null {
+ * always the job — the mailbox vocabulary. A malformed decision row fails
+ * loud at the ledger boundary and the caller treats the read as UNCOVERED
+ * only when the query itself refused; a clean miss is simply uncovered. */
+export function decisionHold(ledger: AutopilotLedger, jobId: string, triple: DecisionHoldTriple): string | null {
   const decision = ledger.coveringDecision({ subject: `job:${jobId}`, signal: triple.signal, basis: triple.basis });
   return decision === null ? null : `an active decision (${decision.id}) covers ${triple.signal}`;
 }
@@ -261,7 +284,7 @@ function decisionHold(ledger: AutopilotLedger, jobId: string, triple: DecisionHo
  * publish boundary, and a moment has passed since. Uncertain ownership
  * fails closed — the row stays for LLM Silas. `hold` is the row's #218
  * coverage triple (absent when the family raises no signal). */
-function fencesHold(ledger: AutopilotLedger, jobId: string, hold?: DecisionHoldTriple): string | null {
+export function fencesHold(ledger: AutopilotLedger, jobId: string, hold?: DecisionHoldTriple): string | null {
   const job = ledger.getJob(jobId);
   if (job === null) return 'job not found';
   if (job.status === 'merged' || job.status === 'done' || job.status === 'binned') {
@@ -279,8 +302,9 @@ function fencesHold(ledger: AutopilotLedger, jobId: string, hold?: DecisionHoldT
   return null;
 }
 
-/** The review-eligibility statuses (`reviewEligibleStatus`). */
-function reviewEligible(ledger: AutopilotLedger, jobId: string): string | null {
+/** The review-eligibility statuses (`reviewEligibleStatus`). Exported so
+ * the ops mutation boundary can re-prove eligibility after its seams. */
+export function reviewEligible(ledger: AutopilotLedger, jobId: string): string | null {
   const job = ledger.getJob(jobId);
   if (job === null) return 'job not found';
   if (job.status !== 'working' && job.status !== 'delivered' && job.status !== 'in-review') {
@@ -360,6 +384,24 @@ function planVerificationRepair(row: VerificationFailureRow, ledger: AutopilotLe
   });
 }
 
+/** Count the durable directive requests that reached `failed` while carrying
+ * this exact blocker fingerprint (issue #243 R2-H6). Counting the durable
+ * requests — not `silas.directive-sent` receipts — includes failures that
+ * never earned a sent receipt (a refused supersession or positive
+ * no-delivery proof recorded `silas.directive-failed` alone). */
+function failedDirectivesForFingerprint(ledger: AutopilotLedger, jobId: string, fingerprint: string): number {
+  return ledger
+    .listPendingDirectives({ jobId, states: ['failed'], limit: 1000 })
+    .filter((record) => {
+      try {
+        const parsed = JSON.parse(record.payload) as { blocker_fingerprint?: unknown };
+        return parsed.blocker_fingerprint === fingerprint;
+      } catch {
+        return false;
+      }
+    }).length;
+}
+
 /** `pr-conflict-rebase`: ONE conflict-integration directive per head. */
 function planConflictRebase(row: ConflictingPrRow, ledger: AutopilotLedger): Verdict {
   const fence = fencesHold(ledger, row.jobId, {
@@ -367,16 +409,15 @@ function planConflictRebase(row: ConflictingPrRow, ledger: AutopilotLedger): Ver
     basis: row.headSha === null ? 'pr-conflict:unknown' : `pr-conflict:${row.headSha}`,
   });
   if (fence !== null) return refuse(fence);
+  // Issue #243 R2-H2: a verification admitted after digest publication is
+  // not caught by writer or directive admission, so the conflict writer
+  // re-reads verification ownership before naming its directive.
+  if (ledger.hasUnsettledVerificationRun(row.jobId)) return refuse('a verification is already in flight on this lane');
   if (row.headSha === null || row.headSha.trim() === '') return refuse('the conflict row carries no head sha to fingerprint');
   const fingerprint = `pr-conflict:${row.headSha}`;
-  const failed = ledger.listJobEventsByKinds(row.jobId, ['silas.directive-sent']).filter((event) => {
-    const payload = typeof event.payload === 'object' && event.payload !== null ? event.payload : {};
-    const record = payload as { blocker_fingerprint?: unknown; request_id?: unknown };
-    if (record.blocker_fingerprint !== fingerprint || typeof record.request_id !== 'string') return false;
-    return ledger.getDirective(record.request_id)?.state === 'failed';
-  });
-  if (failed.length >= 2) {
-    return refuse(`a conflict-integration directive for head ${row.headSha.slice(0, 12)} already failed ${failed.length}×`);
+  const failed = failedDirectivesForFingerprint(ledger, row.jobId, fingerprint);
+  if (failed >= 2) {
+    return refuse(`a conflict-integration directive for head ${row.headSha.slice(0, 12)} already failed ${failed}×`);
   }
   return act('send-directive', {
     endpoint: 'POST /api/silas/directive',
@@ -406,11 +447,16 @@ function planCleanAbortRebrief(row: PrWithoutReviewRow, ledger: AutopilotLedger)
   const sha = delivered === null ? null : deliveredTargetSha(delivered);
   if (sha === null) return refuse('the delivered head is not resolvable — the re-arm cannot be bound');
   if (round.targetRef !== sha) return refuse('the delivered head moved since the aborted round — the re-arm is stale');
+  // Issue #243 R2-H4: carry the ORIGINALLY proved head A through the ops
+  // admission. The binding must never re-read a newer delivery B and bind it
+  // under A's abort provenance; freeze-time then validates A, not B.
   return act('trigger-review', {
     endpoint: 'POST /api/dispatch/review',
     job_id: row.jobId,
     rule_id: 'clean-abort-service-restart',
     source_round_id: cleanAbort.roundId,
+    target_ref: sha,
+    bound_delivered_sha: sha,
   });
 }
 
@@ -458,10 +504,20 @@ function planSweepAck(row: ReleaseEligibleRow, ledger: AutopilotLedger): Verdict
   if (job.status !== 'merged' && job.status !== 'done' && job.status !== 'binned') {
     return refuse(`job is ${job.status} — sweep-ack releases only terminal lanes`);
   }
+  // Issue #243 R2-H1: a valid decision-memory hold covers the terminal lane
+  // exactly like every other family's row. The terminality check above is
+  // why this family cannot use the shared `fencesHold` (which refuses every
+  // terminal status); it queries coverage directly.
+  const covered = decisionHold(ledger, row.jobId, sweepAckHold(job));
+  if (covered !== null) return refuse(covered);
   return act('release-lane', {
     endpoint: 'POST /api/dispatch/release',
     job_id: row.jobId,
     rule_id: 'sweep-ack',
+    // Carried so the ops mutation boundary can re-prove the SAME coverage
+    // after its own awaited seam (R2-H1's final mutation boundary).
+    hold_signal: 'sweep-ack',
+    hold_basis: `status:${job.status}`,
   });
 }
 
@@ -471,10 +527,12 @@ async function planDeliveredPrRegister(
   ledger: AutopilotLedger,
   listOpenPrsForHead: SilasAutopilotOps['listOpenPrsForHead'],
 ): Promise<Verdict> {
+  const hold = deliveredPrRegisterHold(ledger, row.jobId);
   const eligible = reviewEligible(ledger, row.jobId);
   if (eligible !== null) return refuse(eligible);
-  const fence = fencesHold(ledger, row.jobId);
+  const fence = fencesHold(ledger, row.jobId, hold);
   if (fence !== null) return refuse(fence);
+  if (ledger.hasUnsettledVerificationRun(row.jobId)) return refuse('a verification is already in flight on this lane');
   const job = ledger.getJob(row.jobId);
   if (job === null) return refuse('job not found');
   if (job.prUrl !== null) return refuse('the job already carries a PR');
@@ -488,9 +546,18 @@ async function planDeliveredPrRegister(
   if (pulls.length > 1 || pull === undefined) {
     return refuse(`${pulls.length} open PRs were found for the delivered branch — ambiguous`);
   }
-  // Recheck after the awaited lookup (issue #243 M5): another writer may
-  // have registered a PR during the network window; this stale decision
-  // must never overwrite it (setJobPr overwrites unconditionally).
+  // Recheck EVERY eligibility/ownership/link fence after the awaited lookup
+  // (issue #243 M5/R2-H5): a competing registration, a writer that claimed
+  // the lane, a terminal transition or a valid hold that landed during the
+  // network window must refuse this stale decision. The `setJobPr` call at
+  // the ops boundary overwrites unconditionally, so this is the planner half
+  // of the conditional mutation; the ops re-proves it once more at the
+  // final mutation boundary.
+  const afterEligible = reviewEligible(ledger, row.jobId);
+  if (afterEligible !== null) return refuse(afterEligible);
+  const afterFence = fencesHold(ledger, row.jobId, hold);
+  if (afterFence !== null) return refuse(afterFence);
+  if (ledger.hasUnsettledVerificationRun(row.jobId)) return refuse('a verification is already in flight on this lane');
   const afterLookup = ledger.getJob(row.jobId);
   if (afterLookup === null) return refuse('job not found');
   if (afterLookup.prUrl !== null) return refuse('the job already carries a PR');
@@ -499,6 +566,8 @@ async function planDeliveredPrRegister(
     job_id: row.jobId,
     url: pull.url,
     branch: row.branch,
+    hold_signal: hold.signal,
+    hold_basis: hold.basis,
   });
 }
 
@@ -669,7 +738,7 @@ export async function runSilasAutopilot(input: SilasAutopilotInput): Promise<Sil
     }),
     { decisions: 0, enforced: 0, refusals: 0, failures: 0 },
   );
-  return { ok: true, enabled: true, ...totals, rules: counts };
+  return { ok: totals.failures === 0, enabled: true, ...totals, rules: counts };
 }
 
 /** Perform the one call a decision names. Together with the planners above
@@ -722,11 +791,28 @@ async function performCall(
       return;
     }
     case 'delivered-pr-register': {
-      await ops.registerPr({ jobId, url: stringField('url'), ruleId });
+      const holdSignal = optionalField('hold_signal');
+      const holdBasis = optionalField('hold_basis');
+      await ops.registerPr({
+        jobId,
+        url: stringField('url'),
+        ruleId,
+        ...(holdSignal === undefined || holdBasis === undefined
+          ? {}
+          : { hold: { signal: holdSignal, basis: holdBasis } }),
+      });
       return;
     }
     case 'sweep-ack': {
-      await ops.releaseLane({ jobId, ruleId });
+      const holdSignal = optionalField('hold_signal');
+      const holdBasis = optionalField('hold_basis');
+      await ops.releaseLane({
+        jobId,
+        ruleId,
+        ...(holdSignal === undefined || holdBasis === undefined
+          ? {}
+          : { hold: { signal: holdSignal, basis: holdBasis } }),
+      });
       return;
     }
   }
