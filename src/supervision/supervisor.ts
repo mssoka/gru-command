@@ -2062,6 +2062,11 @@ export class Supervisor {
     const controller = new AbortController();
     this.clearRecoveryAdmission(agent); // supersede any older recovery wait
     agent.recoveryAdmission = controller;
+    // Issue #339: set once the recovered prompt is actually delivered to the
+    // resumed session. From that point the session may hold tool results that
+    // must be observed before this method returns, whatever the authority
+    // state is at settle time.
+    let turnStarted = false;
     const stillCurrent = (): boolean =>
       !this.disposed &&
       !controller.signal.aborted &&
@@ -2085,6 +2090,7 @@ export class Supervisor {
       // error is thrown to the catch below, which consults the retry
       // settlement and — when nothing carried the turn — posts the honest
       // recoverable-lane note instead of recording a fabricated 'resumed'.
+      turnStarted = true;
       const verdict = await promptWithTerminalVerdict(handle, pending.text, {
         ...(pending.owner !== null ? { owner: pending.owner } : {}),
         ...(pending.images !== undefined ? { images: pending.images } : {}),
@@ -2098,11 +2104,6 @@ export class Supervisor {
       lease?.release();
       lease = null;
       const disposition = await this.awaitRetrySettlement(agent.agentId);
-      // Issue #339: this recovered turn is a resume too — observe its
-      // settled session on every post-settlement exit (including the
-      // exhausted/superseded return below) so the no-bypass guarantee holds
-      // on the supervisor restart path as well.
-      this.observeRecoveredBlindAccess(laneAgentId, handle);
       if (disposition === 'exhausted' || disposition === 'superseded') {
         this.log('warn', 'interrupted turn did not resume under its automatic retries', {
           agent_id: laneAgentId,
@@ -2132,10 +2133,6 @@ export class Supervisor {
       // escalated to the owner as a failed resume; a spent budget keeps the
       // same ladder truth as the resolve path.
       const disposition = await this.awaitRetrySettlement(agent.agentId);
-      // Issue #339: observe the recovered turn's session here too — a
-      // rejected or in-band-error turn can still have read prohibited
-      // material before it settled.
-      this.observeRecoveredBlindAccess(laneAgentId, handle);
       if (!stillCurrent()) return;
       if (disposition === 'recovered') {
         this.recordEvent('supervision.turn-recovery', laneAgentId, {
@@ -2163,6 +2160,14 @@ export class Supervisor {
       });
       this.postOrphanedTurn(laneAgentId, reason, String(error));
     } finally {
+      // Issue #339: a recovered turn that actually started (its prompt was
+      // delivered to the resumed session) is a resume too — observe its
+      // settled session on EVERY exit, including the stillCurrent() guards
+      // above. Those guards fence delivery bookkeeping, not the read-only
+      // observation: a turn that loses authority mid-flight still ran and may
+      // have read prohibited material, and leaving it unscanned would keep
+      // contaminated coverage qualifying (and steer the parent to reuse it).
+      if (turnStarted) this.observeRecoveredBlindAccess(laneAgentId, handle);
       if (agent.recoveryAdmission === controller) agent.recoveryAdmission = null;
       lease?.release();
     }
@@ -2176,12 +2181,16 @@ export class Supervisor {
   private observeRecoveredBlindAccess(laneAgentId: string, handle: AgentHandle): void {
     const observe = this.observeBlindTurn;
     if (observe === null) return;
-    const jobId = this.ledger.getAgent(laneAgentId)?.jobId ?? null;
-    if (jobId === null) return;
     try {
+      // The ledger lookup rides inside the boundary too: a throwing read must
+      // not escape as a turn failure (at the resolve path it would re-route
+      // the turn into the catch branch; at the catch path it would escape the
+      // void'd caller entirely).
+      const jobId = this.ledger.getAgent(laneAgentId)?.jobId ?? null;
+      if (jobId === null) return;
       observe(jobId, handle.sessionFile);
     } catch (error) {
-      this.log('error', 'blind review access observation failed', { job: jobId, error: String(error) });
+      this.log('error', 'blind review access observation failed', { agent: laneAgentId, error: String(error) });
     }
   }
 

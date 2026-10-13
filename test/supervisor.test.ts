@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -346,6 +346,43 @@ function emitFailure(handle: FakeHandle, text: string): void {
 function hang(handle: FakeHandle): void {
   handle.setState('streaming');
   handle.emit({ type: 'turn_start' });
+}
+
+/** The prohibited read line a blind reviewer's session records — appended by a
+ * scripted turn so an incorrectly early scan reads a clean session. */
+const PROHIBITED_TOOL_RESULT = `${JSON.stringify({
+  type: 'message',
+  message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' },
+})}\n`;
+
+/** A clean (empty) resumed session file that a scripted recovered turn appends
+ * its reads to — the real ordering a settle scan must follow. */
+function blindReplaySession(name: string): string {
+  const sessionDir = join(tmpDir(), name);
+  mkdirSync(sessionDir, { recursive: true });
+  const sessionFile = join(sessionDir, `${name}.jsonl`);
+  writeFileSync(sessionFile, '{}\n', 'utf-8');
+  return sessionFile;
+}
+
+/** Admit `jobId` as a blind review with its implementer agent registered — the
+ * shared fixture for the restored-turn observation tests. */
+function admitBlindReviewJob(h: Harness, jobId: string, agentId: string, targetSha: string): void {
+  h.api.addJob({ id: jobId, repo: 'fixture', title: 'blind review' });
+  h.api.setJobStatus(jobId, 'working');
+  h.api.registerAgent({ id: agentId, role: 'minion', jobId });
+  const admission = admitBlindReview({
+    ledger: h.api,
+    jobId,
+    title: 'review (blind)',
+    deliverable: 'review',
+    briefing: 'Review the immutable package read-only.',
+    targetSha,
+    repoName: 'fixture',
+    inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+  });
+  if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+  recordBlindAdmission(h.api, jobId, admission);
 }
 
 describe('supervisor — watchdog + restart ladder', () => {
@@ -2175,31 +2212,23 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
   it('a recovered turn on a restarted blind reviewer is observed, invalidating coverage (issue #339 D1)', async () => {
     const h = boot();
     const jobId = 'job-blind-recover';
-    h.api.addJob({ id: jobId, repo: 'fixture', title: 'blind review' });
-    h.api.setJobStatus(jobId, 'working');
-    h.api.registerAgent({ id: 'minion-blind-recover', role: 'minion', jobId });
-    const targetSha = 'f'.repeat(40);
-    const admission = admitBlindReview({
-      ledger: h.api,
-      jobId,
-      title: 'review (blind)',
-      deliverable: 'review',
-      briefing: 'Review the immutable package read-only.',
-      targetSha,
-      repoName: 'fixture',
-      inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
-    });
-    if (admission === null) throw new Error('the job was not admitted as a blind review');
-    recordBlindAdmission(h.api, jobId, admission);
+    const agentId = 'minion-blind-recover';
+    admitBlindReviewJob(h, jobId, agentId, 'f'.repeat(40));
     // The observer is installed late in production (main.ts) — the dispatch
     // service is built after the supervisor.
     h.supervisor.setObserveBlindTurn((observedJobId, sessionFile) =>
       observeBlindSessionAccess(h.api, observedJobId, sessionFile));
-    const sessionDir = join(tmpDir(), 'minion');
-    mkdirSync(sessionDir, { recursive: true });
-    const sessionFile = join(sessionDir, 'blind-recover.jsonl');
-    writeFileSync(sessionFile, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`, 'utf-8');
-    const handle = new FakeHandle('minion', 'minion-blind-recover', sessionFile);
+    const sessionFile = blindReplaySession('blind-recover');
+    // The prohibited read is appended BY the recovered turn's prompt, NOT
+    // prewritten: an incorrectly early scan would read a clean session and
+    // pass. This pins the supervisor seam's scan placement after the
+    // continuation settles (issue #339 N4).
+    h.registry.spawnImpl = async (role, options) => {
+      const resumed = new FakeHandle(role, `${role}-resumed-blind`, options?.resumeFile ?? null);
+      resumed.promptHook = () => { appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT); };
+      return resumed;
+    };
+    const handle = new FakeHandle('minion', agentId, sessionFile);
     handle.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
     h.registry.adopt(handle);
     expect(blindCoverageOf(h.api, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
@@ -2210,6 +2239,114 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     }, { timeout: 5_000 });
     // The recovered turn's session was scanned: without the supervisor seam
     // the restarted reviewer would keep qualifying coverage.
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
+    h.dispose();
+  });
+
+  it('a recovered turn that loses authority mid-flight is still observed (issue #339 N1)', async () => {
+    const h = boot();
+    const jobId = 'job-blind-superseded';
+    const agentId = 'minion-blind-superseded';
+    admitBlindReviewJob(h, jobId, agentId, 'e'.repeat(40));
+    h.supervisor.setObserveBlindTurn((observedJobId, sessionFile) =>
+      observeBlindSessionAccess(h.api, observedJobId, sessionFile));
+    const sessionFile = blindReplaySession('blind-superseded');
+    let promptEntered = false;
+    let releasePrompt: () => void = () => {};
+    const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+    h.registry.spawnImpl = async (role, options) => {
+      const resumed = new FakeHandle(role, `${role}-resumed-superseded`, options?.resumeFile ?? null);
+      resumed.promptHook = async () => {
+        appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT);
+        promptEntered = true;
+        await promptGate;
+      };
+      return resumed;
+    };
+    const handle = new FakeHandle('minion', agentId, sessionFile);
+    handle.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
+    h.registry.adopt(handle);
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({ state: 'qualifying', accessObserved: false });
+    hang(handle);
+    h.advance(60);
+    await vi.waitFor(() => expect(promptEntered).toBe(true), { timeout: 5_000 });
+    // Authority flips before the recovered turn settles (the job goes
+    // terminal). The stillCurrent() guards fence delivery bookkeeping, so the
+    // scan must not sit behind them: the turn ran and its read is on disk.
+    h.api.setJobStatus(jobId, 'done');
+    releasePrompt();
+    await vi.waitFor(() => {
+      expect(blindCoverageOf(h.api, jobId).state).toBe('invalidated');
+    }, { timeout: 5_000 });
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
+    h.dispose();
+  });
+
+  it('a rejected recovered turn that already read prohibited material still invalidates coverage (issue #339 N6)', async () => {
+    const h = boot();
+    const jobId = 'job-blind-reject';
+    const agentId = 'minion-blind-reject';
+    admitBlindReviewJob(h, jobId, agentId, 'c'.repeat(40));
+    h.supervisor.setObserveBlindTurn((observedJobId, sessionFile) =>
+      observeBlindSessionAccess(h.api, observedJobId, sessionFile));
+    const sessionFile = blindReplaySession('blind-reject');
+    h.registry.spawnImpl = async (role, options) => {
+      const resumed = new FakeHandle(role, `${role}-resumed-reject`, options?.resumeFile ?? null);
+      resumed.promptHook = () => {
+        appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT);
+        throw new Error('recovered prompt rejected after the read');
+      };
+      return resumed;
+    };
+    const handle = new FakeHandle('minion', agentId, sessionFile);
+    handle.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
+    h.registry.adopt(handle);
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({ state: 'qualifying', accessObserved: false });
+    hang(handle);
+    h.advance(60);
+    // The catch path observes too: a rejected turn can have read before it lost.
+    await vi.waitFor(() => {
+      expect(blindCoverageOf(h.api, jobId).state).toBe('invalidated');
+    }, { timeout: 5_000 });
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
+    h.dispose();
+  });
+
+  it('the production composition observes a recovered blind turn through the real dispatcher (issue #339 N5)', async () => {
+    const h = boot();
+    const jobId = 'job-blind-composed';
+    const agentId = 'minion-blind-composed';
+    admitBlindReviewJob(h, jobId, agentId, 'd'.repeat(40));
+    // The production wiring (main.ts): the supervisor's late-bound observer IS
+    // the real DispatchService.observeBlindSession, not a test-local scan.
+    const service = new DispatchService({
+      ledger: h.api,
+      worktrees: new InMemoryWorktreePort(tmpDir()),
+      spawner: (role, options) => h.registry.spawn(role, options),
+    });
+    h.supervisor.setObserveBlindTurn((observedJobId, sessionFile) =>
+      service.observeBlindSession(observedJobId, sessionFile));
+    const sessionFile = blindReplaySession('blind-composed');
+    h.registry.spawnImpl = async (role, options) => {
+      const resumed = new FakeHandle(role, `${role}-resumed-composed`, options?.resumeFile ?? null);
+      resumed.promptHook = () => { appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT); };
+      return resumed;
+    };
+    const handle = new FakeHandle('minion', agentId, sessionFile);
+    handle.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
+    h.registry.adopt(handle);
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({ state: 'qualifying', accessObserved: false });
+    hang(handle);
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(blindCoverageOf(h.api, jobId).state).toBe('invalidated');
+    }, { timeout: 5_000 });
     expect(blindCoverageOf(h.api, jobId)).toMatchObject({
       state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
     });
