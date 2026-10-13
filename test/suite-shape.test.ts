@@ -192,6 +192,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'escalation-identity.test.ts': 7,
   'dispatch-review-inputs.test.ts': 4,
   'durable-reconcile.test.ts': 13,
+  'fixture-repo-origin.test.ts': 1,
   'harness-diagnostics.test.ts': 18,
   'harness-routing.test.ts': 3,
   'ledger-obligations.test.ts': 30,
@@ -207,7 +208,13 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
 describe('suite shape', () => {
   it('runs the full PR gate on the default merge-result checkout', () => {
     const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
-    expect(workflow).toMatch(/- uses: actions\/checkout@v6\s*\n\s*- uses: actions\/setup-node@v6/);
+    // The gate still runs on the default merge-result checkout — checkout@v6
+    // with the full history as its ONLY option (so no `ref:`/head-sha
+    // override), immediately followed by setup-node@v6. The history is
+    // required: the App contract baseline scope (#190) archives the
+    // immutable pre-repair commit fe6a774 through a shared clone of this
+    // checkout, which a shallow fetch leaves absent.
+    expect(workflow).toMatch(/- uses: actions\/checkout@v6\n\s+with:\n\s+fetch-depth: 0\n\s*- uses: actions\/setup-node@v6/);
     expect(workflow).not.toContain('github.event.pull_request.head.sha');
     expect(workflow).toContain('run: npm test');
   });
