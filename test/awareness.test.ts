@@ -2993,4 +2993,24 @@ describe('GH-122 (g26): credential-bearing detail never reaches an autonomous pr
     expect(text).toContain('runtime error');
     expect(text).not.toContain(TOKEN);
   });
+
+  it('redacts secret-shaped error text in the job.minion-error digest line', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({ kind: 'job.minion-error', jobId: 'j1', payload: { error: `provider rejected key ${TOKEN}` } });
+    const block = rig.awareness.prepare();
+    expect(block).not.toBeNull();
+    expect(block!.text).toContain('job j1: minion error');
+    expect(block!.text).toContain('[redacted]');
+    expect(block!.text).not.toContain(TOKEN);
+  });
+
+  it('redacts secret-shaped error text in the agent.state digest line', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({ kind: 'agent.state', agentId: 'm1', payload: { to: 'error', error: `401 invalid key ${TOKEN}` } });
+    const block = rig.awareness.prepare();
+    expect(block).not.toBeNull();
+    expect(block!.text).toContain('agent m1: errored');
+    expect(block!.text).toContain('[redacted]');
+    expect(block!.text).not.toContain(TOKEN);
+  });
 });
