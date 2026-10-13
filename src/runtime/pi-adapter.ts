@@ -1347,10 +1347,25 @@ export class PiAgentHandle implements AgentHandle {
    * call's promise is cached and returned to every later/concurrent caller,
    * so a retry after a timeout rejection cannot silently bypass the named
    * error, and a concurrent caller waits on the same pending idle proof.
-   * Mirrors `ClaudeCodeHandle.dispose`'s existing single-flight idiom. */
+   * Mirrors `ClaudeCodeHandle.dispose`'s existing single-flight idiom.
+   *
+   * The cache is written BEFORE `disposeOnce` runs: that body's synchronous
+   * prefix emits `compaction_end` (a synchronous listener loop), and a
+   * listener that re-enters `dispose()` in that window must observe the
+   * in-flight promise rather than start a SECOND full disposal. The cached
+   * promise is settled by the body, so it stays the single failure-sharing
+   * promise every caller sees (a retry gets the same rejection). */
   dispose(): Promise<void> {
-    this.disposalPromise ??= this.disposeOnce();
-    return this.disposalPromise;
+    if (this.disposalPromise !== null) return this.disposalPromise;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    this.disposalPromise = promise;
+    void this.disposeOnce().then(resolve, reject);
+    return promise;
   }
 
   private async disposeOnce(): Promise<void> {

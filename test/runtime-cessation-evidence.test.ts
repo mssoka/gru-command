@@ -156,25 +156,34 @@ afterAll(() => {
 });
 
 /** Deterministic PiAgentHandle over a controllable session. `waitForIdleMode`
- * selects the idle proof (immediate, never-settling, rejecting, or absent =
- * dispose-only). The mutable bash flags model an independent executeBash
- * controller, which is NOT part of the SDK session's isIdle. */
+ * selects the idle proof (immediate, never-settling, rejecting, absent =
+ * dispose-only, or deferred = settled by the test). The mutable bash flags
+ * model an independent executeBash controller, which is NOT part of the SDK
+ * session's isIdle. */
 function piHandle(opts: {
-  waitForIdleMode?: 'idle' | 'never' | 'reject' | 'absent';
+  waitForIdleMode?: 'idle' | 'never' | 'reject' | 'absent' | 'deferred';
   bashRunning?: boolean;
   pendingBash?: boolean;
+  /** When true `session.compact()` never settles, pinning the compaction
+   * terminal open so a disposal in that window aborts it synchronously. */
+  compactNeverSettles?: boolean;
 } = {}): {
   handle: PiAgentHandle;
-  session: { disposed: boolean; waitForIdleCalls: number; bashRunning: boolean; pendingBash: boolean };
+  session: { disposed: boolean; disposeCalls: number; waitForIdleCalls: number; bashRunning: boolean; pendingBash: boolean };
   events: RuntimeEvent[];
+  store: SessionStore;
+  sessionFile: string;
+  settleIdle: () => void;
 } {
   const mode = opts.waitForIdleMode ?? 'idle';
   const state = {
     disposed: false,
+    disposeCalls: 0,
     waitForIdleCalls: 0,
     bashRunning: opts.bashRunning ?? false,
     pendingBash: opts.pendingBash ?? false,
   };
+  let settleIdle: () => void = () => {};
   const session: PiSession = {
     sessionId: 'pi-session-341',
     sessionFile: undefined,
@@ -187,23 +196,25 @@ function piHandle(opts: {
     steer: async () => {},
     followUp: async () => {},
     subscribe: () => () => {},
-    dispose: () => { state.disposed = true; },
-    compact: async () => ({}),
+    dispose: () => { state.disposed = true; state.disposeCalls += 1; },
+    compact: async () => (opts.compactNeverSettles === true ? new Promise<unknown>(() => {}) : {}),
     getContextUsage: () => undefined,
     ...(mode === 'absent' ? {} : {
       waitForIdle: async () => {
         state.waitForIdleCalls += 1;
         if (mode === 'never') return new Promise<void>(() => {});
         if (mode === 'reject') throw new Error('idle wait rejected');
+        if (mode === 'deferred') return new Promise<void>((resolve) => { settleIdle = resolve; });
       },
     }),
   };
   const store = new SessionStore(mkdtempSync(join(tmpdir(), 'gru-cessation-pi-')));
   piCleanupDirs.push(store.dataDir);
+  const sessionFile = join(store.dataDir, 'session-341.jsonl');
   const handle = new PiAgentHandle(
     'perkins',
     session,
-    '/tmp/gru-cessation-341.jsonl',
+    sessionFile,
     PI_CAPABILITIES,
     false,
     [],
@@ -212,7 +223,7 @@ function piHandle(opts: {
   );
   const events: RuntimeEvent[] = [];
   handle.subscribe((event) => events.push(event));
-  return { handle, session: state, events };
+  return { handle, session: state, events, store, sessionFile, settleIdle: () => settleIdle() };
 }
 
 /** Exact cessation-evidence events of one verdict (once-only assertions must
@@ -340,6 +351,72 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
       expect(await settled).toBe('rejected');
       session.bashRunning = false; // clearing the controller is not an idle proof
       expect(handle.cessationEvidence()).toBe('unknown');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a subscriber that re-enters dispose() from the synchronous compaction_end emit cannot start a second disposal', async () => {
+    // dispose()`s synchronous prefix emits compaction_end to listeners BEFORE
+    // the single-flight cache used to land, so a listener that disposed in
+    // that window started a SECOND full disposal (duplicate emit, duplicate
+    // session.dispose). The body is deferred one microtask so the cache is
+    // already written when the prefix runs.
+    const { handle, session, events } = piHandle({ waitForIdleMode: 'idle', compactNeverSettles: true });
+    let reentered = false;
+    handle.subscribe((event) => {
+      if (event.type === 'compaction_end' && !reentered) {
+        reentered = true;
+        void handle.dispose();
+      }
+    });
+    void handle.compact(); // compaction stays pending -> disposal aborts it synchronously
+    await handle.dispose();
+    expect(reentered).toBe(true);
+    expect(events.filter((event) => event.type === 'compaction_end').length).toBe(1);
+    expect(session.disposeCalls).toBe(1);
+    expect(handle.cessationEvidence()).toBe('ceased');
+  });
+
+  it('the timed-out session lock is released and re-acquirable (no leak on the failure path)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { handle, store, sessionFile } = piHandle({ waitForIdleMode: 'never' });
+      store.acquireLock(sessionFile);
+      expect(store.isHeld(sessionFile)).toBe(true);
+      const settled = handle.dispose().catch((error: unknown) => error as Error);
+      await vi.advanceTimersByTimeAsync(CESSATION_IDLE_TIMEOUT_MS);
+      expect(await settled).toBeInstanceOf(CessationIdleTimeoutError);
+      // The named failure must not guard releaseLock on a proven idle, or the
+      // timed-out session leaks its lock and blocks reopen/replacement.
+      expect(store.isHeld(sessionFile)).toBe(false);
+      store.acquireLock(sessionFile); // re-acquirable: no leaked lock
+      expect(store.isHeld(sessionFile)).toBe(true);
+      store.releaseLock(sessionFile);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an idle promise that resolves inside the window emits ceased exactly once before the deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const { handle, events, settleIdle } = piHandle({ waitForIdleMode: 'deferred' });
+      let outcome: 'pending' | 'resolved' | 'rejected' = 'pending';
+      void handle.dispose().then(
+        () => { outcome = 'resolved'; },
+        () => { outcome = 'rejected'; },
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      // Still inside the bound: disposal pending, no positive evidence yet.
+      expect(outcome).toBe('pending');
+      expect(cessationEvents(events, 'ceased').length).toBe(0);
+      expect(handle.cessationEvidence()).toBe('unknown');
+      settleIdle();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(outcome).toBe('resolved');
+      expect(handle.cessationEvidence()).toBe('ceased');
+      expect(cessationEvents(events, 'ceased').length).toBe(1);
     } finally {
       vi.useRealTimers();
     }
