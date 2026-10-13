@@ -17,7 +17,7 @@ cd "$d"
 npm run build
 node tools/patch-vitest-rpc-timeout.mjs
 set +e
-npx vitest run test/claude-adapter.test.ts -t 'review-4 initialization' --reporter=json --outputFile="$d/results.json"
+npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts -t 'review-4 initialization' --reporter=json --outputFile="$d/results.json"
 status=$?
 set -e
 printf 'E9 retained baseline vitest exit=%s; report=%s/results.json\n' "$status" "$d"
