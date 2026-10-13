@@ -180,12 +180,19 @@ function hasLaterBoundRequest(file: string, native: readonly NativeEntry[], iden
       nextIndex += 1;
     }
     const immediate = native[nextIndex];
-    if (immediate?.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== baseline) return false;
-    return readDirectiveBindings(file).some((candidate) => {
-      if (candidate.identity.requestId === identity.requestId || candidate.identity.jobId !== identity.jobId ||
-          candidate.userEntryId !== immediate.id || candidate.baseline !== baseline) return false;
-      return isDeepStrictEqual(inspectDirectiveAdmission(file, candidate.identity), candidate);
-    });
+    if (immediate?.type !== 'message' || immediate.message?.role !== 'user' || immediate.parentId !== baseline || !Array.isArray(immediate.message.content)) return false;
+    const hash = contentHash(immediate.message.content);
+    const matching = readDirectiveBindings(file).filter((candidate) => candidate.identity.requestId !== identity.requestId &&
+      candidate.identity.jobId === identity.jobId && candidate.baseline === baseline && candidate.promptHash === hash &&
+      (candidate.userEntryId === null || candidate.userEntryId === immediate.id));
+    const named = matching.filter((candidate) => candidate.userEntryId === immediate.id);
+    // Prefer the real published native association. Without one, only a
+    // unique exact preparation can be read back; identical rejected/later
+    // preparations are ambiguous, never fabricated into another admission.
+    const candidate = named.length === 1 ? named[0] : named.length === 0 && matching.length === 1 ? matching[0] : undefined;
+    if (candidate === undefined) return false;
+    const admitted = inspectDirectiveAdmission(file, candidate.identity);
+    return admitted.userEntryId === immediate.id && isDeepStrictEqual(admitted, { ...candidate, userEntryId: immediate.id });
   } catch { return false; }
 }
 /** Admission is a prefix fact, independent of later unfinished/unknown effects.

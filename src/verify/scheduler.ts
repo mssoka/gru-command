@@ -569,15 +569,17 @@ function splitFrames(text: string): readonly string[] {
   return frames;
 }
 
-/** Tracked HEAD state at submission and at run start (evidence binding). */
-export function readGitState(cwd: string): { sha: string | null; trackedDirty: boolean } {
+/** Tracked HEAD state at submission/run start. Candidate qualification opts
+ * into untracked inputs too: those bytes are not represented by the HEAD.
+ * Ignored evidence/build artifacts remain outside git's candidate status. */
+export function readGitState(cwd: string, opts: { readonly includeUntracked?: boolean } = {}): { sha: string | null; trackedDirty: boolean } {
   try {
     const sha = execFileSync('git', ['-C', cwd, 'rev-parse', 'HEAD'], {
       encoding: 'utf-8',
       timeout: 10_000,
     }).trim();
     const dirty =
-      execFileSync('git', ['-C', cwd, 'status', '--porcelain', '--untracked-files=no'], {
+      execFileSync('git', ['-C', cwd, 'status', '--porcelain', opts.includeUntracked ? '--untracked-files=all' : '--untracked-files=no'], {
         encoding: 'utf-8',
         timeout: 10_000,
       }).trim() !== '';

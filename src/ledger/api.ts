@@ -3882,8 +3882,12 @@ export class LedgerApi {
         current.authorityEpoch !== binding.identity.authorityEpoch) return null;
     try { this.assertRecoveryJobPermission(marker.jobId); }
     catch (error) { if (error instanceof DirectiveCheckpointError) return null; throw error; }
-    const git = readGitState(lane.path);
-    if (git.sha !== facts.sha || git.trackedDirty) return null;
+    const git = readGitState(lane.path, { includeUntracked: true });
+    if (git.sha !== facts.sha || git.trackedDirty || lane.branch === null) return null;
+    try {
+      const branch = execFileSync('git', ['-C', lane.path, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim();
+      if (branch !== lane.branch) return null;
+    } catch { return null; } // unavailable branch proves no candidacy; original completion is retained separately
     return { lane_id: lane.id, lane_path: lane.path, sha: facts.sha, identity: binding.identity,
       checkpoint_id: proof.checkpointId, binding, receipt };
   }
@@ -8248,7 +8252,7 @@ export class LedgerApi {
       const blockers = this.directiveRetirementBlockers(row, lane.id).filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
       const reservations = this.listJobAdmissions(row.jobId).filter((kind) => !own.has(kind));
       if (blockers.length + reservations.length > 0) return `current producer fences: ${[...blockers, ...reservations].join('; ')}`;
-      const git = readGitState(lane.path);
+      const git = readGitState(lane.path, { includeUntracked: true });
       if (git.sha === null || git.sha !== payload['sha'] || git.trackedDirty) return 'current original lane HEAD is different, dirty or unproven';
       const branch = execFileSync('git', ['-C', lane.path, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim();
       if (lane.branch === null || branch !== lane.branch) return 'current branch differs from the original registered lane';
@@ -9271,7 +9275,7 @@ export class LedgerApi {
     const ctx: PipelineEvaluationContext = {
       entries,
       jobStatusOf: (jobId) => this.getJob(jobId)?.status ?? null,
-      jobDeliveredOf: (jobId) => this.latestJobEvent(jobId, 'job.delivered') !== null,
+      jobDeliveredOf: (jobId) => this.latestCandidateDelivery(jobId) !== null,
       jobStartedOf: (jobId) => this.jobHasWorkerStart(jobId),
       capacity,
     };

@@ -359,7 +359,7 @@ export type SupervisorRestartPolicy =
   | { readonly refuse: string };
 
 export class Supervisor {
-  private readonly retainedDirectiveProducers = new Map<string, AgentHandle>();
+  private readonly retainedDirectiveProducers = new Map<AgentHandle, string>(); // original job, independent of logical-agent reassociation
   private readonly cfg: SupervisionConfig;
   private readonly registry: SupervisorRegistry;
   private readonly ledger: LedgerApi;
@@ -1780,6 +1780,12 @@ export class Supervisor {
       this.clearRecoveryAdmission(agent);
       const captured = this.captureInterruptedTurn(old, agent);
       if (captured !== null) agent.pendingRecovery = captured;
+      const interruptedDirective = agent.pendingRecovery?.pending?.directive;
+      // Capture original ownership before disposal can await or re-associate
+      // the logical row. No cleanup fulfillment/row mutation proves cessation.
+      if (old !== null && interruptedDirective !== undefined && !this.retainedDirectiveProducers.has(old)) {
+        this.retainedDirectiveProducers.set(old, interruptedDirective.identity.jobId);
+      }
       agent.handle = null;
       agent.openTurn = false;
       agent.openControl = false;
@@ -1795,17 +1801,17 @@ export class Supervisor {
         }
       }
 
-      if (agent.pendingRecovery?.pending?.directive !== undefined) {
-        const requestId = agent.pendingRecovery.pending.directive.identity.requestId;
+      if (interruptedDirective !== undefined) {
+        const requestId = interruptedDirective.identity.requestId;
         if (old?.cessationEvidence?.() !== 'ceased') {
           agent.handle = old;
-          if (old !== null) this.retainedDirectiveProducers.set(agent.agentId, old);
           agent.state = 'stopped';
           this.log('error', 'directive cleanup has unknown cessation — explicit supervisor ownership retained', { agent_id: agent.agentId, request_id: requestId });
           surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, requestId, 'supervisor cleanup retains unknown producer ownership');
           return;
         }
-        agent.pendingRecovery = null;
+        if (old !== null) this.retainedDirectiveProducers.delete(old); // positive original physical cessation
+        if (agent.pendingRecovery?.pending?.directive === interruptedDirective) agent.pendingRecovery = null;
         agent.state = 'watching';
         surfaceDirectiveRecovery({ ledger: this.ledger, notifications: this.notifications }, requestId, 'supervisor ceased the interrupted turn; service must inspect native completion/checkpoint, never replay');
         return;
@@ -2448,12 +2454,13 @@ export class Supervisor {
    * queued retry or undecided recovery is still producer ownership even
    * while its durable agent row says idle/error/disposed. */
   pendingProducerBlockers(jobId: string): readonly string[] {
-    return this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
-      const retained = this.retainedDirectiveProducers.get(row.id);
-      if (retained !== undefined) {
-        if (retained.cessationEvidence?.() !== 'ceased') return [`unproven directive producer cessation: ${row.id}`];
-        this.retainedDirectiveProducers.delete(row.id);
-      }
+    const retained: string[] = [];
+    for (const [handle, originalJobId] of this.retainedDirectiveProducers) {
+      if (originalJobId !== jobId) continue;
+      if (handle.cessationEvidence?.() === 'ceased') this.retainedDirectiveProducers.delete(handle);
+      else retained.push(`unproven directive producer cessation: ${handle.id}`);
+    }
+    const current = this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
       const agent = this.agents.get(row.id);
       if (agent === undefined) {
         return this.registry.getHandle(row.id) !== null
@@ -2465,6 +2472,7 @@ export class Supervisor {
       const open = agent.openTurn || agent.openControl || agent.openToolCalls.size > 0;
       return pending || open ? [`supervised producer: ${row.id} (${pending ? 'pending recovery/retry' : 'open turn/control/tool'})`] : [];
     });
+    return [...retained, ...current];
   }
 
   /** Board feed: supervision view for one agent id (or null). */

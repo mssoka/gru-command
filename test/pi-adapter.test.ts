@@ -1,5 +1,6 @@
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -4029,7 +4030,7 @@ async function assertGuardedSdkDelivery(resume: boolean) {
 it('production shared executor permits only its exact streaming SDK producer to run two native tools and deliver', () => assertGuardedSdkDelivery(false));
 it('production checkpoint callback permits its exact streaming SDK producer to run two native tools without prompt replay', () => assertGuardedSdkDelivery(true));
 
-async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook' | 'manifest-execution-mode') {
+async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 'prior-hook-await' | 'branch-model-await' | 'branch-hook' | 'foreign-streaming' | 'manifest-model' | 'manifest-role' | 'manifest-hook' | 'manifest-tools' | 'manifest-role-hook' | 'manifest-model-hook' | 'manifest-execution-mode') {
   const hook = fault === 'prior-hook-await' || fault.endsWith('-hook');
   const manifest = fault.startsWith('manifest-');
   const { executeAcceptedDirective, DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
@@ -4089,6 +4090,10 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
       else if (fault === 'manifest-execution-mode') session.agent.toolExecution = 'parallel';
       else session.agent.state.tools = session.agent.state.tools.filter((tool) => tool.name !== 'read');
       expect(f.scene.ledger.directiveTurnIdentity(active.requestId)).toEqual(f.scene.identity);
+    } else if (fault.startsWith('branch-')) {
+      const head = execFileSync('git', ['-C', f.scene.lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['-C', f.scene.lane.path, 'checkout', '-b', 'unapproved-native-branch'], { stdio: 'pipe' });
+      expect(execFileSync('git', ['-C', f.scene.lane.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(head);
     } else f.scene.ledger.setJobStatus(active.jobId, 'parked');
     release(); await run;
     const path = join(f.scene.lane.path, 'guarded-effects.txt');
@@ -4124,6 +4129,8 @@ it('production shared SDK tool guard refuses authority revoked during its model 
 it('production checkpoint SDK tool guard refuses authority revoked during its model await', () => assertProductionSdkFence(true, 'model-await'));
 it('production shared SDK tool guard rechecks authority after its awaited native prior hook', () => assertProductionSdkFence(false, 'prior-hook-await'));
 it('production checkpoint SDK tool guard rechecks authority after its awaited native prior hook', () => assertProductionSdkFence(true, 'prior-hook-await'));
+it('R13 real resumed SDK refuses tool effects after a same-HEAD branch change during model await', () => assertProductionSdkFence(true, 'branch-model-await'));
+it('R13 real resumed SDK rechecks the original branch after its awaited prior tool hook', () => assertProductionSdkFence(true, 'branch-hook'));
 it('production shared SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(false, 'foreign-streaming'));
 it('production checkpoint SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(true, 'foreign-streaming'));
 it('real SDK model authority mutation refuses effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(false, 'manifest-model'));

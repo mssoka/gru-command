@@ -855,6 +855,38 @@ describe('supervisor — watchdog + restart ladder', () => {
   });
 });
 
+it('R13 retained UNKNOWN producer inventory follows its original job after logical-agent reassociation', async () => {
+  const h = boot();
+  try {
+    const jobId = 'r13-original-producer-job';
+    h.api.addJob({ id: jobId, repo: 'fixture', title: 'original approved job' }); h.api.setJobStatus(jobId, 'working');
+    h.api.addJob({ id: 'r13-other-job', repo: 'fixture', title: 'separate job' });
+    const handle = new FakeHandle('minion', 'r13-retained-producer', null);
+    let ceased = false;
+    Object.assign(handle, { cessationEvidence: () => ceased ? 'ceased' : 'unknown' });
+    h.api.registerAgent({ id: handle.id, role: 'minion', jobId });
+    const request = h.api.beginDirectiveIntent({ jobId, requestId: 'r13-retained-request', directive: 'original accepted turn', holder: 'gru' }).record;
+    handle.pendingTurnSnapshot = { text: 'original accepted turn', owner: `dispatch:${jobId}`, directive: {
+      identity: h.api.directiveTurnIdentity(request.requestId), beforeAdmission: () => {}, onAdmitted: () => {},
+    } };
+    let release!: () => void; const disposalGate = new Promise<void>((resolveGate) => { release = resolveGate; });
+    let entered!: () => void; const disposalStarted = new Promise<void>((resolveGate) => { entered = resolveGate; });
+    const dispose = h.registry.disposeHandle.bind(h.registry);
+    const held = vi.spyOn(h.registry, 'disposeHandle').mockImplementation(async (target) => { entered(); await disposalGate; await dispose(target); });
+    h.registry.adopt(handle); hang(handle); h.advance(60);
+    try {
+      await disposalStarted;
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId: 'r13-other-job' });
+      expect(h.supervisor.pendingProducerBlockers(jobId).join('; ')).toContain(`unproven directive producer cessation: ${handle.id}`);
+    } finally { release(); held.mockRestore(); }
+    await vi.waitFor(() => expect(h.supervisor.viewFor(handle.id)?.state).toBe('stopped'));
+    expect(h.supervisor.pendingProducerBlockers(jobId).join('; ')).toContain(`unproven directive producer cessation: ${handle.id}`);
+    expect(handle.promptCount).toBe(0); expect(h.registry.spawnCalls).toEqual([]);
+    ceased = true; // positive original physical cessation, not the reassociation
+    expect(h.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+  } finally { h.dispose(); }
+});
+
 describe('supervisor — durable restart association', () => {
   it('reports failed-restart backoff as producer ownership before any pacing entry exists', async () => {
     vi.useFakeTimers();

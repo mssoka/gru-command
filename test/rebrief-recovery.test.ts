@@ -834,6 +834,28 @@ describe('re-brief restart safety (durable markers)', () => {
     } finally { h.close(); }
   });
 
+  async function assertHistoricalCandidateRefusal(mode: 'branch' | 'untracked') {
+    const jobId = `r13-historical-${mode}`; const { h, head, markers, lane } = await originalCurrentCandidate(jobId);
+    try {
+      if (mode === 'branch') fixtureRepo().git(['checkout', '-b', 'unapproved-historical-branch'], lane.path);
+      else writeFileSync(join(lane.path, 'untracked-material-input.ts'), 'export const changedInput = true;\n');
+      expect(resolveGitCommit(lane.path, 'HEAD')).toBe(head);
+      const nativeBytes = readFileSync(markers[0]!.sessionFile!, 'utf8');
+      const completion = h.ledger.latestJobEvent(jobId, 'silas.rebrief');
+      const delivery = h.ledger.reconstructCompletedRebriefDelivery(markers, lane)!;
+      expect(delivery.payload).toMatchObject({ sha: head, work_revision: 1, historical_bookkeeping_only: true, candidate_delivery_proven: false });
+      expect((delivery.payload as { current_candidate_proof?: unknown }).current_candidate_proof ?? null).toBeNull();
+      expect(h.ledger.latestCandidateDelivery(jobId)).toBeNull();
+      expect(h.ledger.correctiveVerificationDebt(jobId)).toEqual({ revision: 1, head: null });
+      expect(h.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+      expect(h.ledger.getEvent(completion!.seq)).toEqual(completion);
+      expect(readFileSync(markers[0]!.sessionFile!, 'utf8')).toBe(nativeBytes);
+      expect(h.registry.workers).toEqual([]);
+    } finally { h.close(); }
+  }
+  it('R13 historical same-HEAD reconstruction refuses an unapproved branch without erasing original completion', () => assertHistoricalCandidateRefusal('branch'));
+  it('R13 historical reconstruction refuses material untracked inputs absent from its original HEAD', () => assertHistoricalCandidateRefusal('untracked'));
+
   it('reconstructed delivery never proves a same-HEAD candidate whose tracked tree is dirty', async () => {
     const jobId = 'legacy-dirty-current-candidate'; const { h, head, markers, lane } = await originalCurrentCandidate(jobId);
     try {

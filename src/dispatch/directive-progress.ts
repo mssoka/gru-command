@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import type { LedgerApi } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, isDirectiveTerminal } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { DirectiveDispatchDeferredError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
@@ -419,8 +420,21 @@ export class DirectiveProgressService {
     let producerStartSeq: number | undefined;
     let producer: DirectiveProducer | undefined;
     let handle: AgentHandle | null = null;
+    const assertOriginalBranch = (): void => {
+      const current = deps.worktrees.listWorktrees({ jobId: row.jobId }).filter((item) => item.kind === 'job' && item.status !== 'swept');
+      const header = readDirectiveSessionHeader(proof.binding.sessionFile);
+      if (current.length !== 1 || current[0]!.id !== lane.id || current[0]!.path !== lane.path ||
+          current[0]!.branch !== lane.branch || header.cwd !== lane.path || lane.branch === null) {
+        throw new DirectiveCheckpointError('original registered branch/lane/cwd is unavailable or changed; native continuation is forbidden');
+      }
+      let branch: string;
+      try { branch = execFileSync('git', ['-C', lane.path, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim(); }
+      catch (error) { throw new DirectiveCheckpointError(`original registered branch cannot be proven; native continuation is forbidden: ${String(error)}`); }
+      if (branch !== lane.branch) throw new DirectiveCheckpointError('original registered branch differs from the checkout; native continuation is forbidden');
+    };
     const assertProducerFences = (): void => {
       check(deps, identity);
+      assertOriginalBranch(); // before/after awaits, checkpoint claim, and every actual SDK tool boundary
       const ownNativeProducer = handle?.id === producer?.agentId && handle?.sessionFile === producer?.sessionFile ? producer : undefined;
       const durable = deps.ledger.directiveProgressBlockers(requestId, lane.id, handle?.health().state === 'idle' ? handle.id : undefined, producerStartSeq, ownNativeProducer)
         .filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
@@ -457,6 +471,7 @@ export class DirectiveProgressService {
         cwd: lane.path, signal: deps.signal, ...(tools.length === 0 ? {} : { nativeTools: tools }) });
       deps.signal.addEventListener('abort', abort, { once: true });
       check(deps, identity);
+      assertOriginalBranch(); // refuse before preparing or claiming a new continuation producer
       if (handle.id !== proof.binding.agentId || handle.sessionFile !== proof.binding.sessionFile) throw new DirectiveCheckpointError('runtime changed the original native/logical session');
       if (handle.prepareDirectiveProducer === undefined) throw new DirectiveCheckpointError('runtime cannot attest physical checkpoint ownership');
       producer = handle.prepareDirectiveProducer(identity);

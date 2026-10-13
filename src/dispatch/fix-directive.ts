@@ -493,8 +493,8 @@ export function recordFollowUpDelivery(input: {
           if (header.type !== 'session' || header.id !== binding.sessionId || header.cwd !== lane.path) {
             note = 'original native session cwd does not match the current live job lane; original completion is preserved but current candidate gates remain owed';
           } else {
-            const current = readGitState(lane.path);
-            if (current.sha !== sha || current.trackedDirty) note = 'original native completion is preserved, but the live job lane HEAD moved or its tracked tree is dirty; current candidate delivery/verification/review remain owed';
+            const current = readGitState(lane.path, { includeUntracked: true });
+            if (current.sha !== sha || current.trackedDirty) note = 'original native completion is preserved, but the live job lane HEAD moved, its tracked tree is dirty, or untracked inputs are present; current candidate delivery/verification/review remain owed';
             else candidateDeliveryProven = true;
           }
         } catch (error) {

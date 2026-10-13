@@ -4815,6 +4815,29 @@ describe('report-job auto-supersede in the deterministic pass (issue #220)', () 
     }
   });
 
+  it('R13 production report backstop ignores historical-only delivery then opens exactly one current-candidate handback', async () => {
+    const h0 = makeLedger();
+    const center = new NotificationCenter({ ledger: h0.ledger, bus: h0.bus });
+    const h = makeDriverWithProductionPass(h0, { notifications: center });
+    try {
+      const jobId = 'r13-report-backstop';
+      h.ledger.addJob({ id: jobId, repo: 'fixture-app', title: 'original report', briefing: 'approved report', deliverable: 'review', commissioner: 'gru' });
+      h.ledger.setJobStatus(jobId, 'working'); h.ledger.setJobStatus(jobId, 'delivered');
+      const historical = h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: {
+        sha: 'original-historical-head', candidate_delivery_proven: false, historical_bookkeeping_only: true,
+      } });
+      await h.driver.trigger({ kind: 'sweep' }); await h.driver.trigger({ kind: 'sweep' });
+      expect(h.ledger.listObligations({ jobId })).toEqual([]);
+      expect(h.ledger.findNotificationByKind(`silas.report-handback.${jobId}`, 'any')).toBeNull();
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'later-current-report-head' } });
+      await h.driver.trigger({ kind: 'sweep' }); await h.driver.trigger({ kind: 'sweep' });
+      expect(h.ledger.listObligations({ jobId })).toHaveLength(1);
+      expect(h.ledger.listObligations({ jobId })[0]).toMatchObject({ state: 'open', incidentKey: `report:${jobId}` });
+      expect(h.ledger.listNotifications({ limit: 100 }).filter((row) => row.kind === `silas.report-handback.${jobId}`)).toHaveLength(1);
+      expect(h.ledger.getEvent(historical.seq)).toEqual(historical);
+    } finally { h.cleanup(); }
+  });
+
   it('the pass backstops a delivered report whose obligation open was lost — and never touches legacy NULL rows', async () => {
     const h0 = makeLedger();
     const h = makeDriverWithProductionPass(h0);
