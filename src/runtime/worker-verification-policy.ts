@@ -46,6 +46,10 @@ function substitutionEnd(text: string, open: number): number {
     }
     if (char === '"' || char === "'") { quote = char; i += 1; continue; }
     if (char === '\\') { i += 2; continue; }
+    if (char === '#' && (i === open + 1 || /[\s;|&()]/u.test(text[i - 1] ?? ''))) {
+      while (i < text.length && text[i] !== '\n') i += 1;
+      continue;
+    }
     if (char === '(') depth += 1;
     else if (char === ')') { depth -= 1; if (depth === 0) return i; }
     i += 1;
@@ -115,7 +119,7 @@ export function verificationCommandGroups(command: string): readonly (readonly s
     const char = command[i] as string;
     if (quote !== null) {
       if (char === quote) { quote = null; i += 1; continue; }
-      if (char === '\\' && quote === '"') { const next = command[++i]; if (next !== undefined) word += next; i += 1; continue; }
+      if (char === '\\' && quote === '"') { const next = command[++i]; if (next !== undefined && next !== '\n') word += next; i += 1; continue; }
       if (quote === '"' && char === '$' && command[i + 1] === '(') {
         const end = substitutionEnd(command, i + 1);
         substitutions.push(command.slice(i + 2, end));
@@ -161,7 +165,7 @@ export function verificationCommandGroups(command: string): readonly (readonly s
         delimiter += c; i += 1;
       }
       finishWord();
-      if (delimiter !== '') heredocs.push({ delimiter, expand: !quotedDelim, stripTabs });
+      if (delimiter !== '' || quotedDelim) heredocs.push({ delimiter, expand: !quotedDelim, stripTabs });
       continue;
     }
     if (char === '<' || char === '>') {
@@ -169,7 +173,7 @@ export function verificationCommandGroups(command: string): readonly (readonly s
       if (started && /^[0-9]+$/u.test(word)) { word = ''; started = false; }
       else finishWord();
       while (command[i] === '<' || command[i] === '>') i += 1;
-      if (command[i] === '&') i += 1; // >&1 / <&0
+      if (command[i] === '&' || (char === '>' && command[i] === '|')) i += 1; // >&1 / <&0 / >|
       // Whitespace between the operator and its target is insignificant.
       while (command[i] === ' ' || command[i] === '\t') i += 1;
       // The redirect target (including a herestring `<<<`) is data, but a
@@ -246,8 +250,8 @@ const TIME_FLAG_OPTIONS = new Set(['-p', '--portability', '-v', '--verbose', '-a
  */
 export function normalizedVerificationWords(raw: readonly string[]): readonly string[] {
   let words = [...raw];
-  // The `time` reserved word and its own options precede the timed command.
-  for (;;) {
+  while (words.length > 0) {
+    while (LEADING_KEYWORDS.has(words[0] ?? '') || ASSIGNMENT.test(words[0] ?? '')) words = words.slice(1);
     if (words[0] === 'time') {
       words = words.slice(1);
       while (words.length > 0) {
@@ -255,15 +259,11 @@ export function normalizedVerificationWords(raw: readonly string[]): readonly st
         if (TIME_FLAG_OPTIONS.has(option)) { words = words.slice(1); continue; }
         if (option === '-o' || option === '--output') { words = words.slice(2); continue; }
         if (option.startsWith('--output=')) { words = words.slice(1); continue; }
+        if (option === '--') words = words.slice(1);
         break;
       }
       continue;
     }
-    if (LEADING_KEYWORDS.has(words[0] ?? '')) { words = words.slice(1); continue; }
-    break;
-  }
-  while (words.length > 0) {
-    while (ASSIGNMENT.test(words[0] ?? '')) words = words.slice(1);
     if (words[0] === 'command') {
       words = words.slice(1);
       while (words[0] === '-p' || words[0] === '--') words = words.slice(1);
@@ -297,6 +297,7 @@ export function normalizedVerificationWords(raw: readonly string[]): readonly st
       // `nice [-n N | --adjustment[=]N | -N] command`
       while (words.length > 0) {
         const option = words[0] as string;
+        if (option === '--') { words = words.slice(1); break; }
         if (option === '-n' || option === '--adjustment') { words = words.slice(2); continue; }
         if (option.startsWith('--adjustment=') || /^-\d+$/u.test(option)) { words = words.slice(1); continue; }
         break;
@@ -368,7 +369,11 @@ function isDiagnosticInvocation(args: readonly string[], selectsVerb: boolean): 
     }
     if (INSPECT_FLAGS.has(arg)) { sawDiagnostic = true; i += 1; continue; }
     if (CONFIG_VALUE_FLAGS.has(arg)) { i += 2; continue; }
-    if (DIAGNOSTIC_COMPANION_FLAGS.has(arg)) { i += 1; continue; }
+    if (DIAGNOSTIC_COMPANION_FLAGS.has(arg)) {
+      i += 1;
+      if (args[i] === 'true' || args[i] === 'false') i += 1;
+      continue;
+    }
     return false;
   }
   return sawDiagnostic;
@@ -478,15 +483,39 @@ function prefixSelectsVerb(prefix: readonly string[]): boolean {
   return prefix.length > (prefix[0] === 'npx' ? 2 : 1);
 }
 
+/** Vite accepts conventional global configuration options before its verb. */
+function normalizeViteOptions(words: readonly string[], policy: WorkerVerificationPolicy): readonly string[] {
+  const toolIndex = words[0] === 'npx' ? 1 : 0;
+  if (!policy.producerPrefixes.some((prefix) => prefix[toolIndex] === words[toolIndex] && prefix[toolIndex + 1] === 'build')) return words;
+  const options: string[] = [];
+  let i = toolIndex + 1;
+  while (i < words.length) {
+    const option = words[i] as string;
+    if (['--config', '-c', '--mode', '-m', '--logLevel', '-l', '--base'].includes(option)) {
+      options.push(...words.slice(i, i + 2)); i += 2; continue;
+    }
+    if (/^--(?:config|mode|logLevel|base)=/u.test(option) || ['--clearScreen', '--debug', '-d', '--force'].includes(option)) {
+      options.push(option); i += 1; continue;
+    }
+    break;
+  }
+  return [...words.slice(0, toolIndex + 1), ...words.slice(i), ...options];
+}
+
 /** True when any simple command in the string is a known unscheduled producer. */
 export function isVerificationProducer(command: string, policy: WorkerVerificationPolicy): boolean {
   for (const group of verificationCommandGroups(command)) {
-    const words = normalizedVerificationWords(group);
+    const normalized = normalizedVerificationWords(group);
+    const words = normalizeViteOptions(normalized, policy);
     for (const prefix of policy.producerPrefixes) {
       if (prefix.length > words.length) continue;
       if (!prefix.every((word, index) => words[index] === word)) continue;
       // Direct tools keep their non-producing inspection modes; npm scripts never do.
-      if (prefix[0] !== 'npm' && isDiagnosticInvocation(words.slice(prefix.length), prefixSelectsVerb(prefix))) continue;
+      if (prefix[0] !== 'npm') {
+        const args = words.slice(prefix.length);
+        const diagnosticArgs = (prefix.at(-1) === 'vitest' && args[0] === 'run') ? args.slice(1) : args;
+        if (isDiagnosticInvocation(diagnosticArgs, prefixSelectsVerb(prefix))) continue;
+      }
       return true;
     }
   }

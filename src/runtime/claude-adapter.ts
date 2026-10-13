@@ -30,7 +30,8 @@ import {
   type ClaudeReviewSnapshot,
 } from './claude-review-settings.js';
 import { ReviewMcpBridge } from './review-mcp-bridge.js';
-import { privateClaudeVerificationSettings } from './claude-verification-settings.js';
+import { ClaudeVerificationPermissionChannel, privateClaudeVerificationSettings } from './claude-verification-settings.js';
+import type { WorkerVerificationPolicy } from './worker-verification-policy.js';
 import {
   normalizeSessionPath,
   SessionAlreadyActiveError,
@@ -536,6 +537,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           ...(reviewSettings?.file !== undefined ? { reviewSettingsFile: reviewSettings.file } : {}),
           ...(verificationSettings !== undefined ? {
               verificationSettingsFile: verificationSettings.file,
+              workerVerification: options.workerVerification,
               onVerificationCeased: () => verificationSettings?.dispose(),
             } : {}),
           ...(reviewConfiguration !== undefined ? { reviewAuthEnv: claudeReviewProcessEnv(reviewConfiguration) } : {}),
@@ -628,8 +630,9 @@ interface HandleParams {
   readonly systemPrompt: string;
   readonly isolatedReview?: boolean;
   readonly reviewSettingsFile?: string;
-  /** Private worker-verification settings file: native denies + hook (issue #315). */
+  /** Private worker-verification native ask routing + explanation (issue #315). */
   readonly verificationSettingsFile?: string;
+  readonly workerVerification?: WorkerVerificationPolicy;
   /** Invoked once when every original policy child has actually closed. */
   readonly onVerificationCeased?: () => void;
   readonly reviewAuthEnv?: NodeJS.ProcessEnv;
@@ -690,9 +693,8 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
     if (params.mcpConfigFile !== undefined) args.push('--mcp-config', params.mcpConfigFile);
   }
   if (params.verificationSettingsFile !== undefined && !params.isolatedReview) {
-    // Native scoped denies plus the explanatory PreToolUse hook travel in
-    // one private settings file; a failed hook still hits the deny rules.
-    args.push('--settings', params.verificationSettingsFile);
+    // Native ask reaches the original-child-bound host, even in bypass mode.
+    args.push('--settings', params.verificationSettingsFile, '--permission-prompt-tool', 'stdio');
   }
   if (params.managedPluginDir !== undefined && !params.isolatedReview) {
     args.push('--plugin-dir', params.managedPluginDir);
@@ -760,6 +762,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   private bridgeCloseFailed = false;
   private evidenceEmitted = false;
   private readonly verificationChildren = new Set<ChildProcess>();
+  private readonly closedVerificationChildren = new WeakSet<ChildProcess>();
   private verificationCleaned = false;
   private disposalPromise: Promise<void> | null = null;
 
@@ -886,6 +889,22 @@ export class ClaudeCodeHandle implements AgentHandle {
     this.disposed = true;
     this.toolHeartbeat.dispose();
     const live = this.live;
+    if (live !== null) this.trackVerificationChild(live);
+    const originals = [...this.verificationChildren];
+    // New policy custody reuses the existing grace/escalation strategy for
+    // EVERY unresolved original, even while another child occupies live.
+    for (const child of originals) {
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    }
+    if (originals.length > 0) {
+      const escalation = setTimeout(() => {
+        for (const child of originals) {
+          if (!this.verificationChildren.has(child)) continue;
+          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        }
+      }, this.params.killGraceMs);
+      escalation.unref();
+    }
     let killTimer: ReturnType<typeof setTimeout> | null = null;
     let exitDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
     if (live !== null) {
@@ -916,12 +935,12 @@ export class ClaudeCodeHandle implements AgentHandle {
       // forced kill prevents a broken ChildProcess implementation from
       // retaining the transcript and session lock forever.
       try {
-        live.kill('SIGTERM');
+        if (!originals.includes(live)) live.kill('SIGTERM');
       } catch {
         /* already gone */
       }
       killTimer = setTimeout(() => {
-        if (this.live !== null) {
+        if (this.live !== null && !originals.includes(this.live)) {
           try {
             this.live.kill('SIGKILL');
           } catch {
@@ -962,27 +981,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       // A policy-bearing original can remain unclosed after error settlement
       // cleared the live turn slot: it is still owned, not a never-started child.
       this.cessationKind = this.verificationChildren.size === 0 ? 'no-child' : 'live';
-      // The identity-bound original is still a disposal target even though the
-      // live slot was cleared, so apply the same bounded termination to it.
-      for (const child of this.verificationChildren) {
-        try {
-          child.kill('SIGTERM');
-        } catch {
-          /* already gone */
-        }
-      }
-      if (this.verificationChildren.size > 0) {
-        killTimer = setTimeout(() => {
-          for (const child of this.verificationChildren) {
-            try {
-              child.kill('SIGKILL');
-            } catch {
-              /* already gone */
-            }
-          }
-        }, this.params.killGraceMs);
-        killTimer.unref();
-      }
+
     }
     try {
       this.store.releaseLock(this.sessionFile);
@@ -1006,9 +1005,10 @@ export class ClaudeCodeHandle implements AgentHandle {
   /** Verification files belong to every original CLI child until its actual
    * close, even if error/deadline settlement has cleared the live slot. */
   private trackVerificationChild(child: ChildProcess): void {
-    if (this.params.onVerificationCeased === undefined || this.verificationChildren.has(child)) return;
+    if (this.params.onVerificationCeased === undefined || this.verificationChildren.has(child) || this.closedVerificationChildren.has(child)) return;
     this.verificationChildren.add(child);
     child.once('close', () => {
+      this.closedVerificationChildren.add(child);
       this.verificationChildren.delete(child);
       if (this.disposed && this.verificationChildren.size === 0 && this.cessationKind !== 'close-observed') {
         this.cessationKind = 'close-observed-late';
@@ -1121,7 +1121,10 @@ export class ClaudeCodeHandle implements AgentHandle {
         }
       });
 
+      let permissions: ClaudeVerificationPermissionChannel | undefined;
       const handleFrame = (frame: StreamFrame): void => {
+        permissions?.ingest(frame);
+        if (permissions !== undefined && frame['type'] === 'result') child?.stdin?.end();
         if (!transcript.write(`${JSON.stringify(frame)}\n`)) {
           child?.stdout?.pause();
           transcript.once('drain', () => child?.stdout?.resume());
@@ -1249,10 +1252,18 @@ export class ClaudeCodeHandle implements AgentHandle {
         });
       });
 
-      child.stdin?.write(`${JSON.stringify(claudePromptFrame('/compact'))}\n`, (error) => {
-        if (error != null) fail(`failed to write claude compaction command: ${String(error)}`);
-        child?.stdin?.end();
-      });
+      const send = (): void => {
+        child?.stdin?.write(`${JSON.stringify(claudePromptFrame('/compact'))}\n`, (error) => {
+          if (error != null) fail(`failed to write claude compaction command: ${String(error)}`);
+          if (permissions === undefined) child?.stdin?.end();
+        });
+      };
+      if (params.workerVerification !== undefined && !params.isolatedReview) {
+        permissions = new ClaudeVerificationPermissionChannel(child, params.workerVerification, (message) => {
+          fail(message); child?.stdin?.end();
+        }, send);
+        permissions.start();
+      } else send();
     });
   }
 
@@ -1321,7 +1332,10 @@ export class ClaudeCodeHandle implements AgentHandle {
         });
       });
 
+      let permissions: ClaudeVerificationPermissionChannel | undefined;
       const handleFrame = (frame: StreamFrame): void => {
+        permissions?.ingest(frame);
+        if (permissions !== undefined && frame['type'] === 'result') child?.stdin?.end();
         transcript.write(`${JSON.stringify(frame)}\n`);
         for (const event of translator.ingest(frame)) {
           if (event.type === 'tool_start') this.toolHeartbeat.started(event.callId, event.tool);
@@ -1427,16 +1441,21 @@ export class ClaudeCodeHandle implements AgentHandle {
         });
       });
 
-      // One user frame, then EOF — the CLI completes the turn and exits.
-      const frame = `${JSON.stringify(claudePromptFrame(text, images))}\n`;
-      child.stdin?.write(frame, (error?: Error | null) => {
-        if (error != null) {
-          this.log('error', 'failed to write prompt frame to claude stdin', {
-            error: String(error),
-          });
-        }
-        child.stdin?.end();
-      });
+      // Policy children keep stdin open for native permission responses; other
+      // turns retain the existing single-frame/EOF transport.
+      const send = (): void => {
+        const frame = `${JSON.stringify(claudePromptFrame(text, images))}\n`;
+        child.stdin?.write(frame, (error?: Error | null) => {
+          if (error != null) this.log('error', 'failed to write prompt frame to claude stdin', { error: String(error) });
+          if (permissions === undefined) child.stdin?.end();
+        });
+      };
+      if (params.workerVerification !== undefined && !params.isolatedReview) {
+        permissions = new ClaudeVerificationPermissionChannel(child, params.workerVerification, (message) => {
+          failTurn(message); child.stdin?.end();
+        }, send);
+        permissions.start();
+      } else send();
     });
   }
 }
