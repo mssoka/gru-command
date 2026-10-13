@@ -3100,6 +3100,43 @@ describe('supervisor — retry-tail blind observation (issue #339 F1/F2)', () =>
     });
     h.dispose();
   });
+
+  it('F1b: a SHUTDOWN-superseded retry is still observed when its prompt completes', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    const jobId = 'job-blind-f1b';
+    const agentId = 'minion-blind-f1b';
+    admitBlindReviewJob(h, jobId, agentId, 'e'.repeat(40));
+    h.supervisor.setObserveBlindTurn((observedJobId, sessionFile) =>
+      observeBlindSessionAccess(h.api, observedJobId, sessionFile));
+    const sessionFile = blindReplaySession('blind-f1b');
+    let retryEntered = false;
+    let releaseRetry: () => void = () => {};
+    const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    const handle = new FakeHandle('minion', agentId, sessionFile);
+    handle.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
+    handle.promptHook = async () => {
+      retryEntered = true;
+      await retryGate;
+      appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT);
+    };
+    h.registry.adopt(handle);
+    emitFailure(handle, '429 too many requests');
+    await sleeper.release();
+    await vi.waitFor(() => expect(retryEntered).toBe(true), { timeout: 5_000 });
+    // Shutdown disposes the supervisor: every incident is resolved as
+    // superseded immediately, without awaiting the running retry prompt. The
+    // physical completion boundary must still be observed.
+    h.supervisor.dispose();
+    releaseRetry();
+    await vi.waitFor(() => {
+      expect(blindCoverageOf(h.api, jobId).state).toBe('invalidated');
+    }, { timeout: 5_000 });
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true,
+    });
+    h.dispose();
+  });
 });
 
 
