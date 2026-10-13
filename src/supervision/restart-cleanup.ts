@@ -88,7 +88,14 @@ export class RestartCleanupJournal {
           if (debt !== undefined && debt.generation !== null && debt.replacementAgentId !== null && debt.agentId !== null &&
             event.seq > debt.originSeq && data.generation === debt.generation && event.jobId === debt.jobId &&
             event.agentId === debt.agentId && data.replacement_agent_id === debt.replacementAgentId &&
-            data.disposal_acknowledged === true && data.cessation === 'ceased') this.debts.delete(debt.originSeq);
+            data.disposal_acknowledged === true && data.cessation === 'ceased') {
+            this.debts.delete(debt.originSeq);
+            // The originating pending entry can never be reclassified once its
+            // exact generation is confirmed; drop its identity with the debt so
+            // the origins map stays bounded (audit events replay in ascending
+            // order, so no later audit can still need it).
+            this.origins.delete(debt.originSeq);
+          }
         }
         this.cursor = event.seq;
       }
