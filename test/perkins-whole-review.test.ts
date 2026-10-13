@@ -863,6 +863,20 @@ describe('Perkins whole-PR lead engine', () => {
     ]);
   });
 
+  it('pins the reattach instruction in the perkins_run_specialists tool metadata exposed to the lead (#178)', async () => {
+    const h = wholeHarness({ childAnswer: () => '[]' });
+    await h.run();
+    const tool = h.leadCalls[0]!.options.reviewLead!.nativeTools
+      .find((entry) => entry.name === 'perkins_run_specialists') as NativeAgentTool;
+    // Intentional wording changes must update these assertions alongside the
+    // behavior: a lead that re-issues DIFFERENT runs after a transport wait
+    // would start different work instead of re-attaching to the running wave.
+    expect(tool.description).toContain(
+      'If a call reports the wave still running at the transport wait, call this same tool again with the SAME runs to attach to the running wave and collect its results;',
+    );
+    expect(tool.description).toContain('never start a second run for a lens that is already running');
+  });
+
   it('specialists see the WHOLE change from their lens and stay isolated children', async () => {
     const seen: string[] = [];
     const h = wholeHarness({

@@ -1295,6 +1295,30 @@ export class LedgerApi {
     ).map((row) => this.eventFromRow(row));
   }
 
+  /** A job's lifetime counters for one event kind: how many such events
+   * exist, and the summed length of a JSON-array payload field across them.
+   * Both are SQL aggregates over the COMPLETE record, so a value can never
+   * age out of a fixed newest-N window — `total > 0` stays true however many
+   * later events of the same kind follow. `field` is a fixed payload key
+   * supplied by the caller (never request data). */
+  countJobEventsAndArrayFieldLength(
+    jobId: string,
+    kind: string,
+    field: string,
+  ): { readonly events: number; readonly total: number } {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(field)) {
+      throw new Error(`payload field must be a simple JSON key (got ${JSON.stringify(field)})`);
+    }
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS events,
+                COALESCE(SUM(COALESCE(json_array_length(json_extract(payload, '$.${field}')), 0)), 0) AS total
+           FROM events WHERE job_id = ? AND kind = ?`,
+      )
+      .get(jobId, kind) as { events: number; total: number };
+    return { events: Number(row.events), total: Number(row.total) };
+  }
+
   /** A marked request's guarded event, however many newer unrelated job
    * events exist. The request's watermark and phase must both match. */
   latestJobPhaseEvent(jobId: string, kind: string, phaseId: string, baselineSeq: number): EventRecord | null {

@@ -260,6 +260,20 @@ function previousStatusEvent(ledger: BranchIdleLedger, jobId: string, flipSeq: n
   }
 }
 
+/** The job's status event with exactly this seq, found by paging the
+ * newest-first history (the ledger exposes only a limit-bounded window);
+ * null when it is not in the reachable history. */
+export function jobStatusEventAtSeq(ledger: Pick<BranchIdleLedger, 'listJobEvents'>, jobId: string, seq: number): EventRecord | null {
+  let limit = 200;
+  for (;;) {
+    const events = ledger.listJobEvents(jobId, { limit });
+    const found = events.find((event) => event.seq === seq && event.kind === 'job.status');
+    if (found !== undefined) return found;
+    if (events.length < limit || limit >= 12_800 || (events.at(-1)?.seq ?? 0) < seq) return null;
+    limit *= 4;
+  }
+}
+
 /** The attempt a `→ working` hop belongs to: its own, unless it is a
  * refused review round's restore — that resumes the attempt the round
  * interrupted (nothing ran on the lane, so the delivery that settled it
@@ -304,7 +318,7 @@ export function openAttemptStartSeq(ledger: BranchIdleLedger, jobId: string): nu
  * continuation (`provider.recovery-claimed`). The digest's stalled-phase
  * detector reads the same events; review admission must not arm on a head
  * whose repair is still open (issue #162). */
-function latestRepairStartSeq(ledger: Pick<BranchIdleLedger, 'latestJobEvent'>, jobId: string): number {
+export function latestRepairStartSeq(ledger: Pick<BranchIdleLedger, 'latestJobEvent'>, jobId: string): number {
   let newest = 0;
   for (const kind of ['silas.directive-sent', 'provider.recovery-claimed']) {
     const event = ledger.latestJobEvent(jobId, kind);
@@ -400,4 +414,80 @@ export function findBusyLanes(input: {
     });
   }
   return blockers;
+}
+
+/** The identity of the work that owns one job's lane at a moment: which
+ * attempt, which repair, which pending directive / re-brief requests and
+ * which verification debt or run. A forced review (#267) snapshots this at
+ * its arm for every blocker it overrides; later work on the same job is a
+ * different generation and was never authorized. */
+export interface BranchIdleWorkGeneration {
+  readonly branch: string;
+  readonly deliverySeq: number;
+  readonly directiveSeq: number;
+  readonly providerRecoverySeq: number;
+  readonly attemptStartSeq: number;
+  readonly repairStartSeq: number;
+  readonly directiveIds: readonly string[];
+  readonly rebriefIds: readonly string[];
+  readonly verification: { readonly revision: number; readonly head: string | null } | null;
+  /** Newest verification run start/request: a new run is new work. */
+  readonly verificationRunSeq: number;
+}
+
+/** What one forced request authorized at its arm, per job (in memory only;
+ * never carried into an automatic retry). */
+export type ForceAuthorization = ReadonlyMap<string, BranchIdleWorkGeneration>;
+
+export function branchIdleWorkGeneration(ledger: BranchIdleLedger, jobId: string, branch: string): BranchIdleWorkGeneration {
+  let verificationRunSeq = 0;
+  for (const kind of ['verification.requested', 'verification.started']) {
+    verificationRunSeq = Math.max(verificationRunSeq, ledger.latestJobEvent(jobId, kind)?.seq ?? 0);
+  }
+  return {
+    branch: normalizeBranch(branch),
+    deliverySeq: ledger.latestJobEvent(jobId, 'job.delivered')?.seq ?? 0,
+    directiveSeq: ledger.latestJobEvent(jobId, 'silas.directive-sent')?.seq ?? 0,
+    providerRecoverySeq: ledger.latestJobEvent(jobId, 'provider.recovery-claimed')?.seq ?? 0,
+    attemptStartSeq: openAttemptStartSeq(ledger, jobId),
+    repairStartSeq: latestRepairStartSeq(ledger, jobId),
+    directiveIds: ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).map((entry) => entry.requestId).sort(),
+    rebriefIds: ledger.listPendingRebriefs({ jobId }).map((entry) => entry.id).sort(),
+    verification: ledger.correctiveVerificationDebt(jobId),
+    verificationRunSeq,
+  };
+}
+
+/** Snapshot the generation of every job the force overrides at its arm. */
+export function snapshotForceAuthorization(
+  ledger: BranchIdleLedger,
+  blockers: readonly Pick<BranchIdleBlocker, 'jobId' | 'branch'>[],
+): ForceAuthorization {
+  return new Map(blockers.map((blocker) => [blocker.jobId, branchIdleWorkGeneration(ledger, blocker.jobId, blocker.branch)] as const));
+}
+
+/** Does the arm-time snapshot cover this blocker? Only work that already
+ * existed then does: nothing newer may have started, and every pending
+ * request now must have been pending at the arm. A pending material
+ * correction is never covered (owner rule 2). */
+export function forceCoversBlocker(
+  ledger: BranchIdleLedger,
+  authorization: ForceAuthorization,
+  blocker: BranchIdleBlocker,
+  now = branchIdleWorkGeneration(ledger, blocker.jobId, blocker.branch),
+): boolean {
+  const armed = authorization.get(blocker.jobId);
+  if (armed === undefined || blocker.revision !== undefined) return false;
+  return now.branch === armed.branch &&
+    now.deliverySeq <= armed.deliverySeq &&
+    now.directiveSeq <= armed.directiveSeq &&
+    now.providerRecoverySeq <= armed.providerRecoverySeq &&
+    now.attemptStartSeq <= armed.attemptStartSeq &&
+    now.repairStartSeq <= armed.repairStartSeq &&
+    now.verificationRunSeq <= armed.verificationRunSeq &&
+    now.directiveIds.every((id) => armed.directiveIds.includes(id)) &&
+    now.rebriefIds.every((id) => armed.rebriefIds.includes(id)) &&
+    (now.verification === null ||
+      (armed.verification !== null && now.verification.revision === armed.verification.revision &&
+        now.verification.head === armed.verification.head));
 }

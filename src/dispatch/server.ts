@@ -34,6 +34,7 @@ import {
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
+import { BlindInputRefusal, parseBlindInputPackage } from './blind-input.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -507,37 +508,60 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const targetBase = optStrFieldStrict(body, 'target_base');
       const requiredInputs = optRequiredInputs(body);
       const sourcePackage = optSourcePackage(body);
-      let outcome: Awaited<ReturnType<typeof options.dispatch.dispatch>>;
+      // Issue #316: blind-review input isolation fields. Present-but-
+      // malformed is a named refusal, never a silent drop.
+      const reviewRole = optStrFieldStrict(body, 'review_role');
+      const parentContractSha256 = optStrFieldStrict(body, 'parent_contract_sha256');
+      let outcome: Awaited<ReturnType<DispatchService['dispatch']>>;
       try {
+        const inputPackage = Object.hasOwn(body, 'input_package') ? parseBlindInputPackage(body['input_package']) : undefined;
         outcome = await options.dispatch.dispatch({
-        jobId: strField(body, 'job_id'),
-        repoPath: strField(body, 'repo_path'),
-        title: strField(body, 'title'),
-        ...(displayName !== undefined ? { displayName } : {}),
-        ...(deliverable !== undefined ? { deliverable } : {}),
-        ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
-        ...(targetRef !== undefined ? { targetRef } : {}),
-        ...(targetSha !== undefined ? { targetSha } : {}),
-        ...(targetBase !== undefined ? { targetBase } : {}),
-        ...(requiredInputs !== undefined ? { requiredInputs } : {}),
-        ...(sourcePackage !== undefined ? { sourcePackage } : {}),
-        ...(parentJobId !== undefined ? { parentJobId } : {}),
-        briefing: strField(body, 'briefing'),
-        ...(completionHandoff !== undefined ? { completionHandoff } : {}),
+          jobId: strField(body, 'job_id'),
+          repoPath: strField(body, 'repo_path'),
+          title: strField(body, 'title'),
+          ...(displayName !== undefined ? { displayName } : {}),
+          ...(deliverable !== undefined ? { deliverable } : {}),
+          ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
+          ...(targetRef !== undefined ? { targetRef } : {}),
+          ...(targetSha !== undefined ? { targetSha } : {}),
+          ...(targetBase !== undefined ? { targetBase } : {}),
+          ...(requiredInputs !== undefined ? { requiredInputs } : {}),
+          ...(sourcePackage !== undefined ? { sourcePackage } : {}),
+          ...(parentJobId !== undefined ? { parentJobId } : {}),
+          briefing: strField(body, 'briefing'),
+          ...(completionHandoff !== undefined ? { completionHandoff } : {}),
+          ...(reviewRole !== undefined ? { reviewRole } : {}),
+          ...(inputPackage !== undefined ? { inputPackage } : {}),
+          ...(parentContractSha256 !== undefined ? { parentContractSha256 } : {}),
         });
       } catch (error) {
         // Issue #317: the selected source cannot provide the named review
         // inputs. No job, lane or reviewer exists; this is a refusal, not a
         // report, and grants no automatic retry.
-        if (!(error instanceof ReviewSourceUnavailableError)) throw error;
-        log('warn', 'review source preflight refused dispatch', { problems: error.problems });
-        json(res, 422, {
-          error: 'review_source_unavailable',
-          detail: error.message,
-          problems: error.problems,
-          retry_authorized: false,
-        });
-        return true;
+        if (error instanceof ReviewSourceUnavailableError) {
+          log('warn', 'review source preflight refused dispatch', { problems: error.problems });
+          json(res, 422, {
+            error: 'review_source_unavailable',
+            detail: error.message,
+            problems: error.problems,
+            retry_authorized: false,
+          });
+          return true;
+        }
+        // Issue #316: named refusal BEFORE any reviewer spawned: the
+        // correction path is part of the answer, and the violations never
+        // carry private text.
+        if (error instanceof BlindInputRefusal) {
+          json(res, error.status, {
+            error: error.code,
+            detail: error.message,
+            correction: error.correction,
+            violations: error.violations,
+            ...error.details,
+          });
+          return true;
+        }
+        throw error;
       }
       // The minion's turn runs in the background; the board carries the
       // lifecycle. Track it so dispose() never orphans a live lane.
@@ -987,6 +1011,42 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (!authed(req, res)) return true;
       const rows = options.dispatch.worktreesFor(decodeURIComponent(worktreesMatch[1] ?? ''));
       json(res, 200, { worktrees: rows });
+      return true;
+    }
+    // Issue #316: blind-review validity. Derived from the admission and the
+    // reviewer's observed access — settlement/disposition are not inputs.
+    const blindCoverageMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/blind-coverage$/.exec(path);
+    if (req.method === 'GET' && blindCoverageMatch !== null) {
+      if (!authed(req, res)) return true;
+      const jobId = decodeURIComponent(blindCoverageMatch[1] ?? '');
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      json(res, 200, options.dispatch.blindCoverage(jobId) as unknown as Record<string, unknown>);
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/dispatch/blind-access') {
+      if (!authed(req, res)) return true;
+      const body = await readBody(req);
+      const jobId = strField(body, 'job_id');
+      const raw = body['tool_results'];
+      if (!Array.isArray(raw) || raw.length === 0) {
+        json(res, 400, { error: 'bad_request', detail: 'tool_results must be a non-empty array of {tool_name?, text}' });
+        return true;
+      }
+      const results = raw.map((entry, index) => {
+        if (typeof entry !== 'object' || entry === null || typeof (entry as { text?: unknown }).text !== 'string') {
+          throw new Error(`tool_results[${index}].text must be a string`);
+        }
+        const toolName = (entry as { tool_name?: unknown }).tool_name;
+        return { index, toolName: typeof toolName === 'string' ? toolName : null, text: (entry as { text: string }).text };
+      });
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      json(res, 200, options.dispatch.observeBlindAccess(jobId, results) as unknown as Record<string, unknown>);
       return true;
     }
     // Canonical job amendments (owner ruling j-969): authenticated,

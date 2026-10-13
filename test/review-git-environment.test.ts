@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -70,13 +70,14 @@ function origin(repo: FixtureRepo): string {
   return path;
 }
 
-function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeManager; readonly root: string } {
-  const db = new LedgerDb(directory());
+function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeManager; readonly root: string; readonly dbPath: string } {
+  const dbPath = directory();
+  const db = new LedgerDb(dbPath);
   dbs.push(db);
   const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
   const root = directory();
   return {
-    ledger, root,
+    ledger, root, dbPath,
     worktrees: new WorktreeManager({
       ledger, root, preserveRoot: directory(),
       setupTimeoutMs: 30_000, enumerateProcesses: () => [],
@@ -85,7 +86,7 @@ function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeMa
 }
 
 async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe, linkedPr = true) {
-  const { ledger, worktrees } = manager();
+  const { ledger, worktrees, dbPath } = manager();
   const job = ledger.addJob({
     id: 'git-env-job', repo: 'assigned', title: 'review assigned source',
     baseBranch: 'main', briefing: 'Acceptance: the assigned source is reviewed.',
@@ -107,7 +108,7 @@ async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe, linkedPr = tru
     },
     reviewArtifactRoot: artifactRoot, prHeadProbe: probe,
   });
-  return { ledger, worktrees, job, wave, runtime, artifactRoot };
+  return { ledger, worktrees, job, wave, runtime, artifactRoot, dbPath };
 }
 
 function registerPrBranchLane(repo: FixtureRepo, ledger: LedgerApi, jobId: string): void {
@@ -895,6 +896,183 @@ if (argv.includes('POST')) {
       rmSync(hook);
       const lane = await create();
       expect(ledger.getWorktree(lane.id)?.status).toBe('active');
+    }
+  });
+
+  it('refuses same-SHA branch attachment of detached creation authorities without deleting foreign branches', async () => {
+    const repo = fixture('assigned-detached-attachment');
+    const { ledger, worktrees } = manager();
+    const job = ledger.addJob({ id: 'attach-parent', repo: 'assigned', title: 'parent', baseBranch: 'main' });
+    const parent = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    const round = ledger.addRound({ jobId: job.id, targetRef: repo.head() });
+    const before = git(repo.path, ['for-each-ref', '--format=%(refname) %(objectname)']);
+    for (const authority of ['review', 'read-only'] as const) {
+      const { hook, log } = failingCheckoutHook(repo);
+      writeFileSync(hook, '#!/usr/bin/env node\nconst fs = require("node:fs"), cp = require("node:child_process");\n' +
+        `fs.writeFileSync(${JSON.stringify(log)}, process.cwd()); cp.execFileSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main']);\n`);
+      const create = () => authority === 'review' ? worktrees.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: repo.head() })
+        : worktrees.createChildWorktree({ repoPath: repo.path, jobId: job.id, childId: 'attach-reader', parentPath: parent.path, authority });
+      await expect(create()).rejects.toThrow(/target changed/);
+      expect(ledger.getWorktree(authority === 'review' ? round.id : 'attach-reader')).toBeNull();
+      expect(existsSync(readFileSync(log, 'utf8'))).toBe(false);
+      expect(git(repo.path, ['for-each-ref', '--format=%(refname) %(objectname)'])).toBe(before);
+      rmSync(hook);
+      const lane = await create();
+      expect(git(lane.path, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('HEAD');
+    }
+  });
+
+  it('refuses bootstrap retargeting before registration and retains unknown branch custody and data', async () => {
+    const repo = fixture('assigned-bootstrap-retarget');
+    const { ledger, worktrees, root } = manager();
+    const job = ledger.addJob({ id: 'bootstrap-retarget', repo: 'assigned', title: 'retarget', baseBranch: 'main' });
+    const parent = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
+    writeFileSync(join(repo.path, '.gru-command', 'worktree.toml'),
+      `[[setup]]\ncommand = 'git symbolic-ref HEAD refs/heads/main; printf retain > .setup-data'\n`);
+    const before = git(repo.path, ['rev-parse', 'refs/heads/main']);
+    const other = ledger.addJob({ id: 'bootstrap-new-job', repo: 'assigned', title: 'new', baseBranch: 'main' });
+    for (const authority of ['job', 'writer'] as const) {
+      const id = authority === 'job' ? other.id : 'bootstrap-retarget-child';
+      const create = authority === 'job' ? worktrees.createJobWorktree({ repoPath: repo.path, jobId: id })
+        : worktrees.createChildWorktree({ repoPath: repo.path, jobId: job.id, childId: id, parentPath: parent.path, authority });
+      await expect(create).rejects.toThrow(/target changed.*custody unconfirmed/s);
+      expect(ledger.getWorktree(id)).toBeNull();
+      const path = join(root, repo.path.split('/').at(-1)!, `${authority === 'job' ? 'job' : 'child'}-${id}`);
+      expect(readFileSync(join(path, '.setup-data'), 'utf8')).toBe('retain');
+      expect(git(path, ['symbolic-ref', 'HEAD'])).toBe('refs/heads/main');
+      expect(git(repo.path, ['rev-parse', 'refs/heads/main'])).toBe(before);
+      const branch = authority === 'job' ? `gru/${id}` : `gru/${job.id}-child-${id}`;
+      expect(git(repo.path, ['rev-parse', `refs/heads/${branch}`])).toBe(before);
+    }
+  });
+
+  it('cleans owned orphaned job and writer-child registrations and retries with no branch debris', async () => {
+    const repo = fixture('assigned-orphan-writers');
+    const { ledger, worktrees } = manager();
+    const parentJob = ledger.addJob({ id: 'orphan-writer-parent', repo: 'assigned', title: 'parent', baseBranch: 'main' });
+    const parent = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: parentJob.id });
+    const job = ledger.addJob({ id: 'orphan-job', repo: 'assigned', title: 'orphan', baseBranch: 'main' });
+    for (const authority of ['job', 'writer'] as const) {
+      const { hook } = failingCheckoutHook(repo);
+      writeFileSync(hook, '#!/usr/bin/env node\nrequire("node:fs").rmSync(process.cwd(), {recursive:true, force:true}); process.exit(7);\n');
+      const id = authority === 'job' ? job.id : 'orphan-writer-child';
+      const branch = authority === 'job' ? `gru/${id}` : `gru/${parentJob.id}-child-${id}`;
+      const create = () => authority === 'job' ? worktrees.createJobWorktree({ repoPath: repo.path, jobId: id })
+        : worktrees.createChildWorktree({ repoPath: repo.path, jobId: parentJob.id, childId: id, parentPath: parent.path, authority });
+      await expect(create()).rejects.toThrow(/exit 7/);
+      expect(ledger.getWorktree(id)).toBeNull();
+      expect(git(repo.path, ['branch', '--list', branch])).toBe('');
+      expect(git(repo.path, ['worktree', 'list', '--porcelain'])).not.toContain('locked');
+      rmSync(hook);
+      expect((await create()).branch).toBe(branch);
+    }
+  });
+
+  it('fences a late tag-shadowed canonical local owner at both idle checks', async () => {
+    for (const seam of ['freeze', 'probe'] as const) {
+      const repo = fixture(`assigned-local-idle-${seam}`);
+      origin(repo);
+      repo.git(['checkout', '-b', 'feature/shared']);
+      repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+      const h = await waveFixture(repo, async () => { throw new Error('local target must not probe PR'); }, false);
+      const owner = h.ledger.addJob({ id: 'local-owner', repo: 'assigned', title: 'owner', baseBranch: 'main' });
+      registerPrBranchLane(repo, h.ledger, owner.id);
+      h.ledger.setJobStatus(owner.id, 'working');
+      h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: owner.id, payload: {} });
+      h.ledger.setJobStatus(owner.id, 'delivered');
+      const reopen = () => {
+        git(repo.path, ['tag', 'feature/shared', 'main']);
+        h.ledger.setJobStatus(owner.id, 'working');
+      };
+      const original = h.worktrees.createReviewWorktree.bind(h.worktrees);
+      if (seam === 'freeze') vi.spyOn(h.worktrees, 'createReviewWorktree').mockImplementation(async (input) => {
+        const lane = await original(input); reopen(); return lane;
+      });
+      const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, spawner: h.runtime.spawner,
+        reviewArtifactRoot: h.artifactRoot, ...(seam === 'probe' ? { reviewFreezeObserver: reopen } : {}),
+      });
+      await expect(wave.requestReview({ jobId: h.job.id, targetRef: 'feature/shared' }))
+        .rejects.toMatchObject({ name: 'BranchBusyError', targetBranch: 'feature/shared' });
+      expect(git(repo.path, ['tag', '--list', 'feature/shared'])).toBe('feature/shared');
+      expect(h.ledger.getJob(owner.id)?.status).toBe('working');
+      expect(h.runtime.leadCalls).toHaveLength(0);
+      expect(h.ledger.listJobEvents(h.job.id).some((event) => event.kind === 'round.admission-preflight')).toBe(false);
+    }
+  });
+
+  it('rejects new verification while an audited run stays unsettled and accepts its unchanged-run control', async () => {
+    for (const replacement of [false, true]) {
+      const repo = fixture(`assigned-verification-generation-${replacement}`);
+      origin(repo);
+      const h = await waveFixture(repo, async () => { throw new Error('local target must not probe PR'); }, false);
+      const lane = h.worktrees.listWorktrees({ jobId: h.job.id }).find((entry) => entry.kind === 'job')!;
+      writeFileSync(join(lane.path, 'review-change.txt'), 'review change');
+      git(lane.path, ['add', 'review-change.txt']);
+      git(lane.path, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'review change']);
+      h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: h.job.id, payload: { run_id: 'old-run' } });
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: h.job.id, payload: { run_id: 'old-run' } });
+      const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, spawner: h.runtime.spawner,
+        reviewArtifactRoot: h.artifactRoot, reviewFreezeObserver: () => {
+          if (replacement) h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: h.job.id, payload: { run_id: 'new-run' } });
+        },
+      });
+      const request = wave.requestReview({ jobId: h.job.id, force: true });
+      if (replacement) {
+        await expect(request).rejects.toMatchObject({ name: 'BranchBusyError' });
+        expect(h.runtime.leadCalls).toHaveLength(0);
+        expect(h.ledger.listJobEvents(h.job.id).some((event) => event.kind === 'round.admission-preflight')).toBe(false);
+      } else {
+        const admitted = await request;
+        await admitted.run;
+        expect(h.runtime.leadCalls).toHaveLength(1);
+        expect(h.ledger.listJobEvents(h.job.id).find((event) => event.kind === 'round.admission-preflight')?.payload).toMatchObject({ ok: true });
+      }
+      expect(h.ledger.hasUnsettledVerificationRun(h.job.id)).toBe(true);
+    }
+  });
+
+  it('keeps arm authority sampled before audit observers and rejects independently admitted freeze work', async () => {
+    for (const seam of ['arm-audit', 'freeze-sample'] as const) {
+      const repo = fixture(`assigned-independent-generation-${seam}`);
+      origin(repo);
+      repo.git(['checkout', '-b', 'feature/shared']);
+      repo.commitFile('src/assigned.ts', 'export const assigned = true;\n');
+      const h = await waveFixture(repo, async () => { throw new Error('local target must not probe PR'); }, false);
+      const owner = h.ledger.addJob({ id: 'independent-owner', repo: 'assigned', title: 'owner', baseBranch: 'main' });
+      registerPrBranchLane(repo, h.ledger, owner.id);
+      const ledger = h.ledger;
+      const otherDb = new LedgerDb(h.dbPath); dbs.push(otherDb);
+      const independent = new LedgerApi(otherDb.handle, { bus: new EventBus() });
+      ledger.setJobStatus(owner.id, 'working');
+      let freeze = false; let inserted = false; let freezeReads = 0;
+      const insert = () => {
+        if (inserted) return; inserted = true;
+        independent.beginDirectiveIntent({ jobId: owner.id, requestId: 'new-independent-work', directive: 'new', holder: 'fixture' });
+      };
+      const append = ledger.appendCustomEvent.bind(ledger);
+      vi.spyOn(ledger, 'appendCustomEvent').mockImplementation((input) => {
+        const event = append(input);
+        if (seam === 'arm-audit' && input.kind === 'branch-idle.forced') insert();
+        return event;
+      });
+      const original = h.worktrees.createReviewWorktree.bind(h.worktrees);
+      vi.spyOn(h.worktrees, 'createReviewWorktree').mockImplementation(async (input) => {
+        const lane = await original(input); freeze = true; return lane;
+      });
+      const read = ledger.listJobs.bind(ledger);
+      vi.spyOn(ledger, 'listJobs').mockImplementation(() => {
+        // The competing implementation proved one freeze snapshot, then
+        // resampled and force-audited a second. New work enters that gap.
+        if (seam === 'freeze-sample' && freeze && ++freezeReads === 2) insert();
+        return read();
+      });
+      const wave = new WaveRunner({ ledger, worktrees: h.worktrees, spawner: h.runtime.spawner, reviewArtifactRoot: h.artifactRoot });
+      await expect(wave.requestReview({ jobId: h.job.id, targetRef: 'feature/shared', force: true })).rejects.toMatchObject({ name: 'BranchBusyError' });
+      expect(inserted).toBe(true);
+      expect(h.runtime.leadCalls).toHaveLength(0);
+      expect(ledger.listJobEvents(h.job.id).filter((event) => event.kind === 'branch-idle.forced')).toHaveLength(seam === 'arm-audit' ? 1 : 2);
+      expect(ledger.listJobEvents(h.job.id).some((event) => event.kind === 'round.admission-preflight')).toBe(false);
     }
   });
 

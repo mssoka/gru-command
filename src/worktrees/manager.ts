@@ -714,6 +714,7 @@ export class WorktreeManager {
       try {
         this.addLane(repo.repoPath, path, custody);
         await this.bootstrap(repo.repoPath, path);
+        this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
         record = this.opts.ledger.registerWorktree({
           id: input.jobId,
@@ -778,6 +779,7 @@ export class WorktreeManager {
         // Review lanes must contain only bytes tracked by the frozen commit.
         // Job bootstrap links/setup outputs are intentionally not applied.
         const sha = runGit(path, ['rev-parse', 'HEAD']);
+        this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
         record = this.opts.ledger.registerWorktree({
           id: input.roundId,
@@ -855,6 +857,7 @@ export class WorktreeManager {
         this.addLane(repo.repoPath, path, custody);
         if (input.authority === 'writer') await this.bootstrap(repo.repoPath, path);
         const sha = runGit(path, ['rev-parse', 'HEAD']);
+        this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
         record = this.opts.ledger.registerWorktree({
           id: input.childId,
@@ -1143,9 +1146,17 @@ export class WorktreeManager {
     custody.addAttempted = true;
     runGit(repoPath, ['worktree', 'add', '--lock', '--reason', custody.token,
       ...(custody.branch === null ? ['--detach'] : []), path, custody.branch ?? custody.sha]);
+    this.assertCreationIdentity(path, custody);
+  }
+
+  /** Registration requires the requested checkout authority, independently
+   * of the receipts that permit destructive rollback. */
+  private assertCreationIdentity(path: string, custody: CreationCustody): void {
+    const symbolic = spawnGit(path, ['symbolic-ref', '--quiet', 'HEAD']);
+    const expected = custody.branch === null ? null : `refs/heads/${custody.branch}`;
     if (runGit(path, ['rev-parse', 'HEAD']) !== custody.sha ||
-      (custody.branch !== null && runGit(path, ['symbolic-ref', 'HEAD']) !== `refs/heads/${custody.branch}`)) {
-      throw new Error(`worktree creation target changed during add: ${path} — refusing registration`);
+      (expected === null ? symbolic.status !== 1 : symbolic.status !== 0 || symbolic.stdout.trim() !== expected)) {
+      throw new Error(`worktree creation target changed: ${path} — refusing registration or handoff`);
     }
   }
 
@@ -1183,6 +1194,7 @@ export class WorktreeManager {
 
   private handoffLane(repoPath: string, path: string, custody: CreationCustody): void {
     try {
+      this.assertCreationIdentity(path, custody);
       this.assertCreationCustody(repoPath, path, custody);
       runGit(repoPath, ['worktree', 'unlock', path]);
     } catch (error) {

@@ -9,11 +9,13 @@ import { DEFAULT_REVIEW_CHILDREN } from '../config.js';
 import type { JobStatus, LedgerApi, RoundRecord, RoundVerdict } from '../ledger/api.js';
 import { requireSafeRecordId } from '../ledger/api.js';
 import { isJobTerminal, isRoundTerminal } from '../ledger/states.js';
-import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import {
   BranchBusyError,
   findBusyLanes,
+  forceCoversBlocker,
+  snapshotForceAuthorization,
+  type ForceAuthorization,
   laneIsBusy,
   laneBranch,
   normalizeBranch,
@@ -1642,6 +1644,30 @@ interface ReviewOperation {
   settled: Promise<unknown>;
 }
 
+/** A review request (internal fields are never accepted from the public HTTP endpoint). */
+export interface ReviewRequestInput {
+    jobId: string;
+    targetRef?: string;
+    /** Internal: a clean-abort re-arm's request-time delivered head; the
+     * freeze boundary refuses when a newer delivery superseded it. */
+    boundDeliveredSha?: string;
+    lenses?: readonly string[];
+    noSpec?: boolean;
+    force?: boolean;
+    /** Authorized private evidence attachments (service upload identities). */
+    evidence?: readonly ReviewEvidenceRequest[];
+    /** Prior indexes the implementing minion claimed fixed (fix-directive
+     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
+    claimedFixedPriors?: readonly number[];
+    /** Worker tool handoff: acknowledge without waiting for its own turn. */
+    handoff?: boolean;
+    /** Internal replay marker; never accepted from the public HTTP endpoint. */
+    fromHandoff?: boolean;
+    /** Internal: the automatic admission retry this request carries out;
+     * never accepted from the public HTTP endpoint. */
+    admissionRetry?: AdmissionRetry;
+}
+
 export class WaveRunner {
   private readonly opts: WaveRunnerOptions;
   private readonly log: Log;
@@ -2644,34 +2670,26 @@ export class WaveRunner {
   /** Review-path selection (user amendment 2026-09-20): the fail-closed
    * four-leg pre-flight runs at request time. All legs pass -> Perkins
    * (the gate). Any leg failing -> the bmad-review fallback gate. */
-  async requestReview(input: {
-    jobId: string;
-    targetRef?: string;
-    /** Internal: a clean-abort re-arm's request-time delivered head; the
-     * freeze boundary refuses when a newer delivery superseded it. */
-    boundDeliveredSha?: string;
-    lenses?: readonly string[];
-    noSpec?: boolean;
-    force?: boolean;
-    /** Authorized private evidence attachments (service upload identities). */
-    evidence?: readonly ReviewEvidenceRequest[];
-    /** Prior indexes the implementing minion claimed fixed (fix-directive
-     * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
-    claimedFixedPriors?: readonly number[];
-    /** Worker tool handoff: acknowledge without waiting for its own turn. */
-    handoff?: boolean;
-    /** Internal replay marker; never accepted from the public HTTP endpoint. */
-    fromHandoff?: boolean;
-    /** Internal: the automatic admission retry this request carries out;
-     * never accepted from the public HTTP endpoint. */
-    admissionRetry?: AdmissionRetry;
-  }): Promise<ReviewRequestOutcome> {
+  /** Every review request is tracked per job from entry until it settles
+   * (#268), so a due automatic admission retry sees one still in preflight. */
+  async requestReview(input: ReviewRequestInput): Promise<ReviewRequestOutcome> {
+    this.requestsInFlight.set(input.jobId, (this.requestsInFlight.get(input.jobId) ?? 0) + 1);
+    try {
+      return await this.performReviewRequest(input);
+    } finally {
+      const remaining = (this.requestsInFlight.get(input.jobId) ?? 1) - 1;
+      if (remaining <= 0) this.requestsInFlight.delete(input.jobId);
+      else this.requestsInFlight.set(input.jobId, remaining);
+    }
+  }
+
+  private async performReviewRequest(input: ReviewRequestInput): Promise<ReviewRequestOutcome> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     // Branch-idle still gates the freeze. A minion's own busy turn may
     // acknowledge an intent now; it is armed only after job.delivered.
-    let forceAuthority: readonly string[] = [];
+    let forceAuthorization: ForceAuthorization | undefined;
     try {
-      forceAuthority = this.enforceBranchIdleForRequest(input);
+      forceAuthorization = this.enforceBranchIdleForRequest(input);
     } catch (error) {
       if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
         error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId) ||
@@ -2752,7 +2770,7 @@ export class WaveRunner {
     const fallbackBaseline = {
       targetBranch,
       branchOwners,
-      forceAuthority,
+      forceAuthorization: forceAuthorization ?? new Map(),
       markerIds: this.opts.ledger.listPendingRebriefs({ jobId: input.jobId }).map((marker) => marker.id),
       deliverySeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.delivered')?.seq ?? 0,
       statusSeq: this.opts.ledger.latestJobEvent(input.jobId, 'job.status')?.seq ?? 0,
@@ -2802,7 +2820,7 @@ export class WaveRunner {
       }
       const admission = { lanePath, ...fallbackBaseline };
       this.assertFallbackIterationCurrent(input, admission);
-      if (input.force === true) this.enforceBranchIdleForRequest(input);
+      if (input.force === true) this.enforceBranchIdleForRequest({ ...input, forceAuthorization: forceAuthorization ?? new Map() });
       // The fallback gate cannot deliver private evidence: refuse the arm
       // rather than run the fallback review without the promised material.
       if (input.evidence !== undefined && input.evidence.length > 0) {
@@ -2816,8 +2834,9 @@ export class WaveRunner {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
     }
-    const begun = await this.beginPerkinsRound({ ...input, forceAuthority, reviewModel: result.reviewModel,
-      reviewThinkingLevel: result.reviewThinkingLevel });
+    const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel,
+      reviewThinkingLevel: result.reviewThinkingLevel,
+      ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
     return { route: 'perkins', round: begun.round, run: begun.run };
   }
 
@@ -3012,7 +3031,7 @@ export class WaveRunner {
      * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
     claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
-    const forceAuthority = this.enforceBranchIdleForRequest(input);
+    const forceAuthorization = this.enforceBranchIdleForRequest(input);
     let reviewModel: ReviewPreflightResult['reviewModel'];
     let reviewThinkingLevel: string | undefined;
     if (this.opts.reviewPreflight !== undefined) {
@@ -3024,7 +3043,8 @@ export class WaveRunner {
         reviewThinkingLevel = result.reviewThinkingLevel;
       }
     }
-    return this.beginPerkinsRound({ ...input, forceAuthority, reviewModel, reviewThinkingLevel });
+    return this.beginPerkinsRound({ ...input, reviewModel, reviewThinkingLevel,
+      ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
   }
 
   private resolveReviewRequestRepo(input: { jobId: string }): string | null {
@@ -3045,21 +3065,24 @@ export class WaveRunner {
     jobId: string;
     targetRef?: string;
     force?: boolean;
-  }): readonly string[] {
+    forceAuthorization?: ForceAuthorization;
+  }): ForceAuthorization | undefined {
     const job = this.opts.ledger.getJob(input.jobId);
-    if (job === null) return [];
+    if (job === null) return undefined;
     const jobLane = this.opts.worktrees
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job') ?? null;
-    if (jobLane === null) return [];
-    const idle = this.enforceBranchIdle({
+    if (jobLane === null) return undefined;
+    const armed = this.enforceBranchIdle({
       job,
       jobLane,
       ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
       ...(input.force !== undefined ? { force: input.force } : {}),
       phase: 'arm',
+      ...(input.forceAuthorization !== undefined ? { forceAuthorization: input.forceAuthorization } : {}),
     });
-    return idle.authority;
+    // #267: what a force authorizes is the work present at THIS arm.
+    return input.force === true ? armed.authorization : undefined;
   }
 
   /** Branch-idle guard for one review target (rule 2026-09-23): resolve the
@@ -3128,32 +3151,13 @@ export class WaveRunner {
     return { targetBranch, blockers };
   }
 
-  /** Force authorizes these exact busy facts, not the job id forever. The
-   * round's provisional status flip does not start a new work attempt. */
-  private branchIdleAuthority(blocker: BranchIdleBlocker): string {
-    const id = blocker.jobId;
-    return JSON.stringify({
-      jobId: id, branch: blocker.branch,
-      attemptStart: openAttemptStartSeq(this.opts.ledger, id),
-      deliverySeq: this.opts.ledger.latestJobEvent(id, 'job.delivered')?.seq ?? 0,
-      directiveSeq: this.opts.ledger.latestJobEvent(id, 'silas.directive-sent')?.seq ?? 0,
-      recoverySeq: this.opts.ledger.latestJobEvent(id, 'provider.recovery-claimed')?.seq ?? 0,
-      markers: this.opts.ledger.listPendingRebriefs({ jobId: id }).map((marker) => marker.id).sort(),
-      directives: this.opts.ledger.listPendingDirectives({ jobId: id, states: LIVE_DIRECTIVE_STATES }).map((directive) => directive.requestId).sort(),
-      verificationRun: this.opts.ledger.hasUnsettledVerificationRun(id),
-      verificationRequestedSeq: this.opts.ledger.latestJobEvent(id, 'verification.requested')?.seq ?? 0,
-      verificationStartedSeq: this.opts.ledger.latestJobEvent(id, 'verification.started')?.seq ?? 0,
-      revision: blocker.revision, verification: blocker.verification,
-    });
-  }
-
   private refuseUnauditedBlockers(
     jobId: string, roundId: string, idle: { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[] },
-    authority: readonly string[],
+    authorization: ForceAuthorization,
   ): void {
     const unaudited = idle.blockers.filter((blocker) => blocker.revision !== undefined ||
       this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
-      !authority.includes(this.branchIdleAuthority(blocker)));
+      !forceCoversBlocker(this.opts.ledger, authorization, blocker));
     if (unaudited.length === 0) return;
     this.opts.ledger.appendCustomEvent({
       kind: 'branch-idle.refused', jobId, roundId,
@@ -3175,19 +3179,22 @@ export class WaveRunner {
      * (working|blocked → in-review): the flip is bookkeeping and must not
      * mask the lane it moved. */
     reviewedStatus?: { readonly jobId: string; readonly status: JobStatus } | undefined;
-  }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[]; readonly authority: readonly string[] } {
+    /** A forced check covers only the work its arm snapshot holds (#267). */
+    forceAuthorization?: ForceAuthorization;
+  }): { readonly targetBranch: string; readonly blockers: readonly BranchIdleBlocker[]; readonly authorization: ForceAuthorization } {
     const { targetBranch, blockers } = this.branchIdleBlockers(input);
     // Snapshot before publishing an audit: synchronous ledger observers can
     // admit new work while that event is delivered, but cannot inherit it.
-    const authority = blockers.map((blocker) => this.branchIdleAuthority(blocker));
+    const authorization = snapshotForceAuthorization(this.opts.ledger, blockers);
     // A retirement hold is a fresh-authorization boundary, not ordinary
     // branch activity. Neither force nor a foreign target may waive it. A
     // pending material correction is the same (owner rule 2): the candidate
     // is outdated by an approved change, and no override reviews it.
     const held = blockers.some((blocker) =>
       blocker.revision !== undefined || this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId));
-    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers, authority };
-    const forced = input.force === true && !held;
+    if (blockers.length === 0 && input.force !== true) return { targetBranch, blockers, authorization };
+    const forced = input.force === true && !held && (input.forceAuthorization === undefined ||
+      blockers.every((blocker) => forceCoversBlocker(this.opts.ledger, input.forceAuthorization!, blocker, authorization.get(blocker.jobId))));
     this.opts.ledger.appendCustomEvent({
       kind: forced ? 'branch-idle.forced' : 'branch-idle.refused',
       jobId: input.job.id,
@@ -3195,10 +3202,12 @@ export class WaveRunner {
       payload: { phase: input.phase, forced, targetBranch, blockers },
     });
     if (!forced) throw new BranchBusyError(targetBranch, blockers, input.phase);
-    return { targetBranch, blockers, authority };
+    return { targetBranch, blockers, authorization };
   }
 
   private readonly roundAdmission = new Set<string>();
+  /** In-flight requestReview calls per job (#268), counted. */
+  private readonly requestsInFlight = new Map<string, number>();
 
   private async beginPerkinsRound(input: {
     jobId: string;
@@ -3209,7 +3218,6 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
-    forceAuthority?: readonly string[];
     evidence?: readonly ReviewEvidenceRequest[];
     /** Prior indexes the implementing minion claimed fixed. */
     claimedFixedPriors?: readonly number[];
@@ -3217,6 +3225,9 @@ export class WaveRunner {
     reviewThinkingLevel?: string;
     /** The automatic admission retry this round carries out. */
     admissionRetry?: AdmissionRetry;
+    /** What a forced request authorized at its original arm (#267): the
+     * freeze and post-probe checks cover only that work. In memory only. */
+    forceAuthorization?: ForceAuthorization;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     if (this.roundAdmission.has(input.jobId)) throw new RoundAdmissionInProgress(input.jobId);
@@ -3332,7 +3343,9 @@ export class WaveRunner {
     if (deliverySeq !== retry.deliverySeq) return 'a newer delivery replaced the refused one';
     const rounds = this.opts.ledger.listRounds(job.id);
     if (rounds[rounds.length - 1]?.id !== retry.roundId) return 'a newer review round already started';
-    if (this.roundAdmission.has(job.id) || this.handoffs.has(job.id)) return 'another review request for the job is under way';
+    if (this.roundAdmission.has(job.id) || this.handoffs.has(job.id) || this.requestsInFlight.has(job.id)) {
+      return 'another review request for the job is under way';
+    }
     return null;
   }
 
@@ -3510,7 +3523,7 @@ export class WaveRunner {
       readonly deliverySeq: number;
       readonly markerIds: readonly string[];
     }[];
-    readonly forceAuthority: readonly string[];
+    readonly forceAuthorization: ForceAuthorization;
     readonly markerIds: readonly string[];
     readonly deliverySeq: number;
     readonly statusSeq: number;
@@ -3602,7 +3615,7 @@ export class WaveRunner {
     ];
     if (busyNow.some((blocker) => input.force !== true || blocker.revision !== undefined ||
       this.opts.ledger.hasOpenDirectiveRecoveryHold(blocker.jobId) ||
-      !admission.forceAuthority.includes(this.branchIdleAuthority(blocker)))) {
+      !forceCoversBlocker(this.opts.ledger, admission.forceAuthorization, blocker))) {
       throw new FallbackSafetyRefusal(
         `a new busy lane owns branch "${admission.targetBranch}" — the fallback gate stops before the next review round`,
       );
@@ -4071,7 +4084,6 @@ export class WaveRunner {
     lenses?: readonly string[];
     noSpec?: boolean;
     force?: boolean;
-    forceAuthority?: readonly string[];
     evidence?: readonly ReviewEvidenceRequest[];
     /** Prior indexes the implementing minion claimed fixed. */
     claimedFixedPriors?: readonly number[];
@@ -4079,6 +4091,9 @@ export class WaveRunner {
     reviewThinkingLevel?: string;
     /** The automatic admission retry this round carries out. */
     admissionRetry?: AdmissionRetry;
+    /** What a forced request authorized at its original arm (#267): the
+     * freeze and post-probe checks cover only that work. In memory only. */
+    forceAuthorization?: ForceAuthorization;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     // R7-14: the delivery THIS round reviews — fixed before any await, so a
@@ -4281,15 +4296,12 @@ export class WaveRunner {
         targetBranch,
         ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
         ...(input.force !== undefined ? { force: input.force } : {}),
+        ...(input.force === true ? { forceAuthorization: input.forceAuthorization ?? new Map() } : {}),
         phase: 'freeze' as const,
         roundId: round.id,
         ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
       };
-      if (input.force === true) {
-        this.refuseUnauditedBlockers(job.id, round.id, this.branchIdleBlockers(idleInput), input.forceAuthority ?? []);
-      }
       const idle = this.enforceBranchIdle(idleInput);
-      const frozenForceAuthority = idle.authority;
       // A clean-abort re-arm proved ONE delivered head at request time; the
       // awaited pre-flight/capacity/setup window can admit a newer delivery.
       // Re-prove the unchanged-head precondition here, at the last boundary
@@ -4442,7 +4454,7 @@ export class WaveRunner {
         // Unforced: the ordinary refusal (audited). Forced: its audit already
         // stands — only a blocker it never covered is refused (audited below).
         const afterProbe = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
-        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, frozenForceAuthority);
+        this.refuseUnauditedBlockers(job.id, round.id, afterProbe, input.forceAuthorization ?? new Map());
         // Owner rule 3: a setup superseded while it awaited (an approved
         // material change, or a writer that owns the lane) withdraws here,
         // before any admission effect — the rollback below unwinds it.
@@ -4491,7 +4503,13 @@ export class WaveRunner {
       }
       if (reviewWorktree !== undefined) {
         try {
-          await this.sweepReviewWorktree(reviewWorktree.id);
+          // #269: a cleanup-unconfirmed refusal already escalated naming its
+          // process group — its rollback sweep must not alert again for the
+          // same event.
+          await this.sweepReviewWorktree(reviewWorktree.id, {
+            alreadyNotified: error instanceof ReviewAdmissionError &&
+              error.missing.some((entry) => entry.cleanupUnconfirmed === true),
+          });
         } catch (cleanupError) {
           failures.push(cleanupError);
         }
@@ -4704,12 +4722,14 @@ export class WaveRunner {
         };
       }
       const targetSha = resolveGitCommit(input.jobWorktree.path, input.candidateRef);
+      const movementRef = this.resolvedLocalRefName(input.jobWorktree.path, input.candidateRef) ?? targetSha;
       return {
         targetSha,
+        ...(/^(?:refs\/heads\/|refs\/remotes\/)/u.test(movementRef) ? { targetBranch: normalizeBranch(movementRef) } : {}),
         // Named refs retain movement proof in the shared object store.
         // Revision expressions and commit pins bind once in the source
         // lane, never against HEAD of the detached target checkout.
-        movementRef: this.resolvedLocalRefName(input.jobWorktree.path, input.candidateRef) ?? targetSha,
+        movementRef,
       };
     }
     try {
@@ -6010,10 +6030,18 @@ export class WaveRunner {
     }
   }
 
-  private async sweepReviewWorktree(worktreeId: string): Promise<void> {
+  /** `alreadyNotified`: the owner was already alerted about this very event
+   * (#269). A paused release keeps its safety pause and evidence (the
+   * worktree manager's own needs-owner confirmation) but raises no second
+   * action-required alert; unrelated sweep failures still alert. */
+  private async sweepReviewWorktree(worktreeId: string, context: { readonly alreadyNotified?: boolean } = {}): Promise<void> {
     try {
       const result = await this.opts.worktrees.release({ worktreeId });
-      if (result.status === 'paused') {
+      if (result.status === 'paused' && context.alreadyNotified === true) {
+        this.log('warn', 'review worktree release paused on live processes; the refusal already escalated', {
+          round: worktreeId, processes: result.processes.map((entry) => entry.pid),
+        });
+      } else if (result.status === 'paused') {
         this.escalate(
           `Review worktree for round ${worktreeId} paused on live processes`,
           'the sweep found live processes rooted in the review tree — acknowledge to finish cleanup',
