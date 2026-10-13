@@ -14,6 +14,7 @@ import {
 } from '../src/supervision/supervisor.js';
 import { DEFAULT_DECISIONS_CONFIG, type Role } from '../src/config.js';
 import { WorkerDisposalInProgressError } from '../src/runtime/worker-errors.js';
+import { RestartCleanupJournal } from '../src/supervision/restart-cleanup.js';
 import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
 import type { DecisionService } from '../src/decisions/types.js';
 import { deterministicOutcome } from '../src/decisions/service.js';
@@ -240,6 +241,7 @@ class FakeRegistry implements SupervisorRegistry {
 }
 
 interface Harness {
+  readonly dir: string;
   registry: FakeRegistry;
   api: LedgerApi;
   center: NotificationCenter;
@@ -275,6 +277,7 @@ function boot(
   const registry = new FakeRegistry();
   let supervisorRef: Supervisor | null = null;
   const harness: Harness = {
+    dir,
     registry,
     api,
     center,
@@ -1067,6 +1070,108 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     }
   }
 
+  function reopenedSupervisor(dir: string) {
+    const db = new LedgerDb(dir);
+    const api = new LedgerApi(db.handle);
+    const bus = new EventBus();
+    const center = new NotificationCenter({ ledger: api, bus });
+    const supervisor = new Supervisor({ registry: new FakeRegistry(), ledger: api, notifications: center,
+      config: { enabled: false, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 } });
+    return { api, supervisor, close: () => { supervisor.dispose(); db.close(); } };
+  }
+
+  it('restores failed exact-generation cleanup after LedgerDb close/reopen even with supervision disabled (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    let reopened: ReturnType<typeof reopenedSupervisor> | null = null;
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'superseded', briefing: null });
+      f.replacement.dispose = async () => { throw new Error('native cleanup rejected'); };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      const pending = f.rig.api.latestJobEvent(f.jobId, 'supervision.restart-cleanup-pending')!;
+      const notice = f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')[0]!;
+      f.rig.center.ack(notice.id, 'owner');
+      f.rig.api.resolveNotificationById(notice.id, 'owner');
+      f.rig.dispose();
+      reopened = reopenedSupervisor(f.rig.dir);
+      const blockers = reopened.supervisor.pendingProducerBlockers(f.jobId);
+      expect(blockers).toHaveLength(1);
+      expect(pending).not.toBeNull();
+      expect(pending.payload).toMatchObject({ replacement_agent_id: f.replacement.id, generation: expect.any(String) });
+      expect(blockers[0]).toContain(`originating event ${pending.seq}`);
+      expect(blockers[0]).toContain('hard crash');
+      expect(reopened.supervisor.pendingProducerBlockers('unrelated')).toEqual([]);
+      expect(reopened.api.listJobEvents(f.jobId, { limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(false);
+    } finally { reopened?.close(); f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('journals still-pending disposal before awaiting it and retains custody across reopen (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    let finish!: () => void;
+    let reopened: ReturnType<typeof reopenedSupervisor> | null = null;
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'superseded', briefing: null });
+      f.replacement.dispose = () => new Promise<void>((resolve) => { finish = resolve; });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.rig.api.latestJobEvent(f.jobId, 'supervision.restart-cleanup-pending')).not.toBeNull();
+      f.rig.dispose();
+      reopened = reopenedSupervisor(f.rig.dir);
+      expect(reopened.supervisor.pendingProducerBlockers(f.jobId)).toHaveLength(1);
+      // A settlement without cessation after the original ledger disappeared
+      // must not fabricate a receipt in the new service.
+      finish(); await flushMicrotasks();
+      expect(reopened.supervisor.pendingProducerBlockers(f.jobId)).toHaveLength(1);
+    } finally { reopened?.close(); f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('persists exact confirmation without any cleanup notice before releasing custody on restart (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    let reopened: ReturnType<typeof reopenedSupervisor> | null = null;
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'superseded', briefing: null });
+      f.releaseSpawn(f.replacement); await flushMicrotasks();
+      const pending = f.rig.api.latestJobEvent(f.jobId, 'supervision.restart-cleanup-pending')!;
+      const receipt = f.rig.api.latestJobEvent(f.jobId, 'supervision.restart-cleanup-confirmed')!;
+      expect(pending).not.toBeNull();
+      expect(receipt).not.toBeNull();
+      expect(receipt.seq).toBeGreaterThan(pending.seq);
+      expect(receipt.payload).toMatchObject({ origin_seq: pending.seq,
+        generation: (pending.payload as { generation: string }).generation, disposal_acknowledged: true, cessation: 'ceased' });
+      expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')).toEqual([]);
+      f.rig.dispose(); reopened = reopenedSupervisor(f.rig.dir);
+      expect(reopened.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(reopened.api.listJobEvents(f.jobId, { limit: 100 }).some((event) => event.kind === 'job.delivered')).toBe(false);
+    } finally { reopened?.close(); f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('retains pending custody when confirmation persistence fails, then retries the exact proof (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'superseded', briefing: null });
+      const append = f.rig.api.appendCustomEvent.bind(f.rig.api);
+      const write = vi.spyOn(f.rig.api, 'appendCustomEvent').mockImplementation((fields) => {
+        if (fields.kind === 'supervision.restart-cleanup-confirmed') throw new Error('proof storage unavailable');
+        return append(fields);
+      });
+      f.releaseSpawn(f.replacement); await flushMicrotasks();
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toHaveLength(1);
+      expect(f.rig.api.latestJobEvent(f.jobId, 'supervision.restart-cleanup-confirmed')).toBeNull();
+      const reader = reopenedSupervisor(f.rig.dir);
+      try {
+        expect(reader.supervisor.pendingProducerBlockers(f.jobId)).toHaveLength(1);
+        write.mockRestore();
+        expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+        // The durable query cursor refreshes a later original-owner receipt.
+        expect(reader.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      } finally { reader.close(); write.mockRestore(); }
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
   it('rejects a fresh-id replacement superseded during spawn and clears obsolete recovery only after disposal', async () => {
     vi.useFakeTimers();
     const f = await deferredRestart();
@@ -1104,8 +1209,8 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
-  async function deferredDispatchRestart(sameId = false, options: Parameters<typeof boot>[1] = {}) {
-    const rig = boot(undefined, options);
+  async function deferredDispatchRestart(sameId = false, options: Parameters<typeof boot>[1] = {}, decisions?: DecisionService) {
+    const rig = boot(decisions, options);
     const jobId = 'empty-authority-job';
     rig.api.addJob({ id: jobId, repo: 'fixture', title: 'Initially empty native authority' });
     rig.api.setJobStatus(jobId, 'working');
@@ -1215,6 +1320,79 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(recovery.promptCalls[0]?.text).toContain('new authorized briefing');
       expect(recovery.promptCalls[0]?.text).not.toBe('old dispatch briefing');
     } finally { releaseTurn(); await routing; f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('settles a deferred job-bound generic error as exactly one orphan, not a phantom producer (GH-280)', async () => {
+    vi.useFakeTimers();
+    const decisions = { decide: async (request) => deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled') } as DecisionService;
+    const f = await deferredDispatchRestart(true, {}, decisions);
+    try {
+      f.replacement.promptHook = (text, options) => {
+        f.replacement.pendingTurnSnapshot = { text, owner: options?.owner ?? null };
+        f.replacement.emit({ type: 'error', error: 'ordinary tool exception', fatal: false });
+        f.replacement.pendingTurnSnapshot = null;
+        f.replacement.setState('error');
+      };
+      f.releaseSpawn(f.replacement); await flushMicrotasks();
+      expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toHaveLength(1);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.supervisor.viewFor(f.original.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(f.rig.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.turn-recovery')
+        .map((event) => (event.payload as { disposition: string }).disposition)).toEqual(['orphaned', 'resume-attempted']);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('preserves a newer same-handle interruption after the failed delivery turn ended but before rung replay (GH-280)', async () => {
+    vi.useFakeTimers(); const f = await deferredDispatchRestart(true);
+    try {
+      f.replacement.promptHook = (text, options) => {
+        f.replacement.pendingTurnSnapshot = { text, owner: options?.owner ?? null };
+        f.replacement.emit({ type: 'error', error: 'ordinary first-turn exception', fatal: false });
+        f.replacement.emit({ type: 'turn_end' });
+        f.replacement.pendingTurnSnapshot = { text: 'newer native turn body', owner: 'dispatch:newer-native' };
+        f.replacement.emit({ type: 'turn_start' });
+        f.replacement.emit({ type: 'error', error: 'ordinary newer-turn exception', fatal: false });
+        f.replacement.pendingTurnSnapshot = null;
+        f.replacement.setState('error');
+        f.replacement.emit({ type: 'turn_end' });
+      };
+      f.releaseSpawn(f.replacement); await flushMicrotasks();
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('pending recovery/retry');
+      expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
+      const recovery = new FakeHandle('minion', 'newer-native-recovery', f.original.sessionFile);
+      f.rig.registry.spawnImpl = async () => recovery;
+      f.replacement.emit({ type: 'error', error: 'newer native session died', fatal: true });
+      await flushMicrotasks();
+      expect(recovery.promptCalls).toEqual([{ text: 'newer native turn body', owner: 'dispatch:newer-native' }]);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('does not let late generic-error settlement consume a newer fatal interruption or its exact prompt (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart(true);
+    let finish!: () => void;
+    try {
+      f.replacement.promptHook = async (text, options) => {
+        f.replacement.pendingTurnSnapshot = { text, owner: options?.owner ?? null };
+        f.replacement.emit({ type: 'error', error: 'ordinary tool exception', fatal: false });
+        f.replacement.pendingTurnSnapshot = null;
+        f.replacement.setState('error');
+        await new Promise<void>((resolve) => { finish = resolve; });
+      };
+      f.releaseSpawn(f.replacement); await flushMicrotasks();
+      const newer = new FakeHandle('minion', 'newer-fatal-recovery', f.original.sessionFile);
+      let releaseNewer!: () => void;
+      f.rig.registry.spawnImpl = () => new Promise((resolve) => { releaseNewer = () => resolve(newer); });
+      f.replacement.pendingTurnSnapshot = { text: 'newer exact interruption', owner: 'dispatch:newer' };
+      f.replacement.emit({ type: 'error', error: 'newer session died', fatal: true });
+      await flushMicrotasks();
+      finish(); await flushMicrotasks();
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('pending recovery/retry');
+      expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
+      releaseNewer(); await flushMicrotasks();
+      expect(newer.promptCalls).toEqual([{ text: 'newer exact interruption', owner: 'dispatch:newer' }]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+    } finally { finish?.(); f.rig.dispose(); vi.useRealTimers(); }
   });
 
   it('replays a same-id startup fatal after an unchanged-authority rung without delivering on the failed handle', async () => {
@@ -1536,7 +1714,8 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         expect(register).not.toHaveBeenCalled();
         expect(replacement.promptCalls).toEqual([]);
         expect(rig.supervisor.viewFor(replacement.id)).toBeNull();
-        expect(rig.supervisor.pendingProducerBlockers(jobId).join(' ')).toBe(cleanupFails ? `restart cleanup unconfirmed: ${replacement.id}` : '');
+        if (cleanupFails) expect(rig.supervisor.pendingProducerBlockers(jobId).join(' ')).toContain(`restart cleanup unconfirmed: ${replacement.id}`);
+        else expect(rig.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
         expect(rig.supervisor.pendingProducerBlockers('unrelated-job')).toEqual([]);
         expect(rig.api.listJobEvents(jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-rejected')?.payload)
           .toMatchObject({ disposition: cleanupFails ? 'cleanup-unconfirmed' : 'disposed' });
@@ -1544,6 +1723,27 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         expect(rig.registry.spawnCalls).toHaveLength(1);
       } finally { rig.dispose(); vi.useRealTimers(); }
     }
+  });
+
+  it('resolves a cleanup notice whose synchronous observer persists the exact proof before post returns (GH-280)', async () => {
+    vi.useFakeTimers(); const f = await deferredRestart();
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer work', briefing: null });
+      f.replacement.cessationEvidence = () => 'unknown';
+      const post = f.rig.center.post.bind(f.rig.center);
+      const publishing = vi.spyOn(f.rig.center, 'post').mockImplementation((input) => {
+        const notice = post(input);
+        if (input.kind === 'supervision.restart-cleanup-unconfirmed') {
+          f.replacement.cessationEvidence = () => 'ceased';
+          expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).not.toContain('cleanup unconfirmed');
+        }
+        return notice;
+      });
+      f.releaseSpawn(f.replacement); await flushMicrotasks();
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')[0]?.resolvedBy).toBe('supervision-cleanup-confirmed');
+      publishing.mockRestore();
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
   it('retains ownership for fulfilled disposal with unknown, missing or throwing cessation evidence', async () => {
@@ -4079,5 +4279,95 @@ describe('supervision decision surface identity (issue #222)', () => {
     } finally {
       lane.supervisor.dispose();
     }
+  });
+});
+
+describe('restart cleanup journal conservative replay (GH-280)', () => {
+  function journalFixture() {
+    const dir = tmpDir(); const db = new LedgerDb(dir); const api = new LedgerApi(db.handle);
+    api.addJob({ id: 'custody-job', repo: 'fixture', title: 'Custody' });
+    api.addJob({ id: 'other-job', repo: 'fixture', title: 'Other custody' });
+    return { db, api, journal: new RestartCleanupJournal(api) };
+  }
+
+  it('replays more than one page without truncating legacy or malformed event-identity debt', () => {
+    const h = journalFixture();
+    try {
+      for (let i = 0; i < 205; i += 1) h.api.appendCustomEvent({ kind: 'supervision.restart-rejected', jobId: 'custody-job',
+        payload: { disposition: 'cleanup-unconfirmed', replacement_agent_id: 'reused-id' } });
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-pending', jobId: 'custody-job', payload: null });
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'custody-job',
+        payload: { replacement_agent_id: 'reused-id', disposal_acknowledged: true, cessation: 'ceased' } });
+      const reader = new RestartCleanupJournal(h.api);
+      expect(reader.unresolved('custody-job')).toHaveLength(206);
+      expect(reader.unresolved('other-job')).toEqual([]);
+      expect(reader.unresolved('custody-job')).toHaveLength(206);
+    } finally { h.db.close(); }
+  });
+
+  it('retains malformed generation debt even when a matching malformed confirmation claims proof', () => {
+    const h = journalFixture();
+    try {
+      const pending = h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-pending', jobId: 'custody-job', agentId: 'origin',
+        payload: { generation: 'not-an-owned-generation', replacement_agent_id: 'same-id' } });
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'custody-job', agentId: 'origin',
+        payload: { generation: 'not-an-owned-generation', origin_seq: pending.seq, replacement_agent_id: 'same-id', disposal_acknowledged: true, cessation: 'ceased' } });
+      expect(h.journal.unresolved('custody-job')).toMatchObject([{ originSeq: pending.seq, generation: null }]);
+    } finally { h.db.close(); }
+  });
+
+  it('retains an unconfirmed audit with a valid generation but no matching originating journal', () => {
+    const h = journalFixture();
+    try {
+      const malformed = h.api.appendCustomEvent({ kind: 'supervision.restart-rejected', jobId: 'custody-job', agentId: 'origin',
+        payload: { disposition: 'cleanup-unconfirmed', generation: 'c661c47d-c2bc-4b80-91af-e86866002f03', origin_seq: -1, replacement_agent_id: 'same-id' } });
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'custody-job', agentId: 'origin',
+        payload: { generation: 'c661c47d-c2bc-4b80-91af-e86866002f03', origin_seq: malformed.seq, replacement_agent_id: 'same-id', disposal_acknowledged: true, cessation: 'ceased' } });
+      expect(h.journal.unresolved('custody-job')).toMatchObject([{ originSeq: malformed.seq, generation: null }]);
+    } finally { h.db.close(); }
+  });
+
+  it('contains synchronous custody queries during journal publication without recursive generations or receipts', () => {
+    const dir = tmpDir(); const db = new LedgerDb(dir); const bus = new EventBus(); const api = new LedgerApi(db.handle, { bus });
+    const journal = new RestartCleanupJournal(api); const handle = new FakeHandle('minion', 'same-id', null);
+    api.addJob({ id: 'custody-job', repo: 'fixture', title: 'Custody' });
+    const detach = bus.subscribe((event) => {
+      if (event.kind === 'supervision.restart-cleanup-pending') {
+        expect(() => journal.begin(handle, 'custody-job', 'origin')).toThrow('write is in progress');
+        expect(journal.unresolved('custody-job')).toHaveLength(1);
+      }
+    });
+    try {
+      const debt = journal.begin(handle, 'custody-job', 'origin');
+      expect(journal.begin(handle, 'custody-job', 'origin')).toBe(debt);
+      expect(api.listJobEvents('custody-job', { limit: 100 }).filter((event) => event.kind === 'supervision.restart-cleanup-pending')).toHaveLength(1);
+    } finally { detach(); db.close(); }
+  });
+
+  it('keeps same-ID generations independent and rejects wrong job, generation, binding, evidence and order', () => {
+    const h = journalFixture();
+    try {
+      const futureSeq = h.api.latestEventSeq() + 2;
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'custody-job', agentId: 'origin',
+        payload: { generation: 'c661c47d-c2bc-4b80-91af-e86866002f03', origin_seq: futureSeq, replacement_agent_id: 'same-id', disposal_acknowledged: true, cessation: 'ceased' } });
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-pending', jobId: 'custody-job', agentId: 'origin',
+        payload: { generation: 'c661c47d-c2bc-4b80-91af-e86866002f03', replacement_agent_id: 'same-id' } });
+      const one = h.journal.begin(new FakeHandle('minion', 'same-id', null), 'custody-job', 'origin');
+      const two = h.journal.begin(new FakeHandle('minion', 'same-id', null), 'custody-job', 'origin');
+      expect(one.generation).not.toBe(two.generation);
+      const proof = { generation: one.generation, origin_seq: one.originSeq, replacement_agent_id: 'same-id',
+        disposal_acknowledged: true, cessation: 'ceased' };
+      for (const delta of [{ generation: two.generation }, { disposal_acknowledged: false }, { cessation: 'unknown' },
+        { replacement_agent_id: 'another-id' }, { origin_seq: -1 }]) {
+        h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'custody-job', agentId: 'origin', payload: { ...proof, ...delta } });
+      }
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'other-job', agentId: 'origin', payload: proof });
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'custody-job', agentId: 'wrong-origin', payload: proof });
+      expect(h.journal.unresolved('custody-job')).toHaveLength(3);
+      h.journal.confirm(one);
+      expect(h.journal.unresolved('custody-job').map((debt) => debt.originSeq)).toEqual([futureSeq, two.originSeq]);
+      h.journal.confirm(two);
+      expect(h.journal.unresolved('custody-job')).toHaveLength(1);
+    } finally { h.db.close(); }
   });
 });

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { loadConfig, type Role, type RuntimeId } from '../src/config.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -11,6 +11,7 @@ import { BoardEngine } from '../src/board/engine.js';
 import { RuntimeRegistry, type AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { AgentHandle, AgentRuntime, PendingTurn, RuntimeEvent, RuntimeEventListener, SpawnOptions } from '../src/runtime/types.js';
 import type { SessionStore } from '../src/sessions/store.js';
+import { observeDisposalSettlement } from '../src/runtime/disposal-observation.js';
 import { Supervisor } from '../src/supervision/supervisor.js';
 import { rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
 import type { WorktreePort } from '../src/dispatch/worktree-port.js';
@@ -45,7 +46,7 @@ function fixture(options: { readonly sameId?: boolean; readonly holdCleanup?: bo
   const releaseTurn = deferred<void>();
   const releaseRetry = deferred<void>();
   const controls: { readonly emit: (event: RuntimeEvent) => void; pending: PendingTurn | null;
-    readonly prompts: string[] }[] = [];
+    readonly prompts: string[]; cleanupReject: boolean; cessation: 'ceased' | 'unknown' | null }[] = [];
   let count = 0;
   const adapter: AgentRuntime = {
     id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }), dispose: async () => {},
@@ -63,7 +64,7 @@ function fixture(options: { readonly sameId?: boolean; readonly holdCleanup?: bo
       const sessionFile = opts.resumeFile ?? join(dir, `session-${ordinal}.jsonl`);
       let state: 'idle' | 'streaming' | 'error' | 'disposed' = 'idle';
       const listeners = new Set<RuntimeEventListener>();
-      const control = { pending: null as PendingTurn | null, prompts: [] as string[], emit: (event: RuntimeEvent) => {
+      const control = { pending: null as PendingTurn | null, prompts: [] as string[], cleanupReject: false, cessation: null as 'ceased' | 'unknown' | null, emit: (event: RuntimeEvent) => {
         if (event.type === 'state') state = event.state as typeof state;
         for (const listener of listeners) listener(event);
       } };
@@ -92,10 +93,11 @@ function fixture(options: { readonly sameId?: boolean; readonly holdCleanup?: bo
         steer: async () => {}, followUp: async () => {}, pendingTurn: () => control.pending,
         health: () => ({ state, lastActivity: null, sessionFile }),
         hasLiveProcess: () => state === 'streaming', isCompacting: () => false,
-        cessationEvidence: () => state === 'disposed' ? 'ceased' : 'unknown',
+        cessationEvidence: () => control.cessation ?? (state === 'disposed' ? 'ceased' : 'unknown'),
         subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
         dispose: async () => {
           if (ordinal === 2 && options.holdCleanup) await releaseCleanup.promise;
+          if (control.cleanupReject) throw new Error('owned native disposal rejected');
           control.pending = null;
           control.emit({ type: 'state', state: 'disposed' });
         },
@@ -123,7 +125,7 @@ function fixture(options: { readonly sameId?: boolean; readonly holdCleanup?: bo
     ...(options.rateLimitSuccessor ? { rateLimitBackoff: { baseMs: 1, maxMs: 1, maxRetries: 1, patterns: [] },
       sleep: () => releaseRetry.promise, jitter: () => 0 } : {}) });
   const worktrees = { listWorktrees: () => [{ kind: 'job', status: 'active', path: dir }] } as unknown as WorktreePort;
-  return { registry, supervisor, ledger, envelopes, controls, jobId, created, secondStarted, releaseSecond, thirdStarted, releaseSpawn,
+  return { dir, db, config, notifications, registry, supervisor, ledger, envelopes, controls, jobId, created, secondStarted, releaseSecond, thirdStarted, releaseSpawn,
     releaseCleanup, releaseThird, releaseTurn, releaseRetry,
     start: async () => {
       const original = await registry.spawn('minion');
@@ -154,6 +156,117 @@ function fixture(options: { readonly sameId?: boolean; readonly holdCleanup?: bo
 }
 
 describe('registry publication and production consumer custody (GH-280)', () => {
+  function reader(h: ReturnType<typeof fixture>) {
+    const db = new LedgerDb(h.dir); const ledger = new LedgerApi(db.handle); const bus = new EventBus();
+    const supervisor = new Supervisor({ registry: new RuntimeRegistry({ config: h.config, store: {} as SessionStore }),
+      ledger, notifications: new NotificationCenter({ ledger, bus }), config: { ...h.config.supervision, enabled: false } });
+    return { ledger, supervisor, close: () => { supervisor.dispose(); db.close(); } };
+  }
+
+  it('records subsequent exact native disposal after watchdog shutdown and replays it across LedgerDb reopen (GH-280)', async () => {
+    const h = fixture();
+    try {
+      const rejected = await h.start();
+      h.controls[1]!.cleanupReject = true;
+      h.ledger.beginPendingRebrief({ jobId: h.jobId, note: 'superseded', briefing: null });
+      h.releaseSpawn.resolve(); await flush();
+      expect(h.supervisor.pendingProducerBlockers(h.jobId)).toHaveLength(1);
+      const pending = h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-pending')!;
+      h.supervisor.dispose();
+      h.controls[1]!.cleanupReject = false;
+      await h.registry.dispose();
+      expect(rejected.cessationEvidence?.()).toBe('ceased');
+      const receipt = h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-confirmed')!;
+      expect(receipt).not.toBeNull();
+      expect(pending).not.toBeNull();
+      expect(receipt.payload).toMatchObject({ origin_seq: pending.seq, replacement_agent_id: rejected.id,
+        generation: (pending.payload as { generation: string }).generation, disposal_acknowledged: true, cessation: 'ceased' });
+      h.db.close();
+      const next = reader(h);
+      try { expect(next.supervisor.pendingProducerBlockers(h.jobId)).toEqual([]); } finally { next.close(); }
+    } finally { await h.dispose(); }
+  });
+
+  it('refreshes late positive cessation from the original custodian after watchdog disposal (GH-280)', async () => {
+    const h = fixture();
+    try {
+      await h.start();
+      h.controls[1]!.cessation = 'unknown';
+      h.ledger.beginPendingRebrief({ jobId: h.jobId, note: 'superseded', briefing: null });
+      h.releaseSpawn.resolve(); await flush();
+      const next = reader(h);
+      try {
+        expect(next.supervisor.pendingProducerBlockers(h.jobId)).toHaveLength(1);
+        h.supervisor.dispose();
+        // A claimed event alone is not proof; the exact adapter probe must agree.
+        h.controls[1]!.emit({ type: 'cessation_evidence', evidence: 'ceased' });
+        expect(next.supervisor.pendingProducerBlockers(h.jobId)).toHaveLength(1);
+        h.controls[1]!.cessation = 'ceased';
+        h.controls[1]!.emit({ type: 'cessation_evidence', evidence: 'ceased' });
+        expect(next.supervisor.pendingProducerBlockers(h.jobId)).toEqual([]);
+        h.controls[1]!.emit({ type: 'cessation_evidence', evidence: 'ceased' });
+        expect(h.ledger.listJobEvents(h.jobId, { limit: 100 }).filter((event) => event.kind === 'supervision.restart-cleanup-confirmed')).toHaveLength(1);
+      } finally { next.close(); }
+    } finally { await h.dispose(); }
+  });
+
+  it('persists late native confirmation even when posting its cleanup notice failed (GH-280)', async () => {
+    const h = fixture();
+    try {
+      await h.start();
+      h.controls[1]!.cessation = 'unknown';
+      h.ledger.beginPendingRebrief({ jobId: h.jobId, note: 'superseded', briefing: null });
+      const post = vi.spyOn(h.notifications, 'post').mockImplementation(() => { throw new Error('notice storage unavailable'); });
+      h.releaseSpawn.resolve(); await flush();
+      post.mockRestore();
+      expect(h.supervisor.pendingProducerBlockers(h.jobId)).toHaveLength(1);
+      expect(h.ledger.listNotifications({ limit: 100 }).filter((notice) => notice.kind === 'supervision.restart-cleanup-unconfirmed')).toEqual([]);
+      h.supervisor.dispose();
+      h.controls[1]!.cessation = 'ceased';
+      h.controls[1]!.emit({ type: 'cessation_evidence', evidence: 'ceased' });
+      expect(h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-confirmed')).not.toBeNull();
+      h.db.close(); const next = reader(h);
+      try { expect(next.supervisor.pendingProducerBlockers(h.jobId)).toEqual([]); } finally { next.close(); }
+    } finally { await h.dispose(); }
+  });
+
+  it('does not let a successful same-ID successor disposal release the missing original-generation proof (GH-280)', async () => {
+    const h = fixture({ sameId: true });
+    let routing: ReturnType<typeof rebriefFreshMinion> | null = null;
+    try {
+      await h.start();
+      h.controls[1]!.cleanupReject = true;
+      const native = h.rebrief(); routing = native.routing;
+      await flush();
+      h.releaseSpawn.resolve(); await flush();
+      expect(h.supervisor.pendingProducerBlockers(h.jobId).join(' ')).toContain('cleanup unconfirmed');
+      h.releaseTurn.resolve(); await routing;
+      const successor = h.registry.getHandle('original')!;
+      expect(successor).not.toBeNull();
+      await h.registry.disposeHandle(successor);
+      h.supervisor.dispose();
+      h.controls[1]!.emit({ type: 'cessation_evidence', evidence: 'ceased' });
+      const next = reader(h);
+      try { expect(next.supervisor.pendingProducerBlockers(h.jobId)).toHaveLength(1); } finally { next.close(); }
+      h.controls[1]!.cleanupReject = false; // fixture teardown only, exact original owner
+    } finally { h.controls[1]!.cleanupReject = false; await h.dispose(); if (routing !== null) await routing; }
+  });
+
+  it('contains disposal-observer failures without changing native fulfillment or rejection (GH-280)', async () => {
+    const h = fixture();
+    try {
+      const handle = await h.registry.spawn('minion');
+      const calls: boolean[] = [];
+      const detach = observeDisposalSettlement(handle, (acknowledged) => { calls.push(acknowledged); throw new Error('observer failed'); });
+      h.controls[0]!.cleanupReject = true;
+      await expect(handle.dispose()).rejects.toThrow('owned native disposal rejected');
+      h.controls[0]!.cleanupReject = false;
+      await expect(handle.dispose()).resolves.toBeUndefined();
+      expect(calls).toEqual([false, true]);
+      detach();
+    } finally { await h.dispose(); }
+  });
+
   it('hides a fresh-id result and its startup error from every consumer until the owner rejects it', async () => {
     const h = fixture();
     try {

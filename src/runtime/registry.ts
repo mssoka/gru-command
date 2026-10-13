@@ -14,6 +14,7 @@ import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
 import { publishSpawnRegistration } from './spawn-registration.js';
+import { notifyDisposalSettlement } from './disposal-observation.js';
 
 export { WorkerDisposalInProgressError };
 
@@ -718,13 +719,14 @@ export class RuntimeRegistry {
             return probe(target.hasLiveProcess) === 'false' && probe(target.isCompacting) === 'false';
           };
           disposing = Promise.resolve().then(() => target.dispose()).then(
-            () => { if (ceased()) releaseHandle(); },
+            () => { notifyDisposalSettlement(resident, true); if (ceased()) releaseHandle(); },
             (error: unknown) => {
               // A rejected disposal still proves cessation when terminal
               // health says so; otherwise the slot stays owned/debt.
               if (target.health().state === 'disposed') releaseHandle();
               disposing = null;
               disposingNow = false;
+              notifyDisposalSettlement(resident, false);
               throw error;
             },
           );

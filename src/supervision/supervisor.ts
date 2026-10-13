@@ -27,6 +27,8 @@ import {
 import { WorkerDisposalInProgressError } from '../runtime/worker-errors.js';
 import { stageSpawnRegistration } from '../runtime/spawn-registration.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
+import { observeDisposalSettlement } from '../runtime/disposal-observation.js';
+import { RestartCleanupJournal, restartCleanupDiagnostic, type RestartCleanupDebt } from './restart-cleanup.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -259,6 +261,15 @@ interface RejectedRestartCleanup {
   readonly preserveController: boolean;
   disposalAcknowledged: boolean;
   notificationId: string | null;
+  debt: RestartCleanupDebt | null;
+  detach: () => void;
+  settling: boolean;
+}
+
+interface RecoveryDelivery {
+  readonly snapshots: Set<InterruptedTurn>;
+  readonly errors: WeakSet<RuntimeEvent>;
+  readonly classifications: Promise<void>[];
 }
 
 /** Structured provider identity from a runtime error, when the runtime
@@ -410,10 +421,13 @@ export class Supervisor {
    * rejects after the registry has already removed the handle. */
   private readonly rejectedRestartCleanup = new Map<AgentHandle, RejectedRestartCleanup>();
   private readonly rejectedRestartControllers = new WeakSet<SupervisedAgent>();
+  private readonly cleanupJournal: RestartCleanupJournal;
+  private readonly recoveryDeliveries = new WeakMap<AgentHandle, RecoveryDelivery>();
   /** Rung ownership survives a newer same-id controller replacing its index. */
   private readonly restartingAgents = new Map<SupervisedAgent, RestartFlight>();
   /** Held startup failures must retain their synchronous pending-turn evidence. */
   private readonly restartErrorSnapshots = new WeakMap<RuntimeEvent, InterruptedTurn>();
+  private readonly restartSnapshotSources = new WeakMap<InterruptedTurn, RuntimeEvent>();
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
   private restoredStops = new Map<string, AgentSupervisionView>();
@@ -429,6 +443,7 @@ export class Supervisor {
     this.cfg = opts.config;
     this.registry = opts.registry;
     this.ledger = opts.ledger;
+    this.cleanupJournal = new RestartCleanupJournal(opts.ledger);
     this.notifications = opts.notifications;
     this.decisions = opts.decisions ?? null;
     this.providerWalls = opts.providerWalls ?? null;
@@ -869,12 +884,13 @@ export class Supervisor {
             // classification so known auth or quota failures produce durable
             // stop/re-arm guidance.
             if (!this.absorbRateLimitFailure(agent, event.error, this.restartErrorSnapshots.get(event))) {
-              void this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true, {
+              const classification = this.evaluateRecovery(agent, `runtime error: ${event.error}`, false, true, {
                 provider: event.provider ?? null,
                 model: event.model ?? null,
                 error: event.error,
                 typed: event.typed ?? null,
               });
+              if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(classification);
             }
           }
           break;
@@ -1530,13 +1546,13 @@ export class Supervisor {
     runtimeError = false,
     source: ProviderErrorSource | null = null,
   ): Promise<void> {
-    // Any recovery entry (hang, fatal, non-rate-limit error) supersedes an
-    // in-flight automatic retry: the failure it was retrying is no longer
-    // the failure being handled. The delivery continuation self-cancels on
-    // the cleared incident identity; a pending restart-recovery admission
-    // wait is superseded too.
+    // Recovery guidance supersedes an in-flight automatic retry. Only an
+    // actual stop/restart also transfers restart-delivery admission custody;
+    // generic nonfatal guidance must leave its failed delivery to settle.
     this.clearRateLimitRetry(agent, 'superseded');
-    this.clearRecoveryAdmission(agent);
+    // A generic nonfatal classification alone transfers no custody. Its
+    // failed delivery still owns settlement until stop/restart actually wins.
+    if (allowRestart) this.clearRecoveryAdmission(agent);
     // Perkins review attempts are owned by the bounded review workflow. A
     // supervisor resume would drop that attempt's cwd/isolation contract and
     // race the workflow's one permitted retry, so abort the handle only; the
@@ -1673,6 +1689,7 @@ export class Supervisor {
    * — the supervisor's stop semantics are identical either way. */
   private stopForGuidance(agent: SupervisedAgent, failureClass: string, source: ProviderErrorSource | null = null): void {
     if (agent.breakerOpen) return;
+    this.clearRecoveryAdmission(agent);
     agent.breakerOpen = true;
     agent.state = 'stopped';
     agent.stopReason = failureClass;
@@ -1828,6 +1845,9 @@ export class Supervisor {
         const snapshot = selectedSnapshot?.pending != null ? selectedSnapshot : flight.pendingErrorSnapshot ?? selectedSnapshot;
         if (snapshot !== undefined) {
           this.restartErrorSnapshots.set(flight.pendingError, snapshot);
+          const delivery = this.recoveryDeliveries.get(handle);
+          const source = this.restartSnapshotSources.get(snapshot);
+          if (source !== undefined && delivery?.errors.has(source)) delivery.snapshots.add(snapshot);
           current.pendingRecovery = snapshot;
         }
         this.onEnvelope({ handle, agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile,
@@ -1940,6 +1960,7 @@ export class Supervisor {
               const snapshot = this.captureInterruptedTurn(handle, agentRef);
               if (snapshot !== null) {
                 this.restartErrorSnapshots.set(event, snapshot);
+                this.restartSnapshotSources.set(snapshot, event);
                 if (snapshot.pending !== null) flight.pendingErrorSnapshot = snapshot;
               }
             } catch (error) {
@@ -2074,8 +2095,20 @@ export class Supervisor {
     // Captured before spawn: failed authority reads must not lose cleanup's job.
     const { jobId } = authority;
     const preserveController = agent.breakerOpen && this.agents.get(agent.agentId) === agent;
-    const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, preserveController, disposalAcknowledged: false, notificationId: null };
+    const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, preserveController, disposalAcknowledged: false,
+      notificationId: null, debt: null, detach: () => {}, settling: false };
     this.rejectedRestartCleanup.set(spawned, cleanup);
+    const observeProof = (): void => {
+      if (!cleanup.disposalAcknowledged || !this.restartCessationConfirmed(spawned)) return;
+      try { this.settleRejectedRestartCleanup(spawned, cleanup); }
+      catch (error) { this.log('error', 'restart cleanup proof persistence failed — custody retained', { agent_id: spawned.id, error: String(error) }); }
+    };
+    const detachSettlement = observeDisposalSettlement(spawned, (acknowledged) => {
+      if (acknowledged) cleanup.disposalAcknowledged = true;
+      observeProof();
+    });
+    const detachEvidence = spawned.subscribe((event) => { if (event.type === 'cessation_evidence') observeProof(); });
+    cleanup.detach = () => { detachSettlement(); detachEvidence(); };
     if (!preserveController) this.rejectedRestartControllers.add(agent);
     const observed = this.agents.get(spawned.id);
     if (observed?.handle === spawned) {
@@ -2086,6 +2119,8 @@ export class Supervisor {
     }
     let cleanupError: string | null = null;
     try {
+      // Journal physical custody before entering the asynchronous disposal.
+      cleanup.debt = this.cleanupJournal.begin(spawned, jobId, agent.agentId);
       await this.registry.disposeHandle(spawned);
       cleanup.disposalAcknowledged = true;
       if (!this.restartCessationConfirmed(spawned)) throw new Error('adapter-owned cessation evidence is unknown after disposal');
@@ -2111,6 +2146,8 @@ export class Supervisor {
         jobId,
         payload: {
           reason,
+          generation: cleanup.debt?.generation ?? null,
+          origin_seq: cleanup.debt?.originSeq ?? null,
           replacement_agent_id: spawned.id,
           authority_epoch: authority.authorityEpoch,
           disposition: cleanupError === null ? 'disposed' : 'cleanup-unconfirmed',
@@ -2128,10 +2165,14 @@ export class Supervisor {
           severity: 'error',
           title: `Superseded minion ${spawned.id}: cleanup is unconfirmed`,
           detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused automatic recovery, but cleanup is unconfirmed: ${cleanupError}. ` +
-            'Producer ownership remains unknown. Confirm cleanup before retiring or resuming the lane; no automatic restart is authorized.',
+            'Producer ownership remains unknown. Only the original native owner can persist acknowledgment and positive cessation proof. ' +
+            'If that owner is lost in a hard crash, proof is unavailable: ACK, restart and successor cleanup cannot release custody. No automatic restart is authorized.',
           agentId: agent.agentId,
         });
         cleanup.notificationId = notice.id;
+        // A synchronous notice observer may have persisted proof before post
+        // returned its ID. Presentation follows that already-durable receipt.
+        if (!this.rejectedRestartCleanup.has(spawned)) this.ledger.resolveNotificationById(notice.id, 'supervision-cleanup-confirmed');
       } catch (error) {
         this.log('error', 'restart cleanup notification could not be posted', { agent_id: agent.agentId, error: String(error) });
       }
@@ -2147,6 +2188,14 @@ export class Supervisor {
   }
 
   private settleRejectedRestartCleanup(handle: AgentHandle, cleanup: RejectedRestartCleanup): void {
+    if (this.rejectedRestartCleanup.get(handle) !== cleanup || cleanup.settling) return;
+    if (cleanup.debt === null) throw new Error('restart cleanup pending journal was not persisted; custody retained');
+    // Synchronous ledger subscribers can query custody during publication.
+    // Neither recursive receipt writes nor failed writes may erase pending debt.
+    cleanup.settling = true;
+    try { this.cleanupJournal.confirm(cleanup.debt); }
+    finally { cleanup.settling = false; }
+    cleanup.detach();
     this.rejectedRestartCleanup.delete(handle);
     const { agent, recovery, notificationId } = cleanup;
     if (!cleanup.preserveController && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
@@ -2155,8 +2204,6 @@ export class Supervisor {
     if (notificationId !== null) {
       try {
         this.ledger.resolveNotificationById(notificationId, 'supervision-cleanup-confirmed');
-        this.ledger.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: cleanup.jobId,
-          agentId: agent.agentId, payload: { replacement_agent_id: handle.id } });
       } catch (error) {
         this.log('warn', 'restart cleanup confirmation audit failed', { agent_id: handle.id, error: String(error) });
       }
@@ -2317,6 +2364,15 @@ export class Supervisor {
     const controller = new AbortController();
     this.clearRecoveryAdmission(agent); // supersede any older recovery wait
     agent.recoveryAdmission = controller;
+    const delivery: RecoveryDelivery = { snapshots: new Set([recovery]), errors: new WeakSet(), classifications: [] };
+    this.recoveryDeliveries.set(handle, delivery);
+    let turnEnded = false;
+    const detachDelivery = handle.subscribe((event) => {
+      if (event.type === 'turn_end') turnEnded = true;
+      // Queued/native subsequent turns on the same object are not this
+      // failed delivery's custody, even before its promise continuation runs.
+      if (event.type === 'error' && !turnEnded) delivery.errors.add(event);
+    });
     const stillCurrent = (): boolean =>
       !this.disposed &&
       !controller.signal.aborted &&
@@ -2370,6 +2426,9 @@ export class Supervisor {
         reason,
       });
     } catch (error) {
+      // Deferred error guidance may still be deciding whether another
+      // custodian took this delivery. Wait for its exact classifications.
+      await Promise.all(delivery.classifications);
       // Cancellation is not an orphan: the attempt was superseded.
       if (!stillCurrent()) return;
       // Release the slot before consulting the settlement: the retry
@@ -2402,6 +2461,9 @@ export class Supervisor {
         });
         return;
       }
+      if (agent.inRestart || agent.breakerOpen || agent.rateLimitRetry !== null || agent.decisionPending || agent.queuedRecovery !== null) return;
+      if (agent.pendingRecovery !== null && !delivery.snapshots.has(agent.pendingRecovery)) return;
+      if (agent.pendingRecovery !== null) agent.pendingRecovery = null;
       this.log('error', 'interrupted turn could not be resumed — posting recoverable-lane note', {
         agent_id: laneAgentId,
         reason,
@@ -2409,6 +2471,8 @@ export class Supervisor {
       });
       this.postOrphanedTurn(laneAgentId, reason, String(error));
     } finally {
+      detachDelivery();
+      if (this.recoveryDeliveries.get(handle) === delivery) this.recoveryDeliveries.delete(handle);
       if (agent.recoveryAdmission === controller) agent.recoveryAdmission = null;
       lease?.release();
     }
@@ -2688,14 +2752,18 @@ export class Supervisor {
    * queued retry or undecided recovery is still producer ownership even
    * while its durable agent row says idle/error/disposed. */
   pendingProducerBlockers(jobId: string): readonly string[] {
-    const rejected = [...this.rejectedRestartCleanup].flatMap(([handle, cleanup]) => {
-      if (cleanup.jobId !== jobId) return [];
-      if (cleanup.disposalAcknowledged && this.restartCessationConfirmed(handle)) {
-        this.settleRejectedRestartCleanup(handle, cleanup);
-        return [];
+    const unjournaled: string[] = [];
+    for (const [handle, cleanup] of this.rejectedRestartCleanup) {
+      if (cleanup.jobId !== jobId) continue;
+      try {
+        cleanup.debt ??= this.cleanupJournal.begin(handle, cleanup.jobId, cleanup.agent.agentId);
+        if (cleanup.disposalAcknowledged && this.restartCessationConfirmed(handle)) this.settleRejectedRestartCleanup(handle, cleanup);
+      } catch (error) {
+        this.log('error', 'restart cleanup journal unavailable — custody retained', { agent_id: handle.id, error: String(error) });
       }
-      return [`restart cleanup unconfirmed: ${handle.id}`];
-    });
+      if (cleanup.debt === null) unjournaled.push(`restart cleanup unconfirmed: ${handle.id} (pending journal write failed)`);
+    }
+    const rejected = this.cleanupJournal.unresolved(jobId).map(restartCleanupDiagnostic);
     const supervised = this.ledger.listAgents().filter((row) => row.jobId === jobId).flatMap((row) => {
       const agent = this.agents.get(row.id);
       if (agent === undefined) {
@@ -2710,7 +2778,7 @@ export class Supervisor {
     });
     const flights = [...this.restartingAgents].flatMap(([agent, flight]) =>
       flight.authority?.jobId === jobId ? [`restart in flight: ${agent.agentId}`] : []);
-    return [...rejected, ...supervised, ...flights];
+    return [...rejected, ...unjournaled, ...supervised, ...flights];
   }
 
   /** Board feed: supervision view for one agent id (or null). */
