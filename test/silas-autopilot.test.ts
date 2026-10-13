@@ -1095,7 +1095,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
           ];
         },
       },
-      resolveRemote: () => ({ host: 'github.com', owner: 'mssoka', repo: 'gru-command' }),
+      resolveRemote: () => ({ host: 'github.com', owner: 'example-org', repo: 'gru-command' }),
     });
     await expect(ops.listOpenPrsForHead({ repoPath: '/tmp/lane', branch: 'gru/lane' })).resolves.toEqual([
       { number: 4, url: 'https://github.com/mssoka/gru-command/pull/4' },

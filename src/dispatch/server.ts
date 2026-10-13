@@ -629,9 +629,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const jobId = strField(body, 'job_id');
       // Firing-rule provenance (issue #243): the delivered-pr-register rule
       // fires here when Silas registers the one PR the lane actually has.
-      const ruleId = parseSilasRouteRuleId('pr', strictOptStrField(body, 'rule_id'));
-      if (ruleId !== null && by !== 'silas') {
-        throw new Error(`rule_id "${ruleId}" fires only on a silas request`);
+      const prRuleId = parseSilasRouteRuleId('pr', strictOptStrField(body, 'rule_id')) ?? undefined;
+      if (prRuleId !== undefined && by !== 'silas') {
+        throw new Error(`rule_id "${prRuleId}" fires only on a silas request`);
       }
       const job = options.dispatch.recordPr(jobId, strField(body, 'url'));
       if (by === 'silas') {
@@ -640,7 +640,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           jobId,
           payload: {
             url: job.prUrl,
-            ...(ruleId !== null ? { rule_id: ruleId } : {}),
+            ...(prRuleId === undefined ? {} : { rule_id: prRuleId }),
           },
         });
       }
@@ -695,14 +695,17 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const by = byField(body);
       const force = optBoolField(body, 'force');
       const ruleField = strictOptStrField(body, 'rule_id');
-      const ruleId = parseSilasRouteRuleId('review', ruleField);
+      // The route validator answers `null` for an absent rule; the rest of
+      // this handler keys on `undefined` (an absent field never mints a
+      // `rule_id: null` on the deferral receipt).
+      const ruleId = parseSilasRouteRuleId('review', ruleField) ?? undefined;
       const sourceRoundId = strictOptStrField(body, 'source_round_id');
       const requestedTargetRef = optStrField(body, 'target_ref');
       const evidenceRefs = optEvidenceField(body);
-      if (ruleId !== null && by !== 'silas') {
+      if (ruleId !== undefined && by !== 'silas') {
         throw new Error(`rule_id "${ruleId}" fires only on a silas request`);
       }
-      if (sourceRoundId !== undefined && ruleId === null) {
+      if (sourceRoundId !== undefined && ruleId === undefined) {
         throw new Error('source_round_id must be paired with a rule_id');
       }
       if (ruleId === 'clean-abort-service-restart' && sourceRoundId === undefined) {
