@@ -436,33 +436,32 @@ function failedDirectivesForFingerprint(ledger: AutopilotLedger, jobId: string, 
   }
 }
 
-/** The newest CI observation bound to the lane (issue #243 F-M2): the latest
- * `github.ci-green`/`github.ci-failed` signal OR the latest
- * `github.branch-state` cursor's `ci` state (which also carries `pending`).
 /** The newest CI observation bound to the lane (issue #243 F-M2). The
  * NEWEST observation governs — a historical green must never survive a
  * newer failed/pending/malformed observation. Returns `malformed: true`
  * when the newest CI-bearing event carries no usable sha/status (an
  * unknown or malformed observation never falls back to an older green).
- * Optional `repo`/`pr` fields ride along for the caller's binding check. */
+ * `repo`/`pr` ride along for the caller's repository/PR binding check. */
 export interface CiObservation {
   readonly malformed: boolean;
   readonly sha: string | null;
   readonly status: string | null;
+  readonly repo: string | null;
   readonly pr: number | null;
 }
 
 export function latestCiObservation(ledger: AutopilotLedger, jobId: string): CiObservation | null {
-  const signalSha = (payload: unknown): string | null => {
+  const signalString = (payload: unknown, key: string): string | null => {
     if (payload === null || typeof payload !== 'object') return null;
-    const sha = (payload as { sha?: unknown }).sha;
-    return typeof sha === 'string' && sha !== '' ? sha : null;
+    const value = (payload as Record<string, unknown>)[key];
+    return typeof value === 'string' && value !== '' ? value : null;
   };
   const signalPr = (payload: unknown): number | null => {
     if (payload === null || typeof payload !== 'object') return null;
     const pr = (payload as { pr?: unknown }).pr;
     return typeof pr === 'number' && Number.isFinite(pr) ? pr : null;
   };
+  const malformedObservation = (): CiObservation => ({ malformed: true, sha: null, status: null, repo: null, pr: null });
   const entries: { readonly seq: number; readonly kind: 'green' | 'failed' | 'branch'; readonly payload: unknown }[] = [];
   const green = ledger.latestJobEvent(jobId, 'github.ci-green');
   if (green !== null) entries.push({ seq: green.seq, kind: 'green', payload: green.payload });
@@ -473,22 +472,30 @@ export function latestCiObservation(ledger: AutopilotLedger, jobId: string): CiO
   if (entries.length === 0) return null;
   const newest = entries.reduce((best, current) => (current.seq > best.seq ? current : best));
   if (newest.kind === 'green' || newest.kind === 'failed') {
-    const sha = signalSha(newest.payload);
-    if (sha === null) return { malformed: true, sha: null, status: null, pr: null };
-    return { malformed: false, sha, status: newest.kind === 'green' ? 'green' : 'failed', pr: signalPr(newest.payload) };
+    const sha = signalString(newest.payload, 'sha');
+    if (sha === null) return malformedObservation();
+    return {
+      malformed: false,
+      sha,
+      status: newest.kind === 'green' ? 'green' : 'failed',
+      repo: signalString(newest.payload, 'repo'),
+      pr: signalPr(newest.payload),
+    };
   }
   const payload = newest.payload;
   const ci = payload !== null && typeof payload === 'object' ? (payload as { ci?: unknown }).ci : undefined;
-  if (ci === null || ci === undefined || typeof ci !== 'object') {
-    return { malformed: true, sha: null, status: null, pr: null };
-  }
+  if (ci === null || ci === undefined || typeof ci !== 'object') return malformedObservation();
   const sha = (ci as { sha?: unknown }).sha;
   const status = (ci as { status?: unknown }).status;
-  if (typeof sha !== 'string' || sha === '' || typeof status !== 'string') {
-    return { malformed: true, sha: null, status: null, pr: null };
-  }
-  const pr = typeof payload === 'object' && payload !== null ? (payload as { pr_number?: unknown }).pr_number : undefined;
-  return { malformed: false, sha, status, pr: typeof pr === 'number' && Number.isFinite(pr) ? pr : null };
+  if (typeof sha !== 'string' || sha === '' || typeof status !== 'string') return malformedObservation();
+  const pr = payload !== null && typeof payload === 'object' ? (payload as { pr_number?: unknown }).pr_number : undefined;
+  return {
+    malformed: false,
+    sha,
+    status,
+    repo: signalString(payload, 'repo'),
+    pr: typeof pr === 'number' && Number.isFinite(pr) ? pr : null,
+  };
 }
 
 /** `pr-conflict-rebase`: ONE conflict-integration directive per head. */
@@ -573,14 +580,21 @@ function planReviewTrigger(row: PrWithoutReviewRow, ledger: AutopilotLedger): Ve
   if (observation === null || observation.malformed || observation.sha !== deliveredSha || observation.status !== 'green') {
     return refuse('the newest CI observation on the delivered head is not usable green');
   }
-  // Repo/PR binding (issue #243 F-M2): when the observation names a pull and
-  // the job carries a parseable PR url, they must agree — a green for another
-  // pull never authorizes this lane.
-  if (observation.pr !== null && job !== null && job.prUrl !== null) {
+  // Repo/PR binding (issue #243 F-M2): the observation must carry the
+  // repository it was observed on and, when the job names a pull, the same
+  // pull. A missing/malformed/wrong binding never authorizes this lane.
+  if (observation.repo === null) {
+    return refuse('the newest CI observation carries no repository binding');
+  }
+  if (!observation.repo.endsWith(`/${row.repo}`)) {
+    return refuse('the newest CI observation was observed on a different repository');
+  }
+  if (job !== null && job.prUrl !== null) {
     const match = /\/([0-9]+)\/?$/u.exec(job.prUrl);
     const jobPr = match === null ? null : Number(match[1]);
-    if (jobPr !== null && Number.isFinite(jobPr) && observation.pr !== jobPr) {
-      return refuse('the newest CI observation belongs to a different pull request');
+    if (jobPr !== null && Number.isFinite(jobPr)) {
+      if (observation.pr === null) return refuse('the newest CI observation carries no pull-request binding');
+      if (observation.pr !== jobPr) return refuse('the newest CI observation belongs to a different pull request');
     }
   }
   // The reviewed head is the one the green proved: bind it exactly, so the

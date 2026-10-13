@@ -316,6 +316,32 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
               'the newest CI observation on the delivered head is no longer usable green — review admission refused',
             );
           }
+          // Issue #243 M2: the repository/PR binding is re-proved at the
+          // FINAL post-await boundary too — a missing/wrong repository or a
+          // missing/wrong pull never admits this lane.
+          const job = deps.ledger.getJob(input.jobId);
+          const lane = deps.worktrees
+            .listWorktrees({ jobId: input.jobId })
+            .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+          const remote = lane === undefined ? null : deps.resolveRemote(lane.path);
+          if (remote !== null && observation.repo === null) {
+            throw new Error('the newest CI observation carries no repository binding — review admission refused');
+          }
+          if (remote !== null && observation.repo !== `${remote.owner}/${remote.repo}`) {
+            throw new Error('the newest CI observation was observed on a different repository — review admission refused');
+          }
+          if (job !== null && job.prUrl !== null) {
+            const match = /\/([0-9]+)\/?$/u.exec(job.prUrl);
+            const jobPr = match === null ? null : Number(match[1]);
+            if (jobPr !== null && Number.isFinite(jobPr)) {
+              if (observation.pr === null) {
+                throw new Error('the newest CI observation carries no pull-request binding — review admission refused');
+              }
+              if (observation.pr !== jobPr) {
+                throw new Error('the newest CI observation belongs to a different pull request — review admission refused');
+              }
+            }
+          }
         }
       },
     };

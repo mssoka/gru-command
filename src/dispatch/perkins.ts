@@ -1544,6 +1544,12 @@ interface AdmissionRetryInput {
   readonly noSpec?: boolean;
   readonly evidence?: readonly ReviewEvidenceRequest[];
   readonly claimedFixedPriors?: readonly number[];
+  /** Issue #243 H2/M2: the caller's LAST admission guard is carried through
+   * the in-memory automatic retry so EVERY readmission re-proves the
+   * original family/basis owner hold and the latest repo/PR/SHA-bound green.
+   * The closure re-reads the ledger when invoked, so it never becomes stale
+   * evidence; a first-attempt guard is not lifetime coverage. */
+  readonly finalAdmissionGuard?: () => void;
 }
 
 /** One job's automatic admission retry, held IN MEMORY only (owner decision
@@ -1576,6 +1582,7 @@ function admissionRetryInput(input: AdmissionRetryInput): AdmissionRetryInput {
     ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
     ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
     ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
+    ...(input.finalAdmissionGuard !== undefined ? { finalAdmissionGuard: input.finalAdmissionGuard } : {}),
   };
 }
 
