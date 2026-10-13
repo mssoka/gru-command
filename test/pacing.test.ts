@@ -12,6 +12,7 @@ import {
   resolveRateLimitBackoff,
   RetrySettlementUnavailableError,
   settleRetries,
+  type RetrySettlement,
 } from '../src/runtime/pacing.js';
 
 /**
@@ -371,6 +372,14 @@ describe('FIFO admission gate (minion turns + Perkins review turns)', () => {
   });
 });
 
+/** Drain the macrotask queue so Node can emit any pending
+ * 'unhandledRejection' for a rejection that no handler consumed. */
+async function drainMacrotasks(): Promise<void> {
+  for (let i = 0; i < 4; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
 describe('retry settlement consumption gate', () => {
   it('surfaces hook faults as a named unavailable error, missing hooks as none, and passes dispositions through', async () => {
     expect(await settleRetries(undefined, 'agent-a')).toBe('none');
@@ -440,6 +449,98 @@ describe('retry settlement consumption gate', () => {
     expect(abandoned).toHaveLength(1);
     release('recovered');
     await abandoned[0];
+  });
+
+  it('issue #339 G6: a pre-aborted IMMEDIATELY rejecting settlement surfaces the named error with no unhandled rejection', async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await expect(settleRetries(
+        () => Promise.reject(new Error('immediate hook rejection')),
+        'agent-preabort-immediate',
+        preAborted.signal,
+      )).rejects.toThrow(/retry settlement unavailable for agent agent-preabort-immediate: Error: immediate hook rejection/);
+      await drainMacrotasks();
+      // The throwing alias must be created only where consumed: an eager one
+      // leaves this derived rejection unconsumed on the pre-aborted branch.
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('issue #339 G6: a pre-aborted cancellation whose pending settlement later rejects hands a nonrejecting abandoned promise with no unhandled rejection', async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const abandoned: Promise<void>[] = [];
+      let rejectSettlement: (cause: unknown) => void = () => {};
+      const outcome = settleRetries(
+        () => new Promise<RetrySettlement>((_resolve, rejectPromise) => { rejectSettlement = rejectPromise; }),
+        'agent-preabort-late',
+        preAborted.signal,
+        (settlement) => { abandoned.push(settlement); },
+      );
+      await expect(outcome).resolves.toBe('cancelled');
+      expect(abandoned).toHaveLength(1);
+      // The physical retry settlement later REJECTS (hook fault): the handed
+      // alias must still settle without rejecting so a final observation can
+      // be chained onto it.
+      rejectSettlement(new Error('late hook rejection'));
+      await expect(abandoned[0]).resolves.toBeUndefined();
+      await drainMacrotasks();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('issue #339 G6: a mid-wait cancellation whose live settlement later rejects is consumed with no unhandled rejection', async () => {
+    const controller = new AbortController();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      let rejectSettlement: (cause: unknown) => void = () => {};
+      const pending = settleRetries(
+        () => new Promise<RetrySettlement>((_resolve, rejectPromise) => { rejectSettlement = rejectPromise; }),
+        'agent-midwait-reject',
+        controller.signal,
+      );
+      controller.abort();
+      await expect(pending).resolves.toBe('cancelled');
+      rejectSettlement(new Error('mid-wait hook rejection'));
+      await drainMacrotasks();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('issue #339 G6: synchronous-throw and already-settled outcome controls stay intact under cancellation', async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      // Synchronous hook throw: the named error is unchanged and no promise exists.
+      await expect(settleRetries(() => { throw new Error('sync hook fault'); }, 'agent-sync', preAborted.signal))
+        .rejects.toBeInstanceOf(RetrySettlementUnavailableError);
+      // Already-settled outcomes still beat the already-landed cancellation.
+      expect(await settleRetries(async () => 'none', 'agent-settled-none', preAborted.signal)).toBe('none');
+      expect(await settleRetries(async () => 'recovered', 'agent-settled-recovered', preAborted.signal)).toBe('recovered');
+      await drainMacrotasks();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 });
 
