@@ -462,3 +462,11 @@ describe('config-generate CLI', () => {
     expect(readFileSync(backup!, 'utf-8')).toBe(before);
   });
 });
+
+describe('issue #243 F-L1 empty-digest wording', () => {
+  it('qualifies the empty-digest statement with the due-decision-recheck exception', () => {
+    const block = renderConfigDocBlock();
+    expect(block).toContain('empty digest never wakes on its own; a due decision recheck still');
+    expect(block).not.toContain('empty digest never wakes). The wake prompt carries');
+  });
+});

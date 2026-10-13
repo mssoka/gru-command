@@ -408,3 +408,26 @@ describe('verdict digest is fenced by an unsettled verification (issue #243 orig
     expect(after.verdictsAwaitingDirective).toEqual([]);
   });
 });
+
+describe('verdict wake is suppressed while accepted ownership is unresolved (issue #243 F-M1)', () => {
+  it('retracts the verdict row while a live directive owns the lane, and publishes it once free', async () => {
+    const ledger = fixture();
+    ledger.addJob({ id: 'job-fm1', repo: 'fixture-app', title: 't', briefing: 'b' });
+    ledger.setJobStatus('job-fm1', 'working');
+    ledger.setJobStatus('job-fm1', 'in-review');
+    const round = ledger.addRound({ jobId: 'job-fm1', targetRef: HEAD });
+    ledger.setRoundStatus(round.id, 'live');
+    ledger.setRoundVerdict(round.id, 'changes-requested');
+    const before = await digest(ledger);
+    expect(before.verdictsAwaitingDirective.map((row) => row.jobId)).toEqual(['job-fm1']);
+    // An accepted directive PRODUCER owns the lane until its completion
+    // receipt: the row is not actionable, so it must not buy a model wake.
+    const begun = ledger.beginDirectiveIntent({ jobId: 'job-fm1', directive: 'repair the blocker', holder: 'silas-ops' });
+    const during = await digest(ledger);
+    expect(during.verdictsAwaitingDirective).toEqual([]);
+    // Once the request is terminal (free again) the row returns.
+    ledger.failDirective({ requestId: begun.record.requestId, reason: 'fixture terminal' });
+    const after = await digest(ledger);
+    expect(after.verdictsAwaitingDirective.map((row) => row.jobId)).toEqual(['job-fm1']);
+  });
+});

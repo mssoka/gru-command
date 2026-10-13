@@ -4299,16 +4299,17 @@ describe('silas deterministic pass observation (issue #163)', () => {
     );
     expect(mainSource).toMatch(/const durablePass = createProductionDeterministicPass\(\{/);
     expect(mainSource).toMatch(/getWave:\s*\(\)\s*=>\s*state\.wave/);
-    // Issue #243: the autopilot hook is composed into the SAME deterministic
-    // pass, so it runs before any LLM wake and its counts land on
-    // `silas.reconcile` beside the durable reconciliation's.
+    // Issue #243: the autopilot hook is composed with the durable
+    // reconciliation by the exported factory so the SAME deterministic pass
+    // runs both before any LLM wake. Issue #243 F-M4: the FACTORY'S behavior
+    // (either half failing fails the pass) is covered by the real-driver
+    // regression in test/silas-autopilot.test.ts; this alarm only pins that
+    // main.ts still wires both halves through that factory.
     expect(mainSource).toMatch(
-      /import\s*\{[^}]*\bcreateSilasAutopilotHook\b[^}]*\}\s*from\s*'\.\/dispatch\/silas-autopilot-pass\.js'/,
+      /import\s*\{[^}]*\bcomposeDeterministicPass\b[^}]*\}\s*from\s*'\.\/dispatch\/silas-autopilot-pass\.js'/, 
     );
     expect(mainSource).toMatch(/const autopilotHook = createSilasAutopilotHook\(\{/);
-    expect(mainSource).toMatch(/onDeterministicPass:\s*async \(context\)/);
-    expect(mainSource).toMatch(/await durablePass\(context\)/);
-    expect(mainSource).toMatch(/await autopilotHook\(context\)/);
+    expect(mainSource).toMatch(/onDeterministicPass:\s*composeDeterministicPass\(durablePass, autopilotHook\)/);
   });
   it('a wait row is bound to its pinned head: another head cannot retire it, the same head can', async () => {
     const h = makeLedger();
