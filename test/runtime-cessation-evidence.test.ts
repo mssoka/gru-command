@@ -215,6 +215,12 @@ function piHandle(opts: {
   return { handle, session: state, events };
 }
 
+/** Exact cessation-evidence events of one verdict (once-only assertions must
+ * count, not `.some()`, or a duplicate emission would pass). */
+function cessationEvents(events: readonly RuntimeEvent[], evidence: 'ceased' | 'unknown'): RuntimeEvent[] {
+  return events.filter((event) => event.type === 'cessation_evidence' && event.evidence === evidence);
+}
+
 describe('pi adapter cessation evidence requires a bounded idle proof (#341, Option A)', () => {
   it('dispose followed by a confirmed idle reports ceased', async () => {
     const { handle, session, events } = piHandle({ waitForIdleMode: 'idle' });
@@ -222,7 +228,9 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
     expect(session.disposed).toBe(true);
     expect(session.waitForIdleCalls).toBe(1);
     expect(handle.cessationEvidence()).toBe('ceased');
-    expect(events.some((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toBe(true);
+    // Exactly-once: repeating the (idempotent) re-query must not re-emit.
+    expect(handle.cessationEvidence()).toBe('ceased');
+    expect(cessationEvents(events, 'ceased').length).toBe(1);
   });
 
   it('idle never reached within the bound throws the named error and never reports ceased', async () => {
@@ -246,20 +254,46 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
     }
   });
 
-  it('enforces the idle bound exactly at CESSATION_IDLE_TIMEOUT_MS', async () => {
+  it('pins the idle bound to the literal 5s bridge-timeout contract', async () => {
+    // The spec pins the 5s bridge-timeout pattern by VALUE; following the
+    // imported constant would let a 10s change pass the suite silently.
+    expect(CESSATION_IDLE_TIMEOUT_MS).toBe(5_000);
     vi.useFakeTimers();
     try {
       const { handle } = piHandle({ waitForIdleMode: 'never' });
       let outcome: 'pending' | 'resolved' | 'rejected' = 'pending';
+      let rejection: unknown = null;
       const pending = handle.dispose().then(
         () => { outcome = 'resolved'; },
-        () => { outcome = 'rejected'; },
+        (error: unknown) => { outcome = 'rejected'; rejection = error; },
       );
-      await vi.advanceTimersByTimeAsync(CESSATION_IDLE_TIMEOUT_MS - 1);
+      await vi.advanceTimersByTimeAsync(4_999);
       expect(outcome).toBe('pending'); // not a moment early
       await vi.advanceTimersByTimeAsync(1);
       await pending;
       expect(outcome).toBe('rejected');
+      expect(rejection).toBeInstanceOf(CessationIdleTimeoutError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shares one disposal promise: a retry after a timeout observes the same rejection, never a success-shaped bypass', async () => {
+    vi.useFakeTimers();
+    try {
+      const { handle, session } = piHandle({ waitForIdleMode: 'never' });
+      const first = handle.dispose().catch((error: unknown) => error as Error);
+      // A concurrent caller must wait on the SAME pending proof, not resolve
+      // immediately because disposed was marked.
+      const concurrent = handle.dispose().catch((error: unknown) => error as Error);
+      await vi.advanceTimersByTimeAsync(CESSATION_IDLE_TIMEOUT_MS);
+      expect(await first).toBeInstanceOf(CessationIdleTimeoutError);
+      expect(await concurrent).toBeInstanceOf(CessationIdleTimeoutError);
+      // Retry AFTER the rejection: the cached failure is returned again — no
+      // silent degrade-to-dispose-only success shape.
+      await expect(handle.dispose()).rejects.toBeInstanceOf(CessationIdleTimeoutError);
+      expect(session.waitForIdleCalls).toBe(1); // one proof attempt, shared
+      expect(handle.cessationEvidence()).toBe('unknown');
     } finally {
       vi.useRealTimers();
     }
@@ -284,10 +318,14 @@ describe('pi adapter cessation evidence requires a bounded idle proof (#341, Opt
     await handle.dispose();
     expect(session.waitForIdleCalls).toBe(1);
     expect(handle.cessationEvidence()).toBe('unknown');
-    expect(events.some((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toBe(false);
+    expect(cessationEvents(events, 'ceased').length).toBe(0);
     session.bashRunning = false; // the independent controller finished after disposal
     expect(handle.cessationEvidence()).toBe('ceased');
-    expect(events.some((event) => event.type === 'cessation_evidence' && event.evidence === 'ceased')).toBe(true);
+    // Exactly-once across repeated re-queries (a duplicate would re-emit).
+    expect(handle.cessationEvidence()).toBe('ceased');
+    expect(handle.cessationEvidence()).toBe('ceased');
+    expect(cessationEvents(events, 'ceased').length).toBe(1);
+    expect(cessationEvents(events, 'unknown').length).toBe(1);
   });
 
   it('an unproven idle never becomes ceased even after the bash controller clears', async () => {

@@ -120,7 +120,9 @@ const COMPACTION_END_RECONCILE_MS = 5_000;
  * and never awaits `waitForIdle`, so the adapter follows disposal with a
  * bounded session `waitForIdle` before it may report 'ceased'. Mirrors the 5s
  * bridge-teardown cap in `review-mcp-bridge.ts` (`BRIDGE_CLOSE_TIMEOUT_MS`):
- * the same Promise.race + unref'd timer idiom, so a stuck session can never
+ * the same Promise.race against a REFERENCED timer (the bridge does not unref
+ * it either), so an otherwise-drained event loop cannot exit mid-disposal
+ * before the bound fires and disposal settles, and a stuck session can never
  * hang disposal past this window. Exported for the deterministic bound test.
  */
 export const CESSATION_IDLE_TIMEOUT_MS = 5_000;
@@ -1070,6 +1072,11 @@ export class PiAgentHandle implements AgentHandle {
     settled: boolean;
   } | null = null;
   private disposed = false;
+  /** The single-flight disposal promise (issue #341): cached before the idle
+   * proof and returned to every later/concurrent caller, so a retry after a
+   * timeout rejection observes the SAME failure instead of resolving
+   * success-shaped with no idle proof. */
+  private disposalPromise: Promise<void> | null = null;
 
   constructor(
     role: Role,
@@ -1336,8 +1343,19 @@ export class PiAgentHandle implements AgentHandle {
     }
   };
 
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  /** Idempotent, single-flight, and failure-sharing (issue #341): the FIRST
+   * call's promise is cached and returned to every later/concurrent caller,
+   * so a retry after a timeout rejection cannot silently bypass the named
+   * error, and a concurrent caller waits on the same pending idle proof.
+   * Mirrors `ClaudeCodeHandle.dispose`'s existing single-flight idiom. */
+  dispose(): Promise<void> {
+    this.disposalPromise ??= this.disposeOnce();
+    return this.disposalPromise;
+  }
+
+  private async disposeOnce(): Promise<void> {
+    // Synchronous (first statement, before any await): new work is refused
+    // immediately even while the idle proof below is still pending.
     this.disposed = true;
     this.toolHeartbeat.dispose();
     if (this.compactionEndTimer !== null) clearTimeout(this.compactionEndTimer);
@@ -1392,7 +1410,7 @@ export class PiAgentHandle implements AgentHandle {
 
   /** Await the session's own idle transition, bounded by
    * {@link CESSATION_IDLE_TIMEOUT_MS}. Mirrors the bridge-teardown race in
-   * review-mcp-bridge.ts (Promise.race against an unref'd timer, cleared in
+   * review-mcp-bridge.ts (Promise.race against a referenced timer, cleared in
    * finally). Returns true ONLY when idle was actually reached inside the
    * bound: a missing waitForIdle, a rejection, or the timeout all mean "no
    * positive idle proof" — never a silent pass. */
@@ -1402,8 +1420,11 @@ export class PiAgentHandle implements AgentHandle {
     let timer: ReturnType<typeof setTimeout> | null = null;
     try {
       const bound = new Promise<false>((resolve) => {
+        // Deliberately NOT unref'd: like BRIDGE_CLOSE_TIMEOUT_MS this timer
+        // must keep the process alive through the bound, so an
+        // otherwise-drained event loop cannot exit mid-disposal with no
+        // named error and no log (issue #341).
         timer = setTimeout(() => resolve(false), CESSATION_IDLE_TIMEOUT_MS);
-        timer.unref?.();
       });
       // The rejection handler also prevents an unhandled rejection if the
       // session rejects after the bound has already won the race.
