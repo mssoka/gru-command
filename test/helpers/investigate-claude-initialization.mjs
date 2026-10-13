@@ -45,7 +45,7 @@ const server = createServer(async (req, res) => {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   const event = (type, value) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
   event('message_start', { message: { id: 'owned-e9', type: 'message', role: 'assistant', model: 'gpt-6-luna', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } });
-  if (!sent) {
+  if (!sent && !active.textOnly) {
     sent = true;
     event('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'owned_bash', name: 'Bash', input: {} } });
     event('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify({ command: active.command, description: 'owned E9 case' }) } });
@@ -54,7 +54,7 @@ const server = createServer(async (req, res) => {
     event('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'Owned E9 settled.' } });
   }
   event('content_block_stop', { index: 0 });
-  event('message_delta', { delta: { stop_reason: input.messages.some((m) => Array.isArray(m.content) && m.content.some((c) => c.type === 'tool_result')) ? 'end_turn' : 'tool_use', stop_sequence: null }, usage: { output_tokens: 10 } });
+  event('message_delta', { delta: { stop_reason: active.textOnly || input.messages.some((m) => Array.isArray(m.content) && m.content.some((c) => c.type === 'tool_result')) ? 'end_turn' : 'tool_use', stop_sequence: null }, usage: { output_tokens: 10 } });
   event('message_stop', {}); res.end();
 });
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -71,14 +71,17 @@ const cases = [
   { name: 'pipeline-native-rejected-init', command: producer, pipeline: true, rejectInit: true, error: true },
   { name: 'pipeline-reply-after-tool-request', command: producer, pipeline: true, reorder: true, error: true },
   { name: 'silent-init-existing-escalation', command: producer, silent: true, cancel: true, resist: true },
+  { name: 'prompt-before-init-request', command: producer, promptFirst: true, extended: true },
+  { name: 'compaction-silent-init-existing-disposal', command: read, compact: true, silent: true, cancel: true, extended: true },
+  { name: 'pipeline-silent-init-text-only-terminal', command: read, pipeline: true, silent: true, textOnly: true, error: true, extended: true },
 ];
 process.stdout.write(JSON.stringify({ identity: { executable, realExecutable: realpathSync(executable), version, sha256: digest, model: 'gpt-6-luna', effort: 'max' }, root,
   boundary: 'Fixture-only pipelining hypothesis/fault injection; actual ClaudeCodeRuntime; no new timers; NOT final qualification/acceptance' }) + '\n');
 try {
-  for (const row of cases) {
+  for (const row of cases.filter((entry) => Boolean(entry.extended) === (process.argv[3] === 'extended'))) {
     active = { ...row, upstream: [], wire: [], native: [], forwarded: [], signals: [], closed: null }; sent = false;
     const record = active; const before = existsSync(starts) ? readFileSync(starts, 'utf8') : '';
-    const ack = Promise.withResolvers(); const close = Promise.withResolvers();
+    let ack = Promise.withResolvers(); let close = Promise.withResolvers();
     let heldAck; let pipelineSent = false; let original;
     const runtime = new ClaudeCodeRuntime({ config, store: new SessionStore(config.dataDir), binary: executable,
       modelRuntime: { getModel: () => ({ input: ['text'] }) },
@@ -91,6 +94,7 @@ try {
         record.policyBoundBeforeSpawn = { file, permissions: settings.permissions, jobId: policy.jobId, cwd: lane };
         const child = spawn(binary, [...args, '--setting-sources', '', '--strict-mcp-config', '--no-chrome', '--disable-slash-commands'], { ...options, env });
         original = child; record.pid = child.pid;
+        const faults = row.compact && !record.compactPhase ? {} : row;
         const stdin = child.stdin; const stdout = child.stdout; const port = new PassThrough(); child.stdout = port;
         const write = stdin.write.bind(stdin); const kill = child.kill.bind(child);
         child.kill = (signal) => { record.signals.push(signal); return row.resist && signal === 'SIGTERM' ? true : kill(signal); };
@@ -100,7 +104,8 @@ try {
             const callback = rest.find((value) => typeof value === 'function'); callback?.(null); return true;
           }
           if (frame.type === 'control_request' && frame.request?.subtype === 'initialize') {
-            const input = row.rejectInit ? { ...frame, request: { ...frame.request, hooks: [] } } : frame;
+            const input = faults.rejectInit ? { ...frame, request: { ...frame.request, hooks: [] } } : frame;
+            if (faults.promptFirst) { pipelineSent = true; const user = claudePromptFrame(prompt); record.wire.push({ fixturePromptFirst: true, ...user }); write(JSON.stringify(user) + '\n'); }
             const ok = write(JSON.stringify(input) + '\n', ...rest);
             if (row.pipeline) { pipelineSent = true; const user = claudePromptFrame(prompt); record.wire.push({ fixturePipeline: true, ...user }); write(JSON.stringify(user) + '\n'); }
             return ok;
@@ -117,11 +122,11 @@ try {
             const frame = JSON.parse(line); record.native.push(frame);
             if (frame.type === 'control_response') {
               ack.resolve(frame);
-              if (row.silent) continue;
-              if (row.reorder) { heldAck = frame; continue; }
+              if (faults.silent) continue;
+              if (faults.reorder) { heldAck = frame; continue; }
             }
             forward(frame);
-            if (row.reorder && heldAck && frame.type === 'control_request') { forward(heldAck); heldAck = undefined; }
+            if (faults.reorder && heldAck && frame.type === 'control_request') { forward(heldAck); heldAck = undefined; }
           }
         });
         stdout.on('end', () => port.end());
@@ -132,8 +137,14 @@ try {
     let handle;
     try {
       handle = await runtime.spawn('minion', { cwd: lane, model: 'openai-codex/gpt-6-luna', thinkingLevel: 'max', roleTools: ['bash'], workerVerification: policy });
+      if (row.compact) {
+        await handle.prompt(prompt);
+        record.establishedPhase = { wire: record.wire, native: record.native, upstream: record.upstream, pid: record.pid, closed: record.closed };
+        record.wire = []; record.native = []; record.upstream = []; record.forwarded = []; record.closed = null;
+        record.compactPhase = true; ack = Promise.withResolvers(); close = Promise.withResolvers(); sent = false;
+      }
       let settled = false;
-      const turn = handle.prompt(prompt).then(() => ({ ok: true }), (error) => ({ ok: false, error: String(error) })).then((value) => { settled = true; return value; });
+      const turn = (row.compact ? handle.compact() : handle.prompt(prompt)).then(() => ({ ok: true }), (error) => ({ ok: false, error: String(error) })).then((value) => { settled = true; return value; });
       if (row.cancel) {
         await ack.promise;
         await new Promise((resolve) => setImmediate(resolve)); // event-loop observation, not a timeout
@@ -146,8 +157,15 @@ try {
       const outcome = await turn;
       record.outcome = outcome;
       assert.equal(existsSync(starts) ? readFileSync(starts, 'utf8') : '', before, 'zero fake producer starts');
+      if (row.textOnly) process.stdout.write(JSON.stringify({ ...record, distinguishingTerminalEvidence: true }) + '\n');
+      if (row.promptFirst) {
+        const firstAsk = record.forwarded.findIndex((frame) => frame.type === 'control_request');
+        const firstAck = record.forwarded.findIndex((frame) => frame.type === 'control_response');
+        record.requestBeforeInitReply = firstAsk >= 0 && (firstAck < 0 || firstAsk < firstAck);
+        assert.equal(outcome.ok, !record.requestBeforeInitReply);
+      }
       if (row.cancel || row.error) assert.equal(outcome.ok, false, 'silent/rejected/reordered initialization is not a successful turn');
-      else {
+      else if (!row.promptFirst || outcome.ok) {
         assert.equal(outcome.ok, true, outcome.error);
         const blocks = record.native.filter((frame) => frame.type === 'user').flatMap((frame) => frame.message?.content ?? []).filter((block) => block.type === 'tool_result' && block.tool_use_id === 'owned_bash');
         assert.equal(blocks.length, 1);
