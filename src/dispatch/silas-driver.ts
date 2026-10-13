@@ -597,7 +597,7 @@ export interface SilasOpsDigest {
   readonly verificationsOwed: readonly VerificationOwedRow[];
 }
 
-/** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
+/** Count of actionable rows (an empty digest never wakes, issue #243). */
 export function digestActionCount(digest: SilasOpsDigest): number {
   return (
     digest.deliveredWithoutPr.length +
@@ -2763,13 +2763,14 @@ export class SilasDriver {
   }
 
   /** Compute the digest; wake the slot only when there is something to
-   * do. Sweeps skip empty digests AND digests whose decision-relevant
-   * fingerprint is unchanged (issue #217) — unless the bounded safety
-   * re-look elapsed (`[silas] unchanged_rewake_ms`) or a recorded
-   * decision recheck passed since the last delivered wake (#218; a due
-   * recheck wakes even when the digest is empty, because the decision
-   * that stopped covering may be re-suppressing rows). Event wakes
-   * always deliver — the event itself is context Silas should see. */
+   * do. An empty digest is suppressed for EVERY trigger (issue #243): with
+   * the autopilot enforced, an event whose rows the code already handled
+   * must not buy a max-thinking turn. Sweeps additionally skip digests
+   * whose decision-relevant fingerprint is unchanged (issue #217) — unless
+   * the bounded safety re-look elapsed (`[silas] unchanged_rewake_ms`) or a
+   * recorded decision recheck passed since the last delivered wake (#218; a
+   * due recheck wakes even when the digest is empty, because the decision
+   * that stopped covering may be re-suppressing rows). */
   private async runWake(trigger: SilasTrigger): Promise<void> {
     let digest: SilasOpsDigest;
     try {
@@ -2791,12 +2792,17 @@ export class SilasDriver {
     }
     const actionable = digestActionCount(digest);
     const fingerprint = digestFingerprint(digest);
+    const recheckDue = this.decisionRecheckDue();
+    if (actionable === 0 && !recheckDue) {
+      // Issue #243: with families enforced the autopilot has already handled
+      // the rows an event raised, so the recomputed digest is empty and the
+      // event must not buy a max-thinking turn. LLM Silas wakes only when
+      // rows remain that need judgment. A due #218 decision recheck still
+      // wakes (the decision that stopped covering may re-suppress rows).
+      this.log('info', 'silas wake found nothing actionable', { trigger: trigger.kind });
+      return;
+    }
     if (trigger.kind === 'sweep') {
-      const recheckDue = this.decisionRecheckDue();
-      if (actionable === 0 && !recheckDue) {
-        this.log('info', 'silas sweep found nothing actionable', {});
-        return;
-      }
       const unchanged = this.lastDeliveredFingerprint === fingerprint;
       if (unchanged && !recheckDue) {
         const sinceDelivered =

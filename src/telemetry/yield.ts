@@ -36,7 +36,7 @@ export const SERVICE_WAKE_MARKER = 'This turn was started by the service wake po
 export const SESSION_ROLES = ['gru', 'silas', 'bob', 'perkins', 'minion'] as const;
 export type SessionRole = (typeof SESSION_ROLES)[number];
 
-import { AUTOPILOT_DECISION_EVENT } from '../dispatch/silas-autopilot.js';
+import { AUTOPILOT_DECISION_EVENT, AUTOPILOT_SOURCE } from '../dispatch/silas-autopilot.js';
 
 /** Which budget a trigger spends: machine attention, delivery work, owner chat. */
 export const TURN_CLASSES = ['machine', 'delivery', 'owner'] as const;
@@ -1208,19 +1208,37 @@ const AUTOPILOT_FAMILY_RECEIPTS: Readonly<Record<string, readonly string[]>> = {
   'pr-review-trigger': ['silas.review-triggered'],
 };
 
+/** Receipt kinds shared by more than one family. A receipt of a shared kind
+ * can only be credited to a decision when it NAMES that decision's rule id
+ * (issue #243 H6): a bare `silas.directive-sent` is as likely to be another
+ * family's action, and must never count as agreement. */
+const SHARED_RECEIPT_KINDS: ReadonlySet<string> = new Set(
+  Object.values(AUTOPILOT_FAMILY_RECEIPTS).flat().filter((kind, index, all) => all.indexOf(kind) !== index),
+);
+
+function eventPayload(event: LedgerEventRecord): Record<string, unknown> {
+  return event.payload !== null && typeof event.payload === 'object'
+    ? (event.payload as Record<string, unknown>)
+    : {};
+}
+
 /**
  * Autopilot decisions and their agreement with what LLM Silas actually did
  * (issue #243, the rollout's `dry-run` read).
  *
  * An `enforce` decision already acted, so it is reported as `enforced` and
  * excluded from the agreement sample. A `dry-run` decision AGREES when a
- * receipt of the family's action kinds lands for the same job AFTER the
- * decision (the model read the same row and did the same thing); it is
- * UNOBSERVABLE when no `silas.wake` landed after it in the window, so the
- * model was never handed the row again; everything else is a disagreement.
- * The split is deliberately coarse — the rollout's gate (≥95% agreement,
- * zero harmful disagreements) is a human read of these counts plus the raw
- * events.
+ * receipt of the family's own action kinds lands for the same job AFTER the
+ * decision, carries a `rule_id` that names the decision's family (a receipt
+ * of a kind shared across families carries no weight without it, H6), and is
+ * NOT the autopilot's own machine receipt (`source: 'silas-autopilot'`) —
+ * the model read the same row and did the same thing. It is UNOBSERVABLE
+ * when no `silas.wake` landed after it in the window, so the model was
+ * never handed the row again; everything else is a disagreement. The
+ * agreement share is computed over the OBSERVABLE decisions only (L1), and
+ * is null when none is observable. The split is deliberately coarse — the
+ * rollout's gate (≥95% agreement, zero harmful disagreements) is a human
+ * read of these counts plus the raw events.
  */
 export function computeAutopilotMeasures(
   events: readonly LedgerEventRecord[],
@@ -1255,13 +1273,19 @@ export function computeAutopilotMeasures(
     }
     entry.decisions += 1;
     const kinds = AUTOPILOT_FAMILY_RECEIPTS[ruleId] ?? [];
-    const agreed = familyActions.some(
-      (event) =>
-        event.seq > decision.seq &&
-        event.jobId !== null &&
-        event.jobId === decision.jobId &&
-        kinds.includes(event.kind),
-    );
+    const agreed = familyActions.some((event) => {
+      if (event.seq <= decision.seq) return false;
+      if (event.jobId === null || event.jobId !== decision.jobId) return false;
+      if (!kinds.includes(event.kind)) return false;
+      const payload = eventPayload(event);
+      // The autopilot's own action is not the model's agreement (H6).
+      if (payload['source'] === AUTOPILOT_SOURCE) return false;
+      const receiptRuleId = typeof payload['rule_id'] === 'string' ? payload['rule_id'] : undefined;
+      if (receiptRuleId !== undefined) return receiptRuleId === ruleId;
+      // A receipt that names no rule is only attributable to a family whose
+      // action kind is unique (H6).
+      return !SHARED_RECEIPT_KINDS.has(event.kind);
+    });
     if (agreed) entry.agreed += 1;
     else if (decision.seq > newestWakeSeq) entry.unobservable += 1;
     byRule.set(ruleId, entry);
@@ -1269,15 +1293,21 @@ export function computeAutopilotMeasures(
   return {
     decisions: decisions.length,
     byFamily: [...byRule.entries()]
-      .map(([ruleId, entry]) => ({
-        ruleId,
-        mode: entry.modes.size === 1 ? [...entry.modes][0] ?? 'unknown' : 'mixed',
-        decisions: entry.decisions,
-        enforced: entry.enforced,
-        agreed: entry.agreed,
-        unobservable: entry.unobservable,
-        agreementShare: entry.decisions === 0 ? null : entry.agreed / entry.decisions,
-      }))
+      .map(([ruleId, entry]) => {
+        // Unobservable decisions are not a model disagreement — the model
+        // was never handed the row again. Compute the share over what the
+        // model actually observed (L1).
+        const observable = entry.decisions - entry.unobservable;
+        return {
+          ruleId,
+          mode: entry.modes.size === 1 ? [...entry.modes][0] ?? 'unknown' : 'mixed',
+          decisions: entry.decisions,
+          enforced: entry.enforced,
+          agreed: entry.agreed,
+          unobservable: entry.unobservable,
+          agreementShare: observable === 0 ? null : entry.agreed / observable,
+        };
+      })
       .sort((a, b) => b.decisions - a.decisions || a.ruleId.localeCompare(b.ruleId)),
   };
 }
