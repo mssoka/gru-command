@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { branchNameForRef } from '../src/dispatch/branch-idle.js';
-import { freezeReviewInputs, repositoryGitEnv } from '../src/dispatch/perkins-review/artifacts.js';
+import { freezeReviewInputs, repositoryGitEnv, sourceMovementSinceFreeze } from '../src/dispatch/perkins-review/artifacts.js';
 import { headMovedSinceFreeze } from '../src/dispatch/perkins-review/whole.js';
 import { prBranchCandidate, resolveFreshPrHead, type PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
 import { GhPrPoster, GitLabMrPoster, WaveRunner } from '../src/dispatch/perkins.js';
@@ -71,14 +71,15 @@ function origin(repo: FixtureRepo): string {
   return path;
 }
 
-function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeManager; readonly root: string; readonly dbPath: string } {
+function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeManager; readonly root: string; readonly dbPath: string; readonly bus: EventBus } {
   const dbPath = directory();
   const db = new LedgerDb(dbPath);
   dbs.push(db);
-  const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+  const bus = new EventBus();
+  const ledger = new LedgerApi(db.handle, { bus });
   const root = directory();
   return {
-    ledger, root, dbPath,
+    ledger, root, dbPath, bus,
     worktrees: new WorktreeManager({
       ledger, root, preserveRoot: directory(),
       setupTimeoutMs: 30_000, enumerateProcesses: () => [],
@@ -147,6 +148,266 @@ function assertNoPartialLane(repo: FixtureRepo, ledger: LedgerApi, id: string, l
 }
 
 describe('review Git repository environment isolation (GH-270)', () => {
+  async function rollbackRaceFixture(name: string, authority: 'job' | 'writer') {
+    const repo = fixture(name);
+    const h = manager();
+    const parentJob = h.ledger.addJob({ id: 'r8-parent', repo: 'assigned', title: 'parent', baseBranch: 'main' });
+    const parent = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: parentJob.id });
+    const job = h.ledger.addJob({ id: 'r8-job', repo: 'assigned', title: 'rollback', baseBranch: 'main' });
+    const id = authority === 'job' ? job.id : 'r8-child';
+    const ref = authority === 'job' ? `refs/heads/gru/${id}` : `refs/heads/gru/${parentJob.id}-child-${id}`;
+    const create = () => authority === 'job' ? h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: id })
+      : h.worktrees.createChildWorktree({ repoPath: repo.path, jobId: parentJob.id, childId: id, parentPath: parent.path, authority });
+    return { repo, ...h, id, ref, create };
+  }
+
+  it('rechecks original reflog receipt under the prepared deletion lock before touching same-SHA foreign replacements (R8)', async () => {
+    const servicePath = process.env.PATH ?? '';
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    for (const authority of ['job', 'writer'] as const) {
+      const h = await rollbackRaceFixture(`r8-foreign-receipt-${authority}`, authority);
+      const { log } = failingCheckoutHook(h.repo);
+      const root = directory(), counter = join(root, 'transactions');
+      writeFileSync(join(root, 'git'), '#!/usr/bin/env node\nconst cp=require("node:child_process"),fs=require("node:fs"),args=process.argv.slice(2);\n' +
+        `if(args[0]==='update-ref'&&args.includes('--stdin')) { const n=fs.existsSync(${JSON.stringify(counter)})?Number(fs.readFileSync(${JSON.stringify(counter)}))+1:1; fs.writeFileSync(${JSON.stringify(counter)},String(n));
+        if(n===2){ cp.execFileSync(${JSON.stringify(realGit)},['update-ref','-d',${JSON.stringify(h.ref)}]); cp.execFileSync(${JSON.stringify(realGit)},['update-ref','--create-reflog','-m','foreign-recreated',${JSON.stringify(h.ref)},${JSON.stringify(h.repo.head())}]); }}
+        const r=cp.spawnSync(${JSON.stringify(realGit)},args,{stdio:'inherit'});process.exit(r.status??1);\n`);
+      chmodSync(join(root, 'git'), 0o755); vi.stubEnv('PATH', `${root}:${servicePath}`);
+      const creation = h.create(); await expect(creation).rejects.toThrow();
+      vi.stubEnv('PATH', servicePath);
+      expect(git(h.repo.path, ['branch', '--list', h.ref.slice('refs/heads/'.length)])).not.toBe('');
+      await expect(creation).rejects.toThrow(/custody unconfirmed/);
+      expect(git(h.repo.path, ['reflog', 'show', '-1', '--format=%gs', h.ref])).toBe('foreign-recreated');
+      expect(git(h.repo.path, ['rev-parse', h.ref])).toBe(h.repo.head());
+      expect(existsSync(readFileSync(log, 'utf8'))).toBe(true);
+      expect(git(h.repo.path, ['worktree', 'list', '--porcelain'])).toContain('locked gru-creation:');
+      expect(h.ledger.getWorktree(h.id)).toBeNull();
+    }
+  });
+
+  it('reproves checkout and orphan admin custody after settled deletion hooks and retains replacement data (R8)', async () => {
+    for (const authority of ['job', 'writer'] as const) for (const orphan of [false, true]) {
+      const h = await rollbackRaceFixture(`r8-replaced-admin-${authority}-${orphan}`, authority);
+      const { log } = failingCheckoutHook(h.repo);
+      if (orphan) {
+        const checkoutHook = join(h.repo.path, '.git/hooks/post-checkout');
+        writeFileSync(checkoutHook, '#!/usr/bin/env node\nconst fs=require("node:fs"),p=require("node:path");\n' +
+          `fs.writeFileSync(${JSON.stringify(log)},process.cwd());fs.rmSync(process.cwd(),{recursive:true,force:true});process.exit(7);\n`);
+      }
+      const hook = join(h.repo.path, '.git/hooks/reference-transaction');
+      const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+      writeFileSync(hook, '#!/usr/bin/env node\nconst fs=require("node:fs"),p=require("node:path"),cp=require("node:child_process");const fields=fs.readFileSync(0,"utf8").trim().split(" ");\n' +
+        `if(process.argv[2]==='committed'&&fields[2]===${JSON.stringify(h.ref)}&&/^0+$/.test(fields[1])) {
+          const checkout=fs.readFileSync(${JSON.stringify(log)},'utf8'), common=${JSON.stringify(join(h.repo.path, '.git/worktrees'))};
+          const admin=fs.readdirSync(common).map(n=>p.join(common,n)).find(a=>fs.readFileSync(p.join(a,'gitdir'),'utf8').trim()===p.join(checkout,'.git'));
+          fs.writeFileSync(${JSON.stringify(log + '.admin')},admin);fs.renameSync(admin,admin+'-previous');fs.cpSync(admin+'-previous',admin,{recursive:true});fs.writeFileSync(p.join(admin,'locked'),'foreign-reservation');fs.writeFileSync(p.join(admin,'replacement-data'),'retain admin');
+          if(${JSON.stringify(!orphan)}){fs.rmSync(checkout,{recursive:true,force:true});fs.mkdirSync(checkout,{recursive:true});fs.writeFileSync(p.join(checkout,'.git'),'gitdir: '+admin+'\\n');fs.writeFileSync(p.join(checkout,'replacement-data'),'retain checkout');}
+          cp.execFileSync(${JSON.stringify(realGit)},['update-ref','--create-reflog','-m','foreign-after-settlement',${JSON.stringify(h.ref)},${JSON.stringify(h.repo.head())}]);
+        }\n`);
+      chmodSync(hook, 0o755);
+      const creation = h.create(); await expect(creation).rejects.toThrow();
+      const checkout = readFileSync(log, 'utf8');
+      const admin = readFileSync(log + '.admin', 'utf8');
+      expect(existsSync(admin)).toBe(true);
+      await expect(creation).rejects.toThrow(/custody unconfirmed/);
+      expect(readFileSync(join(admin, 'locked'), 'utf8')).toBe('foreign-reservation');
+      expect(readFileSync(join(admin, 'replacement-data'), 'utf8')).toBe('retain admin');
+      if (!orphan) expect(readFileSync(join(checkout, 'replacement-data'), 'utf8')).toBe('retain checkout');
+      expect(git(h.repo.path, ['reflog', 'show', '-1', '--format=%gs', h.ref])).toBe('foreign-after-settlement');
+      expect(git(h.repo.path, ['rev-parse', h.ref])).toBe(h.repo.head());
+      expect(existsSync(admin + '-previous')).toBe(true);
+      expect(h.ledger.getWorktree(h.id)).toBeNull();
+    }
+  });
+
+  it('keeps explicit non-origin tracking pins source-bound without PR selection while origin and heads refresh live (R8)', async () => {
+    for (const targetRef of ['refs/remotes/upstream/topic', 'refs/remotes/origin/topic', 'refs/heads/topic']) {
+      const repo = fixture('r8-nonorigin-pin'); origin(repo);
+      repo.git(['checkout', '-b', 'topic']);
+      const pin = repo.commitFile('src/pin.ts', 'export const pin = true;\n');
+      const live = repo.commitFile('src/live.ts', 'export const live = true;\n');
+      repo.git(['push', '--quiet', 'origin', 'topic']);
+      repo.git(['update-ref', 'refs/remotes/upstream/topic', pin]);
+      const probe = vi.fn(async () => ({ headRefName: 'topic', headSha: live }));
+      const h = await waveFixture(repo, probe);
+      const admitted = await h.wave.requestReview({ jobId: h.job.id, targetRef });
+      await admitted.run;
+      const round = h.ledger.listRounds(h.job.id)[0]!;
+      const manifest = JSON.parse(readFileSync(join(h.artifactRoot, round.id, 'manifest.json'), 'utf8'));
+      expect(manifest.targetSha).toBe(targetRef.includes('/upstream/') ? pin : live);
+      expect(manifest.targetRef).toBe(targetRef.includes('/upstream/') ? targetRef : 'refs/remotes/origin/topic');
+      expect(probe.mock.calls.length).toBe(targetRef.includes('/upstream/') ? 0 : 1);
+      await h.wave.shutdown();
+    }
+  });
+
+  it('rejects same-SHA named aliases at terminal submission and finalization with unchanged canonical controls (R8)', async () => {
+    // The shared equality-shortcut path must protect canonical local heads,
+    // not just the tracking ref used by the publishable PR control.
+    const repo = fixture('r8-terminal-local-head'); repo.git(['checkout', '-b', 'terminal-head']);
+    const target = repo.commitFile('src/local.ts', 'export const local = true;\n');
+    repo.git(['tag', 'same-head', target]);
+    const checkout = join(directory(), 'detached'); repo.git(['worktree', 'add', '--detach', checkout, target]);
+    const frozen = freezeReviewInputs({ repoPath: checkout, artifactRoot: directory(), roundId: 'r8-head',
+      baseRef: 'main', targetRef: target, movementRef: 'refs/heads/terminal-head', noSpec: true });
+    vi.stubEnv('GIT_TRACE', '1');
+    expect(sourceMovementSinceFreeze(frozen)).toBeNull();
+    expect(headMovedSinceFreeze(frozen, frozen.manifest.targetRef)).toBeNull();
+    repo.git(['symbolic-ref', 'refs/heads/terminal-head', 'refs/tags/same-head']);
+    expect(sourceMovementSinceFreeze(frozen)).toMatchObject({ cause: 'target-moved' });
+    expect(headMovedSinceFreeze(frozen, frozen.manifest.targetRef)).toMatchObject({ cause: 'target-moved' });
+    vi.unstubAllEnvs();
+    for (const seam of ['unchanged', 'submission', 'finalization'] as const) {
+      const repo = fixture(`r8-terminal-identity-${seam}`); origin(repo);
+      repo.git(['checkout', '-b', 'topic']);
+      const target = repo.commitFile('src/terminal.ts', 'export const terminal = true;\n');
+      repo.git(['tag', 'terminal-tip', target]);
+      repo.git(['push', '--quiet', 'origin', 'topic']);
+      const probe = async () => ({ headRefName: 'topic', headSha: target });
+      const h = await waveFixture(repo, probe);
+      const alias = () => git(repo.path, ['symbolic-ref', 'refs/remotes/origin/topic', 'refs/tags/terminal-tip']);
+      const runtime = fakeWholeSpawner(directory(), { childAnswer: () => '[]', ...(seam === 'submission' ? { beforeSubmit: alias } : {}) });
+      const post = vi.fn(async ({ targetSha, body }: { targetSha: string; body: string }) => ({ reviewId: 'r8-review', actor: 'fixture-bot', event: 'COMMENTED' as const,
+        commitId: targetSha, headSha: targetSha, baseSha: repo.git(['rev-parse', 'main']), bodySha256: createHash('sha256').update(body).digest('hex') }));
+      const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, reviewArtifactRoot: h.artifactRoot, poster: { post }, prHeadProbe: probe,
+        spawner: async (role, options) => {
+          const handle = await runtime.spawner(role, options);
+          return { ...handle, prompt: async (prompt, promptOptions) => {
+            await handle.prompt(prompt, promptOptions);
+            if (options?.reviewLead !== undefined && seam === 'finalization') alias();
+          } };
+        },
+      });
+      const admitted = await wave.requestReview({ jobId: h.job.id, targetRef: 'refs/heads/topic' });
+      const outcome = await admitted.run;
+      expect(runtime.leadCalls).toHaveLength(1);
+      if (seam === 'unchanged') { expect(outcome.verdict).toBe('approved'); expect(post).toHaveBeenCalledTimes(1); }
+      else {
+        expect(outcome.verdict).toBeNull(); expect(outcome.posted).toBe(false); expect(post).not.toHaveBeenCalled();
+        if (seam === 'submission') expect(runtime.toolErrors.some((error) => /source changed.*named identity/u.test(error.error))).toBe(true);
+        else expect(h.ledger.latestJobEvent(h.job.id, 'round.head-moved')?.payload).toMatchObject({ cause: 'target-moved' });
+        expect(git(repo.path, ['rev-parse', 'refs/remotes/origin/topic'])).toBe(target);
+        expect(git(repo.path, ['symbolic-ref', '--no-recurse', 'refs/remotes/origin/topic'])).toBe('refs/tags/terminal-tip');
+      }
+      await wave.shutdown();
+    }
+
+  });
+
+  it('keeps the event loop responsive during a prepared exact-name metadata query (R8)', async () => {
+    const repo = fixture('r8-async-metadata');
+    const { ledger, worktrees } = manager(); ledger.addJob({ id: 'r8-query', repo: 'assigned', title: 'query', baseBranch: 'main' });
+    const root = directory(), heartbeat = join(root, 'heartbeat'), proof = join(root, 'proof');
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    writeFileSync(heartbeat, '0');
+    writeFileSync(join(root, 'git'), '#!/usr/bin/env node\nconst fs=require("node:fs"),cp=require("node:child_process"),a=process.argv.slice(2);\n' +
+      `if(a[0]==='symbolic-ref'&&a.includes('--no-recurse')&&fs.existsSync(${JSON.stringify(join(repo.path, '.git/refs/heads/gru/r8-query.lock'))})) {
+        const before=fs.readFileSync(${JSON.stringify(heartbeat)},'utf8');let elapsed=0;const timer=setInterval(()=>{elapsed+=10;const responsive=fs.readFileSync(${JSON.stringify(heartbeat)},'utf8')!==before;if(responsive||elapsed>=1000){fs.writeFileSync(${JSON.stringify(proof)},JSON.stringify({responsive}));clearInterval(timer);process.exit(1);}},10);
+      }else{const r=cp.spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});process.exit(r.status??1);}\n`);
+    chmodSync(join(root, 'git'), 0o755); vi.stubEnv('PATH', `${root}:${process.env.PATH ?? ''}`);
+    let ticks = 0; const pulse = setInterval(() => writeFileSync(heartbeat, String(++ticks)), 10);
+    try { await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'r8-query' }); }
+    finally { clearInterval(pulse); }
+    expect(JSON.parse(readFileSync(proof, 'utf8'))).toEqual({ responsive: true });
+  });
+
+  it('bounds prepared metadata floods and TERM-ignoring queries without authority or unrelated-child signals (R8)', async () => {
+    const servicePath = process.env.PATH ?? '';
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    for (const mode of ['symbolic-stdout', 'symbolic-stderr', 'receipt-stdout', 'receipt-stderr', 'deadline', 'exit-pipes'] as const) {
+      const h = await rollbackRaceFixture(`r8-query-${mode}`, 'job');
+      const { log } = failingCheckoutHook(h.repo);
+      const root = directory(), proof = join(root, 'query'), term = join(root, 'term');
+      writeFileSync(join(root, 'git'), '#!/usr/bin/env node\nconst fs=require("node:fs"),cp=require("node:child_process"),a=process.argv.slice(2);\n' +
+        `const lock=${JSON.stringify(join(h.repo.path, '.git', `${h.ref}.lock`))};
+        if(fs.existsSync(lock)&&(a[0]==='symbolic-ref'&&a.includes('--no-recurse')&&${JSON.stringify(!mode.startsWith('receipt'))}||a[0]==='reflog'&&${JSON.stringify(mode.startsWith('receipt'))})) {
+          fs.writeFileSync(${JSON.stringify(proof)},String(process.pid));process.on('SIGTERM',()=>fs.writeFileSync(${JSON.stringify(term)},'owned TERM'));
+          ${mode === 'exit-pipes' ? `cp.spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(join(root, 'pipe-started'))},'started');setTimeout(()=>fs.writeFileSync(${JSON.stringify(join(root, 'pipe-done'))},'done'),5500);`)}],{stdio:'inherit'});process.exit(1);` : ''}
+          ${mode === 'deadline' || mode === 'exit-pipes' ? '' : `process.${mode.endsWith('stderr') ? 'stderr' : 'stdout'}.write(Buffer.alloc(17*1024*1024,120));`}
+          setTimeout(()=>process.exit(1),6000);setInterval(()=>{},1000);
+        }else{const r=cp.spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});process.exit(r.status??1);}\n`);
+      chmodSync(join(root, 'git'), 0o755);
+      git(h.repo.path, ['update-ref', 'refs/heads/unrelated-live', h.repo.head()]);
+      const unrelated = spawn(realGit, ['update-ref', '--stdin', '--no-deref'], { cwd: h.repo.path, stdio: ['pipe', 'pipe', 'pipe'] });
+      let replies = ''; unrelated.stdout.on('data', (chunk: Buffer) => { replies += chunk.toString(); });
+      unrelated.stdin.write(`start\nupdate refs/heads/unrelated-live ${h.repo.head()} ${h.repo.head()}\nprepare\n`);
+      for (let tick = 0; tick < 100 && !replies.includes('prepare: ok'); tick++) await new Promise((done) => setTimeout(done, 10));
+      expect(replies).toContain('prepare: ok');
+      const originalSetTimeout = globalThis.setTimeout;
+      const originalClearTimeout = globalThis.clearTimeout;
+      const active = new Map<ReturnType<typeof setTimeout>, () => void>();
+      if (mode === 'deadline' || mode === 'exit-pipes') {
+        vi.spyOn(globalThis, 'setTimeout').mockImplementation(((cb: () => void, delay?: number) => {
+          const timer = originalSetTimeout(cb, delay); if (delay === 30_000) active.set(timer, cb); return timer;
+        }) as typeof setTimeout);
+        vi.spyOn(globalThis, 'clearTimeout').mockImplementation((timer) => { active.delete(timer as ReturnType<typeof setTimeout>); originalClearTimeout(timer); });
+      }
+      try {
+        vi.stubEnv('PATH', `${root}:${servicePath}`);
+        const creation = h.create(); const assertion = expect(creation).rejects.toThrow(/authority unconfirmed|custody unconfirmed/);
+        if (mode === 'deadline' || mode === 'exit-pipes') {
+          for (let tick = 0; tick < 200 && (!existsSync(proof) || mode === 'exit-pipes' && !existsSync(join(root, 'pipe-started'))); tick++) await new Promise((done) => originalSetTimeout(done, 10));
+          expect(existsSync(proof)).toBe(true); expect(active.size).toBe(1);
+          for (const cb of active.values()) cb();
+        }
+        await assertion;
+        vi.stubEnv('PATH', servicePath);
+        if (mode === 'exit-pipes') expect(existsSync(term)).toBe(false);
+        else expect(readFileSync(term, 'utf8')).toBe('owned TERM');
+        const pid = Number(readFileSync(proof, 'utf8')); expect(() => process.kill(pid, 0)).toThrow();
+        expect(unrelated.exitCode).toBeNull(); expect(unrelated.signalCode).toBeNull();
+        expect(existsSync(join(h.repo.path, '.git/refs/heads/unrelated-live.lock'))).toBe(true);
+        expect(h.ledger.getWorktree(h.id)).toBeNull();
+        if (mode.startsWith('receipt')) { expect(existsSync(readFileSync(log, 'utf8'))).toBe(true); expect(git(h.repo.path, ['rev-parse', h.ref])).toBe(h.repo.head()); }
+        else expect(git(h.repo.path, ['branch', '--list', 'gru/r8-job'])).toBe('');
+      } finally {
+        vi.restoreAllMocks(); vi.stubEnv('PATH', servicePath);
+        const stopped = new Promise<void>((done) => unrelated.once('close', () => done())); unrelated.stdin.end('abort\n'); await stopped;
+        if (mode === 'exit-pipes') {
+          for (let tick = 0; tick < 1000 && !existsSync(join(root, 'pipe-done')); tick++) await new Promise((done) => originalSetTimeout(done, 10));
+          expect(existsSync(join(root, 'pipe-done'))).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('rechecks post-registration identity and nonce before unlock across all authorities with unchanged controls (R8 coverage gap)', async () => {
+    const repo = fixture('r8-published-handoff');
+    const { ledger, worktrees, bus } = manager();
+    const parentJob = ledger.addJob({ id: 'r8-parent', repo: 'assigned', title: 'parent', baseBranch: 'main' });
+    const parent = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: parentJob.id });
+    git(repo.path, ['update-ref', 'refs/heads/foreign-handoff', repo.head()]);
+    const refs = git(repo.path, ['rev-parse', 'refs/heads/foreign-handoff']);
+    for (const authority of ['job', 'review', 'writer', 'read-only'] as const) for (const mutation of ['unchanged', 'identity', 'nonce'] as const) {
+      const job = ledger.addJob({ id: `r8-${authority}-${mutation}`, repo: 'assigned', title: 'handoff', baseBranch: 'main' });
+      const round = ledger.addRound({ jobId: job.id, targetRef: repo.head() });
+      const id = authority === 'review' ? round.id : job.id;
+      let admin = '';
+      const unsubscribe = bus.subscribe((event) => {
+        if (event.kind !== 'worktree.created') return;
+        const lane = ledger.getWorktree(id); if (lane === null) return;
+        admin = git(lane.path, ['rev-parse', '--absolute-git-dir']);
+        writeFileSync(join(lane.path, 'published-data'), 'retain');
+        if (mutation === 'identity') {
+          if (authority === 'job' || authority === 'writer') git(lane.path, ['checkout', '--detach', 'HEAD']);
+          else git(lane.path, ['symbolic-ref', 'HEAD', 'refs/heads/foreign-handoff']);
+        }
+        if (mutation === 'nonce') writeFileSync(join(admin, 'locked'), 'foreign-handoff-nonce');
+      });
+      const creation = authority === 'job' ? worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })
+        : authority === 'review' ? worktrees.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: repo.head() })
+          : worktrees.createChildWorktree({ repoPath: repo.path, jobId: parentJob.id, childId: id, parentPath: parent.path, authority });
+      try {
+        if (mutation === 'unchanged') { await creation; expect(existsSync(join(admin, 'locked'))).toBe(false); }
+        else { await expect(creation).rejects.toThrow(/registered lane retained/); expect(readFileSync(join(admin, 'locked'), 'utf8')).toMatch(mutation === 'nonce' ? /foreign-handoff-nonce/ : /^gru-creation:/); }
+        const lane = ledger.getWorktree(id)!; expect(lane.status).toBe('active');
+        expect(readFileSync(join(lane.path, 'published-data'), 'utf8')).toBe('retain');
+        expect(git(lane.path, ['rev-parse', 'HEAD'])).toBe(repo.head());
+        expect(git(repo.path, ['rev-parse', 'refs/heads/foreign-handoff'])).toBe(refs);
+      } finally { unsubscribe(); }
+    }
+  });
+
   it('strips routing overrides without mutating the service environment or losing transport/configuration', () => {
     const routing = [
       'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',

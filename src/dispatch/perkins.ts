@@ -4752,7 +4752,7 @@ export class WaveRunner {
     /** True when the caller explicitly named `candidateRef` (target_ref). */
     explicitTarget: boolean;
   }): Promise<{ readonly targetSha: string; readonly movementRef: string; readonly targetBranch?: string }> {
-    const armedTargetBranch = input.armedTargetRef !== undefined && /^(?:refs\/heads\/|refs\/remotes\/)/u.test(input.armedTargetRef)
+    const armedTargetBranch = input.armedTargetRef !== undefined && /^(?:refs\/heads\/|refs\/remotes\/origin\/)/u.test(input.armedTargetRef)
       ? normalizeBranch(input.armedTargetRef) : null;
     const candidateBranch = input.job.prUrl === null ? null : input.armedTargetRef !== undefined
       ? armedTargetBranch : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);

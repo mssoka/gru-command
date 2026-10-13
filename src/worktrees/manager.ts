@@ -1146,10 +1146,76 @@ export class WorktreeManager {
     this.assertCreationIdentity(path, custody);
   }
 
+  /** Read-only creation metadata while a ref transaction owns its lock.
+   * Bound output and settlement without blocking the event loop or signalling
+   * any process other than this invocation's exact child handle. */
+  private async creationMetadata(repoPath: string, args: readonly string[]): Promise<{ readonly status: number | null; readonly stdout: string }> {
+    const child = spawn('git', [...args], { cwd: repoPath, env: repositoryGitEnv(false), stdio: ['ignore', 'pipe', 'pipe'] });
+    const limit = 16 * 1024 * 1024;
+    const stdout: Buffer[] = [];
+    let stdoutBytes = 0, stderrBytes = 0;
+    let stderrTail = Buffer.alloc(0);
+    let failure: Error | undefined;
+    let exited = false, closed = false;
+    let status: number | null = null;
+    let signal: NodeJS.Signals | null = null;
+    let wake: () => void = () => {};
+    const failed = new Promise<void>((done) => { wake = done; });
+    const fail = (detail: string): void => {
+      failure ??= new Error(`creation metadata ${args[0]}: ${detail} — authority unconfirmed; resources retained`);
+      wake();
+    };
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (failure !== undefined) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > limit) fail('stdout output exceeded 16 MiB');
+      else stdout.push(chunk);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (failure !== undefined) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > limit) fail('stderr output exceeded 16 MiB');
+      else stderrTail = Buffer.concat([stderrTail, chunk.subarray(-4096)]).subarray(-4096);
+    });
+    child.on('error', (error) => fail(error.message));
+    child.stdout.on('error', (error: Error) => fail(error.message));
+    child.stderr.on('error', (error: Error) => fail(error.message));
+    child.on('exit', (code, killedBy) => { exited = true; status = code; signal = killedBy; });
+    const stopped = new Promise<void>((done) => child.on('close', () => { closed = true; done(); }));
+    const timer = setTimeout(() => fail('query timed out after 30000ms'), 30_000);
+    await Promise.race([stopped, failed]);
+    clearTimeout(timer);
+    const wait = async (): Promise<void> => {
+      if (closed) return;
+      await new Promise<void>((done) => {
+        const bound = setTimeout(done, 1_000);
+        void stopped.then(() => { clearTimeout(bound); done(); });
+      });
+    };
+    if (!closed) {
+      for (const killSignal of ['SIGTERM', 'SIGKILL'] as const) {
+        if (!exited && child.pid !== undefined) {
+          try { child.kill(killSignal); } catch (error) { fail(String(error)); }
+        }
+        await wait();
+        if (closed) break;
+      }
+    }
+    child.stdout.destroy(); child.stderr.destroy();
+    if (!closed) {
+      const detail = exited ? 'owned pipes did not settle' : 'termination unconfirmed';
+      failure = new AggregateError([failure, new Error(detail)], `${failure?.message ?? 'creation metadata settlement failed'}; ${detail}`);
+      child.unref();
+    }
+    if (signal !== null || status === null) fail(`exit ${status}, signal ${signal}: ${stderrTail.toString('utf8').trim()}`);
+    if (failure !== undefined) throw failure;
+    return { status, stdout: Buffer.concat(stdout).toString('utf8') };
+  }
+
   /** A prepared no-deref transaction holds the exact ref-name lock. Git's
    * zero-old/create guard alone accepts dangling symrefs, even with no-deref;
    * inspect the still-unmodified name UNDER that lock before committing. */
-  private async updateDirectCreationRef(repoPath: string, custody: CreationCustody, operation: 'create' | 'delete'): Promise<void> {
+  private async updateDirectCreationRef(repoPath: string, custody: CreationCustody, operation: 'create' | 'delete', ownedPath?: string): Promise<void> {
     if (custody.branch === null) throw new Error('branchless creation cannot mutate a branch ref');
     const ref = `refs/heads/${custody.branch}`;
     // Ref names enter Git's line-oriented transaction protocol, not argv.
@@ -1247,9 +1313,28 @@ export class WorktreeManager {
       child.stdin.write(`start\n${operation} ${ref} ${custody.sha}\nprepare\n`);
       await confirm('start');
       await confirm('prepare');
-      const symbolic = spawnGit(repoPath, ['symbolic-ref', '--quiet', '--no-recurse', ref], { timeoutMs: confirmationTimeoutMs });
+      const symbolic = await this.creationMetadata(repoPath, ['symbolic-ref', '--quiet', '--no-recurse', ref]);
       if (symbolic.status !== 1) {
         throw new Error(`branch name ${ref} is symbolic or unverifiable — refusing ${operation} without changing its alias or referent`);
+      }
+      if (operation === 'delete') {
+        if (ownedPath === undefined) throw new Error('deletion has no invocation-owned checkout reservation');
+        const query = async (path: string, args: readonly string[]): Promise<string> => {
+          const result = await this.creationMetadata(path, args);
+          if (result.status !== 0) throw new Error(`creation custody query ${args[0]} failed`);
+          return result.stdout.trim();
+        };
+        const common = realpathSync(await query(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+        const trees = await query(repoPath, ['worktree', 'list', '--porcelain', '-z']);
+        if (this.branchHasForeignHolder(trees, ref, ownedPath)) throw new Error(`created branch ${ref} acquired a foreign holder`);
+        const receipt = await query(repoPath, ['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
+        if (receipt !== `${custody.sha}\0${custody.token}`) throw new Error(`created branch ${ref} receipt changed under deletion lock`);
+        // No await after the final nonce/backlink/HEAD proof and before commit.
+        const admin = existsSync(ownedPath) ? this.assertCreationCustody(repoPath, ownedPath, custody, common)
+          : this.orphanCreationAdmin(repoPath, ownedPath, custody, common);
+        if (admin === null || readFileSync(join(admin, 'HEAD'), 'utf8').trim() !== `ref: ${ref}`) {
+          throw new Error(`created branch ${ref} lost its invocation-owned checkout reservation`);
+        }
       }
       if (failure !== undefined) throw failure;
       expected.push('commit');
@@ -1301,8 +1386,8 @@ export class WorktreeManager {
     }
   }
 
-  private assertCreationCustody(repoPath: string, path: string, custody: CreationCustody): void {
-    const common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+  private assertCreationCustody(repoPath: string, path: string, custody: CreationCustody,
+    common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string {
     const gitFile = readFileSync(join(path, '.git'), 'utf8').trim();
     if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
     const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
@@ -1311,12 +1396,13 @@ export class WorktreeManager {
       readFileSync(join(admin, 'locked'), 'utf8').trim() !== custody.token) {
       throw new Error('linked-worktree custody receipt does not match this invocation');
     }
+    return admin;
   }
 
   /** A failed hook can remove the checkout while leaving Git's locked
    * administration entry. Its backlink and nonce still prove custody. */
-  private orphanCreationAdmin(repoPath: string, path: string, custody: CreationCustody): string | null {
-    const common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+  private orphanCreationAdmin(repoPath: string, path: string, custody: CreationCustody,
+    common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string | null {
     const container = join(common, 'worktrees');
     if (!existsSync(container)) return null;
     const expected = join(realpathSync(dirname(path)), basename(path), '.git');
@@ -1352,16 +1438,19 @@ export class WorktreeManager {
     const receipt = runGit(repoPath, ['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
     const tip = runGit(repoPath, ['rev-parse', '--verify', ref]);
     const trees = runGit(repoPath, ['worktree', 'list', '--porcelain', '-z']);
-    const foreignHolder = trees.split('\0\0').some((entry) => {
+    if (tip !== custody.sha || receipt !== `${custody.sha}\0${custody.token}` || this.branchHasForeignHolder(trees, ref, ownedPath)) {
+      throw new Error(`created branch ${ref} changed or is held by another worktree`);
+    }
+  }
+
+  private branchHasForeignHolder(trees: string, ref: string, ownedPath: string | null): boolean {
+    return trees.split('\0\0').some((entry) => {
       const fields = entry.split('\0');
       if (!fields.includes(`branch ${ref}`)) return false;
       const tree = fields.find((field) => field.startsWith('worktree '))?.slice('worktree '.length);
       return ownedPath === null || tree === undefined ||
         join(realpathSync(dirname(tree)), basename(tree)) !== join(realpathSync(dirname(ownedPath)), basename(ownedPath));
     });
-    if (tip !== custody.sha || receipt !== `${custody.sha}\0${custody.token}` || foreignHolder) {
-      throw new Error(`created branch ${ref} changed or is held by another worktree`);
-    }
   }
 
   /** Only matching Git-native invocation receipts permit destructive
@@ -1384,9 +1473,15 @@ export class WorktreeManager {
         if (ownedPath === null || heldRef !== `refs/heads/${custody.branch}`) {
           throw new Error(`created branch ${custody.branch} has no invocation-owned checkout reservation`);
         }
-        await this.updateDirectCreationRef(repoPath, custody, 'delete');
+        await this.updateDirectCreationRef(repoPath, custody, 'delete', ownedPath);
       }
       if (ownedPath !== null) {
+        // The awaited transaction may run configured hooks or external actors.
+        // Never remove a path/admin entry using the pre-await custody proof.
+        if (existsSync(path)) this.assertCreationCustody(repoPath, path, custody);
+        else if (this.orphanCreationAdmin(repoPath, path, custody) !== orphanAdmin || orphanAdmin === null) {
+          throw new Error('orphaned worktree custody changed during rollback');
+        }
         // Git protects locked lanes even against a single --force.
         runGit(repoPath, ['worktree', 'remove', '--force', '--force', path]);
       }
