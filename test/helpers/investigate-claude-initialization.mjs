@@ -131,7 +131,7 @@ try {
     });
     let handle;
     try {
-      handle = await runtime.spawn('minion', { cwd: lane }, { model: 'openai-codex/gpt-6-luna', thinkingLevel: 'max', roleTools: ['bash'], workerVerification: policy });
+      handle = await runtime.spawn('minion', { cwd: lane, model: 'openai-codex/gpt-6-luna', thinkingLevel: 'max', roleTools: ['bash'], workerVerification: policy });
       let settled = false;
       const turn = handle.prompt(prompt).then(() => ({ ok: true }), (error) => ({ ok: false, error: String(error) })).then((value) => { settled = true; return value; });
       if (row.cancel) {
