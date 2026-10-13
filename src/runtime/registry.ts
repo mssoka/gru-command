@@ -13,6 +13,7 @@ import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
+import { disposeAll, type DisposableTarget } from './disposal.js';
 
 export { WorkerDisposalInProgressError };
 
@@ -891,9 +892,26 @@ export class RuntimeRegistry {
 
   async dispose(): Promise<void> {
     this.residents.shutdown();
-    for (const handle of [...this.handles]) await this.disposeHandle(handle);
-    for (const adapter of this.adapters.values()) await adapter.dispose();
-    this.adapters.clear();
+    // Contain every handle AND adapter (issue #341): a plain sequential await
+    // aborts on the first CessationIdleTimeoutError, leaving the remaining
+    // handles locked and the adapters' bridges/sockets never torn down.
+    // disposeAll runs them all and fails loud once with the per-target causes.
+    // Handles go through disposeHandle to preserve the override seam.
+    const targets: DisposableTarget[] = [
+      ...[...this.handles].map((handle) => ({
+        id: handle.id,
+        dispose: (): Promise<void> => this.disposeHandle(handle),
+      })),
+      ...[...this.adapters.values()].map((adapter) => ({
+        id: adapter.id,
+        dispose: (): Promise<void> => adapter.dispose(),
+      })),
+    ];
+    try {
+      await disposeAll(targets);
+    } finally {
+      this.adapters.clear();
+    }
   }
 }
 

@@ -2668,6 +2668,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/runtime/claude-review-settings.js",
   "dist/runtime/capabilities.js",
   "dist/runtime/cwd.js",
+  "dist/runtime/disposal.js",
   "dist/runtime/fallbacks.js",
   "dist/runtime/managed-skills.js",
   "dist/runtime/pacing.js",

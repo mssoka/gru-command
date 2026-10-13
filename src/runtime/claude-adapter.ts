@@ -55,6 +55,7 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
+import { disposeAll } from './disposal.js';
 import { CLAUDE_CODE_CAPABILITIES } from './capabilities.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -591,7 +592,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   }
 
   async dispose(): Promise<void> {
-    for (const handle of [...this.handles]) await handle.dispose();
+    // Contain every handle: one failing child must not abandon the remaining
+    // handles' child kills and lock releases (issue #341).
+    await disposeAll([...this.handles]);
   }
 }
 

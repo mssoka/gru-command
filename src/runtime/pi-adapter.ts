@@ -45,6 +45,7 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
+import { disposeAll } from './disposal.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
@@ -994,7 +995,10 @@ export class PiRuntime implements AgentRuntime {
   }
 
   async dispose(): Promise<void> {
-    for (const handle of [...this.handles]) await handle.dispose();
+    // Contain every handle: one hung session must not abandon the remaining
+    // handles' lock releases (issue #341). disposeAll runs them all and
+    // fails loud once with the per-handle causes.
+    await disposeAll([...this.handles]);
   }
 }
 
