@@ -100,7 +100,7 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'patch-vitest-rpc-timeout.test.ts': 11,
   'perkins-admission-preflight.test.ts': 83,
   'perkins-admission-sysctl.test.ts': 1,
-  'perkins-builtin-wave.test.ts': 243,
+  'perkins-builtin-wave.test.ts': 245,
   'perkins-checkpoint-enumeration.test.ts': 1,
   'perkins-crash-child.test.ts': 1, // skipped unless PERKINS_CRASH_CHILD is set; the parent crash test spawns it
   'perkins-findings-dedupe.test.ts': 11,
@@ -192,11 +192,12 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
   'escalation-identity.test.ts': 7,
   'dispatch-review-inputs.test.ts': 4,
   'durable-reconcile.test.ts': 13,
+  'fixture-repo-origin.test.ts': 1,
   'harness-diagnostics.test.ts': 18,
   'harness-routing.test.ts': 3,
   'ledger-obligations.test.ts': 30,
   'obligations-handback.test.ts': 9,
-  'perkins-github-app.test.ts': 162,
+  'perkins-github-app.test.ts': 163,
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 9,
   'tool-call-policy.test.ts': 12,
@@ -207,7 +208,13 @@ const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
 describe('suite shape', () => {
   it('runs the full PR gate on the default merge-result checkout', () => {
     const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf-8');
-    expect(workflow).toMatch(/- uses: actions\/checkout@v6\s*\n\s*- uses: actions\/setup-node@v6/);
+    // The gate still runs on the default merge-result checkout — checkout@v6
+    // with the full history as its ONLY option (so no `ref:`/head-sha
+    // override), immediately followed by setup-node@v6. The history is
+    // required: the App contract baseline scope (#190) archives the
+    // immutable pre-repair commit fe6a774 through a shared clone of this
+    // checkout, which a shallow fetch leaves absent.
+    expect(workflow).toMatch(/- uses: actions\/checkout@v6\n\s+with:\n\s+fetch-depth: 0\n\s*- uses: actions\/setup-node@v6/);
     expect(workflow).not.toContain('github.event.pull_request.head.sha');
     expect(workflow).toContain('run: npm test');
   });
