@@ -1,10 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { loadConfig, type Role, type RuntimeId } from '../src/config.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
-import { disposeAll, type DisposableTarget } from '../src/runtime/disposal.js';
+import { disposeAll, disposePhases, type DisposableTarget } from '../src/runtime/disposal.js';
 import {
   CESSATION_IDLE_TIMEOUT_MS,
   CessationIdleTimeoutError,
@@ -100,6 +100,102 @@ describe('disposeAll (issue #341 shutdown containment)', () => {
 });
 
 interface Activity { disposed: boolean; }
+
+describe('disposeAll / disposePhases attribution (issue #341 R3-3)', () => {
+  it('reports EVERY failing target in INPUT order with its original cause, even when they settle in reverse order (incl. a synchronous throw)', async () => {
+    const syncCause = new Error('sync target exploded');
+    const slowCause = new CessationIdleTimeoutError('agent-slow', CESSATION_IDLE_TIMEOUT_MS);
+    const fastCause = new Error('fast target exploded');
+    const adapterCause = new Error('adapter target exploded');
+    const started: string[] = [];
+    const settled: string[] = [];
+    const gate = (): { promise: Promise<void>; resolve: () => void } => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => { resolve = r; });
+      return { promise, resolve };
+    };
+    const slow = gate();
+    const fast = gate();
+    const adapter = gate();
+    const targets: DisposableTarget[] = [
+      // A SYNCHRONOUS throw: dispose() itself throws, not a rejected promise.
+      { id: 'agent-sync', dispose: () => { started.push('agent-sync'); settled.push('agent-sync'); throw syncCause; } },
+      { id: 'agent-slow', dispose: async () => { started.push('agent-slow'); await slow.promise; settled.push('agent-slow'); throw slowCause; } },
+      { id: 'agent-fast', dispose: async () => { started.push('agent-fast'); await fast.promise; settled.push('agent-fast'); throw fastCause; } },
+      { id: 'adapter:pi', dispose: async () => { started.push('adapter:pi'); await adapter.promise; settled.push('adapter:pi'); throw adapterCause; } },
+    ];
+    const disposal = disposeAll(targets);
+    // ALL siblings attempted before any settlement: the synchronous throw
+    // happens during the synchronous start pass and skips nobody.
+    expect(started).toEqual(['agent-sync', 'agent-slow', 'agent-fast', 'adapter:pi']);
+    // Settle in REVERSE order: adapter, then fast, then slow.
+    adapter.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    fast.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    slow.resolve();
+    const thrown = await disposal.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(settled).toEqual(['agent-sync', 'adapter:pi', 'agent-fast', 'agent-slow']);
+
+    expect(thrown).toBeInstanceOf(AggregateError);
+    const aggregate = thrown as AggregateError;
+    // First-failure-only collection would report 1; settlement-order or
+    // attribution loss would misorder or mispad the causes.
+    expect(aggregate.errors.length).toBe(4);
+    const errors = aggregate.errors as Error[];
+    expect(errors.map((error, index) => error.message.startsWith(`${targets[index]!.id}:`))).toEqual([true, true, true, true]);
+    expect(errors[0]!.cause).toBe(syncCause);
+    expect(errors[1]!.cause).toBe(slowCause);
+    expect(errors[2]!.cause).toBe(fastCause);
+    expect(errors[3]!.cause).toBe(adapterCause);
+    expect(aggregate.message).toContain('4 of 4');
+    for (const target of targets) expect(aggregate.message).toContain(target.id);
+  });
+
+  it('disposePhases keeps phase order, never starts phase 2 while phase 1 is pending, and combines causes after a phase-1 failure', async () => {
+    const residentCause = new CessationIdleTimeoutError('agent-0', CESSATION_IDLE_TIMEOUT_MS);
+    const adapterCause = new Error('adapter teardown failed');
+    const started: string[] = [];
+    let releaseResident!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseResident = resolve; });
+    const phases: DisposableTarget[][] = [
+      [
+        { id: 'agent-0', dispose: async () => { started.push('agent-0'); await gate; throw residentCause; } },
+        { id: 'agent-1', dispose: async () => { started.push('agent-1'); await gate; } },
+      ],
+      [
+        { id: 'adapter:pi', dispose: async () => { started.push('adapter:pi'); throw adapterCause; } },
+        { id: 'adapter:claude', dispose: async () => { started.push('adapter:claude'); } },
+      ],
+    ];
+    const disposal = disposePhases(phases);
+    expect(started).toEqual(['agent-0', 'agent-1']); // concurrent WITHIN phase 1
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(started).toEqual(['agent-0', 'agent-1']); // phase 2 NOT started while phase 1 is pending
+    releaseResident();
+    const thrown = await disposal.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    // Phase 2 ran even though phase 1 failed, with no skipped siblings.
+    expect(started).toEqual(['agent-0', 'agent-1', 'adapter:pi', 'adapter:claude']);
+    const aggregate = thrown as AggregateError;
+    expect(aggregate.errors.length).toBe(2);
+    const errors = aggregate.errors as Error[];
+    expect(errors[0]!.message.startsWith('agent-0:')).toBe(true);
+    expect(errors[0]!.cause).toBe(residentCause);
+    expect(errors[1]!.message.startsWith('adapter:pi:')).toBe(true);
+    expect(errors[1]!.cause).toBe(adapterCause);
+    // Total counts BOTH phases, not just the failing one.
+    expect(aggregate.message).toContain('2 of 4');
+  });
+});
 
 /** Minimal registry over a fake 'pi' adapter whose per-handle dispose can be
  * made to reject, so the real `RuntimeRegistry.dispose()` traversal is hit.
@@ -206,6 +302,117 @@ describe('registry.dispose (issue #341 shutdown containment)', () => {
   });
 });
 
+/** Registry whose resident disposals are held by a gate, so the test can
+ * observe whether the adapter phase starts before the resident phase settles. */
+function phaseHarness(opts: { rejectResident?: boolean } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'gru-disposal-phase-'));
+  cleanupDirs.push(dir);
+  const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 2 } };
+  const adapterCalls: string[] = [];
+  const residentStarts: string[] = [];
+  let spawnIndex = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const adapter: AgentRuntime = {
+    id: 'pi', capabilities: caps, health: () => ({ state: 'ok' }),
+    dispose: async () => { adapterCalls.push('pi'); },
+    spawn: async (role: Role): Promise<AgentHandle> => {
+      const id = `agent-${spawnIndex}`;
+      spawnIndex += 1;
+      return {
+        id, role, sessionFile: null, capabilities: caps,
+        health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
+        subscribe: () => () => {},
+        prompt: async () => {}, steer: async () => {}, followUp: async () => {},
+        hasLiveProcess: () => false, isCompacting: () => false,
+        dispose: async () => {
+          residentStarts.push(id);
+          await gate;
+          if (opts.rejectResident === true) throw new CessationIdleTimeoutError(id, CESSATION_IDLE_TIMEOUT_MS);
+        },
+      };
+    },
+  };
+  class TestRegistry extends RuntimeRegistry {
+    constructor(options: ConstructorParameters<typeof RuntimeRegistry>[0]) {
+      super(options);
+      (this as unknown as { adapters: Map<RuntimeId, AgentRuntime> }).adapters.set('pi', adapter);
+    }
+    override runtimeIdFor(_role: Role): RuntimeId { return 'pi'; }
+    override runtimeFor(): AgentRuntime { return adapter; }
+  }
+  const registry = new TestRegistry({ config, store: {} as SessionStore, canReclaim: () => false });
+  return { registry, adapterCalls, residentStarts, release };
+}
+
+describe('registry disposal phases (issue #341 R3-1)', () => {
+  it('settles the WHOLE resident phase before starting ANY adapter, and still runs the adapter phase after resident failures', async () => {
+    const { registry, adapterCalls, residentStarts, release } = phaseHarness({ rejectResident: true });
+    await registry.spawn('minion');
+    await registry.spawn('minion');
+    let thrown: unknown = null;
+    const disposal = registry.dispose().then(
+      () => null,
+      (error: unknown) => { thrown = error; return error; },
+    );
+    // Let the concurrent resident phase reach its held await.
+    for (let i = 0; i < 8; i += 1) await Promise.resolve();
+    expect(residentStarts).toEqual(['agent-0', 'agent-1']); // concurrent starts
+    expect(adapterCalls).toEqual([]); // adapters NOT started while residents are pending
+    release();
+    await disposal;
+    expect(adapterCalls).toEqual(['pi']); // adapter phase still ran after the resident rejection
+    expect(thrown).toBeInstanceOf(AggregateError);
+    const errors = (thrown as AggregateError).errors as Error[];
+    expect(errors.length).toBe(2);
+    expect(errors[0]!.message.startsWith('agent-0:')).toBe(true);
+    expect(errors[1]!.message.startsWith('agent-1:')).toBe(true);
+  });
+
+  it('a timed-out shared native handle is reported ONCE (resident-attributed), never duplicated as an adapter-only failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-disposal-shared-'));
+    cleanupDirs.push(dir);
+    const config = loadConfig({ GRU_COMMAND_HOME: dir });
+    // The ACTUAL native runtime method under test.
+    const runtime = new PiRuntime({ config, store: {} as SessionStore });
+    const nativeHandles = (runtime as unknown as { handles: Set<unknown> }).handles;
+    const timeout = new CessationIdleTimeoutError('pi-0', CESSATION_IDLE_TIMEOUT_MS);
+    // Single-flight, mirroring PiAgentHandle.dispose(); retires from the
+    // adapter's own set on settlement, mirroring PiRuntime's onDispose hook.
+    let nativeDisposal: Promise<void> | null = null;
+    const native = {
+      id: 'pi-0',
+      dispose: (): Promise<void> => (nativeDisposal ??= (async () => {
+        await Promise.resolve(); // the awaited session disposal + idle proof
+        nativeHandles.delete(native);
+        throw timeout;
+      })()),
+    };
+    nativeHandles.add(native);
+    // The resident whose disposal forwards to the SAME native handle.
+    const resident = { id: 'pi-0', dispose: (): Promise<void> => native.dispose() } as unknown as AgentHandle;
+    const registry = new RuntimeRegistry({ config, store: {} as SessionStore, canReclaim: () => false });
+    (registry as unknown as { adapters: Map<RuntimeId, AgentRuntime> }).adapters.set('pi', runtime);
+    (registry as unknown as { handles: Set<AgentHandle> }).handles.add(resident);
+
+    const thrown = await registry.dispose().then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(thrown).toBeInstanceOf(AggregateError);
+    const aggregate = thrown as AggregateError;
+    const errors = aggregate.errors as Error[];
+    // ONE timeout, ONE attributed cause — not repeated through the adapter.
+    expect(errors.length).toBe(1);
+    expect(errors[0]!.message.startsWith('pi-0:')).toBe(true);
+    expect(errors[0]!.cause).toBe(timeout);
+    expect(aggregate.message).not.toContain('pi: ');
+    // The native handle retired from the adapter's set before the adapter phase.
+    expect(nativeHandles.size).toBe(0);
+  });
+});
+
 describe('native runtime disposal containment (issue #341)', () => {
   /** A stub handle whose dispose rejects for the FIRST one only; the runtime
    * loop must still reach the second. */
@@ -262,16 +469,11 @@ describe('native runtime disposal containment (issue #341)', () => {
 });
 
 describe('service shutdown force-exit budget (issue #341)', () => {
-  it('outlasts the bounded runtime teardown, and main.ts arms it (source-drift alarm)', () => {
-    // One concurrent post-dispose idle proof plus an adapter bridge close is
-    // the worst case the graceful path supervises; a guard no larger than a
-    // bound fired process.exit(1) mid-teardown and abandoned cleanup.
+  it('outlasts the bounded runtime teardown', () => {
+    // The EXECUTABLE orchestration proof (guard vs. a full idle bound, the
+    // 12s earlier-stage + re-arm interaction, cleanup-after-rejection, and a
+    // genuinely stuck stage) lives in test/service-shutdown.test.ts; this pins
+    // the constant relation the re-arm window depends on.
     expect(SHUTDOWN_FORCE_EXIT_MS).toBeGreaterThan(CESSATION_IDLE_TIMEOUT_MS + BRIDGE_CLOSE_TIMEOUT_MS);
-    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
-    expect(mainSource).toContain("from './shutdown-budget.js'");
-    expect(mainSource).toMatch(/},\s*SHUTDOWN_FORCE_EXIT_MS\);/);
-    // Re-armed at the runtime teardown (issue #341): the initial guard plus at
-    // least one re-arm, so earlier stages cannot eat the disposal budget.
-    expect((mainSource.match(/armForceExit\(\)/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 });

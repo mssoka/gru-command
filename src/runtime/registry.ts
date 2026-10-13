@@ -13,7 +13,7 @@ import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
-import { disposeAll, type DisposableTarget } from './disposal.js';
+import { disposePhases, type DisposableTarget } from './disposal.js';
 
 export { WorkerDisposalInProgressError };
 
@@ -892,26 +892,31 @@ export class RuntimeRegistry {
 
   async dispose(): Promise<void> {
     this.residents.shutdown();
-    // Contain every handle AND adapter (issue #341): a plain sequential await
-    // aborts on the first CessationIdleTimeoutError, leaving the remaining
-    // handles locked and the adapters' bridges/sockets never torn down.
-    // disposeAll runs them all CONCURRENTLY (one hung session costs a single
-    // bound, not one bound per session) and fails loud once with the
-    // per-target causes. Handles go through disposeHandle to preserve the
-    // override seam; adapters dispose the same underlying handles, so running
-    // them alongside the resident wrappers is single-flight-safe.
-    const targets: DisposableTarget[] = [
-      ...[...this.handles].map((handle) => ({
-        id: handle.id,
-        dispose: (): Promise<void> => this.disposeHandle(handle),
-      })),
-      ...[...this.adapters.values()].map((adapter) => ({
-        id: adapter.id,
-        dispose: (): Promise<void> => adapter.dispose(),
-      })),
-    ];
+    // Contain every handle AND adapter (issue #341) in TWO ordered, internally
+    // concurrent phases. A plain sequential await aborts on the first
+    // CessationIdleTimeoutError, leaving the remaining handles locked and the
+    // adapters' bridges/sockets never torn down; and starting both kinds at
+    // once lets a native adapter snapshot the same underlying handles before
+    // their resident wrappers retire them, re-attributing one handle's
+    // timeout as an adapter-only failure.
+    //
+    // Phase 1 starts every resident handle's disposal concurrently and waits
+    // for ALL of them. Phase 2 then starts every adapter concurrently EVEN IF
+    // phase 1 failed: by then each underlying handle has retired from the
+    // adapter's own set, so the adapter phase does not duplicate the same
+    // failure. disposePhases combines the attributed causes of both phases
+    // (resident ids first, adapter ids second) and reports them once.
+    // Handles go through disposeHandle to preserve the override seam.
+    const residentTargets: DisposableTarget[] = [...this.handles].map((handle) => ({
+      id: handle.id,
+      dispose: (): Promise<void> => this.disposeHandle(handle),
+    }));
+    const adapterTargets: DisposableTarget[] = [...this.adapters.values()].map((adapter) => ({
+      id: adapter.id,
+      dispose: (): Promise<void> => adapter.dispose(),
+    }));
     try {
-      await disposeAll(targets);
+      await disposePhases([residentTargets, adapterTargets]);
     } finally {
       this.adapters.clear();
     }

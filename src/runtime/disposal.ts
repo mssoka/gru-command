@@ -33,21 +33,24 @@ function describeFailure(error: unknown): string {
   }
 }
 
-/** Dispose every target CONCURRENTLY, then throw one {@link AggregateError}
- * carrying the per-target causes. Never aborts the traversal: a failure on
- * target N does not skip N+1 (and does not delay it behind N's bound).
- * Resolves cleanly when every target disposes. */
-export async function disposeAll(targets: readonly DisposableTarget[]): Promise<void> {
-  // Start every disposal synchronously (capturing a synchronous throw as a
-  // rejection) so the whole set is in flight before the first settlement.
-  const started = targets.map((target) => {
+/** Start every target's disposal SYNCHRONOUSLY (capturing a synchronous throw
+ * as a rejection) so the whole batch is in flight before the first
+ * settlement. */
+function startAll(targets: readonly DisposableTarget[]): Promise<void>[] {
+  return targets.map((target) => {
     try {
       return Promise.resolve(target.dispose());
     } catch (error) {
       return Promise.reject(error);
     }
   });
-  const settled = await Promise.allSettled(started);
+}
+
+/** Await EVERY started disposal and return the attributed failures in TARGET
+ * input order — never settlement order, never first-failure-only. Each failure
+ * carries the target id and the ORIGINAL thrown value as its `cause`. */
+async function collectFailures(targets: readonly DisposableTarget[]): Promise<Error[]> {
+  const settled = await Promise.allSettled(startAll(targets));
   const failures: Error[] = [];
   settled.forEach((result, index) => {
     if (result.status !== 'rejected') return;
@@ -56,11 +59,47 @@ export async function disposeAll(targets: readonly DisposableTarget[]): Promise<
       new Error(`${target.id}: ${describeFailure(result.reason)}`, { cause: result.reason }),
     );
   });
-  if (failures.length > 0) {
-    throw new AggregateError(
-      failures,
-      `disposal failed for ${failures.length} of ${targets.length} target(s): ` +
-        failures.map((failure) => failure.message).join('; '),
-    );
+  return failures;
+}
+
+/** One AggregateError over every collected cause, with the total target count
+ * across the whole traversal (not just the failing phase). */
+function aggregateFailure(failures: readonly Error[], totalTargets: number): AggregateError {
+  return new AggregateError(
+    [...failures],
+    `disposal failed for ${failures.length} of ${totalTargets} target(s): ` +
+      failures.map((failure) => failure.message).join('; '),
+  );
+}
+
+/** Dispose every target CONCURRENTLY, then throw one {@link AggregateError}
+ * carrying the per-target causes. Never aborts the traversal: a failure on
+ * target N does not skip N+1 (and does not delay it behind N's bound).
+ * Resolves cleanly when every target disposes. */
+export async function disposeAll(targets: readonly DisposableTarget[]): Promise<void> {
+  const failures = await collectFailures(targets);
+  if (failures.length > 0) throw aggregateFailure(failures, targets.length);
+}
+
+/** Dispose every target of PHASE 1 concurrently, wait for the whole phase to
+ * settle, then do the same for PHASE 2 (and so on). A failure in an earlier
+ * phase NEVER skips a later phase — phases are ordered, targets within a phase
+ * are not. Causes are combined across phases (phase order, then target input
+ * order) and reported once with the total target count attached.
+ *
+ * `registry.dispose()` uses this to keep the resident-handle phase ahead of the
+ * adapter phase: a native adapter disposes the SAME underlying handles the
+ * residents wrap, so running it only after the resident phase settles lets
+ * each underlying handle retire from the adapter's own set first and avoids
+ * re-attributing one handle's timeout as an adapter-only failure. */
+export async function disposePhases(
+  phases: readonly (readonly DisposableTarget[])[],
+): Promise<void> {
+  const failures: Error[] = [];
+  let totalTargets = 0;
+  for (const phase of phases) {
+    totalTargets += phase.length;
+    failures.push(...(await collectFailures(phase)));
   }
+  if (failures.length > 0) throw aggregateFailure(failures, totalTargets);
 }
