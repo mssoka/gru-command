@@ -41,6 +41,7 @@ import {
   decisionHold,
   deliveredPrRegisterHold,
   fencesHold,
+  latestCiObservation,
   reviewEligible,
   sweepAckHold,
   type AutopilotPull,
@@ -104,12 +105,13 @@ export interface SilasAutopilotOpsHandle extends SilasAutopilotOps {
    * cessation claim: an unsettled producer is reported, never fabricated
    * away.
    *
-   * Issue #243 F-H4: a running gated re-brief awaits its prompt directly, and
-   * its stop signal does not reach that open await — so an UNBOUNDED join
-   * would block shutdown's disposal/persistence stages behind it. When
-   * `graceMs` is supplied the initial join is BOUNDED: it reports the
-   * remaining producers and returns, leaving real cleanup to settle them. */
-  drain(opts?: { readonly graceMs?: number }): Promise<{ readonly settled: boolean; readonly pending: number }>;
+   * Issue #243 F-H4 (corrected): the join is deliberately UNBOUNDED here and
+   * introduces NO new grace/ceiling of its own. The caller must make the
+   * disposal that releases a running producer available BEFORE this join
+   * (registry disposal disposes the handles the producers await), so the join
+   * settles under the EXISTING approved shutdown watchdog rather than a new
+   * invented timer. */
+  drain(): Promise<{ readonly settled: boolean; readonly pending: number }>;
 }
 
 /** The extension of a `silas.*` receipt payload that marks it as the
@@ -149,22 +151,14 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     producers.add(settled);
     void settled.then(() => producers.delete(settled));
   };
-  const drain = async (opts: { readonly graceMs?: number } = {}): Promise<{ readonly settled: boolean; readonly pending: number }> => {
+  const drain = async (): Promise<{ readonly settled: boolean; readonly pending: number }> => {
+    // Issue #243 F-H4 (corrected): a plain join with NO invented grace/ceiling.
+    // The caller disposes the producers' handles BEFORE awaiting this
+    // (registry disposal), so the join settles under the existing approved
+    // shutdown watchdog; an unsettled producer is reported, never claimed
+    // ceased.
     if (producers.size === 0) return { settled: true, pending: 0 };
-    const join = Promise.allSettled([...producers]);
-    if (opts.graceMs !== undefined && Number.isFinite(opts.graceMs)) {
-      // BOUNDED initial join (issue #243 F-H4): report unsettled producers
-      // instead of blocking shutdown's disposal/persistence stages.
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const bound = new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, Math.max(0, opts.graceMs as number));
-        timer.unref?.();
-      });
-      await Promise.race([join, bound]);
-      if (timer !== undefined) clearTimeout(timer);
-      return { settled: producers.size === 0, pending: producers.size };
-    }
-    await join;
+    await Promise.allSettled([...producers]);
     return { settled: producers.size === 0, pending: producers.size };
   };
 
@@ -303,6 +297,27 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       jobId: input.jobId,
       ...(targetRef === undefined ? {} : { targetRef }),
       ...(boundDeliveredSha === undefined ? {} : { boundDeliveredSha }),
+      // Issue #243 F-H2/M2: the caller's LAST admission guard. The WaveRunner
+      // invokes it after every awaited setup/probe step and immediately before
+      // any admission effect — an owner hold (this family/basis) or a CI
+      // observation that lands during the review preflight/capacity/final-probe
+      // awaits refuses the arm rather than admitting stale work.
+      finalAdmissionGuard: () => {
+        requireHoldUncovered(input.jobId, input.hold, 'review request');
+        if (input.ruleId === 'pr-review-trigger') {
+          const delivered = deps.ledger.latestJobEvent(input.jobId, 'job.delivered');
+          const deliveredSha = delivered === null ? null : deliveredTargetSha(delivered);
+          const observation = latestCiObservation(deps.ledger, input.jobId);
+          if (
+            deliveredSha === null || observation === null || observation.malformed ||
+            observation.sha !== deliveredSha || observation.status !== 'green'
+          ) {
+            throw new Error(
+              'the newest CI observation on the delivered head is no longer usable green — review admission refused',
+            );
+          }
+        }
+      },
     };
     // Issue #243 R2-M1: await ADMISSION (the same await the HTTP endpoint
     // performs), never the long review turn. The suppression receipt lands

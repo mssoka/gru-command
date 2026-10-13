@@ -439,38 +439,56 @@ function failedDirectivesForFingerprint(ledger: AutopilotLedger, jobId: string, 
 /** The newest CI observation bound to the lane (issue #243 F-M2): the latest
  * `github.ci-green`/`github.ci-failed` signal OR the latest
  * `github.branch-state` cursor's `ci` state (which also carries `pending`).
- * A historical green must never survive a newer failed/pending observation at
- * the same head. Returns the observation with the highest event seq. */
-function latestCiObservation(ledger: AutopilotLedger, jobId: string): { readonly sha: string; readonly status: string } | null {
-  const candidates: { readonly seq: number; readonly sha: string; readonly status: string }[] = [];
+/** The newest CI observation bound to the lane (issue #243 F-M2). The
+ * NEWEST observation governs — a historical green must never survive a
+ * newer failed/pending/malformed observation. Returns `malformed: true`
+ * when the newest CI-bearing event carries no usable sha/status (an
+ * unknown or malformed observation never falls back to an older green).
+ * Optional `repo`/`pr` fields ride along for the caller's binding check. */
+export interface CiObservation {
+  readonly malformed: boolean;
+  readonly sha: string | null;
+  readonly status: string | null;
+  readonly pr: number | null;
+}
+
+export function latestCiObservation(ledger: AutopilotLedger, jobId: string): CiObservation | null {
   const signalSha = (payload: unknown): string | null => {
     if (payload === null || typeof payload !== 'object') return null;
     const sha = (payload as { sha?: unknown }).sha;
     return typeof sha === 'string' && sha !== '' ? sha : null;
   };
+  const signalPr = (payload: unknown): number | null => {
+    if (payload === null || typeof payload !== 'object') return null;
+    const pr = (payload as { pr?: unknown }).pr;
+    return typeof pr === 'number' && Number.isFinite(pr) ? pr : null;
+  };
+  const entries: { readonly seq: number; readonly kind: 'green' | 'failed' | 'branch'; readonly payload: unknown }[] = [];
   const green = ledger.latestJobEvent(jobId, 'github.ci-green');
-  if (green !== null) {
-    const sha = signalSha(green.payload);
-    if (sha !== null) candidates.push({ seq: green.seq, sha, status: 'green' });
-  }
+  if (green !== null) entries.push({ seq: green.seq, kind: 'green', payload: green.payload });
   const failed = ledger.latestJobEvent(jobId, 'github.ci-failed');
-  if (failed !== null) {
-    const sha = signalSha(failed.payload);
-    if (sha !== null) candidates.push({ seq: failed.seq, sha, status: 'failed' });
-  }
+  if (failed !== null) entries.push({ seq: failed.seq, kind: 'failed', payload: failed.payload });
   const branch = ledger.latestJobEvent(jobId, BRANCH_STATE_EVENT);
-  if (branch !== null && branch.payload !== null && typeof branch.payload === 'object') {
-    const ci = (branch.payload as { ci?: unknown }).ci;
-    if (ci !== null && typeof ci === 'object') {
-      const sha = (ci as { sha?: unknown }).sha;
-      const status = (ci as { status?: unknown }).status;
-      if (typeof sha === 'string' && sha !== '' && typeof status === 'string') {
-        candidates.push({ seq: branch.seq, sha, status });
-      }
-    }
+  if (branch !== null) entries.push({ seq: branch.seq, kind: 'branch', payload: branch.payload });
+  if (entries.length === 0) return null;
+  const newest = entries.reduce((best, current) => (current.seq > best.seq ? current : best));
+  if (newest.kind === 'green' || newest.kind === 'failed') {
+    const sha = signalSha(newest.payload);
+    if (sha === null) return { malformed: true, sha: null, status: null, pr: null };
+    return { malformed: false, sha, status: newest.kind === 'green' ? 'green' : 'failed', pr: signalPr(newest.payload) };
   }
-  if (candidates.length === 0) return null;
-  return candidates.reduce((best, current) => (current.seq > best.seq ? current : best));
+  const payload = newest.payload;
+  const ci = payload !== null && typeof payload === 'object' ? (payload as { ci?: unknown }).ci : undefined;
+  if (ci === null || ci === undefined || typeof ci !== 'object') {
+    return { malformed: true, sha: null, status: null, pr: null };
+  }
+  const sha = (ci as { sha?: unknown }).sha;
+  const status = (ci as { status?: unknown }).status;
+  if (typeof sha !== 'string' || sha === '' || typeof status !== 'string') {
+    return { malformed: true, sha: null, status: null, pr: null };
+  }
+  const pr = typeof payload === 'object' && payload !== null ? (payload as { pr_number?: unknown }).pr_number : undefined;
+  return { malformed: false, sha, status, pr: typeof pr === 'number' && Number.isFinite(pr) ? pr : null };
 }
 
 /** `pr-conflict-rebase`: ONE conflict-integration directive per head. */
@@ -552,8 +570,18 @@ function planReviewTrigger(row: PrWithoutReviewRow, ledger: AutopilotLedger): Ve
   const deliveredSha = delivered === null ? null : deliveredTargetSha(delivered);
   if (deliveredSha === null) return refuse('the delivered head is not resolvable — the arm cannot be bound');
   const observation = latestCiObservation(ledger, row.jobId);
-  if (observation === null || observation.sha !== deliveredSha || observation.status !== 'green') {
-    return refuse('the newest CI observation on the delivered head is not green');
+  if (observation === null || observation.malformed || observation.sha !== deliveredSha || observation.status !== 'green') {
+    return refuse('the newest CI observation on the delivered head is not usable green');
+  }
+  // Repo/PR binding (issue #243 F-M2): when the observation names a pull and
+  // the job carries a parseable PR url, they must agree — a green for another
+  // pull never authorizes this lane.
+  if (observation.pr !== null && job !== null && job.prUrl !== null) {
+    const match = /\/([0-9]+)\/?$/u.exec(job.prUrl);
+    const jobPr = match === null ? null : Number(match[1]);
+    if (jobPr !== null && Number.isFinite(jobPr) && observation.pr !== jobPr) {
+      return refuse('the newest CI observation belongs to a different pull request');
+    }
   }
   // The reviewed head is the one the green proved: bind it exactly, so the
   // awaited review setup cannot re-resolve a newer live PR head and the

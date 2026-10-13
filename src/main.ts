@@ -358,12 +358,6 @@ async function main(): Promise<number> {
   /** Service-stopping signal (pacing): aborts QUEUED admission waits and
    * lets delivery settlement observe shutdown instead of hanging. */
   const serviceStop = new AbortController();
-  // Issue #243 F-H4: bounds for the autopilot producer join, inside the
-  // existing 5000ms shutdown watchdog. The INITIAL grace must leave room for
-  // registry disposal and the persistence stages that settle the producers;
-  // the FINAL grace joins what disposal has released. Neither claims cessation.
-  const AUTOPILOT_DRAIN_INITIAL_GRACE_MS = 1_500;
-  const AUTOPILOT_DRAIN_FINAL_GRACE_MS = 1_000;
   const shutdown = (signal: string, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -446,25 +440,10 @@ async function main(): Promise<number> {
             logger.error('silas driver stop failed', { error: String(error) });
           }
         }
-        // Issue #243 R2-H9/F-H4: the autopilot's in-flight producers are
-        // joined with a BOUNDED initial grace so a running gated re-brief
-        // (whose stop signal does not reach its open prompt) can never block
-        // the disposal/persistence stages below. The service-stop signal
-        // already aborts QUEUED admissions; the real registry disposal below
-        // settles the running ones, and the FINAL accounting reports what is
-        // still open — never fabricated as ceased.
-        if (state.autopilot !== undefined) {
-          try {
-            const drained = await state.autopilot.drain({ graceMs: AUTOPILOT_DRAIN_INITIAL_GRACE_MS });
-            if (!drained.settled) {
-              logger.warn('silas autopilot producers still running at shutdown (bounded initial join)', {
-                pending: drained.pending,
-              });
-            }
-          } catch (error) {
-            logger.error('silas autopilot drain failed', { error: String(error) });
-          }
-        }
+        // Issue #243 F-H4 (corrected): the autopilot producer join runs AFTER
+        // the registry disposal that releases a running producer's handle
+        // (below), so no join here blocks disposal and no new grace/ceiling is
+        // invented. The service-stop signal already aborts QUEUED admissions.
         if (state.providerRecovery !== undefined) {
           try {
             state.providerRecovery.stop();
@@ -509,19 +488,20 @@ async function main(): Promise<number> {
             logger.error('registry dispose failed', { error: String(error) });
           }
         }
-        // Issue #243 F-H4 final accounting: registry disposal has now released
-        // the running producers' handles, so report honestly whether they
-        // settled rather than claiming cessation.
+        // Issue #243 F-H4 (corrected): registry disposal has released the
+        // running producers' handles, so this plain join settles under the
+        // existing approved shutdown watchdog; an unsettled producer is
+        // reported, never fabricated as ceased.
         if (state.autopilot !== undefined) {
           try {
-            const settledNow = await state.autopilot.drain({ graceMs: AUTOPILOT_DRAIN_FINAL_GRACE_MS });
-            if (!settledNow.settled) {
+            const drained = await state.autopilot.drain();
+            if (!drained.settled) {
               logger.warn('silas autopilot producers unsettled after disposal — ownership retained for boot reconciliation', {
-                pending: settledNow.pending,
+                pending: drained.pending,
               });
             }
           } catch (error) {
-            logger.error('silas autopilot final drain failed', { error: String(error) });
+            logger.error('silas autopilot drain failed', { error: String(error) });
           }
         }
         if (state.store !== undefined) {

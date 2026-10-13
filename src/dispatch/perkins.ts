@@ -1680,6 +1680,12 @@ export interface ReviewRequestInput {
     /** Internal: the automatic admission retry this request carries out;
      * never accepted from the public HTTP endpoint. */
     admissionRetry?: AdmissionRetry;
+    /** Internal: the caller's LAST admission guard (issue #243 F-H2/M2). It is
+     * invoked after every awaited setup/probe step and immediately before any
+     * admission effect, so an owner hold or a CI change that landed during
+     * the awaits refuses the round instead of arming stale work. Never accepted
+     * from the public HTTP endpoint. */
+    finalAdmissionGuard?: () => void;
 }
 
 export class WaveRunner {
@@ -3219,6 +3225,9 @@ export class WaveRunner {
     /** What a forced request authorized at its original arm (#267): the
      * freeze and post-probe checks cover only that work. In memory only. */
     forceAuthorization?: ForceAuthorization;
+    /** Issue #243 F-H2/M2: the caller's last admission guard (see
+     * ReviewRequestInput.finalAdmissionGuard). */
+    finalAdmissionGuard?: () => void;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     if (this.roundAdmission.has(input.jobId)) throw new RoundAdmissionInProgress(input.jobId);
@@ -4075,6 +4084,9 @@ export class WaveRunner {
     /** What a forced request authorized at its original arm (#267): the
      * freeze and post-probe checks cover only that work. In memory only. */
     forceAuthorization?: ForceAuthorization;
+    /** Issue #243 F-H2/M2: the caller's last admission guard (see
+     * ReviewRequestInput.finalAdmissionGuard). */
+    finalAdmissionGuard?: () => void;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     // R7-14: the delivery THIS round reviews — fixed before any await, so a
@@ -4467,6 +4479,12 @@ export class WaveRunner {
           );
         }
       }
+      // Issue #243 F-H2/M2: the caller's LAST admission guard runs here,
+      // after every awaited setup/probe step and immediately before any
+      // admission effect — a family/basis owner hold or a CI observation that
+      // landed during the awaits refuses instead of arming stale work. This is
+      // a caller-supplied guard (no private schema/ingress invented here).
+      input.finalAdmissionGuard?.();
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
         jobId: job.id,
