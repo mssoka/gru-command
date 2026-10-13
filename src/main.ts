@@ -1294,12 +1294,13 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
     stopping: () => shuttingDown,
   });
-  if (rebriefRecovery.examined > 0) {
+  if (rebriefRecovery.examined > 0 || rebriefRecovery.failed > 0) {
     logger.info('re-brief reconciliation', {
       examined: rebriefRecovery.examined,
       completed: rebriefRecovery.completed,
       redispatched: rebriefRecovery.redispatched,
       retired: rebriefRecovery.retired,
+      failed: rebriefRecovery.failed,
     });
   }
   // Child-worker restart safety (issue #161): a child that never bound a

@@ -682,7 +682,8 @@ describe('re-brief restart safety (durable markers)', () => {
     const restore = failSettlementPublication(h.ledger, new Error('boot settlement publication failed'));
     try {
       await expect(reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 }))
-        .rejects.toThrow(/boot settlement publication failed/u);
+        .resolves.toMatchObject({ completed: 0, redispatched: 0, failed: 1 });
+      expect(h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${jobId}`, 'active')?.detail).toContain('boot settlement publication failed');
     } finally { restore(); }
     // No clear committed: the spent markers stay for the next pass.
     expect(h.ledger.listPendingRebriefs({ jobId })).toHaveLength(2);
@@ -708,7 +709,8 @@ describe('re-brief restart safety (durable markers)', () => {
     const restore = failSettlementPublication(h.ledger, new Error('shortcut settlement publication failed'));
     try {
       await expect(reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 100 }))
-        .rejects.toThrow(/shortcut settlement publication failed/u);
+        .resolves.toMatchObject({ completed: 0, redispatched: 0, failed: 1 });
+      expect(h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${jobId}`, 'active')?.detail).toContain('shortcut settlement publication failed');
     } finally { restore(); }
     // The recorded delivery committed in its own transaction and stays;
     // the clear rolled back with the settlement, so nothing is stranded.
@@ -859,6 +861,64 @@ describe('re-brief restart safety (durable markers)', () => {
     } finally { h.close(); }
   });
 
+  it('R12 bounded boot observation retains a failed historical group actionably while independent generations settle', async () => {
+    const h = makeHarness(); const failedJob = 'r12-failed-observation';
+    try {
+      for (const jobId of [failedJob, 'r12-healthy-observation']) { await seedPendingRebrief({ h, jobId }); seedHistoricalCompletion(h, jobId); }
+      const original = h.ledger.listPendingRebriefs({ jobId: failedJob });
+      const clear = h.ledger.clearPendingRebriefsIfCurrentAndSettle.bind(h.ledger);
+      const fault = vi.spyOn(h.ledger, 'clearPendingRebriefsIfCurrentAndSettle').mockImplementation((markers) => {
+        if (markers[0]?.jobId === failedJob) throw new Error('persistent original scoped observation failure');
+        return clear(markers);
+      });
+      const deps = { registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications };
+      try {
+        await expect(reconcilePendingRebriefs(deps)).resolves.toMatchObject({ completed: 1, redispatched: 0, failed: 1 });
+        await expect(reconcilePendingRebriefs(deps)).resolves.toMatchObject({ completed: 0, redispatched: 0, failed: 1 });
+        expect(h.ledger.listPendingRebriefs({ jobId: failedJob })).toEqual(original);
+        expect(h.ledger.listPendingRebriefs({ jobId: 'r12-healthy-observation' })).toEqual([]);
+        const debt = h.ledger.listObligations({ jobId: failedJob }).find((row) => row.incidentKey === `rebrief-recovery:${original.find((row) => row.kind === 'silas.rebrief')!.id}`);
+        expect(debt).toMatchObject({ state: 'open', nextAction: { kind: 'gru-decision' } });
+        const card = h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${failedJob}`, 'active');
+        expect(card).toMatchObject({ routing: 'action-required' }); expect(card?.detail).toContain('persistent original scoped observation failure');
+        expect(h.registry.workers).toEqual([]); expect(h.registry.disposed).toEqual([]);
+      } finally { fault.mockRestore(); }
+      const recovered = await reconcilePendingRebriefs(deps);
+      expect(recovered.completed).toBe(1); expect(h.ledger.listPendingRebriefs()).toEqual([]);
+    } finally { h.close(); }
+  });
+
+  it('R12 failed old observation never attributes its error or opens recovery debt against a replacement generation', async () => {
+    const h = makeHarness(); const jobId = 'r12-replaced-failed-observation';
+    try {
+      await seedPendingRebrief({ h, jobId }); seedHistoricalCompletion(h, jobId);
+      const old = h.ledger.listPendingRebriefs({ jobId });
+      const fault = vi.spyOn(h.ledger, 'clearPendingRebriefsIfCurrentAndSettle').mockImplementationOnce(() => {
+        h.ledger.clearPendingRebriefs(old.map((row) => row.id));
+        h.ledger.beginPendingRebrief({ jobId, note: 'new original intent', briefing: 'separately accepted replacement context' });
+        throw new Error('old observation failed after replacement');
+      });
+      try {
+        await expect(reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }))
+          .resolves.toMatchObject({ completed: 0, failed: 1 });
+        const newer = h.ledger.listPendingRebriefs({ jobId }); expect(newer).toHaveLength(2);
+        expect(newer.some((row) => old.some((prior) => prior.id === row.id))).toBe(false);
+        expect(h.ledger.listObligations({ jobId }).some((row) => row.incidentKey?.startsWith('rebrief-recovery:'))).toBe(false);
+        expect(h.ledger.findNotificationByKind(`silas.rebrief-unreconciled.${jobId}`, 'active')).toBeNull();
+        expect(h.registry.workers).toEqual([]);
+      } finally { fault.mockRestore(); }
+    } finally { h.close(); }
+  });
+
+  it('R12 shared historical cursor storage failure remains a loud refusal, not successful isolated recovery', async () => {
+    const h = makeHarness(); const fault = vi.spyOn(h.ledger, 'readReconcileCursor').mockImplementationOnce(() => { throw new Error('shared historical storage unavailable'); });
+    try {
+      await expect(reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }))
+        .rejects.toThrow(/shared historical storage unavailable/);
+      expect(h.registry.workers).toEqual([]);
+    } finally { fault.mockRestore(); h.close(); }
+  });
+
   it('retries a failed historical group on the next bounded pass instead of waiting for cursor wraparound', async () => {
     const h = makeHarness();
     try {
@@ -867,7 +927,8 @@ describe('re-brief restart safety (durable markers)', () => {
       const restore = failSettlementPublication(h.ledger, new Error('first historical settlement fails'));
       try {
         await expect(reconcilePendingRebriefs({ registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications }, { limit: 1 }))
-          .rejects.toThrow(/first historical settlement fails/);
+          .resolves.toMatchObject({ completed: 0, redispatched: 0, failed: 1 });
+        expect(h.ledger.findNotificationByKind('silas.rebrief-unreconciled.retry-cursor-first', 'active')?.detail).toContain('first historical settlement fails');
       } finally { restore(); }
 
       h.db.close();
@@ -943,10 +1004,11 @@ describe('re-brief restart safety (durable markers)', () => {
       });
       const deps = { registry: h.registry, ledger: h.ledger, worktrees: h.worktrees, notifications: h.notifications };
       try {
-        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).rejects.toThrow(/persistent historical settlement failure/);
-        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).rejects.toThrow(/persistent historical settlement failure/);
+        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).resolves.toMatchObject({ completed: 0, redispatched: 0, failed: 1 });
+        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).resolves.toMatchObject({ completed: 1, redispatched: 0, failed: 1 });
         expect(h.ledger.listPendingRebriefs({ jobId: 'successful-main-second' })).toHaveLength(0);
-        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).rejects.toThrow(/persistent historical settlement failure/);
+        await expect(reconcilePendingRebriefs(deps, { limit: 1 })).resolves.toMatchObject({ completed: 1, redispatched: 0, failed: 1 });
+        expect(h.ledger.findNotificationByKind('silas.rebrief-unreconciled.failed-retry-first', 'active')?.detail).toContain('persistent historical settlement failure');
         expect(h.ledger.listPendingRebriefs({ jobId: 'successful-main-third' })).toHaveLength(0);
         expect(h.ledger.listPendingRebriefs({ jobId: 'failed-retry-first' })).toHaveLength(2);
       } finally { fault.mockRestore(); }

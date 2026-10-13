@@ -982,6 +982,7 @@ export class PiAgentHandle implements AgentHandle {
   private livePromptImages: PromptOptions['images'] | undefined;
   private liveDirective: PromptOptions['directive'] | undefined;
   private directiveAdmissionError: unknown = null;
+  private publishedDirectiveAdmission: PromptOptions['directive'] | undefined;
   /** Terminal evidence of the live turn's LAST assistant message: the only
    * positive completion proof (`stopReason: 'stop'`). Reset per turn; the
    * settle capture reads it before `drain()` starts a successor. */
@@ -1082,6 +1083,12 @@ export class PiAgentHandle implements AgentHandle {
         const check = (): void => {
           if (directive === undefined) return;
           if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
+          if (this.directiveAdmissionError !== null) {
+            throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(this.directiveAdmissionError)}`);
+          }
+          if (this.publishedDirectiveAdmission !== directive) {
+            throw new DirectiveCheckpointError('native directive actual admission has not been successfully published; tool effects refused');
+          }
           directive.beforeAdmission();
           if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
             throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before tool effect');
@@ -1100,7 +1107,7 @@ export class PiAgentHandle implements AgentHandle {
             const key = `${producer.incarnation}:${input.toolCall.id}`;
             const refusal = { producer, toolCallId: input.toolCall.id, reason: String(error) };
             this.pendingToolRefusals.set(key, refusal);
-            this.directiveAdmissionError = error;
+            this.directiveAdmissionError ??= error;
             try { recordDirectiveToolRefusal(producer, refusal.toolCallId, refusal.reason); this.pendingToolRefusals.delete(key); }
             catch (journalError) { throw new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained'); }
           }
@@ -1196,8 +1203,14 @@ export class PiAgentHandle implements AgentHandle {
     }
     beforeContinuation();
     this.prepareDirectiveProducer(identity);
-    const turn = this.runTurn('', `directive-recovery:${identity.requestId}`, undefined,
-      { identity, beforeAdmission: beforeContinuation, onAdmitted: () => {} }, () => { beforeContinuation(); claimContinuation?.(); return this.session.agent!.continue(); });
+    const directive = { identity, beforeAdmission: beforeContinuation, onAdmitted: () => {} };
+    const turn = this.runTurn('', `directive-recovery:${identity.requestId}`, undefined, directive, () => {
+      beforeContinuation(); claimContinuation?.();
+      // Exact original admission was inspected above and its continuation
+      // claim just committed; no new user entry or admission is synthesized.
+      this.publishedDirectiveAdmission = directive;
+      return this.session.agent!.continue();
+    });
     await turn.done;
     return turn.verdict();
   };
@@ -1547,6 +1560,7 @@ export class PiAgentHandle implements AgentHandle {
     this.liveTurnStop = { stopReason: null, error: null };
     this.liveDirective = directive;
     this.directiveAdmissionError = null;
+    this.publishedDirectiveAdmission = undefined;
     const promptOptions: Record<string, unknown> = {};
     const mapped = mapImages(images);
     if (mapped !== undefined) promptOptions['images'] = mapped;
@@ -1735,7 +1749,10 @@ export class PiAgentHandle implements AgentHandle {
             try {
               const binding = inspectDirectiveAdmission(this.sessionFile, directive.identity);
               directive.onAdmitted(binding);
-            } catch (error) { this.directiveAdmissionError = error; }
+              if (this.liveDirective === directive) this.publishedDirectiveAdmission = directive;
+            } catch (error) {
+              if (this.liveDirective === directive) this.directiveAdmissionError ??= error;
+            }
           });
         }
         if (msg !== undefined && msg['role'] === 'assistant') {
@@ -1752,7 +1769,9 @@ export class PiAgentHandle implements AgentHandle {
                 const proof = inspectDirectiveCheckpoint(this.sessionFile, directive.identity);
                 if (producer === undefined || proof.state !== 'terminal' || !proof.ok) throw new DirectiveCheckpointError('native completion checkpoint/producer unavailable');
                 recordDirectiveCompletion(producer, proof.checkpointId, head);
-              } catch (error) { this.directiveAdmissionError = error; }
+              } catch (error) {
+                if (this.liveDirective === directive) this.directiveAdmissionError ??= error;
+              }
             });
           }
           // Per-turn terminal evidence for the live prompt: every assistant

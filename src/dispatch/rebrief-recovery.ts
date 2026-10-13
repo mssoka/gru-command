@@ -119,6 +119,9 @@ export interface ReconcileReport {
    * counted by each scan that retired part of it). A retirement reached
    * mid-turn is logged per job and audited, not counted here. */
   readonly retired: number;
+  /** Failed historical groups retained with exact-generation recovery action
+   * and a durable bounded retry; never reported as completed or replayed. */
+  readonly failed: number;
   /** Settles when every background re-dispatch has settled — resumed,
    * escalated, or abandoned because the process is stopping. Boot does not
    * await it (a re-brief turn is long); tests do. */
@@ -327,7 +330,7 @@ export function checkRebriefTurn(ledger: Pick<LedgerApi, 'getJob' | 'listPending
  * (same boot, or a boot racing an open recovery) never double-dispatches. */
 
 
-/** Boot wrapper retains asynchronous failure reporting for callers. */
+/** Boot wrapper reports scoped historical failures without aborting independent initialization. */
 export async function reconcilePendingRebriefs(
   deps: ReconcileRebriefDeps,
   opts: { readonly limit?: number } = {},
@@ -344,7 +347,7 @@ export function observePendingRebriefs(
   deps: ReconcileRebriefDeps,
   opts: { readonly limit?: number } = {},
 ): ReconcileReport {
-  if (deps.stopSignal?.aborted || deps.stopping?.()) return { examined: 0, completed: 0, redispatched: 0, retired: 0, settled: Promise.resolve() };
+  if (deps.stopSignal?.aborted || deps.stopping?.()) return { examined: 0, completed: 0, redispatched: 0, retired: 0, failed: 0, settled: Promise.resolve() };
   const scope = 'historical-rebrief-observation';
   const retryScope = `${scope}-retry`;
   const limit = opts.limit ?? 100;
@@ -369,8 +372,10 @@ export function observePendingRebriefs(
     if (deps.stopSignal?.aborted || deps.stopping?.()) break;
     if (fromMainPage) cursor = groupCursor;
     if (groupCursor === retryCursor && nextRetryCursor === retryCursor) nextRetryCursor = 0;
+    let expected: readonly PendingRebriefRecord[] | null = null;
     try {
       const group = deps.ledger.listPendingRebriefs({ jobId });
+      expected = group;
       examined += group.length;
       const identityMarker = group.find((marker) => marker.kind === 'silas.rebrief');
       if (identityMarker !== undefined && deps.ledger.recoveryOwnerBasis('rebrief', identityMarker.id).owned) {
@@ -471,16 +476,24 @@ export function observePendingRebriefs(
       failures.push(error);
       nextRetryCursor = nextRetryCursor === 0 ? groupCursor : Math.min(nextRetryCursor, groupCursor);
       deps.log?.('error', 'historical re-brief observation failed', { job: jobId, error: String(error) });
+      // Storage inspection or inability to persist an actionable fence is
+      // still a loud shared-precondition failure, not successful recovery.
+      if (expected === null) throw error;
+      const current = deps.ledger.listPendingRebriefs({ jobId });
+      if (sameRebriefGeneration(current, expected) && expected.every((marker) => current.some((row) =>
+        row.id === marker.id && row.agentId === marker.agentId && row.sessionFile === marker.sessionFile && row.workRevision === marker.workRevision))) {
+        escalateRecoveryFailure(deps, jobId, expected, error);
+      }
     }
   }
   deps.ledger.writeReconcileCursor({ scope: retryScope, cursor: nextRetryCursor });
   deps.ledger.writeReconcileCursor({ scope, cursor: groups.length < limit && !deps.stopSignal?.aborted && !deps.stopping?.() ? 0 : cursor });
-  if (failures.length > 0) throw new AggregateError(failures, `historical re-brief observation failed: ${failures.map(String).join('; ')}`);
   return {
     examined,
     completed,
     redispatched,
     retired,
+    failed: failures.length,
     settled: Promise.resolve(),
   };
 }

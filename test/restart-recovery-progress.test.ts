@@ -565,6 +565,54 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.correctiveVerificationDebt(f.intent.jobId)).toEqual({ revision: f.identity.workRevision, head: null });
     expect(f.ledger.getEvent(event.seq)).toEqual(event);
   });
+  async function assertFalsePublisherDebt(mode: 'null-head' | 'dirty' | 'head-moved') {
+    const f = await fixture(); f.ledger.registerWorktree(f.lane); // before original native execution
+    f.seed(); f.native.finish(); f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+    const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+    if (proof.state !== 'terminal' || !proof.ok) throw new Error('original successful native completion required');
+    const producer = inspectDirectiveProducers(f.file, f.identity).at(-1)!.producer;
+    const head = mode === 'null-head' ? null : resolveGitCommit(f.lane.path, 'HEAD');
+    recordDirectiveCompletion(producer, proof.checkpointId, head); // original completion boundary, not recovery
+    const receipt = readDirectiveCompletion(f.file, f.identity, proof.checkpointId);
+    if (mode === 'dirty') writeFileSync(join(f.lane.path, 'README.md'), 'later tracked changes');
+    if (mode === 'head-moved') {
+      writeFileSync(join(f.lane.path, 'later.txt'), 'later separately committed work');
+      f.repo.git(['add', 'later.txt'], f.lane.path);
+      f.repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-m', 'later candidate'], f.lane.path);
+    }
+    const transcript = readFileSync(f.file, 'utf8'); const journal = readFileSync(`${f.file}.producers.jsonl`, 'utf8');
+    const delivered = recordFollowUpDelivery({ ledger: f.ledger, worktrees: f.worktrees, jobId: f.intent.jobId,
+      agentId: 'logical-minion', source: 'silas-directive', requestId: f.intent.requestId, workRevision: f.identity.workRevision,
+      nativeCompletion: { sha: head, provenance: { identity: f.identity, checkpoint_id: proof.checkpointId, binding: proof.binding,
+        receipt, physical_cessation: inspectDirectiveProducers(f.file, f.identity) } } });
+    const event = f.ledger.getEvent(delivered.eventSeq)!;
+    expect(event.payload).toMatchObject({ sha: head, candidate_delivery_proven: false });
+    const settled = f.ledger.recordDirectiveDelivery({ requestId: f.intent.requestId, eventSeq: event.seq });
+    const root = f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-current-gates-owed');
+    expect(root).not.toBeNull();
+    expect(root!.payload).toMatchObject({ root_kind: 'original-native-completion', identity: f.identity, delivery_seq: event.seq, sha: head });
+    const obligationId = (root!.payload as { obligation_id: string }).obligation_id;
+    expect(f.ledger.getObligation(obligationId)?.state).toBe('open');
+    expect(f.ledger.latestCandidateDelivery(f.intent.jobId)).toBeNull();
+    expect(f.ledger.correctiveVerificationDebt(f.intent.jobId)).toEqual({ revision: f.identity.workRevision, head: null });
+    const watermark = f.ledger.latestEventSeq();
+    expect(f.ledger.recordDirectiveDelivery({ requestId: f.intent.requestId, eventSeq: event.seq })).toEqual(settled);
+    expect(f.ledger.latestEventSeq()).toBe(watermark);
+    expect(f.ledger.getEvent(event.seq)).toEqual(event);
+    const reopened = new LedgerDb(f.dir);
+    try {
+      const ledger = new LedgerApi(reopened.handle);
+      expect(ledger.getObligation(obligationId)?.state).toBe('open'); expect(ledger.latestCandidateDelivery(f.intent.jobId)).toBeNull();
+      expect(ledger.getEvent(root!.seq)).toEqual(root); expect(ledger.getEvent(event.seq)).toEqual(event);
+      expect(() => ledger.settleObligation({ obligationId, settlement: { kind: 'accepted-evidence', gate: 'historical delivery', evidenceEventSeq: event.seq, evidenceEventKind: event.kind } })).toThrow();
+    } finally { reopened.close(); }
+    expect(readFileSync(f.file, 'utf8')).toBe(transcript); expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(journal);
+    expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+  }
+  it('R12 publisher-false null HEAD completion retains a protected current-action duty', () => assertFalsePublisherDebt('null-head'));
+  it('R12 publisher-false tracked-dirty lane retains a protected current-action duty', () => assertFalsePublisherDebt('dirty'));
+  it('R12 publisher-false moved HEAD retains a protected current-action duty', () => assertFalsePublisherDebt('head-moved'));
+
   async function assertOriginalLaneCandidate(mode: 'replacement' | 'missing-cwd') {
     const f = await fixture('directive', mode !== 'missing-cwd'); f.seed(); f.native.finish();
     f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));

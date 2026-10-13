@@ -295,6 +295,58 @@ it('P33 production directive resource shutdown joins progress before failing reg
   expect(order).toEqual(['progress', 'registry']); expect((both as AggregateError).errors).toHaveLength(2);
 });
 
+it('R12 actual main boot survives a persistent historical group failure and retains its action while healthy work settles', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'gru-main-historical-fault-')); cleanupDirs.push(home);
+  const workspace = mkdtempSync(join(tmpdir(), 'gru-main-historical-workspace-')); cleanupDirs.push(workspace);
+  writeFileSync(configPathFor(home), `workspace_root = ${JSON.stringify(workspace)}\n[server]\nhost = "127.0.0.1"\nport = 0\n`);
+  const failedJob = 'boot-failed-historical'; const healthyJob = 'boot-healthy-historical';
+  const seedDb = new LedgerDb(home); const seed = new LedgerApi(seedDb.handle);
+  for (const jobId of [failedJob, healthyJob]) {
+    seed.addJob({ id: jobId, repo: 'fixture', title: 'original historical intent', briefing: 'original approved scope' });
+    seed.setJobStatus(jobId, 'working');
+    const markers = seed.beginPendingRebrief({ jobId, note: 'original correction', briefing: 'original approved scope' });
+    seed.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: 'original-historical-minion', sessionFile: null });
+    for (const marker of seed.listPendingRebriefs({ jobId })) seed.appendCustomEvent({ kind: marker.kind, jobId,
+      agentId: 'original-historical-minion', payload: { marker_id: marker.id, payload_hash: marker.payloadHash,
+        work_revision: marker.workRevision, ...(marker.kind === 'silas.rebrief' ? { minion_id: 'original-historical-minion' } : { agentId: 'original-historical-minion', source: 'silas-rebrief', sha: 'original-legacy-head' }) } });
+  }
+  const original = seed.listPendingRebriefs({ jobId: failedJob });
+  const originalEvents = seed.listJobEventsByKinds(failedJob, ['silas.rebrief', 'job.delivered']); seedDb.close();
+  const root = join(import.meta.dirname, '..'); const hook = join(home, 'historical-fault-hook.mjs');
+  writeFileSync(hook, `import { LedgerApi } from ${JSON.stringify(`file://${join(root, 'dist/ledger/api.js')}`)};
+const clear = LedgerApi.prototype.clearPendingRebriefsIfCurrentAndSettle;
+LedgerApi.prototype.clearPendingRebriefsIfCurrentAndSettle = function(markers) {
+  if (markers[0]?.jobId === ${JSON.stringify(failedJob)}) throw new Error('persistent original scoped historical storage refusal');
+  return clear.call(this, markers);
+};
+`);
+  const child = spawn(process.execPath, ['--import', hook, 'dist/main.js'], { cwd: root,
+    env: { ...process.env, GRU_COMMAND_HOME: home }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = ''; child.stderr.on('data', (bytes: Buffer) => { stderr += bytes.toString('utf8'); });
+  const exited = new Promise<number | null>((resolve) => child.on('exit', resolve));
+  try {
+    const outcome = await Promise.race([
+      waitForHealthyPort(home, () => stderr).then((port) => ({ kind: 'listening' as const, port })),
+      exited.then((code) => ({ kind: 'exit' as const, code })),
+    ]);
+    expect(outcome.kind, stderr).toBe('listening');
+    if (outcome.kind !== 'listening') throw new Error('asserted service boot must reach its listener');
+    expect((await fetch(`http://127.0.0.1:${outcome.port}/health`)).status).toBe(200);
+    const summary = readLogLines(home).find((line) => line.msg === 're-brief reconciliation');
+    expect(summary).toMatchObject({ completed: 1, redispatched: 0, failed: 1 });
+    child.kill('SIGTERM'); expect(await exited).toBe(0);
+    const db = new LedgerDb(home); const ledger = new LedgerApi(db.handle);
+    try {
+      expect(ledger.listPendingRebriefs({ jobId: failedJob })).toEqual(original);
+      expect(ledger.listPendingRebriefs({ jobId: healthyJob })).toEqual([]);
+      expect(ledger.listJobEventsByKinds(failedJob, ['silas.rebrief', 'job.delivered'])).toEqual(originalEvents);
+      expect(ledger.listObligations({ jobId: failedJob }).some((row) => row.state === 'open' && row.nextAction.kind === 'gru-decision')).toBe(true);
+      expect(ledger.findNotificationByKind(`silas.rebrief-unreconciled.${failedJob}`, 'active')).toMatchObject({ routing: 'action-required' });
+      expect(ledger.latestJobEvent(failedJob, 'silas.rebrief-settled')).toBeNull();
+    } finally { db.close(); }
+  } finally { if (child.exitCode === null) child.kill('SIGKILL'); await exited; }
+});
+
 it('P33 actual main shutdown joins progress even when shared registry disposal rejects', async () => {
   const home = mkdtempSync(join(tmpdir(), 'gru-main-progress-fault-')); cleanupDirs.push(home);
   writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n');

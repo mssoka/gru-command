@@ -8216,7 +8216,9 @@ export class LedgerApi {
         payload: { request_id: row.requestId, agentId: proof.binding.agentId, source: row.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive', sha: completion?.head ?? null,
           work_revision: identity.workRevision, candidate_delivery_proven: false, historical_bookkeeping_only: true, ...(phase === null ? {} : { phase_id: phase.phaseId }),
           native_completion: { identity, checkpoint_id: proof.checkpointId, binding: proof.binding, receipt: completion, physical_cessation: physical } } });
-      this.retainOriginalNativeGateDebt(row, delivery, 'current authority is changed or parked');
+      // The shared settlement boundary retains exactly one protected duty,
+      // including historical-only completions. Do not rotate its generation
+      // by observing the same delivery twice with different reason text.
       return this.recordDirectiveDelivery({ requestId: row.requestId, eventSeq: delivery.seq });
     });
   }
@@ -8343,6 +8345,10 @@ export class LedgerApi {
           const reason = this.nativeCandidateRefusal(row, payload);
           candidateProven = reason === null;
           if (reason !== null) this.retainOriginalNativeGateDebt(row, event, reason);
+        } else {
+          this.retainOriginalNativeGateDebt(row, event, payload['historical_bookkeeping_only'] === true
+            ? 'current authority is changed or parked'
+            : 'publisher could not establish a current original-lane candidate');
         }
       }
       // Durable action marker and, for modern requests, the independently

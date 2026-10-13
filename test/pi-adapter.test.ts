@@ -3541,6 +3541,40 @@ it('directive native multi-tool invocation persists each sequential result and r
   } finally { await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); }
 });
 
+async function assertAdmissionFailureFencesTools(mode: 'sequential' | 'parallel') {
+  const f = await fixture([{ deltas: [], toolCalls: [
+    { id: 'unpublished-first', name: 'bash', args: { command: 'echo forbidden > unpublished-admission.txt' } },
+    { id: 'unpublished-second', name: 'bash', args: { command: 'echo forbidden >> unpublished-admission.txt' } },
+  ] }, { deltas: ['native terminal after offered tools'] }]);
+  const scene = await directiveRecoveryLedgerFixture(`admission-failure-${mode}`);
+  const handle = await f.runtime.spawn('minion', { cwd: scene.lane.path, agentId: 'admission-failure-minion' });
+  const session = await actualDirectiveSdkSession(handle); session.agent.toolExecution = mode;
+  scene.ledger.registerAgent({ id: handle.id, role: 'minion', jobId: scene.request.jobId, sessionFile: handle.sessionFile });
+  scene.ledger.setAgentState(handle.id, 'idle');
+  scene.ledger.prepareDirectiveTarget(scene.request.requestId, { agentId: handle.id, sessionFile: handle.sessionFile! });
+  const fault = new Error('original exact admission publication failed');
+  const publish = vi.spyOn(scene.ledger, 'bindDirectiveNativeAdmission').mockImplementationOnce(() => { throw fault; });
+  try {
+    const verdict = await handle.promptWithVerdict!('original approved native tools', { directive: { identity: scene.identity,
+      beforeAdmission: () => scene.ledger.assertDirectiveAuthority(scene.identity),
+      onAdmitted: (binding) => { scene.ledger.bindDirectiveNativeAdmission(binding); } } });
+    expect(existsSync(join(scene.lane.path, 'unpublished-admission.txt'))).toBe(false);
+    expect(verdict).toMatchObject({ ok: false }); expect(verdict.error).toContain(fault.message);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(scene.ledger.getDirective(scene.request.requestId)).toMatchObject({ state: 'dispatching', nativeBinding: null });
+    const { inspectDirectiveAdmission } = await import('../src/runtime/directive-checkpoint.js');
+    expect(inspectDirectiveAdmission(handle.sessionFile!, scene.identity)).toMatchObject({ identity: scene.identity, agentId: handle.id });
+    const rows = readFileSync(handle.sessionFile!, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line) as { message?: { role: string; isError?: boolean } });
+    expect(rows.filter((row) => row.message?.role === 'user')).toHaveLength(1);
+    const results = rows.filter((row) => row.message?.role === 'toolResult');
+    expect(results).toHaveLength(2); expect(results.every((row) => row.message?.isError === true)).toBe(true);
+    expect(scene.ledger.latestJobEvent(scene.request.jobId, 'job.delivered')).toBeNull();
+    expect(handle.cessationEvidence!()).toBe('unknown'); expect(f.store.isHeld(handle.sessionFile!)).toBe(true);
+  } finally { publish.mockRestore(); await handle.dispose(); await f.runtime.dispose(); f.store.dispose(); scene.db.close(); scene.repo.cleanup(); }
+}
+it('R12 failed exact admission publication fences real sequential SDK tool effects', () => assertAdmissionFailureFencesTools('sequential'));
+it('R12 failed exact admission publication fences real parallel SDK tool effects', () => assertAdmissionFailureFencesTools('parallel'));
+
 async function assertSdkToolAuthority(boundary: 'model-await' | 'prior-hook-await') {
   let release!: () => void; const hold = new Promise<void>((resolveGate) => { release = resolveGate; });
   const f = await fixture([{ deltas: [], ...(boundary === 'model-await' ? { hold } : {}), toolCalls: [
