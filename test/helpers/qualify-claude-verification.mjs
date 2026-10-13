@@ -10,6 +10,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ClaudeVerificationPermissionChannel, privateClaudeVerificationSettings } from '../../dist/runtime/claude-verification-settings.js';
 import { workerVerificationPolicy } from '../../dist/runtime/worker-verification-policy.js';
 import { nativeCorpus } from './verification-native-corpus.mjs';
+import { loadConfig, configPathFor } from '../../dist/config.js';
 import { claudeTurnArgs, claudePromptFrame } from '../../dist/runtime/claude-adapter.js';
 
 const executable = process.argv[2];
@@ -31,7 +32,10 @@ for (const base of [lane, join(lane, 'web')]) {
   for (const name of ['vitest', 'jest', 'tsc', 'eslint', 'vite', 'playwright']) writeFileSync(join(base, 'node_modules/.bin', name), `#!/bin/sh\nprintf '%s\\n' '${name}' >> '${starts}'\n`, { mode: 0o700 });
 }
 writeFileSync(join(lane, '.gru-command/worktree.toml'), `[verify]\nfull = "npm test"\nquality = "CI=1 npm run quality"\ncustom = 'npm run "check build"'\n`);
-const policy = workerVerificationPolicy({ id: 'native-fixture', jobId: 'native-fixture', kind: 'job', status: 'active', path: lane }, join(home, 'config.toml'));
+const instance = join(home, 'instance-$literal-`literal`'); mkdirSync(instance);
+writeFileSync(join(instance, 'config.toml'), `data_dir = ${JSON.stringify(join(home, 'relocated-data'))}\n[auth]\ntoken = "owned-fake-status-token"\n`, { mode: 0o600 });
+const config = loadConfig({ GRU_COMMAND_HOME: instance });
+const policy = workerVerificationPolicy({ id: 'native-fixture', jobId: 'native-fixture', kind: 'job', status: 'active', path: lane }, configPathFor(config.instanceDir));
 const settings = privateClaudeVerificationSettings(policy);
 // Explicitly unavailable hook, so only the independent native deny can refuse.
 const data = JSON.parse(readFileSync(settings.file, 'utf8')); delete data.hooks;
@@ -51,6 +55,11 @@ if (!identity.version.startsWith('2.1.296')) throw new Error(`Unapproved CLI ide
 let command = ''; let sent = false; const upstream = [];
 const server = createServer(async (req, res) => {
   let body = ''; for await (const chunk of req) body += chunk;
+  if (req.url === '/api/verify/status?request_id=existing-native') {
+    if (req.headers.authorization !== 'Bearer owned-fake-status-token') { res.writeHead(403); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ state: 'unknown', requestId: 'existing-native' })); return;
+  }
   if (req.url?.split('?')[0] !== '/v1/messages') { res.writeHead(404); res.end(); return; }
   const request = JSON.parse(body); upstream.push({ path: req.url, model: request.model });
   if (request.model !== identity.nativeModel) throw new Error(`Foreign model ${request.model}`);
@@ -71,6 +80,12 @@ const server = createServer(async (req, res) => {
 });
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${server.address().port}`;
+if (process.argv[3] !== 'early') {
+  const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+  const action = `${quote(process.execPath)} ${quote(policy.helper)} status --request-id existing-native --url ${env.ANTHROPIC_BASE_URL} --config ${quote(policy.configFile)}`;
+  corpus.push({ raw: action, refused: false, output: 'existing-native' });
+  cases.push([action, false, false]);
+}
 process.stdout.write(JSON.stringify({ identity, root, settings: data, boundary: 'actual vendor permission engine; deterministic fake upstream; no paid model/Perkins READY' }) + '\n');
 try {
   for (const [raw, refused, hostUnavailable] of cases) {

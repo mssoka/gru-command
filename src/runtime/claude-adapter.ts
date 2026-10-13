@@ -1180,10 +1180,10 @@ export class ClaudeCodeHandle implements AgentHandle {
       };
       const parser = new NdjsonParser({
         onFrame: handleFrame,
-        onGarbage: (line) =>
-          this.log('warn', 'skipping non-JSON line on claude compaction stdout', {
-            line: line.slice(0, 200),
-          }),
+        onGarbage: (line) => {
+          if (permissions !== undefined) { fail('malformed worker verification permission transport'); child?.stdin?.end(); }
+          this.log('warn', 'skipping non-JSON line on claude compaction stdout', { line: line.slice(0, 200) });
+        },
       });
 
       try {
@@ -1369,10 +1369,10 @@ export class ClaudeCodeHandle implements AgentHandle {
 
       const parser = new NdjsonParser({
         onFrame: handleFrame,
-        onGarbage: (line) =>
-          this.log('warn', 'skipping non-JSON line on claude stdout', {
-            line: line.slice(0, 200),
-          }),
+        onGarbage: (line) => {
+          if (permissions !== undefined) { failTurn('malformed worker verification permission transport'); child?.stdin?.end(); }
+          this.log('warn', 'skipping non-JSON line on claude stdout', { line: line.slice(0, 200) });
+        },
       });
 
       try {

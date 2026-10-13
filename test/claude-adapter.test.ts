@@ -2886,4 +2886,18 @@ describe('scheduled verification ordinary Claude Bash', () => {
     delete process.env['CLAUDE_DOUBLE_IGNORE_TERM']; await f.runtime.dispose();
   });
 
+  it('strict repair expanding escaped source plaintext and help diagnostics execute ordinary Claude', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = fixture(); process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt("verification-bash:cat > escaped.txt <<EOF\n\\$(npm test)\n\\`npm test\\`\nEOF\ncat > empty.txt <<''\nnpm test\n\ncat escaped.txt empty.txt; tsc --pretty false --showConfig; npx vitest run --help");
+      expect(readFileSync(join(lane.lane.path, 'escaped.txt'), 'utf8')).toBe('$(npm test)\n`npm test`\n');
+      expect(readFileSync(join(lane.lane.path, 'empty.txt'), 'utf8')).toBe('npm test\n');
+      expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toEqual(['tsc', 'npx']);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused'); await handle.dispose();
+    } finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
 });

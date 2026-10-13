@@ -31,7 +31,7 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
     process.stdout.write(`${JSON.stringify(workerVerificationHook(input, policy))}\n`);
   } catch {
     // Never echo arbitrary input/settings bytes. Exit 2 is Claude's blocking
-    // hook error; native permission denies independently cover the known forms.
+    // hook error; native Bash ask/host policy independently covers the known forms.
     process.stderr.write('Minion verification policy hook failed; use the authenticated scheduled capture helper and declared scopes.\n');
     process.exitCode = 2;
   }

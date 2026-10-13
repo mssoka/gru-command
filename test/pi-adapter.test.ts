@@ -3777,4 +3777,18 @@ describe('scheduled verification ordinary Pi Bash', () => {
     } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
   });
 
+  it('strict repair expanding escaped source plaintext and help diagnostics execute ordinary Pi', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const command = "cat > escaped.txt <<EOF\n\\$(npm test)\n\\`npm test\\`\nEOF\ncat > empty.txt <<''\nnpm test\n\ncat escaped.txt empty.txt; tsc --pretty false --showConfig; npx vitest run --help";
+    const f = await fixture([{ deltas: [], toolCall: { id: 'escaped-source', name: 'bash', args: { command } } }, { deltas: ['done'] }]);
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session); await handle.prompt('source');
+      expect(readFileSync(join(lane.lane.path, 'escaped.txt'), 'utf8')).toBe('$(npm test)\n`npm test`\n');
+      expect(readFileSync(join(lane.lane.path, 'empty.txt'), 'utf8')).toBe('npm test\n');
+      expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toEqual(['tsc', 'npx']);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused'); await handle.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
 });

@@ -46,8 +46,9 @@ export function classifyReviewedRed(report, generation, phase) {
   if (!report || !Array.isArray(report.testResults) || report.testResults.length === 0) throw new Error('missing collected suites');
   if (!report.testResults.every((suite) => Array.isArray(suite.assertionResults) && suite.assertionResults.length > 0)) throw new Error('setup/import/collection failure is not behavioral RED');
   const assertions = report.testResults.flatMap((suite) => suite.assertionResults);
+  // Vitest numFailedTestSuites counts nested describe groups, not file records.
   const failed = assertions.filter((entry) => entry.status === 'failed');
-  if (!failed.length || report.numFailedTests !== failed.length || report.numFailedTestSuites > report.testResults.filter((suite) => suite.assertionResults.some((entry) => entry.status === 'failed')).length) throw new Error('missing behavioral failures or inconsistent runner report');
+  if (!failed.length || report.numFailedTests !== failed.length) throw new Error('missing behavioral failures or inconsistent runner report');
   const names = generation === 1 ? review1Names : phase === 'fast' ? [...adapterNames, ...policyNames] : [...adapterNames,
     'independent raw corpus exercises native refusal and allow with hook unavailable',
     'actual prompt registration retains pre-disposal errored original until delayed close',
