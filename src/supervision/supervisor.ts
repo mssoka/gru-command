@@ -256,8 +256,12 @@ interface RestartFlight {
   pendingError: Extract<RuntimeEvent, { type: 'error' }> | null;
   /** Canonical adapter event; its observer may run after registry forwarding. */
   pendingErrorSource: Extract<RuntimeEvent, { type: 'error' }> | null;
-  /** Last usable synchronous custody; duplicate errors may follow clearance. */
+  /** Best synchronous custody from this native turn; duplicate errors may
+   * follow prompt clearance, but a new turn never inherits the old body. */
   pendingErrorSnapshot: InterruptedTurn | null;
+  turnGeneration: number;
+  openTurn: boolean | null;
+  readonly errorTurnGenerations: WeakMap<RuntimeEvent, number>;
 }
 
 interface RejectedRestartCleanup {
@@ -1859,7 +1863,8 @@ export class Supervisor {
     }
     agent.inRestart = true;
     const flight: RestartFlight = { authority: null, handle: null, publish: null, unsubscribe: null,
-      superseded: false, pendingError: null, pendingErrorSource: null, pendingErrorSnapshot: null };
+      superseded: false, pendingError: null, pendingErrorSource: null, pendingErrorSnapshot: null,
+      turnGeneration: 0, openTurn: null, errorTurnGenerations: new WeakMap() };
     this.restartingAgents.set(agent, flight);
     agent.state = 'restarting';
     try {
@@ -1882,7 +1887,9 @@ export class Supervisor {
       const handle = flight.handle;
       const current = handle === null ? undefined : this.agents.get(handle.id);
       if (!this.disposed && handle !== null && current?.handle === handle && !current.breakerOpen && flight.pendingError !== null) {
-        const selectedSnapshot = this.restartErrorSnapshots.get(flight.pendingErrorSource ?? flight.pendingError);
+        const sourceEvent = flight.pendingErrorSource ?? flight.pendingError;
+        const selectedSnapshot = flight.errorTurnGenerations.get(sourceEvent) === flight.turnGeneration
+          ? this.restartErrorSnapshots.get(sourceEvent) : undefined;
         const snapshot = selectedSnapshot?.pending != null ? selectedSnapshot : flight.pendingErrorSnapshot ?? selectedSnapshot;
         if (snapshot !== undefined) {
           this.restartErrorSnapshots.set(flight.pendingError, snapshot);
@@ -2016,13 +2023,27 @@ export class Supervisor {
           flight.handle = handle;
           flight.publish = publish;
           flight.unsubscribe = handle.subscribe((event) => {
+            if (event.type === 'turn_start') {
+              flight.turnGeneration += 1;
+              flight.openTurn = true;
+              flight.pendingErrorSnapshot = null;
+            } else if (event.type === 'turn_end') {
+              flight.openTurn = false;
+            }
             if (event.type !== 'error') return;
+            flight.errorTurnGenerations.set(event, flight.turnGeneration);
             try {
-              const snapshot = this.captureInterruptedTurn(handle, agentRef);
+              // Fresh-ID carry-over leaves agentRef detached. Capture job and
+              // native open-turn truth from the exact current controller, or
+              // from raw turn frames while publication is still held.
+              const current = this.agents.get(handle.id);
+              const controller = current?.handle === handle ? current : agentRef;
+              const snapshot = this.captureInterruptedTurn(handle, controller,
+                (flight.openTurn ?? controller.openTurn) || controller.openControl);
               if (snapshot !== null) {
                 this.restartErrorSnapshots.set(event, snapshot);
                 this.restartSnapshotSources.set(snapshot, event);
-                if (snapshot.pending !== null) flight.pendingErrorSnapshot = snapshot;
+                if (snapshot.pending !== null || flight.pendingErrorSnapshot === null) flight.pendingErrorSnapshot = snapshot;
               }
             } catch (error) {
               this.log('error', 'held restart error snapshot failed', { agent_id: handle.id, error: String(error) });
@@ -2361,9 +2382,9 @@ export class Supervisor {
   private captureInterruptedTurn(
     handle: AgentHandle | null,
     agent: SupervisedAgent,
+    hadOpenTurn = agent.openTurn || agent.openControl,
   ): InterruptedTurn | null {
     if (handle === null) return null;
-    const hadOpenTurn = agent.openTurn || agent.openControl;
     let pending: PendingTurn | null = null;
     if (handle.pendingTurn !== undefined) {
       try {

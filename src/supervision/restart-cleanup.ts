@@ -116,14 +116,12 @@ export class RestartCleanupJournal {
           // The pending journal write failed, so this audit is the ONLY durable
           // record of an unconfirmed hidden producer. Retain it as clearable
           // debt bound to the audit's exact physical generation; a legacy
-          // generation-null audit can never be discharged.
-          const replacementAgentId = text(data.replacement_agent_id);
-          if (replacementAgentId !== null) {
-            const debt = { originSeq: event.seq, generation: generation(data.generation), jobId: event.jobId,
-              agentId: event.agentId, replacementAgentId };
-            this.debts.set(event.seq, debt);
-            this.unjournaled.set(event.seq, debt);
-          }
+          // generation-null audit can never be discharged. Missing replacement
+          // identity also retains debt; a generation alone cannot bind proof.
+          const debt = { originSeq: event.seq, generation: generation(data.generation), jobId: event.jobId,
+            agentId: event.agentId, replacementAgentId: text(data.replacement_agent_id) };
+          this.debts.set(event.seq, debt);
+          this.unjournaled.set(event.seq, debt);
         } else if (event.kind === CONFIRMED && typeof data.origin_seq === 'number') {
           const debt = this.debts.get(data.origin_seq);
           if (debt !== undefined && debt.generation !== null && debt.replacementAgentId !== null && debt.agentId !== null &&

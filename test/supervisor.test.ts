@@ -1379,6 +1379,54 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
+  async function promptLessNativeTurn(sameId: boolean, newerFailure: 'generic' | 'fatal' | 'wall' = 'generic') {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart(sameId);
+    try {
+      f.replacement.promptHook = (text, options) => {
+        f.replacement.pendingTurnSnapshot = { text, owner: options?.owner ?? null };
+        f.replacement.emit({ type: 'error', error: 'ordinary first-turn exception', fatal: false });
+        f.replacement.emit({ type: 'turn_end' });
+        f.replacement.pendingTurnSnapshot = null;
+        f.replacement.emit({ type: 'turn_start' });
+        f.replacement.emit({ type: 'error', error: newerFailure === 'wall' ? '401 unauthorized' : 'newer prompt-less turn exception',
+          fatal: newerFailure === 'fatal' });
+        f.replacement.setState('error');
+        f.replacement.emit({ type: 'turn_end' });
+      };
+      const recovery = new FakeHandle('minion', 'prompt-less-native-recovery', f.original.sessionFile);
+      f.rig.registry.spawnImpl = async () => recovery;
+      f.releaseSpawn(f.replacement); await flushMicrotasks();
+      expect(f.replacement.promptCalls).toEqual([{ text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` }]);
+      if (newerFailure === 'wall') {
+        expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
+        const stop = f.rig.notificationsOfKind(`supervision.provider-wall.${f.replacement.id}.authentication_wall`)[0]!;
+        expect(stop).toBeDefined();
+        f.rig.supervisor.onNotificationAcked(stop.id);
+      } else if (newerFailure === 'generic') {
+        // Either B remains owned or its own lack of a prompt was truthfully
+        // orphaned. A's failed delivery may not grant replay permission for A.
+        const owned = f.rig.supervisor.pendingProducerBlockers(f.jobId).length > 0;
+        const orphaned = f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.replacement.id}`).length > 0;
+        expect(owned || orphaned).toBe(true);
+        f.replacement.emit({ type: 'error', error: 'later native session died', fatal: true });
+      }
+      await flushMicrotasks();
+      expect(recovery.promptCalls).toEqual([]);
+      const orphans = f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.replacement.id}`);
+      expect(orphans).toHaveLength(1);
+      expect(orphans[0]?.detail).toContain('runtime did not expose the pending prompt');
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.turn-recovery')
+        .some((event) => (event.payload as { disposition?: string }).disposition === 'resumed')).toBe(false);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  }
+
+  it('preserves a newer prompt-less native turn on a same-ID recovered handle (GH-280 residual)', () => promptLessNativeTurn(true));
+  it('preserves a newer prompt-less native turn after fresh-ID controller carry-over (GH-280 residual)', () => promptLessNativeTurn(false));
+  it('does not replay A when a newer prompt-less native turn fatally fails (GH-280 residual)', () => promptLessNativeTurn(false, 'fatal'));
+  it('retains provider-stop custody for a newer prompt-less native turn through owner re-arm (GH-280 residual)', () => promptLessNativeTurn(true, 'wall'));
+
   it('does not let late generic-error settlement consume a newer fatal interruption or its exact prompt (GH-280)', async () => {
     vi.useFakeTimers();
     const f = await deferredDispatchRestart(true);
@@ -4904,8 +4952,53 @@ describe('restart cleanup journal conservative replay (GH-280)', () => {
     const dir = tmpDir(); const db = new LedgerDb(dir); const api = new LedgerApi(db.handle);
     api.addJob({ id: 'custody-job', repo: 'fixture', title: 'Custody' });
     api.addJob({ id: 'other-job', repo: 'fixture', title: 'Other custody' });
-    return { db, api, journal: new RestartCleanupJournal(api) };
+    return { dir, db, api, journal: new RestartCleanupJournal(api) };
   }
+
+  function malformedFallbackIdentity(identity: Readonly<Record<string, unknown>>): void {
+    const h = journalFixture();
+    let db = h.db;
+    try {
+      const exactGeneration = 'c661c47d-c2bc-4b80-91af-e86866002f03';
+      const audits = [undefined, 'malformed-generation', exactGeneration].map((generation) => ({
+        generation,
+        event: h.api.appendCustomEvent({ kind: 'supervision.restart-rejected', jobId: 'custody-job', agentId: 'origin',
+          payload: { disposition: 'cleanup-unjournaled', ...(generation === undefined ? {} : { generation }), ...identity } }),
+      }));
+      const expected = audits.map(({ event, generation }) => ({ originSeq: event.seq,
+        generation: generation === exactGeneration ? exactGeneration : null, jobId: 'custody-job',
+        agentId: 'origin', replacementAgentId: null }));
+      // Recognition of uncertainty does not depend on usable replacement identity,
+      // even when the fallback carries a valid physical generation.
+      expect(h.journal.unresolved('custody-job')).toEqual(expected);
+      expect(h.journal.unresolved('other-job')).toEqual([]);
+      for (const { event, generation } of audits) {
+        h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'custody-job', agentId: 'origin',
+          payload: { generation: generation ?? exactGeneration, origin_seq: event.seq, ...identity,
+            disposal_acknowledged: true, cessation: 'ceased' } });
+        expect(h.journal.unresolved('custody-job')).toEqual(expected);
+      }
+      // A later pending/receipt pair can settle its own complete binding, but
+      // cannot guess the missing identity of an earlier fallback generation.
+      const pending = h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-pending', jobId: 'custody-job', agentId: 'origin',
+        payload: { generation: exactGeneration, replacement_agent_id: 'guessed-minion' } });
+      h.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: 'custody-job', agentId: 'origin',
+        payload: { generation: exactGeneration, origin_seq: pending.seq, replacement_agent_id: 'guessed-minion',
+          disposal_acknowledged: true, cessation: 'ceased' } });
+      expect(h.journal.unresolved('custody-job')).toEqual(expected);
+      db.close(); db = new LedgerDb(h.dir);
+      const reader = new RestartCleanupJournal(new LedgerApi(db.handle));
+      expect(reader.unresolved('custody-job')).toEqual(expected);
+      expect(reader.unresolved('other-job')).toEqual([]);
+    } finally { db.close(); }
+  }
+
+  it('retains cleanup-unjournaled fallback with absent replacement identity (GH-280 residual)', () => malformedFallbackIdentity({}));
+  it('retains cleanup-unjournaled fallback with null replacement identity (GH-280 residual)', () => malformedFallbackIdentity({ replacement_agent_id: null }));
+  it('retains cleanup-unjournaled fallback with empty replacement identity (GH-280 residual)', () => malformedFallbackIdentity({ replacement_agent_id: '' }));
+  it('retains cleanup-unjournaled fallback with whitespace replacement identity (GH-280 residual)', () => malformedFallbackIdentity({ replacement_agent_id: ' \t\n' }));
+  it('retains cleanup-unjournaled fallback with numeric replacement identity (GH-280 residual)', () => malformedFallbackIdentity({ replacement_agent_id: 0 }));
+  it('retains cleanup-unjournaled fallback with object replacement identity (GH-280 residual)', () => malformedFallbackIdentity({ replacement_agent_id: { id: 'guessed-minion' } }));
 
   it('replays more than one page without truncating legacy or malformed event-identity debt', () => {
     const h = journalFixture();
