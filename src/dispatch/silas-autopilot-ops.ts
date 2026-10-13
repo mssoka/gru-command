@@ -128,9 +128,8 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly ruleId: SilasAutopilotRuleId;
     readonly sourceRoundId?: string;
   }): Promise<void> => {
-    // The envelope may not be long-lived while the review setup runs: the
-    // endpoint answers 202 and tracks the run; so does this.
-    const controller = new AbortController();
+    // The request may not wait out the review setup: the endpoint answers
+    // 202 and tracks the run; so does this.
     const run = (async (): Promise<void> => {
       // The clean-abort re-arm freezes the PROVED delivered head: the
       // endpoint re-derives it from the round's target and the newest
@@ -163,7 +162,6 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       });
     })();
     background('review trigger', input.jobId, run);
-    void controller;
   };
 
   const sendDirective = async (input: {
@@ -200,6 +198,9 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
         jobId: input.jobId,
         directive: input.directive,
         contract,
+        // The autopilot has no caller to cancel the turn: the signal is
+        // never aborted, and the dirty turn runs to settlement exactly as
+        // the endpoint's own controller does until its request ends.
         signal: new AbortController().signal,
         owner: 'silas-ops',
         ...(deps.workerGate === undefined ? {} : { workerGate: deps.workerGate }),
