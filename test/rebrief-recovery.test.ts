@@ -807,9 +807,9 @@ describe('re-brief restart safety (durable markers)', () => {
     } finally { h.close(); }
   });
 
-  async function originalCurrentCandidate(jobId: string) {
+  async function originalCurrentCandidate(jobId: string, report = false) {
     const h = makeHarness();
-    await seedPendingRebrief({ h, jobId });
+    await seedPendingRebrief({ h, jobId, ...(report ? { deliverable: 'review' as const } : {}) });
     const contract = h.ledger.effectiveContract(jobId)!;
     expect(h.ledger.addJobAmendment({ jobId, body: 'approved corrective scope', supersedes: [],
       approval: { by: 'owner', reference: 'GH-286 current candidate fixture' }, effect: 'material',
@@ -853,6 +853,21 @@ describe('re-brief restart safety (durable markers)', () => {
       expect(h.registry.workers).toEqual([]);
     } finally { h.close(); }
   }
+  it('R14 reconstructed noncandidate historical report never opens direct commissioner handback', async () => {
+    const jobId = 'r14-historical-report'; const { h, head, markers, lane } = await originalCurrentCandidate(jobId, true);
+    try {
+      writeFileSync(join(lane.path, 'new-material-input.ts'), 'export const newInput = true;\n');
+      const bytes = readFileSync(markers[0]!.sessionFile!, 'utf8'); const original = h.ledger.latestJobEvent(jobId, 'silas.rebrief');
+      const delivery = h.ledger.reconstructCompletedRebriefDelivery(markers, lane)!;
+      expect(delivery.payload).toMatchObject({ sha: head, work_revision: 1, historical_bookkeeping_only: true, candidate_delivery_proven: false });
+      expect(h.ledger.latestCandidateDelivery(jobId)).toBeNull();
+      expect(h.ledger.findReportObligation(jobId)).toBeNull();
+      expect(h.ledger.listJobEventsByKinds(jobId, ['job.report-handback'])).toEqual([]);
+      expect(h.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toBe(true);
+      expect(h.ledger.getEvent(original!.seq)).toEqual(original); expect(readFileSync(markers[0]!.sessionFile!, 'utf8')).toBe(bytes);
+      expect(h.registry.workers).toEqual([]);
+    } finally { h.close(); }
+  });
   it('R13 historical same-HEAD reconstruction refuses an unapproved branch without erasing original completion', () => assertHistoricalCandidateRefusal('branch'));
   it('R13 historical reconstruction refuses material untracked inputs absent from its original HEAD', () => assertHistoricalCandidateRefusal('untracked'));
 

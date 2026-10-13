@@ -16,7 +16,7 @@ import type { DispatchService } from './service.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from './fix-directive.js';
-import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
+import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
 import { executeAcceptedDirective } from './directive-progress.js';
 import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
@@ -1426,9 +1426,35 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
           const nativeDecision = choice['kind'] === 'successor'
             ? { kind: 'successor' as const, requestId: strField(choice, 'request_id'), directive: strField(choice, 'directive') }
             : { kind: 'owner-decision' as const, obligationId: strField(choice, 'obligation_id') };
-          outcome = directiveRecovery[1] === 'directives' ? recoverInterruptedDirectiveFromRoute({ ...recoveryInput, decision: nativeDecision }) :
+          const direct = directiveRecovery[1] === 'directives';
+          const receiptSha256 = direct ? undefined : strField(body, 'expected_receipt_evidence_sha256');
+          if (nativeDecision.kind === 'successor') {
+            // Consumed generations are ledger-only, even after the lane is
+            // gone. Neither an exact nor a conflicting replay may stop work.
+            const consumed = direct
+              ? options.ledger.recoveryDecisionHistory('directive', requestId).some((entry) => entry.generation === generation)
+              : options.ledger.getRebriefRecoveryDecision(requestId, generation) !== null;
+            const subject = direct ? options.ledger.getDirective(requestId) : options.ledger.listPendingRebriefs().find((entry) => entry.id === requestId);
+            if (!consumed && subject != null && options.wave.activeReview(subject.jobId) !== null) {
+              const lane = resolveRetirementLane(ops.worktrees, subject.jobId);
+              const resolved = { id: lane.id, resolvedHead: resolveGitCommit(lane.path, 'HEAD') };
+              const jobId = options.ledger.validateRecoverySuccessorBeforeWriterClearance(direct
+                ? { ...recoveryInput, subjectKind: 'directive', decision: nativeDecision, lane: resolved }
+                : { ...recoveryInput, subjectKind: 'rebrief', markerId: requestId, expectedReceiptEvidenceSha256: receiptSha256!, decision: nativeDecision, lane: resolved });
+              if (jobId !== null) {
+                try {
+                  options.wave.assertWriterAdmissible(jobId); // only approved obsolete candidates
+                  await options.wave.clearLaneForWriter({ jobId, writer: `directive ${nativeDecision.requestId}` });
+                } catch (error) { throw new DirectiveCheckpointError(`obsolete review writer clearance remains unproven: ${String(error)}`); }
+              }
+            }
+          }
+          // Re-resolve/revalidate after the awaited positive stop. The
+          // retirement/decision predicates are unchanged; clearance grants
+          // neither cessation of any other producer nor fresh work permission.
+          outcome = direct ? recoverInterruptedDirectiveFromRoute({ ...recoveryInput, decision: nativeDecision }) :
             recoverInterruptedRebriefFromRoute({ ...recoveryInput, markerId: requestId, decision: nativeDecision,
-              expectedReceiptEvidenceSha256: strField(body, 'expected_receipt_evidence_sha256') });
+              expectedReceiptEvidenceSha256: receiptSha256! });
         }
         if (choice['kind'] === 'owner-decision') surfaceRecoveryOwnerTransfer({ ledger: options.ledger, notifications: ops.notifications },
           directiveRecovery[1] === 'directives' ? 'directive' : 'rebrief', requestId);

@@ -1,7 +1,7 @@
 import { bindOriginalRebriefSdkOwner, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { appendFileSync, closeSync, constants, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -90,7 +90,7 @@ class NativeFixture {
   getContextUsage() { return undefined; }
 }
 
-async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = true) {
+async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = true, report = false) {
   const dir = mkdtempSync(join(tmpdir(), 'gru-restart-progress-'));
   const repo = makeFixtureRepo('restart-progress');
   const db = new LedgerDb(dir);
@@ -99,7 +99,7 @@ async function fixture(kind: 'directive' | 'rebrief' = 'directive', nativeCwd = 
   const notifications = new NotificationCenter({ ledger, bus });
   const worktrees = new InMemoryWorktreePort(join(dir, 'lanes'));
   const store = new SessionStore(dir);
-  ledger.addJob({ id: 'approved-job', repo: 'fixture', title: 'approved', briefing: 'approved original contract' });
+  ledger.addJob({ id: 'approved-job', repo: 'fixture', title: 'approved', briefing: 'approved original contract', ...(report ? { deliverable: 'review' as const, commissioner: 'gru' } : {}) });
   ledger.setJobStatus('approved-job', 'working');
   ledger.setJobPr('approved-job', 'https://example.test/pull/286');
   const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'approved-job' });
@@ -218,6 +218,58 @@ describe('restart-recovery-progress — exact native request matrix', () => {
   it('malformed association cannot manufacture actual admission or settle predecessor recovery debt', () => assertAdmissionReadback(false, 'malformed-association'));
   it('foreign native session cannot manufacture actual admission or settle predecessor recovery debt', () => assertAdmissionReadback(false, 'foreign-session'));
 
+  async function completeBeforeOriginalOwnerPark(report = false, parkAfterCompletion = true) {
+    const f = await fixture('directive', true, report);
+    f.ledger.registerWorktree(f.lane); // actual original setup, before native execution
+    f.seed(); f.native.finish();
+    const completed = inspectDirectiveCheckpoint(f.file, f.identity);
+    if (completed.state !== 'terminal' || !completed.ok) throw new Error('original fixture must really reach its terminal before owner control');
+    const owners = inspectDirectiveProducers(f.file, f.identity);
+    if (owners.length !== 1 || owners[0]?.evidence !== 'ceased') throw new Error('original completion must carry its exact original ceased producer');
+    recordDirectiveCompletion(owners[0].producer, completed.checkpointId, resolveGitCommit(f.lane.path, 'HEAD')); // original completion, not recovery backfill
+    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+    if (parkAfterCompletion) f.ledger.setJobStatus(f.intent.jobId, 'parked'); // explicit original owner stop, no automatic release
+    return f;
+  }
+  it('R14 protected historical native completion still projects its exact owed current gate debt', async () => {
+    const f = await completeBeforeOriginalOwnerPark(); const bytes = readFileSync(f.file, 'utf8');
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+    const delivery = f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)!;
+    expect(delivery.payload).toMatchObject({ historical_bookkeeping_only: true, candidate_delivery_proven: false });
+    expect(f.ledger.listObligations({ jobId: f.intent.jobId }).find((row) => row.incidentKey === `directive-current-gates:${f.intent.requestId}`)?.state).toBe('suspended');
+    expect(f.ledger.correctiveVerificationDebt(f.intent.jobId)).toEqual({ revision: 0, head: null });
+    expect(f.ledger.latestCandidateDelivery(f.intent.jobId)).toBeNull();
+    expect(f.ledger.getJob(f.intent.jobId)?.status).toBe('parked');
+    expect(readFileSync(f.file, 'utf8')).toBe(bytes); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+  });
+  it('R14 direct native historical report settlement never opens an unqualified commissioner handback', async () => {
+    const f = await completeBeforeOriginalOwnerPark(true); const bytes = readFileSync(f.file, 'utf8');
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+    expect(f.ledger.latestCandidateDelivery(f.intent.jobId)).toBeNull();
+    expect(f.ledger.findReportObligation(f.intent.jobId)).toBeNull();
+    expect(f.ledger.findNotificationByKind(`silas.report-handback.${f.intent.jobId}`, 'any')).toBeNull();
+    expect(f.ledger.listObligations({ jobId: f.intent.jobId }).find((row) => row.incidentKey === `directive-current-gates:${f.intent.requestId}`)?.state).toBe('suspended');
+    expect(f.ledger.getJob(f.intent.jobId)?.status).toBe('parked');
+    expect(readFileSync(f.file, 'utf8')).toBe(bytes); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+  });
+
+  it('R14 first-implementation publisher never opens report handback before independent native candidate settlement', async () => {
+    const f = await completeBeforeOriginalOwnerPark(true, false);
+    const bytes = readFileSync(f.file, 'utf8');
+    writeFileSync(join(f.lane.path, 'report-material-input.ts'), 'export const pendingReportInput = true;\n');
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+    const delivery = f.ledger.latestJobEventByRequestId(f.intent.jobId, 'job.delivered', f.intent.requestId)!;
+    expect(delivery.payload).toMatchObject({ candidate_delivery_proven: false });
+    expect(f.ledger.latestCandidateDelivery(f.intent.jobId)).toBeNull();
+    expect(f.ledger.findReportObligation(f.intent.jobId)).toBeNull();
+    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.report-handback'])).toEqual([]);
+    expect(f.ledger.listObligations({ jobId: f.intent.jobId }).find((row) => row.incidentKey === `directive-current-gates:${f.intent.requestId}`)?.state).toBe('open');
+    expect(readFileSync(f.file, 'utf8')).toBe(bytes); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+  });
+
   it('null historical delivery payload remains historical revision zero without granting current admission or crashing debt readers', async () => {
     const f = await fixture(); f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.intent.jobId, payload: null });
     expect(f.ledger.workRevisionState(f.intent.jobId)).toEqual({ required: 0, delivered: 0 }); expect(f.ledger.correctiveVerificationDebt(f.intent.jobId)).toBeNull();
@@ -227,6 +279,47 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     const f = await fixture(); const event = f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.intent.jobId, payload: 'historical opaque delivery' });
     expect(f.ledger.workRevisionState(f.intent.jobId)).toEqual({ required: 0, delivered: 0 }); expect(f.ledger.correctiveVerificationDebt(f.intent.jobId)).toBeNull();
     expect(f.ledger.getEvent(event.seq)?.payload).toBe('historical opaque delivery'); expect(f.ledger.getDirective(f.intent.requestId)?.nativeBinding).toBeNull();
+  });
+
+  it('R14 bounded native inspector refuses a FIFO descriptor before attempting any blocking stream read', async () => {
+    const f = await fixture(); rmSync(f.file); execFileSync('mkfifo', [f.file]);
+    // Real FIFO and writer descriptor. The original blocking reader is released
+    // at its observed read boundary, never allowed to hang the test harness.
+    let writer: number | null = openSync(f.file, constants.O_RDWR | constants.O_NONBLOCK);
+    const script = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const originalRead = fs.readSync; let attempts = 0;
+      fs.readSync = (...args) => {
+        if (fs.fstatSync(args[0]).isFIFO()) { attempts += 1; process.send({ type: 'read-boundary' }); }
+        return originalRead(...args);
+      };
+      syncBuiltinESMExports();
+      const { readDirectiveSessionHeader } = await import(${JSON.stringify(new URL('../dist/runtime/directive-checkpoint.js', import.meta.url).href)});
+      let refusal = { name: 'no refusal', message: 'unexpected successful stream inspection' };
+      try { readDirectiveSessionHeader(process.argv[1]); } catch (error) { refusal = { name: error.name, message: error.message }; }
+      process.send({ type: 'result', attempts, ...refusal }, () => process.disconnect());
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, f.file], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    if (child.stderr === null) { child.kill('SIGTERM'); throw new Error('native FIFO fixture requires its actual stderr pipe'); }
+    let diagnostics = ''; child.stderr.on('data', (chunk: Buffer) => { diagnostics += chunk.toString('utf8'); });
+    const exited = once(child, 'exit'); let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error(`native FIFO fixture failed to report its bounded result: ${diagnostics}`)); }, 10_000);
+        child.once('error', reject);
+        child.on('message', (raw) => {
+          if (typeof raw !== 'object' || raw === null) return;
+          const message = raw as Record<string, unknown>;
+          if (message.type === 'read-boundary' && writer !== null) { closeSync(writer); writer = null; }
+          if (message.type === 'result') resolve(message);
+        });
+      });
+      expect(await exited).toEqual([0, null]);
+      expect(result).toEqual({ type: 'result', attempts: 0, name: 'DirectiveCheckpointError', message: expect.stringContaining('not a regular file') });
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('dispatching');
+      expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+    } finally { if (timer !== undefined) clearTimeout(timer); if (writer !== null) closeSync(writer); child.kill('SIGTERM'); }
   });
 
   it('refuses oversized native transcripts before parsing or checkpointing', async () => {

@@ -933,11 +933,20 @@ describe('directive retirement — idempotency, conflicts and late evidence', ()
     const jobId = 'report-handback-open-retry';
     seedJob(h, jobId, 'working', 'review');
     const repo = makeFixtureRepo('report-handback-open-retry'); cleanupRepos.push(repo);
-    await seedLane(h, repo, jobId);
+    const lane = await seedLane(h, repo, jobId);
+    h.ledger.registerWorktree(lane); // genuine original candidate setup before acceptance/completion
     const open = vi.spyOn(h.ledger, 'openReportObligation').mockImplementationOnce(() => { throw new Error('transient report obligation write failure'); });
     const accepted = await call(h.port, 'POST', '/api/silas/directive',
       { job_id: jobId, directive: 'complete the approved report task', request_id: 'report-handback-retry-request' }, TOKEN);
     expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
+    // Native report failure is now loud at independent settlement, not
+    // swallowed by the pre-settlement publisher. Drive the real backstop.
+    await waitFor(() => h.ledger.findNotificationByKind('silas.directive-unreconciled.report-handback-retry-request', 'active') !== null, 'original report handback failure');
+    expect(h.ledger.getDirective('report-handback-retry-request')?.state).toBe('admitted');
+    expect(open).toHaveBeenCalledTimes(1);
+    const progress = new DirectiveProgressService({ ledger: h.ledger, registry: h.registry, worktrees: h.worktrees,
+      notifications: h.notifications, signal: new AbortController().signal, pendingProducerBlockers: () => [] });
+    try { progress.reconsider(); await progress.settled(); } finally { await progress.dispose(); }
     await waitFor(() => h.ledger.getDirective('report-handback-retry-request')?.state === 'settled', 'report request delivery');
     expect(open).toHaveBeenCalledTimes(2);
     expect(h.ledger.findReportObligation(jobId)).toMatchObject({ state: 'open' });

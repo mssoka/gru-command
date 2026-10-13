@@ -3,7 +3,7 @@ import { createServer, type Server as HttpServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LaneWriterConflictError, LedgerApi, type AddJobAmendmentResult } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -37,7 +37,7 @@ import type { ResidentReviewRound } from '../src/runtime/registry.js';
 import type { AgentCapabilities, AgentHandle, AgentState, SpawnOptions } from '../src/runtime/types.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
-import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
+import { bindOriginalRebriefSdkOwner, withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
 
 /**
@@ -612,6 +612,121 @@ async function unreconciledDirective(ledger: LedgerApi, requestId: string, reaso
   }
   throw new Error(`directive ${requestId} never reported ${reason}: ${JSON.stringify(ledger.getDirective(requestId))}`);
 }
+
+it('R14 authenticated recovery successor positively clears its obsolete queued review before native admission', async () => {
+  const h = await heldReview({ mode: 'queued' }); const { port, registry } = await serve(h);
+  const roundId = h.wave.activeReview(h.jobId)!.roundIds[0]!;
+  amend(h.ledger, h.jobId, 'material', 'Approved current remaining scope replaces the candidate held by this original review.');
+  h.wave.assertWriterAdmissible(h.jobId); // the original accepted intake is legal; this is not a current-review override
+  const original = h.ledger.beginDirectiveIntent({ jobId: h.jobId, requestId: 'R14-original-pre-native', directive: 'original approved remaining correction', holder: 'silas-ops' }).record;
+  const debt = h.ledger.openDirectiveRecoveryDebt(original.requestId, 'original intake owner interrupted before native dispatch');
+  const lane = h.port.listWorktrees({ jobId: h.jobId }).find((row) => row.kind === 'job')!;
+  const authority = h.ledger.directiveCurrentAuthority(h.jobId);
+  const body = { by: 'gru', expected_generation: debt.generation, expected_payload_hash: original.payloadHash,
+    expected_head: resolveGitCommit(lane.path, 'HEAD'), expected_epoch: authority.authorityEpoch,
+    expected_work_revision: authority.workRevision, expected_contract_sha256: authority.contractSha256,
+    reason: 'separate exact current successor after positively stopping the obsolete original review',
+    decision: { kind: 'successor', request_id: 'R14-fresh-successor', directive: 'inspect preserved progress and finish only current approved remaining scope' } };
+  const clearance = vi.spyOn(h.wave, 'clearLaneForWriter');
+  try {
+    for (const stale of [{ expected_generation: debt.generation + 1 }, { expected_epoch: authority.authorityEpoch + 1 },
+      { expected_head: '0'.repeat(40) }, { expected_payload_hash: '0'.repeat(64) },
+      { expected_work_revision: authority.workRevision + 1 }, { expected_contract_sha256: '0'.repeat(64) }]) {
+      expect((await post(port, `/api/silas/directives/${original.requestId}/recover`, { ...body, ...stale })).status).toBe(409);
+      expect(clearance).not.toHaveBeenCalled(); expect(h.ledger.latestRoundEvent(roundId, 'round.superseded')).toBeNull();
+      expect(registry.spawns).toEqual([]); expect(registry.prompts).toEqual([]);
+    }
+    const accepted = await post(port, `/api/silas/directives/${original.requestId}/recover`, body);
+    expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
+    expect(h.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed')).not.toBeNull();
+    expect(h.wave.activeReview(h.jobId)).toBeNull();
+    expect(await settledDirective(h.ledger, 'R14-fresh-successor')).toBe('settled');
+    const sent = h.ledger.latestJobEventByRequestId(h.jobId, 'silas.directive-sent', 'R14-fresh-successor')!;
+    expect(h.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed')!.seq).toBeLessThan(sent.seq);
+    expect(h.ledger.getObligation(debt.id)?.state).toBe('settled');
+    const prompts = [...registry.prompts]; const spawns = [...registry.spawns]; const watermark = h.ledger.latestEventSeq(); const clears = clearance.mock.calls.length;
+    const replay = await post(port, `/api/silas/directives/${original.requestId}/recover`, body);
+    expect(replay.status).toBe(200); expect(replay.json).toMatchObject({ idempotent: true });
+    expect(registry.prompts).toEqual(prompts); expect(registry.spawns).toEqual(spawns); expect(h.ledger.latestEventSeq()).toBe(watermark);
+    expect(clearance).toHaveBeenCalledTimes(clears);
+  } finally {
+    // The fixture's real tracked queued owner is withdrawn, not falsely marked ceased.
+    await h.wave.supersedeReviews({ jobId: h.jobId, reason: 'end isolated HTTP recovery fixture', by: 'fixture-cleanup' }); clearance.mockRestore();
+  }
+});
+
+it('R14 first-implementation coverage revalidates original recovery authority after actual awaited obsolete-review clearance', async () => {
+  const h = await heldReview({ mode: 'queued' }); const { port, registry } = await serve(h);
+  const roundId = h.wave.activeReview(h.jobId)!.roundIds[0]!;
+  amend(h.ledger, h.jobId, 'material', 'Separately approved current recovery scope makes original review obsolete.');
+  h.wave.assertWriterAdmissible(h.jobId);
+  const original = h.ledger.beginDirectiveIntent({ jobId: h.jobId, requestId: 'R14-await-original', directive: 'original remaining scope', holder: 'silas-ops' }).record;
+  const debt = h.ledger.openDirectiveRecoveryDebt(original.requestId, 'original pre-native intake interrupted');
+  const lane = h.port.listWorktrees({ jobId: h.jobId }).find((entry) => entry.kind === 'job')!;
+  const authority = h.ledger.directiveCurrentAuthority(h.jobId);
+  const body = { by: 'gru', expected_generation: debt.generation, expected_payload_hash: original.payloadHash,
+    expected_head: resolveGitCommit(lane.path, 'HEAD'), expected_epoch: authority.authorityEpoch,
+    expected_work_revision: authority.workRevision, expected_contract_sha256: authority.contractSha256,
+    reason: 'new separately accepted scope requires original controls to stay current after clearance',
+    decision: { kind: 'successor', request_id: 'R14-await-successor', directive: 'only the separately approved original remaining scope' } };
+  let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
+  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+  const clear = h.wave.clearLaneForWriter.bind(h.wave);
+  const clearance = vi.spyOn(h.wave, 'clearLaneForWriter').mockImplementationOnce(async (input) => {
+    enter(); await gate; return clear(input); // real original queued-owner cessation, not a fulfilled no-op
+  });
+  const response = post(port, `/api/silas/directives/${original.requestId}/recover`, body);
+  try {
+    await entered;
+    amend(h.ledger, h.jobId, 'material', 'Genuine new approved authority arrives during the original review-clearance await.');
+    release();
+    const refused = await response;
+    expect(refused.status, JSON.stringify(refused.json)).toBe(409);
+    expect(h.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed')).not.toBeNull();
+    expect(h.ledger.getDirective('R14-await-successor')).toBeNull();
+    expect(h.ledger.getDirective(original.requestId)?.state).toBe('dispatching');
+    expect(h.ledger.getObligation(debt.id)?.state).toBe('open');
+    expect(h.ledger.recoveryDecisionHistory('directive', original.requestId)).toEqual([]);
+    expect(registry.prompts).toEqual([]); expect(registry.spawns).toEqual([]);
+  } finally {
+    release(); await response;
+    await h.wave.supersedeReviews({ jobId: h.jobId, reason: 'end original-await coverage', by: 'fixture-cleanup' }); clearance.mockRestore();
+  }
+});
+
+it('R14 first-implementation coverage preserves actual legacy ownership while clearing only its obsolete HTTP successor review', async () => {
+  const h = await heldReview({ mode: 'queued' }); const { port, registry } = await serve(h);
+  const roundId = h.wave.activeReview(h.jobId)!.roundIds[0]!;
+  amend(h.ledger, h.jobId, 'material', 'Approved remaining legacy scope replaces the old reviewed candidate.');
+  const lane = h.port.listWorktrees({ jobId: h.jobId }).find((entry) => entry.kind === 'job')!;
+  const markers = h.ledger.beginPendingRebrief({ jobId: h.jobId, note: 'original approved historical remaining work', briefing: 'original approved current contract' });
+  await bindOriginalRebriefSdkOwner(h.ledger, markers, { cwd: lane.path, dataDir: temp('r14-original-legacy-sdk-'), agentId: 'minion-lane' });
+  const marker = h.ledger.listPendingRebriefs({ jobId: h.jobId }).find((entry) => entry.kind === 'silas.rebrief')!;
+  const bytes = readFileSync(marker.sessionFile!, 'utf8');
+  const debt = h.ledger.openRebriefRecoveryDebt(marker.id, 'original legacy callback absent; exact new remaining scope requires separate judgment');
+  const authority = h.ledger.directiveCurrentAuthority(h.jobId);
+  const body = { by: 'gru', expected_generation: debt.generation, expected_payload_hash: marker.payloadHash,
+    expected_head: resolveGitCommit(lane.path, 'HEAD'), expected_epoch: authority.authorityEpoch,
+    expected_work_revision: authority.workRevision, expected_contract_sha256: authority.contractSha256,
+    expected_receipt_evidence_sha256: h.ledger.rebriefReceiptEvidence(marker.id).sha256,
+    reason: 'separate remaining scope, never replay the original completed native user',
+    decision: { kind: 'successor', request_id: 'R14-legacy-fresh-successor', directive: 'inspect current artifacts and finish only separately approved remaining scope' } };
+  const clearance = vi.spyOn(h.wave, 'clearLaneForWriter');
+  try {
+    const stale = await post(port, `/api/silas/rebriefs/${marker.id}/recover`, { ...body, expected_receipt_evidence_sha256: '0'.repeat(64) });
+    expect(stale.status).toBe(409); expect(clearance).not.toHaveBeenCalled(); expect(h.ledger.latestRoundEvent(roundId, 'round.superseded')).toBeNull();
+    const accepted = await post(port, `/api/silas/rebriefs/${marker.id}/recover`, body);
+    expect(accepted.status, JSON.stringify(accepted.json)).toBe(202);
+    expect(await settledDirective(h.ledger, 'R14-legacy-fresh-successor')).toBe('settled');
+    const sent = h.ledger.latestJobEventByRequestId(h.jobId, 'silas.directive-sent', 'R14-legacy-fresh-successor')!;
+    expect(h.ledger.latestRoundEvent(roundId, 'round.supersession-confirmed')!.seq).toBeLessThan(sent.seq);
+    expect(readFileSync(marker.sessionFile!, 'utf8')).toBe(bytes);
+    const clears = clearance.mock.calls.length; const prompts = [...registry.prompts];
+    const replay = await post(port, `/api/silas/rebriefs/${marker.id}/recover`, body);
+    expect(replay.status).toBe(200); expect(replay.json).toMatchObject({ idempotent: true });
+    expect(clearance).toHaveBeenCalledTimes(clears); expect(registry.prompts).toEqual(prompts);
+  } finally { await h.wave.supersedeReviews({ jobId: h.jobId, reason: 'end legacy HTTP coverage fixture', by: 'fixture-cleanup' }); clearance.mockRestore(); }
+});
 
 describe('the service-enforced sequence over HTTP (R1/R2 replayed)', () => {
   it('refuses writers during a current review, then supersede → confirm → one continuation → revision delivered', async () => {

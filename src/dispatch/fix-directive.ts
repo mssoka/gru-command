@@ -155,7 +155,11 @@ export async function routeFixDirectiveToMinion(
       throw error;
     }
   };
-  guard();
+  let minions = input.ledger.listImplementerMinions(input.jobId)
+    .filter((agent) => agent.parentage !== 'child');
+  // Operation-boundary guards below still fence every cleanup, spawn,
+  // preparation and prompt. A structural no-route result attempts none:
+  // it may settle truthful no-effect history without a branch/effect grant.
   // Follow-up turns carry the CURRENT worker rule blocks too (PR creation
   // and the no-call-budget contract): legacy briefing wording must not
   // outrank them on the live/resumed paths.
@@ -166,12 +170,6 @@ export async function routeFixDirectiveToMinion(
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
-  let minions = input.ledger
-    .listImplementerMinions(input.jobId)
-    // Defense-in-depth for issue #161's writer rule (the ledger pick
-    // already excludes children): a tracked child is never the primary
-    // lane worker even if a future writer lets one into the table shape.
-    .filter((agent) => agent.parentage !== 'child');
   if (input.freshSession === true) {
     for (const minion of minions) {
       const prior = input.registry.getHandle(minion.id);
@@ -189,6 +187,7 @@ export async function routeFixDirectiveToMinion(
   for (const minion of minions) {
     const handle = input.registry.getHandle(minion.id);
     if (handle !== null) {
+      guard(); // before even the owned prior retry/pacing awaits
       // Active-incident attribution (B1): if an automatic retry is already
       // covering this handle, wait for its settlement BEFORE prompting.
       // Otherwise the new directive and the retry would deliver overlapping
@@ -281,6 +280,7 @@ export async function routeFixDirectiveToMinion(
   if (lane === undefined) {
     return { delivered: false, note: 'no implementing minion session and no job lane', admission: 'none' };
   }
+  guard(); // lane exists: pin original branch before pacing/spawn awaits
   let lease: PacingLease | null = null;
   if (input.workerGate !== undefined) {
     lease = await input.workerGate.acquireWorkerTurn({
@@ -527,12 +527,12 @@ export function recordFollowUpDelivery(input: {
       ...(input.nativeCompletion === undefined ? {} : { native_completion: input.nativeCompletion.provenance, candidate_delivery_proven: candidateDeliveryProven }),
     },
   });
-  // Issue #220: the report handback's commissioner obligation. A failure
-  // here must never un-record the delivery — the obligation has its own
-  // recovery (the backfill CLI and the deterministic pass read the same
-  // rows) — but it is logged loud, never swallowed silently.
+  // Native completion is published before modern ledger settlement. Only
+  // that exact independently qualified candidate sequence may open report
+  // duty, so native handback belongs to recordDirectiveDelivery's transaction.
+  // Preserve ordinary nonnative report compatibility and its loud retry note.
   const job = input.ledger.getJob(input.jobId);
-  if (job !== null && job.deliverable !== null && job.deliverable !== 'pr') {
+  if (input.nativeCompletion === undefined && job !== null && job.deliverable !== null && job.deliverable !== 'pr') {
     try {
       const opened = input.ledger.openReportObligation({ jobId: input.jobId, observedAtSeq: event.seq });
       if (opened.created) {

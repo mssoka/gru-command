@@ -2395,8 +2395,7 @@ export class LedgerApi {
     const row = this.db.prepare(`SELECT d.* FROM events d WHERE d.job_id = ? AND d.kind = 'job.delivered'
       AND (? = 0 OR COALESCE(json_extract(d.payload, '$.candidate_delivery_proven'), 1) != 0)
       AND (? = 0 OR NOT ${UNPROVEN_NATIVE_CANDIDATE_SQL})
-      AND NOT ((? = 1 OR COALESCE(json_extract(d.payload, '$.historical_bookkeeping_only'), 0) = 1)
-        AND ${ORIGINAL_NATIVE_GATE_DEBT_SQL}) ORDER BY d.seq DESC LIMIT 1`)
+      AND (? = 0 OR NOT ${ORIGINAL_NATIVE_GATE_DEBT_SQL}) ORDER BY d.seq DESC LIMIT 1`)
       .get(jobId, candidateOnly ? 1 : 0, candidateOnly ? 1 : 0, candidateOnly ? 1 : 0) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
@@ -6498,6 +6497,7 @@ export class LedgerApi {
    * delivery. Called inside the owning ledger transaction so a failed open
    * cannot settle the directive while losing the handback. */
   private ensureReportHandback(jobId: string, deliveredSeq: number): void {
+    if (this.latestCandidateDelivery(jobId)?.seq !== deliveredSeq) return;
     const job = this.getJob(jobId);
     if (job === null || job.deliverable === null || !isReportDeliverable(job.deliverable)) return;
     const opened = this.openReportObligation({ jobId, observedAtSeq: deliveredSeq });
@@ -7976,6 +7976,56 @@ export class LedgerApi {
     return blockers;
   }
 
+  /** Internal read-only control preflight for stopping an obsolete review.
+   * This is never cessation, admission or execution authority. Exact consumed
+   * generations skip clearance; the original transactional decision still
+   * revalidates every producer/permission predicate after the awaited stop. */
+  validateRecoverySuccessorBeforeWriterClearance(input: (
+    ({ readonly subjectKind: 'directive' } & Parameters<LedgerApi['consumeDirectiveRecoveryDecision']>[0]) |
+    ({ readonly subjectKind: 'rebrief' } & Parameters<LedgerApi['consumeRebriefRecoveryDecision']>[0])
+  ) & { readonly decision: { readonly kind: 'successor'; readonly requestId: string; readonly directive: string } }): string | null {
+    if (input.subjectKind === 'directive') {
+      const row = this.getDirective(input.requestId);
+      if (row === null) throw new RecordNotFound(`directive request "${input.requestId}" not found`);
+      if (this.recoveryDecisionHistory('directive', row.requestId).some((entry) => entry.generation === input.generation)) return null;
+      const debt = this.listObligations({ jobId: row.jobId }).find((entry) => entry.incidentKey === `directive-recovery:${row.requestId}` && ['open', 'waiting'].includes(entry.state));
+      if (debt?.generation !== input.generation || row.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(row.jobId) !== input.expectedEpoch ||
+          input.expectedHead !== input.lane.resolvedHead || !input.reason.trim()) throw new DirectiveCheckpointError('recovery generation/hash/head/epoch decision is stale or incomplete');
+      const job = this.getJob(row.jobId);
+      if (job === null || isJobTerminal(job.status) || isDirectiveTerminal(row.state)) throw new DirectiveCheckpointError('terminal work cannot be revived by recovery');
+      const owner = this.recoveryOwnerBasis('directive', row.requestId);
+      if (owner.changed && !owner.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
+      this.assertRecoveryJobPermission(row.jobId);
+      this.assertFreshRecoveryContract(row.jobId, input.expectedWorkRevision, input.expectedContractSha256);
+      if (row.authorityEpoch !== null && row.authorityEpoch !== input.expectedEpoch) {
+        const changes = this.db.prepare(`SELECT kind FROM events WHERE job_id = ? AND seq > ? AND seq <= ? AND (${DIRECTIVE_CONTROL_SQL})`).all(row.jobId, row.authorityEpoch, input.expectedEpoch) as Row[];
+        if (!owner.confirmed && (changes.length === 0 || changes.some((event) => event.kind !== 'job.amendment-accepted'))) throw new DirectiveCheckpointError('non-amendment authority change cannot revive the old request');
+      }
+      if (input.decision.requestId === row.requestId || !input.decision.requestId.trim() || !input.decision.directive.trim() || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request and nonempty directive');
+      return row.jobId;
+    }
+    if (this.getRebriefRecoveryDecision(input.markerId, input.generation) !== null) return null;
+    if (!/^[a-f0-9]{64}$/.test(input.expectedReceiptEvidenceSha256)) throw new DirectiveCheckpointError('legacy recovery requires expected_receipt_evidence_sha256 from authenticated readback');
+    const marker = this.listPendingRebriefs().find((entry) => entry.id === input.markerId);
+    if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
+    const group = this.listPendingRebriefs({ jobId: marker.jobId });
+    if (group.length !== 2 || !group.some((entry) => entry.kind === 'silas.rebrief') || !group.some((entry) => entry.kind === 'job.delivered') ||
+        !group.every((entry) => entry.payloadHash === marker.payloadHash && entry.baselineSeq === marker.baselineSeq && entry.phaseId === marker.phaseId)) throw new DirectiveCheckpointError('legacy rebrief marker generation is incoherent — explicit owner evidence repair required');
+    if (this.rebriefReceiptEvidence(marker.id).sha256 !== input.expectedReceiptEvidenceSha256) throw new DirectiveCheckpointError('legacy receipt evidence changed — read the exact generation again before judging');
+    const debt = this.listObligations({ jobId: marker.jobId }).find((entry) => entry.incidentKey === `rebrief-recovery:${marker.id}` && ['open', 'waiting'].includes(entry.state));
+    const job = this.getJob(marker.jobId);
+    if (debt?.generation !== input.generation || marker.payloadHash !== input.expectedPayloadHash || this.directiveRecoveryEpoch(marker.jobId) !== input.expectedEpoch ||
+        input.expectedHead !== input.lane.resolvedHead || !input.reason.trim() || job === null || isJobTerminal(job.status)) throw new DirectiveCheckpointError('legacy rebrief decision is stale, terminal or incomplete');
+    const owner = this.recoveryOwnerBasis('rebrief', marker.id);
+    if (owner.changed && !owner.confirmed) throw new DirectiveCheckpointError('governing owner stop has no genuine confirmed resolution — fresh work remains forbidden');
+    this.assertRecoveryJobPermission(marker.jobId);
+    this.assertFreshRecoveryContract(marker.jobId, input.expectedWorkRevision, input.expectedContractSha256);
+    if (!input.decision.requestId.trim() || !input.decision.directive.trim() || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('legacy rebrief successor must name a fresh unused request and nonempty directive');
+    const completed = group.find((entry) => entry.kind === 'silas.rebrief');
+    if (completed !== undefined && this.pendingRebriefReceipt(completed) !== null) throw new DirectiveCheckpointError('legacy rebrief has guarded completion evidence — settlement owns it');
+    return marker.jobId;
+  }
+
   consumeRebriefRecoveryDecision(input: {
     readonly markerId: string; readonly generation: number; readonly expectedPayloadHash: string; readonly expectedHead: string;
     readonly expectedReceiptEvidenceSha256: string;
@@ -8360,14 +8410,14 @@ export class LedgerApi {
       this.appendEvent({ kind: 'silas.directive-settled', jobId: row.jobId,
         payload: { request_id: input.requestId, delivery_seq: input.eventSeq,
           ...(row.requestKind === null ? {} : { candidate_delivery_proven: candidateProven }) } });
-      // A report handback can fail after the delivery event commits. Retry
-      // the obligation open in the same transaction that records this
-      // correlated terminal receipt, including the landed-delivery recovery
-      // path; the active obligation makes this idempotent.
-      this.ensureReportHandback(row.jobId, event.seq);
       this.db
         .prepare("UPDATE pending_directives SET state = 'settled', delivery_seq = ?, updated_at = ? WHERE request_id = ?")
         .run(input.eventSeq, nowIso(), input.requestId);
+      // Qualify report handback only after exact terminal readback is visible
+      // inside this transaction. Completion history alone cannot open current
+      // commissioner disposition; replay/landed-delivery recovery remains
+      // idempotent, and every write still publishes only after commit.
+      this.ensureReportHandback(row.jobId, event.seq);
       this.settleDirectiveRecoveryDebt(row.requestId, input.eventSeq, 'job.delivered');
       // A separate current inspection may discharge only its explicitly
       // named current-action debt, never the missing historical delivery.

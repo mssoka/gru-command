@@ -20,6 +20,7 @@ import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
 import type { DispatchService } from '../src/dispatch/service.js';
 import type { WaveRunner } from '../src/dispatch/perkins.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { makeFixtureRepo } from './helpers/fixture-repo.js';
 import { DirectiveNativeFixture, markHistoricalDirectiveFixture } from './helpers/directive-native-fixture.js';
 import type { Role } from '../src/config.js';
 import type { AgentCapabilities, AgentHandle, PromptOptions, SpawnOptions } from '../src/runtime/types.js';
@@ -421,6 +422,7 @@ describe('directive requests — boot reconciliation (crash windows, bounded, no
 
 describe('directive requests — the real service path (HTTP 202 + readback)', () => {
   class FakeMinions implements DirectiveRegistry {
+    constructor(private readonly cwd: string) {}
     readonly prompts: { id: string; text: string }[] = [];
     gate: Promise<void> | null = null;
     private readonly handles = new Map<string, AgentHandle>();
@@ -448,7 +450,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
       const gate = (): Promise<void> | null => this.gate;
       const prompts = this.prompts;
       let disposed = false;
-      const native = new DirectiveNativeFixture(join(tmpDir(), `${id}.jsonl`), id);
+      const native = new DirectiveNativeFixture(join(tmpDir(), `${id}.jsonl`), id, undefined, this.cwd);
       return {
         role: 'minion',
         id,
@@ -493,9 +495,12 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     const ledger = new LedgerApi(db.handle, { bus });
     const notifications = new NotificationCenter({ ledger, bus });
     const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
-    const registry = new FakeMinions();
     ledger.addJob({ id: 'job-h1', repo: 'r', title: 'Job H1' });
     ledger.setJobStatus('job-h1', 'working');
+    const repo = makeFixtureRepo('directive-http-original-lane');
+    const lane = await worktrees.createJobWorktree({ repoPath: repo.path, jobId: 'job-h1' });
+    ledger.registerWorktree(lane);
+    const registry = new FakeMinions(lane.path);
     registry.register('minion-h1');
     ledger.registerAgent({ id: 'minion-h1', role: 'minion', sessionFile: registry.getHandle('minion-h1')!.sessionFile, jobId: 'job-h1' });
     ledger.setAgentState('minion-h1', 'idle');
@@ -524,6 +529,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
       close: async () => {
         server.dispose();
         await new Promise<void>((resolveClose) => http.close(() => resolveClose()));
+        repo.cleanup();
       },
     };
   }

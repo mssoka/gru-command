@@ -4131,6 +4131,8 @@ it('production shared SDK tool guard rechecks authority after its awaited native
 it('production checkpoint SDK tool guard rechecks authority after its awaited native prior hook', () => assertProductionSdkFence(true, 'prior-hook-await'));
 it('R13 real resumed SDK refuses tool effects after a same-HEAD branch change during model await', () => assertProductionSdkFence(true, 'branch-model-await'));
 it('R13 real resumed SDK rechecks the original branch after its awaited prior tool hook', () => assertProductionSdkFence(true, 'branch-hook'));
+it('R14 real fresh SDK refuses tool effects after a same-HEAD branch change during model await', () => assertProductionSdkFence(false, 'branch-model-await'));
+it('R14 real fresh SDK rechecks the original branch after its awaited prior tool hook', () => assertProductionSdkFence(false, 'branch-hook'));
 it('production shared SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(false, 'foreign-streaming'));
 it('production checkpoint SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(true, 'foreign-streaming'));
 it('real SDK model authority mutation refuses effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(false, 'manifest-model'));

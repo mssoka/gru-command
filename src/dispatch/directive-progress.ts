@@ -9,7 +9,7 @@ import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { DirectiveDispatchDeferredError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
 import { observePendingRebriefs, type RecoveryNotifications } from './rebrief-recovery.js';
-import type { WorktreePort } from './worktree-port.js';
+import type { WorktreeLane, WorktreePort } from './worktree-port.js';
 import type { LessonsReferencePort } from '../lessons/types.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
@@ -106,8 +106,27 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
   let producerStartSeq: number | undefined;
   let dispatchStartSeq: number | undefined;
   let preparedProducer: DirectiveProducer | undefined;
+  let originalLane: Pick<WorktreeLane, 'id' | 'path' | 'branch'> | undefined;
+  const checkFreshAdmission = (handle?: AgentHandle): void => {
+    const lanes = deps.worktrees.listWorktrees({ jobId: identity.jobId }).filter((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+    if (originalLane === undefined || originalLane.branch === null || lanes.length !== 1 || lanes[0]?.id !== originalLane.id ||
+        lanes[0].path !== originalLane.path || lanes[0].branch !== originalLane.branch) {
+      throw new DirectiveCheckpointError('original registered branch/lane is unavailable or changed; fresh native directive effects are forbidden');
+    }
+    let branch: string;
+    try { branch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: originalLane.path, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim(); }
+    catch (error) { throw new DirectiveCheckpointError(`original registered branch cannot be proven; fresh native directive effects are forbidden: ${String(error)}`); }
+    if (branch !== originalLane.branch) throw new DirectiveCheckpointError('original registered branch differs from the checkout; fresh native directive effects are forbidden');
+    const prepared = preparedHandle ?? handle;
+    if (prepared !== undefined && (prepared.sessionFile === null || readDirectiveSessionHeader(prepared.sessionFile).cwd !== originalLane.path)) {
+      throw new DirectiveCheckpointError('original native cwd differs from its registered lane; fresh directive effects are forbidden');
+    }
+    checkAdmissionFences(deps, identity, prepared, producerStartSeq, preparedProducer);
+  };
   try {
     if (!deps.ledger.claimDirectiveDispatch(requestId)) return;
+    const lanes = deps.worktrees.listWorktrees({ jobId: identity.jobId }).filter((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
+    if (lanes.length === 1) { const { id, path, branch } = lanes[0]!; originalLane = { id, path, branch }; }
     dispatchStartSeq = deps.ledger.latestJobEventByRequestId(row.jobId, 'silas.directive-dispatch-started', requestId)!.seq;
     if (row.requestKind === 'rebrief' && deps.clearLaneForWriter !== undefined) {
       check(deps, identity);
@@ -123,7 +142,7 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
         block: `Approved contract revision ${identity.workRevision} at request acceptance:\n${row.contractSnapshot}`,
         freshNote: `Service-bound contract revision ${identity.workRevision}.`,
       } }),
-      beforeTurnSideEffect: (handle) => checkAdmissionFences(deps, identity, preparedHandle ?? handle, producerStartSeq, preparedProducer),
+      beforeTurnSideEffect: checkFreshAdmission,
       onCleanup: (handle) => {
         if (handle === preparedHandle) preparedCleanupAttempted = true;
         if (handle === preparedHandle && producerStartSeq === undefined) {
@@ -142,7 +161,7 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
         preparedProducer = handle.prepareDirectiveProducer(identity);
         producerStartSeq = deps.ledger.startDirectiveProducer(identity, preparedProducer);
       },
-      directiveTurn: { identity, beforeAdmission: () => checkAdmissionFences(deps, identity, preparedHandle, producerStartSeq, preparedProducer),
+      directiveTurn: { identity, beforeAdmission: () => checkFreshAdmission(),
         onAdmitted: (binding) => { deps.ledger.bindDirectiveNativeAdmission(binding); } },
     });
     // Resident routing does not dispose; the same prepared native owner

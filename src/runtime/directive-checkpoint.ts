@@ -1,6 +1,6 @@
 import { hostname } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, fstatSync, fsyncSync, openSync, readSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, writeFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { dirname } from 'node:path';
 import { withSessionLockCoordination } from '../sessions/lock-coordination.js';
@@ -38,9 +38,11 @@ const MAX_DIRECTIVE_JOURNAL_BYTES = 4 * 1024 * 1024;
 const MAX_DIRECTIVE_JOURNAL_ENTRIES = 100_000;
 const MAX_NATIVE_LOCK_BYTES = 4 * 1024;
 function readBoundedUtf8(path: string, limit: number, label: string): string {
-  const fd = openSync(path, 'r');
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
-    const initialSize = fstatSync(fd).size;
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new DirectiveCheckpointError(`${label} is not a regular file; bounded inspection requires durable file evidence`);
+    const initialSize = stat.size;
     if (initialSize > limit) throw new DirectiveCheckpointError(`${label} exceeds the ${limit}-byte inspection limit`);
     const chunks: Buffer[] = [];
     let total = 0;
