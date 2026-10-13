@@ -1,11 +1,24 @@
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { classifyReviewedRed } from '../tools/classify-scheduled-verification-red.mjs';
+import { loadWorktreeManifest } from '../src/worktrees/manifest.js';
 
 const title = 'review-2 root-relative web bin paths refuse independently';
 function report(message = 'AssertionError: expected true to be false') {
   return { numFailedTests: 1, numFailedTestSuites: 1, testResults: [{ assertionResults: [{ title, status: 'failed', failureMessages: [message] }] }] };
 }
 describe('reviewed-candidate behavioral RED custody', () => {
+  it('declares portable explicit native paths and repository-relative retained proof without replay', () => {
+    const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'))!;
+    for (const scope of ['gh315-native-early', 'scheduled-verification-native']) {
+      const command = manifest.verify[scope]!;
+      expect(command, scope).toContain('"$HOME/.local/bin/claude"');
+      expect(command, scope).not.toMatch(/\/(?:Users|home)\//u);
+    }
+    const retained = manifest.verify['gh315-retained-red-classify']!;
+    expect(retained).toBe('node tools/classify-scheduled-verification-red.mjs 2 _bmad-output/gate-prep/gh315-retained-review2-red/fast-results.json _bmad-output/gate-prep/gh315-retained-review2-red/heavy-results.json');
+    expect(retained).not.toMatch(/vitest|npm|\/(?:Users|home)\//u);
+  });
   it('accepts named behavioral assertions for both fast and heavy phases', () => {
     for (const phase of ['fast', 'heavy']) expect(classifyReviewedRed(report(), 2, phase)).toEqual([title]);
   });

@@ -185,33 +185,68 @@ function nodeFetch(base: string): {
   readonly loseReplies: (on: boolean) => void;
   /** Proposal GETs made so far. */
   readonly proposalGets: () => number;
+  /** Proposal GETs the page is still waiting on (issued − answered). */
+  readonly openProposalGets: () => number;
+  /** Decision POSTs the server answered (the request really reached it). */
+  readonly decisionPosts: () => number;
+  /** Withhold the ANSWER of every proposal GET until released — a
+   * controlled slow-read schedule (the Ubuntu-run window: a reload still
+   * outstanding while the owner tries again), never a wall-clock sleep.
+   * The requests themselves are real and always reach the wire. */
+  readonly holdProposalGets: (on: boolean) => void;
+  readonly releaseProposalGets: () => void;
 } {
   let target = base;
   let dropPosts = false;
   let loseReplies = false;
   let proposalGets = 0;
+  let openProposalGets = 0;
+  let decisionPosts = 0;
+  let holdGets = false;
+  const heldAnswers: Array<() => void> = [];
   const fetchImpl = ((path: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) =>
     new Promise((resolveFetch, rejectFetch) => {
       const method = init.method ?? 'GET';
-      if (method === 'GET' && path === '/api/lessons/proposal') proposalGets += 1;
+      const proposalGet = method === 'GET' && path === '/api/lessons/proposal';
+      const decisionPost = method === 'POST' && /^\/api\/lessons\/proposal\/[^/]+\/(?:accept|reject)$/u.test(path);
+      if (proposalGet) {
+        proposalGets += 1;
+        openProposalGets += 1;
+      }
       if (method === 'POST' && dropPosts) {
         rejectFetch(new TypeError('fetch failed (request never sent)'));
         return;
       }
+      /** Hand the already-settled answer to the page. A held proposal GET is
+       * answered only by releaseProposalGets(), so "the page is still
+       * waiting on this read" stays observable while it is withheld. */
+      const deliver = (answer: () => void): void => {
+        if (proposalGet) {
+          if (holdGets) {
+            heldAnswers.push(() => { openProposalGets -= 1; answer(); });
+            return;
+          }
+          openProposalGets -= 1;
+        }
+        answer();
+      };
       const req = request(`${target}${path}`, { method, headers: init.headers ?? {} }, (res) => {
+        if (decisionPost) decisionPosts += 1;
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
-          if (method === 'POST' && loseReplies) {
-            rejectFetch(new TypeError('fetch failed (reply lost)'));
-            return;
-          }
-          const text = Buffer.concat(chunks).toString('utf8');
-          const status = res.statusCode ?? 0;
-          resolveFetch({ ok: status >= 200 && status < 300, status, json: async () => JSON.parse(text) as unknown });
+          deliver(() => {
+            if (method === 'POST' && loseReplies) {
+              rejectFetch(new TypeError('fetch failed (reply lost)'));
+              return;
+            }
+            const text = Buffer.concat(chunks).toString('utf8');
+            const status = res.statusCode ?? 0;
+            resolveFetch({ ok: status >= 200 && status < 300, status, json: async () => JSON.parse(text) as unknown });
+          });
         });
       });
-      req.on('error', rejectFetch);
+      req.on('error', (error: Error) => deliver(() => rejectFetch(error)));
       if (init.body !== undefined) req.write(init.body);
       req.end();
     })) as unknown as typeof fetch;
@@ -221,6 +256,13 @@ function nodeFetch(base: string): {
     dropPosts: (on) => { dropPosts = on; },
     loseReplies: (on) => { loseReplies = on; },
     proposalGets: () => proposalGets,
+    openProposalGets: () => openProposalGets,
+    decisionPosts: () => decisionPosts,
+    holdProposalGets: (on) => { holdGets = on; },
+    releaseProposalGets: () => {
+      holdGets = false;
+      for (const answer of heldAnswers.splice(0)) answer();
+    },
   };
 }
 
@@ -247,6 +289,10 @@ const bookFiles = (bible: Bible): string =>
 const row = (notificationId: string, surface = 'board-owner'): HTMLElement | null =>
   document.getElementById(surface)!.querySelector<HTMLElement>(`[data-action-id="owner-proposal:${notificationId}"]`)?.closest('article') ?? null;
 const waitFor = <T>(probe: () => T): Promise<T> => vi.waitFor(probe, { timeout: 5_000, interval: 10 });
+/** One macrotask boundary: by the time it resolves, every microtask the page
+ * queued for work already delivered to it has run (its own fetch/WS
+ * reactions included). A turn — never a delay, never a wait for load. */
+const turnEnd = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 const shownRow = (notificationId: string, surface?: string): Promise<HTMLElement> =>
   waitFor(() => {
     const found = row(notificationId, surface);
@@ -324,7 +370,8 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
 
   it('a network failure is unconfirmed, a real 409 is translated, and Reject finishes with the book byte-identical', async () => {
     const h = (harness = await boot());
-    const { down } = await connect(h);
+    const wire = await connect(h);
+    const { down } = wire;
     const before = bookFiles(h.bible);
     const { id, notificationId } = await h.propose();
     await shownRow(notificationId);
@@ -332,24 +379,50 @@ describe('lesson proposal roundtrip through the real client, servers, ledger and
     await waitFor(() => {
       if (row(notificationId)!.querySelector('.board-owner__review-lesson') === null) throw new Error('review not loaded yet');
     });
+    const button = (kind: 'accept' | 'reject'): HTMLButtonElement => row(notificationId)!.querySelector<HTMLButtonElement>(`.board-owner__${kind}`)!;
 
     // 1. The server never hears the decision: unconfirmed, never "not applied".
+    //    The mandated reconcile read is HELD here (a controlled slow-read
+    //    schedule — the read is real, only its answer is withheld): this is
+    //    the exact-head Ubuntu window, where step 2 ran while that read's
+    //    cycle was still in flight — the repeat click then read fresh, saw
+    //    the just-injected durable rejection and locked Accept, so the real
+    //    409 was never requested.
+    wire.holdProposalGets(true);
     down(true);
-    row(notificationId)!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    button('accept').click();
     expect(await alertText(notificationId)).toMatch(/^Couldn’t confirm the decision \(connect ECONNREFUSED/u);
     expect(h.proposals.review()).toMatchObject({ id, decision: null });
+    // The page asked the server again, for real, and is still waiting on it.
+    expect(wire.openProposalGets()).toBe(1);
     down(false);
+    wire.releaseProposalGets();
+    // Readiness barrier — the step the Ubuntu run lacked. The released read is
+    // a real failed read; one turn lets the page run everything it queued for
+    // that answer (the review the owner was reading is restored, the row's
+    // in-flight state cleared), and no read may still be outstanding. Only
+    // then is the repeat attempt below issued against the settled row rather
+    // than against the outage's outstanding read.
+    await turnEnd();
+    await waitFor(() => {
+      if (wire.openProposalGets() !== 0) throw new Error('the mandated reload is still outstanding');
+      if (row(notificationId)!.querySelector('.board-owner__review-lesson') === null) throw new Error('the reviewed text is not restored yet');
+    });
+    expect(button('accept').disabled).toBe(false);
 
     // 2. Another device's Reject was recorded before a crash: this page's
     //    Accept meets the server's real 409, translated to its reason.
     const file = JSON.parse(readFileSync(h.proposalFile, 'utf-8')) as Record<string, unknown>;
     writeFileSync(h.proposalFile, JSON.stringify({ ...file, decision: { kind: 'rejected', at: '2026-10-07T00:00:00.000Z', detail: null } }));
-    row(notificationId)!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    const answeredBefore = wire.decisionPosts();
+    button('accept').click();
     await waitFor(() => {
       if (row(notificationId)?.querySelector('[role="alert"]')?.textContent !== 'Not applied — this lesson proposal was already rejected.') {
         throw new Error('no decided refusal yet');
       }
     });
+    // That refusal is the server's own answer to a real POST.
+    expect(wire.decisionPosts()).toBe(answeredBefore + 1);
     expect(h.bible.readChapter('ops-restarts')).toBeNull();
 
     // 3. Reject (the band is the only place to decide) refetches the

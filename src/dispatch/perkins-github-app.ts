@@ -2,7 +2,7 @@ import { createHash, createPrivateKey, createSign } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { PostedReviewReceipt, PrIdentity, VerdictPoster, VerdictPosterInput, VerdictReconcileContext } from './perkins.js';
-import { AutoVerdictPoster, GhPrPoster, verifyPostedReceipt } from './perkins.js';
+import { AutoVerdictPoster, DefiniteNonDeliveryError, GhPrPoster, verifyPostedReceipt } from './perkins.js';
 import { repoRemote } from './review-path.js';
 
 /**
@@ -738,7 +738,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
     // ambiguous outcome. No broader grant is requested to compensate.
     const postStartMs = this.now();
     if (grant.expiresAtMs <= postStartMs + TOKEN_MIN_REMAINING_MS) {
-      throw new PerkinsAppError('installation token expired or expires too soon before the review POST (it was valid when minted; the pre-POST identity and head probes outlasted it) — review not delivered; no POST was sent');
+      throw new DefiniteNonDeliveryError('installation token expired or expires too soon before the review POST (it was valid when minted; the pre-POST identity and head probes outlasted it) — review not delivered; no POST was sent');
     }
     let review: unknown;
     try {
