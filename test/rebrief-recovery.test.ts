@@ -271,6 +271,33 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-retired')).toBeNull();
   });
 
+  it('R16 original marked completion without duplicated revision reconstructs only its genuinely lost delivery', async () => {
+    const h = makeHarness(); const jobId = 'r16-original-marked-lost-delivery';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      const markers = h.ledger.beginPendingRebrief({ jobId, note: 'original', briefing: 'contract',
+        handoff: { kind: 'gru-decision', decision: 'actual original phase before execution' } });
+      await bindOriginalRebriefSdkOwner(h.ledger, markers, { cwd: h.lanePath!, dataDir: h.dir, agentId: 'original-minion' });
+      const original = seedCorrelatedReceipt(h, jobId, 'silas.rebrief', 'original-minion', { work_revision: undefined });
+      const marker = h.ledger.listPendingRebriefs({ jobId }).find((row) => row.kind === 'silas.rebrief')!;
+      expect(h.ledger.pendingRebriefReceipt(marker)?.seq).toBe(original.seq);
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+      const before = h.ledger.listJobEventsByKinds(jobId, ['silas.rebrief']);
+      const report = await reconcilePendingRebriefs({ ledger: h.ledger, worktrees: h.worktrees, registry: h.registry, notifications: h.notifications });
+      await report.settled;
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')?.payload).toMatchObject({
+        work_revision: marker.workRevision, sha: (original.payload as { sha: string }).sha,
+        historical_bookkeeping_only: true, provenance: { kind: 'original-correlated-completion', event_seq: original.seq },
+      });
+      expect(h.ledger.listJobEventsByKinds(jobId, ['silas.rebrief'])).toEqual(before);
+      expect(h.ledger.listPendingRebriefs({ jobId })).toEqual([]);
+      expect(report.completed).toBe(1); expect(h.registry.workers).toEqual([]);
+      const again = await reconcilePendingRebriefs({ ledger: h.ledger, worktrees: h.worktrees, registry: h.registry, notifications: h.notifications });
+      await again.settled;
+      expect(h.ledger.listJobEventsByKinds(jobId, ['job.delivered'])).toHaveLength(1);
+    } finally { h.close(); }
+  });
+
   async function assertStrictReceiptRefusal(fault: 'missing-binding' | 'foreign-phase' | 'reused-phase' | 'foreign-minion' | 'conflicting-delivery-revision' | 'conflicting-stored-revision' | 'unmarked-missing-revision'): Promise<void> {
       const h = makeHarness(); const jobId = `receipt-refusal-${fault}`; await seedPendingRebrief({ h, jobId });
       h.ledger.beginPendingRebrief({ jobId, note: 'original', briefing: 'contract',

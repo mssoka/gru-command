@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { planCommand } from '../src/verify/build-reuse.js';
 import { renderRecordedVerification } from '../src/verify/evidence.js';
 import {
@@ -10,6 +10,7 @@ import {
   outcomePayload,
   type VerificationOutcome,
   type VerificationProgress,
+  type VerificationRecord,
 } from '../src/verify/scheduler.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
@@ -191,6 +192,136 @@ describe('verification build reuse (#318)', () => {
     expect(docs.checks?.[0]).toMatchObject({ status: 'passed', ran: true, reuseRefusal: 'outputs-missing', reusedFromRunId: null });
     expect(count(lane.steps(), 'build')).toBe(2);
     expect(count(lane.steps(), 'config-docs')).toBe(1);
+  });
+
+  it('R16 received timeout cannot signal a settled native step across an actual reused-output await', async () => {
+    const lane = makeLane(); const storage = mkdtempSync(join(tmpdir(), 'gru-r16-owned-step-'));
+    const settled: number[] = [];
+    const scheduler = new VerificationScheduler({ storageDir: storage,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 30_000, runTimeoutMs: 30_000 },
+      sweepIntervalMs: 50, killGraceMs: 100, disposeGraceMs: 500,
+      onSettled: ({ pid }) => { if (pid !== null) settled.push(pid); } });
+    let release!: () => void; const paused = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void; const reused = new Promise<void>((resolve) => { reached = resolve; });
+    const signals: { readonly pid: number; readonly signal: string }[] = [];
+    const originalKill = process.kill.bind(process);
+    let running: Promise<VerificationOutcome> | null = null;
+    try {
+      expect((await run(scheduler, lane, 'warm', DOCS)).ok).toBe(true);
+      settled.length = 0;
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      // Harness safety: record real production attempts to signal the exact
+      // exited native PID; never deliver a number-based signal to a stranger.
+      vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+        if (signal === 'SIGTERM' || signal === 'SIGKILL') { signals.push({ pid, signal }); return true; }
+        return originalKill(pid, signal);
+      });
+      running = run(scheduler, lane, 'after-original-step', 'npm run lint && npm run build && npm run config:docs', async (frame) => {
+        if (frame.type === 'output' && frame.text.includes('[gru-verify] npm run build reused')) { reached(); await paused; }
+      });
+      await reused;
+      expect(settled).toHaveLength(1);
+      expect(() => originalKill(settled[0]!, 0)).toThrow();
+      vi.advanceTimersByTime(30_000); vi.advanceTimersByTime(100);
+      release(); const result = await running;
+      expect(result.timedOut).toBe(true);
+      expect(signals).toEqual([]);
+      expect(count(lane.steps(), 'lint')).toBe(1);
+      expect(count(lane.steps(), 'config-docs')).toBe(1);
+    } finally {
+      release(); if (running !== null) await running.catch(() => {});
+      vi.restoreAllMocks(); vi.useRealTimers(); await scheduler.dispose(); rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  it('R16 received childless shutdown during reuse preserves original no-start through persistent readback', async () => {
+    const lane = makeLane(); const storage = mkdtempSync(join(tmpdir(), 'gru-r16-reuse-no-start-'));
+    const records: VerificationRecord[] = []; const frames: VerificationProgress[] = [];
+    const options = { storageDir: storage,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 30_000, runTimeoutMs: 30_000 },
+      sweepIntervalMs: 50, killGraceMs: 100, disposeGraceMs: 500,
+      record: (record: VerificationRecord) => { records.push(record); } };
+    const scheduler = new VerificationScheduler(options);
+    let release!: () => void; const paused = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void; const reused = new Promise<void>((resolve) => { reached = resolve; });
+    const requestId = 'r16-original-childless-reuse'; let running: Promise<VerificationOutcome | Error> | null = null;
+    let reopened: VerificationScheduler | null = null;
+    try {
+      expect((await run(scheduler, lane, 'warm', DOCS)).ok).toBe(true);
+      const input = { ...gate(lane, 'childless-reuse', DOCS).spec, requestId };
+      running = scheduler.submit(input, async (frame) => {
+        frames.push(frame);
+        if (frame.type === 'output' && frame.text.includes('[gru-verify] npm run build reused')) { reached(); await paused; }
+      }).catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
+      await reused;
+      const original = scheduler.attemptStatus({ requestId })!;
+      expect(original.started).toBe(false);
+      await scheduler.dispose();
+      expect(records.filter((record) => record.kind === 'verification.no-start')).toHaveLength(1);
+      release(); await running;
+      const immediate = scheduler.attemptStatus({ requestId });
+      expect(immediate).toMatchObject({ runId: original.runId, state: 'admission-failed', started: false, error: { code: 'scheduler_disposed' } });
+      expect(Object.hasOwn(immediate, 'outcome')).toBe(false);
+      expect(immediate.outcome).toBeUndefined();
+      expect(frames.some((frame) => frame.type === 'completed')).toBe(false);
+      expect(records.filter((record) => record.kind === 'verification.completed' && record.payload['run_id'] === original.runId)).toEqual([]);
+      reopened = new VerificationScheduler(options);
+      reopened.start();
+      const restored = reopened.attemptStatus({ requestId });
+      expect(restored).toMatchObject({ runId: original.runId, state: 'admission-failed', started: false, error: { code: 'scheduler_disposed' } });
+      expect(Object.hasOwn(restored, 'outcome')).toBe(false);
+      expect(restored.outcome).toBeUndefined();
+      expect(count(lane.steps(), 'config-docs')).toBe(1);
+    } finally {
+      release(); if (running !== null) await running; await reopened?.dispose(); await scheduler.dispose(); rmSync(storage, { recursive: true, force: true });
+    }
+  });
+
+  async function assertR16OriginalNativeGrace(ignoreTerm: boolean): Promise<void> {
+    const lane = makeLane(); const storage = mkdtempSync(join(tmpdir(), 'gru-r16-native-grace-'));
+    let pid: number | null = null;
+    const scheduler = new VerificationScheduler({ storageDir: storage,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 30_000, runTimeoutMs: 30_000 },
+      sweepIntervalMs: 50, killGraceMs: 100, disposeGraceMs: 500,
+      onSpawn: (info) => { pid = info.pid; } });
+    let reached!: () => void; const ready = new Promise<void>((resolve) => { reached = resolve; });
+    const signals: string[] = []; const originalKill = process.kill.bind(process);
+    let running: Promise<VerificationOutcome> | null = null;
+    try {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      vi.spyOn(process, 'kill').mockImplementation((target, signal) => {
+        if (signal === 'SIGTERM' || signal === 'SIGKILL') {
+          expect(target).toBe(-pid!); signals.push(signal);
+        }
+        return originalKill(target, signal);
+      });
+      const body = `${ignoreTerm ? 'process.on(\"SIGTERM\",()=>{});' : ''}console.log(\"r16-owned-ready\");setInterval(()=>{},1000)`;
+      running = run(scheduler, lane, 'actual-owned-child', `exec node -e '${body}'`, (frame) => {
+        if (frame.type === 'output' && frame.text.includes('r16-owned-ready')) reached();
+      });
+      await ready;
+      expect(pid).not.toBeNull(); expect(originalKill(pid!, 0)).toBe(true);
+      vi.advanceTimersByTime(30_000);
+      if (ignoreTerm) vi.advanceTimersByTime(100);
+      const result = await running;
+      expect(result.timedOut).toBe(true);
+      expect(result.signal).toBe(ignoreTerm ? 'SIGKILL' : 'SIGTERM');
+      expect(() => originalKill(pid!, 0)).toThrow();
+      vi.advanceTimersByTime(100);
+      expect(signals).toEqual(ignoreTerm ? ['SIGTERM', 'SIGKILL'] : ['SIGTERM']);
+    } finally {
+      vi.restoreAllMocks(); vi.useRealTimers(); await scheduler.dispose();
+      if (running !== null) await running.catch(() => {});
+      rmSync(storage, { recursive: true, force: true });
+    }
+  }
+
+  it('R16 post-source healthy owned native exit detaches before the original grace callback', async () => {
+    await assertR16OriginalNativeGrace(false);
+  });
+
+  it('R16 post-source healthy still-owned native child retains the original force-kill grace', async () => {
+    await assertR16OriginalNativeGrace(true);
   });
 
   it('works in the other order (docs first, static reuses the build)', async () => {

@@ -3928,10 +3928,16 @@ export class LedgerApi {
     if (marker === undefined) return null;
     const receipt = this.pendingRebriefReceipt(marker);
     const payload = receipt?.payload as { minion_id?: unknown; sha?: unknown; work_revision?: unknown } | undefined;
+    // pendingRebriefReceipt independently correlates the exact original
+    // phase/generation/minion and every available revision. Old marked
+    // completions need not duplicate their original marker's revision.
+    // An unmarked or unknown original must never borrow today's revision.
+    const workRevision = payload?.work_revision === undefined && marker.phaseId !== null
+      ? marker.workRevision : payload?.work_revision;
     if (receipt === null || typeof payload?.minion_id !== 'string' || typeof payload.sha !== 'string' ||
-        !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(payload.sha) || typeof payload.work_revision !== 'number' ||
-        !Number.isSafeInteger(payload.work_revision) || payload.work_revision < 0) return null;
-    return { completionSeq: receipt.seq, minionId: payload.minion_id, sha: payload.sha, workRevision: payload.work_revision };
+        !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(payload.sha) || typeof workRevision !== 'number' ||
+        !Number.isSafeInteger(workRevision) || workRevision < 0) return null;
+    return { completionSeq: receipt.seq, minionId: payload.minion_id, sha: payload.sha, workRevision };
   }
 
   /** Current eligibility is separate from immutable historical outcome.

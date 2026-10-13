@@ -1816,7 +1816,11 @@ export class VerificationScheduler {
         const live = current;
         if (live === null) return;
         signalGroup(live, 'SIGTERM');
-        const killTimer = setTimeout(() => signalGroup(live, 'SIGKILL'), this.killGraceMs);
+        const killTimer = setTimeout(() => {
+          // The original grace bound grants no authority over a detached
+          // completed step (or a later child which reused its number).
+          if (current === live) signalGroup(live, 'SIGKILL');
+        }, this.killGraceMs);
         killTimer.unref?.();
       }, this.opts.limits.runTimeoutMs);
       timeoutTimer.unref?.();
@@ -1931,7 +1935,14 @@ export class VerificationScheduler {
         child.stdout?.destroy();
         child.stderr?.destroy();
       }
-      // The child is gone (exit or spawn error): reconcile the lane record.
+      // Detach only this exact positively exited native child after drain.
+      // A spawn/error without exit remains UNKNOWN and is not erased. The
+      // run lease still owns its slot between steps; no new work is admitted.
+      if (child.exitCode !== null || child.signalCode !== null) {
+        if (current === child) current = null;
+        if (slot.child === child) { slot.child = null; slot.pid = null; }
+        this.persistBestEffort();
+      }
       this.callbackSafe('onSettled', () =>
         this.opts.onSettled?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
       );
@@ -2020,6 +2031,10 @@ export class VerificationScheduler {
       if (timeoutTimer !== null) clearTimeout(timeoutTimer);
     }
 
+    // A genuine childless shutdown may already have durably settled the
+    // original run/request as no-start while reuse output was awaited.
+    // Preserve that refusal rather than publish/remember a completed run.
+    if (this.disposed && !startedEmitted) throw new VerificationDisposedError();
     const durationMs = clockStarted ? this.now() - startedAt : 0;
     const ok = !halted && !timedOut && runError === null;
     const outcome: VerificationOutcome = {
