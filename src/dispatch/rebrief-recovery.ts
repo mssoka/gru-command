@@ -302,6 +302,10 @@ export function finalizeRebriefRequest(input: {
           // receipt of the rule that fired the re-brief.
           ...(rebriefMarker.ruleId !== null ? { rule_id: rebriefMarker.ruleId } : {}),
           ...(rebriefMarker.sourceRoundId !== null ? { source_round_id: rebriefMarker.sourceRoundId } : {}),
+          // Autopilot provenance (issue #243 M3): a marker minted by the code
+          // autopilot replays `source: 'silas-autopilot'` onto the receipt,
+          // so #214's agreement read can attribute it.
+          ...(rebriefMarker.source !== null ? { source: rebriefMarker.source } : {}),
         },
       }, markers);
       rebriefRecorded = true;

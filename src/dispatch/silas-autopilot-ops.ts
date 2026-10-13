@@ -12,11 +12,11 @@
  *
  * Provenance: every receipt the autopilot can write carries its `rule_id`
  * and `source: 'silas-autopilot'`, so #214's agreement read can never
- * confuse a machine action with the model's own. One limitation is stated
- * rather than hidden: a re-brief's `silas.rebrief` receipt is written by
- * the existing durable finalizer from its request marker, whose fields are
- * the ledger's — it carries the `rule_id`, but the marker has no source
- * column to carry `source`.
+ * confuse a machine action with the model's own. The re-brief's
+ * `silas.rebrief` receipt is written by the existing durable finalizer from
+ * its request marker; the marker schema carries `source` (issue #243 M3),
+ * so that receipt replays the autopilot provenance too — restart-safe,
+ * exactly like its `rule_id`.
  */
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -32,9 +32,11 @@ import {
   routeFixDirectiveToMinion,
   type DirectiveRegistry,
 } from './fix-directive.js';
-import { ReviewSupersessionUnconfirmedError, type ReviewRequestInput, type ReviewRequestOutcome } from './perkins.js';
+import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type ReviewRequestInput, type ReviewRequestOutcome } from './perkins.js';
 import { checkRebriefTurn, finalizeRebriefRequest, RebriefTurnCancelled } from './rebrief-recovery.js';
 import { AUTOPILOT_SOURCE, type AutopilotPull, type SilasAutopilotOps } from './silas-autopilot.js';
+import { renderFreshRevisionNote, renderRevisionContinuation } from './work-revision.js';
+import { amendmentSupersessions, pendingMaterialAmendments } from '../review-inputs/amendments.js';
 import type { SilasAutopilotRuleId } from './silas-rules.js';
 import type { WorktreePort, WorktreeSweepResult } from './worktree-port.js';
 
@@ -45,8 +47,15 @@ export interface AutopilotDispatchSurface {
   recordPr(jobId: string, url: string): { readonly prUrl: string | null };
 }
 
-/** The review-wave surface `POST /api/dispatch/review` calls. */
+/** The review-wave surface `POST /api/dispatch/review` and
+ * `POST /api/silas/directive|rebrief` call. */
 export interface AutopilotWaveSurface {
+  /** Owner rules 3/5 writer admission: a live review whose candidate is
+   * still current REFUSES the writer (the branch stays frozen until the
+   * verdict); a review made obsolete by a pending material correction is
+   * superseded by the gate. The writer paths must call this BEFORE
+   * {@link clearLaneForWriter} — the gate does not establish permission. */
+  assertWriterAdmissible(jobId: string): void;
   /** Returns the supersession record (a `Promise<void>`-compatible await
    * target); only rejection matters here. */
   clearLaneForWriter(input: { readonly jobId: string; readonly writer: string }): Promise<unknown>;
@@ -96,6 +105,23 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     });
   };
 
+  /** Owner rules 3/5 writer admission: a live review whose candidate is
+   * still current REFUSES the writer (the branch stays frozen until the
+   * verdict); a review the gate admits is superseded only afterwards. The
+   * autopilot's own refusal (a typed `ReviewInProgressError`) is rethrown
+   * with the row's disposition named — the deterministic pass counts it as
+   * a failed action and leaves the row for LLM Silas. */
+  const requireWriterAdmissible = (jobId: string, label: string): void => {
+    try {
+      deps.wave.assertWriterAdmissible(jobId);
+    } catch (error) {
+      if (error instanceof ReviewInProgressError) {
+        throw new Error(`a live review owns this lane — the ${label} is left for LLM Silas: ${error.message}`);
+      }
+      throw error;
+    }
+  };
+
   const listOpenPrsForHead = async (input: {
     readonly repoPath: string;
     readonly branch: string;
@@ -127,26 +153,31 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly jobId: string;
     readonly ruleId: SilasAutopilotRuleId;
     readonly sourceRoundId?: string;
+    readonly targetRef?: string;
+    readonly boundDeliveredSha?: string;
   }): Promise<void> => {
     // The request may not wait out the review setup: the endpoint answers
     // 202 and tracks the run; so does this.
     const run = (async (): Promise<void> => {
       // The clean-abort re-arm freezes the PROVED delivered head: the
       // endpoint re-derives it from the round's target and the newest
-      // delivery, and refuses a stale bind.
+      // delivery, and refuses a stale bind. The pr-review-trigger family
+      // binds the sha its green proved instead (issue #187); in both cases
+      // the request carries target_ref + bound_delivered_sha so the awaited
+      // setup cannot re-resolve a newer live PR head and the freeze
+      // boundary re-proves the same delivered sha.
       const deliverEvent = deps.ledger.latestJobEvent(input.jobId, 'job.delivered');
       const deliveredSha =
         deliverEvent !== null && typeof deliverEvent.payload === 'object' && deliverEvent.payload !== null
           ? (deliverEvent.payload as { sha?: unknown }).sha
           : null;
+      const rebindFromDelivery = input.sourceRoundId !== undefined && typeof deliveredSha === 'string';
+      const targetRef = input.targetRef ?? (rebindFromDelivery ? deliveredSha : undefined);
+      const boundDeliveredSha = input.boundDeliveredSha ?? (rebindFromDelivery ? deliveredSha : undefined);
       const requestInput: ReviewRequestInput = {
         jobId: input.jobId,
-        ...(input.sourceRoundId === undefined
-          ? {}
-          : {
-              targetRef: typeof deliveredSha === 'string' ? deliveredSha : undefined,
-              boundDeliveredSha: typeof deliveredSha === 'string' ? deliveredSha : undefined,
-            }),
+        ...(targetRef === undefined ? {} : { targetRef }),
+        ...(boundDeliveredSha === undefined ? {} : { boundDeliveredSha }),
       };
       const outcome = await deps.wave.requestReview(requestInput);
       const armed = outcome.route === 'perkins';
@@ -171,6 +202,14 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly blockerFingerprint?: string;
     readonly sourceRoundId?: string;
   }): Promise<void> => {
+    // Owner rules 3/5 writer admission (issue #243 H1), checked in the SAME
+    // synchronous tick as the durable intent below — the endpoint's own
+    // gate. `clearLaneForWriter` supersedes unconditionally; it does NOT
+    // establish permission, so a live review whose candidate is still
+    // current must refuse the writer here (the row then stays for LLM
+    // Silas). A review made obsolete by a pending material correction is
+    // admitted by this same gate.
+    requireWriterAdmissible(input.jobId, 'directive');
     const begun = deps.ledger.beginDirectiveIntent({
       jobId: input.jobId,
       directive: input.directive,
@@ -179,6 +218,21 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     });
     const intent = begun.record;
     const contract = deps.ledger.effectiveContract(input.jobId)?.text ?? null;
+    // Owner rule 4 (issue #243 H3): the approved material amendments this
+    // lane has not delivered travel ONCE with this request — rendered from
+    // the amendment set of the SAME tick as the intent's revision stamp, so
+    // the delivery that recordFollowUpDelivery stamps is the revision the
+    // worker actually received.
+    const workRevision = intent.workRevision ?? 0;
+    const deliveredRevision = deps.ledger.workRevisionState(input.jobId).delivered;
+    const amendmentsAtIntent = deps.ledger.listJobAmendments(input.jobId);
+    const continuation = renderRevisionContinuation({
+      jobId: input.jobId,
+      revision: workRevision,
+      deliveredRevision,
+      pending: pendingMaterialAmendments(amendmentsAtIntent, deliveredRevision, workRevision),
+      supersededBy: amendmentSupersessions(amendmentsAtIntent),
+    });
     const releaseAdmission = deps.ledger.beginJobAdmission(input.jobId, `directive ${intent.requestId}`);
     const run = (async (): Promise<void> => {
       try {
@@ -198,6 +252,12 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
         jobId: input.jobId,
         directive: input.directive,
         contract,
+        // Owner rule 4: a live or resumed session receives the pending
+        // amendment bodies; a fresh session reads them in its effective
+        // contract and receives the revision note instead.
+        ...(continuation === ''
+          ? {}
+          : { continuation: { block: continuation, freshNote: renderFreshRevisionNote(workRevision) } }),
         // The autopilot has no caller to cancel the turn: the signal is
         // never aborted, and the dirty turn runs to settlement exactly as
         // the endpoint's own controller does until its request ends.
@@ -209,6 +269,20 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
         ...(deps.parentTools === undefined ? {} : { parentTools: deps.parentTools }),
       });
       if (!delivery.delivered) {
+        if (delivery.admission === 'unknown') {
+          // The prompt may already have run (cancellation or a spent retry
+          // AFTER the prompt call). Marking the request failed would release
+          // the single-writer guard while a prior writer's recovery may
+          // still be live — keep it live with a durable reconcile note
+          // (issue #243 H2; the endpoint's own rule).
+          deps.ledger.recordDirectiveReconcile({
+            requestId: intent.requestId,
+            note:
+              `turn interrupted with unknown admission: ${delivery.note ?? 'no proof of non-delivery'}` +
+              ' — no delivery recorded; reconcile settlement/cessation before releasing the request',
+          });
+          return;
+        }
         // Positive no-effect proof: a durable failure is honest, and the
         // row stays for the next pass.
         deps.ledger.failDirective({
@@ -261,7 +335,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
         agentId: delivery.minionId,
         source: 'silas-directive',
         requestId: intent.requestId,
-        workRevision: intent.workRevision ?? 0,
+        workRevision,
       });
       deps.ledger.recordDirectiveDelivery({ requestId: intent.requestId, eventSeq: followUp.eventSeq });
     })();
@@ -277,16 +351,29 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
   }): Promise<void> => {
     const job = deps.ledger.getJob(input.jobId);
     if (job === null) throw new Error(`job "${input.jobId}" not found`);
+    // Owner rules 3/5 writer admission (issue #243 H1), in the SAME
+    // synchronous tick as the request below — the endpoint's own gate.
+    // `clearLaneForWriter` supersedes unconditionally; it does NOT establish
+    // permission, so a live review whose candidate is still current must
+    // refuse the writer here (the row then stays for LLM Silas).
+    requireWriterAdmissible(input.jobId, 're-brief');
     await deps.wave.clearLaneForWriter({ jobId: input.jobId, writer: `re-brief for job ${input.jobId}` });
+    // Re-prove admission after the awaited supersession (the endpoint does
+    // the same): a review that armed in the window between the gate and the
+    // marker write must refuse the re-brief, never run alongside it.
+    requireWriterAdmissible(input.jobId, 're-brief');
     const contract = deps.ledger.effectiveContract(input.jobId)?.text ?? job.briefing;
     // The markers are durable BEFORE any worker exists (restart-safe), and
-    // they carry the firing rule, so the `silas.rebrief` receipt replays it.
+    // they carry the firing rule AND the autopilot source (issue #243 M3),
+    // so the durable `silas.rebrief` receipt replays both even across a
+    // restart mid-turn.
     const markers = deps.ledger.beginPendingRebrief({
       jobId: input.jobId,
       note: input.note,
       briefing: contract,
       ruleId: input.ruleId,
       sourceRoundId: input.sourceRoundId,
+      source: AUTOPILOT_SOURCE,
     });
     const workRevision = markers.find((marker) => marker.workRevision !== null)?.workRevision ?? 0;
     const run = (async (): Promise<void> => {

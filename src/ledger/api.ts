@@ -877,6 +877,11 @@ export interface PendingRebriefRecord {
    * because the marker is the durable request. */
   readonly ruleId: string | null;
   readonly sourceRoundId: string | null;
+  /** The autopilot provenance (issue #243 M3): `'silas-autopilot'` when the
+   * durable request was minted by the code autopilot, null for LLM Silas's
+   * own re-brief. The finalizer replays it onto the `silas.rebrief` receipt
+   * so #214 can attribute the action. */
+  readonly source: string | null;
   /** The required work revision the request was composed with (owner rule
    * 4); the re-brief delivery carries it as its receipt. null = a request
    * accepted before work revisions existed. */
@@ -3566,9 +3571,12 @@ export class LedgerApi {
     handoff?: CompletionHandoffIntent;
     /** Firing-rule provenance (issue #117): the named Silas rule and the
      * round it consumes. Persisted in the marker payload so the receipt
-     * carries them even when a restart replays the request. */
+     * carries them even when a restart replays the request. `source`
+     * (issue #243 M3) rides the same payload so an autopilot-minted
+     * re-brief's receipt is attributable. */
     ruleId?: string;
     sourceRoundId?: string;
+    source?: string;
   }): readonly PendingRebriefRecord[] {
     return this.transaction(() => {
       // The revision is bound in the SAME transaction as the marker: the
@@ -3579,6 +3587,7 @@ export class LedgerApi {
         briefing: input.briefing,
         ...(input.ruleId !== undefined ? { rule_id: input.ruleId } : {}),
         ...(input.sourceRoundId !== undefined ? { source_round_id: input.sourceRoundId } : {}),
+        ...(input.source !== undefined ? { source: input.source } : {}),
         work_revision: requiredWorkRevision(this.listJobAmendments(input.jobId)),
       });
       const payloadHash = createHash('sha256').update(payload).digest('hex');
@@ -8034,10 +8043,10 @@ export class LedgerApi {
     if (!isPendingRebriefKind(kind)) {
       throw new Error(`pending_rebriefs row has unknown kind "${kind}"`);
     }
-    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; work_revision?: unknown };
+    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; source?: unknown; work_revision?: unknown };
     try {
       payload = JSON.parse(str(row.payload)) as {
-        note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; work_revision?: unknown;
+        note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; source?: unknown; work_revision?: unknown;
       };
     } catch (error) {
       throw new Error(`pending_rebriefs row ${str(row.id)} payload is not valid JSON: ${String(error)}`);
@@ -8055,6 +8064,7 @@ export class LedgerApi {
       phaseId: nstr(row.phase_id),
       ruleId: nstr(payload.rule_id),
       sourceRoundId: nstr(payload.source_round_id),
+      source: nstr(payload.source),
       workRevision: typeof payload.work_revision === 'number' && Number.isSafeInteger(payload.work_revision) &&
         payload.work_revision >= 0 ? payload.work_revision : null,
       requestedAt: str(row.requested_at),
