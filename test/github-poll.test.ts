@@ -477,7 +477,7 @@ describe('gh CLI adapter', () => {
 // ------------------------------------------------------------------
 
 interface FakeCall {
-  readonly kind: 'listPulls' | 'getPull' | 'listCheckRuns';
+  readonly kind: 'listPulls' | 'listPullsForHead' | 'getPull' | 'listCheckRuns';
   readonly repo: string;
   readonly arg: number | string | null;
 }
@@ -496,6 +496,16 @@ class FakeGhApi implements GhApiPort {
     const failure = this.failList.get(repo);
     if (failure !== undefined) throw failure;
     return this.pulls.get(repo) ?? [];
+  }
+
+  async listPullsForHead(input: { repo: RepoRef; head: string }): Promise<readonly GhPull[]> {
+    const repo = repoFullName(input.repo);
+    this.calls.push({ kind: 'listPullsForHead', repo, arg: input.head });
+    const failure = this.failList.get(repo);
+    if (failure !== undefined) throw failure;
+    // The fake's `pulls` map is the repo's pull set; the head filter is the
+    // only extra behaviour the api-shaped method adds.
+    return (this.pulls.get(repo) ?? []).filter((pull) => pull.headRef === input.head);
   }
 
   async getPull(input: { repo: RepoRef; number: number }): Promise<GhPull> {

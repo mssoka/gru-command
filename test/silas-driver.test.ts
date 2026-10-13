@@ -4282,13 +4282,23 @@ describe('silas deterministic pass observation (issue #163)', () => {
     }
   });
 
-  it('the main assembly wires the durable reconciliation pass into the driver (assembly alarm)', () => {
+  it('the main assembly wires the durable reconciliation pass and the autopilot into the driver (assembly alarm)', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toMatch(
       /import\s*\{[^}]*\bcreateProductionDeterministicPass\b[^}]*\}\s*from\s*'\.\/dispatch\/durable-reconcile\.js'/,
     );
-    expect(mainSource).toMatch(/onDeterministicPass:\s*createProductionDeterministicPass\(\{/);
+    expect(mainSource).toMatch(/const durablePass = createProductionDeterministicPass\(\{/);
     expect(mainSource).toMatch(/getWave:\s*\(\)\s*=>\s*state\.wave/);
+    // Issue #243: the autopilot hook is composed into the SAME deterministic
+    // pass, so it runs before any LLM wake and its counts land on
+    // `silas.reconcile` beside the durable reconciliation's.
+    expect(mainSource).toMatch(
+      /import\s*\{[^}]*\bcreateSilasAutopilotHook\b[^}]*\}\s*from\s*'\.\/dispatch\/silas-autopilot-pass\.js'/,
+    );
+    expect(mainSource).toMatch(/const autopilotHook = createSilasAutopilotHook\(\{/);
+    expect(mainSource).toMatch(/onDeterministicPass:\s*async \(context\)/);
+    expect(mainSource).toMatch(/await durablePass\(context\)/);
+    expect(mainSource).toMatch(/await autopilotHook\(context\)/);
   });
   it('a wait row is bound to its pinned head: another head cannot retire it, the same head can', async () => {
     const h = makeLedger();

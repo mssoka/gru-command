@@ -730,6 +730,93 @@ describe('computeLedgerMeasures', () => {
 // Report assembly + rendering
 // ------------------------------------------------------------------
 
+describe('autopilot decisions and agreement per family (#243)', () => {
+  const decision = (ruleId: string, jobId: string, ts: string, seq: number, mode = 'dry-run'): LedgerEventRecord =>
+    event('silas.autopilot-decision', ts, {
+      jobId,
+      seq,
+      payload: { rule_id: ruleId, job: jobId, action: 'send-directive', would_call: {}, mode },
+    });
+
+  it('counts a dry-run decision as AGREED when the family receipt lands for the same job afterwards', () => {
+    const measures = computeLedgerMeasures(
+      measureInput([
+        decision('verdict-rung-directive', 'job-a', '2026-10-01T01:00:00.000Z', 1),
+        event('silas.wake', '2026-10-01T01:00:10.000Z', { seq: 2, payload: { trigger: 'sweep', actionable: 1 } }),
+        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', { jobId: 'job-a', seq: 3 }),
+      ]),
+      [],
+    );
+    expect(measures.autopilot.decisions).toBe(1);
+    expect(measures.autopilot.byFamily).toEqual([
+      {
+        ruleId: 'verdict-rung-directive',
+        mode: 'dry-run',
+        decisions: 1,
+        enforced: 0,
+        agreed: 1,
+        unobservable: 0,
+        agreementShare: 1,
+      },
+    ]);
+  });
+
+  it('separates a disagreement from an unobservable decision, and a receipt for another job', () => {
+    const measures = computeLedgerMeasures(
+      measureInput([
+        // Silas was woken and did something else entirely: a disagreement.
+        decision('sweep-ack', 'job-b', '2026-10-01T01:00:00.000Z', 1),
+        event('silas.wake', '2026-10-01T01:00:10.000Z', { seq: 2, payload: { trigger: 'sweep', actionable: 1 } }),
+        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', { jobId: 'job-other', seq: 3 }),
+        // No wake after this one: the model was never given the row again.
+        decision('sweep-ack', 'job-c', '2026-10-01T02:00:00.000Z', 4),
+      ]),
+      [],
+    );
+    const family = measures.autopilot.byFamily[0];
+    expect(family?.decisions).toBe(2);
+    expect(family?.agreed).toBe(0);
+    expect(family?.unobservable).toBe(1);
+    expect(family?.agreementShare).toBe(0);
+  });
+
+  it('reports an enforced decision outside the agreement sample', () => {
+    const measures = computeLedgerMeasures(
+      measureInput([
+        decision('pr-review-trigger', 'job-d', '2026-10-01T01:00:00.000Z', 1, 'enforce'),
+      ]),
+      [],
+    );
+    expect(measures.autopilot.decisions).toBe(1);
+    expect(measures.autopilot.byFamily[0]).toMatchObject({
+      ruleId: 'pr-review-trigger',
+      mode: 'enforce',
+      decisions: 0,
+      enforced: 1,
+      agreementShare: null,
+    });
+  });
+
+  it('the text report carries the autopilot section', () => {
+    const report = buildYieldReport({
+      since: SINCE,
+      until: UNTIL,
+      generatedAt: UNTIL,
+      parseSkips: { unparsableLines: 0, unattributedCompactions: 0 },
+      turns: [],
+      sweepSignatures: [],
+      ledger: measureInput([
+        decision('verdict-rung-directive', 'job-a', '2026-10-01T01:00:00.000Z', 1),
+        event('silas.wake', '2026-10-01T01:00:10.000Z', { seq: 2, payload: { trigger: 'sweep', actionable: 1 } }),
+        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', { jobId: 'job-a', seq: 3 }),
+      ]),
+    });
+    const text = renderTextReport(report);
+    expect(text).toContain('Silas autopilot (#243)');
+    expect(text).toContain('verdict-rung-directive [dry-run]: decisions 1, agreed 1 (100.0%)');
+  });
+});
+
 describe('buildYieldReport and renderTextReport', () => {
   const gruTurn: ParsedTurn = {
     ...makeTurn({ role: 'gru', label: 'service-wake', turnClass: 'machine', costUsd: 2 }),

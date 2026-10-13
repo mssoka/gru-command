@@ -83,6 +83,11 @@ export interface RoundBlocker {
    * part of the base fingerprint (it churns every round) — it only breaks
    * same-key ties inside roundBlockerKeys. */
   readonly evidence?: string;
+  /** The reviewer's recommended fix, when the report carried one. The
+   * autopilot's templated directive (issue #243) is the only consumer: a
+   * bullet without one refuses and leaves the row to LLM Silas. Never
+   * part of the fingerprint or of the digest row's decision projection. */
+  readonly recommendedFix?: string;
   /** Severity and detail ride along when the source report carries them —
    * they are PROJECTED OUT of the digest rows (kept byte-stable below)
    * but the #224 same-blocker shadow ask uses the fuller facts so its
@@ -392,6 +397,15 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
             : {}),
           ...(typeof finding.detail === 'string' && finding.detail.trim() !== ''
             ? { detail: finding.detail }
+            : {}),
+          // The reviewer's recommended fix (issue #243): carried for the
+          // autopilot's templated directive only — out of the fingerprint
+          // and out of the digest row projection, so provenance and the
+          // wake gate stay byte-stable. The consolidated report writes the
+          // finding field as `recommended_fix` (perkins-review types).
+          ...(typeof (finding as { recommended_fix?: unknown }).recommended_fix === 'string' &&
+          ((finding as { recommended_fix?: string }).recommended_fix ?? '').trim() !== ''
+            ? { recommendedFix: (finding as { recommended_fix: string }).recommended_fix }
             : {}),
         }));
       return Promise.resolve({ blockers, note: null });
@@ -1630,6 +1644,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
             title: blocker.title,
             location: blocker.location,
             ...(blocker.evidence !== undefined ? { evidence: blocker.evidence } : {}),
+            ...(blocker.recommendedFix !== undefined ? { recommendedFix: blocker.recommendedFix } : {}),
             fingerprint,
             consecutiveRounds,
             advice: adviseFollowThrough(consecutiveRounds, input.config),

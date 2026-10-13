@@ -27,6 +27,8 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
+import { createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
+import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
@@ -1645,6 +1647,47 @@ async function main(): Promise<number> {
       const remote = remoteCache.get(repoPath) ?? null;
       return remote === null ? null : { host: remote.host, owner: remote.owner, repo: remote.repo };
     };
+    // Silas autopilot (issue #243): the unambiguous rule families executed
+    // in code, before any LLM wake. It reaches the service through the SAME
+    // functions the HTTP endpoints compose (never HTTP), and it is bound to
+    // the SAME seams the driver's own digest uses, so the rows it acts on
+    // are the rows Silas was about to read. `enabled` is the owner's kill
+    // switch (default off); every family defaults to dry-run.
+    const autopilotGh = new GhCliApi();
+    const autopilotHook = createSilasAutopilotHook({
+      ledger,
+      config: config.silas.autopilot,
+      ops: createSilasAutopilotOps({
+        ledger,
+        wave,
+        registry,
+        worktrees: worktreeManager,
+        dispatch: dispatcher,
+        gh: autopilotGh,
+        resolveRemote: resolveLaneRemote,
+        workerGate: pacing.gate,
+        retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+        parentTools: parentToolsFor,
+        ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
+        log: (level, msg, fields) => logger.log(level, msg, fields),
+      }),
+      digest: (trigger) =>
+        computeSilasDigest({
+          ledger,
+          worktrees: worktreeManager,
+          blockersForRound: consolidatedBlockersFor(ledger),
+          config: config.silas,
+          trigger,
+          supervisionFor: supervisionLookup(() => supervisor),
+        }),
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    const durablePass = createProductionDeterministicPass({
+      ledger,
+      notifications,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+      getWave: () => state.wave,
+    });
     const silas = new SilasDriver({
       slot: silasSlot,
       ledger,
@@ -1670,15 +1713,22 @@ async function main(): Promise<number> {
       // Chief phase-3 seam: every deterministic Silas pass runs the
       // production hook — the in-memory review-handoff reconsideration
       // plus the bounded durable reconciliation (issue #163) — BEFORE any
-      // LLM wake. The factory is behaviorally tested with a real ledger
-      // and driver; a wiring regression fails a behavioral test, not just
-      // a source regex.
-      onDeterministicPass: createProductionDeterministicPass({
-        ledger,
-        notifications,
-        log: (level, msg, fields) => logger.log(level, msg, fields),
-        getWave: () => state.wave,
-      }),
+      // LLM wake, and then the autopilot (issue #243). The durable factory
+      // is behaviorally tested with a real ledger and driver; a wiring
+      // regression fails a behavioral test, not just a source regex.
+      onDeterministicPass: async (context) => {
+        const durable = await durablePass(context);
+        const autopilot = await autopilotHook(context);
+        const durableCounts = typeof durable === 'object' && durable !== null ? durable : {};
+        const autopilotCounts = typeof autopilot === 'object' && autopilot !== null ? autopilot : {};
+        return {
+          ...durableCounts,
+          ...autopilotCounts,
+          // One failed half fails the pass: the driver records a failed
+          // reconciliation, never a completed one.
+          ok: durableCounts['ok'] !== false && autopilotCounts['ok'] !== false,
+        };
+      },
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,

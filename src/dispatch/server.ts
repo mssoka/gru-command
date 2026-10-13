@@ -627,12 +627,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const jobId = strField(body, 'job_id');
+      // Firing-rule provenance (issue #243): the delivered-pr-register rule
+      // fires here when Silas registers the one PR the lane actually has.
+      const ruleId = parseSilasRouteRuleId('pr', strictOptStrField(body, 'rule_id'));
+      if (ruleId !== null && by !== 'silas') {
+        throw new Error(`rule_id "${ruleId}" fires only on a silas request`);
+      }
       const job = options.dispatch.recordPr(jobId, strField(body, 'url'));
       if (by === 'silas') {
         options.ledger.appendCustomEvent({
           kind: 'silas.pr-registered',
           jobId,
-          payload: { url: job.prUrl },
+          payload: {
+            url: job.prUrl,
+            ...(ruleId !== null ? { rule_id: ruleId } : {}),
+          },
         });
       }
       json(res, 200, job);
@@ -685,13 +694,22 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const force = optBoolField(body, 'force');
-      const ruleId = optStrField(body, 'rule_id');
-      const sourceRoundId = optStrField(body, 'source_round_id');
+      const ruleField = strictOptStrField(body, 'rule_id');
+      const ruleId = parseSilasRouteRuleId('review', ruleField);
+      const sourceRoundId = strictOptStrField(body, 'source_round_id');
       const requestedTargetRef = optStrField(body, 'target_ref');
       const evidenceRefs = optEvidenceField(body);
-      if ((ruleId === undefined) !== (sourceRoundId === undefined) ||
-          (ruleId !== undefined && (by !== 'silas' || ruleId !== 'clean-abort-service-restart'))) {
-        throw new Error('rule_id/source_round_id must be paired and only silas may use clean-abort-service-restart');
+      if (ruleId !== null && by !== 'silas') {
+        throw new Error(`rule_id "${ruleId}" fires only on a silas request`);
+      }
+      if (sourceRoundId !== undefined && ruleId === null) {
+        throw new Error('source_round_id must be paired with a rule_id');
+      }
+      if (ruleId === 'clean-abort-service-restart' && sourceRoundId === undefined) {
+        throw new Error('rule_id "clean-abort-service-restart" consumes a round — source_round_id is required');
+      }
+      if (ruleId === 'pr-review-trigger' && sourceRoundId !== undefined) {
+        throw new Error('rule_id "pr-review-trigger" is a first/re-review request — it carries no source round');
       }
       const jobId = strField(body, 'job_id');
       // The clean-abort re-arm freezes EXACTLY the proved delivered head:
