@@ -3169,14 +3169,17 @@ describe('silas driver wakes', () => {
     } finally { h.cleanup(); }
   });
 
-  it('a sweep with an empty digest does not wake; an event trigger always does', async () => {
+  it('a sweep with an empty digest does not wake; neither does an event trigger (issue #243)', async () => {
     const h = makeDriver();
     try {
       h.driver.start();
       await h.driver.trigger({ kind: 'sweep' });
       expect(h.prompts).toHaveLength(0);
+      // Issue #243 H7: an event whose recomputed digest is empty must not
+      // buy a max-thinking turn — LLM Silas wakes only when rows remain
+      // that need judgment (the autopilot already handled this event's row).
       await h.driver.trigger({ kind: 'round.verdict', jobId: 'nothing' });
-      expect(h.prompts).toHaveLength(1);
+      expect(h.prompts).toHaveLength(0);
     } finally {
       h.cleanup();
     }
@@ -3924,6 +3927,10 @@ describe('silas driver sweep timer and wake kinds', () => {
   it('subscribes to every wake kind: job.delivered, round.verdict, and job.minion-error', async () => {
     const h = makeDriver();
     try {
+      // Issue #243 H7: an event trigger only delivers when the recomputed
+      // digest still has rows; seed one so the subscription under test is
+      // observable (the published events themselves carry no ledger state).
+      addJobWithDelivery(h.ledger, 'job-seed');
       h.driver.start();
       h.bus.publish({
         seq: 1,
@@ -4239,6 +4246,9 @@ describe('silas deterministic pass observation (issue #163)', () => {
   it('wakes on a failed verification or capacity timeout, never on a routine PASS', async () => {
     const h = makeDriver();
     try {
+      // Issue #243 H7: seed an actionable row so the event wakes deliver;
+      // a routine PASS is still not a wake event at all.
+      addJobWithDelivery(h.ledger, 'job-seed-verify');
       h.driver.start();
       const publish = (kind: string, payload: unknown): void => {
         h.bus.publish({

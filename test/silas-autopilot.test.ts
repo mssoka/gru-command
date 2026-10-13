@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,16 +13,24 @@ import {
   type SilasAutopilotOps,
 } from '../src/dispatch/silas-autopilot.js';
 import { createSilasAutopilotOps } from '../src/dispatch/silas-autopilot-ops.js';
+import { createSilasAutopilotHook } from '../src/dispatch/silas-autopilot-pass.js';
+import { ReviewInProgressError } from '../src/dispatch/perkins.js';
+import { SilasDriver } from '../src/dispatch/silas-driver.js';
+import type { AgentCapabilities, AgentHandle } from '../src/runtime/types.js';
+import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
+import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 import type { SilasAutopilotConfig } from '../src/config.js';
-import type {
-  ConflictingPrRow,
-  DeliveredWithoutPrRow,
-  DigestRecurringBlocker,
-  PrWithoutReviewRow,
-  ReleaseEligibleRow,
-  SilasOpsDigest,
-  VerdictAwaitingDirectiveRow,
-  VerificationFailureRow,
+import {
+  computeSilasDigest,
+  consolidatedBlockersFor,
+  type ConflictingPrRow,
+  type DeliveredWithoutPrRow,
+  type DigestRecurringBlocker,
+  type PrWithoutReviewRow,
+  type ReleaseEligibleRow,
+  type SilasOpsDigest,
+  type VerdictAwaitingDirectiveRow,
+  type VerificationFailureRow,
 } from '../src/dispatch/silas-driver.js';
 
 /**
@@ -61,6 +69,8 @@ interface FakeLedgerState {
   pendingRebriefJobs: string[];
   recoveryHoldJobs: string[];
   unsettledVerificationJobs: string[];
+  /** Active decision rows (issue #218): (subject, signal, basis) coverage. */
+  heldDecisions: { id: string; subject: string; signal: string; basis: string | null }[];
 }
 
 class FakeLedger {
@@ -73,6 +83,7 @@ class FakeLedger {
     pendingRebriefJobs: [],
     recoveryHoldJobs: [],
     unsettledVerificationJobs: [],
+    heldDecisions: [],
   };
 
   private seq = 0;
@@ -142,6 +153,16 @@ class FakeLedger {
 
   hasUnsettledVerificationRun(jobId: string): boolean {
     return this.state.unsettledVerificationJobs.includes(jobId);
+  }
+
+  coveringDecision(opts: { subject: string; signal: string; basis: string }): { id: string } | null {
+    const held = this.state.heldDecisions.find(
+      (decision) =>
+        decision.subject === opts.subject &&
+        decision.signal === opts.signal &&
+        (decision.basis === null || decision.basis === opts.basis),
+    );
+    return held === undefined ? null : { id: held.id };
   }
 }
 
@@ -773,7 +794,14 @@ describe('pr-review-trigger (rule hit and rule miss)', () => {
     });
     expect(result.decisions).toBe(1);
     expect(calls[0]?.method).toBe('triggerReview');
-    expect(calls[0]?.input).toEqual({ jobId: 'job-review', ruleId: 'pr-review-trigger' });
+    // Issue #243 H4: the arm binds the sha the green proved, so the awaited
+    // review setup cannot re-resolve a newer live PR head.
+    expect(calls[0]?.input).toEqual({
+      jobId: 'job-review',
+      ruleId: 'pr-review-trigger',
+      targetRef: sha,
+      boundDeliveredSha: sha,
+    });
   });
 
   it('refuses when the green belongs to an older head', async () => {
@@ -992,7 +1020,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     const job = ledger.addJob({ id: 'job-pr', repo: 'gru-command', title: 'pr', baseBranch: 'main', briefing: 'x' });
     const ops = createSilasAutopilotOps({
       ledger,
-      wave: { clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
+      wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
       worktrees: {} as never,
       dispatch: {
@@ -1020,7 +1048,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     let swept = false;
     const ops = createSilasAutopilotOps({
       ledger,
-      wave: { clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
+      wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
       worktrees: {
         listWorktrees: () => [{ id: job.id, kind: 'job', status: 'active', branch: 'gru/lane', path: '/tmp/lane' }],
@@ -1046,7 +1074,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     pausedLedger.setJobStatus(pausedJob.id, 'done');
     const pausedOps = createSilasAutopilotOps({
       ledger: pausedLedger,
-      wave: { clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
+      wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
       worktrees: {
         listWorktrees: () => [{ id: pausedJob.id, kind: 'job', status: 'active', branch: 'gru/p', path: '/tmp/p' }],
@@ -1066,7 +1094,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     const release = vi.fn();
     const ops = createSilasAutopilotOps({
       ledger,
-      wave: { clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
+      wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
       worktrees: { listWorktrees: () => [], release } as never,
       dispatch: { recordPr: () => ({ prUrl: null }) },
@@ -1082,7 +1110,7 @@ describe('the production ops binding writes receipts that carry rule_id and sour
     const asked: { head: string }[] = [];
     const ops = createSilasAutopilotOps({
       ledger,
-      wave: { clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
+      wave: { assertWriterAdmissible: () => {}, clearLaneForWriter: async () => undefined, requestReview: async () => Promise.reject(new Error('unused')) },
       registry: {} as never,
       worktrees: {} as never,
       dispatch: { recordPr: () => ({ prUrl: null }) },
@@ -1101,5 +1129,569 @@ describe('the production ops binding writes receipts that carry rule_id and sour
       { number: 4, url: 'https://github.com/mssoka/gru-command/pull/4' },
     ]);
     expect(asked).toEqual([{ head: 'gru/lane' }]);
+  });
+});
+
+// ------------------------------------------------------------------
+// Fix-round regressions (issue #243 review H1/M1/M2/M4/M5/H5/M6)
+// ------------------------------------------------------------------
+
+describe('pass budget, planner side effects and ownership fences', () => {
+  it('off runs NO planner: an off delivered-pr-register makes no GitHub lookup (H5)', async () => {
+    const ledger = new FakeLedger().job('job-delivered', 'delivered');
+    const { ops, calls } = fakeOps({
+      listOpenPrsForHead: async () => {
+        throw new Error('the off family must not reach GitHub');
+      },
+    });
+    const result = await runSilasAutopilot({
+      digest: digest({ deliveredWithoutPr: [deliveredRow()] }),
+      config: enabled({ 'delivered-pr-register': 'off' }),
+      ledger: ledger.port,
+      ops,
+    });
+    expect(result.decisions).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it('the budget is applied before planning: a surplus row performs no lookup (M6)', async () => {
+    const rows = Array.from({ length: 25 }, (_, index) => deliveredRow({ jobId: `job-${index}` }));
+    const ledger = new FakeLedger();
+    for (const row of rows) ledger.job(row.jobId, 'delivered');
+    let lookups = 0;
+    const { ops } = fakeOps({
+      listOpenPrsForHead: async () => {
+        lookups += 1;
+        return [{ number: 1, url: 'https://github.com/mssoka/gru-command/pull/1' }];
+      },
+    });
+    const result = await runSilasAutopilot({
+      digest: digest({ deliveredWithoutPr: rows }),
+      config: enabled({ 'delivered-pr-register': 'enforce' }),
+      ledger: ledger.port,
+      ops,
+    });
+    expect(result.decisions).toBe(20);
+    expect(lookups).toBe(20);
+  });
+
+  it('carries the verdict blocker_fingerprint on the directive (M4)', async () => {
+    const ledger = new FakeLedger().job('job-verdict', 'in-review');
+    const { ops, calls } = fakeOps();
+    await runSilasAutopilot({
+      digest: digest({ verdictsAwaitingDirective: [verdictRow()] }),
+      config: enabled({ 'verdict-rung-directive': 'enforce' }),
+      ledger: ledger.port,
+      ops,
+    });
+    expect(calls[0]?.input).toMatchObject({ blockerFingerprint: 'verdict:round-1' });
+    expect(ledger.decisions()[0]?.payload).toMatchObject({
+      would_call: { blocker_fingerprint: 'verdict:round-1' },
+    });
+  });
+
+  it('refuses a verdict family while a verification is in flight on the lane (M2)', async () => {
+    for (const rules of [
+      { 'verdict-rung-directive': 'enforce' },
+      { 'verdict-rung-rebrief': 'enforce' },
+    ] as SilasAutopilotConfig['rules'][]) {
+      const ledger = new FakeLedger().job('job-verdict', 'in-review');
+      ledger.state.unsettledVerificationJobs.push('job-verdict');
+      const { ops, calls } = fakeOps();
+      const row = Object.hasOwn(rules, 'verdict-rung-rebrief')
+        ? verdictRow({ recurringBlockers: [blocker({ advice: 'rebrief' })] })
+        : verdictRow();
+      const result = await runSilasAutopilot({
+        digest: digest({ verdictsAwaitingDirective: [row] }),
+        config: enabled(rules),
+        ledger: ledger.port,
+        ops,
+      });
+      expect(result.decisions).toBe(0);
+      expect(result.refusals).toBe(1);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  it('refuses a stale PR registration when a concurrent writer registered during the lookup (M5)', async () => {
+    const ledger = new FakeLedger().job('job-delivered', 'delivered');
+    const { ops, calls } = fakeOps({
+      listOpenPrsForHead: async () => {
+        // Another writer wins the network window.
+        ledger.state.jobs.get('job-delivered')!.prUrl = 'https://github.com/mssoka/gru-command/pull/99';
+        return [{ number: 12, url: 'https://github.com/mssoka/gru-command/pull/12' }];
+      },
+    });
+    const result = await runSilasAutopilot({
+      digest: digest({ deliveredWithoutPr: [deliveredRow()] }),
+      config: enabled({ 'delivered-pr-register': 'enforce' }),
+      ledger: ledger.port,
+      ops,
+    });
+    expect(result.decisions).toBe(0);
+    expect(result.refusals).toBe(1);
+    expect(calls.map((call) => call.method)).toEqual(['listOpenPrsForHead']);
+  });
+});
+
+describe('decision-memory holds (#218) fence the autopilot (issue #243 M1)', () => {
+  it('refuses pr-conflict-rebase when an active hold covers the conflicting head', async () => {
+    const head = 'b'.repeat(40);
+    const ledger = new FakeLedger().job('job-conflict', 'working');
+    ledger.state.heldDecisions.push({
+      id: 'decision-1',
+      subject: 'job:job-conflict',
+      signal: 'pr-conflict',
+      basis: `pr-conflict:${head}`,
+    });
+    const { ops, calls } = fakeOps();
+    const result = await runSilasAutopilot({
+      digest: digest({ conflictingPrs: [conflictRow()] }),
+      config: enabled({ 'pr-conflict-rebase': 'enforce' }),
+      ledger: ledger.port,
+      ops,
+    });
+    expect(result.decisions).toBe(0);
+    expect(result.refusals).toBe(1);
+    expect(calls).toEqual([]);
+  });
+
+  it('refuses a verdict family when an active hold covers the consumed round', async () => {
+    const ledger = new FakeLedger().job('job-verdict', 'in-review');
+    ledger.state.heldDecisions.push({
+      id: 'decision-2',
+      subject: 'job:job-verdict',
+      signal: 'verdict-rung-directive',
+      basis: 'verdict:round-1',
+    });
+    const { ops, calls } = fakeOps();
+    const result = await runSilasAutopilot({
+      digest: digest({ verdictsAwaitingDirective: [verdictRow()] }),
+      config: enabled({ 'verdict-rung-directive': 'enforce' }),
+      ledger: ledger.port,
+      ops,
+    });
+    expect(result.decisions).toBe(0);
+    expect(result.refusals).toBe(1);
+    expect(calls).toEqual([]);
+  });
+
+  it('does not defer for a hold that covers another signal', async () => {
+    const ledger = new FakeLedger().job('job-verdict', 'in-review');
+    ledger.state.heldDecisions.push({
+      id: 'decision-3',
+      subject: 'job:job-verdict',
+      signal: 'pr-conflict',
+      basis: null,
+    });
+    const { ops, calls } = fakeOps();
+    const result = await runSilasAutopilot({
+      digest: digest({ verdictsAwaitingDirective: [verdictRow()] }),
+      config: enabled({ 'verdict-rung-directive': 'enforce' }),
+      ledger: ledger.port,
+      ops,
+    });
+    expect(result.decisions).toBe(1);
+    expect(calls).toHaveLength(1);
+  });
+});
+
+// ------------------------------------------------------------------
+// Production ops composition (issue #243 H1/H2/M3/M9/M10)
+// ------------------------------------------------------------------
+
+const FAKE_CAPS: AgentCapabilities = {
+  streaming: true,
+  steer: 'native',
+  resume: 'file',
+  images: false,
+  thinking: false,
+  thinkingLevelControl: false,
+  followUp: false,
+};
+
+function idleHandle(id: string, opts: { fail?: Error } = {}): AgentHandle {
+  return {
+    id,
+    role: 'minion',
+    sessionFile: null,
+    async prompt() {
+      if (opts.fail !== undefined) throw opts.fail;
+    },
+    capabilities: FAKE_CAPS,
+    async steer() {},
+    async followUp() {},
+    subscribe() {
+      return () => {};
+    },
+    health() {
+      return { state: 'idle' as const, lastActivity: null, sessionFile: null };
+    },
+    async dispose() {},
+  } satisfies AgentHandle;
+}
+
+function newRealLedger(): LedgerApi {
+  const dir = mkdtempSync(join(tmpdir(), 'autopilot-ops-real-'));
+  dirs.push(dir);
+  return new LedgerApi(new LedgerDb(dir).handle, {});
+}
+
+const repos: FixtureRepo[] = [];
+afterEach(() => {
+  while (repos.length > 0) repos.pop()!.cleanup();
+});
+
+function waveStub(overrides: { assertWriterAdmissible?: (jobId: string) => void } = {}) {
+  return {
+    assertWriterAdmissible: overrides.assertWriterAdmissible ?? ((): void => {}),
+    clearLaneForWriter: async () => undefined,
+    requestReview: async (): Promise<never> => {
+      throw new Error('unused');
+    },
+  };
+}
+
+describe('the production ops binding re-proves writer admission (issue #243 H1)', () => {
+  it('refuses a directive on a lane a live review owns — no intent, no supersession', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-h1', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'in-review');
+    let superseded = false;
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: {
+        assertWriterAdmissible: () => {
+          throw new ReviewInProgressError(job.id, ['round-live']);
+        },
+        clearLaneForWriter: async () => {
+          superseded = true;
+          return undefined;
+        },
+        requestReview: async (): Promise<never> => {
+          throw new Error('unused');
+        },
+      },
+      registry: {} as never,
+      worktrees: {} as never,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    await expect(
+      ops.sendDirective({ jobId: job.id, directive: 'fix', ruleId: 'verdict-rung-directive', sourceRoundId: 'round-live' }),
+    ).rejects.toThrow(/live review owns this lane/);
+    expect(superseded).toBe(false);
+    expect(ledger.listPendingDirectives({ jobId: job.id })).toHaveLength(0);
+  });
+
+  it('refuses a re-brief on a lane a live review owns — no supersession', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-h1b', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'in-review');
+    let superseded = false;
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: {
+        assertWriterAdmissible: () => {
+          throw new ReviewInProgressError(job.id, ['round-live']);
+        },
+        clearLaneForWriter: async () => {
+          superseded = true;
+          return undefined;
+        },
+        requestReview: async (): Promise<never> => {
+          throw new Error('unused');
+        },
+      },
+      registry: {} as never,
+      worktrees: {} as never,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    await expect(
+      ops.sendRebrief({ jobId: job.id, note: 'try again', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'round-live' }),
+    ).rejects.toThrow(/live review owns this lane/);
+    expect(superseded).toBe(false);
+    expect(ledger.listPendingRebriefs({ jobId: job.id })).toHaveLength(0);
+  });
+});
+
+describe('the production directive settlement keeps unknown admission live (issue #243 H2/M9)', () => {
+  it('keeps a directive live (reconcile, never failed) when admission is unknown', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-h2', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.registerAgent({ id: 'min-h2', role: 'minion', jobId: job.id });
+    const handle = idleHandle('min-h2', { fail: new Error('transport dropped after the prompt call') });
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: waveStub(),
+      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      worktrees: { listWorktrees: () => [] } as never,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+      retrySettlement: async () => 'exhausted',
+    });
+    await ops.sendDirective({
+      jobId: job.id,
+      directive: 'fix it',
+      ruleId: 'verdict-rung-directive',
+      sourceRoundId: 'round-h2',
+    });
+    await vi.waitFor(() => expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.attempts).toBeGreaterThan(0));
+    const intent = ledger.listPendingDirectives({ jobId: job.id })[0]!;
+    expect(intent.state).not.toBe('failed');
+    expect(intent.failReason).toMatch(/^reconcile:/u);
+    expect(ledger.latestJobEvent(job.id, 'silas.directive-failed')).toBeNull();
+  });
+
+  it('settles a delivered directive on the real ledger with rule_id, source and revision', async () => {
+    const repo = makeFixtureRepo();
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'autopilot-lanes-'));
+    dirs.push(laneRoot);
+    const lanes = new InMemoryWorktreePort(laneRoot);
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-m9', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    ledger.registerAgent({ id: 'min-m9', role: 'minion', jobId: job.id });
+    const handle = idleHandle('min-m9');
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: waveStub(),
+      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      worktrees: lanes,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    await ops.sendDirective({
+      jobId: job.id,
+      directive: 'fix it',
+      ruleId: 'verdict-rung-directive',
+      sourceRoundId: 'round-m9',
+      blockerFingerprint: 'verdict:round-m9',
+    });
+    await vi.waitFor(() => expect(ledger.latestJobEvent(job.id, 'silas.directive-settled')).not.toBeNull());
+    expect(ledger.latestJobEvent(job.id, 'silas.directive-sent')?.payload).toMatchObject({
+      rule_id: 'verdict-rung-directive',
+      source: AUTOPILOT_SOURCE,
+      blocker_fingerprint: 'verdict:round-m9',
+      source_round_id: 'round-m9',
+    });
+    expect(ledger.latestJobEvent(job.id, 'job.delivered')?.payload).toMatchObject({
+      source: 'silas-directive',
+      request_id: ledger.listPendingDirectives({ jobId: job.id })[0]?.requestId,
+    });
+    expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).toBe('settled');
+  });
+
+  it('carries a pending material amendment into the turn and stamps its revision (H3)', async () => {
+    const repo = makeFixtureRepo();
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'autopilot-lanes-'));
+    dirs.push(laneRoot);
+    const lanes = new InMemoryWorktreePort(laneRoot);
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-h3', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'original' });
+    ledger.setJobStatus(job.id, 'working');
+    await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    ledger.registerAgent({ id: 'min-h3', role: 'minion', jobId: job.id });
+    const prompted: string[] = [];
+    const handle = {
+      ...idleHandle('min-h3'),
+      async prompt(text: string) {
+        prompted.push(text);
+      },
+    } satisfies AgentHandle;
+    const amendment = ledger.addJobAmendment({
+      jobId: job.id,
+      body: 'ALSO: fix the retry path before you push.',
+      effect: 'material',
+      approval: { by: 'owner', reference: 'fixture-approval-h3' },
+      expectedContractSha256: ledger.effectiveContract(job.id)!.contractSha256,
+    });
+    expect(amendment.status).toBe('accepted');
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: waveStub(),
+      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      worktrees: lanes,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    await ops.sendDirective({
+      jobId: job.id,
+      directive: 'fix the blocker',
+      ruleId: 'verdict-rung-directive',
+      sourceRoundId: 'round-h3',
+    });
+    await vi.waitFor(() => expect(ledger.latestJobEvent(job.id, 'silas.directive-settled')).not.toBeNull());
+    // The approved amendment body travels ONCE with the directive turn…
+    expect(prompted.join('\n')).toContain('ALSO: fix the retry path before you push.');
+    // …and the delivery that settles the turn stamps that exact revision.
+    expect(ledger.latestJobEvent(job.id, 'job.delivered')?.payload).toMatchObject({ work_revision: 1 });
+  });
+});
+
+describe('the production re-brief finalization carries autopilot provenance (issue #243 M3/M10)', () => {
+  it('replays rule_id and source onto the durable silas.rebrief receipt', async () => {
+    const repo = makeFixtureRepo();
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'autopilot-lanes-'));
+    dirs.push(laneRoot);
+    const lanes = new InMemoryWorktreePort(laneRoot);
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-m10', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    const handle = idleHandle('fresh-m10');
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: waveStub(),
+      registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+      worktrees: lanes,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    await ops.sendRebrief({
+      jobId: job.id,
+      note: 'same blocker three rounds; change the approach',
+      ruleId: 'verdict-rung-rebrief',
+      sourceRoundId: 'round-m10',
+    });
+    await vi.waitFor(() => expect(ledger.latestJobEvent(job.id, 'silas.rebrief')).not.toBeNull());
+    expect(ledger.latestJobEvent(job.id, 'silas.rebrief')?.payload).toMatchObject({
+      rule_id: 'verdict-rung-rebrief',
+      source_round_id: 'round-m10',
+      source: AUTOPILOT_SOURCE,
+    });
+    expect(ledger.listPendingRebriefs({ jobId: job.id })).toHaveLength(0);
+  });
+});
+
+// ------------------------------------------------------------------
+// Verification gaps M7/M8 (issue #243)
+// ------------------------------------------------------------------
+
+describe('the round-report extractor feeds the autopilot (issue #243 M8)', () => {
+  it('a recommended_fix in the consolidated report reaches the templated directive', async () => {
+    const artifactDir = mkdtempSync(join(tmpdir(), 'autopilot-artifacts-'));
+    dirs.push(artifactDir);
+    writeFileSync(
+      join(artifactDir, 'consolidated.json'),
+      JSON.stringify({
+        findings: [
+          {
+            category: 'correctness',
+            title: 'The gate is skipped on retry',
+            location: 'src/dispatch/gate.ts:42',
+            severity: 'blocker',
+            recommended_fix: 'Re-check the guard before the retry path',
+          },
+        ],
+      }),
+    );
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-m8', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'in-review');
+    const round = ledger.addRound({ jobId: job.id, targetRef: 'a'.repeat(40) });
+    ledger.appendCustomEvent({
+      kind: 'round.perkins-review',
+      roundId: round.id,
+      jobId: job.id,
+      payload: { artifactDirectory: artifactDir },
+    });
+    ledger.setRoundStatus(round.id, 'live');
+    ledger.setRoundVerdict(round.id, 'changes-requested');
+    const measured = await computeSilasDigest({
+      ledger,
+      config: { stallThresholdMs: 1_800_000, directiveAt: 2, rebriefAt: 3, escalateAt: 4 },
+      blockersForRound: consolidatedBlockersFor(ledger),
+      trigger: 'sweep',
+      now: () => 0,
+    });
+    expect(measured.verdictsAwaitingDirective[0]?.recurringBlockers[0]?.recommendedFix).toBe(
+      'Re-check the guard before the retry path',
+    );
+    const { ops, calls } = fakeOps();
+    const result = await runSilasAutopilot({
+      digest: measured,
+      config: enabled({ 'verdict-rung-directive': 'enforce' }),
+      ledger: ledger as unknown as AutopilotLedger,
+      ops,
+    });
+    expect(result.decisions).toBe(1);
+    const directive = String(calls.find((call) => call.method === 'sendDirective')?.input['directive']);
+    expect(directive).toContain('Recommended fix: Re-check the guard before the retry path');
+  });
+});
+
+describe('the production autopilot hook runs inside a driver trigger (issue #243 M7)', () => {
+  it('a driver trigger executes createSilasAutopilotHook before any model wake', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-m7', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    ledger.setJobStatus(job.id, 'done');
+    const released: string[] = [];
+    const hook = createSilasAutopilotHook({
+      ledger: ledger as unknown as AutopilotLedger,
+      config: { enabled: true, rules: { 'sweep-ack': 'enforce' } },
+      ops: {
+        listOpenPrsForHead: async () => [],
+        registerPr: async () => {},
+        triggerReview: async () => {},
+        sendDirective: async () => {},
+        sendRebrief: async () => {},
+        releaseLane: async ({ jobId: releasedJobId }) => {
+          released.push(releasedJobId);
+        },
+      },
+      digest: async () => digest({ releaseEligible: [releaseRow({ jobId: job.id })] }),
+    });
+    let slotWakes = 0;
+    const driver = new SilasDriver({
+      slot: {
+        ensure: async () => {
+          slotWakes += 1;
+          throw new Error('no model wake in this composition test');
+        },
+        viewFor: () => null,
+      } as never,
+      ledger: ledger as never,
+      worktrees: { listWorktrees: () => [] } as never,
+      ops: { baseUrl: 'http://127.0.0.1:0', configPath: 'unused' },
+      config: {
+        enabled: true,
+        sweepIntervalMs: 60_000,
+        pollIntervalMs: 0,
+        directiveAt: 2,
+        rebriefAt: 3,
+        escalateAt: 4,
+        stallThresholdMs: 1_800_000,
+        unchangedRewakeMs: 21_600_000,
+        autopilot: { enabled: true, rules: { 'sweep-ack': 'enforce' } },
+      },
+      skills: [],
+      now: () => 0,
+      setInterval: (() => 1) as unknown as typeof setInterval,
+      clearInterval: (() => {}) as never,
+      onDeterministicPass: hook,
+    });
+    await driver.trigger({ kind: 'job.delivered', jobId: job.id });
+    expect(released).toEqual([job.id]);
+    expect(ledger.listEvents({ limit: 500 }).some((event) => event.kind === 'silas.reconcile')).toBe(true);
+    // The driver's OWN digest for this job is empty: with the hook having
+    // handled the row, no model wake happens (issue #243 H7).
+    expect(slotWakes).toBe(0);
   });
 });

@@ -743,7 +743,11 @@ describe('autopilot decisions and agreement per family (#243)', () => {
       measureInput([
         decision('verdict-rung-directive', 'job-a', '2026-10-01T01:00:00.000Z', 1),
         event('silas.wake', '2026-10-01T01:00:10.000Z', { seq: 2, payload: { trigger: 'sweep', actionable: 1 } }),
-        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', { jobId: 'job-a', seq: 3 }),
+        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', {
+          jobId: 'job-a',
+          seq: 3,
+          payload: { rule_id: 'verdict-rung-directive' },
+        }),
       ]),
       [],
     );
@@ -767,7 +771,11 @@ describe('autopilot decisions and agreement per family (#243)', () => {
         // Silas was woken and did something else entirely: a disagreement.
         decision('sweep-ack', 'job-b', '2026-10-01T01:00:00.000Z', 1),
         event('silas.wake', '2026-10-01T01:00:10.000Z', { seq: 2, payload: { trigger: 'sweep', actionable: 1 } }),
-        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', { jobId: 'job-other', seq: 3 }),
+        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', {
+          jobId: 'job-other',
+          seq: 3,
+          payload: { rule_id: 'sweep-ack' },
+        }),
         // No wake after this one: the model was never given the row again.
         decision('sweep-ack', 'job-c', '2026-10-01T02:00:00.000Z', 4),
       ]),
@@ -777,7 +785,67 @@ describe('autopilot decisions and agreement per family (#243)', () => {
     expect(family?.decisions).toBe(2);
     expect(family?.agreed).toBe(0);
     expect(family?.unobservable).toBe(1);
+    // L1: the share is computed over the OBSERVABLE decisions only.
     expect(family?.agreementShare).toBe(0);
+  });
+
+  it('does not credit a cross-family receipt or the autopilot\'s own receipt as agreement (H6)', () => {
+    const measures = computeLedgerMeasures(
+      measureInput([
+        // A conflict-repair directive (another family, another rule id) is
+        // not agreement for a verdict decision.
+        decision('verdict-rung-directive', 'job-x', '2026-10-01T01:00:00.000Z', 1),
+        event('silas.wake', '2026-10-01T01:00:10.000Z', { seq: 2, payload: { trigger: 'sweep', actionable: 1 } }),
+        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', {
+          jobId: 'job-x',
+          seq: 3,
+          payload: { rule_id: 'pr-conflict-rebase' },
+        }),
+        // A bare shared-kind receipt names no family: never agreement.
+        decision('verdict-rung-directive', 'job-y', '2026-10-01T02:00:00.000Z', 4),
+        event('silas.directive-sent', '2026-10-01T02:05:00.000Z', { jobId: 'job-y', seq: 5 }),
+        // The autopilot's OWN machine receipt is not the model's agreement.
+        decision('verdict-rung-directive', 'job-z', '2026-10-01T03:00:00.000Z', 6),
+        event('silas.directive-sent', '2026-10-01T03:05:00.000Z', {
+          jobId: 'job-z',
+          seq: 7,
+          payload: { rule_id: 'verdict-rung-directive', source: 'silas-autopilot' },
+        }),
+        // A wake after every decision keeps all three OBSERVABLE, so each is
+        // a genuine disagreement rather than an unobservable sample.
+        event('silas.wake', '2026-10-01T04:00:00.000Z', { seq: 8, payload: { trigger: 'sweep', actionable: 1 } }),
+      ]),
+      [],
+    );
+    const family = measures.autopilot.byFamily[0];
+    expect(family?.ruleId).toBe('verdict-rung-directive');
+    expect(family?.decisions).toBe(3);
+    expect(family?.agreed).toBe(0);
+    expect(family?.unobservable).toBe(0);
+    expect(family?.agreementShare).toBe(0);
+  });
+
+  it('computes the agreement share over observable decisions only (L1)', () => {
+    const measures = computeLedgerMeasures(
+      measureInput([
+        decision('verdict-rung-directive', 'job-l1a', '2026-10-01T01:00:00.000Z', 1),
+        event('silas.wake', '2026-10-01T01:00:10.000Z', { seq: 2, payload: { trigger: 'sweep', actionable: 1 } }),
+        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', {
+          jobId: 'job-l1a',
+          seq: 3,
+          payload: { rule_id: 'verdict-rung-directive' },
+        }),
+        // No wake after this one: the model never saw this row again.
+        decision('verdict-rung-directive', 'job-l1b', '2026-10-01T02:00:00.000Z', 4),
+      ]),
+      [],
+    );
+    expect(measures.autopilot.byFamily[0]).toMatchObject({
+      decisions: 2,
+      agreed: 1,
+      unobservable: 1,
+      agreementShare: 1,
+    });
   });
 
   it('reports an enforced decision outside the agreement sample', () => {
@@ -808,7 +876,11 @@ describe('autopilot decisions and agreement per family (#243)', () => {
       ledger: measureInput([
         decision('verdict-rung-directive', 'job-a', '2026-10-01T01:00:00.000Z', 1),
         event('silas.wake', '2026-10-01T01:00:10.000Z', { seq: 2, payload: { trigger: 'sweep', actionable: 1 } }),
-        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', { jobId: 'job-a', seq: 3 }),
+        event('silas.directive-sent', '2026-10-01T01:05:00.000Z', {
+          jobId: 'job-a',
+          seq: 3,
+          payload: { rule_id: 'verdict-rung-directive' },
+        }),
       ]),
     });
     const text = renderTextReport(report);
