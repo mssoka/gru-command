@@ -1,4 +1,5 @@
 import type { Role } from '../config.js';
+import type { WorkerVerificationPolicy } from './worker-verification-policy.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import type { WorkflowContext, WorkflowInvocation } from '../workflows/runtime.js';
 
@@ -144,6 +145,8 @@ export interface ManagedSkillSet {
 
 export interface ManagedWorkflowSession {
   readonly cwd: string;
+  /** Host-owned verification admission for this registered lane (issue #315). */
+  readonly workerVerification?: WorkerVerificationPolicy;
   /** Recorded logical owner, including resumes that supplied only a file. */
   readonly agentId?: string;
   readonly managedSkills?: ManagedSkillSet;
@@ -151,6 +154,12 @@ export interface ManagedWorkflowSession {
 
 /** Options for spawn(). */
 export interface SpawnOptions {
+  /**
+   * Host-owned registered-lane verification admission (issue #315): a
+   * minion on a lane that declares `[verify]` scopes must not run the known
+   * producer commands directly. Omitted = no declared scopes to enforce.
+   */
+  readonly workerVerification?: WorkerVerificationPolicy;
   /** Cancel a queued resident admission without starting an adapter spawn. */
   readonly signal?: AbortSignal;
   /**

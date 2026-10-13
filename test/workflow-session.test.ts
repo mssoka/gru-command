@@ -110,6 +110,16 @@ describe('production owned workflow session binding', () => {
     } finally { await h.registry.dispose(); }
   });
 
+  it('binds the lane verification policy from declared scopes and the loaded config path', () => {
+    const f = fixture();
+    mkdirSync(join(f.lane.path, '.gru-command'), { recursive: true });
+    writeFileSync(join(f.lane.path, '.gru-command', 'worktree.toml'), '[verify]\nfull = "npm test"\n');
+    const bound = createWorkflowSessionBinder(f.dataDir, () => f.lane, undefined, undefined, undefined, '/abs/instance/config.toml')({ cwd: f.lane.path });
+    expect(bound.workerVerification).toMatchObject({ jobId: f.lane.id, scopes: ['full'], configFile: '/abs/instance/config.toml' });
+    // A declaring lane without the host-loaded config path cannot advertise a usable action.
+    expect(() => createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path })).toThrow(/absolute instance config path/u);
+  });
+
   it('production dispatch/registry selects PR builds but excludes new review/artifact workflows', async () => {
     const a = makeWorkflowLane('j-pr'); const b = makeWorkflowLane('j-review'); const c = makeWorkflowLane('j-artifact');
     roots.push(a.root, b.root, c.root);

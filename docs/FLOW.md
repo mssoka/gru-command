@@ -424,6 +424,22 @@ verification budget.
   producer frame). The protection assumes the event loop services the
   timer; a stall longer than the client's idle limit is outside it.
 
+- **Workers cannot bypass a declared contract (issue #315).** A job lane
+  whose `.gru-command/worktree.toml` declares `[verify]` scopes carries a
+  host-owned admission policy into both runtime adapters. A normal worker
+  Bash call that runs a known unscheduled producer (the raw `npm test`,
+  `npx vitest run …`, declared `npm run …` scripts, or their bare/local-bin
+  equivalents) is refused BEFORE any child process starts: the pi runtime
+  blocks the SDK `tool_call`, and claude-code loads a private PreToolUse
+  hook plus native `permissions.deny` rules. The refusal names the declared
+  scopes and the authenticated capture helper's `run`/`status` actions, so
+  the supported path and the timeout-reconcile step are always one message
+  away. The guard never rewrites the command string, never submits a run
+  itself and never infers coverage; ordinary reads, Git operations and the
+  capture helper run normally. It is a bounded refusal for the known
+  conventional producer forms, NOT a general-purpose shell sandbox — opaque
+  scripts, interpreters and adversarial evasion are out of scope.
+
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
 tenant's CI.

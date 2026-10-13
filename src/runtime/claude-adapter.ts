@@ -30,6 +30,7 @@ import {
   type ClaudeReviewSnapshot,
 } from './claude-review-settings.js';
 import { ReviewMcpBridge } from './review-mcp-bridge.js';
+import { privateClaudeVerificationSettings } from './claude-verification-settings.js';
 import {
   normalizeSessionPath,
   SessionAlreadyActiveError,
@@ -425,7 +426,15 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     let createdNewFile: string | null = null;
     let reviewBridge: ReviewMcpBridge | undefined;
     let reviewSettings: ReturnType<typeof privateClaudeReviewSettings> | undefined;
+    let verificationSettings: ReturnType<typeof privateClaudeVerificationSettings> | undefined;
     try {
+      // Issue #315: an ordinary worker session on a lane that declares
+      // verification scopes carries private deny/hook settings, so the
+      // known direct producer commands are refused before they start.
+      // Isolated review sessions keep their ambient-free settings.
+      if (reviewMode === undefined && options.workerVerification !== undefined && fileTools.includes('Bash')) {
+        verificationSettings = privateClaudeVerificationSettings(options.workerVerification);
+      }
       if (reviewConfiguration !== undefined) {
         reviewSettings = privateClaudeReviewSettings(reviewConfiguration.settings);
       }
@@ -520,6 +529,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           isolatedReview: reviewMode !== undefined,
           ...(managed !== undefined ? { managedPluginDir: managed.root } : {}),
           ...(reviewSettings?.file !== undefined ? { reviewSettingsFile: reviewSettings.file } : {}),
+          ...(verificationSettings !== undefined ? { verificationSettingsFile: verificationSettings.file } : {}),
           ...(reviewConfiguration !== undefined ? { reviewAuthEnv: claudeReviewProcessEnv(reviewConfiguration) } : {}),
           fileTools,
           nativeTools,
@@ -540,6 +550,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           this.handles.delete(handle);
           this.activeFiles.delete(sessionFile);
           reviewSettings?.dispose();
+          verificationSettings?.dispose();
         },
         (error) => this.onInfraError(error),
         this.heartbeatMs(),
@@ -554,6 +565,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
       }
       await reviewBridge?.close();
       reviewSettings?.dispose();
+      verificationSettings?.dispose();
       // Never leave an orphan empty transcript behind a failed fresh spawn
       // (it would pollute growth detection and hourly backups forever).
       if (createdNewFile !== null && !this.activeFiles.has(createdNewFile)) {
@@ -604,6 +616,8 @@ interface HandleParams {
   readonly systemPrompt: string;
   readonly isolatedReview?: boolean;
   readonly reviewSettingsFile?: string;
+  /** Private worker-verification settings file: native denies + hook (issue #315). */
+  readonly verificationSettingsFile?: string;
   readonly reviewAuthEnv?: NodeJS.ProcessEnv;
   readonly fileTools?: readonly string[];
   readonly nativeTools?: readonly string[];
@@ -660,6 +674,11 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
     ];
     if (allowed.length > 0) args.push('--allowedTools', allowed.join(','));
     if (params.mcpConfigFile !== undefined) args.push('--mcp-config', params.mcpConfigFile);
+  }
+  if (params.verificationSettingsFile !== undefined && !params.isolatedReview) {
+    // Native scoped denies plus the explanatory PreToolUse hook travel in
+    // one private settings file; a failed hook still hits the deny rules.
+    args.push('--settings', params.verificationSettingsFile);
   }
   if (params.managedPluginDir !== undefined && !params.isolatedReview) {
     args.push('--plugin-dir', params.managedPluginDir);
