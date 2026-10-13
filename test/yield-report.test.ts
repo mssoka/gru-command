@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1368,5 +1369,61 @@ describe('yield-report CLI autopilot ingestion (issue #243 F-M5)', () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe('yield-report COMPILED CLI autopilot ingestion (issue #243 F-M5)', () => {
+  it('the compiled production CLI reads persisted decision/observation/action and reports family measures', () => {
+    const dataDir = tmpDir('gru-yield-cli-compiled-');
+    const db = new LedgerDb(dataDir);
+    try {
+      const insert = db.handle.prepare(
+        'INSERT INTO events (ts, kind, agent_id, job_id, round_id, lens, payload) VALUES (?, ?, NULL, ?, NULL, NULL, ?)',
+      );
+      insert.run(
+        '2026-10-01T01:00:00.000Z',
+        'silas.autopilot-decision',
+        'job-cli2',
+        JSON.stringify({
+          rule_id: 'verdict-rung-directive',
+          job: 'job-cli2',
+          action: 'send-directive',
+          would_call: { blocker_fingerprint: 'verdict:round-1', source_round_id: 'round-1' },
+          mode: 'dry-run',
+        }),
+      );
+      insert.run('2026-10-01T01:10:00.000Z', 'silas.wake', null, JSON.stringify({ trigger: 'sweep', actionable: 1 }));
+      insert.run(
+        '2026-10-01T01:20:00.000Z',
+        'silas.directive-sent',
+        'job-cli2',
+        JSON.stringify({ rule_id: 'verdict-rung-directive', blocker_fingerprint: 'verdict:round-1', source_round_id: 'round-1' }),
+      );
+    } finally {
+      db.close();
+    }
+    mkdirSync(join(dataDir, 'sessions'), { recursive: true });
+    const cli = join(import.meta.dirname, '..', 'dist', 'cli', 'yield-report.js');
+    const result = spawnSync(
+      process.execPath,
+      [cli, '--since', SINCE, '--until', UNTIL, '--data-dir', dataDir, '--json'],
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 },
+    );
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      autopilot: { decisions: number; byFamily: readonly Record<string, unknown>[] };
+    };
+    expect(report.autopilot.decisions).toBe(1);
+    expect(report.autopilot.byFamily).toEqual([
+      {
+        ruleId: 'verdict-rung-directive',
+        mode: 'dry-run',
+        decisions: 1,
+        enforced: 0,
+        agreed: 1,
+        unobservable: 0,
+        agreementShare: 1,
+      },
+    ]);
   });
 });

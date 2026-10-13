@@ -2351,6 +2351,9 @@ describe('R2-M4 production ops drive a REAL WaveRunner admission/freeze', () => 
       reviewArtifactRoot: f.artifacts,
       reviewPreflight: async () => ({ ok: true as const, failures: [] }),
     });
+    // The production pr-review-trigger arm now carries the M2 final green
+    // guard: seed the usable green the planner would have seen.
+    f.ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: f.jobId, payload: { sha: f.deliveredSha } });
     await opsFor(f, wave).triggerReview({
       jobId: f.jobId,
       ruleId: 'pr-review-trigger',
@@ -2451,6 +2454,112 @@ describe('R2-M4 production ops drive a REAL WaveRunner admission/freeze', () => 
       reviewArtifactRoot: f.artifacts,
       reviewPreflight: async () => ({ ok: true as const, failures: [] }),
     });
+    f.ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: f.jobId, payload: { sha: f.deliveredSha } });
+    await opsFor(f, wave).triggerReview({
+      jobId: f.jobId,
+      ruleId: 'pr-review-trigger',
+      targetRef: f.deliveredSha,
+      boundDeliveredSha: f.deliveredSha,
+    });
+    const rounds = f.ledger.listRounds(f.jobId);
+    expect(rounds).toHaveLength(1);
+    expect(rounds[0]?.targetRef).toBe(f.deliveredSha);
+    await wave.shutdown();
+  }, 60_000);
+
+  it('refuses an OWNER HOLD that lands during the awaited review preflight (issue #243 F-H2)', async () => {
+    const f = await makeRealWaveFixture('fh2-late-hold');
+    const hold = { signal: 'pr-review-trigger', basis: 'pr-review:none' };
+    let releasePreflight!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releasePreflight = resolve;
+    });
+    let preflightCalls = 0;
+    const wave = new WaveRunner({
+      ledger: f.ledger,
+      worktrees: f.port,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: f.artifacts,
+      reviewPreflight: async () => {
+        preflightCalls += 1;
+        await gate;
+        return { ok: true as const, failures: [] };
+      },
+    });
+    const call = opsFor(f, wave).triggerReview({
+      jobId: f.jobId,
+      ruleId: 'pr-review-trigger',
+      targetRef: f.deliveredSha,
+      boundDeliveredSha: f.deliveredSha,
+      hold,
+    });
+    await vi.waitFor(() => expect(preflightCalls).toBe(1));
+    // An owner hold lands while the request sits in the awaited preflight.
+    f.ledger.recordDecision({
+      subject: `job:${f.jobId}`,
+      decision: 'hold',
+      covers: ['pr-review-trigger'],
+      basisFingerprint: 'pr-review:none',
+      by: 'owner',
+      reason: 'owner hold arrived during the review preflight',
+    });
+    releasePreflight();
+    await expect(call).rejects.toThrow(/covers pr-review-trigger/);
+    for (const round of f.ledger.listRounds(f.jobId)) expect(round.status).toBe('aborted');
+    expect(f.ledger.latestJobEvent(f.jobId, 'silas.review-triggered')).toBeNull();
+    await wave.shutdown();
+  }, 60_000);
+
+  it('refuses when the delivered-head CI goes PENDING during the awaited preflight (issue #243 F-M2)', async () => {
+    const f = await makeRealWaveFixture('fm2-late-pending');
+    let releasePreflight!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releasePreflight = resolve;
+    });
+    let preflightCalls = 0;
+    const wave = new WaveRunner({
+      ledger: f.ledger,
+      worktrees: f.port,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: f.artifacts,
+      reviewPreflight: async () => {
+        preflightCalls += 1;
+        await gate;
+        return { ok: true as const, failures: [] };
+      },
+    });
+    // A green first (the state the planner would have seen).
+    f.ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: f.jobId, payload: { sha: f.deliveredSha } });
+    const call = opsFor(f, wave).triggerReview({
+      jobId: f.jobId,
+      ruleId: 'pr-review-trigger',
+      targetRef: f.deliveredSha,
+      boundDeliveredSha: f.deliveredSha,
+    });
+    await vi.waitFor(() => expect(preflightCalls).toBe(1));
+    // The newest observation flips to pending at the same head mid-air.
+    f.ledger.appendCustomEvent({
+      kind: 'github.branch-state',
+      jobId: f.jobId,
+      payload: { sha: f.deliveredSha, ci: { sha: f.deliveredSha, status: 'pending' } },
+    });
+    releasePreflight();
+    await expect(call).rejects.toThrow(/no longer usable green/);
+    for (const round of f.ledger.listRounds(f.jobId)) expect(round.status).toBe('aborted');
+    expect(f.ledger.latestJobEvent(f.jobId, 'silas.review-triggered')).toBeNull();
+    await wave.shutdown();
+  }, 60_000);
+
+  it('arms when nothing changes during the awaited preflight (unchanged control)', async () => {
+    const f = await makeRealWaveFixture('fm2-unchanged');
+    const wave = new WaveRunner({
+      ledger: f.ledger,
+      worktrees: f.port,
+      spawner: vi.fn() as unknown as AgentSpawner,
+      reviewArtifactRoot: f.artifacts,
+      reviewPreflight: async () => ({ ok: true as const, failures: [] }),
+    });
+    f.ledger.appendCustomEvent({ kind: 'github.ci-green', jobId: f.jobId, payload: { sha: f.deliveredSha } });
     await opsFor(f, wave).triggerReview({
       jobId: f.jobId,
       ruleId: 'pr-review-trigger',
@@ -2508,6 +2617,31 @@ describe('F-M2 the newest CI observation governs green-only review eligibility',
     ledger.record('job-review', 'job.delivered', { sha: A });
     ledger.record('job-review', 'github.ci-green', { sha: A });
     ledger.record('job-review', 'github.branch-state', { sha: A, ci: { sha: A, status: 'pending' } });
+    const { result, calls } = await armReview(ledger);
+    expect(result.decisions).toBe(0);
+    expect(result.refusals).toBe(1);
+    expect(calls).toEqual([]);
+  });
+
+  it('does not fall back to an older green when the NEWEST observation is malformed', async () => {
+    const A = 'e'.repeat(40);
+    const ledger = new FakeLedger().job('job-review', 'delivered');
+    ledger.record('job-review', 'job.delivered', { sha: A });
+    ledger.record('job-review', 'github.ci-green', { sha: A });
+    // A newer malformed signal (no sha) must not fall back to the older green.
+    ledger.record('job-review', 'github.ci-failed', { note: 'malformed newest observation' });
+    const { result, calls } = await armReview(ledger);
+    expect(result.decisions).toBe(0);
+    expect(result.refusals).toBe(1);
+    expect(calls).toEqual([]);
+  });
+
+  it('refuses when the newest branch-state carries no usable ci state', async () => {
+    const A = 'e'.repeat(40);
+    const ledger = new FakeLedger().job('job-review', 'delivered');
+    ledger.record('job-review', 'job.delivered', { sha: A });
+    ledger.record('job-review', 'github.ci-green', { sha: A });
+    ledger.record('job-review', 'github.branch-state', { sha: A, ci: null });
     const { result, calls } = await armReview(ledger);
     expect(result.decisions).toBe(0);
     expect(result.refusals).toBe(1);
@@ -2664,44 +2798,70 @@ describe('F-H3 verification ownership is re-proved after the pacing wait', () =>
   });
 });
 
-describe('F-H4 the shutdown drain join is bounded', () => {
-  it('drain reports an unsettled producer instead of blocking on it', async () => {
+describe('F-H4 the shutdown producer join settles after disposal releases the handle', () => {
+  it('a RUNNING gated re-brief producer is released by disposal before the join settles', async () => {
+    const repo = makeFixtureRepo();
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'fh4-rebrief-lanes-'));
+    dirs.push(laneRoot);
+    const lanes = new InMemoryWorktreePort(laneRoot);
     const ledger = newRealLedger();
-    const job = ledger.addJob({ id: 'job-fh4', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    const job = ledger.addJob({ id: 'job-fh4r', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
     ledger.setJobStatus(job.id, 'working');
-    ledger.registerAgent({ id: 'min-fh4', role: 'minion', jobId: job.id });
+    await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    let entered = false;
+    let disposed = false;
     let openPrompt!: () => void;
     const promptGate = new Promise<void>((resolve) => {
       openPrompt = resolve;
     });
-    let entered = false;
+    // The running re-brief awaits its prompt directly; only DISPOSING the
+    // handle (production: registry.dispose()) rejects it — the stop signal
+    // does not reach this open await.
     const handle = {
-      ...idleHandle('min-fh4'),
+      ...idleHandle('min-fh4r'),
       async prompt() {
         entered = true;
         await promptGate;
+        if (disposed) throw new Error('handle disposed during shutdown');
+      },
+      async dispose() {
+        disposed = true;
+        openPrompt();
       },
     } satisfies AgentHandle;
     const ops = createSilasAutopilotOps({
       ledger,
       wave: waveStub(),
-      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
-      worktrees: { listWorktrees: () => [] } as never,
+      registry: {
+        getHandle: () => null,
+        spawn: async () => handle,
+        disposeHandle: async () => {
+          await handle.dispose();
+        },
+      },
+      worktrees: lanes,
       dispatch: { recordPr: () => ({ prUrl: null }) },
       gh: { listPullsForHead: async () => [] },
       resolveRemote: () => null,
     });
-    await ops.sendDirective({ jobId: job.id, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'round-fh4' });
+    await ops.sendRebrief({
+      jobId: job.id,
+      note: 'same blocker; try differently',
+      ruleId: 'verdict-rung-rebrief',
+      sourceRoundId: 'round-fh4',
+    });
     await vi.waitFor(() => expect(entered).toBe(true));
-    const started = Date.now();
-    const drained = await ops.drain({ graceMs: 50 });
-    const elapsed = Date.now() - started;
-    expect(elapsed).toBeLessThan(2_000);
-    expect(drained.settled).toBe(false);
-    expect(drained.pending).toBeGreaterThanOrEqual(1);
-    openPrompt();
-    await vi.waitFor(async () => expect((await ops.drain({ graceMs: 200 })).settled).toBe(true));
-  });
+    // Production shutdown order: the registry disposal releases the running
+    // producer's handle BEFORE the join. No invented grace/ceiling is used.
+    await handle.dispose();
+    const drained = await ops.drain();
+    expect(drained.settled).toBe(true);
+    expect(drained.pending).toBe(0);
+    // Honest accounting: the PRODUCER settled, but the unresolved request
+    // markers remain (ownership retained, never fabricated as ceased).
+    expect(ledger.listPendingRebriefs({ jobId: job.id }).length).toBeGreaterThan(0);
+  }, 30_000);
 });
 
 describe('F-M4 the production composition fails the pass on either half failure', () => {
@@ -2763,4 +2923,219 @@ describe('F-M4 the production composition fails the pass on either half failure'
     expect(outcome.failed).toBe(false);
     expect(outcome.completed).toBe(true);
   });
+});
+
+describe('F-M1 the real driver does not wake for verdict work an accepted producer owns', () => {
+  const driveWakes = async (ledger: LedgerApi, jobId: string): Promise<number> => {
+    const prompts: string[] = [];
+    const handle = {
+      ...idleHandle('silas-fm1'),
+      role: 'silas' as const,
+      async prompt(text: string) {
+        prompts.push(text);
+      },
+    } satisfies AgentHandle;
+    const driver = new SilasDriver({
+      slot: { ensure: async () => handle, viewFor: () => null } as never,
+      ledger: ledger as never,
+      worktrees: { listWorktrees: () => [] } as never,
+      ops: { baseUrl: 'http://127.0.0.1:0', configPath: 'unused' },
+      config: {
+        enabled: true,
+        sweepIntervalMs: 60_000,
+        pollIntervalMs: 0,
+        directiveAt: 2,
+        rebriefAt: 3,
+        escalateAt: 4,
+        stallThresholdMs: 1_800_000,
+        unchangedRewakeMs: 21_600_000,
+        autopilot: { enabled: false, rules: {} },
+      },
+      skills: [],
+      now: () => 0,
+      setInterval: (() => 1) as unknown as typeof setInterval,
+      clearInterval: (() => {}) as never,
+    });
+    await driver.trigger({ kind: 'job.delivered', jobId });
+    return prompts.length;
+  };
+
+  const seedVerdictJob = (ledger: LedgerApi, jobId: string): void => {
+    ledger.addJob({ id: jobId, repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'b' });
+    ledger.setJobStatus(jobId, 'working');
+    ledger.setJobStatus(jobId, 'in-review');
+    const round = ledger.addRound({ jobId, targetRef: 'a'.repeat(40) });
+    ledger.setRoundStatus(round.id, 'live');
+    ledger.setRoundVerdict(round.id, 'changes-requested');
+  };
+
+  it('a gated LIVE accepted directive suppresses the redundant model wake', async () => {
+    const ledger = newRealLedger();
+    const jobId = 'job-fm1w';
+    seedVerdictJob(ledger, jobId);
+    ledger.registerAgent({ id: 'min-fm1w', role: 'minion', jobId });
+    let entered = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const handle = {
+      ...idleHandle('min-fm1w'),
+      async prompt() {
+        entered = true;
+        await gate;
+      },
+    } satisfies AgentHandle;
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: waveStub(),
+      registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+      worktrees: { listWorktrees: () => [] } as never,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    await ops.sendDirective({ jobId, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'round-x' });
+    await vi.waitFor(() => expect(entered).toBe(true));
+    // The accepted producer owns the lane: the driver must not buy a turn.
+    expect(await driveWakes(ledger, jobId)).toBe(0);
+    release();
+    await vi.waitFor(() => expect((ledger.getDirective(ledger.listPendingDirectives({ jobId })[0]?.requestId ?? '')?.state ?? '') === 'settled'));
+  }, 30_000);
+
+  it('a terminally REFUSED directive still publishes the row (wake control)', async () => {
+    const ledger = newRealLedger();
+    const jobId = 'job-fm1refuse';
+    seedVerdictJob(ledger, jobId);
+    const begun = ledger.beginDirectiveIntent({ jobId, directive: 'x', holder: 'silas-ops' });
+    ledger.failDirective({ requestId: begun.record.requestId, reason: 'fixture no-effect refusal' });
+    expect(await driveWakes(ledger, jobId)).toBe(1);
+  }, 30_000);
+
+  it('a gated LIVE accepted re-brief suppresses the redundant model wake', async () => {
+    const repo = makeFixtureRepo();
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'fm1-rebrief-lanes-'));
+    dirs.push(laneRoot);
+    const lanes = new InMemoryWorktreePort(laneRoot);
+    const ledger = newRealLedger();
+    const jobId = 'job-fm1rebrief';
+    seedVerdictJob(ledger, jobId);
+    await lanes.createJobWorktree({ repoPath: repo.path, jobId });
+    let entered = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const handle = {
+      ...idleHandle('min-fm1rebrief'),
+      async prompt() {
+        entered = true;
+        await gate;
+      },
+    } satisfies AgentHandle;
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: waveStub(),
+      registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+      worktrees: lanes,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+    await ops.sendRebrief({ jobId, note: 'same blocker; try differently', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'round-x' });
+    await vi.waitFor(() => expect(entered).toBe(true));
+    expect(await driveWakes(ledger, jobId)).toBe(0);
+    release();
+    await vi.waitFor(() => expect(ledger.listPendingRebriefs({ jobId })).toHaveLength(0));
+  }, 30_000);
+});
+
+describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief boundaries', () => {
+  it('a FRESH-spawn directive never spawns after verification takes the lane during the pacing wait', async () => {
+    const repo = makeFixtureRepo();
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'fh3-fresh-lanes-'));
+    dirs.push(laneRoot);
+    const lanes = new InMemoryWorktreePort(laneRoot);
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-fh3-fresh', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    let spawns = 0;
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'hold the pool' });
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: waveStub(),
+      registry: {
+        getHandle: () => null,
+        spawn: async () => {
+          spawns += 1;
+          throw new Error('must not spawn after verification took the lane');
+        },
+        disposeHandle: async () => {},
+      },
+      worktrees: lanes,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+      workerGate: gate,
+    });
+    await ops.sendDirective({ jobId: job.id, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'r' });
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+    ledger.appendCustomEvent({
+      kind: 'verification.requested',
+      jobId: job.id,
+      payload: { scope: 'full', run_id: 'run-fh3-fresh', head: 'a'.repeat(40) },
+    });
+    holder.release();
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(0));
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(spawns).toBe(0);
+    expect(ledger.latestJobEvent(job.id, 'silas.directive-sent')).toBeNull();
+  }, 30_000);
+
+  it('a re-brief never spawns after verification takes the lane during the pacing wait', async () => {
+    const repo = makeFixtureRepo();
+    repos.push(repo);
+    const laneRoot = mkdtempSync(join(tmpdir(), 'fh3-rebrief-lanes-'));
+    dirs.push(laneRoot);
+    const lanes = new InMemoryWorktreePort(laneRoot);
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-fh3-rebrief', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    await lanes.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    let spawns = 0;
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'hold the pool' });
+    const ops = createSilasAutopilotOps({
+      ledger,
+      wave: waveStub(),
+      registry: {
+        getHandle: () => null,
+        spawn: async () => {
+          spawns += 1;
+          throw new Error('must not spawn after verification took the lane');
+        },
+        disposeHandle: async () => {},
+      },
+      worktrees: lanes,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+      workerGate: gate,
+    });
+    await ops.sendRebrief({ jobId: job.id, note: 'n', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'r' });
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1));
+    ledger.appendCustomEvent({
+      kind: 'verification.requested',
+      jobId: job.id,
+      payload: { scope: 'full', run_id: 'run-fh3-rebrief', head: 'a'.repeat(40) },
+    });
+    holder.release();
+    await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(0));
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(spawns).toBe(0);
+  }, 30_000);
 });
