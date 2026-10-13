@@ -1323,6 +1323,15 @@ export class Supervisor {
       } catch (error) {
         rejection = error;
       }
+      // Issue #339: this retry turn actually started. Observe its session at
+      // its PHYSICAL prompt-completion boundary, BEFORE any logical-disposition
+      // or supersession check can return. `clearRateLimitRetry` resolves the
+      // incident's logical disposition immediately on supersession/shutdown
+      // without awaiting this running prompt, so a logical settlement is never
+      // a physical transcript snapshot; a scan tied only to it (or to the
+      // recovered turn's bookkeeping authority) would miss a prohibited read
+      // appended by this retry.
+      this.observeBlindTurnAccess(agent.agentId, handle);
       if (agent.rateLimitRetry !== incident) return; // superseded mid-flight
       if (incident.activeDelivery !== deliveryToken) {
         // A newer rung owns the incident now; this stale settlement must
@@ -2167,18 +2176,20 @@ export class Supervisor {
       // observation: a turn that loses authority mid-flight still ran and may
       // have read prohibited material, and leaving it unscanned would keep
       // contaminated coverage qualifying (and steer the parent to reuse it).
-      if (turnStarted) this.observeRecoveredBlindAccess(laneAgentId, handle);
+      if (turnStarted) this.observeBlindTurnAccess(laneAgentId, handle);
       if (agent.recoveryAdmission === controller) agent.recoveryAdmission = null;
       lease?.release();
     }
   }
 
-  /** Issue #339: record the finished recovered turn's observed tool access
+  /** Issue #339: record a finished resume/retry turn's observed tool access
    * against the rule the job was admitted under (no-op for a non-blind job
-   * or an agent with no job). The production observer owns its own error
-   * boundary; this one keeps a raw port from failing an already-delivered
+   * or an agent with no job). This is the supervisor's one call-through to the
+   * shared blind-coverage observer for both the restart-recovered turn and the
+   * automatic rate-limit retry turn; the production observer owns its own error
+   * boundary, and this one keeps a raw port from failing an already-delivered
    * turn. */
-  private observeRecoveredBlindAccess(laneAgentId: string, handle: AgentHandle): void {
+  private observeBlindTurnAccess(laneAgentId: string, handle: AgentHandle): void {
     const observe = this.observeBlindTurn;
     if (observe === null) return;
     try {

@@ -3005,6 +3005,103 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
   });
 });
 
+describe('supervisor — retry-tail blind observation (issue #339 F1/F2)', () => {
+  it('F1: a logically superseded retry turn is observed at its physical completion', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    const jobId = 'job-blind-f1';
+    const agentId = 'minion-blind-f1';
+    admitBlindReviewJob(h, jobId, agentId, 'a'.repeat(40));
+    h.supervisor.setObserveBlindTurn((observedJobId, sessionFile) =>
+      observeBlindSessionAccess(h.api, observedJobId, sessionFile));
+    const sessionFile = blindReplaySession('blind-f1');
+    let retryEntered = false;
+    let releaseRetry: () => void = () => {};
+    const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    const handle = new FakeHandle('minion', agentId, sessionFile);
+    handle.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
+    handle.promptHook = async () => {
+      retryEntered = true;
+      await retryGate;
+      appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT);
+    };
+    h.registry.adopt(handle);
+    emitFailure(handle, '429 too many requests');
+    expect(sleeper.delays).toEqual([100]);
+    await sleeper.release();
+    await vi.waitFor(() => expect(retryEntered).toBe(true), { timeout: 5_000 });
+    // Logical supersession (the disposed envelope clears the incident) resolves
+    // the settlement NOW, while the retry prompt is still running: a scan tied
+    // to the logical disposition would precede this turn's prohibited read.
+    await handle.dispose();
+    releaseRetry();
+    await vi.waitFor(() => {
+      expect(blindCoverageOf(h.api, jobId).state).toBe('invalidated');
+    }, { timeout: 5_000 });
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true,
+    });
+    h.dispose();
+  });
+
+  it('F2: authority loss does not strand a later automatic-retry read', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    const jobId = 'job-blind-f2';
+    const agentId = 'minion-blind-f2';
+    admitBlindReviewJob(h, jobId, agentId, 'b'.repeat(40));
+    h.supervisor.setObserveBlindTurn((observedJobId, sessionFile) =>
+      observeBlindSessionAccess(h.api, observedJobId, sessionFile));
+    const sessionFile = blindReplaySession('blind-f2');
+    let recoveredEntered = false;
+    let retryEntered = false;
+    let releaseRecovered: () => void = () => {};
+    const recoveredGate = new Promise<void>((resolve) => { releaseRecovered = resolve; });
+    let releaseRetry: () => void = () => {};
+    const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    h.registry.spawnImpl = async (role, options) => {
+      const resumed = new FakeHandle(role, `${role}-resumed-f2`, options?.resumeFile ?? null);
+      resumed.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
+      resumed.promptHook = async () => {
+        if (!recoveredEntered) {
+          recoveredEntered = true;
+          // The resumed turn fails in-band with a 429: an automatic retry is
+          // scheduled and will still be running when this method exits.
+          emitFailure(resumed, '429 too many requests');
+          await recoveredGate;
+        } else {
+          retryEntered = true;
+          await retryGate;
+          appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT);
+        }
+      };
+      return resumed;
+    };
+    const handle = new FakeHandle('minion', agentId, sessionFile);
+    handle.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
+    h.registry.adopt(handle);
+    hang(handle);
+    h.advance(60);
+    await vi.waitFor(() => expect(recoveredEntered).toBe(true), { timeout: 5_000 });
+    // Authority loss: the blind job goes terminal mid-flight, so the recovered
+    // method returns at its stillCurrent() guard — before it ever awaits the
+    // retry settlement.
+    h.api.setJobStatus(jobId, 'done');
+    releaseRecovered();
+    await vi.waitFor(() => expect(sleeper.delays).toEqual([100]));
+    await sleeper.release();
+    await vi.waitFor(() => expect(retryEntered).toBe(true), { timeout: 5_000 });
+    releaseRetry();
+    await vi.waitFor(() => {
+      expect(blindCoverageOf(h.api, jobId).state).toBe('invalidated');
+    }, { timeout: 5_000 });
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true,
+    });
+    h.dispose();
+  });
+});
+
 
 describe('supervisor pacing admission and workflow boundary', () => {
   it('a worker automatic retry queues behind running work and releases its lease', async () => {
