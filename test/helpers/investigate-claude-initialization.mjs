@@ -10,6 +10,8 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { PassThrough } from 'node:stream';
+import process from 'node:process';
+import { setImmediate } from 'node:timers';
 import { ClaudeCodeRuntime, claudePromptFrame } from '../../dist/runtime/claude-adapter.js';
 import { workerVerificationPolicy } from '../../dist/runtime/worker-verification-policy.js';
 import { SessionStore } from '../../dist/sessions/store.js';
@@ -89,7 +91,7 @@ try {
     active = { ...row, upstream: [], wire: [], native: [], forwarded: [], signals: [], closed: null }; sent = false;
     const record = active; const before = existsSync(starts) ? readFileSync(starts, 'utf8') : '';
     let ack = Promise.withResolvers(); let close = Promise.withResolvers();
-    let heldAck; let pipelineSent = false; let original;
+    let heldAck; let pipelineSent = false;
     const runtime = new ClaudeCodeRuntime({ config, store: new SessionStore(config.dataDir), binary: executable,
       modelRuntime: { getModel: () => ({ input: ['text'] }) },
       spawnProcess: (binary, args, options) => {
@@ -100,7 +102,7 @@ try {
         writeFileSync(file, JSON.stringify(settings));
         record.policyBoundBeforeSpawn = { file, permissions: settings.permissions, jobId: policy.jobId, cwd: lane };
         const child = spawn(binary, [...args, '--setting-sources', '', '--strict-mcp-config', '--no-chrome', '--disable-slash-commands'], { ...options, env });
-        original = child; record.pid = child.pid;
+        record.pid = child.pid;
         const faults = row.compact && !record.compactPhase ? {} : row;
         const stdin = child.stdin; const stdout = child.stdout; const port = new PassThrough(); child.stdout = port;
         const write = stdin.write.bind(stdin); const kill = child.kill.bind(child);
