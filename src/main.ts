@@ -360,11 +360,15 @@ async function main(): Promise<number> {
     shuttingDown = true;
     serviceStop.abort();
     logger.info('shutdown begin', { signal, exit_code: exitCode });
-    const forceExit = setTimeout(() => {
-      logger.error('shutdown timeout — forcing exit', { signal });
-      process.exit(1);
-    }, SHUTDOWN_FORCE_EXIT_MS);
-    forceExit.unref();
+    const armForceExit = (): ReturnType<typeof setTimeout> => {
+      const timer = setTimeout(() => {
+        logger.error('shutdown timeout — forcing exit', { signal });
+        process.exit(1);
+      }, SHUTDOWN_FORCE_EXIT_MS);
+      timer.unref();
+      return timer;
+    };
+    let forceExit = armForceExit();
     if (state.handle === undefined) {
       clearTimeout(forceExit);
       logger.info('shutdown complete', { signal, note: 'signal arrived during boot' });
@@ -474,6 +478,13 @@ async function main(): Promise<number> {
         }
         state.deployDrift?.stop();
         state.repoOverview?.stop();
+        // The runtime teardown is the one bounded stage this guard supervises
+        // directly (concurrent post-dispose idle proofs + adapter bridge
+        // closes). Re-arm it here so elapsed time in the earlier stages cannot
+        // eat into that budget and preempt a healthy bounded teardown — the
+        // loss #341 exists to contain (issue #341).
+        clearTimeout(forceExit);
+        forceExit = armForceExit();
         if (state.registry !== undefined) {
           try {
             await state.registry.dispose();

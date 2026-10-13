@@ -270,5 +270,8 @@ describe('service shutdown force-exit budget (issue #341)', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toContain("from './shutdown-budget.js'");
     expect(mainSource).toMatch(/},\s*SHUTDOWN_FORCE_EXIT_MS\);/);
+    // Re-armed at the runtime teardown (issue #341): the initial guard plus at
+    // least one re-arm, so earlier stages cannot eat the disposal budget.
+    expect((mainSource.match(/armForceExit\(\)/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 });
