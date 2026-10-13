@@ -2828,11 +2828,12 @@ describe('GH-104 (g7): Gru actions are labeled apart from passive board activity
       expect(text).toContain('- activity: 3 board events');
       expect(text).not.toContain('actions');
       expect(text).not.toContain('Gru disposition');
+      expect(text).not.toContain('Machine disposition');
       rig.awareness.dispose();
     } finally { vi.useRealTimers(); }
   });
 
-  it('a Gru disposition is an action; traffic plus disposition shows both lines', () => {
+  it('a machine disposition in the Gru role is an action; traffic plus disposition shows both lines', () => {
     vi.useFakeTimers();
     try {
       const rig = away();
@@ -2842,8 +2843,8 @@ describe('GH-104 (g7): Gru actions are labeled apart from passive board activity
       const text = rig.awareness.prepare()!.text;
       expect(text).toContain('- activity: 1 board event');
       expect(text).toContain('- Gru actions: 1 disposition');
-      expect(text).toContain('Gru disposition');
-      expect(text).toContain('Repaired the lane');
+      expect(text.split('\n')).toContain(`- Machine disposition [${alert.id}]: Repaired the lane`);
+      expect(text).not.toContain('Gru disposition');
       rig.awareness.dispose();
     } finally { vi.useRealTimers(); }
   });

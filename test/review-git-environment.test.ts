@@ -1002,8 +1002,8 @@ if (argv.includes('POST')) {
   });
 
   it('rejects new verification while an audited run stays unsettled and accepts its unchanged-run control', async () => {
-    for (const replacement of [false, true]) {
-      const repo = fixture(`assigned-verification-generation-${replacement}`);
+    for (const replacement of [null, 'verification.requested', 'verification.started'] as const) {
+      const repo = fixture(`assigned-verification-generation-${replacement ?? 'unchanged'}`);
       origin(repo);
       const h = await waveFixture(repo, async () => { throw new Error('local target must not probe PR'); }, false);
       const lane = h.worktrees.listWorktrees({ jobId: h.job.id }).find((entry) => entry.kind === 'job')!;
@@ -1014,11 +1014,12 @@ if (argv.includes('POST')) {
       h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: h.job.id, payload: { run_id: 'old-run' } });
       const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, spawner: h.runtime.spawner,
         reviewArtifactRoot: h.artifactRoot, reviewFreezeObserver: () => {
-          if (replacement) h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: h.job.id, payload: { run_id: 'new-run' } });
+          expect(h.ledger.hasUnsettledVerificationRun(h.job.id)).toBe(true);
+          if (replacement !== null) h.ledger.appendCustomEvent({ kind: replacement, jobId: h.job.id, payload: { run_id: 'new-run' } });
         },
       });
       const request = wave.requestReview({ jobId: h.job.id, force: true });
-      if (replacement) {
+      if (replacement !== null) {
         await expect(request).rejects.toMatchObject({ name: 'BranchBusyError' });
         expect(h.runtime.leadCalls).toHaveLength(0);
         expect(h.ledger.listJobEvents(h.job.id).some((event) => event.kind === 'round.admission-preflight')).toBe(false);
