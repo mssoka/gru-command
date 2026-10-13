@@ -113,6 +113,36 @@ function nativeReviewTools(definitions: readonly NativeAgentTool[]): ToolDefinit
 
 const COMPACTION_END_RECONCILE_MS = 5_000;
 
+/**
+ * Bound on the post-dispose wait for the SDK session to actually reach idle
+ * (issue #341, Option A). SDK 0.85.1 `AgentSession.dispose()` is synchronous
+ * and never awaits `waitForIdle`, so the adapter follows disposal with a
+ * bounded session `waitForIdle` before it may report 'ceased'. Mirrors the 5s
+ * bridge-teardown cap in `review-mcp-bridge.ts` (`BRIDGE_CLOSE_TIMEOUT_MS`):
+ * the same Promise.race + unref'd timer idiom, so a stuck session can never
+ * hang disposal past this window. Exported for the deterministic bound test.
+ */
+export const CESSATION_IDLE_TIMEOUT_MS = 5_000;
+
+/** Named failure for a session that was disposed but did not confirm idle
+ * inside {@link CESSATION_IDLE_TIMEOUT_MS}. Disposal tore the session down,
+ * but 'ceased' asserts that ALL work stopped; a still-running turn must never
+ * be reported as ceased, and dispose-only semantics must never be a silent
+ * fallback (issue #341, Option A). */
+export class CessationIdleTimeoutError extends Error {
+  constructor(
+    readonly sessionId: string,
+    readonly timeoutMs: number,
+  ) {
+    super(
+      `session ${sessionId} was disposed but did not reach idle within ${timeoutMs}ms; ` +
+        "refusing to report 'ceased' — the turn may still be running, investigate " +
+        'the hung session before treating this worker as stopped',
+    );
+    this.name = 'CessationIdleTimeoutError';
+  }
+}
+
 /** Typed provenance from an SDK provider error object ONLY (numeric status
  * on the error, retry-after from its Headers). Anything else → null.
  * Exported for the deterministic adapter-provenance tests. */
@@ -1023,6 +1053,10 @@ export class PiAgentHandle implements AgentHandle {
   private compacting = false;
   /** Adapter-owned cessation evidence state (once-only transition). */
   private cessationState: 'live' | 'ceased' | 'unknown' = 'live';
+  /** True only once the bounded post-dispose `waitForIdle` actually
+   * resolved (issue #341). 'ceased' requires this proof: dispose() alone
+   * proves the abort hooks ran, never that the session went idle. */
+  private idleProvenAfterDispose = false;
   private pendingCompactionEnd: RuntimeEvent | null = null;
   private nativeCompactionOpen = false;
   private compactionEndDeadline = 0;
@@ -1041,10 +1075,10 @@ export class PiAgentHandle implements AgentHandle {
       followUp(text: string, images?: unknown): Promise<void>;
       subscribe(listener: (event: unknown) => void): () => void;
       /** SDK 0.85.1 AgentSession.dispose() is synchronous (returns void) and
-       * does NOT await session-level waitForIdle. Awaiting it here proves only
-       * that the abort hooks ran, not that the session is idle. (Whether
-       * dispose() should additionally await a bounded waitForIdle is an open
-       * owner decision; see PR #332 review.) */
+       * does NOT await session-level waitForIdle (only abort() does);
+       * awaiting it proves only that the abort hooks ran. The adapter
+       * therefore follows dispose() with a bounded session waitForIdle
+       * before it may report 'ceased' (see settleCessationEvidence). */
       dispose(): Promise<void> | void;
       waitForIdle?(): Promise<void>;
       /** Real controller-set queries (executeBash controllers, removed in
@@ -1328,40 +1362,70 @@ export class PiAgentHandle implements AgentHandle {
       if (item.timer !== null) clearTimeout(item.timer);
       item.reject(new Error('agent session disposed before queued message was delivered'));
     }
+    let idleProven = false;
     try {
       // SDK 0.85.1 AgentSession.dispose() is synchronous: it runs the abort
       // hooks (retry, compaction, branch summary, bash, agent) and returns
-      // void. It does NOT await session-level waitForIdle, so awaiting it here
-      // proves only that the abort hooks ran, not that the session is idle.
-      // (Whether disposal should additionally await a bounded waitForIdle is
-      // an open owner decision; see PR #332 review.)
+      // void. It does NOT await session-level waitForIdle (only abort() does),
+      // so awaiting it proves only that the abort hooks ran. The bounded
+      // waitForIdle below is the ONLY positive idle proof (issue #341).
       await this.session.dispose();
+      idleProven = await this.awaitIdleWithinBound();
     } finally {
       this.store.releaseLock(this.sessionFile);
       this.setState('disposed');
       this.onDispose();
-      this.settleCessationEvidence();
+      this.settleCessationEvidence(idleProven);
+    }
+    if (!idleProven) {
+      // Fail loud (issue #341, Option A): dispose() alone never proves idle.
+      // A session that did not confirm idle inside the bound must not be
+      // reported 'ceased' and must not silently degrade to dispose-only
+      // semantics — the turn may still be running.
+      throw new CessationIdleTimeoutError(this.id, CESSATION_IDLE_TIMEOUT_MS);
+    }
+  }
+
+  /** Await the session's own idle transition, bounded by
+   * {@link CESSATION_IDLE_TIMEOUT_MS}. Mirrors the bridge-teardown race in
+   * review-mcp-bridge.ts (Promise.race against an unref'd timer, cleared in
+   * finally). Returns true ONLY when idle was actually reached inside the
+   * bound: a missing waitForIdle, a rejection, or the timeout all mean "no
+   * positive idle proof" — never a silent pass. */
+  private async awaitIdleWithinBound(): Promise<boolean> {
+    const idle = this.session.waitForIdle?.();
+    if (idle === undefined) return false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const bound = new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), CESSATION_IDLE_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      // The rejection handler also prevents an unhandled rejection if the
+      // session rejects after the bound has already won the race.
+      return await Promise.race([idle.then(() => true, () => false), bound]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
     }
   }
 
   /** Compute + emit the once-only cessation evidence transition. Called
-   * after disposal settles; re-queryable (UNKNOWN can later flip to
-   * 'ceased' when an independently owned bash controller finishes — the
-   * evidence event fires on that late transition too). */
-  private settleCessationEvidence(): void {
+   * after disposal settles with the bounded idle result; re-queryable
+   * (UNKNOWN can later flip to 'ceased' when an independently owned bash
+   * controller finishes — the evidence event fires on that late transition
+   * too). 'ceased' requires BOTH the post-dispose idle proof and an
+   * idle-free controller set. */
+  private settleCessationEvidence(idleProven: boolean): void {
+    this.idleProvenAfterDispose = idleProven;
     if (this.cessationState === 'ceased') return; // once-only positive
     let evidence: 'ceased' | 'unknown';
     try {
       const bashActive = this.session.isBashRunning === true || this.session.hasPendingBashMessages === true;
-      // dispose() (SDK 0.85.1) is synchronous and does NOT await session-level
-      // waitForIdle, so it does not prove the session is idle: 'ceased' is
-      // asserted here on the absence of an active bash controller alone.
-      // Independent executeBash controllers are NOT part of isIdle: if still
-      // active, evidence is UNKNOWN (observable later by re-query; no
-      // timer/watcher added). Whether disposal should await a bounded
-      // waitForIdle before reporting 'ceased' is an open owner decision (see
-      // PR #332 review).
-      evidence = bashActive ? 'unknown' : 'ceased';
+      // 'ceased' is asserted only on positive idle proof (the bounded
+      // waitForIdle that followed dispose()). Independent executeBash
+      // controllers are NOT part of isIdle: if still active, evidence is
+      // UNKNOWN (observable later by re-query; no timer/watcher added).
+      evidence = idleProven && !bashActive ? 'ceased' : 'unknown';
     } catch {
       evidence = 'unknown'; // throwing probes are unknown, never false
     }
@@ -1373,9 +1437,16 @@ export class PiAgentHandle implements AgentHandle {
     if (this.cessationState === 'live') return 'unknown';
     if (this.cessationState === 'ceased') return 'ceased';
     // UNKNOWN may have settled since: re-query the truthful controller
-    // sets (bounded, read-only; a throw stays unknown).
+    // sets (bounded, read-only; a throw stays unknown). The positive still
+    // requires the post-dispose idle proof — a late-finishing bash
+    // controller releases the UNKNOWN only when idle was already proven
+    // (issue #341).
     try {
-      if (this.session.isBashRunning !== true && this.session.hasPendingBashMessages !== true) {
+      if (
+        this.idleProvenAfterDispose &&
+        this.session.isBashRunning !== true &&
+        this.session.hasPendingBashMessages !== true
+      ) {
         this.cessationState = 'ceased';
         this.emit({ type: 'cessation_evidence', evidence: 'ceased' });
       }
