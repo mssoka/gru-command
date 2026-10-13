@@ -37,7 +37,7 @@ const PINS: Record<string, number> = {
   'workflow-runtime.test.ts': 17,
   'workflow-runtime-packaged.test.ts': 2,
   'workflow-session.test.ts': 21,
-  'worker-verification-policy.test.ts': 51,
+  'worker-verification-policy.test.ts': 53,
   'board-engine-v4.test.ts': 9,
   'board-engine.test.ts': 44,
   'board-frames.test.ts': 4,

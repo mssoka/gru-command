@@ -590,6 +590,27 @@ describe('worker verification policy', () => {
 
 });
 
+describe('review-4 conventional settings preserve producer and read boundaries', () => {
+  it('review-4 npm boolean configuration flags do not bypass producer refusal or turn metadata into a producer', () => {
+    const { policy } = retainedFixture();
+    for (const command of ['npm --no-audit test', 'npm --no-fund run build', 'npm --audit=false test', 'npm --audit false test', 'npm --no-progress test', 'npm --no-color test', 'npm --foreground-scripts test']) {
+      expect(isVerificationProducer(command, policy), command).toBe(true);
+    }
+    for (const command of ['npm --no-audit view test', 'npm --audit=false view test']) {
+      expect(isVerificationProducer(command, policy), command).toBe(false);
+    }
+  });
+  it('review-4 Vite clearScreen boolean options preserve build refusal and genuine help reads', () => {
+    const { policy } = retainedFixture();
+    for (const command of ['vite --clearScreen=false build', 'vite --clearScreen false build', 'npx vite --clearScreen=false build', './node_modules/.bin/vite --clearScreen=false build']) {
+      expect(isVerificationProducer(command, policy), command).toBe(true);
+    }
+    for (const command of ['vite --clearScreen=false build --help', 'vite --clearScreen false build --help', 'npx vite --clearScreen=false build --help']) {
+      expect(isVerificationProducer(command, policy), command).toBe(false);
+    }
+  });
+});
+
 describe('strict repair native host identity and failure fences', () => {
   function channelFixture() {
     const child = Object.assign(new EventEmitter(), { stdin: new PassThrough() }) as unknown as ChildProcess;

@@ -26,11 +26,12 @@ nativeCorpus.push(
     '>| /dev/null npm test', 'npm >| /dev/null test', 'env CI=1 time -p npm test', 'nice -- npm test',
     'vite --config vite.config.ts build', 'npx vite --config vite.config.ts build',
     './node_modules/.bin/vite --config vite.config.ts build', 'printf \'%s\' "$(npm test)"',
-    'eslint . -- --help'].map((raw) => ({ raw, refused: true, subjects: [raw] })),
+    'eslint . -- --help', 'npm --no-audit test', 'npm --audit=false test',
+    'vite --clearScreen=false build', 'vite --clearScreen false build'].map((raw) => ({ raw, refused: true, subjects: [raw] })),
   ...['tsc --pretty false --showConfig', 'tsc --noEmit --showConfig', 'tsc --project tsconfig.json --showConfig',
     'tsc -p tsconfig.json --showConfig', 'vite build --help', 'vitest run --help', 'npx vitest run --help',
     "cat <<''\nnpm test\n\n", 'cat <<EOF\n\\$(npm test)\nEOF',
-    'cat <<EOF\n\\`npm test\\`\nEOF'].map((raw) => ({ raw, refused: false, subjects: [raw] })),
+    'cat <<EOF\n\\`npm test\\`\nEOF', 'vite --clearScreen=false build --help'].map((raw) => ({ raw, refused: false, subjects: [raw] })),
 );
 for (const row of nativeCorpus) {
   if (row.refused) continue;

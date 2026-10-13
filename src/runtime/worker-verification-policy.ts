@@ -236,7 +236,11 @@ export function verificationCommandGroups(command: string): readonly (readonly s
 }
 
 const NPM_VALUE_OPTIONS = new Set(['--prefix', '--workspace', '-w', '--cache', '--userconfig', '--registry', '--loglevel']);
-const NPM_FLAG_OPTIONS = new Set(['--silent', '-s', '--quiet', '-q', '--offline', '--ignore-scripts', '--workspaces', '--if-present']);
+const NPM_FLAG_OPTIONS = new Set([
+  '--silent', '-s', '--quiet', '-q', '--offline', '--ignore-scripts', '--workspaces', '--if-present',
+  '--audit', '--no-audit', '--fund', '--no-fund', '--progress', '--no-progress', '--color', '--no-color',
+  '--foreground-scripts', '--no-foreground-scripts', '--no-ignore-scripts',
+]);
 const NPX_VALUE_OPTIONS = new Set(['--package', '-p', '--cache', '--userconfig', '--registry']);
 const NPX_FLAG_OPTIONS = new Set(['--no-install', '--yes', '-y', '--offline', '--quiet', '-q']);
 const LEADING_KEYWORDS = new Set(['!', 'if', 'then', 'elif', 'else', 'while', 'until', 'do', '{', '}']);
@@ -314,7 +318,11 @@ export function normalizedVerificationWords(raw: readonly string[]): readonly st
     const arg = args[i] as string;
     if (arg === '--') { kept.push(...args.slice(i + 1)); break; }
     if (values.has(arg)) { i += 1; continue; }
-    if (flags.has(arg) || (arg.includes('=') && values.has(arg.split('=')[0] as string))) continue;
+    if (flags.has(arg)) {
+      if (args[i + 1] === 'true' || args[i + 1] === 'false') i += 1;
+      continue;
+    }
+    if (arg.includes('=') && (values.has(arg.split('=')[0] as string) || flags.has(arg.split('=')[0] as string))) continue;
     kept.push(arg);
   }
   if (tool === 'npm') {
@@ -336,7 +344,7 @@ const DIAGNOSTIC_VALUE_FLAGS = new Set(['--print-config']);
 /** Option positions whose value is configuration, not a literal operand. */
 const CONFIG_VALUE_FLAGS = new Set(['-p', '--project', '--config', '-c']);
 /** Flags that leave a combined invocation a read (`tsc --noEmit --showConfig`). */
-const DIAGNOSTIC_COMPANION_FLAGS = new Set(['--noEmit', '--pretty', '--diagnostics', '--extendedDiagnostics']);
+const DIAGNOSTIC_COMPANION_FLAGS = new Set(['--noEmit', '--pretty', '--diagnostics', '--extendedDiagnostics', '--clearScreen']);
 
 /**
  * True when every argument is a non-producing inspection position. A prefix
@@ -369,6 +377,10 @@ function isDiagnosticInvocation(args: readonly string[], selectsVerb: boolean): 
     }
     if (INSPECT_FLAGS.has(arg)) { sawDiagnostic = true; i += 1; continue; }
     if (CONFIG_VALUE_FLAGS.has(arg)) { i += 2; continue; }
+    if (arg.includes('=') && DIAGNOSTIC_COMPANION_FLAGS.has(arg.split('=')[0] as string) && /=(?:true|false)$/u.test(arg)) {
+      i += 1;
+      continue;
+    }
     if (DIAGNOSTIC_COMPANION_FLAGS.has(arg)) {
       i += 1;
       if (args[i] === 'true' || args[i] === 'false') i += 1;
@@ -494,7 +506,12 @@ function normalizeViteOptions(words: readonly string[], policy: WorkerVerificati
     if (['--config', '-c', '--mode', '-m', '--logLevel', '-l', '--base'].includes(option)) {
       options.push(...words.slice(i, i + 2)); i += 2; continue;
     }
-    if (/^--(?:config|mode|logLevel|base)=/u.test(option) || ['--clearScreen', '--debug', '-d', '--force'].includes(option)) {
+    if (option === '--clearScreen') {
+      options.push(option); i += 1;
+      if (words[i] === 'true' || words[i] === 'false') { options.push(words[i] as string); i += 1; }
+      continue;
+    }
+    if (/^--(?:config|mode|logLevel|base|clearScreen)=/u.test(option) || ['--debug', '-d', '--force'].includes(option)) {
       options.push(option); i += 1; continue;
     }
     break;
