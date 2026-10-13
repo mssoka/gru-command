@@ -411,7 +411,7 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
   'job.delivered': (event) => `job ${event.jobId ?? '?'}: briefing delivered to minion ${textOf(payloadOf(event).agentId) ?? '?'}`,
   'job.minion-error': (event) => {
     const error = textOf(payloadOf(event).error);
-    return `job ${event.jobId ?? '?'}: minion error${error !== null ? ` — ${error}` : ''}`;
+    return `job ${event.jobId ?? '?'}: minion error${error !== null ? ` — ${promptSafe(error)}` : ''}`;
   },
   'job.pr-linked': (event) => `job ${event.jobId ?? '?'}: pull request linked`,
   'job.status': (event) => {
@@ -495,7 +495,7 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
     const payload = payloadOf(event);
     if (payload.to !== 'error') return null;
     const error = textOf(payload.error);
-    return `agent ${event.agentId ?? '?'}: errored${error !== null ? ` — ${error}` : ''}`;
+    return `agent ${event.agentId ?? '?'}: errored${error !== null ? ` — ${promptSafe(error)}` : ''}`;
   },
   'supervision.escalated': (event) => {
     const failureClass = textOf(payloadOf(event).class);
