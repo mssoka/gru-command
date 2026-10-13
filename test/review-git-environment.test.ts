@@ -281,9 +281,9 @@ describe('review Git repository environment isolation (GH-270)', () => {
       const admitted = await wave.requestReview({ jobId: h.job.id, targetRef: 'refs/heads/topic' });
       const outcome = await admitted.run;
       expect(runtime.leadCalls).toHaveLength(1);
-      if (seam === 'unchanged') { expect(outcome.verdict).toBe('approved'); expect(post).toHaveBeenCalledTimes(1); }
+      if (seam === 'unchanged') { expect(outcome).toMatchObject({ verdict: 'approved' }); expect(post).toHaveBeenCalledTimes(1); }
       else {
-        expect(outcome.verdict).toBeNull(); expect(outcome.posted).toBe(false); expect(post).not.toHaveBeenCalled();
+        expect(outcome).toMatchObject({ verdict: null, posted: false }); expect(post).not.toHaveBeenCalled();
         if (seam === 'submission') expect(runtime.toolErrors.some((error) => /source changed.*named identity/u.test(error.error))).toBe(true);
         else expect(h.ledger.latestJobEvent(h.job.id, 'round.head-moved')?.payload).toMatchObject({ cause: 'target-moved' });
         expect(git(repo.path, ['rev-parse', 'refs/remotes/origin/topic'])).toBe(target);
