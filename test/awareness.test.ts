@@ -2838,12 +2838,17 @@ describe('GH-104 (g7): Gru actions are labeled apart from passive board activity
       const rig = away();
       rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
       const alert = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Fix' });
-      rig.api.disposeMachineNotification(alert.id, 'Repaired the lane');
+      rig.api.disposeMachineNotification(alert.id, 'Repaired the lane', { credential: 'shared-bearer', declaredActor: 'gru' });
       const text = rig.awareness.prepare()!.text;
       expect(text).toContain('- activity: 1 board event');
       expect(text).toContain('- Gru actions: 1 disposition');
-      expect(text).toContain('Gru disposition');
-      expect(text).toContain('Repaired the lane');
+      // #322 relabel: the disposition row names the machine role with its id and
+      // the caller-declared actor instead of over-claiming "Gru" (#99), but it
+      // must still render as its own labeled line, never folded into activity.
+      const disposition = text.split('\n').find((line) => line.startsWith('- Machine disposition [')) ?? '';
+      expect(disposition).toContain('Repaired the lane');
+      expect(disposition).toContain('(declared actor: gru)');
+      expect(text).not.toContain('Gru disposition');
       rig.awareness.dispose();
     } finally { vi.useRealTimers(); }
   });
