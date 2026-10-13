@@ -209,6 +209,9 @@ interface RateLimitRetryIncident {
   readonly pending: PendingTurn;
   /** Exact interrupted-turn ownership transferred into this retry. */
   readonly recovery: InterruptedTurn;
+  /** Startup replay has no recovered-delivery coroutine to settle its failure. */
+  readonly startupHandle: AgentHandle | null;
+  readonly classifications: Promise<void>[];
   /** A delivery attempt is in flight right now. */
   awaitingDelivery: boolean;
   /** Monotonic per-delivery token; only the owning delivery may clear
@@ -880,17 +883,20 @@ export class Supervisor {
             flight.pendingError = deferred;
             break;
           }
+          const retry = agent.rateLimitRetry;
           if (event.fatal) {
             this.log('warn', 'fatal runtime error — climbing restart ladder', {
               agent_id: agent.agentId,
               error: event.error,
             });
-            return this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true, {
+            const classification = this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true, {
               provider: event.provider ?? null,
               model: event.model ?? null,
               error: event.error,
               typed: event.typed ?? null,
             });
+            retry?.classifications.push(classification);
+            return classification;
           } else {
             // Preserve the adapter contract: in-band failures never restart.
             // Rate-limit-class failures first spend the bounded automatic
@@ -904,6 +910,7 @@ export class Supervisor {
                 error: event.error,
                 typed: event.typed ?? null,
               });
+              retry?.classifications.push(classification);
               if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(classification);
               return classification;
             }
@@ -1316,6 +1323,9 @@ export class Supervisor {
       maxRetries: policy.maxRetries,
       pending: captured.pending,
       recovery: captured,
+      startupHandle: snapshot !== undefined && agent.pendingRecovery === captured && agent.handle !== null &&
+        !this.recoveryDeliveries.has(agent.handle) ? agent.handle : null,
+      classifications: [],
       awaitingDelivery: false,
       deliveryToken: 0,
       activeDelivery: null,
@@ -1373,6 +1383,7 @@ export class Supervisor {
     delayMs: number,
   ): Promise<void> {
     let retryLease: PacingLease | null = null;
+    let failure: string | null = null;
     try {
       await this.sleep(delayMs);
       // The incident may have been superseded (recovery, replacement,
@@ -1448,6 +1459,7 @@ export class Supervisor {
       } catch (error) {
         rejection = error;
       }
+      if (rejection !== null) failure = String(rejection);
       if (agent.rateLimitRetry !== incident) return; // superseded mid-flight
       if (incident.activeDelivery !== deliveryToken) {
         // A newer rung owns the incident now; this stale settlement must
@@ -1490,6 +1502,7 @@ export class Supervisor {
         // a persisted disposed state): no failure to ladder, no retry to
         // continue. Arbitrary text containing 'disposed' must NOT land here —
         // a genuine non-rate-limit failure keeps its stop/escalation path.
+        failure = null; // Disposal cancellation is not a failed startup turn.
         this.clearRateLimitRetry(agent, 'superseded');
         this.log('warn', 'rate-limit retry delivery ended on a disposed session', {
           agent_id: agent.agentId,
@@ -1501,15 +1514,29 @@ export class Supervisor {
       }
       // No adapter event surfaced this failure (or the budget is spent):
       // the existing recovery ladder still owns it.
-      void this.evaluateRecovery(agent, `runtime error: ${text}`, false, true);
+      incident.classifications.push(this.evaluateRecovery(agent, `runtime error: ${text}`, false, true));
     } catch (error) {
       if (agent.rateLimitRetry !== incident || this.disposed) return;
+      failure = String(error);
       this.clearRateLimitRetry(agent, 'exhausted');
       this.log('error', 'rate-limit retry delivery failed internally', { agent_id: agent.agentId, error: String(error) });
-      void this.evaluateRecovery(agent, `rate-limit retry failed: ${String(error)}`, false, true);
+      incident.classifications.push(this.evaluateRecovery(agent, `rate-limit retry failed: ${String(error)}`, false, true));
     } finally {
       retryLease?.release();
+      if (failure !== null && incident.startupHandle !== null) {
+        await Promise.all(incident.classifications);
+        this.settleFailedStartupRetry(agent, incident, failure);
+      }
     }
+  }
+
+  private settleFailedStartupRetry(agent: SupervisedAgent, incident: RateLimitRetryIncident, failure: string): void {
+    if (this.disposed || this.agents.get(agent.agentId) !== agent || agent.handle !== incident.startupHandle) return;
+    if (agent.pendingRecovery !== incident.recovery || !this.recoveryAuthorityCurrent(agent, incident.recovery)) return;
+    if (agent.inRestart || agent.breakerOpen || agent.rateLimitRetry !== null || agent.recoveryAdmission !== null ||
+      agent.decisionPending || agent.queuedRecovery !== null || agent.openTurn || agent.openControl || agent.openToolCalls.size > 0) return;
+    agent.pendingRecovery = null;
+    this.postOrphanedTurn(incident.recovery.originAgentId, 'automatic startup retry failed', failure);
   }
 
   // ------------------------------------------------------------------
@@ -2220,6 +2247,19 @@ export class Supervisor {
     // write keeps one binding: the fallback audit, any retry, and the receipt
     // all carry this SAME generation, while a same-id successor mints its own.
     const custody = this.cleanupJournal.claim(spawned, jobId, agent.agentId);
+    const recordRejection = (disposition: string, error: string | null): boolean => {
+      try {
+        this.ledger.appendCustomEvent({ kind: 'supervision.restart-rejected', agentId: agent.agentId, jobId,
+          payload: { reason, generation: custody.generation, origin_seq: cleanup.debt?.originSeq ?? null,
+            replacement_agent_id: spawned.id, authority_epoch: authority.authorityEpoch, disposition,
+            ...(error !== null ? { error } : {}) } });
+        return true;
+      } catch (failure) {
+        this.log('warn', 'restart rejection audit could not be recorded — custody retained in memory', { agent_id: agent.agentId, error: String(failure) });
+        return false;
+      }
+    };
+    let fallbackRecorded = false;
     let journalError: string | null = null;
     try {
       // Journal physical custody before entering the asynchronous disposal.
@@ -2230,6 +2270,7 @@ export class Supervisor {
       // below must STILL run — a skipped disposal is an unaccounted, live
       // hidden producer.
       journalError = String(error);
+      fallbackRecorded = recordRejection('cleanup-unjournaled', journalError);
     }
     let disposalError: string | null = null;
     try {
@@ -2267,30 +2308,11 @@ export class Supervisor {
         error: cleanupError,
       });
     }
-    try {
-      this.ledger.appendCustomEvent({
-        kind: 'supervision.restart-rejected',
-        agentId: agent.agentId,
-        jobId,
-        payload: {
-          reason,
-          generation: custody.generation,
-          origin_seq: cleanup.debt?.originSeq ?? null,
-          replacement_agent_id: spawned.id,
-          authority_epoch: authority.authorityEpoch,
-          // Only a durable pending journal entry may classify the audit as
-          // cleanup-unconfirmed. A failed pending write records the fallback
-          // disposition carrying the pre-minted exact generation: it stays
-          // clearable by the ORIGINAL custodian's later receipt, while a
-          // same-id successor's receipt (a different generation) never is.
-          disposition: cleanupError === null ? 'disposed'
-            : cleanup.debt !== null ? 'cleanup-unconfirmed' : 'cleanup-unjournaled',
-          ...(cleanupError !== null ? { error: cleanupError } : {}),
-        },
-      });
-    } catch (error) {
-      this.log('warn', 'restart rejection audit could not be recorded', { agent_id: agent.agentId, error: String(error) });
-    }
+    // The early fallback already records this refusal. Its later exact receipt
+    // settles it; another unconfirmed audit after that receipt would resurrect
+    // obsolete custody once replay has dropped the pending origin.
+    if (!fallbackRecorded) recordRejection(cleanupError === null ? 'disposed'
+      : cleanup.debt !== null ? 'cleanup-unconfirmed' : 'cleanup-unjournaled', cleanupError);
     if (cleanupError !== null) {
       try {
         const notice = this.notifications.post({
@@ -2327,12 +2349,13 @@ export class Supervisor {
 
   private settleRejectedRestartCleanup(handle: AgentHandle, cleanup: RejectedRestartCleanup): void {
     if (this.rejectedRestartCleanup.get(handle) !== cleanup || cleanup.settling) return;
-    if (cleanup.debt === null) throw new Error('restart cleanup pending journal was not persisted; custody retained');
     // Synchronous ledger subscribers can query custody during publication.
     // Neither recursive receipt writes nor failed writes may erase pending debt.
     cleanup.settling = true;
-    try { this.cleanupJournal.confirm(cleanup.debt); }
-    finally { cleanup.settling = false; }
+    try {
+      cleanup.debt ??= this.cleanupJournal.begin(handle, cleanup.jobId, cleanup.agent.agentId);
+      this.cleanupJournal.confirm(cleanup.debt);
+    } finally { cleanup.settling = false; }
     cleanup.detach();
     this.rejectedRestartCleanup.delete(handle);
     const { agent, recovery, notificationId } = cleanup;

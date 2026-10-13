@@ -29,7 +29,7 @@ function deferred<T>() {
 async function flush() { for (let i = 0; i < 48; i += 1) await Promise.resolve(); }
 
 function fixture(options: { readonly sameId?: boolean; readonly holdCleanup?: boolean; readonly holdThirdBirth?: boolean;
-  readonly rateLimitSuccessor?: boolean; readonly holdSecondBirth?: boolean } = {}) {
+  readonly rateLimitSuccessor?: boolean; readonly holdSecondBirth?: boolean; readonly slotted?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'gru-spawn-custody-'));
   const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 2 } };
   const db = new LedgerDb(dir);
@@ -128,11 +128,12 @@ function fixture(options: { readonly sameId?: boolean; readonly holdCleanup?: bo
   const supervisor = new Supervisor({ registry, ledger, notifications, config: { ...config.supervision, enabled: true },
     ...(options.rateLimitSuccessor ? { rateLimitBackoff: { baseMs: 1, maxMs: 1, maxRetries: 1, patterns: [] },
       sleep: () => releaseRetry.promise, jitter: () => 0 } : {}) });
+  const slot = options.slotted ? supervisor.declareSlot({ id: 'native-minion-slot', role: 'minion', spawn: (opts) => registry.spawn('minion', opts) }) : null;
   const worktrees = { listWorktrees: () => [{ kind: 'job', status: 'active', path: dir }] } as unknown as WorktreePort;
-  return { dir, db, config, notifications, registry, supervisor, ledger, envelopes, controls, jobId, created, secondStarted, releaseSecond, thirdStarted, releaseSpawn,
+  return { dir, db, config, notifications, registry, supervisor, slot, ledger, envelopes, controls, jobId, created, secondStarted, releaseSecond, thirdStarted, releaseSpawn,
     releaseCleanup, releaseThird, releaseTurn, releaseRetry,
     start: async () => {
-      const original = await registry.spawn('minion');
+      const original = slot === null ? await registry.spawn('minion') : await slot.ensure();
       ledger.registerAgent({ id: original.id, role: 'minion', jobId, sessionFile: original.sessionFile });
       controls[0]!.pending = { text: 'original dispatch briefing', owner: `dispatch:${jobId}` };
       controls[0]!.emit({ type: 'state', state: 'streaming' });
@@ -167,7 +168,7 @@ describe('registry publication and production consumer custody (GH-280)', () => 
     return { ledger, supervisor, close: () => { supervisor.dispose(); db.close(); } };
   }
 
-  async function originalResidentPendingWriteProof(rejectedDisposal: boolean) {
+  async function originalResidentPendingWriteProof(rejectedDisposal: boolean, queryRecovery = true, failedProofWrite = false) {
     const h = fixture({ sameId: rejectedDisposal });
     const repo = makeFixtureRepo('native-pending-write-proof');
     const lane = { id: 'native-proof-lane', kind: 'job' as const, status: 'active' as const,
@@ -183,8 +184,9 @@ describe('registry publication and production consumer custody (GH-280)', () => 
       const row = h.ledger.beginDirectiveIntent({ jobId: h.jobId, directive: 'new authoritative directive', holder: 'silas-ops', requestId: 'native-proof-request' }).record;
       const append = h.ledger.appendCustomEvent.bind(h.ledger);
       let pendingWrites = 0;
+      let blockProofWrite = false;
       const store = vi.spyOn(h.ledger, 'appendCustomEvent').mockImplementation((fields) => {
-        if (fields.kind === 'supervision.restart-cleanup-pending' && ++pendingWrites === 1) throw new Error('first actual pending write failed');
+        if (fields.kind === 'supervision.restart-cleanup-pending' && (++pendingWrites === 1 || blockProofWrite)) throw new Error('actual pending write failed');
         return append(fields);
       });
       restoreStore = () => store.mockRestore();
@@ -229,10 +231,12 @@ describe('registry publication and production consumer custody (GH-280)', () => 
       }
       // Only the ORIGINAL owner retries its failed pending write. This is
       // not proof: failed disposal/unknown cessation still fences the guard.
-      h.supervisor.pendingProducerBlockers(h.jobId);
-      const pending = h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-pending')!;
-      expect(pending).not.toBeNull();
-      expect(pending.payload).toMatchObject({ generation: token, replacement_agent_id: originalResident.id });
+      if (queryRecovery) h.supervisor.pendingProducerBlockers(h.jobId);
+      let pending = h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-pending');
+      if (queryRecovery) {
+        expect(pending).not.toBeNull();
+        expect(pending!.payload).toMatchObject({ generation: token, replacement_agent_id: originalResident.id });
+      } else expect(pending).toBeNull();
       expect(h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-confirmed')).toBeNull();
       refused();
       h.supervisor.dispose();
@@ -242,12 +246,22 @@ describe('registry publication and production consumer custody (GH-280)', () => 
       await h.registry.dispose();
       expect(h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-confirmed')).toBeNull();
       refused();
+      blockProofWrite = failedProofWrite;
       h.controls[1]!.cessation = 'ceased';
       h.controls[1]!.emit({ type: 'cessation_evidence', evidence: 'ceased' });
-      const confirmed = h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-confirmed')!;
+      if (failedProofWrite) {
+        expect(h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-confirmed')).toBeNull();
+        refused();
+        blockProofWrite = false;
+        h.controls[1]!.emit({ type: 'cessation_evidence', evidence: 'ceased' });
+      }
+      pending = h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-pending');
+      const confirmed = h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-confirmed');
+      expect(pending).not.toBeNull();
       expect(confirmed).not.toBeNull();
-      expect(confirmed.seq).toBeGreaterThan(pending.seq);
-      expect(confirmed.payload).toMatchObject({ generation: token, origin_seq: pending.seq,
+      expect(pending!.payload).toMatchObject({ generation: token, replacement_agent_id: originalResident.id });
+      expect(confirmed!.seq).toBeGreaterThan(pending!.seq);
+      expect(confirmed!.payload).toMatchObject({ generation: token, origin_seq: pending!.seq,
         replacement_agent_id: originalResident.id, disposal_acknowledged: true, cessation: 'ceased' });
       expect(next.supervisor.pendingProducerBlockers(h.jobId)).toEqual([]); // cursor refresh sees original receipt
       h.db.close(); next.close(); next = reader(h);
@@ -264,6 +278,83 @@ describe('registry publication and production consumer custody (GH-280)', () => 
 
   it('keeps original resident pending-write fallback through failed disposal and a same-ID successor until native proof and guarded retirement (GH-280 residual)', () => originalResidentPendingWriteProof(true));
   it('keeps original resident pending-write fallback through unknown cessation until native proof, reopen and guarded retirement (GH-280 residual)', () => originalResidentPendingWriteProof(false));
+
+  it('retries original native pending persistence after shutdown without an old blockers query (GH-280 residual R9)', () => originalResidentPendingWriteProof(false, false));
+  it('retains rejected disposal and same-ID controls before query-free original native proof (GH-280 residual R9)', () => originalResidentPendingWriteProof(true, false));
+  it('retains failed proof storage until a later query-free original native callback persists it (GH-280 residual R9)', () => originalResidentPendingWriteProof(true, false, true));
+
+  it('persists fallback before a held original resident disposal and refuses reopened guarded retirement (GH-280 residual R9)', async () => {
+    const h = fixture({ holdCleanup: true });
+    const repo = makeFixtureRepo('held-native-fallback');
+    const lane = { id: 'held-native-lane', kind: 'job' as const, status: 'active' as const, path: repo.path,
+      repoPath: repo.path, repoName: 'fixture', jobId: h.jobId, roundId: null, branch: 'main', sha: repo.head() };
+    let next: ReturnType<typeof reader> | null = null;
+    let restore: (() => void) | null = null;
+    try {
+      h.ledger.registerWorktree(lane);
+      const resident = await h.start();
+      h.controls[1]!.cessation = 'unknown';
+      const row = h.ledger.beginDirectiveIntent({ jobId: h.jobId, directive: 'superseding work', holder: 'silas-ops', requestId: 'held-native-request' }).record;
+      const append = h.ledger.appendCustomEvent.bind(h.ledger);
+      let writes = 0;
+      const store = vi.spyOn(h.ledger, 'appendCustomEvent').mockImplementation((fields) => {
+        if (fields.kind === 'supervision.restart-cleanup-pending' && ++writes === 1) throw new Error('first pending append failed');
+        return append(fields);
+      });
+      restore = () => store.mockRestore();
+      h.releaseSpawn.resolve(); await flush();
+      expect(h.controls[1]!.disposalAttempts).toBe(1);
+      expect(resident.cessationEvidence?.()).toBe('unknown');
+      expect(h.registry.getHandle(resident.id)).toBeNull();
+      expect(h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-pending')).toBeNull();
+      // No query of the old Supervisor is allowed to repair the missing write.
+      next = reader(h); next.close(); next = reader(h);
+      try {
+        retireInterruptedDirectiveFromRoute({ ledger: next.ledger, worktrees: { listWorktrees: () => [lane] },
+          pendingProducerBlockers: (jobId) => next!.supervisor.pendingProducerBlockers(jobId), requestId: row.requestId,
+          expected: { jobId: h.jobId, state: 'dispatching', payloadHash: row.payloadHash, head: repo.head() },
+          reason: 'unknown held native producer', by: 'silas-ops' });
+        throw new Error('guarded retirement released held native custody');
+      } catch (error) {
+        expect(error).toBeInstanceOf(DirectiveRetirementError);
+        expect((error as DirectiveRetirementError).code).toBe('live_work');
+      }
+      const fallback = h.ledger.latestJobEvent(h.jobId, 'supervision.restart-rejected');
+      expect(fallback).not.toBeNull();
+      expect(fallback!.payload).toMatchObject({ disposition: 'cleanup-unjournaled', generation: expect.any(String), origin_seq: null, replacement_agent_id: resident.id });
+      expect(next.supervisor.pendingProducerBlockers(h.jobId).join(' ')).toContain((fallback!.payload as { generation: string }).generation);
+      expect(next.supervisor.pendingProducerBlockers('unrelated-job')).toEqual([]);
+      expect(next.ledger.getDirective(row.requestId)?.state).toBe('dispatching');
+      expect(h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-confirmed')).toBeNull();
+      expect(h.ledger.listJobEvents(h.jobId, { limit: 100 }).filter((event) => ['job.delivered', 'supervision.turn-recovery', 'silas.directive-settled'].includes(event.kind))).toEqual([]);
+    } finally { restore?.(); next?.close(); await h.dispose(); repo.cleanup(); }
+  });
+
+  it('refuses a held spawn after real A-to-B binding without changing A authority or publishing the result (GH-280 residual R9)', async () => {
+    const h = fixture({ sameId: true, slotted: true });
+    try {
+      const resident = await h.start();
+      const swapped = vi.fn(); h.slot!.onSwap(swapped);
+      h.ledger.addJob({ id: 'binding-B', repo: 'fixture', title: 'B' });
+      h.ledger.setJobStatus('binding-B', 'working');
+      h.ledger.registerAgent({ id: 'original', role: 'minion', jobId: 'binding-B', sessionFile: '/fixture/B.jsonl' });
+      expect(h.ledger.directiveRecoveryEpoch(h.jobId)).toBe(0);
+      expect(h.ledger.directiveRecoveryEpoch('binding-B')).toBe(0);
+      expect(h.ledger.listPendingRebriefs({ jobId: h.jobId })).toEqual([]);
+      expect(h.ledger.listPendingDirectives({ jobId: h.jobId })).toEqual([]);
+      h.controls[1]!.cleanupReject = true;
+      h.releaseSpawn.resolve(); await flush();
+      expect(h.controls[1]!.prompts).toEqual([]);
+      expect(swapped).not.toHaveBeenCalled();
+      expect(h.slot!.current()).toBeNull();
+      expect(h.envelopes.filter((event) => event.handle === resident && event.phase === 'spawned')).toEqual([]);
+      expect(h.ledger.getAgent('original')).toMatchObject({ jobId: 'binding-B', sessionFile: '/fixture/B.jsonl' });
+      expect(h.ledger.latestJobEvent(h.jobId, 'supervision.restart-cleanup-pending')?.payload).toMatchObject({ replacement_agent_id: resident.id });
+      expect(h.ledger.latestJobEvent('binding-B', 'supervision.restart-cleanup-pending')).toBeNull();
+      expect(h.supervisor.pendingProducerBlockers(h.jobId).join(' ')).toContain('restart cleanup unconfirmed');
+      expect(h.supervisor.pendingProducerBlockers('binding-B')).toEqual([]);
+    } finally { if (h.controls[1]) h.controls[1].cleanupReject = false; await h.dispose(); }
+  });
 
   it('records subsequent exact native disposal after watchdog shutdown and replays it across LedgerDb reopen (GH-280)', async () => {
     const h = fixture();
