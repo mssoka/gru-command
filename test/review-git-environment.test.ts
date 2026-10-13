@@ -314,7 +314,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
   it('bounds prepared metadata floods and TERM-ignoring queries without authority or unrelated-child signals (R8)', async () => {
     const servicePath = process.env.PATH ?? '';
     const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-    for (const mode of ['symbolic-stdout', 'symbolic-stderr', 'receipt-stdout', 'receipt-stderr', 'deadline', 'exit-pipes'] as const) {
+    for (const mode of ['symbolic-stdout', 'symbolic-stderr', 'receipt-stdout', 'receipt-stderr', 'deadline', 'exit-pipes', 'symbolic-mixed', 'receipt-mixed'] as const) {
       const h = await rollbackRaceFixture(`r8-query-${mode}`, 'job');
       const { log } = failingCheckoutHook(h.repo);
       const root = directory(), proof = join(root, 'query'), term = join(root, 'term');
@@ -323,7 +323,8 @@ describe('review Git repository environment isolation (GH-270)', () => {
         if(fs.existsSync(lock)&&(a[0]==='symbolic-ref'&&a.includes('--no-recurse')&&${JSON.stringify(!mode.startsWith('receipt'))}||a[0]==='reflog'&&${JSON.stringify(mode.startsWith('receipt'))})) {
           fs.writeFileSync(${JSON.stringify(proof)},String(process.pid));process.on('SIGTERM',()=>fs.writeFileSync(${JSON.stringify(term)},'owned TERM'));
           ${mode === 'exit-pipes' ? `cp.spawn(process.execPath,['-e',${JSON.stringify(`const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(join(root, 'pipe-started'))},'started');setTimeout(()=>fs.writeFileSync(${JSON.stringify(join(root, 'pipe-done'))},'done'),5500);`)}],{stdio:'inherit'});process.exit(1);` : ''}
-          ${mode === 'deadline' || mode === 'exit-pipes' ? '' : `process.${mode.endsWith('stderr') ? 'stderr' : 'stdout'}.write(Buffer.alloc(17*1024*1024,120));`}
+          ${mode.endsWith('mixed') ? 'process.stdout.write(Buffer.alloc(9*1024*1024,120));process.stderr.write(Buffer.alloc(9*1024*1024,120));'
+            : mode === 'deadline' || mode === 'exit-pipes' ? '' : `process.${mode.endsWith('stderr') ? 'stderr' : 'stdout'}.write(Buffer.alloc(17*1024*1024,120));`}
           setTimeout(()=>process.exit(1),6000);setInterval(()=>{},1000);
         }else{const r=cp.spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});process.exit(r.status??1);}\n`);
       chmodSync(join(root, 'git'), 0o755);
@@ -344,13 +345,16 @@ describe('review Git repository environment isolation (GH-270)', () => {
       }
       try {
         vi.stubEnv('PATH', `${root}:${servicePath}`);
-        const creation = h.create(); const assertion = expect(creation).rejects.toThrow(/authority unconfirmed|custody unconfirmed/);
+        const creation = h.create(); const assertion = expect(creation).rejects.toThrow(mode === 'symbolic-mixed'
+          ? /combined output exceeded 16 MiB/ : /authority unconfirmed|custody unconfirmed/);
         if (mode === 'deadline' || mode === 'exit-pipes') {
           for (let tick = 0; tick < 200 && (!existsSync(proof) || mode === 'exit-pipes' && !existsSync(join(root, 'pipe-started'))); tick++) await new Promise((done) => originalSetTimeout(done, 10));
           expect(existsSync(proof)).toBe(true); expect(active.size).toBe(1);
           for (const cb of active.values()) cb();
         }
         await assertion;
+        if (mode === 'receipt-mixed') await expect(creation).rejects.toMatchObject({ errors: [expect.anything(),
+          expect.objectContaining({ message: expect.stringContaining('combined output exceeded 16 MiB') })] });
         vi.stubEnv('PATH', servicePath);
         if (mode === 'exit-pipes') expect(existsSync(term)).toBe(false);
         else expect(readFileSync(term, 'utf8')).toBe('owned TERM');

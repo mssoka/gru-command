@@ -1169,12 +1169,14 @@ export class WorktreeManager {
       if (failure !== undefined) return;
       stdoutBytes += chunk.length;
       if (stdoutBytes > limit) fail('stdout output exceeded 16 MiB');
+      else if (stdoutBytes + stderrBytes > limit) fail('combined output exceeded 16 MiB');
       else stdout.push(chunk);
     });
     child.stderr.on('data', (chunk: Buffer) => {
       if (failure !== undefined) return;
       stderrBytes += chunk.length;
       if (stderrBytes > limit) fail('stderr output exceeded 16 MiB');
+      else if (stdoutBytes + stderrBytes > limit) fail('combined output exceeded 16 MiB');
       else stderrTail = Buffer.concat([stderrTail, chunk.subarray(-4096)]).subarray(-4096);
     });
     child.on('error', (error) => fail(error.message));
