@@ -295,7 +295,7 @@ describe('verification build reuse (#318)', () => {
         }
         return originalKill(target, signal);
       });
-      const body = `${ignoreTerm ? 'process.on(\"SIGTERM\",()=>{});' : ''}console.log(\"r16-owned-ready\");setInterval(()=>{},1000)`;
+      const body = `${ignoreTerm ? 'process.on("SIGTERM",()=>{});' : ''}console.log("r16-owned-ready");setInterval(()=>{},1000)`;
       running = run(scheduler, lane, 'actual-owned-child', `exec node -e '${body}'`, (frame) => {
         if (frame.type === 'output' && frame.text.includes('r16-owned-ready')) reached();
       });
