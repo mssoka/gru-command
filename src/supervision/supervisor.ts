@@ -2291,9 +2291,15 @@ export class Supervisor {
       if (jobId === null) return true;
       const job = this.ledger.getJob(jobId);
       if (job === null || isJobTerminal(job.status) || this.ledger.hasOpenDirectiveRecoveryHold(jobId)) return false;
+      // No captured turn is not stale authority: an idle agent on a live,
+      // unheld job takes its otherwise authorized restart/re-arm path even
+      // when that job carries retirement/handoff history (issue #279). A
+      // captured turn must still match the current native authority exactly —
+      // a stale epoch or unreadable authority stays fenced.
+      if (recovery === null) return true;
       const epoch = this.ledger.directiveRecoveryEpoch(jobId);
-      const current = (recovery?.authorityEpoch === epoch || (epoch === 0 && recovery === null)) &&
-        (recovery === null || recovery.producerIdentity === this.nativeProducerIdentity(jobId));
+      const current = recovery.authorityEpoch === epoch &&
+        recovery.producerIdentity === this.nativeProducerIdentity(jobId);
       if (!current) this.log('info', 'interrupted turn superseded — automatic recovery fenced', { agent_id: agent.agentId, job_id: jobId });
       return current;
     } catch (error) {

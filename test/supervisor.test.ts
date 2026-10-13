@@ -1919,6 +1919,163 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
   });
 });
 
+describe('supervisor — idle restart after retirement handoff (GH-279)', () => {
+  /** A live, working job carrying an OPEN retirement hold: the native epoch
+   * has advanced past zero but no successor has accepted authority yet. */
+  function retireHold(rig: Harness, jobId: string): number {
+    rig.api.addJob({ id: jobId, repo: 'fixture', title: 'Idle handoff restart' });
+    rig.api.setJobStatus(jobId, 'working');
+    const retired = rig.api.beginDirectiveIntent({ jobId, directive: 'retired work', holder: 'silas-ops', requestId: `${jobId}-retired` });
+    rig.api.retireInterruptedDirective({ requestId: retired.record.requestId, expectedJobId: jobId, expectedState: 'dispatching',
+      expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40),
+      lane: { id: `${jobId}-lane`, resolvedHead: 'a'.repeat(40) }, reason: 'fixture has no live producer', by: 'silas-ops' });
+    expect(rig.api.hasOpenDirectiveRecoveryHold(jobId)).toBe(true);
+    const epoch = rig.api.directiveRecoveryEpoch(jobId);
+    expect(epoch).toBeGreaterThan(0);
+    return epoch;
+  }
+
+  /** The hold released by a fresh accepted directive: the native epoch
+   * advances again, leaving a legitimately fresh, nonterminal authority. */
+  function freshHandoffJob(rig: Harness, jobId: string): number {
+    const held = retireHold(rig, jobId);
+    rig.api.beginDirectiveIntent({ jobId, directive: 'fresh authorized work', holder: 'silas-ops', requestId: `${jobId}-fresh` });
+    expect(rig.api.hasOpenDirectiveRecoveryHold(jobId)).toBe(false);
+    const epoch = rig.api.directiveRecoveryEpoch(jobId);
+    expect(epoch).toBeGreaterThan(held);
+    return epoch;
+  }
+
+  /** An adopted, job-bound minion with no open turn and no pending snapshot. */
+  function adoptIdle(rig: Harness, id: string, jobId: string, sessionFile: string | null): FakeHandle {
+    const handle = new FakeHandle('minion', id, sessionFile);
+    handle.pendingTurnSnapshot = null;
+    rig.registry.adopt(handle);
+    rig.api.registerAgent({ id, role: 'minion', jobId, sessionFile });
+    return handle;
+  }
+
+  it('an idle minion with no snapshot takes its authorized restart after a retirement handoff without inventing recovery evidence (GH-279)', async () => {
+    vi.useFakeTimers();
+    const rig = boot(undefined, { maxRestarts: 1 });
+    try {
+      const jobId = 'idle-no-snapshot-job';
+      const epoch = freshHandoffJob(rig, jobId);
+      const idle = adoptIdle(rig, 'idle-no-snapshot', jobId, '/fixture/idle-no-snapshot.jsonl');
+      expect(rig.supervisor.viewFor(idle.id)?.openTurn).toBe(false);
+      expect(rig.supervisor.viewFor(idle.id)?.openControl).toBe(false);
+      const resumed = new FakeHandle('minion', 'idle-no-snapshot-resumed', idle.sessionFile);
+      rig.registry.spawnImpl = async () => resumed;
+      idle.emit({ type: 'error', error: 'idle session stream died', fatal: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(1);
+      expect(rig.supervisor.viewFor(resumed.id)?.state).toBe('watching');
+      // The idle restart invents nothing: no prompt, delivery, no-effect
+      // receipt, phase completion or authority handoff.
+      expect(resumed.promptCalls).toEqual([]);
+      expect(rig.notificationsOfKind(`supervision.turn-orphaned.${idle.id}`)).toEqual([]);
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.turn-recovery')).toEqual([]);
+      expect(rig.api.listJobEvents(jobId, { limit: 200 }).filter((event) => event.kind === 'job.delivered')).toEqual([]);
+      expect(rig.api.listJobEvents(jobId, { limit: 200 }).filter((event) => event.kind.startsWith('phase-handoff'))).toEqual([]);
+      expect(rig.api.listJobEvents(jobId, { limit: 200 }).filter((event) => event.kind === 'silas.directive-recovery-handoff')).toHaveLength(1);
+      expect(rig.api.directiveRecoveryEpoch(jobId)).toBe(epoch);
+    } finally { rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('an idle minion with no snapshot re-arms on the breaker ACK after a retirement handoff (GH-279)', async () => {
+    vi.useFakeTimers();
+    const rig = boot(undefined, { maxRestarts: 1 });
+    try {
+      const jobId = 'idle-no-snapshot-ack-job';
+      freshHandoffJob(rig, jobId);
+      const idle = adoptIdle(rig, 'idle-no-snapshot-ack', jobId, null);
+      rig.registry.spawnImpl = async () => { throw new Error('fixture first rung failed'); };
+      idle.emit({ type: 'error', error: 'idle session stream died', fatal: true });
+      await vi.advanceTimersByTimeAsync(5);
+      expect(rig.supervisor.viewFor(idle.id)?.breakerOpen).toBe(true);
+      const stop = rig.notificationsOfKind('supervision.breaker')[0]!;
+      const resumed = new FakeHandle('minion', 'idle-no-snapshot-ack-resumed', null);
+      rig.registry.spawnImpl = async () => resumed;
+      rig.supervisor.onNotificationAcked(stop.id);
+      await flushMicrotasks();
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toHaveLength(1);
+      expect(rig.supervisor.viewFor(resumed.id)?.state).toBe('watching');
+      expect(rig.supervisor.viewFor(resumed.id)?.breakerOpen).toBe(false);
+      expect(resumed.promptCalls).toEqual([]);
+    } finally { rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('an open retirement hold still blocks an idle no-snapshot restart (GH-279)', async () => {
+    vi.useFakeTimers();
+    const rig = boot(undefined, { maxRestarts: 1 });
+    try {
+      const jobId = 'idle-held-job';
+      retireHold(rig, jobId);
+      const idle = adoptIdle(rig, 'idle-held', jobId, null);
+      rig.registry.spawnImpl = async () => new FakeHandle('minion', 'idle-held-should-not-run', null);
+      idle.emit({ type: 'error', error: 'idle session stream died', fatal: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toEqual([]);
+      expect(rig.supervisor.viewFor('idle-held-should-not-run')).toBeNull();
+    } finally { rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('a terminal job still blocks an idle no-snapshot restart (GH-279)', async () => {
+    vi.useFakeTimers();
+    const rig = boot(undefined, { maxRestarts: 1 });
+    try {
+      const jobId = 'idle-terminal-job';
+      freshHandoffJob(rig, jobId);
+      const idle = adoptIdle(rig, 'idle-terminal', jobId, null);
+      rig.api.setJobStatus(jobId, 'done');
+      rig.registry.spawnImpl = async () => new FakeHandle('minion', 'idle-terminal-should-not-run', null);
+      idle.emit({ type: 'error', error: 'idle session stream died', fatal: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toEqual([]);
+      expect(rig.supervisor.viewFor('idle-terminal-should-not-run')).toBeNull();
+    } finally { rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('a captured obsolete turn stays fenced after a later handoff releases the hold (GH-279)', async () => {
+    vi.useFakeTimers();
+    const rig = boot(undefined, { maxRestarts: 1 });
+    try {
+      const jobId = 'stale-captured-job';
+      rig.api.addJob({ id: jobId, repo: 'fixture', title: 'Stale captured turn' });
+      rig.api.setJobStatus(jobId, 'working');
+      const idle = new FakeHandle('minion', 'stale-captured', null);
+      idle.pendingTurnSnapshot = { text: 'pre-retirement prompt', owner: 'dispatch:stale-captured' };
+      rig.registry.adopt(idle);
+      rig.api.registerAgent({ id: idle.id, role: 'minion', jobId, sessionFile: null });
+      hang(idle);
+      rig.registry.spawnImpl = async () => { throw new Error('fixture rung failed'); };
+      idle.emit({ type: 'error', error: 'session stream died', fatal: true });
+      await vi.advanceTimersByTimeAsync(5);
+      // The breaker trip captured the open turn under the ORIGINAL (epoch 0) authority.
+      expect(rig.supervisor.viewFor(idle.id)?.breakerOpen).toBe(true);
+      rig.api.setAgentState(idle.id, 'disposed');
+      expect(rig.supervisor.pendingProducerBlockers(jobId)).toEqual([]);
+      // Retire the old directive, then accept fresh authority: the hold
+      // releases and the native epoch advances past the captured turn.
+      const retired = rig.api.beginDirectiveIntent({ jobId, directive: 'retired work', holder: 'silas-ops', requestId: `${jobId}-retired` });
+      rig.api.retireInterruptedDirective({ requestId: retired.record.requestId, expectedJobId: jobId, expectedState: 'dispatching',
+        expectedPayloadHash: retired.record.payloadHash, expectedHead: 'a'.repeat(40),
+        lane: { id: `${jobId}-lane`, resolvedHead: 'a'.repeat(40) }, reason: 'fixture ceased', by: 'silas-ops' });
+      rig.api.beginDirectiveIntent({ jobId, directive: 'fresh authorized work', holder: 'silas-ops', requestId: `${jobId}-fresh` });
+      expect(rig.api.hasOpenDirectiveRecoveryHold(jobId)).toBe(false);
+      expect(rig.api.directiveRecoveryEpoch(jobId)).toBeGreaterThan(0);
+      const stop = rig.notificationsOfKind('supervision.breaker')[0]!;
+      const before = rig.registry.spawnCalls.length;
+      rig.registry.spawnImpl = async () => new FakeHandle('minion', 'stale-should-not-run', null);
+      rig.supervisor.onNotificationAcked(stop.id);
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(before);
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
+      expect(rig.supervisor.viewFor(idle.id)?.breakerOpen).toBe(true);
+    } finally { rig.dispose(); vi.useRealTimers(); }
+  });
+});
+
 describe('supervisor — workflow-owned review attempts', () => {
   it('aborts an isolated review attempt without spawning a non-isolated replacement', async () => {
     const h = boot();
