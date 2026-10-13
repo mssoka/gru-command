@@ -404,6 +404,13 @@ export function isAdmittedBlind(ledger: LedgerApi, jobId: string): boolean {
  * invalidates coverage exactly like one at the first briefing. A non-blind
  * job is a no-op, and an unreadable session (`readResults` returns null)
  * records nothing rather than inventing a clean pass.
+ *
+ * A resumed session's jsonl is cumulative, so a settle scan re-reads results
+ * an earlier scan already saw. The derived verdict is idempotent (a nonzero
+ * prohibited count invalidates either way), but `blindCoverageOf` SUMS the
+ * prohibited arrays across every observation event, so the informational
+ * `prohibitedAccess` count is cumulative, not distinct reads (issue #339,
+ * accepted tradeoff: a delta scan would need persisted per-job offset state).
  */
 export function observeBlindSessionAccess(
   ledger: LedgerApi,

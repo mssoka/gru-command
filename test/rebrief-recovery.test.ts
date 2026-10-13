@@ -12,7 +12,38 @@ import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtim
 import type { Role } from '../src/config.js';
 import { finalizeRebriefRequest, reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import {
+  admitBlindReview,
+  blindCoverageOf,
+  observeBlindSessionAccess,
+  recordBlindAdmission,
+  BLIND_ACCESS_EVENT,
+} from '../src/dispatch/blind-review.js';
 import { PacingGate } from '../src/runtime/pacing.js';
+
+const BASE_SHA = 'a'.repeat(40);
+const TARGET_SHA = 'f'.repeat(40);
+
+/** A pi-session toolResult line (what the reviewer's session jsonl holds). */
+const sessionToolResult = (text: string): string =>
+  `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: text } })}\n`;
+
+/** Admit `jobId` as a blind review so the re-brief settle seam has an
+ * isolation rule to judge the re-briefed session's tool access against. */
+function admitBlindJob(h: Harness, jobId: string): void {
+  const admission = admitBlindReview({
+    ledger: h.ledger,
+    jobId,
+    title: 'review (blind)',
+    deliverable: 'review',
+    briefing: 'Review the immutable package read-only.',
+    targetSha: TARGET_SHA,
+    repoName: 'fixture',
+    inputPackage: { baseSha: BASE_SHA, targetSha: TARGET_SHA, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+  });
+  if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+  recordBlindAdmission(h.ledger, jobId, admission);
+}
 
 /**
  * Re-brief restart safety (Silas finding 2026-09-23): the durable marker
@@ -377,6 +408,38 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(recovered?.payload).toMatchObject({ path: 'resumed' });
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
     expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
+  });
+
+  it('boot re-brief observes the resumed session and invalidates blind coverage (issue #339 P4)', async () => {
+    const h = makeHarness();
+    const jobId = 'blind-rebrief-job';
+    const sessionFile = join(h.dir, 'sessions', 'reviewer-crashed.jsonl');
+    mkdirSync(join(h.dir, 'sessions'), { recursive: true });
+    // The resumed session already holds the prohibited read (the turn that
+    // performed it ran before the crash this reconciler recovers).
+    writeFileSync(sessionFile, sessionToolResult('docs/issues/305-review.md:1:prior assessment'));
+    await seedPendingRebrief({ h, jobId, bindWorker: { agentId: 'reviewer-crashed', sessionFile } });
+    admitBlindJob(h, jobId);
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: h.ledger,
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+        observeBlindTurn: (recoveredJobId, recoveredSession) =>
+          observeBlindSessionAccess(h.ledger, recoveredJobId, recoveredSession),
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    await report.settled;
+    expect(h.registry.workers[0]?.options.resumeFile).toBe(sessionFile);
+    // Deleting the forwarding line in runRebriefTurn leaves coverage
+    // qualifying and fails this assertion.
+    expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
   });
 
   it('never resumes a review-only session, however new its row is (Gru ruling 2026-09-29)', async () => {
