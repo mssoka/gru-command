@@ -384,3 +384,27 @@ describe('Silas corrective verification after exact failure dismissals (GH-302)'
     }
   });
 });
+
+describe('verdict digest is fenced by an unsettled verification (issue #243 original-M2)', () => {
+  it('never publishes a verdict row while a verification owns the lane', async () => {
+    const ledger = fixture();
+    ledger.addJob({ id: 'job-verdict-fence', repo: 'fixture-app', title: 't', briefing: 'b' });
+    ledger.setJobStatus('job-verdict-fence', 'working');
+    ledger.setJobStatus('job-verdict-fence', 'in-review');
+    const round = ledger.addRound({ jobId: 'job-verdict-fence', targetRef: HEAD });
+    ledger.setRoundStatus(round.id, 'live');
+    ledger.setRoundVerdict(round.id, 'changes-requested');
+    // Baseline: with no verification in flight the verdict row is offered.
+    const before = await digest(ledger);
+    expect(before.verdictsAwaitingDirective.map((row) => row.jobId)).toEqual(['job-verdict-fence']);
+    // An unsettled verification owns the lane: the publish boundary must
+    // retract the row, so neither the autopilot nor a model wake sees it.
+    ledger.appendCustomEvent({
+      kind: 'verification.requested',
+      jobId: 'job-verdict-fence',
+      payload: { scope: 'full', run_id: 'run-verdict-fence', head: HEAD },
+    });
+    const after = await digest(ledger);
+    expect(after.verdictsAwaitingDirective).toEqual([]);
+  });
+});

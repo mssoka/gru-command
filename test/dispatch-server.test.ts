@@ -1046,6 +1046,37 @@ describe('dispatch server (E8)', () => {
     }
   });
 
+  it('the two new autopilot rules are accepted and persist their durable attribution (issue #243 R2-M6)', async () => {
+    const h = await boot();
+    const repo = makeFixtureRepo('fixture-silas-rules');
+    cleanupRepos.push(repo);
+    attachBareOrigin(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', {
+        job_id: 'silas-rule-job', repo_path: repo.path, title: 'rules', briefing: 'b',
+      }, TOKEN);
+      await waitForDelivery(h, 'silas-rule-job');
+      const pr = await call(h.port, 'POST', '/api/dispatch/pr', {
+        job_id: 'silas-rule-job', url: PR_URL, by: 'silas', rule_id: 'delivered-pr-register',
+      }, TOKEN);
+      expect(pr.status).toBe(200);
+      const review = await call(h.port, 'POST', '/api/dispatch/review', {
+        job_id: 'silas-rule-job', by: 'silas', rule_id: 'pr-review-trigger',
+      }, TOKEN);
+      expect(review.status).toBe(202);
+      expect(h.ledger.latestJobEvent('silas-rule-job', 'silas.pr-registered')?.payload).toMatchObject({
+        url: PR_URL,
+        rule_id: 'delivered-pr-register',
+      });
+      expect(h.ledger.latestJobEvent('silas-rule-job', 'silas.review-triggered')?.payload).toMatchObject({
+        route: 'perkins',
+        rule_id: 'pr-review-trigger',
+      });
+    } finally {
+      await h.close();
+    }
+  });
+
   it('without by, the pr/review endpoints record no silas attribution events', async () => {
     // One scenario per case: the combined form ran two complete review
     // setups under one inherited 30s default and overran it under

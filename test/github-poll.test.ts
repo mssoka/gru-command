@@ -451,6 +451,36 @@ describe('gh CLI adapter', () => {
     ]);
   });
 
+  it('listPullsForHead asks the owner-qualified head filter and returns only that head (issue #243 R2-M5)', async () => {
+    const asked: string[] = [];
+    const runner: GhCommandRunner = async (args) => {
+      const path = args[args.length - 1] ?? '';
+      asked.push(path);
+      // Query-dependent: only the requested owner:branch returns a pull, so
+      // a dropped `head` parameter would change the returned identity.
+      const matches = path.includes('head=acme%3Agru%2Fjob-1');
+      const pulls = [
+        {
+          number: matches ? 11 : 12,
+          head: { ref: matches ? 'gru/job-1' : 'other', sha: matches ? 'sha-a' : 'sha-b' },
+          state: 'open',
+          merged_at: null,
+          mergeable_state: null,
+          merge_commit_sha: null,
+          html_url: matches
+            ? 'https://github.com/acme/app/pull/11'
+            : 'https://github.com/acme/app/pull/12',
+        },
+      ];
+      return { status: 0, stdout: JSON.stringify(pulls), stderr: '' };
+    };
+    const api = new GhCliApi(runner);
+    const pulls = await api.listPullsForHead({ repo: REPO, head: 'gru/job-1' });
+    expect(pulls.map((pull) => pull.number)).toEqual([11]);
+    expect(asked[0]).toContain('head=acme%3Agru%2Fjob-1');
+    expect(asked[0]).toContain('state=open');
+  });
+
   it('fails loud on unavailability, rate limits, and malformed responses', async () => {
     const unavailable = new GhCliApi(async () => ({ status: -1, stdout: '', stderr: '', error: 'spawn gh ENOENT' }));
     await expect(unavailable.listPulls({ repo: REPO, limit: 1 })).rejects.toThrow(/gh is unavailable/);

@@ -887,6 +887,86 @@ describe('autopilot decisions and agreement per family (#243)', () => {
     expect(text).toContain('Silas autopilot (#243)');
     expect(text).toContain('verdict-rung-directive [dry-run]: decisions 1, agreed 1 (100.0%)');
   });
+
+  it('credits only the debt identity a receipt names (issue #243 R2-H7)', () => {
+    const decisionWith = (
+      ts: string,
+      seq: number,
+      fingerprint: string,
+    ): LedgerEventRecord =>
+      event('silas.autopilot-decision', ts, {
+        jobId: 'job-v',
+        seq,
+        payload: {
+          rule_id: 'verification-repair',
+          job: 'job-v',
+          action: 'send-directive',
+          would_call: { blocker_fingerprint: fingerprint },
+          mode: 'dry-run',
+        },
+      });
+    const measures = computeLedgerMeasures(
+      measureInput([
+        event('silas.wake', '2026-10-01T01:00:00.000Z', { seq: 1, payload: { trigger: 'sweep', actionable: 1 } }),
+        decisionWith('2026-10-01T01:01:00.000Z', 2, 'verification-failure:unit@run-A'),
+        decisionWith('2026-10-01T01:02:00.000Z', 3, 'verification-failure:unit@run-B'),
+        event('silas.wake', '2026-10-01T01:03:00.000Z', { seq: 4, payload: { trigger: 'sweep', actionable: 1 } }),
+        // LLM Silas repaired run B only: it must credit B, never A.
+        event('silas.directive-sent', '2026-10-01T01:04:00.000Z', {
+          jobId: 'job-v',
+          seq: 5,
+          payload: { rule_id: 'verification-repair', blocker_fingerprint: 'verification-failure:unit@run-B' },
+        }),
+      ]),
+      [],
+    );
+    expect(measures.autopilot.byFamily[0]).toMatchObject({ decisions: 2, agreed: 1 });
+  });
+
+  it('never credits the untagged machine job.pr-linked as model agreement (issue #243 R2-H8)', () => {
+    const decisionWith = (ts: string, seq: number, url: string): LedgerEventRecord =>
+      event('silas.autopilot-decision', ts, {
+        jobId: 'job-pr',
+        seq,
+        payload: {
+          rule_id: 'delivered-pr-register',
+          job: 'job-pr',
+          action: 'register-pr',
+          would_call: { url },
+          mode: 'dry-run',
+        },
+      });
+    const measures = computeLedgerMeasures(
+      measureInput([
+        event('silas.wake', '2026-10-01T01:00:00.000Z', { seq: 1, payload: { trigger: 'sweep', actionable: 1 } }),
+        decisionWith('2026-10-01T01:01:00.000Z', 2, 'https://github.com/o/r/pull/1'),
+        // The service's bare link event (the autopilot's own recordPr emits
+        // this too): no model evidence, never agreement.
+        event('job.pr-linked', '2026-10-01T01:02:00.000Z', {
+          jobId: 'job-pr',
+          seq: 3,
+          payload: { url: 'https://github.com/o/r/pull/1' },
+        }),
+      ]),
+      [],
+    );
+    expect(measures.autopilot.byFamily[0]).toMatchObject({ decisions: 1, agreed: 0 });
+
+    // The attributable tagged receipt for the SAME url IS agreement.
+    const withReceipt = computeLedgerMeasures(
+      measureInput([
+        event('silas.wake', '2026-10-01T01:00:00.000Z', { seq: 1, payload: { trigger: 'sweep', actionable: 1 } }),
+        decisionWith('2026-10-01T01:01:00.000Z', 2, 'https://github.com/o/r/pull/1'),
+        event('silas.pr-registered', '2026-10-01T01:02:00.000Z', {
+          jobId: 'job-pr',
+          seq: 3,
+          payload: { url: 'https://github.com/o/r/pull/1', rule_id: 'delivered-pr-register' },
+        }),
+      ]),
+      [],
+    );
+    expect(withReceipt.autopilot.byFamily[0]).toMatchObject({ decisions: 1, agreed: 1 });
+  });
 });
 
 describe('buildYieldReport and renderTextReport', () => {
