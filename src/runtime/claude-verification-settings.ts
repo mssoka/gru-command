@@ -95,7 +95,7 @@ export class ClaudeVerificationPermissionChannel {
   }
 
   private write(frame: StreamFrame): void {
-    if (this.closed || this.child.stdin === null || this.child.stdin.destroyed || this.child.stdin.writableEnded) {
+    if (this.closed || this.child.stdin == null || this.child.stdin.destroyed || this.child.stdin.writableEnded) {
       this.fail('worker verification permission transport is unavailable');
       return;
     }
