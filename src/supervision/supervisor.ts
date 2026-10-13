@@ -259,6 +259,10 @@ interface RejectedRestartCleanup {
   readonly agent: SupervisedAgent;
   readonly recovery: InterruptedTurn | null;
   readonly preserveController: boolean;
+  /** true = the replacement's captured authority was superseded, so the
+   * controller is abandoned once custody settles. false = an unbound
+   * replacement (binding failure) whose controller stays retryable. */
+  readonly superseded: boolean;
   disposalAcknowledged: boolean;
   notificationId: string | null;
   debt: RestartCleanupDebt | null;
@@ -1368,6 +1372,15 @@ export class Supervisor {
         this.clearRateLimitRetry(agent, 'superseded');
         return;
       }
+      // The captured turn must still match the current native authority
+      // across every await: a newer rebrief or directive during the backoff
+      // window supersedes this incident, and its prompt must never be
+      // re-delivered on the old handle (the same fence the absorb path and
+      // every restart await apply).
+      if (!this.recoveryAuthorityCurrent(agent, incident.recovery)) {
+        this.clearRateLimitRetry(agent, 'superseded');
+        return;
+      }
       if (agent.role === 'minion' && this.workerGate !== undefined) {
         retryLease = await this.workerGate.acquireWorkerTurn({
           id: agent.agentId, label: `rate-limit retry → ${agent.agentId}`, agentId: agent.agentId,
@@ -1375,6 +1388,12 @@ export class Supervisor {
           signal: incident.admissionAbort.signal,
         });
         if (this.disposed || agent.rateLimitRetry !== incident || this.agents.get(agent.agentId) !== agent) return;
+        // Admission waited on the gate: the authority fence must be re-checked
+        // again here, after the awaited admission.
+        if (!this.recoveryAuthorityCurrent(agent, incident.recovery)) {
+          this.clearRateLimitRetry(agent, 'superseded');
+          return;
+        }
       }
       // Defensive: a scheduled rung must never start while another delivery
       // is still in flight. Its settlement owns the next transition.
@@ -1677,7 +1696,15 @@ export class Supervisor {
         agent.activityGeneration === queued.activityGeneration &&
         queuedTurnStillMatches
       ) {
-        void this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError, queued.source);
+        // Replay the newest queued trigger INSIDE this classification's
+        // lifecycle: a failed recovered delivery awaits the classification
+        // promises, and a still-running (or newly queued) replay must stay in
+        // that custody. A fire-and-forget replay would let settlement observe
+        // `decisionPending` and give up, silently dropping the turn's orphan
+        // notice and leaving a phantom pending-recovery blocker.
+        const replay = this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError, queued.source);
+        if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(replay);
+        await replay;
       }
     }
   }
@@ -1943,6 +1970,16 @@ export class Supervisor {
       // Respawn with resume (crash = resume, SPEC ruling 3).
       const resumeFile = agent.sessionFile;
       try {
+        // A transient ledger fault inside captureJobAuthority leaves the
+        // captured job authority unreadable (null epoch) with a non-null job
+        // id. Every post-spawn fence would reject such a replacement, so
+        // refuse BEFORE the destructive spawn: throwing fails the rung
+        // retryably with backoff instead of spawn-then-dispose churn with no
+        // retry. (A captured turn with an unreadable authority never reaches
+        // here — the rung's entry fence already returned.)
+        if (restartAuthority.jobId !== null && restartAuthority.authorityEpoch === null) {
+          throw new Error('captured job authority is unreadable; refusing replacement spawn');
+        }
         // SPEC ruling 17: a minion resumes in the job lane it serves (which
         // also keeps the lane's bound BMAD runtime, issue #283), unless its
         // owning subsystem's policy names the cwd itself.
@@ -2004,14 +2041,21 @@ export class Supervisor {
           } catch (error) {
             // Never recover a prompt on a replacement whose known ownership
             // could not be recorded; the existing ladder reports/retries it.
-            // A dispose hiccup is reported but must not mask the actionable
-            // binding error (mirrors the stale-result path above).
-            await this.registry.disposeHandle(spawned).catch((disposeError: unknown) => {
+            // Route the unbound replacement through the SAME exact cleanup
+            // custody as every rejected replacement (issue #280): a disposal
+            // rejection must leave a quarantined, fenced producer with durable
+            // debt and a needs-owner notice, never an unaccounted hidden one.
+            // This is NOT supersede custody — the controller stays retryable
+            // and the rung still fails to the ladder — so a dispose hiccup is
+            // reported without masking the actionable binding error (mirrors
+            // the stale-result path above).
+            const cleanupError = await this.rejectRestartReplacement(agent, spawned, reason, restartAuthority, false);
+            if (cleanupError !== null) {
               this.log('warn', 'dispose of the unbound replacement failed — the binding error is preserved', {
                 agent_id: spawned.id,
-                error: String(disposeError),
+                error: cleanupError,
               });
-            });
+            }
             throw error;
           }
         }
@@ -2090,13 +2134,14 @@ export class Supervisor {
     spawned: AgentHandle,
     reason: string,
     authority: RecoveryAuthority,
-  ): Promise<void> {
+    superseded = true,
+  ): Promise<string | null> {
     const recovery = agent.pendingRecovery;
     // Captured before spawn: failed authority reads must not lose cleanup's job.
     const { jobId } = authority;
     const preserveController = agent.breakerOpen && this.agents.get(agent.agentId) === agent;
-    const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, preserveController, disposalAcknowledged: false,
-      notificationId: null, debt: null, detach: () => {}, settling: false };
+    const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, preserveController, superseded,
+      disposalAcknowledged: false, notificationId: null, debt: null, detach: () => {}, settling: false };
     this.rejectedRestartCleanup.set(spawned, cleanup);
     const observeProof = (): void => {
       if (!cleanup.disposalAcknowledged || !this.restartCessationConfirmed(spawned)) return;
@@ -2109,7 +2154,10 @@ export class Supervisor {
     });
     const detachEvidence = spawned.subscribe((event) => { if (event.type === 'cessation_evidence') observeProof(); });
     cleanup.detach = () => { detachSettlement(); detachEvidence(); };
-    if (!preserveController) this.rejectedRestartControllers.add(agent);
+    // Supersede custody abandons the rejected controller. Unbound custody
+    // (a failed binding whose rung still retries) must NOT mark it rejected —
+    // the retry's fresh same-id adoption would evict and supersede itself.
+    if (!preserveController && superseded) this.rejectedRestartControllers.add(agent);
     const observed = this.agents.get(spawned.id);
     if (observed?.handle === spawned) {
       this.clearRateLimitRetry(observed, 'superseded');
@@ -2121,13 +2169,25 @@ export class Supervisor {
     try {
       // Journal physical custody before entering the asynchronous disposal.
       cleanup.debt = this.cleanupJournal.begin(spawned, jobId, agent.agentId);
+    } catch (error) {
+      // The pending-custody write failed. Physical custody stays in memory
+      // (rejectedRestartCleanup + the pendingProducerBlockers retry); disposal
+      // below must STILL run — a skipped disposal is an unaccounted, live
+      // hidden producer.
+      cleanupError = String(error);
+    }
+    try {
       await this.registry.disposeHandle(spawned);
       cleanup.disposalAcknowledged = true;
       if (!this.restartCessationConfirmed(spawned)) throw new Error('adapter-owned cessation evidence is unknown after disposal');
       this.settleRejectedRestartCleanup(spawned, cleanup);
     } catch (error) {
-      cleanupError = String(error);
-      if (!preserveController) {
+      cleanupError ??= String(error);
+    }
+    if (cleanupError !== null) {
+      // Supersede custody stops the abandoned controller. Unbound custody
+      // keeps it retryable, so the rung's failure ladder owns the state.
+      if (!preserveController && superseded) {
         agent.state = 'stopped';
         agent.stopReason = `restart cleanup unconfirmed: ${spawned.id}`;
         agent.stoppedAt = this.now();
@@ -2150,7 +2210,12 @@ export class Supervisor {
           origin_seq: cleanup.debt?.originSeq ?? null,
           replacement_agent_id: spawned.id,
           authority_epoch: authority.authorityEpoch,
-          disposition: cleanupError === null ? 'disposed' : 'cleanup-unconfirmed',
+          // Only a durable pending journal entry may classify the audit as
+          // cleanup-unconfirmed: an unbound audit (generation null) can never
+          // be cleared by a later CONFIRMED receipt, so a failed pending write
+          // must not mint permanent, uncleareable debt.
+          disposition: cleanupError === null ? 'disposed'
+            : cleanup.debt !== null ? 'cleanup-unconfirmed' : 'cleanup-unjournaled',
           ...(cleanupError !== null ? { error: cleanupError } : {}),
         },
       });
@@ -2177,6 +2242,7 @@ export class Supervisor {
         this.log('error', 'restart cleanup notification could not be posted', { agent_id: agent.agentId, error: String(error) });
       }
     }
+    return cleanupError;
   }
 
   private restartCessationConfirmed(handle: AgentHandle): boolean {
@@ -2198,9 +2264,13 @@ export class Supervisor {
     cleanup.detach();
     this.rejectedRestartCleanup.delete(handle);
     const { agent, recovery, notificationId } = cleanup;
-    if (!cleanup.preserveController && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
-    // Preserve explicit owner/provider stops and their re-arm custody.
-    if (!cleanup.preserveController && this.agents.get(agent.agentId) === agent && agent.handle === null) this.agents.delete(agent.agentId);
+    // Supersede custody abandons the rejected controller once cleanup settles:
+    // its obsolete recovery ownership and live record are released. Unbound
+    // custody retains both — the rung's retry still owns the entity.
+    if (cleanup.superseded) {
+      if (!cleanup.preserveController && agent.pendingRecovery === recovery) agent.pendingRecovery = null;
+      if (!cleanup.preserveController && this.agents.get(agent.agentId) === agent && agent.handle === null) this.agents.delete(agent.agentId);
+    }
     if (notificationId !== null) {
       try {
         this.ledger.resolveNotificationById(notificationId, 'supervision-cleanup-confirmed');

@@ -1917,6 +1917,163 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(f.replacement.promptCalls).toEqual([]);
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
+
+  it('still disposes the rejected replacement and mints no unclearable debt when the pending cleanup journal write fails (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer authorized work', briefing: null });
+      const append = f.rig.api.appendCustomEvent.bind(f.rig.api);
+      let pendingWriteAttempts = 0;
+      const store = vi.spyOn(f.rig.api, 'appendCustomEvent').mockImplementation((fields) => {
+        if (fields.kind === 'supervision.restart-cleanup-pending') {
+          pendingWriteAttempts += 1;
+          throw new Error('pending custody storage unavailable');
+        }
+        return append(fields);
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(pendingWriteAttempts).toBeGreaterThan(0);
+      // A failed pending write must never SKIP disposal: a live hidden
+      // replacement is the exact unaccounted-producer state #280 closes.
+      expect(f.replacement.disposed).toBe(true);
+      expect(f.rig.registry.getHandle(f.replacement.id)).toBeNull();
+      expect(f.rig.supervisor.viewFor(f.replacement.id)).toBeNull();
+      // Custody survives in memory while no durable entry could be written.
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('pending journal write failed');
+      // The fallback audit must not claim cleanup-unconfirmed without an
+      // originating pending entry: a generation-null audit is permanent debt
+      // no later CONFIRMED receipt could ever clear.
+      const rejected = f.rig.api.listJobEvents(f.jobId, { limit: 100 }).filter((event) => event.kind === 'supervision.restart-rejected');
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0]?.payload).toMatchObject({ disposition: 'cleanup-unjournaled', generation: null, origin_seq: null });
+      // Once the pending store recovers, the SAME in-memory custody retries the
+      // exact journal receipt and clears — proving the debt was never permanent.
+      store.mockRestore();
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.api.latestJobEvent(f.jobId, 'supervision.restart-cleanup-confirmed')).not.toBeNull();
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('retains exact cleanup custody when a replacement binding failure and its disposal both reject (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredDispatchRestart();
+    try {
+      f.register.mockImplementation(() => { throw new Error('binding store unavailable'); });
+      f.replacement.dispose = async () => { throw new Error('binding cleanup refused'); };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      // The unbound replacement was never adopted, but its failed disposal is
+      // accounted exactly like any rejected replacement: durable debt, a
+      // needs-owner notice and a retirement blocker. (#280 / ECH-1)
+      expect(f.register).toHaveBeenCalled();
+      expect(f.rig.supervisor.viewFor(f.replacement.id)).toBeNull();
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain(`cleanup unconfirmed: ${f.replacement.id}`);
+      expect(f.rig.supervisor.pendingProducerBlockers('unrelated-job')).toEqual([]);
+      expect(f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed')).toHaveLength(1);
+      expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-rejected')?.payload)
+        .toMatchObject({ disposition: 'cleanup-unconfirmed', replacement_agent_id: f.replacement.id });
+      // The controller is NOT superseded: the rung still fails to the ladder.
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('pending recovery/retry');
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('fences the captured job with in-memory custody when the pending journal and rejection audit writes both fail (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer authorized work', briefing: null });
+      f.replacement.dispose = async () => { throw new Error('replacement cleanup refused'); };
+      const append = f.rig.api.appendCustomEvent.bind(f.rig.api);
+      const store = vi.spyOn(f.rig.api, 'appendCustomEvent').mockImplementation((fields) => {
+        if (fields.kind === 'supervision.restart-cleanup-pending' || fields.kind === 'supervision.restart-rejected') {
+          throw new Error('supervision event store unavailable');
+        }
+        return append(fields);
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      // After the flight has settled, the ONLY surviving custody is the
+      // in-memory unjournaled blocker — it must still fence the job.
+      expect(f.rig.api.latestJobEvent(f.jobId, 'supervision.restart-cleanup-pending')).toBeNull();
+      expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).filter((event) => event.kind === 'supervision.restart-rejected')).toEqual([]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' '))
+        .toContain(`restart cleanup unconfirmed: ${f.replacement.id} (pending journal write failed)`);
+      expect(f.rig.supervisor.pendingProducerBlockers('unrelated-job')).toEqual([]);
+      store.mockRestore();
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('awaits the queued classification replay so a doubly-failed recovered turn still posts exactly one orphan (GH-280)', async () => {
+    vi.useFakeTimers();
+    const releases: ((value: ReturnType<typeof deterministicOutcome>) => void)[] = [];
+    // The fatal restart trigger classifies immediately; the recovered turn's
+    // two generic errors defer so the second is queued while the first decides.
+    const decide = vi.fn((request: Parameters<DecisionService['decide']>[0]) => {
+      if (decide.mock.calls.length === 1) {
+        return Promise.resolve(deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+      }
+      return new Promise<ReturnType<typeof deterministicOutcome>>((resolve) => { releases.push(resolve); });
+    });
+    const f = await deferredDispatchRestart(true, {}, { decide } as unknown as DecisionService);
+    try {
+      let releasePrompt!: () => void;
+      f.replacement.promptHook = (text, options) => new Promise<void>((resolve) => {
+        f.replacement.pendingTurnSnapshot = { text, owner: options?.owner ?? null };
+        releasePrompt = () => { f.replacement.setState('error'); resolve(); };
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      // The recovered delivery is in flight; two generic errors arrive while it
+      // still awaits its turn, so both classifications belong to it.
+      f.replacement.emit({ type: 'error', error: 'ordinary tool exception', fatal: false });
+      f.replacement.emit({ type: 'error', error: 'second ordinary tool exception', fatal: false });
+      await flushMicrotasks();
+      expect(releases).toHaveLength(1);
+      // Resolve the first classification: its queued replay starts, still running.
+      releases[0]!(deterministicOutcome(decide.mock.calls[1]![0], DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+      await flushMicrotasks();
+      expect(releases).toHaveLength(2);
+      // The recovered turn now fails in-band while the queued replay is still
+      // deciding. Settlement must WAIT for the replay, not give up on it.
+      releasePrompt();
+      await flushMicrotasks();
+      expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toEqual([]);
+      releases[1]!(deterministicOutcome(decide.mock.calls[2]![0], DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled'));
+      await flushMicrotasks();
+      // The doubly-failed recovered turn is accounted as exactly one orphan,
+      // not silently dropped behind a phantom pending-recovery blocker.
+      expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toHaveLength(1);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(f.rig.supervisor.viewFor(f.original.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('refuses the destructive spawn when an idle restart captured an unreadable job authority, then retries honestly (GH-280)', async () => {
+    vi.useFakeTimers();
+    const rig = boot(undefined, { maxRestarts: 2 });
+    try {
+      const jobId = 'idle-sentinel-job';
+      rig.api.addJob({ id: jobId, repo: 'fixture', title: 'Idle unreadable authority' });
+      rig.api.setJobStatus(jobId, 'working');
+      const original = new FakeHandle('minion', 'idle-sentinel-original', null);
+      rig.registry.adopt(original);
+      rig.api.registerAgent({ id: original.id, role: 'minion', jobId });
+      const epoch = vi.spyOn(rig.api, 'directiveRecoveryEpoch').mockImplementation(() => { throw new Error('authority store unavailable'); });
+      original.emit({ type: 'error', error: 'idle session stream died', fatal: true });
+      await flushMicrotasks();
+      // No replacement is created while the captured authority is unreadable:
+      // every post-spawn fence could only reject it (spawn-then-dispose churn
+      // with no retry). The rung fails retryably BEFORE the destructive spawn.
+      expect(rig.registry.spawnCalls).toHaveLength(0);
+      expect(rig.supervisor.viewFor(original.id)).toMatchObject({ state: 'watching' });
+      // Once the authority store recovers, the scheduled rung spawns normally.
+      epoch.mockRestore();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(rig.registry.spawnCalls).toHaveLength(1);
+    } finally { rig.dispose(); vi.useRealTimers(); }
+  });
 });
 
 describe('supervisor — idle restart after retirement handoff (GH-279)', () => {
@@ -3504,6 +3661,30 @@ describe('supervisor — automatic rate-limit retries (owner heist 2026-09-29, s
     emitFailure(handle, 'HTTP 429');
     expect(sleeper.delays).toEqual([100, 100]);
     h.dispose();
+  });
+
+  it('revalidates native authority after the backoff and never re-delivers a superseded retry (GH-280)', async () => {
+    const sleeper = new ManualSleeper();
+    const h = boot(undefined, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0 });
+    try {
+      const jobId = 'job-429-authority';
+      h.api.addJob({ id: jobId, repo: 'fixture', title: 'Rate-limit authority fence' });
+      h.api.setJobStatus(jobId, 'working');
+      const handle = new FakeHandle('minion', 'minion-429-authority', null);
+      handle.pendingTurnSnapshot = { text: 'resume authorized work', owner: `dispatch:${jobId}` };
+      h.registry.adopt(handle);
+      h.api.registerAgent({ id: handle.id, role: 'minion', jobId });
+      emitFailure(handle, 'HTTP 429');
+      expect(sleeper.delays).toEqual([100]);
+      // A newer native rebrief supersedes the captured authority DURING backoff.
+      h.api.beginPendingRebrief({ jobId, note: 'newer native authority', briefing: null });
+      await sleeper.release();
+      // The stale retry is superseded, never re-delivered on the old handle.
+      expect(handle.promptCalls).toEqual([]);
+      expect(handle.disposed).toBe(false);
+      expect(h.api.listEvents({ limit: 100 }).some((event) => event.kind === 'pacing.auto-retry-recovered')).toBe(false);
+      expect(h.supervisor.viewFor(handle.id)?.breakerOpen).toBe(false);
+    } finally { h.dispose(); }
   });
 
   it('duplicate failure signals of one failure never double-count the attempt', async () => {
