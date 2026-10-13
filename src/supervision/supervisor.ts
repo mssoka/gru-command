@@ -48,6 +48,12 @@ function defaultSleep(ms: number): Promise<void> {
 export interface SupervisorRegistry {
   onAgentEvent(listener: (envelope: AgentEventEnvelope) => void): () => void;
   getHandle(agentId: string): AgentHandle | null;
+  /** Revoke lookup eligibility for a handle supervision rejected: a
+   * quarantined handle is never returned by getHandle, so no dispatch path
+   * can hand a supervisor-refused producer new work while its cleanup is
+   * outstanding (issue #280 AC1). Implementations make this monotonic;
+   * disposal, or registry shutdown, drops the record. */
+  quarantineHandle(handle: AgentHandle): void;
   spawn(role: Role, options?: SpawnOptions): Promise<AgentHandle>;
   disposeHandle(handle: AgentHandle): Promise<void>;
 }
@@ -758,23 +764,23 @@ export class Supervisor {
   // Registry tap feed
   // ------------------------------------------------------------------
 
-  private onEnvelope(envelope: AgentEventEnvelope): void {
-    if (this.disposed) return;
+  private onEnvelope(envelope: AgentEventEnvelope): Promise<void> | null {
+    if (this.disposed) return null;
     try {
       if (envelope.phase === 'spawned') {
         const handle = envelope.handle ?? this.registry.getHandle(envelope.agentId);
         // The awaiting owner, not its tap, adopts its authorized result.
-        if (handle !== null && [...this.restartingAgents.values()].some((flight) => flight.handle === handle)) return;
+        if (handle !== null && [...this.restartingAgents.values()].some((flight) => flight.handle === handle)) return null;
         this.adopt(handle ?? null, null, envelope.sessionFile, envelope);
-        return;
+        return null;
       }
       const current = this.agents.get(envelope.agentId);
-      if (envelope.handle !== undefined && current?.handle !== envelope.handle) return;
+      if (envelope.handle !== undefined && current?.handle !== envelope.handle) return null;
       if (envelope.handle === undefined && current?.handle !== null &&
-        [...this.restartingAgents.values()].some((flight) => flight.superseded && flight.handle?.id === envelope.agentId)) return;
+        [...this.restartingAgents.values()].some((flight) => flight.superseded && flight.handle?.id === envelope.agentId)) return null;
       if (envelope.phase === 'disposed') {
         const agent = this.agents.get(envelope.agentId);
-        if (agent === undefined) return;
+        if (agent === undefined) return null;
         // A disposed handle can never deliver a pending retry: conclude
         // the incident with it (the delivery continuation self-cancels
         // too) and supersede any restart-recovery admission wait.
@@ -790,13 +796,13 @@ export class Supervisor {
         if (agent.slot === null && !agent.inRestart && !agent.breakerOpen) {
           this.agents.delete(envelope.agentId); // owner-disposed minion: stop watching
         }
-        return;
+        return null;
       }
       // phase 'event'
       const agent = this.agents.get(envelope.agentId);
-      if (agent === undefined) return;
+      if (agent === undefined) return null;
       const event = envelope.event;
-      if (event === undefined) return;
+      if (event === undefined) return null;
       agent.lastEventAt = this.now();
       // Adapters emit `error` followed immediately by their sticky
       // `state:error`. The latter is the same failure, not recovery/new
@@ -875,7 +881,7 @@ export class Supervisor {
               agent_id: agent.agentId,
               error: event.error,
             });
-            void this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true, {
+            return this.evaluateRecovery(agent, `fatal error: ${event.error}`, true, true, {
               provider: event.provider ?? null,
               model: event.model ?? null,
               error: event.error,
@@ -895,6 +901,7 @@ export class Supervisor {
                 typed: event.typed ?? null,
               });
               if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(classification);
+              return classification;
             }
           }
           break;
@@ -910,6 +917,7 @@ export class Supervisor {
         error: String(error),
       });
     }
+    return null;
   }
 
   /** Idempotent adoption by agent id; creates or refreshes the record. */
@@ -1379,6 +1387,10 @@ export class Supervisor {
       // every restart await apply).
       if (!this.recoveryAuthorityCurrent(agent, incident.recovery)) {
         this.clearRateLimitRetry(agent, 'superseded');
+        // The flight-replay path installs this exact object as
+        // pendingRecovery; superseding the incident must consume that same
+        // ownership or it strands as a permanent pending-recovery blocker.
+        if (agent.pendingRecovery === incident.recovery) agent.pendingRecovery = null;
         return;
       }
       if (agent.role === 'minion' && this.workerGate !== undefined) {
@@ -1392,6 +1404,8 @@ export class Supervisor {
         // again here, after the awaited admission.
         if (!this.recoveryAuthorityCurrent(agent, incident.recovery)) {
           this.clearRateLimitRetry(agent, 'superseded');
+          // Same exact-ownership consumption as the pre-admission fence.
+          if (agent.pendingRecovery === incident.recovery) agent.pendingRecovery = null;
           return;
         }
       }
@@ -1877,8 +1891,18 @@ export class Supervisor {
           if (source !== undefined && delivery?.errors.has(source)) delivery.snapshots.add(snapshot);
           current.pendingRecovery = snapshot;
         }
-        this.onEnvelope({ handle, agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile,
+        // A startup error replayed here may take its own custody (fatal
+        // restart, provider wall, or bounded retry). A plain generic error
+        // takes none: settle the retained recovery after the classification
+        // concludes, or the interrupted turn strands behind a phantom
+        // pending-recovery blocker and is never resumed or visibly orphaned.
+        const replayed = this.onEnvelope({ handle, agentId: handle.id, role: handle.role, sessionFile: handle.sessionFile,
           phase: 'event', event: flight.pendingError });
+        if (replayed !== null) {
+          void replayed
+            .then(() => this.settleStrandedStartupRecovery(current, handle, reason))
+            .catch((error: unknown) => { this.log('error', 'stranded startup recovery settlement failed', { agent_id: handle.id, error: String(error) }); });
+        }
       }
     }
   }
@@ -2143,6 +2167,12 @@ export class Supervisor {
     const cleanup: RejectedRestartCleanup = { jobId, agent, recovery, preserveController, superseded,
       disposalAcknowledged: false, notificationId: null, debt: null, detach: () => {}, settling: false };
     this.rejectedRestartCleanup.set(spawned, cleanup);
+    // A published-but-rejected replacement is already registry-gettable: its
+    // publication preceded these post-spawn fences. Revoke that eligibility
+    // synchronously, before the asynchronous disposal, so no directive-routing
+    // or dispatch lookup can hand the refused producer new work even when the
+    // disposal later rejects (#280 AC1).
+    this.registry.quarantineHandle(spawned);
     const observeProof = (): void => {
       if (!cleanup.disposalAcknowledged || !this.restartCessationConfirmed(spawned)) return;
       try { this.settleRejectedRestartCleanup(spawned, cleanup); }
@@ -2165,7 +2195,7 @@ export class Supervisor {
       if (observed.backoffTimer !== null) clearTimeout(observed.backoffTimer);
       this.agents.delete(spawned.id);
     }
-    let cleanupError: string | null = null;
+    let journalError: string | null = null;
     try {
       // Journal physical custody before entering the asynchronous disposal.
       cleanup.debt = this.cleanupJournal.begin(spawned, jobId, agent.agentId);
@@ -2174,16 +2204,29 @@ export class Supervisor {
       // (rejectedRestartCleanup + the pendingProducerBlockers retry); disposal
       // below must STILL run — a skipped disposal is an unaccounted, live
       // hidden producer.
-      cleanupError = String(error);
+      journalError = String(error);
     }
+    let disposalError: string | null = null;
     try {
       await this.registry.disposeHandle(spawned);
       cleanup.disposalAcknowledged = true;
       if (!this.restartCessationConfirmed(spawned)) throw new Error('adapter-owned cessation evidence is unknown after disposal');
       this.settleRejectedRestartCleanup(spawned, cleanup);
     } catch (error) {
-      cleanupError ??= String(error);
+      disposalError = String(error);
     }
+    // CURRENT custody, never the historical journal error, decides the outcome.
+    // The disposal await can retry the pending write and fully settle custody
+    // (`pendingProducerBlockers`), and a synchronous settlement observer can
+    // settle too. If a failed first pending write survived in `cleanupError`,
+    // the appended audit would point at an origin already confirmed and
+    // dropped: replay would classify it as permanent generation-null debt and
+    // block retirement of an acknowledged, proven-ceased replacement forever.
+    // Both failures stay in the diagnostic instead of one masking the other.
+    const settled = !this.rejectedRestartCleanup.has(spawned);
+    const cleanupError = settled
+      ? null
+      : [journalError, disposalError].filter((value): value is string => value !== null).join('; ') || null;
     if (cleanupError !== null) {
       // Supersede custody stops the abandoned controller. Unbound custody
       // keeps it retryable, so the rung's failure ladder owns the state.
@@ -2231,7 +2274,10 @@ export class Supervisor {
           title: `Superseded minion ${spawned.id}: cleanup is unconfirmed`,
           detail: `Replacement ${spawned.id} for job ${jobId ?? '(unbound)'} was refused automatic recovery, but cleanup is unconfirmed: ${cleanupError}. ` +
             'Producer ownership remains unknown. Only the original native owner can persist acknowledgment and positive cessation proof. ' +
-            'If that owner is lost in a hard crash, proof is unavailable: ACK, restart and successor cleanup cannot release custody. No automatic restart is authorized.',
+            'If that owner is lost in a hard crash, proof is unavailable: ACK, restart and successor cleanup cannot release custody. ' +
+            (superseded
+              ? 'No automatic restart is authorized.'
+              : 'The owning restart rung still retries this binding after its backoff.'),
           agentId: agent.agentId,
         });
         cleanup.notificationId = notice.id;
@@ -2376,6 +2422,17 @@ export class Supervisor {
       this.log('warn', 'interrupted turn authority unavailable — automatic recovery fenced', { agent_id: agent.agentId, job_id: jobId, error: String(error) });
       return false;
     }
+  }
+
+  /** After a deferred restart replay's classification settles: if no stop,
+   * restart, or bounded retry took custody of the retained turn, resume it on
+   * the live handle or post its orphan notice. Without this a generic nonfatal
+   * startup error leaves the turn behind a permanent pending-recovery blocker. */
+  private settleStrandedStartupRecovery(agent: SupervisedAgent, handle: AgentHandle, reason: string): void {
+    if (this.disposed || this.agents.get(agent.agentId) !== agent || agent.handle !== handle) return;
+    if (agent.inRestart || agent.breakerOpen || agent.rateLimitRetry !== null || agent.recoveryAdmission !== null) return;
+    if (agent.pendingRecovery === null) return;
+    this.recoverInterruptedTurn(agent, handle, reason);
   }
 
   /**

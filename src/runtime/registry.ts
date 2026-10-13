@@ -177,6 +177,7 @@ export class RuntimeRegistry {
   private readonly nativeAdapters = new Map<RuntimeId, PiRuntime | ClaudeCodeRuntime>();
   private readonly handles = new Set<AgentHandle>();
   private readonly unpublished = new Set<AgentHandle>();
+  private readonly quarantined = new Set<AgentHandle>();
   private readonly ceasedReviewOwners = new Map<string, string>();
 
   /** Pi isolated review tools and host-native callbacks run inside this
@@ -685,6 +686,7 @@ export class RuntimeRegistry {
       }
       this.handles.delete(resident);
       this.unpublished.delete(resident);
+      this.quarantined.delete(resident);
       this.residents.unwatch(resident);
       release?.();
       // AFTER the permit is actually released: notify capacity consumers
@@ -858,9 +860,18 @@ export class RuntimeRegistry {
   /** Live handle by agent id (E7 supervision feed), or null. */
   getHandle(agentId: string): AgentHandle | null {
     for (const handle of this.handles) {
-      if (handle.id === agentId && !this.unpublished.has(handle)) return handle;
+      if (handle.id === agentId && !this.unpublished.has(handle) && !this.quarantined.has(handle)) return handle;
     }
     return null;
+  }
+
+  /** Revoke lookup eligibility for a handle its owner rejected: a quarantined
+   * handle is no longer returned by getHandle, so no dispatch/consumer path
+   * can hand a supervisor-refused producer new work while its cleanup is
+   * outstanding (issue #280 AC1). The quarantine is monotonic — disposal, or
+   * registry shutdown, drops the record (and the quarantined handle with it). */
+  quarantineHandle(handle: AgentHandle): void {
+    if (this.handles.has(handle)) this.quarantined.add(handle);
   }
 
   /** The shared offline pi ModelRuntime for read-only consumers (the
@@ -918,6 +929,7 @@ export class RuntimeRegistry {
     for (const handle of [...this.handles]) await this.disposeHandle(handle);
     for (const adapter of this.adapters.values()) await adapter.dispose();
     this.adapters.clear();
+    this.quarantined.clear();
   }
 }
 

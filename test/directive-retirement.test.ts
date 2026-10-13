@@ -315,7 +315,7 @@ describe('directive retirement — evidence-fenced control closure', () => {
     const restored = new LedgerDb(h.dir); const api = new LedgerApi(restored.handle); const bus = new EventBus();
     supervisor = new Supervisor({ ledger: api, notifications: new NotificationCenter({ ledger: api, bus }),
       config: { enabled: false, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
-      registry: { getHandle: () => null, onAgentEvent: () => () => {}, spawn: async () => { throw new Error('must not spawn'); }, disposeHandle: async () => {} } });
+      registry: { getHandle: () => null, quarantineHandle: () => {}, onAgentEvent: () => () => {}, spawn: async () => { throw new Error('must not spawn'); }, disposeHandle: async () => {} } });
     try {
       expect(supervisor.pendingProducerBlockers('unrelated')).toEqual([]);
       const refused = await retire(h, row.requestId, laneHead(lane));

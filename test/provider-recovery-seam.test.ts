@@ -103,6 +103,7 @@ class FakeRegistry implements SupervisorRegistry {
   private readonly listeners = new Set<(envelope: AgentEventEnvelope) => void>();
   readonly handles = new Map<string, FakeHandle>();
   private readonly unpublished = new Set<AgentHandle>();
+  private readonly quarantined = new Set<AgentHandle>();
   private next = 0;
   onAgentEvent(listener: (envelope: AgentEventEnvelope) => void): () => void {
     this.listeners.add(listener);
@@ -115,7 +116,10 @@ class FakeRegistry implements SupervisorRegistry {
   }
   getHandle(agentId: string): AgentHandle | null {
     const handle = this.handles.get(agentId);
-    return handle !== undefined && !this.unpublished.has(handle) ? handle : null;
+    return handle !== undefined && !this.unpublished.has(handle) && !this.quarantined.has(handle) ? handle : null;
+  }
+  quarantineHandle(handle: AgentHandle): void {
+    if (this.handles.get(handle.id) === handle) this.quarantined.add(handle);
   }
   spawns = 0;
   /** Test hook: observe EVERY spawned handle, whichever path spawns it
@@ -151,6 +155,7 @@ class FakeRegistry implements SupervisorRegistry {
   }
   async disposeHandle(handle: AgentHandle): Promise<void> {
     this.unpublished.delete(handle);
+    this.quarantined.delete(handle);
     this.handles.delete(handle.id);
     await handle.dispose();
   }

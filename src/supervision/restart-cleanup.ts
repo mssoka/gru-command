@@ -33,6 +33,10 @@ export class RestartCleanupJournal {
   private cursor = 0;
   private readonly debts = new Map<number, RestartCleanupDebt>();
   private readonly origins = new Map<number, RestartCleanupDebt>();
+  /** Cleanup-unjournaled audits: the only durable record of a hidden producer
+   * whose pending entry could not be written. Kept separate so a later bound
+   * pending+confirmed pair with the same replacement id can clear them. */
+  private readonly unjournaled = new Map<number, RestartCleanupDebt>();
   private readonly owned = new WeakMap<AgentHandle, RestartCleanupDebt>();
   private readonly writing = new WeakSet<AgentHandle>();
 
@@ -83,6 +87,19 @@ export class RestartCleanupJournal {
           // retain event-identity debt. ID-only confirmations can never clear it.
           if (!bound) this.debts.set(event.seq, { originSeq: event.seq, generation: null,
             jobId: event.jobId, agentId: event.agentId, replacementAgentId: text(data.replacement_agent_id) });
+        } else if (event.kind === 'supervision.restart-rejected' && data.disposition === 'cleanup-unjournaled') {
+          // The pending journal write failed, so this audit is the ONLY durable
+          // record of an unconfirmed hidden producer. Until a later bound
+          // pending+confirmed pair proves a real disposal for the same
+          // replacement, retain it as clearable debt: a crash must never let
+          // retirement proceed past the surviving record.
+          const replacementAgentId = text(data.replacement_agent_id);
+          if (replacementAgentId !== null) {
+            const debt = { originSeq: event.seq, generation: null, jobId: event.jobId,
+              agentId: event.agentId, replacementAgentId };
+            this.debts.set(event.seq, debt);
+            this.unjournaled.set(event.seq, debt);
+          }
         } else if (event.kind === CONFIRMED && typeof data.origin_seq === 'number') {
           const debt = this.debts.get(data.origin_seq);
           if (debt !== undefined && debt.generation !== null && debt.replacementAgentId !== null && debt.agentId !== null &&
@@ -95,6 +112,15 @@ export class RestartCleanupJournal {
             // the origins map stays bounded (audit events replay in ascending
             // order, so no later audit can still need it).
             this.origins.delete(debt.originSeq);
+            // A later bound pending+confirmed pair for the same replacement also
+            // discharges any cleanup-unjournaled audit that predates it: the
+            // disposal that audit recorded as unconfirmed is now proven.
+            for (const [seq, audit] of this.unjournaled) {
+              if (audit.jobId === debt.jobId && audit.replacementAgentId === debt.replacementAgentId && seq < debt.originSeq) {
+                this.debts.delete(seq);
+                this.unjournaled.delete(seq);
+              }
+            }
           }
         }
         this.cursor = event.seq;
