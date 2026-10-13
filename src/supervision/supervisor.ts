@@ -373,6 +373,10 @@ export class Supervisor {
   private readonly jitter: (capMs: number) => number;
   /** Late-bound restart specialization (issue #161; see the option doc). */
   private restartPolicyFor: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined;
+  /** Late-bound blind-coverage observer (issue #339): a restart-recovered
+   * turn is a resume too. The dispatch service that owns the scan is built
+   * after the supervisor, so this is installed by `setObserveBlindTurn`. */
+  private observeBlindTurn: ((jobId: string, sessionFile: string | null) => void) | null = null;
   private readonly agents = new Map<string, SupervisedAgent>();
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
@@ -411,6 +415,15 @@ export class Supervisor {
    * here. Returning undefined = default restart. */
   setRestartPolicy(policy: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined): void {
     this.restartPolicyFor = policy;
+  }
+
+  /** Issue #339: install the blind-coverage observer for supervisor-recovered
+   * turns (late-bound: the dispatch service that owns the scan is built after
+   * the supervisor). A restarted blind reviewer's recovered turn is a resume,
+   * so its prohibited reads must invalidate coverage exactly like the initial
+   * dispatch and re-brief settle seams. */
+  setObserveBlindTurn(observe: (jobId: string, sessionFile: string | null) => void): void {
+    this.observeBlindTurn = observe;
   }
 
   /** Start the watchdog ticker. */
@@ -2085,6 +2098,11 @@ export class Supervisor {
       lease?.release();
       lease = null;
       const disposition = await this.awaitRetrySettlement(agent.agentId);
+      // Issue #339: this recovered turn is a resume too — observe its
+      // settled session on every post-settlement exit (including the
+      // exhausted/superseded return below) so the no-bypass guarantee holds
+      // on the supervisor restart path as well.
+      this.observeRecoveredBlindAccess(laneAgentId, handle);
       if (disposition === 'exhausted' || disposition === 'superseded') {
         this.log('warn', 'interrupted turn did not resume under its automatic retries', {
           agent_id: laneAgentId,
@@ -2114,6 +2132,10 @@ export class Supervisor {
       // escalated to the owner as a failed resume; a spent budget keeps the
       // same ladder truth as the resolve path.
       const disposition = await this.awaitRetrySettlement(agent.agentId);
+      // Issue #339: observe the recovered turn's session here too — a
+      // rejected or in-band-error turn can still have read prohibited
+      // material before it settled.
+      this.observeRecoveredBlindAccess(laneAgentId, handle);
       if (!stillCurrent()) return;
       if (disposition === 'recovered') {
         this.recordEvent('supervision.turn-recovery', laneAgentId, {
@@ -2143,6 +2165,23 @@ export class Supervisor {
     } finally {
       if (agent.recoveryAdmission === controller) agent.recoveryAdmission = null;
       lease?.release();
+    }
+  }
+
+  /** Issue #339: record the finished recovered turn's observed tool access
+   * against the rule the job was admitted under (no-op for a non-blind job
+   * or an agent with no job). The production observer owns its own error
+   * boundary; this one keeps a raw port from failing an already-delivered
+   * turn. */
+  private observeRecoveredBlindAccess(laneAgentId: string, handle: AgentHandle): void {
+    const observe = this.observeBlindTurn;
+    if (observe === null) return;
+    const jobId = this.ledger.getAgent(laneAgentId)?.jobId ?? null;
+    if (jobId === null) return;
+    try {
+      observe(jobId, handle.sessionFile);
+    } catch (error) {
+      this.log('error', 'blind review access observation failed', { job: jobId, error: String(error) });
     }
   }
 

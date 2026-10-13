@@ -1193,6 +1193,11 @@ async function main(): Promise<number> {
   // recovery), so none can bypass it.
   const observeBlindTurn = (jobId: string, sessionFile: string | null): void =>
     dispatcher.observeBlindSession(jobId, sessionFile);
+  // Issue #339: a supervisor restart-recovered turn is a resume too. The
+  // supervisor is built before the dispatcher, so install the same observer
+  // late — otherwise a restarted blind reviewer that reads prohibited
+  // material keeps qualifying coverage.
+  supervisorLive.setObserveBlindTurn(observeBlindTurn);
   // The durable queue's mechanical consumer: one shared-budget-aware
   // reconsider pass over the ledger-backed pipeline, triggered by enqueue,
   // bus transitions and runtime capacity events. No timer, no second
@@ -1472,6 +1477,7 @@ async function main(): Promise<number> {
                     ledger,
                     worktrees: worktreeManager,
                     slotReArm: slotReArmPort,
+                    retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
                     observeBlindTurn,
                     log: (level, msg, fields) => logger.log(level, msg, fields),
                   },

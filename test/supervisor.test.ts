@@ -32,6 +32,12 @@ import { promptVerdictFromHealth } from '../src/runtime/prompt-verdict.js';
 import type { PromptTurnVerdict } from '../src/runtime/types.js';
 import { DispatchService } from '../src/dispatch/service.js';
 import { routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
+import {
+  admitBlindReview,
+  blindCoverageOf,
+  observeBlindSessionAccess,
+  recordBlindAdmission,
+} from '../src/dispatch/blind-review.js';
 import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
@@ -2163,6 +2169,50 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     expect(recovery.some((event) => (event.payload as Record<string, unknown>)['disposition'] === 'resumed')).toBe(true);
     // A resumable turn never orphans the lane.
     expect(h.notificationsOfKind('supervision.turn-orphaned.minion-resume')).toHaveLength(0);
+    h.dispose();
+  });
+
+  it('a recovered turn on a restarted blind reviewer is observed, invalidating coverage (issue #339 D1)', async () => {
+    const h = boot();
+    const jobId = 'job-blind-recover';
+    h.api.addJob({ id: jobId, repo: 'fixture', title: 'blind review' });
+    h.api.setJobStatus(jobId, 'working');
+    h.api.registerAgent({ id: 'minion-blind-recover', role: 'minion', jobId });
+    const targetSha = 'f'.repeat(40);
+    const admission = admitBlindReview({
+      ledger: h.api,
+      jobId,
+      title: 'review (blind)',
+      deliverable: 'review',
+      briefing: 'Review the immutable package read-only.',
+      targetSha,
+      repoName: 'fixture',
+      inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+    });
+    if (admission === null) throw new Error('the job was not admitted as a blind review');
+    recordBlindAdmission(h.api, jobId, admission);
+    // The observer is installed late in production (main.ts) — the dispatch
+    // service is built after the supervisor.
+    h.supervisor.setObserveBlindTurn((observedJobId, sessionFile) =>
+      observeBlindSessionAccess(h.api, observedJobId, sessionFile));
+    const sessionDir = join(tmpDir(), 'minion');
+    mkdirSync(sessionDir, { recursive: true });
+    const sessionFile = join(sessionDir, 'blind-recover.jsonl');
+    writeFileSync(sessionFile, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`, 'utf-8');
+    const handle = new FakeHandle('minion', 'minion-blind-recover', sessionFile);
+    handle.pendingTurnSnapshot = { text: 'finish the review', owner: `dispatch:${jobId}` };
+    h.registry.adopt(handle);
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
+    hang(handle);
+    h.advance(60);
+    await vi.waitFor(() => {
+      expect(blindCoverageOf(h.api, jobId).state).toBe('invalidated');
+    }, { timeout: 5_000 });
+    // The recovered turn's session was scanned: without the supervisor seam
+    // the restarted reviewer would keep qualifying coverage.
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
     h.dispose();
   });
 
