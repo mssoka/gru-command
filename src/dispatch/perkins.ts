@@ -2687,9 +2687,11 @@ export class WaveRunner {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     // Branch-idle still gates the freeze. A minion's own busy turn may
     // acknowledge an intent now; it is armed only after job.delivered.
+    const armedTargetRef = this.resolveLocalRequestTarget(input);
+    const idleRequest = { ...input, ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) };
     let forceAuthorization: ForceAuthorization | undefined;
     try {
-      forceAuthorization = this.enforceBranchIdleForRequest(input);
+      forceAuthorization = this.enforceBranchIdleForRequest(idleRequest);
     } catch (error) {
       if (!(error instanceof BranchBusyError) || input.handoff !== true || input.force === true ||
         error.blockers.length === 0 || error.blockers.some((blocker) => blocker.jobId !== input.jobId) ||
@@ -2755,7 +2757,7 @@ export class WaveRunner {
     const jobLaneAtArm = lanesAtArm.find((lane) => lane.kind === 'job' && lane.jobId === input.jobId && lane.status !== 'swept') ?? null;
     const targetBranch = resolveReviewTargetBranch({
       jobId: input.jobId,
-      ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+      ...(idleRequest.targetRef !== undefined ? { targetRef: idleRequest.targetRef } : {}),
       lanePath: jobLaneAtArm?.path ?? null,
       laneBranch: jobLaneAtArm?.branch ?? null,
     });
@@ -2803,7 +2805,7 @@ export class WaveRunner {
       // A forced request must FIRST reject newly arrived blockers; logging
       // another override before that proof would misstate what the owner
       // authorized at the original arm.
-      if (input.force !== true) this.enforceBranchIdleForRequest(input);
+      if (input.force !== true) this.enforceBranchIdleForRequest(idleRequest);
       // The shared guard early-returns without a job lane, so re-prove the
       // CURRENT lane/marker/authorization facts directly at this seam
       // (fail closed on a missing lane instead of reusing the pre-await
@@ -2820,7 +2822,7 @@ export class WaveRunner {
       }
       const admission = { lanePath, ...fallbackBaseline };
       this.assertFallbackIterationCurrent(input, admission);
-      if (input.force === true) this.enforceBranchIdleForRequest({ ...input, forceAuthorization: forceAuthorization ?? new Map() });
+      if (input.force === true) this.enforceBranchIdleForRequest({ ...idleRequest, forceAuthorization: forceAuthorization ?? new Map() });
       // The fallback gate cannot deliver private evidence: refuse the arm
       // rather than run the fallback review without the promised material.
       if (input.evidence !== undefined && input.evidence.length > 0) {
@@ -2834,7 +2836,8 @@ export class WaveRunner {
       const pending = this.handoffs.get(input.jobId);
       this.assertHandoffAuthorized(input.jobId, pending?.seq ?? -1);
     }
-    const begun = await this.beginPerkinsRound({ ...input, reviewModel: result.reviewModel,
+    const begun = await this.beginPerkinsRound({ ...input,
+      ...(armedTargetRef !== undefined ? { armedTargetRef } : {}), reviewModel: result.reviewModel,
       reviewThinkingLevel: result.reviewThinkingLevel,
       ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
     return { route: 'perkins', round: begun.round, run: begun.run };
@@ -3031,7 +3034,9 @@ export class WaveRunner {
      * receipt); Stage-5 carry-forward always re-verifies claimed priors. */
     claimedFixedPriors?: readonly number[];
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
-    const forceAuthorization = this.enforceBranchIdleForRequest(input);
+    const armedTargetRef = this.resolveLocalRequestTarget(input);
+    const forceAuthorization = this.enforceBranchIdleForRequest({ ...input,
+      ...(armedTargetRef !== undefined ? { targetRef: armedTargetRef } : {}) });
     let reviewModel: ReviewPreflightResult['reviewModel'];
     let reviewThinkingLevel: string | undefined;
     if (this.opts.reviewPreflight !== undefined) {
@@ -3043,7 +3048,8 @@ export class WaveRunner {
         reviewThinkingLevel = result.reviewThinkingLevel;
       }
     }
-    return this.beginPerkinsRound({ ...input, reviewModel, reviewThinkingLevel,
+    return this.beginPerkinsRound({ ...input,
+      ...(armedTargetRef !== undefined ? { armedTargetRef } : {}), reviewModel, reviewThinkingLevel,
       ...(forceAuthorization !== undefined ? { forceAuthorization } : {}) });
   }
 
@@ -3054,6 +3060,20 @@ export class WaveRunner {
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job') ?? null;
     return lane?.path ?? null;
+  }
+
+  /** Preserve named local targets before preflight can admit a shadowing tag.
+   * Origin spellings retain their existing fetch/live-PR classification. */
+  private resolveLocalRequestTarget(input: { readonly jobId: string; readonly targetRef?: string }): string | undefined {
+    const job = this.opts.ledger.getJob(input.jobId);
+    if (job === null || isJobTerminal(job.status)) return undefined;
+    // A default PR lane branch is only a hint; the live PR head is authority.
+    if (job.prUrl !== null && input.targetRef === undefined) return undefined;
+    const lane = this.opts.worktrees.listWorktrees({ jobId: input.jobId }).find((entry) => entry.kind === 'job');
+    if (lane === undefined) return undefined;
+    const ref = input.targetRef ?? lane.branch ?? lane.sha;
+    if (isExactOriginBranchSpelling(ref)) return undefined;
+    return this.localTargetIdentity(lane.path, ref) ?? undefined;
   }
 
   /** Arm-intake branch-idle check. An unknown job is left to the round setup
@@ -3212,6 +3232,8 @@ export class WaveRunner {
   private async beginPerkinsRound(input: {
     jobId: string;
     targetRef?: string;
+    /** Canonical local name sampled before awaited preflight; never a replacement force authority. */
+    armedTargetRef?: string;
     /** Clean-abort re-arm: the exact delivered head proved at request time;
      * re-proved at the freeze boundary before any lens runs. */
     boundDeliveredSha?: string;
@@ -4078,6 +4100,8 @@ export class WaveRunner {
   private async setupRound(input: {
     jobId: string;
     targetRef?: string;
+    /** Canonical local name sampled before awaited preflight; never a replacement force authority. */
+    armedTargetRef?: string;
     /** Clean-abort re-arm: the exact delivered head proved at request time;
      * re-proved at the freeze boundary before any lens runs. */
     boundDeliveredSha?: string;
@@ -4121,11 +4145,12 @@ export class WaveRunner {
       throw new Error('Perkins review lens set is canonical and cannot be reduced or reordered');
     }
     const artifactRoot = this.artifactRoot();
-    const candidateRef = input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
+    const candidateRef = input.armedTargetRef ?? input.targetRef ?? jobWorktree.branch ?? jobWorktree.sha;
     const { targetSha, movementRef, targetBranch } = await this.resolveFreezeTarget({
       job,
       jobWorktree,
       candidateRef,
+      ...(input.armedTargetRef !== undefined ? { armedTargetRef: input.armedTargetRef } : {}),
       explicitTarget: input.targetRef !== undefined && input.targetRef.trim() !== '',
     });
     // R8-18: a shutdown during resolution starts nothing — no round, no worktree.
@@ -4288,6 +4313,7 @@ export class WaveRunner {
       if (jobAtFreeze !== null && isJobTerminal(jobAtFreeze.status)) {
         throw new Error(`job "${job.id}" is ${jobAtFreeze.status} — terminal lanes do not go back under review`);
       }
+      this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
       // Freeze-time close of the race window: a lane may have re-opened
       // between the arm intake and this freeze. The same refusal applies.
       const idleInput = {
@@ -4459,6 +4485,7 @@ export class WaveRunner {
         // material change, or a writer that owns the lane) withdraws here,
         // before any admission effect — the rollback below unwinds it.
         if (setupSignal.reason instanceof ReviewSupersededError) throw setupSignal.reason;
+        this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
       }
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
@@ -4634,6 +4661,45 @@ export class WaveRunner {
     return name === '' ? null : name;
   }
 
+  /** Names require canonical Git identity; pins require explicit revision
+   * syntax or one uniquely identified object, never merely empty output.
+   * C-locale diagnostics make ambiguity errors distinguishable from tracing. */
+  private localTargetIdentity(repoPath: string, ref: string): string | null {
+    const options = { encoding: 'utf-8' as const, timeout: 30_000,
+      env: { ...repositoryGitEnv(false), LC_ALL: 'C' } };
+    const result = spawnSync('git', ['-C', repoPath, '-c', 'core.warnAmbiguousRefs=true',
+      'rev-parse', '--symbolic-full-name', '--verify', ref], options);
+    const name = (result.stdout ?? '').trim();
+    const failIdentity = (): never => {
+      throw new Error(`review target identity for ${ref} is lost, ambiguous or unverifiable — retry with an exact named ref or intentional commit pin`);
+    };
+    const failedDiagnostic = /(?:^|\n)(?:error|fatal):|(?:^|\n)warning:[^\n]*\bambiguous\b/u;
+    if (result.error !== undefined || result.status !== 0 || failedDiagnostic.test(result.stderr ?? '')) failIdentity();
+    if (/^refs\/[^\r\n]+$/u.test(name)) return name;
+    if (name === ref && /^[A-Z_]+$/u.test(name)) return null; // Source-bound Git pseudo-ref.
+    if (name !== '') failIdentity();
+    if (/^[a-f0-9]{4,64}$/iu.test(ref)) {
+      const objects = spawnSync('git', ['-C', repoPath, 'rev-parse', `--disambiguate=${ref.toLowerCase()}`], options);
+      if (objects.error === undefined && objects.status === 0 && !failedDiagnostic.test(objects.stderr ?? '') &&
+        /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test((objects.stdout ?? '').trim())) return null;
+    } else {
+      // A verified revision whose syntax cannot name a ref is an intentional
+      // expression pin. Valid-but-missing/ambiguous names never take this path.
+      const shape = spawnSync('git', ['-C', repoPath, 'check-ref-format', '--allow-onelevel', ref], options);
+      if (shape.error === undefined && shape.status === 1 && !failedDiagnostic.test(shape.stderr ?? '')) return null;
+    }
+    return failIdentity();
+  }
+
+  /** Same OID is insufficient when a named ref becomes an alias to a
+   * different identity. Retain the captured name; never authorize its replacement. */
+  private assertNamedTargetIdentity(repoPath: string, expectedRef: string): void {
+    if (!expectedRef.startsWith('refs/')) return;
+    if (this.localTargetIdentity(repoPath, expectedRef) !== expectedRef) {
+      throw new Error(`review target identity for ${expectedRef} changed before admission — refusing replacement authority`);
+    }
+  }
+
   /** True when origin currently advertises a branch by that name — the
    * SHORT-spelling collision bit (Perkins r6 B2). Read-only, bounded; a
    * failed probe reports a collision (the remote route — PR-head
@@ -4652,12 +4718,14 @@ export class WaveRunner {
     job: { readonly id: string; readonly prUrl: string | null };
     jobWorktree: { readonly path: string; readonly repoPath: string };
     candidateRef: string;
+    readonly armedTargetRef?: string;
     /** True when the caller explicitly named `candidateRef` (target_ref). */
     explicitTarget: boolean;
   }): Promise<{ readonly targetSha: string; readonly movementRef: string; readonly targetBranch?: string }> {
-    const candidateBranch = input.job.prUrl === null
-      ? null
-      : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
+    const armedTargetBranch = input.armedTargetRef !== undefined && /^(?:refs\/heads\/|refs\/remotes\/)/u.test(input.armedTargetRef)
+      ? normalizeBranch(input.armedTargetRef) : null;
+    const candidateBranch = input.job.prUrl === null ? null : input.armedTargetRef !== undefined
+      ? armedTargetBranch : prBranchCandidate(input.jobWorktree.repoPath, input.candidateRef);
     // An EXACT origin branch spelling is NEVER an explicit pin (Perkins
     // R3/R5): a remote-only origin/topic is invisible to prBranchCandidate
     // (nothing local resolves), but it still names a REMOTE BRANCH, and
@@ -4721,8 +4789,15 @@ export class WaveRunner {
           ...(resolved.trackingRef !== null ? { targetBranch: normalizeBranch(resolved.trackingRef) } : {}),
         };
       }
-      const targetSha = resolveGitCommit(input.jobWorktree.path, input.candidateRef);
-      const movementRef = this.resolvedLocalRefName(input.jobWorktree.path, input.candidateRef) ?? targetSha;
+      const identity = this.localTargetIdentity(input.jobWorktree.path, input.candidateRef);
+      if (input.armedTargetRef !== undefined && identity !== input.armedTargetRef) {
+        throw new Error(`review target identity for ${input.armedTargetRef} changed before freeze — refusing replacement authority`);
+      }
+      const targetSha = resolveGitCommit(input.jobWorktree.path, identity ?? input.candidateRef);
+      if (identity !== null && this.localTargetIdentity(input.jobWorktree.path, identity) !== identity) {
+        throw new Error(`review target identity for ${identity} changed during commit resolution — refusing replacement authority`);
+      }
+      const movementRef = identity ?? targetSha;
       return {
         targetSha,
         ...(/^(?:refs\/heads\/|refs\/remotes\/)/u.test(movementRef) ? { targetBranch: normalizeBranch(movementRef) } : {}),

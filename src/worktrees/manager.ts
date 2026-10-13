@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   copyFileSync,
@@ -712,7 +712,7 @@ export class WorktreeManager {
       const custody = this.creationCustody(branch, sha);
       let record;
       try {
-        this.addLane(repo.repoPath, path, custody);
+        await this.addLane(repo.repoPath, path, custody);
         await this.bootstrap(repo.repoPath, path);
         this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
@@ -728,7 +728,7 @@ export class WorktreeManager {
           jobId: input.jobId,
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, custody, error);
+        await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
       this.handoffLane(repo.repoPath, path, custody);
@@ -775,7 +775,7 @@ export class WorktreeManager {
       const custody = this.creationCustody(null, resolved.sha);
       let record;
       try {
-        this.addLane(repo.repoPath, path, custody);
+        await this.addLane(repo.repoPath, path, custody);
         // Review lanes must contain only bytes tracked by the frozen commit.
         // Job bootstrap links/setup outputs are intentionally not applied.
         const sha = runGit(path, ['rev-parse', 'HEAD']);
@@ -794,7 +794,7 @@ export class WorktreeManager {
           ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, custody, error);
+        await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
       this.handoffLane(repo.repoPath, path, custody);
@@ -854,7 +854,7 @@ export class WorktreeManager {
       const custody = this.creationCustody(branch, parentHead);
       let record;
       try {
-        this.addLane(repo.repoPath, path, custody);
+        await this.addLane(repo.repoPath, path, custody);
         if (input.authority === 'writer') await this.bootstrap(repo.repoPath, path);
         const sha = runGit(path, ['rev-parse', 'HEAD']);
         this.assertCreationIdentity(path, custody);
@@ -873,7 +873,7 @@ export class WorktreeManager {
           jobId: input.jobId,
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, custody, error);
+        await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
       this.handoffLane(repo.repoPath, path, custody);
@@ -1135,18 +1135,159 @@ export class WorktreeManager {
     return { token: `gru-creation:${randomUUID()}`, branch, sha, branchCreated: false, addAttempted: false };
   }
 
-  private addLane(repoPath: string, path: string, custody: CreationCustody): void {
+  private async addLane(repoPath: string, path: string, custody: CreationCustody): Promise<void> {
     if (custody.branch !== null) {
-      // A zero old value is Git's atomic create-only guard; an external
-      // creator between the earlier checks and here keeps its branch.
-      runGit(repoPath, ['update-ref', '--create-reflog', '-m', custody.token,
-        `refs/heads/${custody.branch}`, custody.sha, '0'.repeat(custody.sha.length)]);
+      await this.updateDirectCreationRef(repoPath, custody, 'create');
       custody.branchCreated = true;
     }
     custody.addAttempted = true;
     runGit(repoPath, ['worktree', 'add', '--lock', '--reason', custody.token,
       ...(custody.branch === null ? ['--detach'] : []), path, custody.branch ?? custody.sha]);
     this.assertCreationIdentity(path, custody);
+  }
+
+  /** A prepared no-deref transaction holds the exact ref-name lock. Git's
+   * zero-old/create guard alone accepts dangling symrefs, even with no-deref;
+   * inspect the still-unmodified name UNDER that lock before committing. */
+  private async updateDirectCreationRef(repoPath: string, custody: CreationCustody, operation: 'create' | 'delete'): Promise<void> {
+    if (custody.branch === null) throw new Error('branchless creation cannot mutate a branch ref');
+    const ref = `refs/heads/${custody.branch}`;
+    // Ref names enter Git's line-oriented transaction protocol, not argv.
+    runGit(repoPath, ['check-ref-format', ref]);
+    const child = spawn('git', ['update-ref', '--stdin', '--no-deref', '--create-reflog', '-m', custody.token], {
+      cwd: repoPath, env: repositoryGitEnv(false),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const outputLimit = 16 * 1024 * 1024;
+    const confirmationTimeoutMs = 30_000;
+    const stopTimeoutMs = 1_000;
+    let stderrBytes = 0;
+    let stdoutBytes = 0;
+    let stderrTail = Buffer.alloc(0);
+    let pending = Buffer.alloc(0);
+    const expected = ['start', 'prepare'];
+    const confirmed = new Set<string>();
+    let notify: (() => void) | undefined;
+    let failure: Error | undefined;
+    let exited = false;
+    let closed = false;
+    let status: number | null = null;
+    let signal: NodeJS.Signals | null = null;
+    const transactionError = (detail: string): Error => new Error(
+      `git update-ref ${operation} ${ref}: ${detail} — transaction authority unconfirmed; resources retained`,
+    );
+    const fail = (error: Error): void => {
+      failure ??= error;
+      notify?.();
+    };
+    // Count bytes even when retaining only a diagnostic tail. Hooks still run
+    // normally, but neither an unterminated line nor queued replies can grow.
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (failure !== undefined) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > outputLimit) fail(transactionError('stderr output exceeded 16 MiB'));
+      else stderrTail = Buffer.concat([stderrTail, chunk.subarray(-4096)]).subarray(-4096);
+    });
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (failure !== undefined) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > outputLimit) return fail(transactionError('stdout output exceeded 16 MiB'));
+      pending = Buffer.concat([pending, chunk]);
+      let newline = pending.indexOf(10);
+      while (newline !== -1) {
+        if (newline > 64) return fail(transactionError('stdout confirmation exceeded 64 bytes'));
+        const reply = pending.subarray(0, newline).toString('utf8').replace(/\r$/u, '');
+        pending = pending.subarray(newline + 1);
+        const phase = expected.shift();
+        if (phase === undefined || reply !== `${phase}: ok`) {
+          return fail(transactionError(`invalid ${phase ?? 'unsolicited'} confirmation`));
+        }
+        confirmed.add(phase);
+        notify?.();
+        newline = pending.indexOf(10);
+      }
+      if (pending.length > 64) fail(transactionError('stdout confirmation exceeded 64 bytes'));
+    });
+    child.on('error', (error) => { fail(transactionError(error.message)); });
+    child.stdin.on('error', (error: Error) => { fail(transactionError(error.message)); });
+    child.stdout.on('error', (error: Error) => { fail(transactionError(error.message)); });
+    child.stderr.on('error', (error: Error) => { fail(transactionError(error.message)); });
+    child.on('exit', (code, killedBy) => { exited = true; status = code; signal = killedBy; });
+    const stopped = new Promise<void>((done) => child.on('close', () => {
+      closed = true;
+      if (expected.length > 0 || pending.length > 0) {
+        fail(transactionError(`missing or unterminated confirmation: ${stderrTail.toString('utf8').trim()}`));
+      }
+      done();
+    }));
+    const confirm = async (phase: string): Promise<void> => {
+      if (failure !== undefined) throw failure;
+      if (confirmed.has(phase)) return;
+      await new Promise<void>((done, reject) => {
+        const timer = setTimeout(() => fail(transactionError(`${phase} confirmation timed out after 30000ms`)), confirmationTimeoutMs);
+        notify = () => {
+          if (failure === undefined && !confirmed.has(phase)) return;
+          clearTimeout(timer);
+          notify = undefined;
+          if (failure !== undefined) reject(failure);
+          else done();
+        };
+      });
+    };
+    const waitForStop = async (): Promise<boolean> => {
+      if (closed) return true;
+      return new Promise<boolean>((done) => {
+        const timer = setTimeout(() => done(false), stopTimeoutMs);
+        void stopped.then(() => { clearTimeout(timer); done(true); });
+      });
+    };
+    let committed = false;
+    let stopFailure: Error | undefined;
+    try {
+      child.stdin.write(`start\n${operation} ${ref} ${custody.sha}\nprepare\n`);
+      await confirm('start');
+      await confirm('prepare');
+      const symbolic = spawnGit(repoPath, ['symbolic-ref', '--quiet', '--no-recurse', ref], { timeoutMs: confirmationTimeoutMs });
+      if (symbolic.status !== 1) {
+        throw new Error(`branch name ${ref} is symbolic or unverifiable — refusing ${operation} without changing its alias or referent`);
+      }
+      if (failure !== undefined) throw failure;
+      expected.push('commit');
+      child.stdin.write('commit\n');
+      await confirm('commit');
+      if (failure !== undefined) throw failure;
+      committed = true;
+    } catch (error) {
+      fail(error instanceof Error ? error : transactionError(String(error)));
+    } finally {
+      try { child.stdin.end(committed ? '' : 'abort\n'); }
+      catch (error) { fail(transactionError(String(error))); }
+      if (!await waitForStop()) {
+        stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} did not close within 1000ms`);
+        // Signal only the ChildProcess we spawned, never a group, discovered
+        // PID or ref lock. An exited child may just have inherited pipes open.
+        if (!exited && child.pid !== undefined) {
+          try { child.kill('SIGTERM'); } catch (error) { fail(transactionError(String(error))); }
+        }
+        if (!await waitForStop() && !exited && child.pid !== undefined) {
+          try { child.kill('SIGKILL'); } catch (error) { fail(transactionError(String(error))); }
+          await waitForStop();
+        }
+      }
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (!closed && !exited) {
+        stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} termination unconfirmed`);
+        child.unref();
+      }
+    }
+    if (stopFailure !== undefined) {
+      throw new AggregateError([...(failure === undefined ? [] : [failure]), stopFailure],
+        `${failure?.message ?? 'Git transaction settlement failed'}; ${stopFailure.message}`);
+    }
+    if (failure !== undefined) throw failure;
+    if (status !== 0 || signal !== null) throw transactionError(`exit ${status}, signal ${signal}: ${stderrTail.toString('utf8').trim()}`);
   }
 
   /** Registration requires the requested checkout authority, independently
@@ -1205,6 +1346,9 @@ export class WorktreeManager {
   private assertBranchCreationCustody(repoPath: string, custody: CreationCustody, ownedPath: string | null): void {
     if (!custody.branchCreated || custody.branch === null) return;
     const ref = `refs/heads/${custody.branch}`;
+    if (spawnGit(repoPath, ['symbolic-ref', '--quiet', '--no-recurse', ref]).status !== 1) {
+      throw new Error(`created branch ${ref} is no longer a direct ref`);
+    }
     const receipt = runGit(repoPath, ['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
     const tip = runGit(repoPath, ['rev-parse', '--verify', ref]);
     const trees = runGit(repoPath, ['worktree', 'list', '--porcelain', '-z']);
@@ -1223,7 +1367,7 @@ export class WorktreeManager {
   /** Only matching Git-native invocation receipts permit destructive
    * rollback. Check ALL custody before any cleanup; uncertainty retains the
    * resources and reports both the original failure and the missing proof. */
-  private rollbackPartialLane(repoPath: string, path: string, custody: CreationCustody, originalError: unknown): void {
+  private async rollbackPartialLane(repoPath: string, path: string, custody: CreationCustody, originalError: unknown): Promise<void> {
     try {
       const present = custody.addAttempted && existsSync(path);
       const orphanAdmin = custody.addAttempted && !present ? this.orphanCreationAdmin(repoPath, path, custody) : null;
@@ -1240,7 +1384,7 @@ export class WorktreeManager {
         if (ownedPath === null || heldRef !== `refs/heads/${custody.branch}`) {
           throw new Error(`created branch ${custody.branch} has no invocation-owned checkout reservation`);
         }
-        runGit(repoPath, ['update-ref', '-d', `refs/heads/${custody.branch}`, custody.sha]);
+        await this.updateDirectCreationRef(repoPath, custody, 'delete');
       }
       if (ownedPath !== null) {
         // Git protects locked lanes even against a single --force.
