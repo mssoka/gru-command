@@ -10,14 +10,20 @@ import { createProductionDeterministicPass } from '../src/dispatch/durable-recon
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { preflightFailure } from '../src/dispatch/review-path.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
+import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 const dirs: string[] = [];
-afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+const repos: FixtureRepo[] = [];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const repo of repos.splice(0)) repo.cleanup();
+});
 
 /** Minimal REAL composition: SilasDriver (real trigger/bus/sweep) driving a
  * REAL WaveRunner queued handoff through the deterministic seam. */
 describe('Silas deterministic-pass seam drives actual handoff reconsideration', () => {
   it('a bus wake event arms an idle-lane handoff with NO second API call, before any slot wake, without double start', async () => {
+    const repo = makeFixtureRepo('seam-comp-source'); repos.push(repo);
     const root = mkdtempSync(join(tmpdir(), 'seam-comp-port-')); dirs.push(root);
     const dbDir = mkdtempSync(join(tmpdir(), 'seam-comp-db-')); const db = new LedgerDb(dbDir); dirs.push(dbDir);
     // Two buses: the ledger publishes on its own; the wave and driver share
@@ -27,16 +33,17 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
     const bus = new EventBus();
     const ledgerBus = new EventBus();
     const ledger = new LedgerApi(db.handle, { bus: ledgerBus });
-    const port = new GitReviewPort(root, 'main', 'a'.repeat(40));
+    const port = new GitReviewPort(root, 'main', repo.head());
     const job = ledger.addJob({ id: 'job-seam', repo: 'fixture', title: 'seam', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
-    await port.createJobWorktree({ repoPath: root, jobId: job.id });
+    await port.createJobWorktree({ repoPath: repo.path, jobId: job.id });
     const order: string[] = [];
     const spawner = vi.fn();
     const wave = new WaveRunner({
       ledger, worktrees: port, spawner, bus,
       reviewPreflight: async () => { order.push('preflight'); return { ok: false as const, failures: [preflightFailure('review-policy', 'disabled')] }; },
     });
+    const requestReview = vi.spyOn(wave, 'requestReview');
     const accepted = await wave.requestReview({ jobId: job.id, handoff: true });
     expect(accepted.route).toBe('queued');
     // The lane settles for real (a recorded delivery), while the CONTROL
@@ -44,7 +51,7 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
     // the deterministic pass — not a second API request — may arm the
     // queued handoff. The status stays working: a settled delivery is the
     // review-ready point, not a status flip.
-    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: 'seam-settled' } });
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: { sha: repo.head() } });
     const sweep: { cb: (() => void) | null } = { cb: null };
     const driver = new SilasDriver({
       slot: {
@@ -83,11 +90,18 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
     expect(order).not.toContain('slot-wake');
     const terminal = ledger.latestJobEvent(job.id, 'job.review-handoff-started') ?? ledger.latestJobEvent(job.id, 'job.review-handoff-failed');
     expect(terminal).not.toBeNull();
+    expect(order).toContain('preflight');
+    const terminalCount = ledger.listJobEvents(job.id).filter((event) =>
+      event.kind === 'job.review-handoff-started' || event.kind === 'job.review-handoff-failed').length;
     // Sweep tick fires the hook again: bounded, no duplicate start (the
     // pending entry is gone after its terminal outcome).
     sweep.cb?.();
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(order.filter((entry) => entry === 'hook').length).toBeGreaterThanOrEqual(2);
+    expect(requestReview.mock.calls.filter(([input]) => input.fromHandoff !== true)).toHaveLength(1);
+    expect(requestReview).toHaveBeenCalledTimes(2); // Initial API arm plus the internal deterministic replay.
+    expect(ledger.listJobEvents(job.id).filter((event) =>
+      event.kind === 'job.review-handoff-started' || event.kind === 'job.review-handoff-failed')).toHaveLength(terminalCount);
     await wave.shutdown();
     driver.stop();
   }, 30_000);

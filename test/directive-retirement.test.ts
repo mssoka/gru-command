@@ -1389,7 +1389,12 @@ describe('directive retirement — continuation boundary and consumers', () => {
     h.ledger.setJobStatus('job-review-escape', 'delivered');
     h.ledger.setJobPr('job-review-escape', 'https://github.com/example/fixture/pull/1');
     expect((await retire(h, 'req-review-escape', laneHead(lane))).status).toBe(200);
-    for (const extra of [{ force: true }, { target_ref: 'gru/unrelated' }, { force: true, target_ref: 'gru/unrelated' }]) {
+    repo.git(['tag', lane.branch!, laneHead(lane)]); // Same-SHA ambiguity must not mask the own hold either.
+    expect(() => repo.git(['show-ref', '--verify', 'refs/heads/gru/unrelated'])).toThrow();
+    const refs = repo.git(['show-ref']);
+    const lanes = h.worktrees.listWorktrees();
+    for (const extra of [{ force: true }, { target_ref: 'gru/unrelated' }, { force: true, target_ref: 'gru/unrelated' },
+      { target_ref: lane.branch }, { force: true, target_ref: lane.branch }]) {
       const result = await call(h.port, 'POST', '/api/dispatch/review', { job_id: 'job-review-escape', ...extra }, TOKEN);
       expect(result.status).toBe(409);
       expect(field<string>(result.json, 'error')).toBe('branch_busy');
@@ -1398,6 +1403,12 @@ describe('directive retirement — continuation boundary and consumers', () => {
     expect(h.spawns).toEqual([]);
     expect(countEvents(h, 'branch-idle.forced')).toBe(0);
     expect(countEvents(h, 'silas.directive-retired')).toBe(1);
+    expect(countEvents(h, 'round.admission-preflight')).toBe(0);
+    expect(countEvents(h, 'branch-idle.refused')).toBe(5);
+    expect(h.ledger.hasOpenDirectiveRecoveryHold('job-review-escape')).toBe(true);
+    expect(laneHead(lane)).toBe(repo.head());
+    expect(repo.git(['show-ref'])).toBe(refs);
+    expect(h.worktrees.listWorktrees()).toEqual(lanes);
   });
 
   it('refuses pending supervisor ownership even with an idle durable agent', async () => {

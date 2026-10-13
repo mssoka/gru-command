@@ -17,7 +17,7 @@ import {
   type AppFetch,
   type AppFetchInit,
 } from '../src/dispatch/perkins-github-app.js';
-import { AutoVerdictPoster, GhPrPoster, GitLabMrPoster, type VerdictPoster, type VerdictPosterInput } from '../src/dispatch/perkins.js';
+import { AutoVerdictPoster, DefiniteNonDeliveryError, GhPrPoster, GitLabMrPoster, type VerdictPoster, type VerdictPosterInput } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 // ---------------------------------------------------------------------------
@@ -953,6 +953,28 @@ describe('fail-closed credential and identity checks', () => {
         expect(posts(api.calls)).toBe(1);
       }
     }
+  });
+
+  it('classifies the stale-token POST refusal as a definite non-delivery, not an ambiguous publication (#340)', async () => {
+    // The stale token is refused BEFORE any POST: the thrown error names the
+    // no-POST fact so the WaveRunner cannot misclassify it as an unknown
+    // outcome whose retry "could duplicate a real publication".
+    const fixture = bundleFixture();
+    let clock = NOW;
+    const api = makeApiDouble([
+      { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => {
+        clock += 3_600_001; // the pre-POST probes outlast the minted token
+        return { status: 200, body: { number: 7, head: { sha: HEAD }, base: { sha: BASE } } };
+      } },
+    ]);
+    const poster = new PerkinsAppPrPoster({ instanceDir: fixture.home, fetchImpl: api.fetchImpl, now: () => clock });
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(error).toBeInstanceOf(DefiniteNonDeliveryError);
+    expect(error?.message).toMatch(/installation token .*(expired|expires too soon).*before the review POST/u);
+    expect(error?.message).toMatch(/no POST was sent/u);
+    // No review POST reached the wire, so a retry cannot duplicate anything.
+    expect(api.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
   });
 
   it('fails on an expired token grant and maps mint rejections to actionable named errors', async () => {

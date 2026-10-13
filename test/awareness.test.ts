@@ -2839,11 +2839,12 @@ describe('GH-104 (g7): Gru actions are labeled apart from passive board activity
       const rig = away();
       rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
       const alert = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Fix' });
-      rig.api.disposeMachineNotification(alert.id, 'Repaired the lane');
+      rig.api.disposeMachineNotification(alert.id, 'Repaired the lane', { credential: 'shared-bearer', declaredActor: 'gru' });
       const text = rig.awareness.prepare()!.text;
       expect(text).toContain('- activity: 1 board event');
       expect(text).toContain('- Gru actions: 1 disposition');
-      expect(text.split('\n')).toContain(`- Machine disposition [${alert.id}]: Repaired the lane`);
+      expect(text.split('\n')).toContain(`- Machine disposition [${alert.id}]: Repaired the lane (declared actor: gru)`);
+      expect(text).toContain('(declared actor: gru)');
       expect(text).not.toContain('Gru disposition');
       rig.awareness.dispose();
     } finally { vi.useRealTimers(); }
