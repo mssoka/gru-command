@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
@@ -93,6 +93,10 @@ class FakeAgents implements DirectiveRegistry {
   healthError: string | null = null;
   /** When set, every minion prompt waits on this gate before settling. */
   gate: Promise<void> | null = null;
+  /** Issue #339: the side effect a real turn has on its session — tests append
+   * the continuation's reads HERE, so a scan placed before delivery reads a
+   * clean file and cannot pass by reading prewritten contamination. */
+  promptEffect: ((text: string) => void) | null = null;
   private readonly expectedSessionFile: string | null;
 
   constructor(expectedSessionFile: string | null = null) {
@@ -120,6 +124,7 @@ class FakeAgents implements DirectiveRegistry {
   private handleFor(record: { id: string; role: Role; options: SpawnOptions; prompts: string[] }): AgentHandle {
     const gate = (): Promise<void> | null => this.gate;
     const failPrompt = (): Error | null => this.failPrompt;
+    const promptEffect = (): ((text: string) => void) | null => this.promptEffect;
     const healthState = (): 'idle' | 'error' => this.healthState;
     const healthError = (): string | null => this.healthError;
     const disposedSpawned = this.disposedSpawned;
@@ -130,6 +135,7 @@ class FakeAgents implements DirectiveRegistry {
       capabilities: FAKE_CAPABILITIES,
       async prompt(text: string): Promise<void> {
         record.prompts.push(text);
+        promptEffect()?.(text);
         const pending = gate();
         if (pending !== null) await pending;
         const failure = failPrompt();
@@ -415,11 +421,13 @@ describe('re-brief restart safety (durable markers)', () => {
     const jobId = 'blind-rebrief-job';
     const sessionFile = join(h.dir, 'sessions', 'reviewer-crashed.jsonl');
     mkdirSync(join(h.dir, 'sessions'), { recursive: true });
-    // The resumed session already holds the prohibited read (the turn that
-    // performed it ran before the crash this reconciler recovers).
-    writeFileSync(sessionFile, sessionToolResult('docs/issues/305-review.md:1:prior assessment'));
+    // The resumed session STARTS clean; the continuation turn appends its own
+    // prohibited read during delivery, so a scan that ran before the prompt
+    // reads a clean session and cannot pass (issue #339 F5).
+    writeFileSync(sessionFile, '{}\n');
     await seedPendingRebrief({ h, jobId, bindWorker: { agentId: 'reviewer-crashed', sessionFile } });
     admitBlindJob(h, jobId);
+    h.registry.promptEffect = () => { appendFileSync(sessionFile, sessionToolResult('docs/issues/305-review.md:1:prior assessment')); };
     expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
     const report = await reconcilePendingRebriefs(
       {

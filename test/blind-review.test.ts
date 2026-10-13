@@ -79,9 +79,13 @@ describe('observeBlindSessionAccess — no-op contracts (issue #339 N9)', () => 
   it('records no fabricated clean pass when the resumed session is unreadable', () => {
     const h = blindLedger();
     h.admit('job-unreadable');
-    // The real reader on a nonexistent path returns null — the observer must
-    // record NOTHING rather than an empty (clean-reading) observation.
-    observeBlindSessionAccess(h.ledger, 'job-unreadable', join(tmpdir(), 'gru-no-such-session-339.jsonl'));
+    // A path this test OWNS that cannot exist (a unique empty directory), so a
+    // pre-existing readable file can never make this assertion pass wrongly. The
+    // real reader on a nonexistent path returns null — the observer must record
+    // NOTHING rather than an empty (clean-reading) observation.
+    const missingDir = mkdtempSync(join(tmpdir(), 'gru-command-blind-missing-'));
+    cleanupDirs.push(missingDir);
+    observeBlindSessionAccess(h.ledger, 'job-unreadable', join(missingDir, 'no-such-session.jsonl'));
     expect(h.ledger.latestJobEvent('job-unreadable', BLIND_ACCESS_EVENT)).toBeNull();
     expect(blindCoverageOf(h.ledger, 'job-unreadable')).toMatchObject({ state: 'qualifying', accessObserved: false });
     h.dispose();
