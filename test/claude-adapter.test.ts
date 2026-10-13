@@ -2901,6 +2901,48 @@ describe('scheduled verification ordinary Claude Bash', () => {
     } finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; process.env['PATH'] = oldPath; await f.runtime.dispose(); }
   });
 
+  async function initializationOrdering(operation: 'prompt' | 'compact', inspectDelivery: boolean): Promise<void> {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const start = vi.fn(spawn); const f = fixture({ spawnProcess: start as unknown as typeof spawn });
+    const handle = await f.runtime.spawn('minion', lane.session);
+    if (operation === 'compact') await handle.prompt('establish original conversation');
+    const original = Object.assign(new EventEmitter(), {
+      exitCode: null, signalCode: null, kill: vi.fn(() => true), stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    }) as unknown as ChildProcess;
+    const wire: Record<string, unknown>[] = [];
+    original.stdin!.on('data', (chunk: Buffer) => wire.push(JSON.parse(chunk.toString('utf8')) as Record<string, unknown>));
+    start.mockReturnValueOnce(original as ReturnType<typeof spawn>);
+    const owned = handle as unknown as { params: { sessionId: string; verificationSettingsFile: string } };
+    let running: Promise<void> | undefined;
+    try {
+      running = operation === 'compact' ? handle.compact!() : handle.prompt('owned prompt before initialization reply');
+      // Observe rejection immediately; do not create an unhandled promise if
+      // a delivery assertion fails on the archived, pre-fix implementation.
+      const outcome = running.then(() => 'resolved', (error: unknown) => String(error));
+      expect(existsSync(owned.params.verificationSettingsFile)).toBe(true);
+      expect(wire[0]?.['type']).toBe('control_request');
+      if (inspectDelivery) {
+        expect(wire.map((frame) => frame['type'])).toEqual(['control_request', 'user']);
+        const message = wire[1]?.['message'] as { readonly content?: string };
+        expect(message.content).toBe(operation === 'compact' ? '/compact' : 'owned prompt before initialization reply');
+      }
+      // A valid session/result is not initialization of the permission
+      // transport. Missing reply must remain fail-loud even without Bash.
+      original.stdout!.emit('data', Buffer.from(JSON.stringify({ type: 'system', subtype: 'init', session_id: owned.params.sessionId }) + '\n'));
+      original.stdout!.emit('data', Buffer.from(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'ordinary text', session_id: owned.params.sessionId }) + '\n'));
+      original.emit('close', 0, null);
+      expect(await outcome).toContain('worker verification permission initialization did not complete before result');
+      expect(existsSync(lane.starts)).toBe(false);
+    } finally {
+      original.emit('close', 0, null); await running?.catch(() => undefined);
+      await handle.dispose(); expect(handle.cessationEvidence!()).toBe('ceased');
+      await f.runtime.dispose();
+    }
+  }
+  it('review-4 initialization prompt pipelines after original binding without waiting for a reply', async () => initializationOrdering('prompt', true));
+  it('review-4 initialization compaction pipelines after original binding without waiting for a reply', async () => initializationOrdering('compact', true));
+  it('review-4 initialization unanswered transport cannot accept a text-only terminal turn', async () => initializationOrdering('prompt', false));
+
   it('strict repair malformed native permission transport fails ordinary Claude closed with zero starts', async () => {
     const lane = verificationLane(); cleanupDirs.push(lane.root);
     const f = fixture(); process.env['CLAUDE_DOUBLE_PERMISSION_MALFORMED'] = '1'; process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';

@@ -58,6 +58,12 @@ export class ClaudeVerificationPermissionChannel {
   }
 
   ingest(frame: StreamFrame): void {
+    // Pipelining must not silently turn an unanswered initialization into a
+    // healthy terminal turn, even when the model never requested Bash.
+    if (frame['type'] === 'result' && (!this.initialized || this.closed)) {
+      this.fail('worker verification permission initialization did not complete before result');
+      return;
+    }
     if (frame['type'] === 'control_response') {
       const response = frame['response'] as Record<string, unknown> | undefined;
       if (response?.['request_id'] !== this.initializeId || response['subtype'] !== 'success' || this.initialized || this.closed) {

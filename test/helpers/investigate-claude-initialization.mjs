@@ -42,6 +42,9 @@ const server = createServer(async (req, res) => {
   if (req.url?.split('?')[0] !== '/v1/messages') { res.writeHead(404); res.end(); return; }
   const input = JSON.parse(body); assert.equal(input.model, 'gpt-6-luna');
   active.upstream.push({ path: req.url, model: input.model });
+  // Explicit caller disposal while an owned provider request is pending;
+  // only existing SIGTERM/SIGKILL timing applies, never a fixture init clock.
+  if (active.resist && receiving) return;
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   const event = (type, value) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
   event('message_start', { message: { id: 'owned-e9', type: 'message', role: 'assistant', model: 'gpt-6-luna', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } });
@@ -75,10 +78,14 @@ const cases = [
   { name: 'compaction-silent-init-existing-disposal', command: read, compact: true, silent: true, cancel: true, extended: true },
   { name: 'pipeline-silent-init-text-only-terminal', command: read, pipeline: true, silent: true, textOnly: true, error: true, extended: true },
 ];
+const receiving = process.argv[3] === 'receiving';
 process.stdout.write(JSON.stringify({ identity: { executable, realExecutable: realpathSync(executable), version, sha256: digest, model: 'gpt-6-luna', effort: 'max' }, root,
-  boundary: 'Fixture-only pipelining hypothesis/fault injection; actual ClaudeCodeRuntime; no new timers; NOT final qualification/acceptance' }) + '\n');
+  boundary: receiving ? 'Actual receiving ClaudeCodeRuntime delivery, no fixture prompt injection except explicit prompt-first fault; no new timers; NOT final acceptance'
+    : 'Fixture-only pipelining hypothesis/fault injection; actual ClaudeCodeRuntime; no new timers; NOT final qualification/acceptance' }) + '\n');
+const selected = receiving ? cases.map((entry) => ({ ...entry, pipeline: false }))
+  : cases.filter((entry) => Boolean(entry.extended) === (process.argv[3] === 'extended'));
 try {
-  for (const row of cases.filter((entry) => Boolean(entry.extended) === (process.argv[3] === 'extended'))) {
+  for (const row of selected) {
     active = { ...row, upstream: [], wire: [], native: [], forwarded: [], signals: [], closed: null }; sent = false;
     const record = active; const before = existsSync(starts) ? readFileSync(starts, 'utf8') : '';
     let ack = Promise.withResolvers(); let close = Promise.withResolvers();
@@ -148,9 +155,11 @@ try {
       if (row.cancel) {
         await ack.promise;
         await new Promise((resolve) => setImmediate(resolve)); // event-loop observation, not a timeout
-        assert.equal(record.wire.filter((frame) => frame.type === 'user').length, 0);
-        assert.equal(record.upstream.length, 0); assert.equal(settled, false);
-        record.distinguishingRED = 'initialize response absent: original turn pending/user frame unsent before existing cancellation';
+        assert.equal(record.wire.filter((frame) => frame.type === 'user').length, receiving ? 1 : 0);
+        if (!receiving) { assert.equal(record.upstream.length, 0); assert.equal(settled, false); }
+        record.deliveryObservation = receiving
+          ? 'original prompt/compact frame submitted without initialization-reply wait; existing explicit cancellation'
+          : 'distinguishing RED: initialization reply absent, original turn pending/user frame unsent before existing cancellation';
         record.beforeDispose = { state: handle.health().state, liveTool: handle.hasLiveProcess(), pendingTurn: handle.pendingTurn() };
         await handle.dispose(); await close.promise;
       }
@@ -162,9 +171,10 @@ try {
         const firstAsk = record.forwarded.findIndex((frame) => frame.type === 'control_request');
         const firstAck = record.forwarded.findIndex((frame) => frame.type === 'control_response');
         record.requestBeforeInitReply = firstAsk >= 0 && (firstAck < 0 || firstAsk < firstAck);
-        assert.equal(outcome.ok, !record.requestBeforeInitReply);
+        const initialized = firstAck >= 0 && record.forwarded[firstAck].response?.subtype === 'success';
+        assert.equal(outcome.ok, initialized && !record.requestBeforeInitReply);
       }
-      if (row.cancel || row.error) assert.equal(outcome.ok, false, 'silent/rejected/reordered initialization is not a successful turn');
+      if (row.cancel || row.error || (receiving && row.silent)) assert.equal(outcome.ok, false, 'silent/rejected/reordered initialization is not a successful turn');
       else if (!row.promptFirst || outcome.ok) {
         assert.equal(outcome.ok, true, outcome.error);
         const blocks = record.native.filter((frame) => frame.type === 'user').flatMap((frame) => frame.message?.content ?? []).filter((block) => block.type === 'tool_result' && block.tool_use_id === 'owned_bash');

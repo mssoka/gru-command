@@ -778,6 +778,8 @@ gh315-review4-red = "sh tools/scheduled-verification-review4-baseline.sh"
 # Existing scheduler/process-group and runtime-disposal bounds; no init timer.
 gh315-e9-native-investigate = 'npm run build && node test/helpers/investigate-claude-initialization.mjs "$HOME/.local/bin/claude"'
 gh315-e9-native-extended = 'npm run build && node test/helpers/investigate-claude-initialization.mjs "$HOME/.local/bin/claude" extended'
+gh315-e9-red = "sh tools/scheduled-verification-e9-baseline.sh"
+gh315-e9-receiving-native = 'npm run build && node test/helpers/investigate-claude-initialization.mjs "$HOME/.local/bin/claude" receiving'
 # Existing immutable retained reports are copied byte-for-byte into this ignored
 # repository-relative fixture directory; absence fails loud, never reruns proof.
 gh315-retained-red-classify = "node tools/classify-scheduled-verification-red.mjs 2 _bmad-output/gate-prep/gh315-retained-review2-red/fast-results.json _bmad-output/gate-prep/gh315-retained-review2-red/heavy-results.json"

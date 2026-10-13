@@ -50,7 +50,7 @@ const PINS: Record<string, number> = {
   'chat-frames.test.ts': 4,
   'chat-server.test.ts': 90,
   'chat-session-state.test.ts': 6,
-  'claude-adapter.test.ts': 139,
+  'claude-adapter.test.ts': 142,
   'config-generate.test.ts': 11,
   'config.test.ts': 75,
   'decisions-backtest.test.ts': 20,

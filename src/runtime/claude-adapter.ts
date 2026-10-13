@@ -1261,8 +1261,12 @@ export class ClaudeCodeHandle implements AgentHandle {
       if (params.workerVerification !== undefined && !params.isolatedReview) {
         permissions = new ClaudeVerificationPermissionChannel(child, params.workerVerification, (message) => {
           fail(message); child?.stdin?.end();
-        }, send);
+        }, () => undefined);
+        // Private ask policy and original-child binding already exist. The
+        // qualified native iterator accepts initialize then user on one input
+        // stream; acknowledgement gates Bash authority, not prompt delivery.
         permissions.start();
+        if (!failed) send();
       } else send();
     });
   }
@@ -1453,8 +1457,11 @@ export class ClaudeCodeHandle implements AgentHandle {
       if (params.workerVerification !== undefined && !params.isolatedReview) {
         permissions = new ClaudeVerificationPermissionChannel(child, params.workerVerification, (message) => {
           failTurn(message); child.stdin?.end();
-        }, send);
+        }, () => undefined);
+        // Pipeline only after the child-bound permission channel is installed.
+        // Never add an initialization clock or approve Bash before its reply.
         permissions.start();
+        if (!failed) send();
       } else send();
     });
   }
