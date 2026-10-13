@@ -787,6 +787,35 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     controller.abort();
     await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
   });
+
+  it('observes the settled turn on the exhaustion failure exit too — the scan precedes the throw (issue #339 P1)', async () => {
+    const observed: { jobId: string; sessionFile: string | null }[] = [];
+    const handle = {
+      id: 'minion-scan-exhausted', sessionFile: '/sessions/scan.jsonl',
+      prompt: async () => {},
+      dispose: async () => {},
+    };
+    await expect(rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listImplementerMinions: () => [],
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id) => minionRecord(id, 'job-cancel', null),
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'contract',
+      retrySettlement: async () => 'exhausted',
+      observeBlindTurn: (jobId, sessionFile) => { observed.push({ jobId, sessionFile }); },
+    })).rejects.toThrow(/automatic rate-limit retry exhausted/);
+    // The observer ran BEFORE the failure exit: without this, a continuation
+    // that fails before delivery leaves its prohibited reads unscanned.
+    expect(observed).toEqual([{ jobId: 'job-cancel', sessionFile: '/sessions/scan.jsonl' }]);
+  });
 });
 
 describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {

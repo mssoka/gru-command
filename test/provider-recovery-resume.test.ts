@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -91,9 +91,14 @@ class FakeHandle implements AgentHandle {
   turnStart(): void {
     for (const listener of this.listeners) listener({ type: 'turn_start' });
   }
+  /** Issue #339: the side effect a REAL turn has on its session — writing the
+   * tool results it read. Tests append the prohibited read HERE (inside the
+   * delivery) so a scan that ran before the prompt cannot see it. */
+  promptEffect: ((text: string) => void) | null = null;
   async prompt(text?: string): Promise<void> {
     this.promptCount += 1;
     this.prompts.push(text ?? '');
+    this.promptEffect?.(text ?? '');
     // Realistic admission: the turn STARTS when the prompt is delivered.
     this.turnStart();
   }
@@ -158,20 +163,34 @@ class ClaimHarness {
     cleanupDirs.push(this.worktrees.root);
   }
 
-  deps(): RecoveryClaimDeps {
+  /** Scan faults the observer boundary swallowed (issue #339/P5): the
+   * production `DispatchService.observeBlindSession` must never fail a
+   * delivered turn on a bookkeeping fault. */
+  readonly observeErrors: string[] = [];
+
+  deps(overrides: Partial<RecoveryClaimDeps> = {}): RecoveryClaimDeps {
     return {
       registry: this.registry as unknown as RecoveryClaimDeps['registry'],
       ledger: this.ledger,
       worktrees: this.worktrees,
       // Issue #339: the same blind-coverage observation the dispatch settle
-      // seam runs, wired to the resume settle seam.
-      observeBlindTurn: (jobId, sessionFile) => observeBlindSessionAccess(this.ledger, jobId, sessionFile),
+      // seam runs, wired to the resume settle seam — through the error
+      // boundary the production observer owns (a scan fault is logged and
+      // swallowed, never thrown into the delivery).
+      observeBlindTurn: (jobId, sessionFile) => {
+        try {
+          observeBlindSessionAccess(this.ledger, jobId, sessionFile);
+        } catch (error) {
+          this.observeErrors.push(String(error));
+        }
+      },
       slotReArm: {
         ownedProviderReArm: (agentId, waitId) => {
           this.slotReArmCalls.push({ agentId, waitId });
           return this.slotReArmResult;
         },
       },
+      ...overrides,
     };
   }
 
@@ -573,15 +592,30 @@ describe('guarded claim — every recheck fails visible', () => {
 });
 
 describe('guarded claim — blind coverage scan at the resume settle seam (issue #339)', () => {
-  it('a prohibited read during a resume invalidates blind coverage instead of leaving it qualifying', async () => {
+  const PROHIBITED = 'docs/issues/305-review.md:1:prior assessment';
+
+  /** The resumed continuation handle whose turn appends the transcript it
+   * "read" — the real ordering (a scan before delivery reads a clean file). */
+  function resumeTurnThatReads(h: ClaimHarness, sessionFile: string, text: string): void {
+    h.registry.spawnImpl = (resumeFile) => {
+      const handle = new FakeHandle('minion', `agent-blind-${h.registry.handles.size + 1}`, resumeFile);
+      handle.promptEffect = () => appendFileSync(sessionFile, sessionToolResult(text));
+      h.registry.handles.set(handle.id, handle);
+      return handle;
+    };
+  }
+
+  it('a prohibited read during the resumed TURN invalidates blind coverage instead of leaving it qualifying', async () => {
     const h = new ClaimHarness();
     const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-prohibited-'));
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'reviewer.jsonl');
-    writeFileSync(sessionFile, sessionToolResult('docs/issues/305-review.md:1:prior assessment'));
     const jobId = 'j-blind-prohibited';
-    const waitId = await h.recoveredMinionWait({ sessionFile, jobId, writeSession: false });
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
     h.admitBlind(jobId, fixtureRepo().path);
+    // The prohibited read is written BY the resumed turn, not pre-written: a
+    // scan that ran before the prompt would read a clean session and pass.
+    resumeTurnThatReads(h, sessionFile, PROHIBITED);
     expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
     expect(result).toMatchObject({ outcome: 'continued', path: 'resumed' });
@@ -593,21 +627,96 @@ describe('guarded claim — blind coverage scan at the resume settle seam (issue
     });
   });
 
-  it('a clean resume keeps blind coverage qualifying (and is still observed)', async () => {
+  it('a clean resumed turn keeps coverage qualifying (and is still observed)', async () => {
     const h = new ClaimHarness();
     const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-clean-'));
     cleanupDirs.push(sessionDir);
     const sessionFile = join(sessionDir, 'reviewer.jsonl');
-    writeFileSync(sessionFile, sessionToolResult('src/feature.ts:1:export const feature = 1;'));
     const jobId = 'j-blind-clean';
-    const waitId = await h.recoveredMinionWait({ sessionFile, jobId, writeSession: false });
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
     h.admitBlind(jobId, fixtureRepo().path);
+    resumeTurnThatReads(h, sessionFile, 'src/feature.ts:1:export const feature = 1;');
     const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
     expect(result).toMatchObject({ outcome: 'continued', path: 'resumed' });
     // The scan ran (an observation is recorded) and found nothing prohibited.
     expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
     expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
       state: 'qualifying', qualifying: true, accessObserved: true, prohibitedAccess: 0,
+    });
+  });
+
+  it('the scan awaits automatic retry settlement, so a RETRY turn\'s prohibited read is observed (P2)', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-retry-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    const jobId = 'j-blind-retry-read';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    h.admitBlind(jobId, fixtureRepo().path);
+    // The FIRST delivery reads nothing; the supervisor-scheduled retry turn
+    // reads the prohibited file DURING settlement, after the prompt settled.
+    let settlementAsked = 0;
+    const result = await claimProviderRecoveryContinuation(h.deps({
+      retrySettlement: async () => {
+        settlementAsked += 1;
+        appendFileSync(sessionFile, sessionToolResult(PROHIBITED));
+        return 'recovered';
+      },
+    }), waitId, 'silas');
+    expect(result).toMatchObject({ outcome: 'continued' });
+    // The recovery path forwarded the settlement hook (without it the scan
+    // runs before the retry turn and the read is never observed).
+    expect(settlementAsked).toBe(1);
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
+  });
+
+  it('a resumed turn whose automatic retries EXHAUST still invalidates coverage (the scan precedes the failure exit, P1)', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-exhausted-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    const jobId = 'j-blind-exhausted';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    h.admitBlind(jobId, fixtureRepo().path);
+    resumeTurnThatReads(h, sessionFile, PROHIBITED);
+    let settlementAsked = 0;
+    const result = await claimProviderRecoveryContinuation(h.deps({
+      retrySettlement: async () => { settlementAsked += 1; return 'exhausted'; },
+    }), waitId, 'silas');
+    // The continuation failed before delivery...
+    expect(settlementAsked).toBe(1);
+    expect(result).toMatchObject({ outcome: 'skipped' });
+    // ...but the prohibited read is still observed: only a future successful
+    // resume would otherwise heal the coverage.
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
+  });
+
+  it('a resumed turn that settles with an in-band error after a prohibited read still invalidates coverage (P5)', async () => {
+    const h = new ClaimHarness();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'pr-blind-session-inband-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    const jobId = 'j-blind-inband';
+    const waitId = await h.recoveredMinionWait({ sessionFile, jobId });
+    h.admitBlind(jobId, fixtureRepo().path);
+    h.registry.spawnImpl = (resumeFile) => {
+      const handle = new FakeHandle('minion', `agent-blind-inband-${h.registry.handles.size + 1}`, resumeFile);
+      handle.healthState = 'error';
+      handle.healthError = 'assistant stopReason error';
+      handle.promptEffect = () => appendFileSync(sessionFile, sessionToolResult(PROHIBITED));
+      h.registry.handles.set(handle.id, handle);
+      return handle;
+    };
+    const result = await claimProviderRecoveryContinuation(h.deps(), waitId, 'silas');
+    expect(result.outcome).toBe('skipped');
+    expect(result.outcome === 'skipped' ? result.why : '').toContain('in-band');
+    // The observer runs before the in-band-error return: the read still counts.
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
     });
   });
 });

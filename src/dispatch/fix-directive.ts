@@ -540,8 +540,10 @@ export async function rebriefFreshMinion(
     beforeTurnSideEffect?: () => void;
     /** Issue #339: observe the settled continuation session's tool access so
      * a prohibited read during a resume/re-brief invalidates blind coverage
-     * exactly like one at the first briefing. The observer owns its own error
-     * handling (a bookkeeping failure must not fail a delivered turn); absent
+     * exactly like one at the first briefing. Runs on EVERY post-settlement
+     * exit (the in-band-error return, the successful return, AND the
+     * cancelled/exhausted/superseded failure exits). The observer owns its
+     * own error handling (a bookkeeping failure must not fail a turn); absent
      * = no observation (non-review re-briefs, tests). */
     observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   },
@@ -657,19 +659,23 @@ export async function rebriefFreshMinion(
     // must not land the re-brief/delivery markers early, and a rejection
     // whose retry recovers is a delivery, not a failure.
     const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+    // Issue #339: observe the settled continuation turn's own tool results at
+    // THIS settle seam on EVERY post-settlement exit — including the failure
+    // exits below — so a prohibited read during a resume/re-brief invalidates
+    // blind coverage exactly like one at the first briefing. Running it before
+    // the cancelled/exhausted/superseded throws is what keeps a failed
+    // continuation from leaving unscanned prohibited reads behind (only a
+    // future successful resume would otherwise heal it). `handle.sessionFile`
+    // is the resumed session (the whole file, cumulative), read-only with
+    // respect to the review inputs. The observer owns its error handling (a
+    // bookkeeping failure must not fail a delivered turn).
+    input.observeBlindTurn?.(input.jobId, handle.sessionFile);
     if (disposition === 'cancelled') {
       throw new Error(`re-brief turn on ${handle.id} was cancelled before its automatic retries settled`);
     }
     if (disposition === 'exhausted' || disposition === 'superseded') {
       throw new Error(`re-brief turn failed on ${handle.id}: automatic rate-limit retry ${disposition} before delivery`);
     }
-    // Issue #339: observe the continuation turn's own tool results at THIS
-    // settle seam (before the in-band-error return too), so a prohibited read
-    // performed during a resume/re-brief invalidates blind coverage exactly
-    // like one at the first briefing. `handle.sessionFile` is the resumed
-    // session (the whole file, cumulative), read-only with respect to the
-    // review inputs.
-    input.observeBlindTurn?.(input.jobId, handle.sessionFile);
     if (promptError !== null && disposition !== 'recovered') {
       throw new Error(`re-brief turn failed on ${handle.id}: ${String(promptError)}`);
     }
