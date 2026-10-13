@@ -2,12 +2,19 @@
  * Silas autopilot (issue #243) — the unambiguous rule families executed in
  * plain code, BEFORE any LLM wake.
  *
- * Every family reads the freshly computed digest (whose publish boundary
- * already applied the ownership fences: live directives, pending
- * re-briefs, in-flight verification, decision-memory holds, re-brief
- * settlement) and calls the SAME service functions the matching HTTP
- * endpoint composes — never HTTP. Each action's receipt carries `rule_id`
+ * Every family reads the freshly computed digest and RE-READS the ownership
+ * fences immediately before acting — live directives, pending re-briefs,
+ * in-flight verification, directive-recovery holds and decision-memory
+ * holds (#218) — then calls the SAME service functions the matching HTTP
+ * endpoint composes, never HTTP. Each action's receipt carries `rule_id`
  * and `source: 'silas-autopilot'`.
+ *
+ * Decision-memory holds (#218): the publish boundary does NOT apply them;
+ * this module asks the coverage query itself for each row (see
+ * {@link decisionHold}). The signal is the mailbox incident vocabulary
+ * where one is established (`pr-conflict`, `verification-failure`); every
+ * other family uses its own landed rule id as the signal — the deliberate
+ * mapping for families whose vocabulary the mailbox does not name.
  *
  * Posture (the issue's rollout):
  *  - `enabled` is the global kill switch. When it is false nothing is
@@ -54,9 +61,12 @@ export const AUTOPILOT_DECISION_EVENT = 'silas.autopilot-decision';
  * machine actions from LLM Silas's own. */
 export const AUTOPILOT_SOURCE = 'silas-autopilot';
 
-/** Bound on decisions per family per pass: the pass runs inside the
- * driver's deterministic hook, which must stay bounded. */
-const MAX_DECISIONS_PER_FAMILY = 20;
+/** Bound on the rows one family PLANS per pass (decisions + refusals): the
+ * pass runs inside the driver's deterministic hook and must stay bounded.
+ * It is applied BEFORE the planner runs, so a surplus row never spends a
+ * planner side effect (the delivered-pr-register GitHub lookup) just to be
+ * dropped. A skipped row is left for LLM Silas exactly as a refusal is. */
+const MAX_ROWS_PER_FAMILY = 20;
 
 /** One open pull request as the PR-registration family consumes it. */
 export interface AutopilotPull {
@@ -84,11 +94,16 @@ export interface SilasAutopilotOps {
     readonly url: string;
     readonly ruleId: SilasAutopilotRuleId;
   }) => Promise<void>;
-  /** The function `POST /api/dispatch/review` calls. */
+  /** The function `POST /api/dispatch/review` calls. `targetRef`/
+   * `boundDeliveredSha` bind the reviewed head to the sha the green proved
+   * (issue #187); the clean-abort re-arm derives the same binding from its
+   * source round. */
   readonly triggerReview: (input: {
     readonly jobId: string;
     readonly ruleId: SilasAutopilotRuleId;
     readonly sourceRoundId?: string;
+    readonly targetRef?: string;
+    readonly boundDeliveredSha?: string;
   }) => Promise<void>;
   /** The function `POST /api/silas/directive` calls. */
   readonly sendDirective: (input: {
@@ -125,6 +140,7 @@ export type AutopilotLedger = Pick<
   | 'listPendingDirectives'
   | 'hasOpenDirectiveRecoveryHold'
   | 'hasUnsettledVerificationRun'
+  | 'coveringDecision'
 >;
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -223,10 +239,29 @@ export function renderRebriefNote(row: VerdictAwaitingDirectiveRow): string {
 // Per-family planning (pure: digest row + ledger reads → verdict)
 // ------------------------------------------------------------------
 
+/** One row's #218 coverage identity: the signal family it raises and the
+ * basis fingerprint the decision must have been made against. */
+interface DecisionHoldTriple {
+  readonly signal: string;
+  readonly basis: string;
+}
+
+/** The #218 coverage query for one row (issue #218): does an active decision
+ * hold actually cover this row's (subject, signal, basis)? The subject is
+ * always the job — the mailbox vocabulary. A malformed decision row must
+ * never take the pass down: the read fails loud in the log and the row is
+ * treated as UNCOVERED (the autopilot may act), matching the awareness
+ * layer's fail-toward-waking posture. */
+function decisionHold(ledger: AutopilotLedger, jobId: string, triple: DecisionHoldTriple): string | null {
+  const decision = ledger.coveringDecision({ subject: `job:${jobId}`, signal: triple.signal, basis: triple.basis });
+  return decision === null ? null : `an active decision (${decision.id}) covers ${triple.signal}`;
+}
+
 /** Fences re-read IMMEDIATELY before acting: the digest applied them at its
  * publish boundary, and a moment has passed since. Uncertain ownership
- * fails closed — the row stays for LLM Silas. */
-function fencesHold(ledger: AutopilotLedger, jobId: string): string | null {
+ * fails closed — the row stays for LLM Silas. `hold` is the row's #218
+ * coverage triple (absent when the family raises no signal). */
+function fencesHold(ledger: AutopilotLedger, jobId: string, hold?: DecisionHoldTriple): string | null {
   const job = ledger.getJob(jobId);
   if (job === null) return 'job not found';
   if (job.status === 'merged' || job.status === 'done' || job.status === 'binned') {
@@ -237,6 +272,10 @@ function fencesHold(ledger: AutopilotLedger, jobId: string): string | null {
     return 'a live directive owns this lane';
   }
   if (ledger.hasOpenDirectiveRecoveryHold(jobId)) return 'an open directive-recovery hold owns this lane';
+  if (hold !== undefined) {
+    const covered = decisionHold(ledger, jobId, hold);
+    if (covered !== null) return covered;
+  }
   return null;
 }
 
@@ -252,8 +291,12 @@ function reviewEligible(ledger: AutopilotLedger, jobId: string): string | null {
 
 /** `verdict-rung-directive`: structured blockers → templated directive. */
 function planVerdictDirective(row: VerdictAwaitingDirectiveRow, ledger: AutopilotLedger): Verdict {
-  const fence = fencesHold(ledger, row.jobId);
+  const fence = fencesHold(ledger, row.jobId, {
+    signal: 'verdict-rung-directive',
+    basis: `verdict:${row.roundId}`,
+  });
   if (fence !== null) return refuse(fence);
+  if (ledger.hasUnsettledVerificationRun(row.jobId)) return refuse('a verification is already in flight on this lane');
   for (const blocker of row.recurringBlockers) {
     if (blocker.title.trim() === '' || blocker.location.trim() === '') {
       return refuse(`blocker "${blocker.fingerprint}" lacks a title or location`);
@@ -267,6 +310,10 @@ function planVerdictDirective(row: VerdictAwaitingDirectiveRow, ledger: Autopilo
     job_id: row.jobId,
     rule_id: 'verdict-rung-directive',
     source_round_id: row.roundId,
+    // The digest row's stable verdict identity, so #214's dedup and the
+    // receipt's audit key match the way pr-conflict:<head> and
+    // verification-failure:<scope>@<run> do (issue #243 family table).
+    blocker_fingerprint: `verdict:${row.roundId}`,
     blocker_count: row.recurringBlockers.length,
     directive: renderBlockerDirective(row),
   });
@@ -274,8 +321,12 @@ function planVerdictDirective(row: VerdictAwaitingDirectiveRow, ledger: Autopilo
 
 /** `verdict-rung-rebrief`: the ladder's fresh-worker rung. */
 function planVerdictRebrief(row: VerdictAwaitingDirectiveRow, ledger: AutopilotLedger): Verdict {
-  const fence = fencesHold(ledger, row.jobId);
+  const fence = fencesHold(ledger, row.jobId, {
+    signal: 'verdict-rung-rebrief',
+    basis: `verdict:${row.roundId}`,
+  });
   if (fence !== null) return refuse(fence);
+  if (ledger.hasUnsettledVerificationRun(row.jobId)) return refuse('a verification is already in flight on this lane');
   if (row.recurringBlockers.length === 0) return refuse('the verdict row carries no structured blocker to re-brief against');
   return act('send-rebrief', {
     endpoint: 'POST /api/silas/rebrief',
@@ -289,7 +340,10 @@ function planVerdictRebrief(row: VerdictAwaitingDirectiveRow, ledger: AutopilotL
 
 /** `verification-repair`: the exact failed verification debt. */
 function planVerificationRepair(row: VerificationFailureRow, ledger: AutopilotLedger): Verdict {
-  const fence = fencesHold(ledger, row.jobId);
+  const fence = fencesHold(ledger, row.jobId, {
+    signal: 'verification-failure',
+    basis: `verification-failure:${row.scope ?? ''}@${row.runId ?? ''}`,
+  });
   if (fence !== null) return refuse(fence);
   // The #117 deferral: a null scope cannot be named, and the digest retires
   // the debt only on the EXACT fingerprint — an unscoped rung would re-fire
@@ -308,7 +362,10 @@ function planVerificationRepair(row: VerificationFailureRow, ledger: AutopilotLe
 
 /** `pr-conflict-rebase`: ONE conflict-integration directive per head. */
 function planConflictRebase(row: ConflictingPrRow, ledger: AutopilotLedger): Verdict {
-  const fence = fencesHold(ledger, row.jobId);
+  const fence = fencesHold(ledger, row.jobId, {
+    signal: 'pr-conflict',
+    basis: row.headSha === null ? 'pr-conflict:unknown' : `pr-conflict:${row.headSha}`,
+  });
   if (fence !== null) return refuse(fence);
   if (row.headSha === null || row.headSha.trim() === '') return refuse('the conflict row carries no head sha to fingerprint');
   const fingerprint = `pr-conflict:${row.headSha}`;
@@ -336,7 +393,10 @@ function planCleanAbortRebrief(row: PrWithoutReviewRow, ledger: AutopilotLedger)
   if (cleanAbort === undefined) return refuse('the row is not a clean-abort row');
   const eligible = reviewEligible(ledger, row.jobId);
   if (eligible !== null) return refuse(eligible);
-  const fence = fencesHold(ledger, row.jobId);
+  const fence = fencesHold(ledger, row.jobId, {
+    signal: 'clean-abort-service-restart',
+    basis: `round:${cleanAbort.roundId}`,
+  });
   if (fence !== null) return refuse(fence);
   const round = ledger.getRound(cleanAbort.roundId);
   if (round === null || round.jobId !== row.jobId) return refuse('the clean-abort round does not belong to this job');
@@ -359,7 +419,11 @@ function planReviewTrigger(row: PrWithoutReviewRow, ledger: AutopilotLedger): Ve
   if (row.cleanAbort !== undefined) return refuse('the clean-abort rule owns this row');
   const eligible = reviewEligible(ledger, row.jobId);
   if (eligible !== null) return refuse(eligible);
-  const fence = fencesHold(ledger, row.jobId);
+  const job = ledger.getJob(row.jobId);
+  const fence = fencesHold(ledger, row.jobId, {
+    signal: 'pr-review-trigger',
+    basis: job === null ? 'pr-review:unknown' : `pr-review:${job.prUrl ?? 'none'}`,
+  });
   if (fence !== null) return refuse(fence);
   // #187's final eligibility recheck: the green must be ON the delivered
   // head — a green from an older commit never authorizes the arm.
@@ -374,10 +438,15 @@ function planReviewTrigger(row: PrWithoutReviewRow, ledger: AutopilotLedger): Ve
   if (typeof greenSha !== 'string' || greenSha !== deliveredSha) {
     return refuse('no github.ci-green observation on the delivered head');
   }
+  // The reviewed head is the one the green proved: bind it exactly, so the
+  // awaited review setup cannot re-resolve a newer live PR head and the
+  // freeze boundary re-proves the same delivered sha (issue #187).
   return act('trigger-review', {
     endpoint: 'POST /api/dispatch/review',
     job_id: row.jobId,
     rule_id: 'pr-review-trigger',
+    target_ref: deliveredSha,
+    bound_delivered_sha: deliveredSha,
   });
 }
 
@@ -419,6 +488,12 @@ async function planDeliveredPrRegister(
   if (pulls.length > 1 || pull === undefined) {
     return refuse(`${pulls.length} open PRs were found for the delivered branch — ambiguous`);
   }
+  // Recheck after the awaited lookup (issue #243 M5): another writer may
+  // have registered a PR during the network window; this stale decision
+  // must never overwrite it (setJobPr overwrites unconditionally).
+  const afterLookup = ledger.getJob(row.jobId);
+  if (afterLookup === null) return refuse('job not found');
+  if (afterLookup.prUrl !== null) return refuse('the job already carries a PR');
   return act('register-pr', {
     endpoint: 'POST /api/dispatch/pr',
     job_id: row.jobId,
@@ -526,17 +601,23 @@ export async function runSilasAutopilot(input: SilasAutopilotInput): Promise<Sil
   const plan = async (
     ruleId: SilasAutopilotRuleId,
     jobId: string,
-    verdict: Verdict | Promise<Verdict>,
+    settle: () => Verdict | Promise<Verdict>,
   ): Promise<void> => {
+    const rule = counts[ruleId]!;
     // `off` means the family does not run at all: no decision, no refusal
-    // count, no log. Its rows stay for LLM Silas untouched.
-    if (counts[ruleId]!.mode === 'off') return;
-    const resolved = await verdict;
+    // count, no log, and NO planner side effect (the delivered-pr-register
+    // planner performs a GitHub lookup). Its rows stay for LLM Silas
+    // untouched.
+    if (rule.mode === 'off') return;
+    // The pass budget is applied BEFORE the planner runs (issue #243 M6): a
+    // surplus row is skipped without spending a sequential lookup. A skipped
+    // row is left for LLM Silas exactly as a refusal is.
+    if (rule.decisions + rule.refusals >= MAX_ROWS_PER_FAMILY) return;
+    const resolved = await settle();
     if (resolved.kind === 'refuse') {
       decline(ruleId, jobId, resolved.reason);
       return;
     }
-    if (counts[ruleId]!.decisions >= MAX_DECISIONS_PER_FAMILY) return;
     await decide(ruleId, jobId, resolved.call);
   };
 
@@ -544,9 +625,9 @@ export async function runSilasAutopilot(input: SilasAutopilotInput): Promise<Sil
   for (const row of digest.verdictsAwaitingDirective) {
     const rung = uniformAdvice(row.recurringBlockers);
     if (rung === 'directive') {
-      await plan('verdict-rung-directive', row.jobId, planVerdictDirective(row, input.ledger));
+      await plan('verdict-rung-directive', row.jobId, () => planVerdictDirective(row, input.ledger));
     } else if (rung === 'rebrief') {
-      await plan('verdict-rung-rebrief', row.jobId, planVerdictRebrief(row, input.ledger));
+      await plan('verdict-rung-rebrief', row.jobId, () => planVerdictRebrief(row, input.ledger));
     } else if (counts['verdict-rung-directive']!.mode !== 'off' && counts['verdict-rung-rebrief']!.mode !== 'off') {
       decline(
         'verdict-rung-directive',
@@ -558,25 +639,23 @@ export async function runSilasAutopilot(input: SilasAutopilotInput): Promise<Sil
     }
   }
   for (const row of digest.verificationFailures) {
-    await plan('verification-repair', row.jobId, planVerificationRepair(row, input.ledger));
+    await plan('verification-repair', row.jobId, () => planVerificationRepair(row, input.ledger));
   }
   for (const row of digest.conflictingPrs) {
-    await plan('pr-conflict-rebase', row.jobId, planConflictRebase(row, input.ledger));
+    await plan('pr-conflict-rebase', row.jobId, () => planConflictRebase(row, input.ledger));
   }
   for (const row of digest.prWithoutReview) {
     if (row.cleanAbort !== undefined) {
-      await plan('clean-abort-service-restart', row.jobId, planCleanAbortRebrief(row, input.ledger));
+      await plan('clean-abort-service-restart', row.jobId, () => planCleanAbortRebrief(row, input.ledger));
     } else {
-      await plan('pr-review-trigger', row.jobId, planReviewTrigger(row, input.ledger));
+      await plan('pr-review-trigger', row.jobId, () => planReviewTrigger(row, input.ledger));
     }
   }
   for (const row of digest.releaseEligible) {
-    await plan('sweep-ack', row.jobId, planSweepAck(row, input.ledger));
+    await plan('sweep-ack', row.jobId, () => planSweepAck(row, input.ledger));
   }
   for (const row of digest.deliveredWithoutPr) {
-    await plan(
-      'delivered-pr-register',
-      row.jobId,
+    await plan('delivered-pr-register', row.jobId, () =>
       planDeliveredPrRegister(row, input.ledger, input.ops.listOpenPrsForHead),
     );
   }
@@ -630,7 +709,16 @@ async function performCall(
       return;
     }
     case 'pr-review-trigger': {
-      await ops.triggerReview({ jobId, ruleId });
+      // The reviewed head is bound to the sha the green proved (issue #187),
+      // so the awaited review setup cannot re-resolve a newer live PR head.
+      const targetRef = optionalField('target_ref');
+      const boundDeliveredSha = optionalField('bound_delivered_sha');
+      await ops.triggerReview({
+        jobId,
+        ruleId,
+        ...(targetRef === undefined ? {} : { targetRef }),
+        ...(boundDeliveredSha === undefined ? {} : { boundDeliveredSha }),
+      });
       return;
     }
     case 'delivered-pr-register': {
