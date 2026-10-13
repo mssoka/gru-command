@@ -14,7 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # PRs test GitHub's merge result against the current base branch.
+      # Full history too, never a single-commit fetch: the App contract
+      # baseline scope (#190) archives the immutable pre-repair integration
+      # fe6a774, and the checkout's object store is what its shared clone
+      # reads. A shallow fetch leaves that commit absent and the scope fails
+      # on "fatal: not a tree object" instead of on the exercised contract.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v6
         with:
