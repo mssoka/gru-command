@@ -39,6 +39,7 @@
 import type { SilasAutopilotConfig, SilasAutopilotRuleMode } from '../config.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
+import { BRANCH_STATE_EVENT } from './github-poll.js';
 import type { LogLevel } from '../logger.js';
 import { SILAS_AUTOPILOT_RULE_IDS, type SilasAutopilotRuleId } from './silas-rules.js';
 import {
@@ -100,28 +101,35 @@ export interface SilasAutopilotOps {
   /** The function `POST /api/dispatch/review` calls. `targetRef`/
    * `boundDeliveredSha` bind the reviewed head to the sha the green proved
    * (issue #187); the clean-abort re-arm derives the same binding from its
-   * source round. */
+   * source round. `hold` carries the row's family/basis coverage identity so
+   * the admission boundary re-proves it after awaited seams (F-H2). */
   readonly triggerReview: (input: {
     readonly jobId: string;
     readonly ruleId: SilasAutopilotRuleId;
     readonly sourceRoundId?: string;
     readonly targetRef?: string;
     readonly boundDeliveredSha?: string;
+    readonly hold?: DecisionHoldTriple;
   }) => Promise<void>;
-  /** The function `POST /api/silas/directive` calls. */
+  /** The function `POST /api/silas/directive` calls. `hold` carries the
+   * row's family/basis coverage identity for the final admission boundary
+   * (issue #243 F-H2). */
   readonly sendDirective: (input: {
     readonly jobId: string;
     readonly directive: string;
     readonly ruleId: SilasAutopilotRuleId;
     readonly blockerFingerprint?: string;
     readonly sourceRoundId?: string;
+    readonly hold?: DecisionHoldTriple;
   }) => Promise<void>;
-  /** The function `POST /api/silas/rebrief` calls. */
+  /** The function `POST /api/silas/rebrief` calls. `hold` carries the row's
+   * family/basis coverage identity for the final admission boundary. */
   readonly sendRebrief: (input: {
     readonly jobId: string;
     readonly note: string;
     readonly ruleId: SilasAutopilotRuleId;
     readonly sourceRoundId: string;
+    readonly hold?: DecisionHoldTriple;
   }) => Promise<void>;
   /** The function `POST /api/dispatch/release` calls for a sweep-ack.
    * `hold` carries the row's #218 coverage identity for the final mutation
@@ -313,12 +321,17 @@ export function reviewEligible(ledger: AutopilotLedger, jobId: string): string |
   return null;
 }
 
+/** The `hold_signal`/`hold_basis` pair a planner carries on its decision so
+ * the ops admission boundary can re-prove the SAME family/basis coverage
+ * after its awaited seams (issue #243 F-H2). */
+function holdFields(hold: DecisionHoldTriple): { readonly hold_signal: string; readonly hold_basis: string } {
+  return { hold_signal: hold.signal, hold_basis: hold.basis };
+}
+
 /** `verdict-rung-directive`: structured blockers → templated directive. */
 function planVerdictDirective(row: VerdictAwaitingDirectiveRow, ledger: AutopilotLedger): Verdict {
-  const fence = fencesHold(ledger, row.jobId, {
-    signal: 'verdict-rung-directive',
-    basis: `verdict:${row.roundId}`,
-  });
+  const hold: DecisionHoldTriple = { signal: 'verdict-rung-directive', basis: `verdict:${row.roundId}` };
+  const fence = fencesHold(ledger, row.jobId, hold);
   if (fence !== null) return refuse(fence);
   if (ledger.hasUnsettledVerificationRun(row.jobId)) return refuse('a verification is already in flight on this lane');
   for (const blocker of row.recurringBlockers) {
@@ -340,15 +353,14 @@ function planVerdictDirective(row: VerdictAwaitingDirectiveRow, ledger: Autopilo
     blocker_fingerprint: `verdict:${row.roundId}`,
     blocker_count: row.recurringBlockers.length,
     directive: renderBlockerDirective(row),
+    ...holdFields(hold),
   });
 }
 
 /** `verdict-rung-rebrief`: the ladder's fresh-worker rung. */
 function planVerdictRebrief(row: VerdictAwaitingDirectiveRow, ledger: AutopilotLedger): Verdict {
-  const fence = fencesHold(ledger, row.jobId, {
-    signal: 'verdict-rung-rebrief',
-    basis: `verdict:${row.roundId}`,
-  });
+  const hold: DecisionHoldTriple = { signal: 'verdict-rung-rebrief', basis: `verdict:${row.roundId}` };
+  const fence = fencesHold(ledger, row.jobId, hold);
   if (fence !== null) return refuse(fence);
   if (ledger.hasUnsettledVerificationRun(row.jobId)) return refuse('a verification is already in flight on this lane');
   if (row.recurringBlockers.length === 0) return refuse('the verdict row carries no structured blocker to re-brief against');
@@ -359,15 +371,17 @@ function planVerdictRebrief(row: VerdictAwaitingDirectiveRow, ledger: AutopilotL
     source_round_id: row.roundId,
     blocker_count: row.recurringBlockers.length,
     note: renderRebriefNote(row),
+    ...holdFields(hold),
   });
 }
 
 /** `verification-repair`: the exact failed verification debt. */
 function planVerificationRepair(row: VerificationFailureRow, ledger: AutopilotLedger): Verdict {
-  const fence = fencesHold(ledger, row.jobId, {
+  const hold: DecisionHoldTriple = {
     signal: 'verification-failure',
     basis: `verification-failure:${row.scope ?? ''}@${row.runId ?? ''}`,
-  });
+  };
+  const fence = fencesHold(ledger, row.jobId, hold);
   if (fence !== null) return refuse(fence);
   // The #117 deferral: a null scope cannot be named, and the digest retires
   // the debt only on the EXACT fingerprint — an unscoped rung would re-fire
@@ -381,6 +395,7 @@ function planVerificationRepair(row: VerificationFailureRow, ledger: AutopilotLe
     rule_id: 'verification-repair',
     blocker_fingerprint: `verification-failure:${row.scope}@${row.runId}`,
     directive: renderVerificationRepairDirective(row),
+    ...holdFields(hold),
   });
 }
 
@@ -388,18 +403,74 @@ function planVerificationRepair(row: VerificationFailureRow, ledger: AutopilotLe
  * this exact blocker fingerprint (issue #243 R2-H6). Counting the durable
  * requests — not `silas.directive-sent` receipts — includes failures that
  * never earned a sent receipt (a refused supersession or positive
- * no-delivery proof recorded `silas.directive-failed` alone). */
+ * no-delivery proof recorded `silas.directive-failed` alone).
+ *
+ * The ledger sorts/caps by request id and exposes a cursor: the history is
+ * PAGED to exhaustion (issue #243 F-M3) so two matching failures behind more
+ * than one page of earlier-sorting unrelated failures still stop the cutoff.
+ * The scan stops early once the two-match threshold is reached. */
 function failedDirectivesForFingerprint(ledger: AutopilotLedger, jobId: string, fingerprint: string): number {
-  return ledger
-    .listPendingDirectives({ jobId, states: ['failed'], limit: 1000 })
-    .filter((record) => {
+  const pageSize = 1000;
+  let matches = 0;
+  let cursor: string | undefined;
+  for (;;) {
+    const page = ledger.listPendingDirectives({
+      jobId,
+      states: ['failed'],
+      limit: pageSize,
+      ...(cursor === undefined ? {} : { cursor }),
+    });
+    for (const record of page) {
       try {
         const parsed = JSON.parse(record.payload) as { blocker_fingerprint?: unknown };
-        return parsed.blocker_fingerprint === fingerprint;
+        if (parsed.blocker_fingerprint === fingerprint) matches += 1;
       } catch {
-        return false;
+        // A malformed durable payload can never match a fingerprint.
       }
-    }).length;
+    }
+    if (matches >= 2) return matches;
+    if (page.length < pageSize) return matches;
+    const last: string | undefined = page[page.length - 1]?.requestId;
+    if (last === undefined || last === cursor) return matches;
+    cursor = last;
+  }
+}
+
+/** The newest CI observation bound to the lane (issue #243 F-M2): the latest
+ * `github.ci-green`/`github.ci-failed` signal OR the latest
+ * `github.branch-state` cursor's `ci` state (which also carries `pending`).
+ * A historical green must never survive a newer failed/pending observation at
+ * the same head. Returns the observation with the highest event seq. */
+function latestCiObservation(ledger: AutopilotLedger, jobId: string): { readonly sha: string; readonly status: string } | null {
+  const candidates: { readonly seq: number; readonly sha: string; readonly status: string }[] = [];
+  const signalSha = (payload: unknown): string | null => {
+    if (payload === null || typeof payload !== 'object') return null;
+    const sha = (payload as { sha?: unknown }).sha;
+    return typeof sha === 'string' && sha !== '' ? sha : null;
+  };
+  const green = ledger.latestJobEvent(jobId, 'github.ci-green');
+  if (green !== null) {
+    const sha = signalSha(green.payload);
+    if (sha !== null) candidates.push({ seq: green.seq, sha, status: 'green' });
+  }
+  const failed = ledger.latestJobEvent(jobId, 'github.ci-failed');
+  if (failed !== null) {
+    const sha = signalSha(failed.payload);
+    if (sha !== null) candidates.push({ seq: failed.seq, sha, status: 'failed' });
+  }
+  const branch = ledger.latestJobEvent(jobId, BRANCH_STATE_EVENT);
+  if (branch !== null && branch.payload !== null && typeof branch.payload === 'object') {
+    const ci = (branch.payload as { ci?: unknown }).ci;
+    if (ci !== null && typeof ci === 'object') {
+      const sha = (ci as { sha?: unknown }).sha;
+      const status = (ci as { status?: unknown }).status;
+      if (typeof sha === 'string' && sha !== '' && typeof status === 'string') {
+        candidates.push({ seq: branch.seq, sha, status });
+      }
+    }
+  }
+  if (candidates.length === 0) return null;
+  return candidates.reduce((best, current) => (current.seq > best.seq ? current : best));
 }
 
 /** `pr-conflict-rebase`: ONE conflict-integration directive per head. */
@@ -415,6 +486,7 @@ function planConflictRebase(row: ConflictingPrRow, ledger: AutopilotLedger): Ver
   if (ledger.hasUnsettledVerificationRun(row.jobId)) return refuse('a verification is already in flight on this lane');
   if (row.headSha === null || row.headSha.trim() === '') return refuse('the conflict row carries no head sha to fingerprint');
   const fingerprint = `pr-conflict:${row.headSha}`;
+  const hold: DecisionHoldTriple = { signal: 'pr-conflict', basis: fingerprint };
   const failed = failedDirectivesForFingerprint(ledger, row.jobId, fingerprint);
   if (failed >= 2) {
     return refuse(`a conflict-integration directive for head ${row.headSha.slice(0, 12)} already failed ${failed}×`);
@@ -425,6 +497,7 @@ function planConflictRebase(row: ConflictingPrRow, ledger: AutopilotLedger): Ver
     rule_id: 'pr-conflict-rebase',
     blocker_fingerprint: fingerprint,
     directive: renderConflictDirective(row),
+    ...holdFields(hold),
   });
 }
 
@@ -434,10 +507,8 @@ function planCleanAbortRebrief(row: PrWithoutReviewRow, ledger: AutopilotLedger)
   if (cleanAbort === undefined) return refuse('the row is not a clean-abort row');
   const eligible = reviewEligible(ledger, row.jobId);
   if (eligible !== null) return refuse(eligible);
-  const fence = fencesHold(ledger, row.jobId, {
-    signal: 'clean-abort-service-restart',
-    basis: `round:${cleanAbort.roundId}`,
-  });
+  const hold: DecisionHoldTriple = { signal: 'clean-abort-service-restart', basis: `round:${cleanAbort.roundId}` };
+  const fence = fencesHold(ledger, row.jobId, hold);
   if (fence !== null) return refuse(fence);
   const round = ledger.getRound(cleanAbort.roundId);
   if (round === null || round.jobId !== row.jobId) return refuse('the clean-abort round does not belong to this job');
@@ -457,6 +528,7 @@ function planCleanAbortRebrief(row: PrWithoutReviewRow, ledger: AutopilotLedger)
     source_round_id: cleanAbort.roundId,
     target_ref: sha,
     bound_delivered_sha: sha,
+    ...holdFields(hold),
   });
 }
 
@@ -466,23 +538,22 @@ function planReviewTrigger(row: PrWithoutReviewRow, ledger: AutopilotLedger): Ve
   const eligible = reviewEligible(ledger, row.jobId);
   if (eligible !== null) return refuse(eligible);
   const job = ledger.getJob(row.jobId);
-  const fence = fencesHold(ledger, row.jobId, {
+  const hold: DecisionHoldTriple = {
     signal: 'pr-review-trigger',
     basis: job === null ? 'pr-review:unknown' : `pr-review:${job.prUrl ?? 'none'}`,
-  });
+  };
+  const fence = fencesHold(ledger, row.jobId, hold);
   if (fence !== null) return refuse(fence);
   // #187's final eligibility recheck: the green must be ON the delivered
-  // head — a green from an older commit never authorizes the arm.
+  // head — a green from an older commit never authorizes the arm. Issue #243
+  // F-M2: the LATEST repo/PR/SHA-bound observation governs, so a historical
+  // green cannot survive a newer failed/pending observation at the same head.
   const delivered = ledger.latestJobEvent(row.jobId, 'job.delivered');
   const deliveredSha = delivered === null ? null : deliveredTargetSha(delivered);
   if (deliveredSha === null) return refuse('the delivered head is not resolvable — the arm cannot be bound');
-  const green = ledger.latestJobEvent(row.jobId, 'github.ci-green');
-  const greenSha =
-    green !== null && typeof green.payload === 'object' && green.payload !== null
-      ? (green.payload as { sha?: unknown }).sha
-      : null;
-  if (typeof greenSha !== 'string' || greenSha !== deliveredSha) {
-    return refuse('no github.ci-green observation on the delivered head');
+  const observation = latestCiObservation(ledger, row.jobId);
+  if (observation === null || observation.sha !== deliveredSha || observation.status !== 'green') {
+    return refuse('the newest CI observation on the delivered head is not green');
   }
   // The reviewed head is the one the green proved: bind it exactly, so the
   // awaited review setup cannot re-resolve a newer live PR head and the
@@ -493,6 +564,7 @@ function planReviewTrigger(row: PrWithoutReviewRow, ledger: AutopilotLedger): Ve
     rule_id: 'pr-review-trigger',
     target_ref: deliveredSha,
     bound_delivered_sha: deliveredSha,
+    ...holdFields(hold),
   });
 }
 
@@ -754,6 +826,14 @@ async function performCall(
     const value = call.wouldCall[field];
     return typeof value === 'string' && value !== '' ? value : undefined;
   };
+  // The family/basis coverage identity every mutation-capable family carries
+  // so the ops admission boundary can re-prove it after awaited seams
+  // (issue #243 F-H2). Absent → the boundary cannot re-prove (legacy rows).
+  const holdSignal = optionalField('hold_signal');
+  const holdBasis = optionalField('hold_basis');
+  const holdFields = holdSignal === undefined || holdBasis === undefined
+    ? {}
+    : { hold: { signal: holdSignal, basis: holdBasis } as DecisionHoldTriple };
   switch (ruleId) {
     case 'verdict-rung-directive':
     case 'verification-repair':
@@ -766,15 +846,22 @@ async function performCall(
         ruleId,
         ...(sourceRoundId === undefined ? {} : { sourceRoundId }),
         ...(blockerFingerprint === undefined ? {} : { blockerFingerprint }),
+        ...holdFields,
       });
       return;
     }
     case 'verdict-rung-rebrief': {
-      await ops.sendRebrief({ jobId, note: stringField('note'), ruleId, sourceRoundId: stringField('source_round_id') });
+      await ops.sendRebrief({
+        jobId,
+        note: stringField('note'),
+        ruleId,
+        sourceRoundId: stringField('source_round_id'),
+        ...holdFields,
+      });
       return;
     }
     case 'clean-abort-service-restart': {
-      await ops.triggerReview({ jobId, ruleId, sourceRoundId: stringField('source_round_id') });
+      await ops.triggerReview({ jobId, ruleId, sourceRoundId: stringField('source_round_id'), ...holdFields });
       return;
     }
     case 'pr-review-trigger': {
@@ -787,32 +874,16 @@ async function performCall(
         ruleId,
         ...(targetRef === undefined ? {} : { targetRef }),
         ...(boundDeliveredSha === undefined ? {} : { boundDeliveredSha }),
+        ...holdFields,
       });
       return;
     }
     case 'delivered-pr-register': {
-      const holdSignal = optionalField('hold_signal');
-      const holdBasis = optionalField('hold_basis');
-      await ops.registerPr({
-        jobId,
-        url: stringField('url'),
-        ruleId,
-        ...(holdSignal === undefined || holdBasis === undefined
-          ? {}
-          : { hold: { signal: holdSignal, basis: holdBasis } }),
-      });
+      await ops.registerPr({ jobId, url: stringField('url'), ruleId, ...holdFields });
       return;
     }
     case 'sweep-ack': {
-      const holdSignal = optionalField('hold_signal');
-      const holdBasis = optionalField('hold_basis');
-      await ops.releaseLane({
-        jobId,
-        ruleId,
-        ...(holdSignal === undefined || holdBasis === undefined
-          ? {}
-          : { hold: { signal: holdSignal, basis: holdBasis } }),
-      });
+      await ops.releaseLane({ jobId, ruleId, ...holdFields });
       return;
     }
   }

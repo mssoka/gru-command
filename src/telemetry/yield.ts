@@ -1230,9 +1230,11 @@ function eventPayload(event: LedgerEventRecord): Record<string, unknown> {
 }
 
 /** The per-row debt identity a decision predicted, from its `would_call`
- * (issue #243 R2-H7): the round, verification run, conflicting head or PR
- * url the decision named. A family with no per-row key (sweep-ack,
- * pr-review-trigger) returns `{}` and is matched on job + kind + rule only. */
+ * (issue #243 R2-H7/F-H5): the exact blocker fingerprint, source round, PR
+ * url or BOUND review head the decision named. A family with no per-row key
+ * (sweep-ack) returns `{}` and is matched on job + kind + rule only. For the
+ * review families the predicted bound head is normalised to `target_ref` so
+ * a receipt that names the ARMED/FROZEN head can be compared directly. */
 function decisionDebtIdentity(payload: Record<string, unknown>): Record<string, string> {
   const wouldCall = payload['would_call'];
   const call = wouldCall !== null && typeof wouldCall === 'object'
@@ -1243,6 +1245,8 @@ function decisionDebtIdentity(payload: Record<string, unknown>): Record<string, 
     const value = call[key];
     if (typeof value === 'string' && value !== '') identity[key] = value;
   }
+  const head = call['target_ref'] ?? call['bound_delivered_sha'];
+  if (typeof head === 'string' && head !== '') identity['target_ref'] = head;
   return identity;
 }
 
@@ -1309,7 +1313,13 @@ export function computeAutopilotMeasures(
     entry.decisions += 1;
     const kinds = AUTOPILOT_FAMILY_RECEIPTS[ruleId] ?? [];
     const debt = decisionDebtIdentity(payload);
-    const agreed = familyActions.some((event) => {
+    // Issue #243 F-H6: agreement requires positive model provenance in the
+    // comparison window — a `silas.wake` AFTER this decision, i.e. the model
+    // was actually shown the row again. A tagged authenticated API action
+    // (or a wake that only precedes the decision) is NOT model observation:
+    // it stays UNOBSERVABLE rather than being credited as agreement.
+    const observedAfterDecision = newestWakeSeq > decision.seq;
+    const agreed = observedAfterDecision && familyActions.some((event) => {
       if (event.seq <= decision.seq) return false;
       if (event.jobId === null || event.jobId !== decision.jobId) return false;
       if (!kinds.includes(event.kind)) return false;
@@ -1324,11 +1334,11 @@ export function computeAutopilotMeasures(
         // action kind is unique (H6).
         return false;
       }
-      // Issue #243 R2-H7: the debt identity must match too.
+      // Issue #243 R2-H7/F-H5: the debt identity must match too.
       return receiptMatchesDebt(debt, eventBody);
     });
     if (agreed) entry.agreed += 1;
-    else if (decision.seq > newestWakeSeq) entry.unobservable += 1;
+    else if (!observedAfterDecision) entry.unobservable += 1;
     byRule.set(ruleId, entry);
   }
   return {

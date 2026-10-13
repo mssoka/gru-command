@@ -840,6 +840,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
               route: outcome.route,
               ...(armed && ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
               ...(outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
+              // Issue #243 F-H5: the frozen head the round actually armed on,
+              // so #214 can match a predicted bound head to the real target.
+              ...(outcome.route === 'perkins' ? { target_ref: outcome.round.targetRef } : {}),
             },
           });
         }

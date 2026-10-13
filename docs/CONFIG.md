@@ -307,7 +307,8 @@ sweep_interval_ms = 300000
 # since the last delivered wake (a bounded safety re-look). 0 = never
 # re-wake on an unchanged digest; a changed digest, an event whose
 # digest is non-empty, or a passed decision recheck always wakes (an
-# empty digest never wakes). The wake prompt carries
+# empty digest never wakes on its own; a due decision recheck still
+# does). The wake prompt carries
 # digest DELTA rows plus a pointer to GET /api/silas/digest, and the
 # static operating brief (orders, ops surface, skills) is injected
 # once per session — re-injected only when the brief hash changes,

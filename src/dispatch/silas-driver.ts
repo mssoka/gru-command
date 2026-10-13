@@ -2092,6 +2092,15 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     return recheck > dispositionNow ? [] : [failure];
   };
   const verificationFailures = digest.verificationFailures.filter(continuationAllowed).flatMap(failureAttention);
+  // Issue #243 F-M1: an accepted directive or re-brief producer owns the
+  // lane from its durable request until its completion receipt. While that
+  // ownership is unresolved the recomputed verdict row is NOT actionable —
+  // code already owns the work — so publishing it only buys a redundant
+  // max-thinking model wake. This is the ledger's own writer-ownership test,
+  // not the earlier recovery-hold history.
+  const liveWriterOwns = (jobId: string): boolean =>
+    input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+    input.ledger.listPendingRebriefs({ jobId }).length > 0;
   return {
     ...digest,
     // Issue #243 original-M2 carry-forward: the publish boundary must not
@@ -2101,7 +2110,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     // every autopilot verdict planner refuses it. Re-read at this final,
     // no-await boundary like the sibling fences.
     verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(
-      (row) => continuationAllowed(row) && !verificationInFlight(input.ledger, row.jobId),
+      (row) => continuationAllowed(row) && !verificationInFlight(input.ledger, row.jobId) && !liveWriterOwns(row.jobId),
     ),
     verificationFailures,
     verificationWaits: digest.verificationWaits.filter(continuationAllowed),

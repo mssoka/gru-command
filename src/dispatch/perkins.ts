@@ -4452,6 +4452,21 @@ export class WaveRunner {
         // before any admission effect — the rollback below unwinds it.
         if (setupSignal.reason instanceof ReviewSupersededError) throw setupSignal.reason;
       }
+      // Issue #243 F-H7: the recorded-delivery ledger is INDEPENDENT of
+      // branch idleness — a completed same-revision delivery B can leave the
+      // lane idle while an explicitly pinned SHA A stays immutable, so the
+      // post-probe branch recheck above cannot see the drift. Re-prove the
+      // bound delivered head HERE, at the last boundary before any admission
+      // effect, so A never freezes after B arrived during the final probe.
+      if (input.boundDeliveredSha !== undefined) {
+        const deliveredNow = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+        const shaNow = deliveredNow === null ? null : deliveredTargetSha(deliveredNow);
+        if (shaNow !== input.boundDeliveredSha) {
+          throw new Error(
+            `the bound delivered head moved during the final admission probe (${input.boundDeliveredSha} -> ${shaNow ?? 'none'}) — request the review again`,
+          );
+        }
+      }
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
         jobId: job.id,

@@ -267,7 +267,8 @@ export interface SilasConfig {
    * since the last delivered wake (a bounded safety re-look). 0 = never
    * re-wake on an unchanged digest; a changed digest, an event whose
    * digest is non-empty, or a passed decision recheck always wakes (an
-   * empty digest never wakes — issue #243). */
+   * empty digest never wakes on its own — a due decision recheck still
+   * does, issue #243). */
   readonly unchangedRewakeMs: number;
   /** Consecutive same-blocker rounds before a fix directive is advised. */
   readonly directiveAt: number;

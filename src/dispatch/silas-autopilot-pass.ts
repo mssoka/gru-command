@@ -14,9 +14,35 @@
 import type { SilasAutopilotConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { runSilasAutopilot, type AutopilotLedger, type SilasAutopilotOps } from './silas-autopilot.js';
-import type { DeterministicPassHook, SilasOpsDigest } from './silas-driver.js';
+import type { DeterministicPassHook, DeterministicPassResult, SilasOpsDigest } from './silas-driver.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+/**
+ * The production deterministic-pass composition (issue #243 F-M4): the
+ * durable reconciliation half plus the autopilot half in ONE pass. Either
+ * half reporting `ok: false` fails the whole pass, so the driver records
+ * `silas.reconcile-failed` and never advances a completed reconciliation over
+ * a failed half. Extracted from main.ts so the composition itself is
+ * behaviorally testable through a real driver and ledger. */
+export function composeDeterministicPass(
+  durable: DeterministicPassHook,
+  autopilot: DeterministicPassHook,
+): DeterministicPassHook {
+  return async (context) => {
+    const durableResult = await durable(context);
+    const autopilotResult = await autopilot(context);
+    const durableCounts = typeof durableResult === 'object' && durableResult !== null ? durableResult : {};
+    const autopilotCounts = typeof autopilotResult === 'object' && autopilotResult !== null ? autopilotResult : {};
+    return {
+      ...durableCounts,
+      ...autopilotCounts,
+      // One failed half fails the pass: the driver records a failed
+      // reconciliation, never a completed one.
+      ok: durableCounts['ok'] !== false && autopilotCounts['ok'] !== false,
+    } satisfies DeterministicPassResult;
+  };
+}
 
 export interface SilasAutopilotPassDeps {
   readonly ledger: AutopilotLedger;

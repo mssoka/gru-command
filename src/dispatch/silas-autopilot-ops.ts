@@ -102,8 +102,14 @@ export interface SilasAutopilotOpsHandle extends SilasAutopilotOps {
    * queued admission waits (a producer whose seat is not yet taken never
    * starts) and lets running prompts settle. This is a JOIN, never a
    * cessation claim: an unsettled producer is reported, never fabricated
-   * away. */
-  drain(): Promise<{ readonly settled: boolean; readonly pending: number }>;
+   * away.
+   *
+   * Issue #243 F-H4: a running gated re-brief awaits its prompt directly, and
+   * its stop signal does not reach that open await — so an UNBOUNDED join
+   * would block shutdown's disposal/persistence stages behind it. When
+   * `graceMs` is supplied the initial join is BOUNDED: it reports the
+   * remaining producers and returns, leaving real cleanup to settle them. */
+  drain(opts?: { readonly graceMs?: number }): Promise<{ readonly settled: boolean; readonly pending: number }>;
 }
 
 /** The extension of a `silas.*` receipt payload that marks it as the
@@ -143,10 +149,22 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     producers.add(settled);
     void settled.then(() => producers.delete(settled));
   };
-  const drain = async (): Promise<{ readonly settled: boolean; readonly pending: number }> => {
-    while (producers.size > 0) {
-      await Promise.allSettled([...producers]);
+  const drain = async (opts: { readonly graceMs?: number } = {}): Promise<{ readonly settled: boolean; readonly pending: number }> => {
+    if (producers.size === 0) return { settled: true, pending: 0 };
+    const join = Promise.allSettled([...producers]);
+    if (opts.graceMs !== undefined && Number.isFinite(opts.graceMs)) {
+      // BOUNDED initial join (issue #243 F-H4): report unsettled producers
+      // instead of blocking shutdown's disposal/persistence stages.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const bound = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.max(0, opts.graceMs as number));
+        timer.unref?.();
+      });
+      await Promise.race([join, bound]);
+      if (timer !== undefined) clearTimeout(timer);
+      return { settled: producers.size === 0, pending: producers.size };
     }
+    await join;
     return { settled: producers.size === 0, pending: producers.size };
   };
 
@@ -166,6 +184,17 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     if (deps.ledger.hasUnsettledVerificationRun(jobId)) {
       throw new Error(`a verification is already in flight on this lane — the ${label} is left for LLM Silas`);
     }
+  };
+
+  /** Family/basis coverage re-proved at the FINAL admission boundary (issue
+   * #243 F-H2): the planner's check can be stale by the time a producer gets
+   * its turn (an owner hold that lands after planning/supersession/preflight
+   * must refuse before any durable or prompt effect). `hold` is absent only
+   * for legacy rows the boundary cannot re-prove. */
+  const requireHoldUncovered = (jobId: string, hold: DecisionHoldTriple | undefined, label: string): void => {
+    if (hold === undefined) return;
+    const covered = decisionHold(deps.ledger, jobId, hold);
+    if (covered !== null) throw new Error(`${covered} — the ${label} is left for LLM Silas`);
   };
 
   /** Owner rules 3/5 writer admission: a live review whose candidate is
@@ -234,8 +263,12 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly sourceRoundId?: string;
     readonly targetRef?: string;
     readonly boundDeliveredSha?: string;
+    readonly hold?: DecisionHoldTriple;
   }): Promise<void> => {
     requireNotStopping('review request');
+    // Issue #243 F-H2: an owner hold that arrived after planning must refuse
+    // the review admission, not just the planner's initial read.
+    requireHoldUncovered(input.jobId, input.hold, 'review request');
     let targetRef = input.targetRef;
     let boundDeliveredSha = input.boundDeliveredSha;
     if (input.sourceRoundId !== undefined) {
@@ -301,6 +334,9 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       payload: {
         route: outcome.route,
         ...(armed && outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
+        // Issue #243 F-H5: the ARMED/FROZEN head, so #214's agreement read
+        // can match a predicted bound head against the round's real target.
+        ...(armed && outcome.route === 'perkins' ? { target_ref: outcome.round.targetRef } : {}),
         ...(input.sourceRoundId === undefined ? {} : { source_round_id: input.sourceRoundId }),
         ...autopilotReceiptFields(input.ruleId),
       },
@@ -316,6 +352,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly ruleId: SilasAutopilotRuleId;
     readonly blockerFingerprint?: string;
     readonly sourceRoundId?: string;
+    readonly hold?: DecisionHoldTriple;
   }): Promise<void> => {
     // Owner rules 3/5 writer admission (issue #243 H1), checked in the SAME
     // synchronous tick as the durable intent below — the endpoint's own
@@ -327,6 +364,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     requireNotStopping('directive');
     requireWriterAdmissible(input.jobId, 'directive');
     requireNoUnsettledVerification(input.jobId, 'directive');
+    requireHoldUncovered(input.jobId, input.hold, 'directive');
     const begun = deps.ledger.beginDirectiveIntent({
       jobId: input.jobId,
       directive: input.directive,
@@ -364,6 +402,13 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       }
       let delivery: Awaited<ReturnType<typeof routeFixDirectiveToMinion>>;
       try {
+        // Issue #243 F-H2/F-H3: re-prove family/basis coverage and
+        // verification ownership AFTER the awaited lane supersession and
+        // before any prompt/durable effect. The in-route
+        // `beforeWriterSideEffect` repeats the coverage check at the
+        // post-pacing boundaries inside routeFixDirectiveToMinion.
+        requireHoldUncovered(input.jobId, input.hold, 'directive');
+        requireNoUnsettledVerification(input.jobId, 'directive');
         delivery = await routeFixDirectiveToMinion({
           registry: deps.registry,
           ledger: deps.ledger,
@@ -383,6 +428,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
           // cessation — an aborted turn reports unknown admission below.
           signal: deps.stopSignal ?? new AbortController().signal,
           owner: 'silas-ops',
+          beforeWriterSideEffect: () => requireHoldUncovered(input.jobId, input.hold, 'directive'),
           ...(deps.workerGate === undefined ? {} : { workerGate: deps.workerGate }),
           ...(deps.retrySettlement === undefined ? {} : { retrySettlement: deps.retrySettlement }),
           ...(deps.lessons === undefined ? {} : { lessons: deps.lessons }),
@@ -480,6 +526,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly note: string;
     readonly ruleId: SilasAutopilotRuleId;
     readonly sourceRoundId: string;
+    readonly hold?: DecisionHoldTriple;
   }): Promise<void> => {
     const job = deps.ledger.getJob(input.jobId);
     if (job === null) throw new Error(`job "${input.jobId}" not found`);
@@ -497,6 +544,9 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     requireWriterAdmissible(input.jobId, 're-brief');
     requireNoUnsettledVerification(input.jobId, 're-brief');
     requireNotStopping('re-brief');
+    // Issue #243 F-H2: an owner hold that arrived during the awaited
+    // supersession must refuse the re-brief before its marker is created.
+    requireHoldUncovered(input.jobId, input.hold, 're-brief');
     // Issue #243 R2-H3: a newer re-brief admitted during the awaited
     // supersession must NEVER be replaced by this stale request. The marker
     // upsert would otherwise overwrite the newer generation; refuse instead.
@@ -529,7 +579,15 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
           note: input.note,
           briefing: contract,
           workRevision,
-          beforeTurnSideEffect: () => checkRebriefTurn(deps.ledger, input.jobId, markers),
+          // Issue #243 F-H2/F-H3: at each in-turn admission boundary,
+          // re-prove the family/basis coverage and verification ownership —
+          // an owner hold or a verification that took the lane while this
+          // producer queued must refuse before spawn/prompt.
+          beforeTurnSideEffect: () => {
+            requireHoldUncovered(input.jobId, input.hold, 're-brief');
+            requireNoUnsettledVerification(input.jobId, 're-brief');
+            checkRebriefTurn(deps.ledger, input.jobId, markers);
+          },
           onSpawned: (worker) => {
             deps.ledger.bindPendingRebriefWorker({
               ids: markers.map((marker) => marker.id),
@@ -608,7 +666,13 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
       .listWorktrees({ jobId: input.jobId })
       .find((candidate) => candidate.kind === 'job' && candidate.status !== 'swept');
     if (lane === undefined) throw new Error(`job "${input.jobId}" has no active job lane`);
-    const result: WorktreeSweepResult = await deps.worktrees.release({ worktreeId: lane.id });
+    const result: WorktreeSweepResult = await deps.worktrees.release({
+      worktreeId: lane.id,
+      // Issue #243 F-H1: the unattended autopilot release owes pre-removal
+      // proofs (tracked cleanliness, fresh required containment) BEFORE any
+      // forced removal; the operator path keeps its own authority.
+      requireReleaseProofs: true,
+    });
     if (result.status !== 'swept') {
       // A paused release is a refusal, never an override: the pause-and-ask
       // rule stays absolute and no receipt is minted.

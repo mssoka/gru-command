@@ -27,7 +27,7 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
-import { createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
+import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
 import { createSilasAutopilotOps, type SilasAutopilotOpsHandle } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
@@ -358,6 +358,12 @@ async function main(): Promise<number> {
   /** Service-stopping signal (pacing): aborts QUEUED admission waits and
    * lets delivery settlement observe shutdown instead of hanging. */
   const serviceStop = new AbortController();
+  // Issue #243 F-H4: bounds for the autopilot producer join, inside the
+  // existing 5000ms shutdown watchdog. The INITIAL grace must leave room for
+  // registry disposal and the persistence stages that settle the producers;
+  // the FINAL grace joins what disposal has released. Neither claims cessation.
+  const AUTOPILOT_DRAIN_INITIAL_GRACE_MS = 1_500;
+  const AUTOPILOT_DRAIN_FINAL_GRACE_MS = 1_000;
   const shutdown = (signal: string, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -440,14 +446,20 @@ async function main(): Promise<number> {
             logger.error('silas driver stop failed', { error: String(error) });
           }
         }
-        // Issue #243 R2-H9: join the autopilot's in-flight producers. The
-        // service-stop signal already aborts QUEUED admissions; this awaits
-        // settlement and reports (never fabricates) anything still running.
+        // Issue #243 R2-H9/F-H4: the autopilot's in-flight producers are
+        // joined with a BOUNDED initial grace so a running gated re-brief
+        // (whose stop signal does not reach its open prompt) can never block
+        // the disposal/persistence stages below. The service-stop signal
+        // already aborts QUEUED admissions; the real registry disposal below
+        // settles the running ones, and the FINAL accounting reports what is
+        // still open — never fabricated as ceased.
         if (state.autopilot !== undefined) {
           try {
-            const drained = await state.autopilot.drain();
+            const drained = await state.autopilot.drain({ graceMs: AUTOPILOT_DRAIN_INITIAL_GRACE_MS });
             if (!drained.settled) {
-              logger.warn('silas autopilot producers still running at shutdown', { pending: drained.pending });
+              logger.warn('silas autopilot producers still running at shutdown (bounded initial join)', {
+                pending: drained.pending,
+              });
             }
           } catch (error) {
             logger.error('silas autopilot drain failed', { error: String(error) });
@@ -495,6 +507,21 @@ async function main(): Promise<number> {
             await state.registry.dispose();
           } catch (error) {
             logger.error('registry dispose failed', { error: String(error) });
+          }
+        }
+        // Issue #243 F-H4 final accounting: registry disposal has now released
+        // the running producers' handles, so report honestly whether they
+        // settled rather than claiming cessation.
+        if (state.autopilot !== undefined) {
+          try {
+            const settledNow = await state.autopilot.drain({ graceMs: AUTOPILOT_DRAIN_FINAL_GRACE_MS });
+            if (!settledNow.settled) {
+              logger.warn('silas autopilot producers unsettled after disposal — ownership retained for boot reconciliation', {
+                pending: settledNow.pending,
+              });
+            }
+          } catch (error) {
+            logger.error('silas autopilot final drain failed', { error: String(error) });
           }
         }
         if (state.store !== undefined) {
@@ -1735,22 +1762,10 @@ async function main(): Promise<number> {
       // Chief phase-3 seam: every deterministic Silas pass runs the
       // production hook — the in-memory review-handoff reconsideration
       // plus the bounded durable reconciliation (issue #163) — BEFORE any
-      // LLM wake, and then the autopilot (issue #243). The durable factory
-      // is behaviorally tested with a real ledger and driver; a wiring
-      // regression fails a behavioral test, not just a source regex.
-      onDeterministicPass: async (context) => {
-        const durable = await durablePass(context);
-        const autopilot = await autopilotHook(context);
-        const durableCounts = typeof durable === 'object' && durable !== null ? durable : {};
-        const autopilotCounts = typeof autopilot === 'object' && autopilot !== null ? autopilot : {};
-        return {
-          ...durableCounts,
-          ...autopilotCounts,
-          // One failed half fails the pass: the driver records a failed
-          // reconciliation, never a completed one.
-          ok: durableCounts['ok'] !== false && autopilotCounts['ok'] !== false,
-        };
-      },
+      // LLM wake, and then the autopilot (issue #243). The composition is
+      // the exported factory (issue #243 F-M4) so the asymmetric failure
+      // behavior is behaviorally tested through a real driver, not a regex.
+      onDeterministicPass: composeDeterministicPass(durablePass, autopilotHook),
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,
