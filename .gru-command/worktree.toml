@@ -767,5 +767,5 @@ merge-authority-baseline = 'set -e; base=dffa10af37691238d5f3cbb7dd03696d43e4ff0
 
 # #315 strict repair: authenticated exact-head component proof; no live models.
 scheduled-verification-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build"
-scheduled-verification-native-early = "npm run build && node test/helpers/qualify-claude-verification.mjs /Users/moses/.local/bin/claude early"
+gh315-native-early = "npm run build && node test/helpers/qualify-claude-verification.mjs /Users/moses/.local/bin/claude early"
 scheduled-verification-native = "npm run build && node test/helpers/qualify-claude-verification.mjs /Users/moses/.local/bin/claude"
