@@ -15,6 +15,17 @@ export interface RestartCleanupDebt {
   readonly replacementAgentId: string | null;
 }
 
+/** Exact physical-handle custody token, minted BEFORE any pending write is
+ * attempted. It survives a failed write so every retry and the fallback audit
+ * carry the SAME generation; a distinct handle reusing the logical id mints
+ * its own generation and can therefore never discharge this custody. */
+export interface RestartCleanupCustody {
+  readonly generation: string;
+  readonly jobId: string | null;
+  readonly agentId: string;
+  readonly replacementAgentId: string;
+}
+
 function payload(event: EventRecord): Record<string, unknown> {
   return typeof event.payload === 'object' && event.payload !== null && !Array.isArray(event.payload)
     ? event.payload as Record<string, unknown> : {};
@@ -35,12 +46,26 @@ export class RestartCleanupJournal {
   private readonly origins = new Map<number, RestartCleanupDebt>();
   /** Cleanup-unjournaled audits: the only durable record of a hidden producer
    * whose pending entry could not be written. Kept separate so a later bound
-   * pending+confirmed pair with the same replacement id can clear them. */
+   * pending+confirmed pair with the SAME exact generation can clear them. */
   private readonly unjournaled = new Map<number, RestartCleanupDebt>();
+  private readonly tokens = new WeakMap<AgentHandle, RestartCleanupCustody>();
   private readonly owned = new WeakMap<AgentHandle, RestartCleanupDebt>();
   private readonly writing = new WeakSet<AgentHandle>();
 
   constructor(private readonly ledger: LedgerApi) {}
+
+  /** Mint (exactly once per physical handle) the exact generation that binds
+   * this handle's custody. Called BEFORE the pending write so a failed write
+   * keeps one binding for the retry, the fallback audit, and the receipt; a
+   * distinct handle reusing the same id mints its own generation and can
+   * never discharge the original's custody by id alone. */
+  claim(handle: AgentHandle, jobId: string | null, agentId: string): RestartCleanupCustody {
+    const existing = this.tokens.get(handle);
+    if (existing !== undefined) return existing;
+    const token = { generation: randomUUID(), jobId, agentId, replacementAgentId: handle.id };
+    this.tokens.set(handle, token);
+    return token;
+  }
 
   begin(handle: AgentHandle, jobId: string | null, agentId: string): RestartCleanupDebt {
     const previous = this.owned.get(handle);
@@ -48,10 +73,10 @@ export class RestartCleanupJournal {
     if (this.writing.has(handle)) throw new Error('restart cleanup pending journal write is in progress; custody remains unknown');
     this.writing.add(handle);
     try {
-      const generation = randomUUID();
+      const token = this.claim(handle, jobId, agentId);
       const event = this.ledger.appendCustomEvent({ kind: PENDING, jobId, agentId,
-        payload: { generation, replacement_agent_id: handle.id } });
-      const debt = { generation, originSeq: event.seq, jobId, agentId, replacementAgentId: handle.id };
+        payload: { generation: token.generation, replacement_agent_id: handle.id } });
+      const debt = { generation: token.generation, originSeq: event.seq, jobId, agentId, replacementAgentId: handle.id };
       this.owned.set(handle, debt);
       return debt;
     } finally { this.writing.delete(handle); }
@@ -89,13 +114,12 @@ export class RestartCleanupJournal {
             jobId: event.jobId, agentId: event.agentId, replacementAgentId: text(data.replacement_agent_id) });
         } else if (event.kind === 'supervision.restart-rejected' && data.disposition === 'cleanup-unjournaled') {
           // The pending journal write failed, so this audit is the ONLY durable
-          // record of an unconfirmed hidden producer. Until a later bound
-          // pending+confirmed pair proves a real disposal for the same
-          // replacement, retain it as clearable debt: a crash must never let
-          // retirement proceed past the surviving record.
+          // record of an unconfirmed hidden producer. Retain it as clearable
+          // debt bound to the audit's exact physical generation; a legacy
+          // generation-null audit can never be discharged.
           const replacementAgentId = text(data.replacement_agent_id);
           if (replacementAgentId !== null) {
-            const debt = { originSeq: event.seq, generation: null, jobId: event.jobId,
+            const debt = { originSeq: event.seq, generation: generation(data.generation), jobId: event.jobId,
               agentId: event.agentId, replacementAgentId };
             this.debts.set(event.seq, debt);
             this.unjournaled.set(event.seq, debt);
@@ -112,11 +136,14 @@ export class RestartCleanupJournal {
             // the origins map stays bounded (audit events replay in ascending
             // order, so no later audit can still need it).
             this.origins.delete(debt.originSeq);
-            // A later bound pending+confirmed pair for the same replacement also
-            // discharges any cleanup-unjournaled audit that predates it: the
-            // disposal that audit recorded as unconfirmed is now proven.
+            // A later bound pending+confirmed pair discharges a fallback audit
+            // only when it carries the SAME exact physical generation: the
+            // original custodian's recovered retry. A same-id successor (or a
+            // legacy generation-null audit) never clears it.
             for (const [seq, audit] of this.unjournaled) {
-              if (audit.jobId === debt.jobId && audit.replacementAgentId === debt.replacementAgentId && seq < debt.originSeq) {
+              if (audit.generation !== null && audit.generation === debt.generation &&
+                audit.jobId === debt.jobId && audit.agentId === debt.agentId &&
+                audit.replacementAgentId === debt.replacementAgentId && seq < debt.originSeq) {
                 this.debts.delete(seq);
                 this.unjournaled.delete(seq);
               }

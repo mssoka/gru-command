@@ -2195,6 +2195,10 @@ export class Supervisor {
       if (observed.backoffTimer !== null) clearTimeout(observed.backoffTimer);
       this.agents.delete(spawned.id);
     }
+    // Mint the exact physical generation BEFORE the pending write so a failed
+    // write keeps one binding: the fallback audit, any retry, and the receipt
+    // all carry this SAME generation, while a same-id successor mints its own.
+    const custody = this.cleanupJournal.claim(spawned, jobId, agent.agentId);
     let journalError: string | null = null;
     try {
       // Journal physical custody before entering the asynchronous disposal.
@@ -2249,14 +2253,15 @@ export class Supervisor {
         jobId,
         payload: {
           reason,
-          generation: cleanup.debt?.generation ?? null,
+          generation: custody.generation,
           origin_seq: cleanup.debt?.originSeq ?? null,
           replacement_agent_id: spawned.id,
           authority_epoch: authority.authorityEpoch,
           // Only a durable pending journal entry may classify the audit as
-          // cleanup-unconfirmed: an unbound audit (generation null) can never
-          // be cleared by a later CONFIRMED receipt, so a failed pending write
-          // must not mint permanent, uncleareable debt.
+          // cleanup-unconfirmed. A failed pending write records the fallback
+          // disposition carrying the pre-minted exact generation: it stays
+          // clearable by the ORIGINAL custodian's later receipt, while a
+          // same-id successor's receipt (a different generation) never is.
           disposition: cleanupError === null ? 'disposed'
             : cleanup.debt !== null ? 'cleanup-unconfirmed' : 'cleanup-unjournaled',
           ...(cleanupError !== null ? { error: cleanupError } : {}),

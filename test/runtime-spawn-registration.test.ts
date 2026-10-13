@@ -252,6 +252,31 @@ describe('registry publication and production consumer custody (GH-280)', () => 
     } finally { h.controls[1]!.cleanupReject = false; await h.dispose(); if (routing !== null) await routing; }
   });
 
+  it('revokes lookup for a PUBLISHED replacement the moment the post-publication fence rejects it (GH-280)', async () => {
+    const h = fixture({ holdCleanup: true });
+    try {
+      const stale = await h.start();
+      // Supersede exactly at the post-publication fence: the 'spawned' observer
+      // runs synchronously AFTER publication, before the supervisor's own
+      // post-publication authority fence.
+      h.registry.onAgentEvent((envelope) => {
+        if (envelope.phase === 'spawned' && envelope.handle === stale)
+          h.ledger.beginPendingRebrief({ jobId: h.jobId, note: 'synchronous post-publication supersession', briefing: null });
+      });
+      h.releaseSpawn.resolve();
+      await flush();
+      // Disposal is still held by the fixture, so the handle is still live...
+      expect(h.registry.listHandles()).toContain(stale);
+      // ...yet the refused producer is already invisible to every lookup,
+      // BEFORE any disposal settlement.
+      expect(h.registry.getHandle(stale.id)).toBeNull();
+      expect(h.supervisor.viewFor(stale.id)).toBeNull();
+      h.releaseCleanup.resolve();
+      await flush();
+      expect(h.registry.getHandle(stale.id)).toBeNull();
+    } finally { await h.dispose(); }
+  });
+
   it('contains disposal-observer failures without changing native fulfillment or rejection (GH-280)', async () => {
     const h = fixture();
     try {

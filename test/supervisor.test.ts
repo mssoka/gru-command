@@ -1954,12 +1954,12 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(f.rig.supervisor.viewFor(f.replacement.id)).toBeNull();
       // Custody survives in memory while no durable entry could be written.
       expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain('pending journal write failed');
-      // The fallback audit must not claim cleanup-unconfirmed without an
-      // originating pending entry: a generation-null audit is permanent debt
-      // no later CONFIRMED receipt could ever clear.
+      // The fallback audit carries the exact physical generation minted
+      // BEFORE the failed write — never a bare id — so only the original
+      // custodian's later receipt can ever clear it.
       const rejected = f.rig.api.listJobEvents(f.jobId, { limit: 100 }).filter((event) => event.kind === 'supervision.restart-rejected');
       expect(rejected).toHaveLength(1);
-      expect(rejected[0]?.payload).toMatchObject({ disposition: 'cleanup-unjournaled', generation: null, origin_seq: null });
+      expect(rejected[0]?.payload).toMatchObject({ disposition: 'cleanup-unjournaled', generation: expect.stringMatching(/^[0-9a-f-]{36}$/u), origin_seq: null });
       // Once the pending store recovers, the SAME in-memory custody retries the
       // exact journal receipt and clears — proving the debt was never permanent.
       store.mockRestore();
@@ -1984,13 +1984,50 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       // Disposal succeeded but the pending entry could not be written, so the
       // audit is the ONLY durable record of the unconfirmed producer.
       expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-rejected')?.payload)
-        .toMatchObject({ disposition: 'cleanup-unjournaled', generation: null, origin_seq: null });
+        .toMatchObject({ disposition: 'cleanup-unjournaled', generation: expect.stringMatching(/^[0-9a-f-]{36}$/u), origin_seq: null });
       // The process dies before the journal can recover; the surviving audit
       // must still fence retirement after the reopen.
       f.rig.dispose(); reopened = reopenedSupervisor(f.rig.dir);
       const blockers = reopened.supervisor.pendingProducerBlockers(f.jobId);
       expect(blockers).toHaveLength(1);
       expect(blockers[0]).toContain(f.replacement.id);
+    } finally { reopened?.close(); f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('keeps fallback custody across a same-id successor and clears it only on the original generation (GH-280)', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    let reopened: ReturnType<typeof reopenedSupervisor> | null = null;
+    try {
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer authorized work', briefing: null });
+      const append = f.rig.api.appendCustomEvent.bind(f.rig.api);
+      const store = vi.spyOn(f.rig.api, 'appendCustomEvent').mockImplementation((fields) => {
+        if (fields.kind === 'supervision.restart-cleanup-pending') throw new Error('pending custody storage unavailable');
+        return append(fields);
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      store.mockRestore();
+      const audit = f.rig.api.listJobEvents(f.jobId, { limit: 100 }).find((event) => event.kind === 'supervision.restart-rejected')!;
+      const generation = (audit.payload as { generation: string }).generation;
+      expect(generation).toMatch(/^[0-9a-f-]{36}$/u);
+      // A same-id SUCCESSOR's cleanly journaled pair (a DIFFERENT physical
+      // generation) must never discharge the predecessor's unproven custody.
+      const successor = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+      const successorPending = f.rig.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-pending', jobId: f.jobId, agentId: f.original.id,
+        payload: { generation: successor, replacement_agent_id: f.replacement.id } });
+      f.rig.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: f.jobId, agentId: f.original.id,
+        payload: { generation: successor, origin_seq: successorPending.seq, replacement_agent_id: f.replacement.id, disposal_acknowledged: true, cessation: 'ceased' } });
+      f.rig.dispose(); reopened = reopenedSupervisor(f.rig.dir);
+      const blocked = reopened.supervisor.pendingProducerBlockers(f.jobId);
+      expect(blocked.some((line) => line.includes(generation))).toBe(true);
+      // The ORIGINAL custodian's recovered receipt (the SAME exact generation)
+      // is the only proof that discharges it.
+      const recoveredPending = reopened.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-pending', jobId: f.jobId, agentId: f.original.id,
+        payload: { generation, replacement_agent_id: f.replacement.id } });
+      reopened.api.appendCustomEvent({ kind: 'supervision.restart-cleanup-confirmed', jobId: f.jobId, agentId: f.original.id,
+        payload: { generation, origin_seq: recoveredPending.seq, replacement_agent_id: f.replacement.id, disposal_acknowledged: true, cessation: 'ceased' } });
+      expect(reopened.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
     } finally { reopened?.close(); f.rig.dispose(); vi.useRealTimers(); }
   });
 
@@ -2247,6 +2284,41 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       expect(f.replacement.promptCalls).toEqual([]);
       expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
       expect(f.rig.supervisor.viewFor(f.replacement.id)?.breakerOpen).toBe(false);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('clears a retained restart-replay recovery when a queued admission is superseded (GH-280 verification gap)', async () => {
+    vi.useFakeTimers();
+    const sleeper = new ManualSleeper();
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' });
+    const f = await deferredDispatchRestart(true, { rateLimitBackoff: rateLimitPolicy(), sleep: sleeper.sleep, jitter: () => 0, workerGate: gate });
+    try {
+      const create = f.rig.registry.adopt.bind(f.rig.registry);
+      vi.spyOn(f.rig.registry, 'adopt').mockImplementation((handle, options) => {
+        create(handle, options);
+        if (handle !== f.replacement) return;
+        handle.pendingTurnSnapshot = { text: 'recovered 429 turn', owner: `dispatch:${f.jobId}` };
+        handle.emit({ type: 'error', error: '429 too many requests', fatal: false });
+        handle.setState('error');
+      });
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(sleeper.delays).toEqual([100]);
+      await sleeper.release();
+      // The retry's delivery is queued at admission behind the capacity-one
+      // holder while the restart-replay's exact recovery is still retained.
+      expect(f.replacement.promptCalls).toEqual([]);
+      expect(gate.view().worker.queued.map((entry) => entry.id)).toEqual([f.replacement.id]);
+      // The newer native authority supersedes the captured turn WHILE queued.
+      f.rig.api.beginPendingRebrief({ jobId: f.jobId, note: 'newer native authority', briefing: null });
+      holder.release();
+      await flushMicrotasks();
+      // The post-admission fence re-checks authority AND consumes the exact
+      // retained recovery ownership: no prompt, no phantom blocker, lease free.
+      expect(f.replacement.promptCalls).toEqual([]);
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
+      expect(gate.view().worker).toMatchObject({ running: 0, queued: [] });
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 });
@@ -4916,21 +4988,63 @@ describe('restart cleanup journal conservative replay (GH-280)', () => {
     } finally { h.db.close(); }
   });
 
-  it('replays a cleanup-unjournaled audit as debt cleared only by a bound pair for the same replacement', () => {
+  it('discharges a cleanup-unjournaled audit only by the SAME physical generation, never a same-id successor', () => {
+    const h = journalFixture();
+    try {
+      const reader = new RestartCleanupJournal(h.api);
+      const original = new FakeHandle('minion', 'same-id', null);
+      // The token is minted BEFORE the failed pending write; the fallback audit
+      // carries exactly that generation.
+      const token = reader.claim(original, 'custody-job', 'origin');
+      const audit = h.api.appendCustomEvent({ kind: 'supervision.restart-rejected', jobId: 'custody-job', agentId: 'origin',
+        payload: { disposition: 'cleanup-unjournaled', generation: token.generation, replacement_agent_id: 'same-id' } });
+      expect(reader.unresolved('custody-job')).toMatchObject([{ originSeq: audit.seq, generation: token.generation, replacementAgentId: 'same-id' }]);
+      // A confirmed pair for a DIFFERENT replacement id does not clear it.
+      const other = reader.begin(new FakeHandle('minion', 'other-id', null), 'custody-job', 'origin');
+      reader.confirm(other);
+      expect(reader.unresolved('custody-job').map((debt) => debt.originSeq)).toEqual([audit.seq]);
+      // A same-id SUCCESSOR (distinct physical handle, distinct generation)
+      // never clears it — logical id equality is not disposal proof.
+      const successor = reader.begin(new FakeHandle('minion', 'same-id', null), 'custody-job', 'origin');
+      expect(successor.generation).not.toBe(token.generation);
+      reader.confirm(successor);
+      expect(reader.unresolved('custody-job').map((debt) => debt.originSeq)).toEqual([audit.seq]);
+      // Only the ORIGINAL handle's recovered retry reuses the exact generation.
+      const recovered = reader.begin(original, 'custody-job', 'origin');
+      expect(recovered.generation).toBe(token.generation);
+      reader.confirm(recovered);
+      expect(reader.unresolved('custody-job')).toEqual([]);
+    } finally { h.db.close(); }
+  });
+
+  it('never ID-clears a legacy cleanup-unjournaled audit without a generation token', () => {
     const h = journalFixture();
     try {
       const audit = h.api.appendCustomEvent({ kind: 'supervision.restart-rejected', jobId: 'custody-job', agentId: 'origin',
         payload: { disposition: 'cleanup-unjournaled', replacement_agent_id: 'same-id' } });
       const reader = new RestartCleanupJournal(h.api);
-      expect(reader.unresolved('custody-job')).toMatchObject([{ originSeq: audit.seq, generation: null, replacementAgentId: 'same-id' }]);
-      // A confirmed pair for a DIFFERENT replacement does not clear it.
-      const other = reader.begin(new FakeHandle('minion', 'other-id', null), 'custody-job', 'origin');
-      reader.confirm(other);
-      expect(reader.unresolved('custody-job').map((debt) => debt.originSeq)).toEqual([audit.seq]);
-      // A later bound pending+confirmed pair for the SAME replacement does.
+      expect(reader.unresolved('custody-job')).toMatchObject([{ originSeq: audit.seq, generation: null }]);
       const same = reader.begin(new FakeHandle('minion', 'same-id', null), 'custody-job', 'origin');
       reader.confirm(same);
-      expect(reader.unresolved('custody-job')).toEqual([]);
+      expect(reader.unresolved('custody-job').map((debt) => debt.originSeq)).toEqual([audit.seq]);
+    } finally { h.db.close(); }
+  });
+
+  it('retains the same physical generation across a failed and retried pending write', () => {
+    const h = journalFixture();
+    try {
+      const handle = new FakeHandle('minion', 'same-id', null);
+      const token = h.journal.claim(handle, 'custody-job', 'origin');
+      const append = h.api.appendCustomEvent.bind(h.api);
+      const write = vi.spyOn(h.api, 'appendCustomEvent').mockImplementation((fields) => {
+        if (fields.kind === 'supervision.restart-cleanup-pending') throw new Error('custody store unavailable');
+        return append(fields);
+      });
+      expect(() => h.journal.begin(handle, 'custody-job', 'origin')).toThrow('custody store unavailable');
+      write.mockRestore();
+      const debt = h.journal.begin(handle, 'custody-job', 'origin');
+      expect(debt.generation).toBe(token.generation);
+      expect(h.journal.claim(handle, 'custody-job', 'origin').generation).toBe(token.generation);
     } finally { h.db.close(); }
   });
 });
