@@ -14,9 +14,11 @@ cd "$d"
 npm run build
 node tools/patch-vitest-rpc-timeout.mjs
 set +e
-npx vitest run test/worker-verification-policy.test.ts test/workflow-session.test.ts test/pi-adapter.test.ts -t 'review-1'
+npx vitest run --reporter=json --outputFile="$d/fast-results.json" test/worker-verification-policy.test.ts test/workflow-session.test.ts test/pi-adapter.test.ts -t 'review-1'
 a=$?
-npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts -t 'review-1'
+npx vitest run --reporter=json --outputFile="$d/heavy-results.json" --config vitest.heavy.config.ts test/claude-adapter.test.ts -t 'review-1'
 b=$?
 printf 'GH315 reviewed-candidate fast=%s heavy=%s; expected assertion RED, inspect retained output\n' "$a" "$b"
-if [ "$a" -ne 0 ] || [ "$b" -ne 0 ]; then exit 1; fi
+if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo 'NOT BEHAVIORAL RED: passing candidate leg'; exit 2; fi
+node "$root/tools/classify-scheduled-verification-red.mjs" 1 "$d/fast-results.json" "$d/heavy-results.json" || exit 2
+exit 1

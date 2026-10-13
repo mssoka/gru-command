@@ -8,7 +8,8 @@ import { describe, expect, it } from 'vitest';
  * to an aborted module) fails here instead of passing vacuously.
  * Adding a test? Bump this pin — that is the point.
  */
-const PINS: Record<string, number> = {  'assert-binned-baseline.test.ts': 3,
+const PINS: Record<string, number> = {
+  'classify-scheduled-verification-red.test.ts': 8,  'assert-binned-baseline.test.ts': 3,
   'assert-merge-authority-baseline.test.ts': 8,
   'assert-repo-overview-baseline.test.ts': 4,
   'assert-verify-keepalive-baseline.test.ts': 7,

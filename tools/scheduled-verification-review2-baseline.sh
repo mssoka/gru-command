@@ -20,4 +20,6 @@ a=$?
 npx vitest run --reporter=json --outputFile="$d/heavy-results.json" --config vitest.heavy.config.ts test/claude-adapter.test.ts -t 'review-2'
 b=$?
 printf 'GH315 reviewed-candidate fast=%s heavy=%s; expected assertion RED, inspect retained output\n' "$a" "$b"
-if [ "$a" -ne 0 ] || [ "$b" -ne 0 ]; then exit 1; fi
+if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then echo 'NOT BEHAVIORAL RED: passing candidate leg'; exit 2; fi
+node "$root/tools/classify-scheduled-verification-red.mjs" 2 "$d/fast-results.json" "$d/heavy-results.json" || exit 2
+exit 1

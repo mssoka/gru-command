@@ -2869,14 +2869,14 @@ describe('scheduled verification ordinary Claude Bash', () => {
   });
   it('strict repair SIGTERM-resistant post-error original actually dies on existing SIGKILL escalation', async () => {
     const lane = verificationLane(); cleanupDirs.push(lane.root);
-    const start = vi.fn(spawn); const f = fixture({ killGraceMs: 30, spawnProcess: start });
+    const start = vi.fn(spawn); const f = fixture({ killGraceMs: 30, spawnProcess: start as unknown as typeof spawn });
     process.env['CLAUDE_DOUBLE_IGNORE_TERM'] = '1';
     const handle = await f.runtime.spawn('minion', lane.session);
     const pending = handle.prompt(`hold:${join(lane.root, 'never-created')}`);
     const rejection = expect(pending).rejects.toThrow(/process failed to spawn/);
     await vi.waitFor(() => expect(existsSync(f.doubleLog)).toBe(true));
-    const child = start.mock.results[0]!.value;
-    const close = new Promise<{ code: number | null; signal: string | null }>((resolve) => child.once('close', (code, signal) => resolve({ code, signal })));
+    const child = start.mock.results[0]!.value as ChildProcess;
+    const close = new Promise<{ code: number | null; signal: string | null }>((resolve) => child.once('close', (code: number | null, signal: NodeJS.Signals | null) => resolve({ code, signal })));
     const signals = vi.spyOn(child, 'kill'); child.emit('error', new Error('owned pre-disposal transport error')); await rejection;
     await handle.dispose();
     expect(await close).toEqual({ code: null, signal: 'SIGKILL' });
