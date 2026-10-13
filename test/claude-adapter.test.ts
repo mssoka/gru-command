@@ -1,4 +1,6 @@
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import type { ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -6,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
+import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import {
   CLAUDE_CODE_CAPABILITIES,
   ClaudeCodeRuntime,
@@ -2419,5 +2422,78 @@ describe('ReviewMcpBridge fail-closed guards', () => {
     } finally {
       rmSync(staged, { recursive: true, force: true });
     }
+  });
+
+  it('issue #315: an ordinary minion carries the private verification settings, never a review session', async () => {
+    const policy: WorkerVerificationPolicy = {
+      jobId: 'job-915', laneId: 'job-915', cwd: '/lane', scopes: ['full'],
+      producerPrefixes: [['npm', 'test']], helper: '/pkg/dist/verify/capture-cli.js', configFile: '/instance/config.toml',
+    };
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+    const owned = handle as unknown as { params: { verificationSettingsFile?: string; isolatedReview?: boolean } };
+    const file = owned.params.verificationSettingsFile;
+    expect(file).toBeDefined();
+    expect(existsSync(file as string)).toBe(true);
+    const settings = JSON.parse(readFileSync(file as string, 'utf8')) as { permissions?: { deny?: string[] } };
+    expect(settings.permissions?.deny?.length ?? 0).toBeGreaterThan(0);
+    await handle.dispose();
+    // A child that never started ceases immediately: the private dir is cleaned.
+    expect(existsSync(file as string)).toBe(false);
+    const isolated = await fx.runtime.spawn('gru', { isolatedReview: { systemPrompt: 'frozen native policy', tools: [] } });
+    expect((isolated as unknown as { params: { verificationSettingsFile?: string } }).params.verificationSettingsFile).toBeUndefined();
+    await isolated.dispose();
+    await fx.runtime.dispose();
+  });
+
+  describe('issue #315: private verification-file custody', () => {
+    const policy: WorkerVerificationPolicy = {
+      jobId: 'job-915', laneId: 'job-915', cwd: '/lane', scopes: ['full'],
+      producerPrefixes: [['npm', 'test']], helper: '/pkg/dist/verify/capture-cli.js', configFile: '/instance/config.toml',
+    };
+
+    async function settingsLifetime(outcome: 'deadline' | 'error'): Promise<void> {
+      const fx = fixture({ killGraceMs: 5 });
+      const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+      const owned = handle as unknown as {
+        params: { verificationSettingsFile?: string };
+        live: ChildProcess | null;
+        cessationKind: string;
+      };
+      const file = owned.params.verificationSettingsFile as string;
+      const policyFile = join(dirname(file), 'policy.json');
+      const original = Object.assign(new EventEmitter(), {
+        exitCode: null, signalCode: null, kill: vi.fn(() => true),
+      }) as unknown as ChildProcess;
+      owned.live = original;
+      vi.useFakeTimers();
+      try {
+        const disposing = handle.dispose();
+        const settled = disposing.then(() => 'fulfilled', () => 'rejected');
+        if (outcome === 'error') original.emit('error', new Error('owned fixture transport error'));
+        await vi.advanceTimersByTimeAsync(40);
+        expect(await settled).toBe('fulfilled');
+        // Cessation is UNKNOWN: the original child never reported a close.
+        expect(handle.cessationEvidence!()).toBe('unknown');
+        expect(existsSync(file)).toBe(true);
+        expect(existsSync(policyFile)).toBe(true);
+        // Only the identity-bound original close releases the private files.
+        original.emit('close', 0, null);
+        expect(existsSync(file)).toBe(false);
+        expect(existsSync(policyFile)).toBe(false);
+      } finally {
+        original.emit('close', 0, null);
+        vi.useRealTimers();
+        await fx.runtime.dispose();
+      }
+    }
+
+    it('retains private verification files through an unknown deadline until late close', async () => {
+      await settingsLifetime('deadline');
+    });
+
+    it('retains private verification files through a child error until actual close', async () => {
+      await settingsLifetime('error');
+    });
   });
 });

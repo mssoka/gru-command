@@ -133,6 +133,8 @@ export interface ClaudeCodeRuntimeOptions {
   readonly store: SessionStore;
   /** The claude binary (name on PATH or absolute path). Default: 'claude'. */
   readonly binary?: string;
+  /** Owned subprocess fixture seam; production uses Node's spawn unchanged. */
+  readonly spawnProcess?: typeof spawn;
   /** Test seam: grace before SIGKILL on dispose. Default 2000ms. */
   readonly killGraceMs?: number;
   /** Test seam: override the long-tool heartbeat cadence. */
@@ -172,6 +174,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   private readonly config: GruCommandConfig;
   private readonly store: SessionStore;
   private readonly binary: string;
+  private readonly spawnProcess: typeof spawn;
   private readonly killGraceMs: number;
   private readonly log: Log;
   private readonly reviewSettingsFile: string;
@@ -190,6 +193,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
     this.config = opts.config;
     this.store = opts.store;
     this.binary = opts.binary ?? 'claude';
+    this.spawnProcess = opts.spawnProcess ?? spawn;
     this.killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     this.log = opts.log ?? (() => {});
     this.reviewSettingsFile = opts.reviewSettingsFile ?? userClaudeSettingsFile();
@@ -522,6 +526,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           sessionFile,
           cwd,
           binary: this.binary,
+          spawnProcess: this.spawnProcess,
           tools,
           systemPrompt: reviewMode?.systemPrompt ?? (managed === undefined
             ? roleDef.systemPrompt
@@ -529,7 +534,10 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           isolatedReview: reviewMode !== undefined,
           ...(managed !== undefined ? { managedPluginDir: managed.root } : {}),
           ...(reviewSettings?.file !== undefined ? { reviewSettingsFile: reviewSettings.file } : {}),
-          ...(verificationSettings !== undefined ? { verificationSettingsFile: verificationSettings.file } : {}),
+          ...(verificationSettings !== undefined ? {
+              verificationSettingsFile: verificationSettings.file,
+              onVerificationCeased: () => verificationSettings?.dispose(),
+            } : {}),
           ...(reviewConfiguration !== undefined ? { reviewAuthEnv: claudeReviewProcessEnv(reviewConfiguration) } : {}),
           fileTools,
           nativeTools,
@@ -550,7 +558,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           this.handles.delete(handle);
           this.activeFiles.delete(sessionFile);
           reviewSettings?.dispose();
-          verificationSettings?.dispose();
+          // The private verification files are NOT deleted here: they survive
+          // while an original owned child has no proven close (the handle
+          // invokes onVerificationCeased on actual/late close).
         },
         (error) => this.onInfraError(error),
         this.heartbeatMs(),
@@ -612,12 +622,16 @@ interface HandleParams {
   readonly sessionFile: string;
   readonly cwd: string;
   readonly binary: string;
+  /** Owned subprocess seam (fixture); production uses Node's spawn unchanged. */
+  readonly spawnProcess?: typeof spawn;
   readonly tools: readonly string[];
   readonly systemPrompt: string;
   readonly isolatedReview?: boolean;
   readonly reviewSettingsFile?: string;
   /** Private worker-verification settings file: native denies + hook (issue #315). */
   readonly verificationSettingsFile?: string;
+  /** Invoked once when every original policy child has actually closed. */
+  readonly onVerificationCeased?: () => void;
   readonly reviewAuthEnv?: NodeJS.ProcessEnv;
   readonly fileTools?: readonly string[];
   readonly nativeTools?: readonly string[];
@@ -745,6 +759,8 @@ export class ClaudeCodeHandle implements AgentHandle {
   private bridgeCloseSettled = false;
   private bridgeCloseFailed = false;
   private evidenceEmitted = false;
+  private readonly verificationChildren = new Set<ChildProcess>();
+  private verificationCleaned = false;
   private disposalPromise: Promise<void> | null = null;
 
   constructor(
@@ -873,6 +889,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     let killTimer: ReturnType<typeof setTimeout> | null = null;
     let exitDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
     if (live !== null) {
+      this.trackVerificationChild(live);
       this.cessationKind = 'live'; // identity: THIS original child
       // Distinguish observed close from ChildProcess error and from the
       // deadline; keep a LATE latch on the ORIGINAL child so a real close
@@ -942,7 +959,9 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.settleLiveOnDispose?.();
       }
     } else {
-      this.cessationKind = 'no-child'; // never-prompted: settles with owned resources below
+      // A policy-bearing original can remain unclosed after error settlement
+      // cleared the live turn slot: it is still owned, not a never-started child.
+      this.cessationKind = this.verificationChildren.size === 0 ? 'no-child' : 'live';
     }
     try {
       this.store.releaseLock(this.sessionFile);
@@ -957,9 +976,31 @@ export class ClaudeCodeHandle implements AgentHandle {
       } finally {
         this.setState('disposed');
         this.onDispose();
+        this.cleanupVerificationSettings();
         this.emitEvidence();
       }
     }
+  }
+
+  /** Verification files belong to every original CLI child until its actual
+   * close, even if error/deadline settlement has cleared the live slot. */
+  private trackVerificationChild(child: ChildProcess): void {
+    if (this.params.onVerificationCeased === undefined || this.verificationChildren.has(child)) return;
+    this.verificationChildren.add(child);
+    child.once('close', () => {
+      this.verificationChildren.delete(child);
+      if (this.disposed && this.verificationChildren.size === 0 && this.cessationKind !== 'close-observed') {
+        this.cessationKind = 'close-observed-late';
+      }
+      this.cleanupVerificationSettings();
+      if (this.disposed) this.emitEvidence();
+    });
+  }
+
+  private cleanupVerificationSettings(): void {
+    if (!this.disposed || this.verificationChildren.size !== 0 || this.verificationCleaned) return;
+    this.verificationCleaned = true;
+    this.params.onVerificationCeased?.();
   }
 
   /** Once-only evidence transition; identity-bound to the original child
@@ -976,6 +1017,9 @@ export class ClaudeCodeHandle implements AgentHandle {
   cessationEvidence(): 'ceased' | 'unknown' {
     if (this.disposed !== true) return 'unknown';
     if (this.bridgeCloseSettled !== true || this.bridgeCloseFailed) return 'unknown';
+    // Policy-bearing custody remains unclosed even after error settlement has
+    // cleared the live turn slot. Non-policy evidence semantics are unchanged.
+    if (this.verificationChildren.size !== 0) return 'unknown';
     if (this.cessationKind === 'close-observed' || this.cessationKind === 'close-observed-late' || this.cessationKind === 'no-child') {
       return 'ceased';
     }
@@ -1121,7 +1165,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       try {
         // Compaction is meaningful only for an established conversation, so
         // this path ALWAYS resumes; it never mints or forks a session.
-        child = spawn(params.binary, claudeTurnArgs(params, true), {
+        child = (params.spawnProcess ?? spawn)(params.binary, claudeTurnArgs(params, true), {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
@@ -1133,6 +1177,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         );
         return;
       }
+      this.trackVerificationChild(child);
       this.live = child;
       child.stdout?.on('data', (chunk: Buffer) => parser.push(chunk));
       child.stderr?.on('data', (chunk: Buffer) => {
@@ -1296,7 +1341,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       });
 
       try {
-        child = spawn(params.binary, claudeTurnArgs(params, this.sessionEstablished), {
+        child = (params.spawnProcess ?? spawn)(params.binary, claudeTurnArgs(params, this.sessionEstablished), {
           cwd: params.cwd,
           stdio: ['pipe', 'pipe', 'pipe'],
           ...(params.reviewAuthEnv !== undefined ? { env: params.reviewAuthEnv } : {}),
@@ -1308,6 +1353,7 @@ export class ClaudeCodeHandle implements AgentHandle {
         transcript.end(() => settle(new Error(failure)));
         return;
       }
+      this.trackVerificationChild(child);
       this.live = child;
 
       child.stdout?.on('data', (chunk: Buffer) => parser.push(chunk));

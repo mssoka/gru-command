@@ -26,7 +26,7 @@ afterAll(() => { for (const root of roots) rmSync(root, { recursive: true, force
 function fixture() { const f = makeWorkflowLane(); roots.push(f.root); return f; }
 const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
 
-function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>, authority?: Pick<ReturnType<typeof serviceWorkflowAuthority>, 'workflowLaneFor' | 'workflowBuildFor' | 'workflowAgentFor'>) {
+function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>, authority?: Pick<ReturnType<typeof serviceWorkflowAuthority>, 'workflowLaneFor' | 'workflowBuildFor' | 'workflowAgentFor'>, verificationConfigFile?: string) {
   const config = loadConfig({ GRU_COMMAND_HOME: f.dataDir });
   const seen: SpawnOptions[] = [];
   const adapter: AgentRuntime = {
@@ -44,7 +44,9 @@ function host(runtimeId: RuntimeId, f: ReturnType<typeof fixture>, authority?: P
     override runtimeIdFor(): RuntimeId { return runtimeId; }
     override runtimeFor(): AgentRuntime { return adapter; }
   }
-  const registry = new HostRegistry(serviceRegistryOptions({ config, store: new SessionStore(f.dataDir), ...(authority ?? { workflowLaneFor: () => f.lane }) }));
+  const registry = new HostRegistry(serviceRegistryOptions({ config, store: new SessionStore(f.dataDir),
+    ...(verificationConfigFile !== undefined ? { verificationConfigFile } : {}),
+    ...(authority ?? { workflowLaneFor: () => f.lane }) }));
   return { seen, registry };
 }
 
@@ -118,6 +120,25 @@ describe('production owned workflow session binding', () => {
     expect(bound.workerVerification).toMatchObject({ jobId: f.lane.id, scopes: ['full'], configFile: '/abs/instance/config.toml' });
     // A declaring lane without the host-loaded config path cannot advertise a usable action.
     expect(() => createWorkflowSessionBinder(f.dataDir, () => f.lane)({ cwd: f.lane.path })).toThrow(/absolute instance config path/u);
+  });
+
+  it('forwards the declared verification policy through production spawn on fresh, resumed and reopened turns (H6)', async () => {
+    const f = fixture();
+    mkdirSync(join(f.lane.path, '.gru-command'), { recursive: true });
+    writeFileSync(join(f.lane.path, '.gru-command', 'worktree.toml'), '[verify]\nfull = "npm test"\n');
+    const authority = { workflowLaneFor: () => f.lane, workflowBuildFor: () => true, workflowAgentFor: () => undefined };
+    const h = host('pi', f, authority, '/abs/instance/config.toml');
+    const worker = await h.registry.spawn('minion', { cwd: f.lane.path, agentId: 'original-worker' });
+    const resumed = await h.registry.spawn('minion', { agentId: 'original-worker', resumeFile: worker.sessionFile! });
+    const isolated = await h.registry.spawn('minion', { cwd: f.lane.path, isolatedReview: { systemPrompt: 'frozen native policy', tools: [] } });
+    // Removing the registry forwarding would leave workerVerification undefined here.
+    expect(h.seen[0]!.workerVerification).toMatchObject({ jobId: f.lane.id, configFile: '/abs/instance/config.toml' });
+    expect(h.seen[1]!.workerVerification).toMatchObject({ jobId: f.lane.id, configFile: '/abs/instance/config.toml' });
+    expect(h.seen[2]!.workerVerification).toBeUndefined();
+    await worker.dispose();
+    await resumed.dispose();
+    await isolated.dispose();
+    await h.registry.dispose();
   });
 
   it('production dispatch/registry selects PR builds but excludes new review/artifact workflows', async () => {

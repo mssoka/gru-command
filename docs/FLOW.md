@@ -440,6 +440,21 @@ verification budget.
   conventional producer forms, NOT a general-purpose shell sandbox — opaque
   scripts, interpreters and adversarial evasion are out of scope.
 
+  The claude-code native `permissions.deny` rules are an independent fallback
+  for when the explanatory hook fails or is unavailable. Because a deny-glob
+  language cannot exclude a read from a broader producer pattern, the fallback
+  names the executable/verb/option positions literally: it covers `npm test`
+  and its conventional aliases/options/`command`/`!` wrappers, the `npx <tool>`
+  forms such as `npx --yes vitest run`, and the bare/local-bin spellings. It
+  deliberately emits no blanket `Bash(tsc *)`/`Bash(eslint *)`/`Bash(vite build
+  *)` wildcard, because that would deny the inspection reads the classifier
+  permits (`tsc --showConfig`, `eslint --help`, `vite build --help`). The
+  residual native-only gaps — a bare assignment prefix (`CI=1 npm test`), an
+  arbitrary positional operand of a bare tool (`tsc src/index.ts`), and an
+  argument tail the classifier would refuse under a producing verb — are
+  enforced by the classifier/hook and are documented here rather than bridged
+  with a wildcard that would over-block quoted read data.
+
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
 tenant's CI.

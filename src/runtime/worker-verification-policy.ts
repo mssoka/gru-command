@@ -30,18 +30,68 @@ export interface WorkerVerificationPolicy {
 const CONTROL_CHARS = new Set([';', '|', '&', '(', ')', '\n']);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/u;
 
+/** Index of the `)` matching the `(` at `open`, honoring nested parens and
+ * quotes. An unterminated substitution runs to the end of the text. */
+function substitutionEnd(text: string, open: number): number {
+  let depth = 0;
+  let quote: string | null = null;
+  let i = open;
+  while (i < text.length) {
+    const char = text[i] as string;
+    if (quote !== null) {
+      if (char === '\\' && quote === '"') { i += 2; continue; }
+      if (char === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") { quote = char; i += 1; continue; }
+    if (char === '\\') { i += 2; continue; }
+    if (char === '(') depth += 1;
+    else if (char === ')') { depth -= 1; if (depth === 0) return i; }
+    i += 1;
+  }
+  return text.length;
+}
+
+/** Executable bodies of unescaped `$(...)`/backtick substitutions in expanding
+ * text. An odd number of backslashes escapes the `$`/backtick and the text
+ * stays literal source. */
+function collectSubstitutions(text: string, out: string[]): void {
+  let i = 0;
+  while (i < text.length) {
+    const char = text[i] as string;
+    if (char === '\\') { i += 2; continue; }
+    if (char === '$' && text[i + 1] === '(') {
+      const end = substitutionEnd(text, i + 1);
+      out.push(text.slice(i + 2, end));
+      i = end + 1;
+      continue;
+    }
+    if (char === '`') {
+      const end = text.indexOf('`', i + 1);
+      out.push(text.slice(i + 1, end < 0 ? text.length : end));
+      i = end < 0 ? text.length : end + 1;
+      continue;
+    }
+    i += 1;
+  }
+}
+
 /**
  * Bounded, quote-aware split of a command string into simple-command word
  * groups. Quoted and escaped text stays one word; redirection targets and
- * literal heredoc bodies are data, not additional executables.
+ * literal heredoc bodies are data, not additional executables. Unescaped
+ * `$(...)`/backtick substitutions in expanding quotes and unquoted heredoc
+ * bodies are executable and are recursively classified.
  */
 export function verificationCommandGroups(command: string): readonly (readonly string[])[] {
   const groups: string[][] = [];
+  const substitutions: string[] = [];
   let words: string[] = [];
   let word = '';
   let started = false;
   let quote: string | null = null;
-  const heredocs: string[] = [];
+  const heredocs: { delimiter: string; expand: boolean; stripTabs: boolean }[] = [];
   const finishWord = (): void => {
     if (started) words.push(word);
     word = '';
@@ -56,11 +106,21 @@ export function verificationCommandGroups(command: string): readonly (readonly s
   while (i < command.length) {
     const char = command[i] as string;
     if (quote !== null) {
-      if (char === quote) quote = null;
-      else if (char === '\\' && quote === '"') { const next = command[++i]; if (next !== undefined) word += next; }
-      else word += char;
-      i += 1;
-      continue;
+      if (char === quote) { quote = null; i += 1; continue; }
+      if (char === '\\' && quote === '"') { const next = command[++i]; if (next !== undefined) word += next; i += 1; continue; }
+      if (quote === '"' && char === '$' && command[i + 1] === '(') {
+        const end = substitutionEnd(command, i + 1);
+        substitutions.push(command.slice(i + 2, end));
+        i = end + 1;
+        continue;
+      }
+      if (quote === '"' && char === '`') {
+        const end = command.indexOf('`', i + 1);
+        substitutions.push(command.slice(i + 1, end < 0 ? command.length : end));
+        i = end < 0 ? command.length : end + 1;
+        continue;
+      }
+      word += char; i += 1; continue;
     }
     if (char === '\\') {
       const next = command[++i];
@@ -73,26 +133,32 @@ export function verificationCommandGroups(command: string): readonly (readonly s
     if (char === '<' && command[i + 1] === '<' && command[i + 2] !== '<') {
       // Heredoc redirection: the body is stdin data, never a command here.
       i += 2;
-      if (command[i] === '-') i += 1;
+      const stripTabs = command[i] === '-';
+      if (stripTabs) i += 1;
       while (command[i] === ' ' || command[i] === '\t') i += 1;
       let delimiter = '';
       let delimQuote: string | null = null;
+      let quotedDelim = false;
       while (i < command.length) {
         const c = command[i] as string;
         if (delimQuote !== null) { if (c === delimQuote) delimQuote = null; else delimiter += c; i += 1; continue; }
-        if (c === '"' || c === "'") { delimQuote = c; i += 1; continue; }
-        if (c === '\\') { const next = command[++i]; if (next !== undefined) delimiter += next; i += 1; continue; }
+        if (c === '"' || c === "'") { delimQuote = c; quotedDelim = true; i += 1; continue; }
+        if (c === '\\') { const next = command[++i]; if (next !== undefined) delimiter += next; quotedDelim = true; i += 1; continue; }
         if (/[\s;&|()]/u.test(c)) break;
         delimiter += c; i += 1;
       }
       finishWord();
-      if (delimiter !== '') heredocs.push(delimiter);
+      if (delimiter !== '') heredocs.push({ delimiter, expand: !quotedDelim, stripTabs });
       continue;
     }
     if (char === '<' || char === '>') {
-      finishWord();
+      // A digit sequence adjacent to the operator is a file descriptor, not a word.
+      if (started && /^[0-9]+$/u.test(word)) { word = ''; started = false; }
+      else finishWord();
       while (command[i] === '<' || command[i] === '>') i += 1;
       if (command[i] === '&') i += 1; // >&1 / <&0
+      // Whitespace between the operator and its target is insignificant.
+      while (command[i] === ' ' || command[i] === '\t') i += 1;
       // The redirect target is data; consume one (optionally quoted) word.
       while (i < command.length) {
         const c = command[i] as string;
@@ -113,12 +179,17 @@ export function verificationCommandGroups(command: string): readonly (readonly s
       if (doubled) i += 1;
       i += 1;
       if (char === '\n') {
-        for (const delimiter of heredocs.splice(0)) {
+        for (const heredoc of heredocs.splice(0)) {
           while (i < command.length) {
             const end = command.indexOf('\n', i);
             const line = end < 0 ? command.slice(i) : command.slice(i, end);
             i = end < 0 ? command.length : end + 1;
-            if (line.replace(/^\t+/u, '') === delimiter) break;
+            // Tabs are only stripped for `<<-`, never for a plain `<<`.
+            const compared = heredoc.stripTabs ? line.replace(/^\t+/u, '') : line;
+            if (compared === heredoc.delimiter) break;
+            // Plain stdin is data; only supported executable expansions in an
+            // unquoted body contribute a producer.
+            if (heredoc.expand) collectSubstitutions(line, substitutions);
           }
         }
       }
@@ -128,6 +199,9 @@ export function verificationCommandGroups(command: string): readonly (readonly s
     word += char; started = true; i += 1;
   }
   finishGroup();
+  for (const substitution of substitutions) {
+    for (const group of verificationCommandGroups(substitution)) groups.push([...group]);
+  }
   return groups;
 }
 
@@ -135,7 +209,9 @@ const NPM_VALUE_OPTIONS = new Set(['--prefix', '--workspace', '-w', '--cache', '
 const NPM_FLAG_OPTIONS = new Set(['--silent', '-s', '--quiet', '-q', '--offline', '--ignore-scripts', '--workspaces', '--if-present']);
 const NPX_VALUE_OPTIONS = new Set(['--package', '-p', '--cache', '--userconfig', '--registry']);
 const NPX_FLAG_OPTIONS = new Set(['--no-install', '--yes', '-y', '--offline', '--quiet', '-q']);
-const LEADING_KEYWORDS = new Set(['!', 'if', 'then', 'elif', 'else', 'while', 'until', 'do', '{', '}', 'time']);
+const LEADING_KEYWORDS = new Set(['!', 'if', 'then', 'elif', 'else', 'while', 'until', 'do', '{', '}']);
+/** `time` reserved-word options that carry no command of their own. */
+const TIME_FLAG_OPTIONS = new Set(['-p', '--portability', '-v', '--verbose', '-a', '--append']);
 
 /**
  * One bounded normalization shared by declared-script extraction and
@@ -144,7 +220,22 @@ const LEADING_KEYWORDS = new Set(['!', 'if', 'then', 'elif', 'else', 'while', 'u
  */
 export function normalizedVerificationWords(raw: readonly string[]): readonly string[] {
   let words = [...raw];
-  while (LEADING_KEYWORDS.has(words[0] ?? '')) words = words.slice(1);
+  // The `time` reserved word and its own options precede the timed command.
+  for (;;) {
+    if (words[0] === 'time') {
+      words = words.slice(1);
+      while (words.length > 0) {
+        const option = words[0] as string;
+        if (TIME_FLAG_OPTIONS.has(option)) { words = words.slice(1); continue; }
+        if (option === '-o' || option === '--output') { words = words.slice(2); continue; }
+        if (option.startsWith('--output=')) { words = words.slice(1); continue; }
+        break;
+      }
+      continue;
+    }
+    if (LEADING_KEYWORDS.has(words[0] ?? '')) { words = words.slice(1); continue; }
+    break;
+  }
   while (words.length > 0) {
     while (ASSIGNMENT.test(words[0] ?? '')) words = words.slice(1);
     if (words[0] === 'command') {
@@ -188,15 +279,30 @@ export function normalizedVerificationWords(raw: readonly string[]): readonly st
 
 /** Non-producing inspection modes of a known tool (`tsc --version`, `eslint --help`). */
 const DIAGNOSTIC_FLAGS = new Set(['--version', '-v', '-V', '--help', '-h', '--showConfig', '--print-config']);
+/** Diagnostic flags that consume a following operand (the file to inspect). */
+const DIAGNOSTIC_VALUE_FLAGS = new Set(['--print-config']);
+/** Option positions whose value is configuration, not a literal operand. */
 const CONFIG_VALUE_FLAGS = new Set(['-p', '--project', '--config', '-c']);
+/** Flags that leave a combined invocation a read (`tsc --noEmit --showConfig`). */
+const DIAGNOSTIC_COMPANION_FLAGS = new Set(['--noEmit', '--pretty', '--diagnostics', '--extendedDiagnostics']);
 
 function isDiagnosticInvocation(args: readonly string[]): boolean {
-  if (args.length === 0) return false;
   let sawDiagnostic = false;
-  for (let i = 0; i < args.length; i += 1) {
+  let i = 0;
+  while (i < args.length) {
     const arg = args[i] as string;
-    if (DIAGNOSTIC_FLAGS.has(arg)) { sawDiagnostic = true; continue; }
-    if (CONFIG_VALUE_FLAGS.has(arg)) { i += 1; continue; }
+    // `--` ends option interpretation: literal operands after it (including a
+    // trailing `--help`) are data, not a help request.
+    if (arg === '--') return false;
+    if (DIAGNOSTIC_VALUE_FLAGS.has(arg)) {
+      sawDiagnostic = true;
+      i += 1;
+      if (i < args.length && !(args[i] as string).startsWith('-')) i += 1;
+      continue;
+    }
+    if (DIAGNOSTIC_FLAGS.has(arg)) { sawDiagnostic = true; i += 1; continue; }
+    if (CONFIG_VALUE_FLAGS.has(arg)) { i += 2; continue; }
+    if (DIAGNOSTIC_COMPANION_FLAGS.has(arg)) { i += 1; continue; }
     return false;
   }
   return sawDiagnostic;
@@ -217,25 +323,48 @@ const FIXED_PRODUCER_PREFIXES: readonly (readonly string[])[] = [
   ...KNOWN_TOOLS.map((tool) => ['npx', ...tool]),
 ];
 
+const LOCAL_BIN_DIRS: readonly string[] = [
+  './node_modules/.bin/', '../node_modules/.bin/', 'node_modules/.bin/',
+  'web/node_modules/.bin/', './web/node_modules/.bin/',
+];
+
 /** Conventional local-bin path forms for the same known tools. */
 function directProducerPrefixes(laneRoot: string): readonly (readonly string[])[] {
-  const dirs = [
-    './node_modules/.bin/', '../node_modules/.bin/', 'node_modules/.bin/',
-    'web/node_modules/.bin/', './web/node_modules/.bin/',
-    `${join(laneRoot, 'node_modules/.bin')}/`, `${join(laneRoot, 'web/node_modules/.bin')}/`,
-  ];
+  const dirs = [...LOCAL_BIN_DIRS, `${join(laneRoot, 'node_modules/.bin')}/`, `${join(laneRoot, 'web/node_modules/.bin')}/`];
   return dirs.flatMap((dir) => KNOWN_TOOLS.map((tool) => [`${dir}${tool[0] as string}`, ...tool.slice(1)]));
 }
 
-/** Declared-scope commands also register the npm scripts and npx tools they use. */
-function declaredProducerPrefixes(commands: readonly string[]): readonly (readonly string[])[] {
-  const prefixes: string[][] = [];
+/** Tools whose other subcommands are development operations (dev server,
+ * browser install), never declared-script authority from a bare name. */
+const DEV_SUBCOMMAND_TOOLS = new Set(['vite', 'playwright']);
+
+function localBinPrefixes(tool: string, args: readonly string[], laneRoot: string): readonly (readonly string[])[] {
+  const dirs = [...LOCAL_BIN_DIRS, `${join(laneRoot, 'node_modules/.bin')}/`, `${join(laneRoot, 'web/node_modules/.bin')}/`];
+  return dirs.map((dir) => [`${dir}${tool}`, ...args]);
+}
+
+/** Declared-scope commands also register the npm scripts, npx tools and their
+ * bare/local-bin equivalents that the lane's own contract names. */
+function declaredProducerPrefixes(commands: readonly string[], laneRoot: string): readonly (readonly string[])[] {
+  const prefixes: (readonly string[])[] = [];
   for (const command of commands) {
     for (const group of verificationCommandGroups(command)) {
       const words = normalizedVerificationWords(group);
       if (words[0] === 'npm' && words[1] === 'test') prefixes.push(['npm', 'test']);
       else if (words[0] === 'npm' && words[1] === 'run' && (words[2]?.length ?? 0) > 0) prefixes.push(words.slice(0, 3));
-      else if (words[0] === 'npx' && (words[1]?.length ?? 0) > 0) prefixes.push(words.slice(0, 2));
+      else if (words[0] === 'npx' && (words[1]?.length ?? 0) > 0) {
+        const tool = words[1] as string;
+        const verb = words[2];
+        const tail = verb !== undefined && !verb.startsWith('-') ? [verb] : [];
+        prefixes.push(['npx', tool, ...tail]);
+        if (DEV_SUBCOMMAND_TOOLS.has(tool)) {
+          // A declared verb keeps the producer precise; a bare declaration
+          // would block the tool's development/install subcommands.
+          if (tail.length > 0) prefixes.push([tool, ...tail], ...localBinPrefixes(tool, tail, laneRoot));
+        } else {
+          prefixes.push([tool], ...localBinPrefixes(tool, [], laneRoot));
+        }
+      }
     }
   }
   return prefixes;
@@ -262,7 +391,7 @@ export function workerVerificationPolicy(lane: WorktreeLane, configFile?: string
     );
   }
   const commands = scopes.map((scope) => (manifest as { verify: Record<string, string> }).verify[scope] as string);
-  const producerPrefixes = [...FIXED_PRODUCER_PREFIXES, ...declaredProducerPrefixes(commands), ...directProducerPrefixes(lane.path)]
+  const producerPrefixes = [...FIXED_PRODUCER_PREFIXES, ...declaredProducerPrefixes(commands, lane.path), ...directProducerPrefixes(lane.path)]
     .map((words) => Object.freeze([...words]));
   return Object.freeze({
     jobId: lane.jobId,

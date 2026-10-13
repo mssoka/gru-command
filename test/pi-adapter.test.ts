@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
+import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import { RuntimeRegistry, applyThinkingFallback, serviceRegistryOptions } from '../src/runtime/registry.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
@@ -3163,6 +3164,35 @@ describe('Perkins r1 regressions', () => {
     } finally {
       await handle.dispose();
       await runtime.dispose();
+    }
+  });
+
+  it('issue #315: a declared-scope lane blocks the producer bash call before it starts', async () => {
+    const laneDir = mkdtempSync(join(tmpdir(), 'gru-command-315-'));
+    cleanupDirs.push(laneDir);
+    // If the guard ever failed, the shell redirect would still create the
+    // sentinel before npm runs — so its absence proves zero producer starts.
+    writeFileSync(join(laneDir, 'package.json'), JSON.stringify({
+      name: 'lane-fixture',
+      scripts: { test: 'node -e "require(\'node:fs\').writeFileSync(\'started.txt\',\'x\')"' },
+    }));
+    const sentinel = join(laneDir, 'started.txt');
+    const policy: WorkerVerificationPolicy = {
+      jobId: 'job-915', laneId: 'job-915', cwd: laneDir, scopes: ['full'],
+      producerPrefixes: [['npm', 'test']], helper: '/pkg/dist/verify/capture-cli.js', configFile: '/instance/config.toml',
+    };
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'call-producer', name: 'bash', args: { command: 'npm test > started.txt' } } },
+      { deltas: ['refused'] },
+    ]);
+    const handle = await fx.runtime.spawn('gru', { cwd: laneDir, workerVerification: policy });
+    try {
+      await handle.prompt('run the declared verification', { owner: 'alice' });
+      expect(existsSync(sentinel)).toBe(false);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).toContain('Minion verification refused before execution');
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
     }
   });
 
