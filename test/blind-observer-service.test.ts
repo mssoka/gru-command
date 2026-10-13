@@ -93,4 +93,75 @@ describe('compiled service: the production blind observer is installed at startu
       await service.stop();
     }
   }, 90_000);
+
+  it('a directive HTTP continuation invalidates blind coverage through the real main-to-server assembly (issue #339 G2)', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gru-blind-http-home-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'gru-blind-http-ws-'));
+    const sessionDir = mkdtempSync(join(tmpdir(), 'gru-blind-http-session-'));
+    cleanup.push(home, workspace, sessionDir);
+    const jobId = 'job-blind-http';
+    const agentId = 'minion-blind-http';
+    const targetSha = 'f'.repeat(40);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    // The session STARTS clean; the runtime fixture appends its prohibited
+    // read when the production directive route prompts the seeded minion.
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const db = new LedgerDb(home);
+    try {
+      const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+      ledger.addJob({ id: jobId, repo: 'fixture', title: 'blind review' });
+      ledger.setJobStatus(jobId, 'working');
+      ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
+      const admission = admitBlindReview({
+        ledger,
+        jobId,
+        title: 'review (blind)',
+        deliverable: 'review',
+        briefing: 'Review the immutable package read-only.',
+        targetSha,
+        repoName: 'fixture',
+        inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+      });
+      if (admission === null) throw new Error('the job was not admitted as a blind review');
+      recordBlindAdmission(ledger, jobId, admission);
+    } finally {
+      db.close();
+    }
+    const token = 'blind-http-token';
+    const service = await startRealService({
+      port: await pickFreePort(),
+      token,
+      home,
+      workspace,
+      requireWebDist: false,
+      // The runtime fixture only supplies a scripted minion handle; the test
+      // never injects the observer and never calls the scanner.
+      nodeImport: join(import.meta.dirname, 'helpers', 'blind-http-directive-preload.mjs'),
+      extraEnv: { GRU_BLIND_HTTP_MINION_ID: agentId, GRU_BLIND_HTTP_SESSION_FILE: sessionFile },
+    });
+    try {
+      const res = await fetch(`${service.baseUrl}/api/silas/directive`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, directive: 'continue the blind review' }),
+      });
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as { request_id?: string };
+      expect(typeof body.request_id).toBe('string');
+      // The observer is supplied ONLY by main.ts's createDispatchServer port.
+      await vi.waitFor(() => {
+        const read = new DatabaseSync(join(home, 'ledger', 'ledger.db'), { readOnly: true });
+        try {
+          const rows = read.prepare('SELECT payload FROM events WHERE kind = ? AND job_id = ?').all(BLIND_ACCESS_EVENT, jobId) as { payload: string }[];
+          expect(rows).toHaveLength(1);
+          const payload = JSON.parse(rows[0]!.payload) as { prohibited?: readonly unknown[] };
+          expect(payload.prohibited?.length).toBeGreaterThanOrEqual(1);
+        } finally {
+          read.close();
+        }
+      }, { timeout: 20_000, interval: 200 });
+    } finally {
+      await service.stop();
+    }
+  }, 120_000);
 });
