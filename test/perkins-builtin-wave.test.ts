@@ -4371,6 +4371,11 @@ describe('WaveRunner delivery receipts, reconciliation, prior selection, and dis
     const escalation = escalations.find((line) => line.includes('provably NOT posted')) ?? '';
     expect(escalation).toContain('no POST was sent');
     expect(escalation).toContain('a retry cannot duplicate a publication');
+    // The remediation must not contradict the embedded diagnosis: the token
+    // was valid when minted, so there is no credential to repair — a retry
+    // mints a fresh one.
+    expect(escalation).toContain('re-publish (the retry mints a fresh token');
+    expect(escalation).not.toContain('fix the credential');
     // The false duplication caution is never attached.
     expect(escalation).not.toContain('verify manually before any retry');
     expect(escalation).not.toContain('could duplicate a real publication');

@@ -5414,9 +5414,10 @@ export class WaveRunner {
         if (definiteNonDelivery) {
           // Provable non-delivery: no POST was sent, so the ambiguous-post
           // caution below would be false. Surface the refusal directly —
-          // remediation is fixing the credential and re-publishing.
+          // remediation is re-publishing: the retry mints a fresh token, so
+          // there is no credential to repair.
           deliveryError = new Error(
-            `${String(error)}; the failure proved no POST was sent, so a retry cannot duplicate a publication — fix the credential and re-publish`,
+            `${String(error)}; the failure proved no POST was sent, so a retry cannot duplicate a publication — re-publish (the retry mints a fresh token; check probe latency if expiry recurs)`,
           );
           this.escalate(
             `Perkins report for round ${round.id} was recorded and provably NOT posted to the pull request`,
