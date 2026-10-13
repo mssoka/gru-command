@@ -1,5 +1,5 @@
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import type { ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -88,7 +88,7 @@ interface Fixture {
   runtime: ClaudeCodeRuntime;
 }
 
-function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string } = {}): Fixture {
+function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string; spawnProcess?: typeof spawn } = {}): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   cleanupDirs.push(home, workspace);
@@ -102,6 +102,7 @@ function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; too
     config,
     store,
     binary: DOUBLE,
+    ...(knobs.spawnProcess !== undefined ? { spawnProcess: knobs.spawnProcess } : {}),
     ...(knobs.killGraceMs !== undefined ? { killGraceMs: knobs.killGraceMs } : {}),
     ...(knobs.toolHeartbeatMs !== undefined ? { toolHeartbeatMs: knobs.toolHeartbeatMs } : {}),
     ...(knobs.modelRuntime !== undefined ? { modelRuntime: knobs.modelRuntime } : {}),
@@ -2494,6 +2495,61 @@ describe('ReviewMcpBridge fail-closed guards', () => {
 
     it('retains private verification files through a child error until actual close', async () => {
       await settingsLifetime('error');
+    });
+
+    /** A controllable policy child: the spawn seam returns it for the turn so
+     * an owned error can clear the live slot without a real close. */
+    function policyChild(): ChildProcess & { kill: ReturnType<typeof vi.fn> } {
+      const child = new EventEmitter() as unknown as ChildProcess & { stdout: EventEmitter; stderr: EventEmitter };
+      Object.assign(child, {
+        stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null,
+        kill: vi.fn(() => true),
+      });
+      return child as ChildProcess & { kill: ReturnType<typeof vi.fn> };
+    }
+
+    it('registers the policy child at spawn so a pre-disposal error keeps the files (N4/R2-V2)', async () => {
+      const child = policyChild();
+      const fx = fixture({ killGraceMs: 5, spawnProcess: (() => child) as unknown as typeof spawn });
+      const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+      const owned = handle as unknown as { params: { verificationSettingsFile?: string }; live: ChildProcess | null };
+      const file = owned.params.verificationSettingsFile as string;
+      const policyFile = join(dirname(file), 'policy.json');
+      const turn = handle.prompt('run the declared checks').catch(() => 'rejected');
+      await waitFor(() => owned.live === child);
+      // An owned transport error clears the live slot BEFORE dispose runs.
+      child.emit('error', new Error('owned fixture transport error'));
+      expect(await turn).toBe('rejected');
+      expect(owned.live).toBeNull();
+      await handle.dispose();
+      // Spawn-time registration keeps the tracked original owned, so the files
+      // survive and the evidence is honestly UNKNOWN.
+      expect(handle.cessationEvidence!()).toBe('unknown');
+      expect(existsSync(file)).toBe(true);
+      expect(existsSync(policyFile)).toBe(true);
+      // Only the identity-bound original close releases them.
+      child.emit('close', 0, null);
+      expect(existsSync(file)).toBe(false);
+      expect(existsSync(policyFile)).toBe(false);
+      await fx.runtime.dispose();
+    });
+
+    it('signals a tracked policy child after the live slot cleared (N10)', async () => {
+      const child = policyChild();
+      const fx = fixture({ killGraceMs: 5, spawnProcess: (() => child) as unknown as typeof spawn });
+      const handle = await fx.runtime.spawn('gru', { workerVerification: policy });
+      const owned = handle as unknown as { live: ChildProcess | null };
+      const turn = handle.prompt('run the declared checks').catch(() => 'rejected');
+      await waitFor(() => owned.live === child);
+      child.emit('error', new Error('owned fixture transport error'));
+      expect(await turn).toBe('rejected');
+      expect(owned.live).toBeNull();
+      await handle.dispose();
+      // The identity-bound original is still a disposal target even though the
+      // live slot was cleared: the same bounded termination applies.
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+      child.emit('close', 0, null);
+      await fx.runtime.dispose();
     });
   });
 });

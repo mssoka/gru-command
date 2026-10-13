@@ -962,6 +962,27 @@ export class ClaudeCodeHandle implements AgentHandle {
       // A policy-bearing original can remain unclosed after error settlement
       // cleared the live turn slot: it is still owned, not a never-started child.
       this.cessationKind = this.verificationChildren.size === 0 ? 'no-child' : 'live';
+      // The identity-bound original is still a disposal target even though the
+      // live slot was cleared, so apply the same bounded termination to it.
+      for (const child of this.verificationChildren) {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* already gone */
+        }
+      }
+      if (this.verificationChildren.size > 0) {
+        killTimer = setTimeout(() => {
+          for (const child of this.verificationChildren) {
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              /* already gone */
+            }
+          }
+        }, this.params.killGraceMs);
+        killTimer.unref();
+      }
     }
     try {
       this.store.releaseLock(this.sessionFile);
