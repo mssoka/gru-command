@@ -658,18 +658,32 @@ export async function rebriefFreshMinion(
     // rate-limited turn whose bounded retry is still carrying the prompt
     // must not land the re-brief/delivery markers early, and a rejection
     // whose retry recovers is a delivery, not a failure.
-    const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
-    // Issue #339: observe the settled continuation turn's own tool results at
-    // THIS settle seam on EVERY post-settlement exit — including the failure
-    // exits below — so a prohibited read during a resume/re-brief invalidates
-    // blind coverage exactly like one at the first briefing. Running it before
-    // the cancelled/exhausted/superseded throws is what keeps a failed
-    // continuation from leaving unscanned prohibited reads behind (only a
-    // future successful resume would otherwise heal it). `handle.sessionFile`
-    // is the resumed session (the whole file, cumulative), read-only with
-    // respect to the review inputs. The observer owns its error handling (a
-    // bookkeeping failure must not fail a delivered turn).
-    input.observeBlindTurn?.(input.jobId, handle.sessionFile);
+    let disposition: RetrySettlement | 'cancelled' = 'none';
+    const abandonedSettlements: Promise<void>[] = [];
+    try {
+      disposition = await settleRetries(input.retrySettlement, handle.id, input.signal, (abandoned) => {
+        abandonedSettlements.push(abandoned);
+      });
+    } finally {
+      // Issue #339: observe the settled continuation turn's own tool results
+      // at THIS settle seam on EVERY post-settlement exit — including the
+      // failure exits below AND a settlement-hook fault (a named
+      // RetrySettlementUnavailableError propagates only after this runs).
+      // Running it before the cancelled/exhausted/superseded throws keeps a
+      // failed continuation from leaving unscanned prohibited reads behind
+      // (only a future successful resume would otherwise heal it).
+      // `handle.sessionFile` is the resumed session (the whole file,
+      // cumulative), read-only with respect to the review inputs. The
+      // observer owns its error handling (a bookkeeping failure must not fail
+      // a delivered turn).
+      input.observeBlindTurn?.(input.jobId, handle.sessionFile);
+      for (const abandoned of abandonedSettlements) {
+        // Issue #339: cancellation won the race before the retry turn
+        // settled; it can still append prohibited reads AFTER the scan just
+        // above, so chain a FINAL observation onto the abandoned settlement.
+        void abandoned.then(() => input.observeBlindTurn?.(input.jobId, handle.sessionFile));
+      }
+    }
     if (disposition === 'cancelled') {
       throw new Error(`re-brief turn on ${handle.id} was cancelled before its automatic retries settled`);
     }

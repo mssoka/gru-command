@@ -13,7 +13,7 @@ import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { PacingGate } from '../src/runtime/pacing.js';
+import { PacingGate, RetrySettlementUnavailableError } from '../src/runtime/pacing.js';
 import type { AgentRecord } from '../src/ledger/api.js';
 
 /**
@@ -815,6 +815,75 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     // The observer ran BEFORE the failure exit: without this, a continuation
     // that fails before delivery leaves its prohibited reads unscanned.
     expect(observed).toEqual([{ jobId: 'job-cancel', sessionFile: '/sessions/scan.jsonl' }]);
+  });
+
+  it('a prohibited read appended by an abandoned retry turn is observed after cancellation (issue #339 N2)', async () => {
+    const controller = new AbortController();
+    const prompted: string[] = [];
+    const observed: { jobId: string; sessionFile: string | null }[] = [];
+    const handle = {
+      id: 'minion-rebrief-abandoned', sessionFile: '/sessions/rebrief-abandoned.jsonl',
+      prompt: async (text: string) => { prompted.push(text); },
+      dispose: async () => {},
+    };
+    let releaseRetry: () => void = () => {};
+    const retrySettled = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    const routing = rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listImplementerMinions: () => [],
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id) => minionRecord(id, 'job-cancel', null),
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'original contract',
+      signal: controller.signal,
+      retrySettlement: async () => { await retrySettled; return 'recovered'; },
+      observeBlindTurn: (jobId, sessionFile) => { observed.push({ jobId, sessionFile }); },
+    });
+    await vi.waitFor(() => expect(prompted).toHaveLength(1));
+    controller.abort();
+    await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
+    // The immediate scan ran before the abandoned retry turn settled.
+    expect(observed).toHaveLength(1);
+    // The retry turn settles AFTER the cancellation; its reads must still be
+    // observed, so a final scan is chained onto the abandoned settlement.
+    releaseRetry();
+    await vi.waitFor(() => expect(observed).toHaveLength(2));
+    expect(observed[1]).toEqual({ jobId: 'job-cancel', sessionFile: '/sessions/rebrief-abandoned.jsonl' });
+  });
+
+  it('a settlement-hook rejection still observes the delivered turn before the named error propagates (issue #339 N3)', async () => {
+    const observed: { jobId: string; sessionFile: string | null }[] = [];
+    const handle = {
+      id: 'minion-rebrief-hookfault', sessionFile: '/sessions/rebrief-hookfault.jsonl',
+      prompt: async () => {},
+      dispose: async () => {},
+    };
+    await expect(rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listImplementerMinions: () => [],
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id) => minionRecord(id, 'job-cancel', null),
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'original contract',
+      retrySettlement: async () => { throw new Error('settlement hook fault'); },
+      observeBlindTurn: (jobId, sessionFile) => { observed.push({ jobId, sessionFile }); },
+    })).rejects.toThrow(RetrySettlementUnavailableError);
+    // The prompt already ran: the scan must precede the named hook-fault error.
+    expect(observed).toEqual([{ jobId: 'job-cancel', sessionFile: '/sessions/rebrief-hookfault.jsonl' }]);
   });
 });
 

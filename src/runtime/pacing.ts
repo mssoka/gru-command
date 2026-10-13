@@ -189,6 +189,13 @@ export async function settleRetries(
   hook: ((agentId: string) => Promise<RetrySettlement>) | undefined,
   agentId: string,
   signal?: AbortSignal,
+  /** Issue #339: invoked when the cancellation wins the race while the retry
+   * settlement is still in flight, handing the caller the abandoned
+   * settlement so it can chain a FINAL observation onto the retry turn (it
+   * can still append prohibited reads after the immediate scan). The handed
+   * promise never rejects: an abandoned hook fault is irrelevant to a
+   * post-hoc rescan. */
+  onAbandonedSettlement?: (settlement: Promise<void>) => void,
 ): Promise<RetrySettlement | 'cancelled'> {
   if (hook === undefined) return 'none';
   let settle: Promise<RetrySettlement>;
@@ -200,6 +207,10 @@ export async function settleRetries(
   const surfaced = settle.catch((cause: unknown) => {
     throw new RetrySettlementUnavailableError(agentId, cause);
   });
+  const abandoned = settle.then(
+    () => undefined,
+    () => undefined,
+  );
   if (signal === undefined) return surfaced;
   if (signal.aborted === true) {
     // Shutdown already landed, but the hook may have had nothing to wait
@@ -216,17 +227,20 @@ export async function settleRetries(
         throw new RetrySettlementUnavailableError(agentId, cause);
       },
     );
+    if (winner === 'cancelled') onAbandonedSettlement?.(abandoned);
     return winner;
   }
   let listener: (() => void) | null = null;
   try {
-    return await Promise.race([
+    const winner = await Promise.race([
       surfaced,
       new Promise<'cancelled'>((resolve) => {
         listener = () => resolve('cancelled');
         signal.addEventListener('abort', listener, { once: true });
       }),
     ]);
+    if (winner === 'cancelled') onAbandonedSettlement?.(abandoned);
+    return winner;
   } finally {
     if (listener !== null) signal.removeEventListener('abort', listener);
   }
