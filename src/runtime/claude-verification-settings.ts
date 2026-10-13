@@ -6,8 +6,8 @@ import { isVerificationProducer, verificationShellQuote, type WorkerVerification
 
 /** Conventional npm verb aliases (review-2/3 parity items). */
 const NPM_VERB_ALIASES: Record<string, readonly string[]> = {
-  test: ['test', 'tst'],
-  run: ['run', 'run-script'],
+  test: ['test', 'tst', 't'],
+  run: ['run', 'run-script', 'rum', 'urn'],
 };
 /** Supported npm option positions that may precede the verb/script. */
 const NPM_OPTION_PREFIXES: readonly string[] = [
@@ -91,6 +91,10 @@ export function claudeVerificationDenyRules(policy: WorkerVerificationPolicy): r
   for (const prefix of policy.producerPrefixes) for (const base of variantBases(prefix)) bases.add(base);
   for (const base of bases) {
     if (base.trim() === '') continue;
+    // Emit a stem only when the classifier refuses the complete form. A bare
+    // stem such as `npm run` (script listing) or `npx vite` (dev server) is a
+    // read, and a native deny would override the hook's allow.
+    if (!isVerificationProducer(base, policy)) continue;
     for (const wrapped of [base, `command ${base}`, `! ${base}`]) {
       const pattern = escapePattern(wrapped);
       rules.add(`Bash(${pattern})`);

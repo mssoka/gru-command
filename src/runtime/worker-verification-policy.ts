@@ -53,27 +53,35 @@ function substitutionEnd(text: string, open: number): number {
   return text.length;
 }
 
+/**
+ * If an unescaped `$(...)`/backtick substitution begins at `at` in expanding
+ * text, append its executable body to `out` and return the index just past it;
+ * otherwise return -1. Callers have already handled escapes and single
+ * quotes, which keep the text literal.
+ */
+function takeSubstitution(text: string, at: number, out: string[]): number {
+  if (text[at] === '$' && text[at + 1] === '(') {
+    const end = substitutionEnd(text, at + 1);
+    out.push(text.slice(at + 2, end));
+    return end + 1;
+  }
+  if (text[at] === '`') {
+    const end = text.indexOf('`', at + 1);
+    out.push(text.slice(at + 1, end < 0 ? text.length : end));
+    return end < 0 ? text.length : end + 1;
+  }
+  return -1;
+}
+
 /** Executable bodies of unescaped `$(...)`/backtick substitutions in expanding
  * text. An odd number of backslashes escapes the `$`/backtick and the text
  * stays literal source. */
 function collectSubstitutions(text: string, out: string[]): void {
   let i = 0;
   while (i < text.length) {
-    const char = text[i] as string;
-    if (char === '\\') { i += 2; continue; }
-    if (char === '$' && text[i + 1] === '(') {
-      const end = substitutionEnd(text, i + 1);
-      out.push(text.slice(i + 2, end));
-      i = end + 1;
-      continue;
-    }
-    if (char === '`') {
-      const end = text.indexOf('`', i + 1);
-      out.push(text.slice(i + 1, end < 0 ? text.length : end));
-      i = end < 0 ? text.length : end + 1;
-      continue;
-    }
-    i += 1;
+    if (text[i] === '\\') { i += 2; continue; }
+    const next = takeSubstitution(text, i, out);
+    i = next < 0 ? i + 1 : next;
   }
 }
 
@@ -129,6 +137,11 @@ export function verificationCommandGroups(command: string): readonly (readonly s
       continue;
     }
     if (char === '"' || char === "'") { quote = char; started = true; i += 1; continue; }
+    // An unquoted `$(...)`/backtick is executed, not literal word text.
+    {
+      const expansion = takeSubstitution(command, i, substitutions);
+      if (expansion >= 0) { i = expansion; continue; }
+    }
     if (char === '#' && !started) { while (i < command.length && command[i] !== '\n') i += 1; continue; }
     if (char === '<' && command[i + 1] === '<' && command[i + 2] !== '<') {
       // Heredoc redirection: the body is stdin data, never a command here.
@@ -159,16 +172,26 @@ export function verificationCommandGroups(command: string): readonly (readonly s
       if (command[i] === '&') i += 1; // >&1 / <&0
       // Whitespace between the operator and its target is insignificant.
       while (command[i] === ' ' || command[i] === '\t') i += 1;
-      // The redirect target is data; consume one (optionally quoted) word.
+      // The redirect target (including a herestring `<<<`) is data, but a
+      // supported executable expansion inside it (`>"$(cmd)"`) still runs.
+      let targetQuote: string | null = null;
       while (i < command.length) {
         const c = command[i] as string;
-        if (/[\s;&|()]/u.test(c)) break;
-        if (c === '\\') { i += 2; continue; }
-        if (c === '"' || c === "'") {
-          const close = command.indexOf(c, i + 1);
-          i = close < 0 ? command.length : close + 1;
+        if (targetQuote !== null) {
+          if (c === targetQuote) { targetQuote = null; i += 1; continue; }
+          if (c === '\\' && targetQuote === '"') { i += 2; continue; }
+          if (targetQuote === '"') {
+            const expansion = takeSubstitution(command, i, substitutions);
+            if (expansion >= 0) { i = expansion; continue; }
+          }
+          i += 1;
           continue;
         }
+        if (/[\s;&|()]/u.test(c)) break;
+        if (c === '\\') { i += 2; continue; }
+        if (c === '"' || c === "'") { targetQuote = c; i += 1; continue; }
+        const expansion = takeSubstitution(command, i, substitutions);
+        if (expansion >= 0) { i = expansion; continue; }
         i += 1;
       }
       continue;
@@ -180,6 +203,7 @@ export function verificationCommandGroups(command: string): readonly (readonly s
       i += 1;
       if (char === '\n') {
         for (const heredoc of heredocs.splice(0)) {
+          let body = '';
           while (i < command.length) {
             const end = command.indexOf('\n', i);
             const line = end < 0 ? command.slice(i) : command.slice(i, end);
@@ -187,10 +211,12 @@ export function verificationCommandGroups(command: string): readonly (readonly s
             // Tabs are only stripped for `<<-`, never for a plain `<<`.
             const compared = heredoc.stripTabs ? line.replace(/^\t+/u, '') : line;
             if (compared === heredoc.delimiter) break;
-            // Plain stdin is data; only supported executable expansions in an
-            // unquoted body contribute a producer.
-            if (heredoc.expand) collectSubstitutions(line, substitutions);
+            body += `${line}\n`;
           }
+          // Plain stdin is data; only supported executable expansions in an
+          // unquoted body contribute a producer. The whole body is scanned at
+          // once so a substitution may span lines (`$(` newline `cmd`).
+          if (heredoc.expand) collectSubstitutions(body, substitutions);
         }
       }
       continue;
@@ -254,6 +280,27 @@ export function normalizedVerificationWords(raw: readonly string[]): readonly st
           words = words.slice(2);
         } else break;
       }
+    } else if (words[0] === 'exec') {
+      words = words.slice(1);
+      // `exec [-c] [-l] [-a name] [--] command`
+      while (words.length > 0) {
+        const option = words[0] as string;
+        if (option === '-a') { words = words.slice(2); continue; }
+        if (option === '-c' || option === '-l' || option === '--') { words = words.slice(1); continue; }
+        break;
+      }
+    } else if (words[0] === 'nohup') {
+      words = words.slice(1);
+      if (words[0] === '--') words = words.slice(1);
+    } else if (words[0] === 'nice') {
+      words = words.slice(1);
+      // `nice [-n N | --adjustment[=]N | -N] command`
+      while (words.length > 0) {
+        const option = words[0] as string;
+        if (option === '-n' || option === '--adjustment') { words = words.slice(2); continue; }
+        if (option.startsWith('--adjustment=') || /^-\d+$/u.test(option)) { words = words.slice(1); continue; }
+        break;
+      }
     } else break;
   }
   const tool = words[0];
@@ -277,16 +324,26 @@ export function normalizedVerificationWords(raw: readonly string[]): readonly st
   return [tool, ...kept];
 }
 
-/** Non-producing inspection modes of a known tool (`tsc --version`, `eslint --help`). */
-const DIAGNOSTIC_FLAGS = new Set(['--version', '-v', '-V', '--help', '-h', '--showConfig', '--print-config']);
-/** Diagnostic flags that consume a following operand (the file to inspect). */
+/** Help flags short-circuit any tool, with or without a selected subcommand. */
+const HELP_FLAGS = new Set(['--help', '-h']);
+/** Version flags only suppress a producer that has NOT selected a subcommand. */
+const VERSION_FLAGS = new Set(['--version', '-v', '-V']);
+/** Non-producing inspection flags (`tsc --showConfig`). */
+const INSPECT_FLAGS = new Set(['--showConfig', '--print-config']);
+/** Inspection flags that consume a following operand (the file to inspect). */
 const DIAGNOSTIC_VALUE_FLAGS = new Set(['--print-config']);
 /** Option positions whose value is configuration, not a literal operand. */
 const CONFIG_VALUE_FLAGS = new Set(['-p', '--project', '--config', '-c']);
 /** Flags that leave a combined invocation a read (`tsc --noEmit --showConfig`). */
 const DIAGNOSTIC_COMPANION_FLAGS = new Set(['--noEmit', '--pretty', '--diagnostics', '--extendedDiagnostics']);
 
-function isDiagnosticInvocation(args: readonly string[]): boolean {
+/**
+ * True when every argument is a non-producing inspection position. A prefix
+ * that already selected a verb (`vite build`, `npx vitest run`) makes the
+ * version exemption subcommand-aware: `vite build --version` still builds, so
+ * only `--help` and the tool's own inspection flags stay reads.
+ */
+function isDiagnosticInvocation(args: readonly string[], selectsVerb: boolean): boolean {
   let sawDiagnostic = false;
   let i = 0;
   while (i < args.length) {
@@ -294,13 +351,22 @@ function isDiagnosticInvocation(args: readonly string[]): boolean {
     // `--` ends option interpretation: literal operands after it (including a
     // trailing `--help`) are data, not a help request.
     if (arg === '--') return false;
+    if (HELP_FLAGS.has(arg)) { sawDiagnostic = true; i += 1; continue; }
+    if (VERSION_FLAGS.has(arg)) {
+      // `vite build --version` executes the selected subcommand; a bare
+      // `tsc --version` is a read.
+      if (selectsVerb) return false;
+      sawDiagnostic = true;
+      i += 1;
+      continue;
+    }
     if (DIAGNOSTIC_VALUE_FLAGS.has(arg)) {
       sawDiagnostic = true;
       i += 1;
       if (i < args.length && !(args[i] as string).startsWith('-')) i += 1;
       continue;
     }
-    if (DIAGNOSTIC_FLAGS.has(arg)) { sawDiagnostic = true; i += 1; continue; }
+    if (INSPECT_FLAGS.has(arg)) { sawDiagnostic = true; i += 1; continue; }
     if (CONFIG_VALUE_FLAGS.has(arg)) { i += 2; continue; }
     if (DIAGNOSTIC_COMPANION_FLAGS.has(arg)) { i += 1; continue; }
     return false;
@@ -355,14 +421,16 @@ function declaredProducerPrefixes(commands: readonly string[], laneRoot: string)
       else if (words[0] === 'npx' && (words[1]?.length ?? 0) > 0) {
         const tool = words[1] as string;
         const verb = words[2];
-        const tail = verb !== undefined && !verb.startsWith('-') ? [verb] : [];
-        prefixes.push(['npx', tool, ...tail]);
         if (DEV_SUBCOMMAND_TOOLS.has(tool)) {
           // A declared verb keeps the producer precise; a bare declaration
           // would block the tool's development/install subcommands.
+          const tail = verb !== undefined && !verb.startsWith('-') ? [verb] : [];
+          prefixes.push(['npx', tool, ...tail]);
           if (tail.length > 0) prefixes.push([tool, ...tail], ...localBinPrefixes(tool, tail, laneRoot));
         } else {
-          prefixes.push([tool], ...localBinPrefixes(tool, [], laneRoot));
+          // The word after a plain tool is an operand, not a verb: the tool
+          // itself is the producer, so every spelling of it is covered.
+          prefixes.push(['npx', tool], [tool], ...localBinPrefixes(tool, [], laneRoot));
         }
       }
     }
@@ -404,6 +472,12 @@ export function workerVerificationPolicy(lane: WorktreeLane, configFile?: string
   });
 }
 
+/** True when a matched prefix already names a producing verb/subcommand
+ * (`vite build`, `npx vitest run`) rather than a bare executable (`tsc`). */
+function prefixSelectsVerb(prefix: readonly string[]): boolean {
+  return prefix.length > (prefix[0] === 'npx' ? 2 : 1);
+}
+
 /** True when any simple command in the string is a known unscheduled producer. */
 export function isVerificationProducer(command: string, policy: WorkerVerificationPolicy): boolean {
   for (const group of verificationCommandGroups(command)) {
@@ -412,7 +486,7 @@ export function isVerificationProducer(command: string, policy: WorkerVerificati
       if (prefix.length > words.length) continue;
       if (!prefix.every((word, index) => words[index] === word)) continue;
       // Direct tools keep their non-producing inspection modes; npm scripts never do.
-      if (prefix[0] !== 'npm' && isDiagnosticInvocation(words.slice(prefix.length))) continue;
+      if (prefix[0] !== 'npm' && isDiagnosticInvocation(words.slice(prefix.length), prefixSelectsVerb(prefix))) continue;
       return true;
     }
   }

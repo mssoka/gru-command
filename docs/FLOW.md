@@ -444,16 +444,34 @@ verification budget.
   for when the explanatory hook fails or is unavailable. Because a deny-glob
   language cannot exclude a read from a broader producer pattern, the fallback
   names the executable/verb/option positions literally: it covers `npm test`
-  and its conventional aliases/options/`command`/`!` wrappers, the `npx <tool>`
-  forms such as `npx --yes vitest run`, and the bare/local-bin spellings. It
-  deliberately emits no blanket `Bash(tsc *)`/`Bash(eslint *)`/`Bash(vite build
-  *)` wildcard, because that would deny the inspection reads the classifier
-  permits (`tsc --showConfig`, `eslint --help`, `vite build --help`). The
-  residual native-only gaps — a bare assignment prefix (`CI=1 npm test`), an
-  arbitrary positional operand of a bare tool (`tsc src/index.ts`), and an
-  argument tail the classifier would refuse under a producing verb — are
-  enforced by the classifier/hook and are documented here rather than bridged
-  with a wildcard that would over-block quoted read data.
+  and its conventional aliases/options/`command`/`!` wrappers (including the
+  short npm verbs `t`, `rum`, `urn`, `run-script`), the `npx <tool>` forms such
+  as `npx --yes vitest run`, and the bare/local-bin spellings. A stem is
+  emitted only when the classifier also refuses the complete form, so a read
+  such as `npm run` (script listing) or `npx vite` (dev server) is never
+  denied. It deliberately emits no blanket `Bash(tsc *)`/`Bash(eslint
+  *)`/`Bash(vite build *)` wildcard, because that would deny the inspection
+  reads the classifier permits (`tsc --showConfig`, `eslint --help`, `vite
+  build --help`). The version exemption is subcommand-aware: `vite build
+  --version` still builds (the vendored CLI only suppresses `--version` when
+  no subcommand matched), so it is refused, while `vite build --help` stays a
+  read. Executable substitutions are classified wherever they execute — in
+  expanding double quotes, in unquoted positions and command-word tails, in
+  redirect targets and here strings, and in unquoted heredoc bodies even when
+  they span lines — while single-quoted and escaped text stays literal source.
+
+  The residual native-only gaps are enforced by the classifier/hook and are
+  documented here rather than bridged with a wildcard that would over-block
+  quoted read data: a bare assignment prefix (`CI=1 npm test`), an arbitrary
+  positional operand of a bare tool (`tsc src/index.ts`), and an argument tail
+  the classifier would refuse under a producing verb. One bounded over-block
+  is accepted for the same reason: `vitest run --help` is refused by both the
+  classifier and the native catalogue, because the `Bash(npx vitest run *)`
+  wildcard that must retain the original incident forms under an unavailable
+  hook cannot exclude that help read. The native catalogue is also not
+  qualified against an installed vendor CLI in this revision; the vendor
+  consumer's handling of the enumerated rules remains a separate, unclaimed
+  qualification scope.
 
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a

@@ -1,7 +1,9 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { PACKAGE_ROOT } from '../src/bmad/runtime.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
 import { claudeTurnArgs } from '../src/runtime/claude-adapter.js';
 import { claudeVerificationDenyRules, privateClaudeVerificationSettings } from '../src/runtime/claude-verification-settings.js';
@@ -256,6 +258,117 @@ describe('worker verification policy: bounded producer classification', () => {
     expect(workerVerificationPolicy({ ...lane, kind: 'review' } as WorktreeLane, CONFIG_FILE)).toBeUndefined();
     expect(workerVerificationPolicy(lane, CONFIG_FILE)).toBeUndefined(); // no manifest -> no scopes
   });
+
+  it('refuses a version flag that cannot suppress a selected subcommand (N1)', () => {
+    const policy = policyFixture();
+    // vite dispatches a matched subcommand BEFORE it reads --version, so a
+    // build still runs; --help genuinely suppresses it.
+    for (const form of ['vite build --version', 'npx vite build --version', 'playwright test --version']) {
+      expect(isVerificationProducer(form, policy), form).toBe(true);
+    }
+    for (const form of ['vite build --help', 'npx vite build --help', 'tsc --version', 'npx tsc --version']) {
+      expect(isVerificationProducer(form, policy), form).toBe(false);
+    }
+    // The help read stays a read: no blanket wildcard may deny it.
+    expect(claudeVerificationDenyRules(policy)).not.toContain('Bash(vite build *)');
+  });
+
+  it('classifies executable substitutions in redirect targets, herestrings and unquoted positions (N2/N3/N9)', () => {
+    const policy = policyFixture();
+    for (const form of [
+      'cat >"$(npm test)"',
+      'cat <<<"$(npm test)"',
+      'cat > out-$(npm test).log',
+      'echo `npm test`',
+      'FOO=`npm test`',
+      'npm test$(true)',
+      'npx vitest run$(true)',
+      '$(npm test)',
+      'cat <<EOF\n$(\nnpm test\n)\nEOF\n',
+    ]) {
+      expect(isVerificationProducer(form, policy), form).toBe(true);
+    }
+    // Quoted/plain data and a harmless expansion stay data.
+    for (const form of ["printf '%s' '$(npm test)'", 'cat > notes.md', 'cat <<< "plain"', 'echo done']) {
+      expect(isVerificationProducer(form, policy), form).toBe(false);
+    }
+  });
+
+  it('omits native stems the classifier itself treats as reads (N5)', () => {
+    const policy = policyFixture();
+    const rules = claudeVerificationDenyRules(policy);
+    for (const rule of ['Bash(npm run)', 'Bash(npx vite)', 'Bash(npx playwright)']) {
+      expect(rules, rule).not.toContain(rule);
+    }
+    for (const rule of ['Bash(npm run lint)', 'Bash(tsc)', 'Bash(vite build)', 'Bash(npx vitest run)']) {
+      expect(rules, rule).toContain(rule);
+    }
+    // The classifier agrees: script listing and the dev server are reads.
+    for (const form of ['npm run', 'npx vite', 'npx playwright', 'npx vite dev']) {
+      expect(isVerificationProducer(form, policy), form).toBe(false);
+    }
+    expect(isVerificationProducer('npm run lint', policy)).toBe(true);
+  });
+
+  it('treats a declared npx operand as data, not a mandatory prefix word (N6)', () => {
+    const policy = policyWithVerify(['custom = "npx mocha test/foo.js"']);
+    for (const form of [
+      'npx mocha test/foo.js', 'npx mocha test/bar.js', 'npx mocha',
+      'mocha', './node_modules/.bin/mocha test/bar.js',
+    ]) {
+      expect(isVerificationProducer(form, policy), form).toBe(true);
+    }
+    expect(isVerificationProducer('npx mocha --version', policy)).toBe(false);
+  });
+
+  it('strips conventional exec, nohup and nice wrappers before matching (N7)', () => {
+    const policy = policyFixture();
+    for (const form of [
+      'exec npm test', 'exec -a x npm test', 'exec -- npm test',
+      'nohup npm test', 'nice npm test', 'nice -n 5 npm test', 'nice -10 npm test',
+    ]) {
+      expect(isVerificationProducer(form, policy), form).toBe(true);
+    }
+    for (const form of ['exec cat package.json', 'nohup cat package.json', 'nice -n 5 cat package.json']) {
+      expect(isVerificationProducer(form, policy), form).toBe(false);
+    }
+  });
+
+  it('covers the npm verb aliases t/rum/urn in classifier and native catalogue (N8)', () => {
+    const policy = policyFixture();
+    for (const form of ['npm t', 'npm rum build', 'npm urn build', 'npm run-script build']) {
+      expect(isVerificationProducer(form, policy), form).toBe(true);
+    }
+    const rules = claudeVerificationDenyRules(policy);
+    for (const rule of ['Bash(npm t)', 'Bash(npm rum build)', 'Bash(npm urn build)']) {
+      expect(rules, rule).toContain(rule);
+    }
+  });
+
+  it('runs the shipped hook CLI as a subprocess and denies a producer (N4)', () => {
+    const policy = policyFixture();
+    const hook = join(PACKAGE_ROOT, 'dist/runtime/worker-verification-hook.js');
+    if (!existsSync(hook)) {
+      throw new Error('dist/runtime/worker-verification-hook.js is missing — run `npm run build` first');
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'gru-hook-'));
+    roots.push(dir);
+    const policyFile = join(dir, 'policy.json');
+    writeFileSync(policyFile, JSON.stringify(policy), { mode: 0o600 });
+    const run = (input: unknown): { status: number | null; stdout: string; stderr: string } => {
+      const result = spawnSync(process.execPath, [hook, policyFile], {
+        input: JSON.stringify(input), encoding: 'utf8',
+      });
+      return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+    };
+    const denied = run({ tool_name: 'Bash', tool_input: { command: 'npm test' } });
+    expect(denied.status, denied.stderr).toBe(0);
+    const decision = JSON.parse(denied.stdout) as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(decision.hookSpecificOutput?.permissionDecision).toBe('deny');
+    const allowed = run({ tool_name: 'Bash', tool_input: { command: 'git status' } });
+    expect(allowed.status, allowed.stderr).toBe(0);
+    expect(JSON.parse(allowed.stdout)).toEqual({});
+  });
 });
 
 describe('worker verification policy: runtime enforcement seams', () => {
@@ -279,11 +392,13 @@ describe('worker verification policy: runtime enforcement seams', () => {
     (inline as (pi: unknown) => void)({ on: (_event: string, h: (event: unknown) => unknown) => { handler = h; } });
     expect(handler).toBeDefined();
     const decide = handler as (event: unknown) => unknown;
-    const denied = decide({ type: 'tool_call', toolCallId: '1', toolName: 'bash', input: { command: INCIDENT_FORMS[1] } }) as {
-      block?: boolean; reason?: string;
-    };
-    expect(denied.block).toBe(true);
-    expect(denied.reason).toContain(policy.helper);
+    for (const form of INCIDENT_FORMS) {
+      const denied = decide({ type: 'tool_call', toolCallId: '1', toolName: 'bash', input: { command: form } }) as {
+        block?: boolean; reason?: string;
+      };
+      expect(denied.block, form).toBe(true);
+      expect(denied.reason).toContain(policy.helper);
+    }
     expect(decide({ type: 'tool_call', toolCallId: '2', toolName: 'bash', input: { command: 'git log -1' } })).toBeUndefined();
   });
 
