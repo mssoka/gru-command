@@ -1284,6 +1284,43 @@ describe('directive continuation physical-tail observation (issue #339 D1 tail)'
       h.dispose();
     }
   });
+
+  it('G4: a REJECTED live directive prompt is still observed and preserves the original failure', async () => {
+    const jobId = 'job-tail-reject';
+    const agentId = 'tail-reject';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-reject-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'reject.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = observedSessionLedger(jobId, agentId, sessionFile, { admit: true });
+    try {
+      const handle = tailHandle({
+        id: agentId, sessionFile,
+        // The physical prompt reads prohibited material AND then rejects: the
+        // rejection arm of runObservedPrompt must still observe the read.
+        onPrompt: () => {
+          appendFileSync(sessionFile, PROHIBITED);
+          throw new Error('directive turn rejected after the read');
+        },
+      });
+      const failure = await routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: new AbortController().signal, owner: 'test',
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        observeBlindTurn: observed(h.ledger),
+      }).then(() => null, (error: unknown) => error);
+      // The ORIGINAL prompt failure is preserved (never replaced by a
+      // coverage/bookkeeping error).
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain('directive turn rejected after the read');
+      // Deleting only the rejection-arm observation leaves coverage qualifying.
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+    } finally {
+      h.dispose();
+    }
+  });
 });
 
 describe('per-prompt terminal verdict capture (r5 blocker 1)', () => {

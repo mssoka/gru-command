@@ -2259,9 +2259,12 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     h.registry.spawnImpl = async (role, options) => {
       const resumed = new FakeHandle(role, `${role}-resumed-superseded`, options?.resumeFile ?? null);
       resumed.promptHook = async () => {
-        appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT);
         promptEntered = true;
         await promptGate;
+        // Issue #339 G3: the prohibited read lands only AFTER the awaited
+        // physical completion gate. An early scan (or a scan placed between
+        // invocation and the gate) cannot satisfy the assertions below.
+        appendFileSync(sessionFile, PROHIBITED_TOOL_RESULT);
       };
       return resumed;
     };
@@ -2272,10 +2275,13 @@ describe('supervisor — live tools, sleep/wake, and interrupted-turn recovery',
     hang(handle);
     h.advance(60);
     await vi.waitFor(() => expect(promptEntered).toBe(true), { timeout: 5_000 });
-    // Authority flips before the recovered turn settles (the job goes
-    // terminal). The stillCurrent() guards fence delivery bookkeeping, so the
-    // scan must not sit behind them: the turn ran and its read is on disk.
+    // Authority flips WHILE the recovered prompt is physically pending (the job
+    // goes terminal). The stillCurrent() guards fence delivery bookkeeping, so
+    // the scan must not sit behind them: the turn ran and its read will land.
     h.api.setJobStatus(jobId, 'done');
+    // Nothing prohibited has been written yet: coverage must still qualify, so
+    // neither an early scan nor an authority-guard placement can pass this.
+    expect(blindCoverageOf(h.api, jobId)).toMatchObject({ state: 'qualifying', accessObserved: false });
     releasePrompt();
     await vi.waitFor(() => {
       expect(blindCoverageOf(h.api, jobId).state).toBe('invalidated');
