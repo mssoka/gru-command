@@ -18,6 +18,7 @@ import {
   incidentSubjectOf,
   isHardFloorRow,
 } from './incident.js';
+import { redactedText } from '../decisions/questions.js';
 import { WakePolicy, type WakeCandidate, type WakeDecision } from './wake-policy.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -141,6 +142,10 @@ export interface AwarenessInjection {
   /** Domain-qualified identities and immutable evidence from the actual rendered rows. */
   readonly attentionKeys?: readonly string[];
   readonly mailboxDeliveries?: readonly MailboxDelivery[];
+  /** GH-110: false when a morning digest was owed but did not fully render
+   * (byte cap). commit() then leaves the owner watermark untouched so the
+   * digest is preserved for the next block instead of consumed unseen. */
+  readonly digestDelivered?: boolean;
 }
 
 /** The chat server's narrow view of the awareness layer (injection provider
@@ -152,6 +157,9 @@ export interface GruAwarenessPort {
   /** Charge an admitted prompt against the minimum wake interval. */
   noteWakeAttempt?(): void;
   commit(injection: AwarenessInjection, source?: 'chat' | 'wake'): void;
+  /** GH-119: an owner turn was accepted although prepare() returned no
+   * block (nothing to report). Records presence without a digest. */
+  recordOwnerPresence?(): void;
   /** Accepted turn_start claims visible IDs and arms unresolved attention;
    * pre-acceptance failures remain pending for retry. */
   noteWakeOutcome?(ok: boolean, detail?: string, injection?: AwarenessInjection): void;
@@ -314,6 +322,9 @@ interface AwarenessState {
     readonly lastDeliveredAt: number | null;
     readonly lastOwnerAt?: number | null;
     readonly lastOwnerSeq?: number;
+    /** GH-111: install/first-start time, the bounded digest baseline used
+     * until the first owner turn is committed. */
+    readonly baselineAt?: number;
   };
   /** Passive queue rotation offsets (GH-109); absent in legacy state
    * files, which start a fresh cycle at the newest rows. */
@@ -334,6 +345,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 /** Default morning-digest gap (8 h): first block after a quiet night. */
 export const DEFAULT_MORNING_DIGEST_GAP_MS = 28_800_000;
 /** Morning-digest kernel kinds — the "actions" count. */
+/** Passive board traffic counted as digest ACTIVITY (not Gru action, GH-104). */
 const MORNING_ACTION_KINDS = ['job.delivered', 'job.status', 'round.verdict'] as const;
 /** Bounded morning-digest lines (fires/actions/merges/staged PRs). */
 const MAX_MORNING_LINES = 6;
@@ -367,6 +379,15 @@ function numberOf(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+/** GH-122: notification title/detail is external data that can echo a
+ * credential (a provider error quoting a token). The block rides a
+ * tool-capable model turn, so redact with the same pass as the event-triage
+ * transcript tail. The stored row, and every owner-facing surface, keep the
+ * original text. */
+function promptSafe(value: string): string {
+  return redactedText(value, 2_000);
+}
+
 function clampLine(line: string, max: number): string {
   // Ledger titles, details and check names are external data, not prompt
   // structure. No metadata may create another service-context line.
@@ -391,7 +412,7 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
   'job.delivered': (event) => `job ${event.jobId ?? '?'}: briefing delivered to minion ${textOf(payloadOf(event).agentId) ?? '?'}`,
   'job.minion-error': (event) => {
     const error = textOf(payloadOf(event).error);
-    return `job ${event.jobId ?? '?'}: minion error${error !== null ? ` — ${error}` : ''}`;
+    return `job ${event.jobId ?? '?'}: minion error${error !== null ? ` — ${promptSafe(error)}` : ''}`;
   },
   'job.pr-linked': (event) => `job ${event.jobId ?? '?'}: pull request linked`,
   'job.status': (event) => {
@@ -475,7 +496,7 @@ const DIGEST_RULES: Readonly<Record<string, (event: EventRecord) => string | nul
     const payload = payloadOf(event);
     if (payload.to !== 'error') return null;
     const error = textOf(payload.error);
-    return `agent ${event.agentId ?? '?'}: errored${error !== null ? ` — ${error}` : ''}`;
+    return `agent ${event.agentId ?? '?'}: errored${error !== null ? ` — ${promptSafe(error)}` : ''}`;
   },
   'supervision.escalated': (event) => {
     const failureClass = textOf(payloadOf(event).class);
@@ -516,6 +537,11 @@ export class GruAwareness {
   /** Only an owner-directed user turn advances the morning boundary. */
   private lastOwnerAt: number | null;
   private lastOwnerSeq: number;
+  /** GH-119: ledger seq a block-free chat prepare() covered, else null. */
+  private blockFreeThroughSeq: number | null = null;
+  /** GH-111: digest baseline while `lastOwnerAt` is null (no owner turn yet). */
+  private readonly digestBaselineAt: number;
+  private readonly baselineIsNew: boolean;
   private wakeSink: (() => void) | null = null;
   /** Candidate ids waiting to be released as ONE coalesced wake. */
   private readonly pendingWakeIds: Set<string>;
@@ -585,6 +611,12 @@ export class GruAwareness {
     this.lastDeliveredAt = state.digest?.lastDeliveredAt ?? null;
     this.lastOwnerAt = state.digest?.lastOwnerAt !== undefined ? state.digest.lastOwnerAt : this.lastDeliveredAt;
     this.lastOwnerSeq = state.digest?.lastOwnerSeq ?? state.coveredThroughSeq;
+    // Decision (GH-111, docs/decisions/awareness-digest-semantics.md): until
+    // the first owner turn, the digest baseline is the persisted install /
+    // first-start time. No synthetic owner turn, and history stays bounded
+    // by the digest's own 101-row caps and the `since` filters.
+    this.baselineIsNew = state.digest?.baselineAt === undefined;
+    this.digestBaselineAt = state.digest?.baselineAt ?? this.now();
     const compatibleLegacyRow = (id: string): NotificationRecord | null =>
       id.startsWith('mailbox:') && this.ledger.getNotification(id) === null ? this.mailbox?.getAttentionRow(id) ?? null : null;
     const normalizeLegacyKey = (id: string): string => {
@@ -623,6 +655,13 @@ export class GruAwareness {
         }),
       },
     );
+    if (this.baselineIsNew && this.lastOwnerAt === null) {
+      try { this.persist(); } catch (error) {
+        this.log('error', 'gru awareness baseline persist failed — digest baseline resets on restart', {
+          file: this.file, error: String(error),
+        });
+      }
+    }
     opts.bus?.subscribe((event) => this.onBusEvent(event));
   }
 
@@ -721,8 +760,10 @@ export class GruAwareness {
       const delivered = record['lastDeliveredAt'];
       const ownerAt = record['lastOwnerAt'];
       const ownerSeq = record['lastOwnerSeq'];
+      const baselineAt = record['baselineAt'];
       if (!(delivered === null || (typeof delivered === 'number' && Number.isFinite(delivered))) ||
           !(ownerAt === undefined || ownerAt === null || (typeof ownerAt === 'number' && Number.isFinite(ownerAt))) ||
+          !(baselineAt === undefined || (typeof baselineAt === 'number' && Number.isFinite(baselineAt))) ||
           !(ownerSeq === undefined || (typeof ownerSeq === 'number' && Number.isSafeInteger(ownerSeq) && ownerSeq >= 0))) {
         throw new Error(
           `gru awareness state ${file} has an invalid digest section; ` +
@@ -733,6 +774,7 @@ export class GruAwareness {
         lastDeliveredAt: delivered as number | null,
         ...(ownerAt !== undefined ? { lastOwnerAt: ownerAt as number | null } : {}),
         ...(ownerSeq !== undefined ? { lastOwnerSeq: ownerSeq as number } : {}),
+        ...(baselineAt !== undefined ? { baselineAt: baselineAt as number } : {}),
       };
     }
     const attentionRecord = record['attention'];
@@ -847,6 +889,32 @@ export class GruAwareness {
    * separately once the turn actually received the block.
    */
   prepare(source: 'chat' | 'wake' = 'chat'): AwarenessInjection | null {
+    const block = this.prepareBlock(source);
+    if (source === 'chat') this.blockFreeThroughSeq = block === null ? this.ledger.latestEventSeq() : null;
+    return block;
+  }
+
+  /** GH-119: an accepted owner turn that carried no awareness block (nothing
+   * to report) still proves the owner was present. Advance only the owner
+   * watermark — through the seq the block-free prepare() saw, so events that
+   * landed afterwards stay owed — never the event cursor, the wake claims, or
+   * a digest. A no-op unless the last chat prepare() was block-free. */
+  recordOwnerPresence(): void {
+    if (this.blockFreeThroughSeq === null) return;
+    this.lastOwnerAt = this.now();
+    this.lastOwnerSeq = Math.max(this.lastOwnerSeq, this.blockFreeThroughSeq);
+    this.blockFreeThroughSeq = null;
+    try {
+      this.persist();
+    } catch (error) {
+      this.log('error', 'gru awareness presence persist failed — owner presence resets after restart', {
+        file: this.file,
+        error: String(error),
+      });
+    }
+  }
+
+  private prepareBlock(source: 'chat' | 'wake'): AwarenessInjection | null {
     const latest = this.ledger.latestEventSeq();
     const exclusiveWake = source === 'wake' && this.activeWakeIds !== null;
     const morning = source === 'chat' ? this.morningDigest() : null;
@@ -941,7 +1009,7 @@ export class GruAwareness {
       // A stop reclassified while a wake was waiting must never ride a
       // machine-only turn; all mode explicitly opts into owner context.
       if (exclusiveWake && this.wakeMode === 'action-required' && row.routing !== 'action-required') return;
-      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(row.detail)}` : '';
+      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(promptSafe(row.detail))}` : '';
       const icon = row.routing === 'action-required' ? '⚠' : row.routing === 'needs-owner' ? '🔔' : 'ℹ';
       renderedRows.set(id, row);
       if (this.mailbox?.captureRow(row) != null) {
@@ -949,16 +1017,16 @@ export class GruAwareness {
         notes.push({ id, displayId: row.id, mailbox: true, line: `- [${row.id}] ${JSON.stringify({ id: item.id, subject: item.subject, title: item.title, notificationIds: item.notificationIds, basis: item.basis, reasons: item.reasons.map((reason) => reason.label), state: item.state, owner: item.owner, dependency: item.disposition?.dependency ?? null, recheckAt: item.disposition?.recheckAt ?? null, receipt: item.receipt, references: item.references, restrictions: item.restrictions.length === 0 ? 'none recorded' : `${item.restrictions.length} recorded restrictions; inspect GET /api/mailbox before acting` })}` });
         return;
       }
-      notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(row.title)}${detail} (routing: ${row.routing})` });
+      notes.push({ id, displayId: row.id, mailbox: false, line: `- ${icon} [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (routing: ${row.routing})` });
     };
     const addReceipt = (id: string): void => {
       if (receiptNotes.length >= this.limits.maxActionNotes) return;
       const row = this.attentionRow(id);
       if (row === null || row.ackedAt !== null || row.resolvedAt !== null) return;
-      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(row.detail)}` : '';
+      const detail = row.detail !== null && row.detail !== '' ? ` — ${JSON.stringify(promptSafe(row.detail))}` : '';
       receiptNotes.push({
         id, displayId: row.id, mailbox: false,
-        line: `- 🧾 [${row.id}] title=${JSON.stringify(row.title)}${detail} (closed receipt — no action required)`,
+        line: `- 🧾 [${row.id}] title=${JSON.stringify(promptSafe(row.title))}${detail} (closed receipt — no action required)`,
       });
     };
     if (exclusiveWake) {
@@ -1027,7 +1095,8 @@ export class GruAwareness {
     const rows = rendered.ids.flatMap((id) => renderedRows.has(id) ? [renderedRows.get(id)!] : []);
     return { text: rendered.text, coveredThroughSeq: latest,
       notificationIds: rendered.ids.map((id) => renderedRows.get(id)?.id ?? id),
-      attentionKeys: rendered.ids, mailboxDeliveries: this.mailbox?.captureDelivery(rows) ?? [] };
+      attentionKeys: rendered.ids, mailboxDeliveries: this.mailbox?.captureDelivery(rows) ?? [],
+      ...(morning !== null && !rendered.digestDelivered ? { digestDelivered: false } : {}) };
 
   }
 
@@ -1051,7 +1120,7 @@ export class GruAwareness {
     }
     this.cursor = Math.max(this.cursor, injection.coveredThroughSeq);
     this.lastDeliveredAt = this.now();
-    if (source === 'chat') {
+    if (source === 'chat' && injection.digestDelivered !== false) {
       this.lastOwnerAt = this.lastDeliveredAt;
       this.lastOwnerSeq = Math.max(this.lastOwnerSeq, injection.coveredThroughSeq);
     }
@@ -1532,17 +1601,32 @@ export class GruAwareness {
     digestLines: readonly string[],
     overflow: boolean,
     morning: readonly string[] | null,
-  ): { text: string; ids: readonly string[] } | null {
+  ): { text: string; ids: readonly string[]; digestDelivered: boolean } | null {
     const parts: string[] = [AWARENESS_BLOCK_HEADER];
     const ids: string[] = [];
     let bytes = Buffer.byteLength(AWARENESS_BLOCK_HEADER, 'utf8');
     let truncated = overflow;
     let exhausted = false;
+    // GH-110: the morning digest is owner-directed catch-up whose watermark
+    // advances at commit, so notes (rendered first) must not be able to
+    // spend its bytes. Reserve what the digest lines need (greedy, in
+    // order, up to the cap); the reservation is released as the digest
+    // renders. A digest that cannot fit whole is reported undelivered.
+    let reserved = 0;
+    let reservable = 0;
+    if (morning !== null) {
+      for (const line of morning) {
+        const size = Buffer.byteLength(clampLine(line, this.limits.maxLineChars), 'utf8') + 1;
+        if (bytes + reserved + size > this.limits.maxBytes) break;
+        reserved += size;
+        reservable += 1;
+      }
+    }
     const push = (line: string, force = false, mailbox = false): boolean => {
       if (exhausted && !force) return false;
       const sized = clampLine(line, mailbox ? Number.MAX_SAFE_INTEGER : this.limits.maxLineChars);
       const size = Buffer.byteLength(sized, 'utf8') + 1; // newline
-      if (bytes + size > this.limits.maxBytes) {
+      if (bytes + size + reserved > this.limits.maxBytes) {
         truncated = true;
         if (mailbox) return false; // another item can still fit; never let one large thread hide the tail
         exhausted = true;
@@ -1565,14 +1649,20 @@ export class GruAwareness {
         if (push(note.line, false, note.mailbox) && parts.at(-1)?.includes(`[${note.displayId}]`)) ids.push(note.id);
       }
     }
-    if (morning !== null) for (const line of morning) push(line);
+    let digestDelivered = true;
+    if (morning !== null) {
+      reserved = 0; // released: the reserved bytes are spent right here
+      digestDelivered = reservable === morning.length;
+      exhausted = false;
+      for (const line of morning) if (!push(line)) digestDelivered = false;
+    }
     if (digestLines.length > 0) {
       push('Since your last turn:');
       for (const line of digestLines) push(line);
     }
     if (parts.length === 1) return null;
     if (truncated) push('- (further context omitted…)', true);
-    return { text: parts.join('\n'), ids };
+    return { text: parts.join('\n'), ids, digestDelivered };
   }
 
   /**
@@ -1697,8 +1787,8 @@ export class GruAwareness {
    * merges, and staged PRs from the ledger — the morning catch-up. Derived
    * from the ledger alone; null when the gap was short or nothing landed. */
   private morningDigest(): readonly string[] | null {
-    if (this.morningDigestGapMs <= 0 || this.lastOwnerAt === null) return null;
-    const since = this.lastOwnerAt;
+    if (this.morningDigestGapMs <= 0) return null;
+    const since = this.lastOwnerAt ?? this.digestBaselineAt;
     if (this.now() - since < this.morningDigestGapMs) return null;
     const lines: string[] = [];
     const push = (line: string): void => {
@@ -1711,19 +1801,39 @@ export class GruAwareness {
     capped('fires', wakes.length, 'wake delivered');
     const boardActions = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: [...MORNING_ACTION_KINDS], limit: 101 });
     const resolutions = this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['notification.resolved'], limit: 101, order: 'desc' });
-    const actionCount = boardActions.length + resolutions.length;
-    if (actionCount > 0) push(`- actions: ${boardActions.length >= 101 || resolutions.length >= 101 ? '100+' : actionCount} board event${actionCount === 1 ? '' : 's'}`);
+    // Decision (GH-104, docs/decisions/awareness-digest-semantics.md): only
+    // durable `notification.resolved` rows attributed `by: 'gru'` are Gru
+    // ACTIONS. Deliveries, status changes, verdicts and non-Gru resolutions
+    // are passive board ACTIVITY and are labeled separately.
+    const gruResolutions = resolutions.filter((event) => payloadOf(event)['by'] === 'gru');
+    const activityCount = boardActions.length + (resolutions.length - gruResolutions.length);
+    const bound = (count: number, capped: boolean): string => (capped ? '100+' : String(count));
+    const anyCapped = boardActions.length >= 101 || resolutions.length >= 101;
+    if (activityCount > 0) push(`- activity: ${bound(activityCount, anyCapped)} board event${activityCount === 1 ? '' : 's'}`);
+    if (gruResolutions.length > 0) push(`- Gru actions: ${bound(gruResolutions.length, resolutions.length >= 101)} disposition${gruResolutions.length === 1 ? '' : 's'}`);
     const latestDisposition = resolutions.find((event) => payloadOf(event)['by'] === 'gru');
     if (latestDisposition !== undefined) {
-      push(clampLine(`- Gru disposition [${textOf(payloadOf(latestDisposition)['id']) ?? '?'}]: ${textOf(payloadOf(latestDisposition)['detail']) ?? 'no detail recorded'}`, this.limits.maxLineChars));
+      const disposition = payloadOf(latestDisposition);
+      // #99: `by: 'gru'` names the disposition ROLE, not a proven actor — the
+      // board's shared bearer can speak for owner or agent alike. Surface the
+      // role and any caller-declared actor rather than over-claiming "Gru".
+      const declared = textOf(disposition['declaredActor']);
+      const actor = declared !== null ? ` (declared actor: ${declared})` : '';
+      push(clampLine(`- Machine disposition [${textOf(disposition['id']) ?? '?'}]: ${textOf(disposition['detail']) ?? 'no detail recorded'}${actor}`, this.limits.maxLineChars));
     }
     const jobs = this.ledger.listJobs();
     const list = (ids: readonly string[]): string =>
       `${ids.slice(0, 3).join(', ')}${ids.length > 3 ? ` +${ids.length - 3} more` : ''}`;
     const merges = jobs.filter((job) => job.status === 'merged' && Date.parse(job.updatedAt) > since);
     if (merges.length > 0) push(`- merges: ${list(merges.map((job) => job.id))}`);
+    // GH-103: staged during the away window means a `job.pr` link event
+    // after the owner watermark; a PR open since before it is not news.
+    const linkedAway = new Set(
+      this.ledger.listEventsAfter(this.lastOwnerSeq, { kinds: ['job.pr'], limit: 101 })
+        .flatMap((event) => event.jobId === null || event.jobId === undefined ? [] : [event.jobId]),
+    );
     const staged = jobs.filter(
-      (job) => job.prUrl !== null && !isJobTerminal(job.status),
+      (job) => job.prUrl !== null && !isJobTerminal(job.status) && linkedAway.has(job.id),
     );
     if (staged.length > 0) push(`- staged PRs: ${list(staged.map((job) => job.id))}`);
     if (lines.length === 0) return null;
@@ -1740,7 +1850,7 @@ export class GruAwareness {
         ...(this.unreceipted.length > 0 ? { unreceipted: this.unreceipted.map((batch) => ({ ...batch, ids: [...batch.ids] })) } : {}),
         ...(this.wakeFailures.size > 0 ? { wakeFailures: Object.fromEntries(this.wakeFailures) } : {}),
       },
-      digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq },
+      digest: { lastDeliveredAt: this.lastDeliveredAt, lastOwnerAt: this.lastOwnerAt, lastOwnerSeq: this.lastOwnerSeq, baselineAt: this.digestBaselineAt },
       attention: { machineOffset: this.attentionRotation.machine, ownerOffset: this.attentionRotation.owner },
     };
     const staging = `${this.file}.tmp-${process.pid}-${randomUUID()}`;
@@ -2317,7 +2427,15 @@ export class GruAwareness {
     }
     if (this.wakeSink === null) return; // boot binds this later
     this.cancelWakeTimer();
-    this.activeWakeIds = [...this.pendingWakeIds].slice(0, this.limits.maxActionNotes);
+    // GH-116: machine stops lead the batch. Pending ids keep insertion order
+    // within a priority class (stable sort), so FYI/owner volume in all mode
+    // cannot starve an older action-required id behind five-minute spacing.
+    const priority = (id: string): number => this.attentionRow(id)?.routing === 'action-required' ? 0 : 1;
+    this.activeWakeIds = [...this.pendingWakeIds]
+      .map((id, index) => ({ id, index, rank: priority(id) }))
+      .sort((left, right) => left.rank - right.rank || left.index - right.index)
+      .slice(0, this.limits.maxActionNotes)
+      .map(({ id }) => id);
     // The batch is durably pending; charge the attempt only at actual chat
     // admission (a queued wake may cross into quiet hours before prompt()).
     this.persistWakeState();

@@ -18,6 +18,7 @@ import { createServiceReviewWave, liveReviewSessionIds } from './dispatch/servic
 import { NotificationCenter } from './notifications/center.js';
 import { Supervisor } from './supervision/supervisor.js';
 import { TranscriptService } from './transcripts/service.js';
+import { gitReviewSourcePreflight } from './dispatch/review-source.js';
 import { DispatchService } from './dispatch/service.js';
 import { WorktreeManager } from './worktrees/manager.js';
 import { createWorktreeServer } from './worktrees/server.js';
@@ -44,6 +45,7 @@ import { adoptBlockedLanes, observeFollowUpDelivery, observePhaseCompletion, rec
 import { createDispatchServer } from './dispatch/server.js';
 import { PipelineService } from './dispatch/pipeline.js';
 import { IntakeService } from './intake/service.js';
+import { IntakeApprovalService } from './intake/approval.js';
 import { ChildWorkerService } from './dispatch/child-workers.js';
 import { createVerificationServer } from './verify/server.js';
 import type { VerificationQueueView } from './verify/scheduler.js';
@@ -1181,6 +1183,7 @@ async function main(): Promise<number> {
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     stopSignal: serviceStop.signal,
     parentTools: parentToolsFor,
+    reviewSource: gitReviewSourcePreflight,
     ...(config.lessons.enabled ? { lessons: lessonReferences, lessonsCapture } : {}),
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
@@ -1438,6 +1441,7 @@ async function main(): Promise<number> {
   const dispatchServer = createDispatchServer({
     config,
     intake,
+    intakeApproval: new IntakeApprovalService({ intake, ledger, pipeline }),
     dispatch: dispatcher,
     wave,
     ledger,

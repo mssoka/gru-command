@@ -31,6 +31,37 @@ draft first, never a later draft-to-ready conversion. This corrects HOW
 an already-authorized PR is created; it grants no publication permission
 to a lane that has none, and existing drafts are left untouched.
 
+## Review source preflight (issue #317)
+
+A `deliverable: "review"` dispatch may bind the exact source it will
+review. Three optional fields, valid only on review jobs:
+
+- `"target_base"` — focused-delta base; the range reviewed is
+  `target_base..target_sha`, both exact commit ids (a symbolic name like
+  `"main"` is refused).
+- `"required_inputs"` — `[{ "path": "<repo-relative file>", "lens":
+  "claims" }]` content the review needs. Only the `claims` lens accepts
+  inputs; a `blind` lens is a 400, so a missing spec is never a reason to
+  feed claims or old assessments to a blind reviewer (#316).
+- `"source_package"` — `{ "path": "<absolute bundle path>", "sha256":
+  "<64 hex>" }` of a git bundle. It authorizes ONE repair: the service
+  verifies the pinned hash and that the bundle carries the target, then
+  fetches it into the SELECTED repository under a private ref — never a
+  checkout, reset or unrelated worktree.
+
+Before any job row, worktree or reviewer spawn, the service proves the
+ACTUAL selected object store holds the named target, base/range and
+inputs. When it cannot, `POST /api/dispatch` answers `422`:
+
+```json
+{"error":"review_source_unavailable","detail":"...","problems":["..."],"retry_authorized":false}
+```
+
+That is a concrete, named refusal — never a no-findings report, a
+completed review, or authority for an automatic retry. Re-dispatch to the
+repository that holds the commits, or re-dispatch with an explicit
+`source_package`.
+
 ## No tool-call ceilings in briefings or directives (issue #158)
 
 A worker's tool-call count is telemetry, never a boundary. You never

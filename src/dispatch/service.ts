@@ -17,8 +17,27 @@ import { isPromptTurnVerdict, promptVerdictFromHealth } from '../runtime/prompt-
 import type { PromptTurnVerdict } from '../runtime/types.js';
 import { settleRetries, RetrySettlementUnavailableError, type PacingGate, type PacingLease, type RetrySettlement } from '../runtime/pacing.js';
 import { WORKER_RULE_BLOCKS } from './worker-rules.js';
+import {
+  assertLaneUsesBoundStore,
+  renderReviewSourceBlock,
+  type ReviewRequiredInput,
+  type ReviewSourceBinding,
+  type ReviewSourcePackage,
+  type ReviewSourcePreflight,
+} from './review-source.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+
+import {
+  admitBlindReview,
+  blindCoverageOf,
+  isAdmittedBlind,
+  readSessionToolResults,
+  recordBlindAdmission,
+  recordObservedAccess,
+  type BlindCoverage,
+} from './blind-review.js';
+import type { BlindInputPackage, ObservedToolResult } from './blind-input.js';
 
 /**
  * Dispatch flow (EPICS E8 story 2; SPEC rulings 2/17/18): the Gru-authored
@@ -70,6 +89,13 @@ export interface DispatchServiceOptions {
    * parent session (request/list/cancel child workers, bound to the
    * parent's agent id by closure). Absent = no child-request path. */
   readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
+  /** Issue #317: the review-source preflight (git against the actual
+   * selected object store). Absent = report reviews carry no source proof
+   * and may not name a base, required inputs or a source package. */
+  readonly reviewSource?: ReviewSourcePreflight;
+  /** Issue #316: reads a finished blind reviewer's tool results from its
+   * session file (default: the session jsonl on disk). null = unobservable. */
+  readonly sessionToolResults?: (sessionFile: string | null) => readonly ObservedToolResult[] | null;
   readonly log?: Log;
 }
 
@@ -94,6 +120,8 @@ export function renderMinionBriefing(input: {
    *  nothing, and an unmodified tree is the expected result; artifact and
    *  investigation jobs hand back their artifacts without opening a PR. */
   deliverable?: JobDeliverable;
+  /** Issue #317: the preflight-verified review source, bound verbatim. */
+  reviewSource?: ReviewSourceBinding;
 }): string {
   const lessonsSection = renderLessonsSection(input.lessons ?? []);
   return [
@@ -105,6 +133,7 @@ export function renderMinionBriefing(input: {
     '',
     'BRIEFING:',
     input.briefing,
+    ...(input.reviewSource === undefined ? [] : ['', ...renderReviewSourceBlock(input.reviewSource)]),
     ...(lessonsSection === '' ? [] : ['', lessonsSection]),
     ...WORKER_RULE_BLOCKS.flatMap((block) => ['', block]),
     '',
@@ -183,10 +212,25 @@ export class DispatchService {
     commissioner?: string;
     targetRef?: string;
     targetSha?: string;
+    /** Issue #317 review-source preflight inputs (review jobs only): the
+     * focused-delta base, content the review needs (claims lenses), and an
+     * optional hash-pinned git bundle authorizing a source repair. */
+    targetBase?: string;
+    requiredInputs?: readonly ReviewRequiredInput[];
+    sourcePackage?: ReviewSourcePackage;
     /** The commissioning job: a minion dispatching a specialist
      * (megaminion) names its own job so the child nests under that heist. */
     parentJobId?: string;
     briefing: string;
+    /** Issue #316: `blind` (isolated input, validated before spawn) or
+     * `claims` (a reviewer that legitimately needs claims — a separate
+     * contract). Omitted = inferred from a lane named blind, else unclassified. */
+    reviewRole?: string;
+    /** Issue #316: the blind reviewer's exact immutable input package. */
+    inputPackage?: BlindInputPackage;
+    /** Issue #316: the parent contract hash the child was composed against;
+     * a stale hash is refused so a clarification cannot be missed. */
+    parentContractSha256?: string;
     /** Explicit completion intent: when present, the phase-handoff guard
      * row is persisted BEFORE any side effect and this exact phase's
      * validated completion owes the named decision durably. Omitted =
@@ -230,6 +274,53 @@ export class DispatchService {
     const targetSha = isReportKind ? input.targetSha?.trim() : undefined;
     const repoName = input.repoPath.split('/').filter(Boolean).pop() ?? input.repoPath;
 
+    // (0b) Issue #317: prove the ACTUAL selected object store holds the
+    // review inputs BEFORE any job row, worktree or reviewer turn exists. A
+    // refusal throws ReviewSourceUnavailableError — never a report.
+    const namesSourceFields = input.targetBase !== undefined || input.requiredInputs !== undefined || input.sourcePackage !== undefined;
+    if (namesSourceFields && input.deliverable !== 'review') {
+      throw new Error(`job "${input.jobId}": target_base/required_inputs/source_package only apply to review jobs`);
+    }
+    if (namesSourceFields && this.opts.reviewSource === undefined) {
+      throw new Error(`job "${input.jobId}": review source preflight is not wired — refusing to admit a review whose source cannot be proven`);
+    }
+    const reviewSource: ReviewSourceBinding | null =
+      input.deliverable === 'review' && targetSha !== undefined && this.opts.reviewSource !== undefined
+        ? this.opts.reviewSource({
+            jobId: input.jobId,
+            repoPath: input.repoPath,
+            targetSha,
+            ...(input.targetBase !== undefined ? { targetBase: input.targetBase.trim() } : {}),
+            ...(input.requiredInputs !== undefined ? { requiredInputs: input.requiredInputs } : {}),
+            ...(input.sourcePackage !== undefined ? { sourcePackage: input.sourcePackage } : {}),
+          })
+        : null;
+
+    // The durable record binds the RESOLVED commit the preflight proved,
+    // never the caller's possibly-abbreviated spelling: durable-reconcile
+    // compares the recorded target_sha to full oids by exact string. The
+    // raw value is the fallback only when no preflight ran.
+    const recordedTargetSha = reviewSource?.targetSha ?? targetSha;
+
+    // (0) Issue #316: a blind reviewer's input is validated against the
+    // parent's EFFECTIVE isolation rule before any job, worktree or reviewer
+    // exists. A refusal spends no reviewer turn and names its correction.
+    const blindAdmission = admitBlindReview({
+      ledger: this.opts.ledger,
+      jobId: input.jobId,
+      title: input.title,
+      displayName: input.displayName,
+      deliverable: input.deliverable,
+      reviewRole: input.reviewRole,
+      briefing: input.briefing,
+      targetRef: input.targetRef,
+      targetSha: input.targetSha,
+      parentJobId: input.parentJobId,
+      repoName,
+      inputPackage: input.inputPackage,
+      parentContractSha256: input.parentContractSha256,
+    });
+
     // (1) The job row: the briefing IS the contract (recorded verbatim).
     const job = this.opts.ledger.addJob({
       id: input.jobId,
@@ -240,9 +331,27 @@ export class DispatchService {
       ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
       ...(commissioner !== undefined ? { commissioner } : {}),
       ...(targetRef !== undefined ? { targetRef } : {}),
-      ...(targetSha !== undefined ? { targetSha } : {}),
+      ...(recordedTargetSha !== undefined ? { targetSha: recordedTargetSha } : {}),
       ...(input.parentJobId !== undefined ? { parentJobId: input.parentJobId } : {}),
     });
+
+    if (reviewSource !== null) {
+      this.opts.ledger.appendCustomEvent({
+        kind: 'job.review-source-verified',
+        jobId: job.id,
+        payload: {
+          object_store: reviewSource.objectStore,
+          target_sha: reviewSource.targetSha,
+          target_base: reviewSource.targetBase,
+          range_commits: reviewSource.rangeCommits,
+          inputs: reviewSource.inputs,
+          source: reviewSource.source,
+          package_sha256: reviewSource.packageSha256,
+        },
+      });
+    }
+
+    if (blindAdmission !== null) recordBlindAdmission(this.opts.ledger, job.id, blindAdmission);
 
     // (2) Ops handoff: dispatched → working, on the record.
     this.opts.ledger.appendCustomEvent({
@@ -297,6 +406,14 @@ export class DispatchService {
         repoPath: input.repoPath,
         jobId: job.id,
       });
+      if (reviewSource !== null) {
+        try {
+          assertLaneUsesBoundStore(job.id, reviewSource, worktree.path);
+        } catch (error) {
+          await this.sweepQuietly(worktree.id);
+          throw error;
+        }
+      }
 
       // (4) The minion: a fresh agent session rooted in the PROJECT
       // worktree (ruling 17: dispatch cwd = project root, all runtimes).
@@ -498,6 +615,9 @@ export class DispatchService {
           disposition === 'recovered'
             ? ({ ok: true, error: null } as const)
             : (verdict ?? promptVerdictFromHealth(handle));
+        // Issue #316: whatever the reviewer's tools actually returned is
+        // judged against the rule it was admitted under, success or not.
+        this.observeBlindSession(job.id, handle.sessionFile);
         if (!evidence.ok) {
           return this.recordTurnFailure(
             job.id,
@@ -535,6 +655,7 @@ export class DispatchService {
         sha: worktree.sha,
         briefing: input.briefing,
         ...(input.deliverable !== undefined ? { deliverable: input.deliverable } : {}),
+        ...(reviewSource !== null ? { reviewSource } : {}),
         agentId: handle.id,
         ...(this.opts.parentTools !== undefined && this.opts.parentTools(handle.id).length > 0
           ? { childWorkerTools: true }
@@ -621,6 +742,32 @@ export class DispatchService {
     } catch (error) {
       this.log('error', 'phase handoff close after failure also failed', { phase: phaseId, error: String(error) });
     }
+  }
+
+  /** Issue #316: record the finished blind reviewer's observed tool access.
+   * An unreadable session records nothing (never a fabricated clean pass);
+   * a failure here is logged and never blocks the report's delivery. */
+  private observeBlindSession(jobId: string, sessionFile: string | null): void {
+    try {
+      if (!isAdmittedBlind(this.opts.ledger, jobId)) return;
+      const results = (this.opts.sessionToolResults ?? readSessionToolResults)(sessionFile);
+      if (results === null) return;
+      recordObservedAccess(this.opts.ledger, jobId, results, 'session');
+    } catch (error) {
+      this.log('error', 'blind review access observation failed', { job: jobId, error: String(error) });
+    }
+  }
+
+  /** Issue #316: blind-coverage validity of one review job (derived from the
+   * admission and observed access — never from settlement). */
+  blindCoverage(jobId: string): BlindCoverage {
+    return blindCoverageOf(this.opts.ledger, jobId);
+  }
+
+  /** Issue #316: record tool results observed outside the settle path (a
+   * LATER read by the same reviewer still invalidates its coverage). */
+  observeBlindAccess(jobId: string, results: readonly ObservedToolResult[]): BlindCoverage {
+    return recordObservedAccess(this.opts.ledger, jobId, results, 'operator');
   }
 
   /** Capture the minion's opt-in lessons block (a bonus, never the

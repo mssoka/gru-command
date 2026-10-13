@@ -11,6 +11,7 @@ import { parsePipelinePrerequisites, type PipelinePrerequisite } from '../ledger
 import type { PipelineService } from './pipeline.js';
 import type { IntakeService } from '../intake/service.js';
 import { IntakeError } from '../intake/types.js';
+import { IntakePartialFailure, type IntakeApprovalService } from '../intake/approval.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
@@ -27,9 +28,16 @@ import { BranchBusyError } from './branch-idle.js';
 import { deliveredTargetSha, type SilasOpsDigest } from './silas-driver.js';
 import { isVerdictRungRule, parseSilasRouteRuleId, strictOptStrField } from './silas-rules.js';
 import type { WorktreePort } from './worktree-port.js';
+import {
+  REVIEW_INPUT_LENSES,
+  ReviewSourceUnavailableError,
+  type ReviewRequiredInput,
+  type ReviewSourcePackage,
+} from './review-source.js';
 import type { PacingGate, RetrySettlement } from '../runtime/pacing.js';
 import { childRefusalStatus, type ChildWorkerService } from './child-workers.js';
 import { REVIEW_EVIDENCE_MAX_FILES, type ReviewEvidenceRequest } from '../review-inputs/evidence.js';
+import { BlindInputRefusal, parseBlindInputPackage } from './blind-input.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -85,8 +93,9 @@ export interface DispatchServerOptions {
   /** Durable pipeline queue surface (approved j-239/j-1064); absent =
    * /api/pipeline/* answers 503 (queue not hosted in this build). */
   readonly pipeline?: PipelineService;
-  /** Read-only native intake preview; never connected to executable enqueue. */
+  /** Preview remains read-only; approval is a separate explicit boundary. */
   readonly intake?: IntakeService;
+  readonly intakeApproval?: IntakeApprovalService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
   readonly log?: Log;
@@ -217,6 +226,39 @@ function optEvidenceField(body: Record<string, unknown>): readonly ReviewEvidenc
       ...(typeof capturedAt === 'string' ? { capturedAt } : {}),
     };
   });
+}
+
+/** Issue #317: `required_inputs` — [{path, lens}] content the review needs.
+ * Only claims-needed lenses may declare inputs; a blind lens is refused here
+ * so a missing spec can never become a reason to feed claims to it (#316). */
+function optRequiredInputs(body: Record<string, unknown>): readonly ReviewRequiredInput[] | undefined {
+  const value = body['required_inputs'];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) throw new Error('required_inputs must be a non-empty array when supplied');
+  return value.map((entry, index) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new Error(`required_inputs[${index}] must be an object`);
+    const { path, lens, ...rest } = entry as Record<string, unknown>;
+    if (Object.keys(rest).length > 0) throw new Error(`required_inputs[${index}] has unknown field "${Object.keys(rest)[0]}"`);
+    if (typeof path !== 'string' || path.trim() === '' || path.startsWith('/') || path.split('/').includes('..')) {
+      throw new Error(`required_inputs[${index}].path must be a non-empty repo-relative path`);
+    }
+    if (typeof lens !== 'string' || !(REVIEW_INPUT_LENSES as readonly string[]).includes(lens)) {
+      throw new Error(`required_inputs[${index}].lens must be one of ${REVIEW_INPUT_LENSES.join('|')} (blind lenses never receive claims inputs)`);
+    }
+    return { path, lens: lens as ReviewRequiredInput['lens'] };
+  });
+}
+
+/** Issue #317: `source_package` — {path, sha256} of a hash-pinned bundle. */
+function optSourcePackage(body: Record<string, unknown>): ReviewSourcePackage | undefined {
+  const value = body['source_package'];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('source_package must be an object');
+  const { path, sha256, ...rest } = value as Record<string, unknown>;
+  if (Object.keys(rest).length > 0) throw new Error(`source_package has unknown field "${Object.keys(rest)[0]}"`);
+  if (typeof path !== 'string' || !path.startsWith('/')) throw new Error('source_package.path must be an absolute path');
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/iu.test(sha256)) throw new Error('source_package.sha256 must be 64 hex characters');
+  return { path, sha256 };
 }
 
 /** The optional explicit completion intent on phase-authorizing requests.
@@ -384,13 +426,30 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         return true;
       }
       try {
-        if (req.method === 'POST' && path === '/api/intake/preview') {
+        if (req.method === 'POST' && ['/api/intake/preview', '/api/intake/revision', '/api/intake/review', '/api/intake/reject', '/api/intake/approve'].includes(path)) {
           let body: Record<string, unknown>;
           try { body = await readBody(req, false); } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             throw new IntakeError('intake_invalid_request', message, message.includes('exceeds 512 KiB') ? 413 : 400);
           }
-          json(res, 200, await intake.preview(body) as unknown as Record<string, unknown>);
+          if (path === '/api/intake/preview' || path === '/api/intake/revision') {
+            json(res, 200, await (path.endsWith('/preview') ? intake.preview(body) : intake.revise(body)) as unknown as Record<string, unknown>);
+          } else {
+            const approval = options.intakeApproval;
+            if (approval === undefined) throw new IntakeError('intake_approval_not_hosted', 'Explicit intake approval is not hosted on this service', 503);
+            const result = path.endsWith('/approve') ? approval.approve(body) : path.endsWith('/reject') ? approval.reject(body) : approval.review(body);
+            json(res, 200, result as unknown as Record<string, unknown>);
+          }
+          return true;
+        }
+        const reviewRead = /^\/api\/intake\/([^/]+)\/review$/u.exec(path);
+        if (req.method === 'GET' && reviewRead !== null) {
+          if ((req.url?.length ?? 0) > 8192) throw new IntakeError('intake_invalid_request', 'intake URL exceeds 8 KiB');
+          const params = new URL(req.url ?? '/', 'http://localhost').searchParams;
+          for (const key of params.keys()) if (!['repoPath', 'token'].includes(key) || params.getAll(key).length !== 1) throw new IntakeError('intake_invalid_request', 'unsupported or duplicated review query parameter');
+          if (!params.get('repoPath')) throw new IntakeError('intake_invalid_request', 'missing repoPath');
+          if (options.intakeApproval === undefined) throw new IntakeError('intake_approval_not_hosted', 'Explicit intake approval is not hosted on this service', 503);
+          json(res, 200, options.intakeApproval.read(params.get('repoPath')!, decodeURIComponent(reviewRead[1]!), params.get('token') ?? undefined) as unknown as Record<string, unknown>);
           return true;
         }
         const read = /^\/api\/intake\/([^/]+)\/requests\/([^/]+)$/u.exec(path);
@@ -419,7 +478,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             // chunked sender. Merely pausing/draining leaves it alive forever.
             res.once('finish', () => socket.destroySoon());
           }
-          json(res, error.status, { error: error.code, detail: error.message });
+          json(res, error.status, { error: error.code, detail: error.message, ...(error instanceof IntakePartialFailure ? { readback: error.readback } : {}) });
         } else if (error instanceof URIError) json(res, 400, { error: 'intake_invalid_request', detail: 'malformed percent escape in intake identity' });
         else json(res, 500, { error: 'intake_failed', detail: error instanceof Error ? error.message : String(error) });
       }
@@ -449,19 +508,64 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       // its own job id so the board nests the child under that heist. The
       // ledger refuses an unknown, cross-repo, self, or grandchild parent.
       const parentJobId = parentJobIdField(body);
-      const outcome = await options.dispatch.dispatch({
-        jobId: strField(body, 'job_id'),
-        repoPath: strField(body, 'repo_path'),
-        title: strField(body, 'title'),
-        ...(displayName !== undefined ? { displayName } : {}),
-        ...(deliverable !== undefined ? { deliverable } : {}),
-        ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
-        ...(targetRef !== undefined ? { targetRef } : {}),
-        ...(targetSha !== undefined ? { targetSha } : {}),
-        ...(parentJobId !== undefined ? { parentJobId } : {}),
-        briefing: strField(body, 'briefing'),
-        ...(completionHandoff !== undefined ? { completionHandoff } : {}),
-      });
+      const targetBase = optStrFieldStrict(body, 'target_base');
+      const requiredInputs = optRequiredInputs(body);
+      const sourcePackage = optSourcePackage(body);
+      // Issue #316: blind-review input isolation fields. Present-but-
+      // malformed is a named refusal, never a silent drop.
+      const reviewRole = optStrFieldStrict(body, 'review_role');
+      const parentContractSha256 = optStrFieldStrict(body, 'parent_contract_sha256');
+      let outcome: Awaited<ReturnType<DispatchService['dispatch']>>;
+      try {
+        const inputPackage = Object.hasOwn(body, 'input_package') ? parseBlindInputPackage(body['input_package']) : undefined;
+        outcome = await options.dispatch.dispatch({
+          jobId: strField(body, 'job_id'),
+          repoPath: strField(body, 'repo_path'),
+          title: strField(body, 'title'),
+          ...(displayName !== undefined ? { displayName } : {}),
+          ...(deliverable !== undefined ? { deliverable } : {}),
+          ...(commissioner !== undefined ? { commissioner } : by !== undefined ? { commissioner: by } : {}),
+          ...(targetRef !== undefined ? { targetRef } : {}),
+          ...(targetSha !== undefined ? { targetSha } : {}),
+          ...(targetBase !== undefined ? { targetBase } : {}),
+          ...(requiredInputs !== undefined ? { requiredInputs } : {}),
+          ...(sourcePackage !== undefined ? { sourcePackage } : {}),
+          ...(parentJobId !== undefined ? { parentJobId } : {}),
+          briefing: strField(body, 'briefing'),
+          ...(completionHandoff !== undefined ? { completionHandoff } : {}),
+          ...(reviewRole !== undefined ? { reviewRole } : {}),
+          ...(inputPackage !== undefined ? { inputPackage } : {}),
+          ...(parentContractSha256 !== undefined ? { parentContractSha256 } : {}),
+        });
+      } catch (error) {
+        // Issue #317: the selected source cannot provide the named review
+        // inputs. No job, lane or reviewer exists; this is a refusal, not a
+        // report, and grants no automatic retry.
+        if (error instanceof ReviewSourceUnavailableError) {
+          log('warn', 'review source preflight refused dispatch', { problems: error.problems });
+          json(res, 422, {
+            error: 'review_source_unavailable',
+            detail: error.message,
+            problems: error.problems,
+            retry_authorized: false,
+          });
+          return true;
+        }
+        // Issue #316: named refusal BEFORE any reviewer spawned: the
+        // correction path is part of the answer, and the violations never
+        // carry private text.
+        if (error instanceof BlindInputRefusal) {
+          json(res, error.status, {
+            error: error.code,
+            detail: error.message,
+            correction: error.correction,
+            violations: error.violations,
+            ...error.details,
+          });
+          return true;
+        }
+        throw error;
+      }
       // The minion's turn runs in the background; the board carries the
       // lifecycle. Track it so dispose() never orphans a live lane.
       track(outcome.settled);
@@ -910,6 +1014,42 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       if (!authed(req, res)) return true;
       const rows = options.dispatch.worktreesFor(decodeURIComponent(worktreesMatch[1] ?? ''));
       json(res, 200, { worktrees: rows });
+      return true;
+    }
+    // Issue #316: blind-review validity. Derived from the admission and the
+    // reviewer's observed access — settlement/disposition are not inputs.
+    const blindCoverageMatch = /^\/api\/dispatch\/jobs\/([^/]+)\/blind-coverage$/.exec(path);
+    if (req.method === 'GET' && blindCoverageMatch !== null) {
+      if (!authed(req, res)) return true;
+      const jobId = decodeURIComponent(blindCoverageMatch[1] ?? '');
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      json(res, 200, options.dispatch.blindCoverage(jobId) as unknown as Record<string, unknown>);
+      return true;
+    }
+    if (req.method === 'POST' && path === '/api/dispatch/blind-access') {
+      if (!authed(req, res)) return true;
+      const body = await readBody(req);
+      const jobId = strField(body, 'job_id');
+      const raw = body['tool_results'];
+      if (!Array.isArray(raw) || raw.length === 0) {
+        json(res, 400, { error: 'bad_request', detail: 'tool_results must be a non-empty array of {tool_name?, text}' });
+        return true;
+      }
+      const results = raw.map((entry, index) => {
+        if (typeof entry !== 'object' || entry === null || typeof (entry as { text?: unknown }).text !== 'string') {
+          throw new Error(`tool_results[${index}].text must be a string`);
+        }
+        const toolName = (entry as { tool_name?: unknown }).tool_name;
+        return { index, toolName: typeof toolName === 'string' ? toolName : null, text: (entry as { text: string }).text };
+      });
+      if (options.ledger.getJob(jobId) === null) {
+        json(res, 404, { error: 'job_not_found', detail: `job "${jobId}" not found` });
+        return true;
+      }
+      json(res, 200, options.dispatch.observeBlindAccess(jobId, results) as unknown as Record<string, unknown>);
       return true;
     }
     // Canonical job amendments (owner ruling j-969): authenticated,

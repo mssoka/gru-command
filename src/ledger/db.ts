@@ -990,8 +990,39 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
-    // GH-286 is unshipped: retain main's landed mailbox migration 25.
     id: 26,
+    name: 'intake-review-acceptance',
+    sql: `
+      CREATE TABLE intake_reviews (
+        token TEXT PRIMARY KEY,
+        repo_path TEXT NOT NULL,
+        intake_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reviewed','rejected','approved')),
+        record TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX intake_one_approval ON intake_reviews(repo_path, intake_id, revision_id) WHERE status = 'approved';
+      CREATE TABLE intake_review_heads (
+        repo_path TEXT NOT NULL,
+        intake_id TEXT NOT NULL,
+        token TEXT NOT NULL REFERENCES intake_reviews(token),
+        PRIMARY KEY(repo_path, intake_id)
+      );
+    `,
+  },
+  {
+    id: 27,
+    name: 'intake-recovery-query-indexes',
+    sql: `
+      CREATE INDEX idx_intake_reviews_scope ON intake_reviews(repo_path, intake_id, revision_id);
+      CREATE INDEX idx_pipeline_enqueued_entry ON events(json_extract(payload, '$.entry_id'))
+        WHERE kind = 'pipeline.enqueued' AND json_valid(payload);
+    `,
+  },
+  {
+    // Approved GH-286 integration-only ordinal change: unshipped candidate
+    // 26 becomes 28; landed main 25–27 and original native SQL stay intact.
+    id: 28,
     name: 'directive-native-progress',
     sql: `
       ALTER TABLE pending_directives ADD COLUMN request_kind TEXT CHECK (request_kind IS NULL OR request_kind IN ('directive','rebrief'));

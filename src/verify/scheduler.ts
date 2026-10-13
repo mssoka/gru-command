@@ -5,6 +5,16 @@ import { availableParallelism } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import type { LogLevel } from '../logger.js';
+import {
+  BuildRecords,
+  DEFAULT_BUILD_OUTPUT_ROOTS,
+  inspectReuse,
+  observeBuildInputs,
+  planCommand,
+  type VerificationCheck,
+} from './build-reuse.js';
+
+export type { VerificationCheck, VerificationCheckStatus } from './build-reuse.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -93,6 +103,12 @@ export interface VerificationOutcome {
   readonly outputTail: string;
   /** Spawn-level failure (never a silent exit-code null). */
   readonly error: string | null;
+  /**
+   * Per-step evidence (issue #318), present only when the declared command
+   * was decomposed for narrow build reuse. Says which checks really ran,
+   * how each ended, and which build step was satisfied by an earlier run.
+   */
+  readonly checks?: readonly VerificationCheck[];
 }
 
 export type VerificationProgress =
@@ -428,6 +444,13 @@ export interface VerificationSchedulerOptions {
   /** How long dispose() waits for active children to exit. */
   readonly disposeGraceMs?: number;
   readonly now?: () => number;
+  /**
+   * Narrow build reuse (issue #318). Default: enabled with the default
+   * output root (`dist/`); `false` runs every declared command exactly as
+   * written. There is no config-file off-switch — disabling is this
+   * code-level option only.
+   */
+  readonly buildReuse?: false | { readonly roots?: readonly string[] };
 }
 
 const STATE_FILE = 'scheduler.json';
@@ -658,6 +681,9 @@ export class VerificationScheduler {
   private readonly noStartSettled = new Set<string>();
   private readonly pendingNoStart = new Map<string, VerificationRecord>();
   private readonly publishingNoStart = new Set<string>();
+  private readonly buildRecords = new BuildRecords();
+  /** Null = reuse disabled. */
+  private readonly buildReuseRoots: readonly string[] | null;
 
   constructor(opts: VerificationSchedulerOptions) {
     this.opts = opts;
@@ -685,6 +711,8 @@ export class VerificationScheduler {
     this.sweepIntervalMs = opts.sweepIntervalMs ?? 15_000;
     this.stateFile = join(opts.storageDir, STATE_FILE);
     this.requestLogFile = join(opts.storageDir, REQUEST_LOG_FILE);
+    this.buildReuseRoots =
+      opts.buildReuse === false ? null : (opts.buildReuse?.roots ?? DEFAULT_BUILD_OUTPUT_ROOTS);
   }
 
   /** Total workers allowed across all concurrent runs. */
@@ -1751,119 +1779,233 @@ export class VerificationScheduler {
       });
       return outcome;
     }
-    const child = spawn('/bin/sh', ['-c', lease.command], {
-      cwd: lease.cwd,
-      env: verificationEnvironment(process.env, {
-        runId: lease.runId,
-        jobId: lease.jobId,
-        scope: lease.scope,
-        workers,
-      }),
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+    const env = verificationEnvironment(process.env, {
+      runId: lease.runId,
+      jobId: lease.jobId,
+      scope: lease.scope,
+      workers,
     });
+    const plan = this.buildReuseRoots === null ? null : planCommand(lease.command);
+    const planned = plan !== null && plan.buildIndex !== null && plan.refusal === null;
+    const steps: readonly string[] = planned ? plan.steps : [lease.command];
+    const checks: VerificationCheck[] = [];
+
+    let startedAt = 0;
+    let queuedMs = 0;
+    let startedEmitted = false;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+    let current: ChildProcess | null = null;
     let exitCode: number | null = null;
     let signal: string | null = null;
-    let runError: Error | null = null;
-    const exited = new Promise<void>((resolveExit) => {
-      child.once('error', (error: Error) => { runError = error; resolveExit(); });
-      child.once('exit', (code: number | null, exitSignal: NodeJS.Signals | null) => { exitCode = code; signal = exitSignal; resolveExit(); });
-    });
-    slot.pid = child.pid ?? null;
-    slot.child = child;
-    // Native child existence, not a client started-frame callback, fences
-    // reentrant shutdown from manufacturing a no-start receipt.
-    const attempt = [...this.attempts.values()].find((owner) => owner.runId === lease.runId);
-    if (attempt !== undefined && child.pid !== undefined) attempt.started = true;
-    const spawnResult = await new Promise<Error | null>((resolveSpawn) => {
-      child.once('spawn', () => resolveSpawn(null));
-      child.once('error', (error: Error) => resolveSpawn(error));
-    });
-    if (spawnResult !== null) {
-      if (child.pid === undefined) { slot.child = null; slot.pid = null; throw new VerificationSpawnFailedError(spawnResult.message); }
-      throw spawnResult;
-    }
-    if (child.pid === undefined) throw new Error('native spawn event has no bound PID; verification ownership is UNKNOWN');
-    this.callbackSafe('onSpawn', () =>
-      this.opts.onSpawn?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
-    );
-    // Decode at the stream boundary so multi-byte characters split across
-    // OS pipe chunks never corrupt the streamed output or the tail.
-    child.stdout?.setEncoding('utf8');
-    child.stderr?.setEncoding('utf8');
-    this.persistBestEffort();
-
-    const startedAt = this.now();
-    const queuedMs = startedAt - lease.queuedAt;
-    this.safeRecord({
-      kind: 'verification.started',
-      jobId: lease.jobId,
-      payload: {
-        run_id: lease.runId,
-        pid: child.pid ?? null,
-        scope: lease.scope,
-        command: lease.command,
-        cwd: lease.cwd,
-        sha: git.sha,
-        workers,
-        queued_ms: queuedMs,
-      },
-    });
-    await sink({
-      type: 'started',
-      runId: lease.runId,
-      workers,
-      sha: git.sha,
-      queuedMs,
-    });
-
     let timedOut = false;
     const hash = createHash('sha256');
     let outputBytes = 0;
     let outputTail = '';
+    let runError: Error | null = null;
+
+    const emitStarted = async (): Promise<void> => {
+      startedEmitted = true;
+      startedAt = this.now();
+      queuedMs = startedAt - lease.queuedAt;
+      this.safeRecord({
+        kind: 'verification.started',
+        jobId: lease.jobId,
+        payload: {
+          run_id: lease.runId,
+          pid: current?.pid ?? null,
+          scope: lease.scope,
+          command: lease.command,
+          cwd: lease.cwd,
+          sha: git.sha,
+          workers,
+          queued_ms: queuedMs,
+        },
+      });
+      await sink({
+        type: 'started',
+        runId: lease.runId,
+        workers,
+        sha: git.sha,
+        queuedMs,
+      });
+      // ONE wall-clock bound for the whole run, whichever step is live.
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        const live = current;
+        if (live === null) return;
+        signalGroup(live, 'SIGTERM');
+        const killTimer = setTimeout(() => signalGroup(live, 'SIGKILL'), this.killGraceMs);
+        killTimer.unref?.();
+      }, this.opts.limits.runTimeoutMs);
+      timeoutTimer.unref?.();
+    };
+
+    // Every byte the caller sees is hashed here, so the exact-output proof
+    // also covers the scheduler's own reuse note.
+    const emit = async (streamName: 'stdout' | 'stderr', text: string): Promise<void> => {
+      outputBytes += Buffer.byteLength(text);
+      hash.update(text);
+      outputTail = (outputTail + text).slice(-OUTPUT_TAIL_MAX_BYTES);
+      for (const frame of splitFrames(text)) {
+        await sink({ type: 'output', runId: lease.runId, stream: streamName, text: frame });
+      }
+    };
 
     const consume = async (stream: Readable | null, streamName: 'stdout' | 'stderr'): Promise<void> => {
       if (stream === null) return;
       for await (const chunk of stream) {
-        const text = Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk);
-        outputBytes += Buffer.byteLength(text);
-        hash.update(text);
-        outputTail = (outputTail + text).slice(-OUTPUT_TAIL_MAX_BYTES);
-        for (const frame of splitFrames(text)) {
-          await sink({ type: 'output', runId: lease.runId, stream: streamName, text: frame });
-        }
+        await emit(streamName, Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk));
       }
     };
-    const streamsDone = Promise.all([
-      consume(child.stdout, 'stdout'),
-      consume(child.stderr, 'stderr'),
-    ]).catch((error: unknown) => {
-      runError ??= error instanceof Error ? error : new Error(String(error));
-    });
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
-      signalGroup(child, 'SIGTERM');
-      const killTimer = setTimeout(() => signalGroup(child, 'SIGKILL'), this.killGraceMs);
-      killTimer.unref?.();
-    }, this.opts.limits.runTimeoutMs);
-    timeoutTimer.unref?.();
-    try {
-      await exited;
-      // Streams normally close with the process; cap the drain so an
-      // inherited pipe from a stray grandchild cannot hold the slot.
-      await Promise.race([streamsDone, delay(2_000)]);
-    } finally {
-      clearTimeout(timeoutTimer);
-      child.stdout?.destroy();
-      child.stderr?.destroy();
-    }
-    // The child is gone (exit or spawn error): reconcile the lane record.
-    this.callbackSafe('onSettled', () =>
-      this.opts.onSettled?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
-    );
 
-    const durationMs = this.now() - startedAt;
-    const ok = !timedOut && runError === null && exitCode === 0 && signal === null;
+    /** Spawn one shell, stream it to EOF, and report how it ended. */
+    const runStep = async (
+      command: string,
+    ): Promise<{ readonly exitCode: number | null; readonly signal: string | null }> => {
+      const child = spawn('/bin/sh', ['-c', command], {
+        cwd: lease.cwd,
+        env,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stepExit: number | null = null;
+      let stepSignal: string | null = null;
+      const exited = new Promise<void>((resolveExit) => {
+        child.once('error', (error: Error) => { runError = error; resolveExit(); });
+        child.once('exit', (code: number | null, exitSignal: NodeJS.Signals | null) => { stepExit = code; stepSignal = exitSignal; resolveExit(); });
+      });
+      current = child;
+      slot.pid = child.pid ?? null;
+      slot.child = child;
+      // Real child existence precedes every callback/started-frame await;
+      // shutdown must not convert an owned native step into a no-start.
+      const attempt = [...this.attempts.values()].find((owner) => owner.runId === lease.runId);
+      if (attempt !== undefined && child.pid !== undefined) attempt.started = true;
+      const spawnResult = await new Promise<Error | null>((resolveSpawn) => {
+        child.once('spawn', () => resolveSpawn(null));
+        child.once('error', (error: Error) => resolveSpawn(error));
+      });
+      if (spawnResult !== null) {
+        if (child.pid === undefined) { current = null; slot.child = null; slot.pid = null; throw new VerificationSpawnFailedError(spawnResult.message); }
+        throw spawnResult;
+      }
+      if (child.pid === undefined) throw new Error('native spawn event has no bound PID; verification ownership is UNKNOWN');
+      this.callbackSafe('onSpawn', () =>
+        this.opts.onSpawn?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
+      );
+      // Decode at the stream boundary so multi-byte characters split across
+      // OS pipe chunks never corrupt the streamed output or the tail.
+      child.stdout?.setEncoding('utf8');
+      child.stderr?.setEncoding('utf8');
+      this.persistBestEffort();
+      if (!startedEmitted) await emitStarted();
+
+      const streamsDone = Promise.all([
+        consume(child.stdout, 'stdout'),
+        consume(child.stderr, 'stderr'),
+      ]).catch((error: unknown) => {
+        runError ??= error instanceof Error ? error : new Error(String(error));
+      });
+      try {
+        await exited;
+        // Streams normally close with the process; cap the drain so an
+        // inherited pipe from a stray grandchild cannot hold the slot.
+        await Promise.race([streamsDone, delay(2_000)]);
+      } finally {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
+      // The child is gone (exit or spawn error): reconcile the lane record.
+      this.callbackSafe('onSettled', () =>
+        this.opts.onSettled?.({ lease, pid: child.pid ?? null, command: child.spawnargs.join(' ') }),
+      );
+      return { exitCode: stepExit, signal: stepSignal };
+    };
+
+    const stepOk = (result: { exitCode: number | null; signal: string | null }): boolean =>
+      !timedOut && runError === null && result.exitCode === 0 && result.signal === null;
+
+    let halted = false;
+    try {
+      for (const [index, step] of steps.entries()) {
+        const check = (
+          status: VerificationCheck['status'],
+          extra: Partial<VerificationCheck> = {},
+        ): VerificationCheck => ({
+          command: step,
+          status,
+          ran: status === 'passed' || status === 'failed',
+          exitCode: null,
+          signal: null,
+          durationMs: 0,
+          reusedFromRunId: null,
+          reuseRefusal: null,
+          ...extra,
+        });
+        if (halted || timedOut || this.disposed) {
+          if (!halted && this.disposed && runError === null) runError = new VerificationDisposedError();
+          halted = true;
+          if (planned) checks.push(check('not-run'));
+          continue;
+        }
+
+        const isBuild = planned && index === plan.buildIndex;
+        let reuseRefusal: string | null = null;
+        if (isBuild && this.buildReuseRoots !== null) {
+          const records = this.buildRecords;
+          const before = observeBuildInputs(lease.cwd, env, this.buildReuseRoots);
+          reuseRefusal = records.isBuilding(lease.cwd)
+            ? 'build-in-flight'
+            : inspectReuse(records.get(lease.cwd), before, lease.head);
+          const prior = records.get(lease.cwd);
+          if (reuseRefusal === null && prior !== undefined) {
+            if (!startedEmitted) await emitStarted();
+            await emit(
+              'stdout',
+              `[gru-verify] ${step} reused (not executed) from run ${prior.runId}: head, clean tree, configuration, environment and build outputs are unchanged.\n`,
+            );
+            checks.push(check('reused', { reusedFromRunId: prior.runId }));
+            continue;
+          }
+          records.beginBuild(lease.cwd);
+        }
+
+        const stepStarted = this.now();
+        let result: { exitCode: number | null; signal: string | null };
+        try {
+          result = await runStep(step);
+        } finally {
+          if (isBuild) this.buildRecords.endBuild(lease.cwd);
+        }
+        exitCode = result.exitCode;
+        signal = result.signal;
+        const ok = stepOk(result);
+        if (planned) {
+          checks.push(
+            check(ok ? 'passed' : 'failed', {
+              exitCode: result.exitCode,
+              signal: result.signal,
+              durationMs: this.now() - stepStarted,
+              reuseRefusal,
+            }),
+          );
+        }
+        if (isBuild && ok && this.buildReuseRoots !== null && !this.buildRecords.isBuilding(lease.cwd)) {
+          this.buildRecords.remember(
+            lease.cwd,
+            lease.runId,
+            observeBuildInputs(lease.cwd, env, this.buildReuseRoots),
+            lease.head,
+          );
+        }
+        if (!ok) halted = true;
+      }
+    } finally {
+      if (timeoutTimer !== null) clearTimeout(timeoutTimer);
+    }
+
+    const durationMs = startedEmitted ? this.now() - startedAt : 0;
+    const ok = !halted && !timedOut && runError === null;
     const outcome: VerificationOutcome = {
       runId: lease.runId,
       jobId: lease.jobId,
@@ -1883,6 +2025,7 @@ export class VerificationScheduler {
       outputSha256: hash.digest('hex'),
       outputTail,
       error: runError === null ? null : String(runError),
+      ...(planned ? { checks } : {}),
     };
     this.safeRecord({
       kind: 'verification.completed',
@@ -2030,7 +2173,40 @@ function outcomeFromPersisted(attempt: PersistedAttempt): VerificationOutcome | 
     outputSha256: text('outputSha256') ?? '',
     outputTail: text('outputTail') ?? '',
     error: text('error'),
+    ...checksFromPayload(payload['checks']),
   };
+}
+
+const CHECK_STATUSES: ReadonlySet<string> = new Set(['passed', 'failed', 'reused', 'not-run']);
+
+/** Parse persisted per-step evidence; any malformed entry drops the whole list (never half-evidence). */
+function checksFromPayload(value: unknown): { readonly checks?: readonly VerificationCheck[] } {
+  if (!Array.isArray(value)) return {};
+  const checks: VerificationCheck[] = [];
+  for (const item of value as unknown[]) {
+    if (item === null || typeof item !== 'object') return {};
+    const c = item as Record<string, unknown>;
+    if (
+      typeof c['command'] !== 'string' ||
+      typeof c['status'] !== 'string' ||
+      !CHECK_STATUSES.has(c['status']) ||
+      typeof c['ran'] !== 'boolean' ||
+      typeof c['durationMs'] !== 'number'
+    ) {
+      return {};
+    }
+    checks.push({
+      command: c['command'],
+      status: c['status'] as VerificationCheck['status'],
+      ran: c['ran'],
+      exitCode: typeof c['exitCode'] === 'number' ? c['exitCode'] : null,
+      signal: typeof c['signal'] === 'string' ? c['signal'] : null,
+      durationMs: c['durationMs'],
+      reusedFromRunId: typeof c['reusedFromRunId'] === 'string' ? c['reusedFromRunId'] : null,
+      reuseRefusal: typeof c['reuseRefusal'] === 'string' ? c['reuseRefusal'] : null,
+    });
+  }
+  return { checks };
 }
 
 /** The ledger payload for a completed run (also what review evidence reads). */
@@ -2053,5 +2229,6 @@ export function outcomePayload(outcome: VerificationOutcome): Record<string, unk
     output_sha256: outcome.outputSha256,
     output_tail: outcome.outputTail,
     error: outcome.error,
+    ...(outcome.checks === undefined ? {} : { checks: outcome.checks }),
   };
 }

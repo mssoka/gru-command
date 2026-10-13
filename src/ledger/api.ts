@@ -1,5 +1,5 @@
 import { projectMailbox, mailboxBasis } from '../gru-mailbox/projection.js';
-import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt } from './mailbox.js';
+import { MailboxConflictError, validateMailboxDisposition, type MailboxItem, type MailboxDelivery, type MailboxReceipt, type MailboxDisposition } from './mailbox.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
@@ -8,6 +8,8 @@ import { readGitState } from '../verify/scheduler.js';
 import { FROZEN_MANIFEST_MAX_BYTES, readReviewCheckpointBytes, type FrozenReviewInputs } from '../dispatch/perkins-review/artifacts.js';
 import { canonicalRebriefEvidence, type RebriefReceiptEvidence } from './rebrief-evidence.js';
 import type { RecoverySubject, RecoverySubjectKind, RecoveryOwnerTransfer, RecoveryDecisionHistory, RecoveryOwnerActionInput } from './recovery-owner.js';
+import type { IntakeReviewRecord } from '../intake/types.js';
+import { canonical as canonicalIntake, digest as intakeDigest, IntakeError } from '../intake/types.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BusEvent, EventBus } from '../events/bus.js';
 import type { Role } from '../config.js';
@@ -1384,6 +1386,30 @@ export class LedgerApi {
         .prepare(`SELECT * FROM events WHERE job_id = ? AND kind IN (${placeholders}) ORDER BY seq DESC LIMIT ?`)
         .all(jobId, ...(kinds as string[]), limit) as Row[]
     ).map((row) => this.eventFromRow(row));
+  }
+
+  /** A job's lifetime counters for one event kind: how many such events
+   * exist, and the summed length of a JSON-array payload field across them.
+   * Both are SQL aggregates over the COMPLETE record, so a value can never
+   * age out of a fixed newest-N window — `total > 0` stays true however many
+   * later events of the same kind follow. `field` is a fixed payload key
+   * supplied by the caller (never request data). */
+  countJobEventsAndArrayFieldLength(
+    jobId: string,
+    kind: string,
+    field: string,
+  ): { readonly events: number; readonly total: number } {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(field)) {
+      throw new Error(`payload field must be a simple JSON key (got ${JSON.stringify(field)})`);
+    }
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS events,
+                COALESCE(SUM(COALESCE(json_array_length(json_extract(payload, '$.${field}')), 0)), 0) AS total
+           FROM events WHERE job_id = ? AND kind = ?`,
+      )
+      .get(jobId, kind) as { events: number; total: number };
+    return { events: Number(row.events), total: Number(row.total) };
   }
 
   /** A marked request's guarded event, however many newer unrelated job
@@ -4793,6 +4819,13 @@ export class LedgerApi {
     return row === undefined ? null : this.notificationFromRow(row);
   }
 
+  /** Report replacements are ordered by insertion, including same-timestamp UUID ties. */
+  latestReportHandbackNotification(jobId: string): NotificationRecord | null {
+    const row = this.db.prepare('SELECT * FROM notifications WHERE kind = ? ORDER BY rowid DESC LIMIT 1')
+      .get(`silas.report-handback.${jobId}`) as Row | undefined;
+    return row === undefined ? null : this.notificationFromRow(row);
+  }
+
   /**
    * Routing-scoped open-incident lookup (Perkins R1/R2, gh-97): the plain
    * kind lookup ties-break by id (ts DESC, id ASC), so a legacy
@@ -4907,8 +4940,17 @@ export class LedgerApi {
   }
 
   /** Explicit machine disposition, distinct from the owner's Ack.
-   * A successful wake prompt by itself never calls this method. */
-  disposeMachineNotification(id: string, detail: string): NotificationRecord | null {
+   * A successful wake prompt by itself never calls this method.
+   *
+   * `by: 'gru'` names the disposition ROLE (machine rows are Gru's to
+   * dispose); it is NOT proof of who held the pen. The audit event carries
+   * the credential class that authorised the call and any caller-declared
+   * actor so the record never claims provenance it cannot prove (#99). */
+  disposeMachineNotification(
+    id: string,
+    detail: string,
+    provenance: { readonly credential: string; readonly declaredActor: string | null } = { credential: 'internal', declaredActor: null },
+  ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('machine disposition detail must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
@@ -4923,7 +4965,7 @@ export class LedgerApi {
       if (current.resolvedAt !== null || current.ackedAt !== null) return current;
       this.db.prepare('UPDATE notifications SET resolved_at = ?, resolved_by = ? WHERE id = ?')
         .run(nowIso(), 'gru', id);
-      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'gru', detail } });
+      this.appendEvent({ kind: 'notification.resolved', agentId: current.agentId, payload: { id, by: 'gru', detail, credential: provenance.credential, declaredActor: provenance.declaredActor } });
       return this.getNotification(id) as NotificationRecord;
     });
   }
@@ -9044,6 +9086,75 @@ export class LedgerApi {
     });
   }
 
+  /** Append-only review history plus a transactional CAS head. Frozen
+   * approval identities commit before any individual pipeline enqueue. */
+  recordIntakeReview(record: IntakeReviewRecord): void {
+    this.transaction(() => {
+      const head = this.getIntakeReview(record.repoPath, record.intakeId);
+      const replay = this.getIntakeReview(record.repoPath, record.intakeId, record.token);
+      if (replay !== null) {
+        if (canonicalIntake(replay) !== canonicalIntake(record)) throw new IntakeError('intake_acceptance_conflict', 'Review token already binds different bytes', 409);
+        return;
+      }
+      if ((head?.token ?? null) !== record.previousToken) throw new IntakeError('intake_stale_review', 'Review changed or was rejected; read back before deciding', 409);
+      const rejected = this.db.prepare("SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? AND revision_id = ? AND status = 'rejected'").get(record.repoPath, record.intakeId, record.revisionId);
+      if (rejected !== undefined) throw new IntakeError('intake_stale_review', 'Rejected revisions cannot be reopened; create a new revision', 409);
+      if (record.status !== 'reviewed' && (head?.status !== 'reviewed' || head.revisionId !== record.revisionId)) throw new IntakeError('intake_stale_review', 'Only the exact currently reviewed revision can be approved or rejected', 409);
+      if (record.status === 'reviewed' && head?.revisionId === record.revisionId && head.status !== 'reviewed') throw new IntakeError('intake_stale_review', 'Rejected or accepted revisions cannot be reopened; create a new revision', 409);
+      const approved = this.db.prepare("SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? AND revision_id = ? AND status = 'approved'").get(record.repoPath, record.intakeId, record.revisionId);
+      if (approved !== undefined) throw new IntakeError('intake_acceptance_conflict', 'This revision already has an immutable accepted selection; retry its original approval', 409);
+      const serialized = canonicalIntake(record);
+      this.verifyIntakeHistoryBudget(record.repoPath, record.intakeId, Buffer.byteLength(serialized));
+      this.db.prepare('INSERT INTO intake_reviews(token, repo_path, intake_id, revision_id, status, record) VALUES (?, ?, ?, ?, ?, ?)').run(record.token, record.repoPath, record.intakeId, record.revisionId, record.status, serialized);
+      this.db.prepare('INSERT INTO intake_review_heads(repo_path, intake_id, token) VALUES (?, ?, ?) ON CONFLICT(repo_path, intake_id) DO UPDATE SET token = excluded.token').run(record.repoPath, record.intakeId, record.token);
+      this.appendEvent({ kind: `intake.${record.status}`, payload: { intake_id: record.intakeId, revision_id: record.revisionId, token: record.token, selected: record.selected } });
+    });
+  }
+
+  /** Bound total retained verification work before loading/parsing/hashing any
+   * decision. Over-budget history stays intact for restoration/inspection. */
+  private verifyIntakeHistoryBudget(repoPath: string, intakeId: string, additionalBytes = 0): void {
+    const size = this.db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(record AS BLOB))), 0) AS bytes FROM intake_reviews WHERE repo_path = ? AND intake_id = ?').get(repoPath, intakeId) as { count: number; bytes: number };
+    if (size.count + (additionalBytes > 0 ? 1 : 0) > 4096) throw new IntakeError('intake_storage_error', 'Intake history reached its 4096-decision verification bound; create a new intake for further revisions, retaining this history', 500);
+    if (size.bytes + additionalBytes > 8 * 1024 * 1024) throw new IntakeError('intake_storage_error', 'Intake history reached its 8-MiB byte verification bound; create a new intake for further revisions, retaining this history', 500);
+  }
+
+  getIntakeReview(repoPath: string, intakeId: string, token?: string): IntakeReviewRecord | null {
+    this.verifyIntakeHistoryBudget(repoPath, intakeId);
+    const row = token === undefined
+      ? this.db.prepare('SELECT r.* FROM intake_review_heads h LEFT JOIN intake_reviews r ON r.token = h.token WHERE h.repo_path = ? AND h.intake_id = ?').get(repoPath, intakeId)
+      : this.db.prepare('SELECT * FROM intake_reviews WHERE token = ? AND repo_path = ? AND intake_id = ?').get(token, repoPath, intakeId);
+    if (row === undefined) {
+      if (token === undefined && this.db.prepare('SELECT token FROM intake_reviews WHERE repo_path = ? AND intake_id = ? LIMIT 1').get(repoPath, intakeId) !== undefined) throw new IntakeError('intake_storage_error', 'Review history exists without its coordination head; restore the intake ledger before deciding', 500);
+      return null;
+    }
+    try {
+      let ancestor: Row | undefined = row as Row;
+      let first: IntakeReviewRecord | undefined;
+      const visited = new Set<string>();
+      // Iterative, bounded ancestry verification: a valid head cannot conceal
+      // a deleted rejection or a damaged predecessor beneath it.
+      while (ancestor !== undefined) {
+        if (visited.size >= 4096) throw new Error('Review ancestry exceeds 4096 decisions');
+        const record = JSON.parse(str(ancestor.record)) as IntakeReviewRecord;
+        const { token: savedToken, ...body } = record;
+        if (visited.has(savedToken)) throw new Error('Cyclic review ancestry');
+        if (savedToken !== intakeDigest(canonicalIntake(body)) || savedToken !== ancestor.token || record.repoPath !== repoPath || record.intakeId !== intakeId || ancestor.repo_path !== repoPath || ancestor.intake_id !== intakeId || record.revisionId !== ancestor.revision_id || record.status !== ancestor.status) throw new Error('Review bytes or binding are damaged');
+        visited.add(savedToken); first ??= record;
+        if (record.previousToken === null) break;
+        if (typeof record.previousToken !== 'string' || !/^[a-f0-9]{64}$/u.test(record.previousToken)) throw new Error('Invalid review predecessor');
+        ancestor = this.db.prepare('SELECT * FROM intake_reviews WHERE token = ? AND repo_path = ? AND intake_id = ?').get(record.previousToken, repoPath, intakeId) as Row | undefined;
+        if (ancestor === undefined) throw new Error('Missing review ancestor; restore the intake ledger');
+      }
+      return first!;
+    } catch (error) { throw new IntakeError('intake_storage_error', `Cannot verify durable intake decision: ${String(error)}`, 500); }
+  }
+
+  /** Indexed durable enqueue witness; no event payload list is loaded. */
+  hasPipelineEnqueueEvidence(id: string): boolean {
+    return this.db.prepare("SELECT 1 FROM events WHERE kind = 'pipeline.enqueued' AND json_valid(payload) AND json_extract(payload, '$.entry_id') = ? LIMIT 1").get(id) !== undefined;
+  }
+
   getPipelineEntry(id: string): PipelineEntryRecord | null {
     const row = this.db.prepare('SELECT * FROM pipeline_entries WHERE id = ?').get(id) as Row | undefined;
     return row === undefined ? null : this.pipelineEntryFromRow(row);
@@ -9749,6 +9860,55 @@ export class LedgerApi {
     return items;
   }
 
+  /** Adopt an authenticated pre-GH313 incident wait only when its report source stayed unchanged. */
+  private migrateLegacyReportCustody(source: MailboxItem, previous: ReadonlyMap<string, MailboxItem>, now: string): MailboxItem | null {
+    if (source.kind !== 'incident' || source.reasons.length !== 1) return null;
+    const kind = source.reasons[0]!.label;
+    const jobId = /^silas\.report-handback\.(.+)$/u.exec(kind)?.[1];
+    if (jobId === undefined) return null;
+    const current = this.latestReportHandbackNotification(jobId);
+    const job = this.getJob(jobId);
+    const debt = this.findReportObligation(jobId);
+    if (current === null || job === null || debt === null) return null;
+    const candidates: { readonly item: MailboxItem; readonly seq: number }[] = [];
+    let latestRulingSeq = 0;
+    for (const old of previous.values()) {
+      if (old.kind !== 'incident' || old.notificationIds.length !== 1 || !old.reasons.some((reason) => reason.label === kind)) continue;
+      const row = this.getNotification(old.notificationIds[0]!);
+      if (row === null || row.kind !== kind) continue;
+      const key = `notification:${row.id}`;
+      if (old.id !== `incident:${mailboxBasis(key)}`) continue;
+      const ruling = this.db.prepare(`SELECT seq, payload FROM events WHERE kind = 'mailbox.disposition'
+        AND json_extract(payload, '$.id') = ? ORDER BY seq DESC LIMIT 1`).get(old.id) as Row | undefined;
+      if (ruling === undefined) continue;
+      // Any newer report-wide ruling wins, including explicit needs-gru/resolved rulings.
+      latestRulingSeq = Math.max(latestRulingSeq, Number(ruling.seq));
+      const saved = old.disposition;
+      if (old.subject !== source.subject || saved?.state !== 'waiting' || saved.sourceObligationId !== undefined
+        || saved.basis !== old.basis || row.detail !== current.detail || row.severity !== current.severity) continue;
+      const legacyReason = mailboxBasis([mailboxBasis([key, mailboxBasis([key, row.kind, row.detail, row.severity])]), null]);
+      if (old.basis !== mailboxBasis([[source.reasons[0]!.signal, legacyReason]])) continue;
+      if (JSON.stringify((JSON.parse(str(ruling.payload)) as { disposition: MailboxDisposition }).disposition) !== JSON.stringify(saved)) continue;
+      // Mailbox receipts/dispositions are metadata, never source mutations. Other later job writes
+      // remain unprovable without an old source fingerprint and must restore attention.
+      if (Date.parse(job.updatedAt) > Date.parse(saved.recordedAt) || Date.parse(debt.updatedAt) > Date.parse(saved.recordedAt)
+        || this.db.prepare(`SELECT 1 FROM events WHERE job_id = ? AND seq > ?
+          AND kind NOT IN ('mailbox.disposition', 'mailbox.received', 'mailbox.report-custody-migrated') LIMIT 1`)
+          .get(jobId, Number(ruling.seq)) !== undefined) continue;
+      try { validateMailboxDisposition(this, old, saved, now, true); }
+      catch (error) { if (!(error instanceof MailboxConflictError)) throw error; continue; }
+      candidates.push({ item: old, seq: Number(ruling.seq) });
+    }
+    const old = candidates.find((candidate) => candidate.seq === latestRulingSeq)?.item;
+    if (old === undefined) return null;
+    const disposition = { ...old.disposition!, basis: source.basis };
+    this.appendEvent({ kind: 'mailbox.report-custody-migrated', payload: {
+      from_id: old.id, from_basis: old.basis, id: source.id, basis: source.basis,
+      original_disposition: old.disposition, notification_id: current.id, obligation_id: debt.id,
+    } });
+    return { ...old, id: source.id, basis: source.basis, disposition };
+  }
+
   /** Additive mailbox metadata only: this path never changes operational rows. */
   reconcileMailbox(now = nowIso()): readonly MailboxItem[] {
     return this.transaction(() => {
@@ -9756,7 +9916,7 @@ export class LedgerApi {
       const previous = new Map(this.listMailboxItems().map((item) => [item.id, item]));
       const liveIds = new Set(projected.map((item) => item.id));
       const items = projected.map((source): MailboxItem => {
-        const old = previous.get(source.id);
+        const old = previous.get(source.id) ?? this.migrateLegacyReportCustody(source, previous, now) ?? undefined;
         const saved = old?.disposition?.sourceObligationId === undefined ? old?.disposition ?? null : null;
         let supported = saved?.basis === source.basis;
         if (supported && saved !== null) {

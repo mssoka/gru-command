@@ -7,6 +7,8 @@ import {
 import { devNull } from 'node:os';
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import type { WorktreeLane } from '../dispatch/worktree-port.js';
+import type { ArtifactWorkflow } from './types.js';
+export type { ArtifactWorkflow } from './types.js';
 
 /** A missing, unsafe or conflicting explicit GC artifact binding. */
 export class ArtifactContextError extends Error {
@@ -14,12 +16,6 @@ export class ArtifactContextError extends Error {
     super(message, { cause });
     this.name = 'ArtifactContextError';
   }
-}
-
-/** Identity of the verified, immutable workflow selected by the caller. */
-export interface ArtifactWorkflow {
-  readonly id: string;
-  readonly sha256: string;
 }
 
 /** Metadata for exact captured inputs; source content is never executed/copied here. */

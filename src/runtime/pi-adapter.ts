@@ -10,7 +10,7 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { Api, Model, ThinkingLevel } from '@earendil-works/pi-ai';
-import { realpathSync, readFileSync, writeFileSync } from 'node:fs';
+import { realpathSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -283,21 +283,45 @@ interface QueuedMessage {
 }
 
 /**
- * Read defaultProvider/defaultModel from the agentDir settings
- * (<agentDir>/settings.json). Plain JSON with BOM stripping, matching the
- * SDK's own loader; a missing, unreadable, or partial file names nothing.
+ * Read the effective defaultProvider/defaultModel through the SDK's own
+ * SettingsManager — the same loader (BOM tolerance, global+project merge,
+ * error capture) pi's session creation uses, so the eager path and pi's
+ * fallthrough can never disagree on where a default is defined.
+ *
+ * - absent file(s) or a partial default (only one key) name nothing;
+ * - empty / whitespace-only / null values name nothing (pi's own falsy
+ *   semantics);
+ * - a file that exists but cannot be read or parsed THROWS naming the
+ *   file: swallowing it resurrects the cryptic "No API key found" the
+ *   eager path exists to prevent;
+ * - a non-string, non-null value for either key THROWS naming the file.
  */
-function readSettingsDefault(agentDir: string): { provider: string; model: string } | undefined {
-  try {
-    const raw = readFileSync(join(agentDir, 'settings.json'), 'utf-8').replace(/^\uFEFF/, '');
-    const parsed = JSON.parse(raw) as { defaultProvider?: unknown; defaultModel?: unknown };
-    const provider = typeof parsed.defaultProvider === 'string' ? parsed.defaultProvider : undefined;
-    const model = typeof parsed.defaultModel === 'string' ? parsed.defaultModel : undefined;
-    if (provider !== undefined && model !== undefined) return { provider, model };
-    return undefined;
-  } catch {
-    return undefined;
+function readSettingsDefault(
+  cwd: string,
+  agentDir: string,
+): { provider: string; model: string } | undefined {
+  const manager = SettingsManager.create(cwd, agentDir);
+  const [firstError] = manager.drainErrors();
+  if (firstError !== undefined) {
+    const where = firstError.path ?? join(agentDir, 'settings.json');
+    throw new Error(
+      `pi ${firstError.scope} settings are unreadable or corrupt (${where}): ${firstError.error.message}. ` +
+        `Fix or remove that file — pi cannot resolve the default model from it`,
+    );
   }
+  const read = (key: 'defaultProvider' | 'defaultModel', value: unknown): string | undefined => {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'string') {
+      throw new Error(
+        `pi settings ${key} must be a string, got ${typeof value} (check ${join(agentDir, 'settings.json')} ` +
+          `and ${join(cwd, '.pi', 'settings.json')})`,
+      );
+    }
+    return value.trim() === '' ? undefined : value;
+  };
+  const provider = read('defaultProvider', manager.getDefaultProvider());
+  const model = read('defaultModel', manager.getDefaultModel());
+  return provider !== undefined && model !== undefined ? { provider, model } : undefined;
 }
 
 /**
@@ -478,12 +502,32 @@ export class PiRuntime implements AgentRuntime {
    * reference, the catalog-refresh outcome, and the nearest registered
    * models for the provider.
    */
-  private async resolveModel(role: Role, override?: string): Promise<Model<Api> | undefined> {
-    const ref =
-      override !== undefined
-        ? override
-        : resolveSpawnPolicy(this.config, 'pi', role).model;
-    if (ref === '' || ref === 'default') return this.resolveSettingsDefault(role);
+  private modelRef(role: Role, override?: string): string {
+    return override !== undefined ? override : resolveSpawnPolicy(this.config, 'pi', role).model;
+  }
+
+  private async resolveModel(
+    role: Role,
+    override?: string,
+    cwd: string = this.config.workspaceRoot,
+    restored?: { readonly provider: string; readonly modelId: string },
+  ): Promise<Model<Api> | undefined> {
+    const ref = this.modelRef(role, override);
+    if (ref === '' || ref === 'default') {
+      // Precedence (documented, matches pi): a resumed session's persisted
+      // model wins over the settings default; settings win over pi's own
+      // "first available". Only the sentinel defers — an explicit
+      // provider/model always wins over the session.
+      if (restored !== undefined) {
+        const persisted = (await this.runtime()).getModel(restored.provider, restored.modelId);
+        if (persisted !== undefined) return persisted;
+        this.log('warn', 'persisted session model is not registered; using the settings default', {
+          role,
+          model: `${restored.provider}/${restored.modelId}`,
+        });
+      }
+      return this.resolveSettingsDefault(role, cwd);
+    }
     const slash = ref.indexOf('/');
     if (slash <= 0 || slash >= ref.length - 1) {
       throw new Error(`model reference must be "provider/model" or "default", got: ${ref}`);
@@ -521,9 +565,11 @@ export class PiRuntime implements AgentRuntime {
    * found for the selected model" while fully authed). Prompting an
    * explicitly-passed model bypasses the stale gate. When settings name
    * nothing, undefined preserves pi's own resolution (fresh installs).
+   * Settings are read through the SDK SettingsManager for the session cwd
+   * (global agentDir + project .pi/settings.json, exactly pi's merge).
    */
-  private async resolveSettingsDefault(role: Role): Promise<Model<Api> | undefined> {
-    const settingsDefault = readSettingsDefault(this.agentDir);
+  private async resolveSettingsDefault(role: Role, cwd: string): Promise<Model<Api> | undefined> {
+    const settingsDefault = readSettingsDefault(cwd, this.agentDir);
     if (settingsDefault === undefined) return undefined;
     const { provider, model: modelId } = settingsDefault;
     const { model, refresh, nearest } = await this.resolveWithCatalogFallback(
@@ -694,20 +740,19 @@ export class PiRuntime implements AgentRuntime {
         throw new Error('Pi review model changed since preflight (including routing) — do not spawn a lead or lens against a different endpoint');
       }
     }
-    const model = await this.resolveModel(role, options.model);
+    // A resumed session's persisted model outranks the "default" sentinel,
+    // but the session file may only be opened after the lock below — defer
+    // sentinel resolution on resume until the session is open.
+    const modelRef = this.modelRef(role, options.model);
+    const deferToSession = options.resumeFile !== undefined && options.reviewLead === undefined &&
+      options.isolatedReview === undefined && (modelRef === '' || modelRef === 'default');
+    let model = deferToSession ? undefined : await this.resolveModel(role, options.model, cwd);
     if (options.reviewModel !== undefined &&
       (model === undefined || !isDeepStrictEqual(model, this.reviewModels.get(options.reviewModel)) ||
         (options.reviewModel.routingSha256 !== undefined && this.reviewRouting(model) !== options.reviewModel.routingSha256))) {
       throw new Error('Pi review endpoint changed before session creation');
     }
     const thinkingLevel = this.resolveThinkingLevel(role, options.thinkingLevel);
-    // Name the RESOLVED model: future "No API key"-style complaints must
-    // name the actual model, not the sentinel that requested it.
-    this.log('info', 'spawn: model resolved', {
-      role,
-      model: model ? `${model.provider}/${model.id}` : 'pi default resolution (settings name no default)',
-      thinkingLevel: thinkingLevel ?? 'default',
-    });
     const isolatedReview = options.isolatedReview;
     const reviewLead = options.reviewLead;
     if (isolatedReview !== undefined && reviewLead !== undefined) {
@@ -743,6 +788,7 @@ export class PiRuntime implements AgentRuntime {
     // lock removal is bound to acquisition ownership, never mere existence
     // (Perkins r2 B4-race: the loser must never delete the winner's lock).
     let lockAcquired = false;
+    let modelRejected = false;
     if (resumeFile !== undefined && (options.directiveRecoveryProducer !== undefined || !this.store.isHeld(resumeFile))) {
       const predecessor = options.directiveRecoveryProducer;
       if (predecessor === undefined) this.store.acquireLock(resumeFile);
@@ -771,6 +817,27 @@ export class PiRuntime implements AgentRuntime {
         writeFileSync(file, `${JSON.stringify(header)}\n`, { flag: 'wx', mode: 0o600 });
         sessionManager = SessionManager.open(file, dirname(file), cwd);
       }
+      if (deferToSession) {
+        const context = sessionManager.buildSessionContext();
+        try {
+          model = await this.resolveModel(
+            role,
+            options.model,
+            cwd,
+            context.messages.length > 0 ? context.model ?? undefined : undefined,
+          );
+        } catch (error) {
+          modelRejected = true;
+          throw error;
+        }
+      }
+      // Name the RESOLVED model: future "No API key"-style complaints must
+      // name the actual model, not the sentinel that requested it.
+      this.log('info', 'spawn: model resolved', {
+        role,
+        model: model ? `${model.provider}/${model.id}` : 'pi default resolution (no settings default named)',
+        thinkingLevel: thinkingLevel ?? 'default',
+      });
       const isolatedSettings = reviewMode === undefined
         ? undefined
         : SettingsManager.inMemory({}, { projectTrusted: false });
@@ -917,7 +984,8 @@ export class PiRuntime implements AgentRuntime {
       // (SessionAlreadyActiveError) — are state conflicts, never health.
       if (
         !(error instanceof SessionAlreadyActiveError) &&
-        !(error instanceof LockBusyError)
+        !(error instanceof LockBusyError) &&
+        !modelRejected
       ) {
         this.down = String(error);
       }
@@ -1019,7 +1087,8 @@ export class PiAgentHandle implements AgentHandle {
       steer(text: string, images?: unknown): Promise<void>;
       followUp(text: string, images?: unknown): Promise<void>;
       subscribe(listener: (event: unknown) => void): () => void;
-      /** Pinned SDK disposal is synchronous cleanup, NOT native idle proof. */
+      /** SDK 0.85.1 dispose is synchronous cleanup, NOT native idle proof.
+       * GH286 independently awaits owned native/adapter quiescence below. */
       dispose(): Promise<void> | void;
       abort?(): Promise<void>;
       waitForIdle?(): Promise<void>;

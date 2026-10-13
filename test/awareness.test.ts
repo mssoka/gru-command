@@ -921,7 +921,8 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       expect(morning).not.toBeNull();
       expect(morning?.text).toContain('While you were away (since 2026-09-22T');
       expect(morning?.text).toContain('- fires: 1 wake delivered');
-      expect(morning?.text).toContain('- actions:');
+      expect(morning?.text).toContain('- activity: ');
+      expect(morning?.text).not.toContain('- actions:'); // traffic is not Gru action (GH-104)
       expect(morning?.text).toContain('- merges: j-merge');
       const stagedLine = morning?.text.split('\n').find((line) => line.startsWith('- staged PRs:')) ?? '';
       expect(stagedLine).toContain('j-staged');
@@ -964,7 +965,8 @@ describe('gru awareness — morning digest (owner ruling 2026-09-23)', () => {
       const morning = next.prepare();
       expect(morning?.text).toContain('While you were away (since 2026-09-22T21:00:00.000Z)');
       expect(morning?.text).toContain('- fires: 1 wake delivered');
-      expect(morning?.text).toContain('- actions: 1 board event');
+      expect(morning?.text).toContain('- activity: 1 board event');
+      expect(morning?.text).not.toContain('- actions:');
       next.commit(morning!, 'chat');
       api.disposeMachineNotification(alert.id, 'Night alert fixed');
       expect(next.prepare()).toBeNull();
@@ -1239,8 +1241,13 @@ describe('gru awareness — passive queue rotation (GH-109)', () => {
     const again = rig.awareness.prepare();
     expect(again?.notificationIds).toEqual(first?.notificationIds);
     expect(again?.text).toBe(first?.text);
-    // Nothing was delivered: no rotation was consumed or persisted.
-    expect(existsSync(join(rig.dir, AWARENESS_STATE_NAME))).toBe(false);
+    // Nothing was delivered: no rotation was consumed or persisted. (Boot
+    // writes only the GH-111 digest baseline: cursor 0, offsets absent.)
+    const booted = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+      coveredThroughSeq: number; attention?: { machineOffset: number; ownerOffset: number };
+    };
+    expect(booted.coveredThroughSeq).toBe(0);
+    expect(booted.attention).toEqual({ machineOffset: 0, ownerOffset: 0 });
     rig.awareness.commit(first!);
     const persisted = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
       attention?: { machineOffset: number; ownerOffset: number };
@@ -2716,5 +2723,299 @@ describe('GH-305 awareness repair regressions', () => {
         expect(sink).toHaveBeenCalledTimes(1);
       } finally { next.dispose(); }
     } finally { r.close(); vi.useRealTimers(); }
+  });
+});
+
+/**
+ * PR71 review follow-up queue (awareness). Each block names the issue it
+ * proves; the decisions (g7, g15) are recorded in docs/decisions.
+ */
+describe('GH-110 (g13): the morning digest is rendered or not consumed under the byte cap', () => {
+  function overnight(limits?: Partial<AwarenessLimits>): Rig {
+    vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+    const rig = boot({ now: () => Date.now(), ...(limits !== undefined ? { limits } : {}) });
+    rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+    rig.awareness.commit(rig.awareness.prepare()!);
+    vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+    rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+    return rig;
+  }
+
+  it('reserves digest budget so a full page of multibyte notes cannot spend the morning catch-up', () => {
+    vi.useFakeTimers();
+    try {
+      // Cap sized so a full 8-note page of multibyte notes would consume it:
+      // each rendered note line is 110 bytes and the two morning lines need
+      // 80, so without the reservation the digest lines miss the cap and are
+      // shed. Reserving instead sheds the note and keeps the catch-up.
+      const rig = overnight({ maxBytes: 1_000, maxActionNotes: 8 });
+      for (let i = 0; i < 8; i += 1) {
+        rig.notifications.post({
+          kind: `test.machine.${i}`, routing: 'action-required', severity: 'error',
+          title: '漢'.repeat(10),
+        });
+      }
+      const block = rig.awareness.prepare()!;
+      expect(Buffer.byteLength(block.text, 'utf8')).toBeLessThanOrEqual(1_000);
+      expect(block.text).toContain('While you were away');
+      expect(block.text).toContain('- fires: 1 wake delivered');
+      // The digest kept its bytes: the note page is the part that was shed.
+      expect(block.notificationIds).toHaveLength(7);
+      rig.awareness.commit(block);
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('preserves the owner watermark when the digest could not be fully rendered', () => {
+    vi.useFakeTimers();
+    try {
+      // A cap too small for the digest itself: it cannot be reserved in full.
+      const rig = overnight({ maxBytes: 130 });
+      const first = rig.awareness.prepare()!;
+      expect(first.text).not.toContain('- fires: 1 wake delivered');
+      rig.awareness.commit(first);
+      // Not consumed: the digest is still owed on the next block.
+      rig.awareness.dispose();
+      const state = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+        digest: { lastOwnerAt: number };
+      };
+      expect(state.digest.lastOwnerAt).toBe(Date.parse('2026-09-22T21:00:00Z'));
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-103 (g6): the staged-PRs line is limited to PRs linked during the away window', () => {
+  it('omits a PR open since before the owner left and lists one linked after', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T20:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.addJob({ id: 'j-old', repo: 'demo', title: 'Old PR' });
+      rig.api.setJobStatus('j-old', 'working');
+      rig.api.setJobPr('j-old', 'https://example.invalid/pr/old');
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      rig.awareness.commit(rig.awareness.prepare()!); // owner leaves here
+      vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+      rig.api.addJob({ id: 'j-new', repo: 'demo', title: 'New PR' });
+      rig.api.setJobStatus('j-new', 'working');
+      rig.api.setJobPr('j-new', 'https://example.invalid/pr/new');
+      const line = rig.awareness.prepare()?.text.split('\n').find((l) => l.startsWith('- staged PRs:')) ?? '';
+      expect(line).toContain('j-new');
+      expect(line).not.toContain('j-old');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-104 (g7): Gru actions are labeled apart from passive board activity', () => {
+  function away(): Rig {
+    vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+    const rig = boot({ now: () => Date.now() });
+    rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+    rig.awareness.commit(rig.awareness.prepare()!);
+    vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+    return rig;
+  }
+
+  it('traffic alone reads as activity and never as Gru actions', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = away();
+      rig.api.appendCustomEvent({ kind: 'job.delivered', jobId: 'j1', payload: { agentId: 'm1' } });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      rig.api.appendCustomEvent({ kind: 'round.verdict', jobId: 'j1', payload: { verdict: 'approve' } });
+      const text = rig.awareness.prepare()!.text;
+      expect(text).toContain('- activity: 3 board events');
+      expect(text).not.toContain('actions');
+      expect(text).not.toContain('Gru disposition');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a Gru disposition is an action; traffic plus disposition shows both lines', () => {
+    vi.useFakeTimers();
+    try {
+      const rig = away();
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      const alert = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Fix' });
+      rig.api.disposeMachineNotification(alert.id, 'Repaired the lane', { credential: 'shared-bearer', declaredActor: 'gru' });
+      const text = rig.awareness.prepare()!.text;
+      expect(text).toContain('- activity: 1 board event');
+      expect(text).toContain('- Gru actions: 1 disposition');
+      // #322 relabel: the disposition row names the machine role with its id and
+      // the caller-declared actor instead of over-claiming "Gru" (#99), but it
+      // must still render as its own labeled line, never folded into activity.
+      const disposition = text.split('\n').find((line) => line.startsWith('- Machine disposition [')) ?? '';
+      expect(disposition).toContain('Repaired the lane');
+      expect(disposition).toContain('(declared actor: gru)');
+      expect(text).not.toContain('Gru disposition');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-111 (g15): the first-ever owner digest has a bounded install-time baseline', () => {
+  it('a fresh install that accumulated events gets a catch-up on the first owner turn after the gap', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const dir = tmpDir();
+      const rig = boot({ dir, now: () => Date.now() });
+      vi.setSystemTime(new Date('2026-09-22T22:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.dispose();
+      // Service restarts mid-night: the baseline is install time, not restart time.
+      vi.setSystemTime(new Date('2026-09-23T07:00:00Z'));
+      const restarted = boot({ dir, now: () => Date.now() });
+      const first = restarted.awareness.prepare()!;
+      expect(first.text).toContain('While you were away (since 2026-09-22T21:00:00.000Z)');
+      expect(first.text).toContain('- fires: 1 wake delivered');
+      expect(first.text).toContain('- activity: 1 board event');
+      restarted.awareness.commit(first);
+      // Consumed once; nothing replays.
+      restarted.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'b', to: 'c' } });
+      expect(restarted.awareness.prepare()?.text ?? '').not.toContain('While you were away');
+      restarted.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('stays quiet when the unattended interval is shorter than the gap', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      vi.setSystemTime(new Date('2026-09-22T23:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      expect(rig.awareness.prepare()?.text ?? '').not.toContain('While you were away');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-119 (g23): an accepted block-free owner turn records presence', () => {
+  it('advances the owner watermark without a digest or a cursor/wake change', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.commit(rig.awareness.prepare()!);
+      // Six hours later the owner talks; nothing is digestible, so no block.
+      vi.setSystemTime(new Date('2026-09-23T03:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'misc.noise', payload: {} });
+      expect(rig.awareness.prepare('chat')).toBeNull();
+      rig.awareness.recordOwnerPresence();
+      // Presence is durable and does not move the event cursor.
+      const state = JSON.parse(readFileSync(join(rig.dir, AWARENESS_STATE_NAME), 'utf-8')) as {
+        coveredThroughSeq: number; digest: { lastOwnerAt: number; lastOwnerSeq: number };
+      };
+      expect(state.digest.lastOwnerAt).toBe(Date.parse('2026-09-23T03:00:00Z'));
+      expect(state.digest.lastOwnerSeq).toBe(rig.api.latestEventSeq());
+      // Five hours after that turn (11 h after the last delivered block) the
+      // gap is measured from the turn, so no digest fires and nothing from
+      // before the turn is re-reported later either.
+      vi.setSystemTime(new Date('2026-09-23T08:00:00Z'));
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['n1'], count: 1 } });
+      expect(rig.awareness.prepare('chat')?.text ?? '').not.toContain('While you were away');
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const digest = rig.awareness.prepare('chat')!;
+      expect(digest.text).toContain('While you were away (since 2026-09-23T03:00:00.000Z)');
+      expect(digest.text).toContain('- fires: 1 wake delivered');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('never skips events that landed after the block-free prepare', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-22T21:00:00Z'));
+      const rig = boot({ now: () => Date.now() });
+      rig.api.appendCustomEvent({ kind: 'job.status', jobId: 'j1', payload: { from: 'a', to: 'b' } });
+      rig.awareness.commit(rig.awareness.prepare()!);
+      vi.setSystemTime(new Date('2026-09-23T03:00:00Z'));
+      expect(rig.awareness.prepare('chat')).toBeNull();
+      rig.api.appendCustomEvent({ kind: 'gru.wake', payload: { notification_ids: ['late'], count: 1 } });
+      rig.awareness.recordOwnerPresence();
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      expect(rig.awareness.prepare('chat')?.text).toContain('- fires: 1 wake delivered');
+      rig.awareness.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('GH-116 (g20): all-mode FYI backlog cannot outrank machine stops', () => {
+  it('puts an older action-required id in the first eligible batch ahead of FYI volume', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    const machine = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old machine stop' });
+    for (let i = 0; i < 20; i += 1) passive.notifications.post({ kind: 'noise', routing: 'fyi', severity: 'info', title: `FYI ${i}` });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    passive.awareness.dispose();
+    const active = boot({ dir, wakeMode: 'all' });
+    expect(active.woke.length).toBeGreaterThan(0);
+    expect(active.wakeBlocks[0]).toContain(machine.id);
+    // Existing gates still hold: the first batch is still bounded.
+    expect(active.wakeBlocks[0]!.split('\n').filter((line) => line.includes('title="FYI')).length).toBeLessThan(8);
+  });
+
+  it('keeps machine ids ahead of FYI after a restart restores pending order', () => {
+    const dir = tmpDir();
+    const passive = boot({ dir });
+    for (let i = 0; i < 9; i += 1) passive.notifications.post({ kind: 'noise', routing: 'fyi', severity: 'info', title: `FYI ${i}` });
+    const machine = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Late machine stop' });
+    passive.awareness.commit(passive.awareness.prepare()!);
+    passive.awareness.dispose();
+    const active = boot({ dir, wakeMode: 'all' });
+    expect(active.wakeBlocks[0]).toContain(machine.id);
+  });
+});
+
+describe('GH-122 (g26): credential-bearing detail never reaches an autonomous prompt verbatim', () => {
+  const TOKEN = 'sk-ant-abcdefghijklmnop0123456789';
+  const GH = 'ghp_abcdefghijklmnopqrstuvwxyz0123';
+
+  it('redacts secret-shaped detail in the wake block while the owner-visible row keeps it', () => {
+    const rig = boot({ wakeMode: 'action-required' });
+    const row = rig.notifications.post({
+      kind: 'agent.runtime', routing: 'action-required', severity: 'error', title: `Agent m1 failed with ${GH}`,
+      detail: `provider rejected key ${TOKEN}; Authorization: Bearer ${GH}`,
+    });
+    expect(rig.wakeBlocks).toHaveLength(1);
+    const block = rig.wakeBlocks[0]!;
+    expect(block).toContain(row.id);
+    expect(block).toContain('[redacted]');
+    expect(block).not.toContain(TOKEN);
+    expect(block).not.toContain(GH);
+    // The stored record (owner-visible policy) is not rewritten.
+    expect(rig.api.getNotification(row.id)?.detail).toContain(TOKEN);
+  });
+
+  it('also redacts a derived agent-error detail and passive blocks', () => {
+    const rig = boot({ wakeMode: 'all' });
+    rig.api.appendCustomEvent({ kind: 'agent.error', agentId: 'm1', payload: { error: `401 invalid key ${TOKEN}` } });
+    const text = [...rig.wakeBlocks, rig.awareness.prepare('chat')?.text ?? ''].join('\n');
+    expect(text).toContain('runtime error');
+    expect(text).not.toContain(TOKEN);
+  });
+
+  it('redacts secret-shaped error text in the job.minion-error digest line', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({ kind: 'job.minion-error', jobId: 'j1', payload: { error: `provider rejected key ${TOKEN}` } });
+    const block = rig.awareness.prepare();
+    expect(block).not.toBeNull();
+    expect(block!.text).toContain('job j1: minion error');
+    expect(block!.text).toContain('[redacted]');
+    expect(block!.text).not.toContain(TOKEN);
+  });
+
+  it('redacts secret-shaped error text in the agent.state digest line', () => {
+    const rig = boot();
+    rig.api.appendCustomEvent({ kind: 'agent.state', agentId: 'm1', payload: { to: 'error', error: `401 invalid key ${TOKEN}` } });
+    const block = rig.awareness.prepare();
+    expect(block).not.toBeNull();
+    expect(block!.text).toContain('agent m1: errored');
+    expect(block!.text).toContain('[redacted]');
+    expect(block!.text).not.toContain(TOKEN);
   });
 });

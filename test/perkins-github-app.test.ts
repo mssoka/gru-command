@@ -17,7 +17,7 @@ import {
   type AppFetch,
   type AppFetchInit,
 } from '../src/dispatch/perkins-github-app.js';
-import { AutoVerdictPoster, GhPrPoster, GitLabMrPoster, type VerdictPoster, type VerdictPosterInput } from '../src/dispatch/perkins.js';
+import { AutoVerdictPoster, DefiniteNonDeliveryError, GhPrPoster, GitLabMrPoster, type VerdictPoster, type VerdictPosterInput } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
 
 // ---------------------------------------------------------------------------
@@ -910,6 +910,54 @@ describe('fail-closed credential and identity checks', () => {
     expect(otherRepo.calls.filter((call) => call.url.endsWith('/reviews'))).toHaveLength(0);
   });
 
+  it('refuses to POST with an installation token that expired during the pre-POST probes, and still posts with a live grant (#185)', async () => {
+    const posts = (calls: readonly RecordedCall[]): number => calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')).length;
+    // Time advances inside the PR-head probe, i.e. after the token was minted.
+    for (const [advanceMs, expectRefusal] of [[3_600_001, true], [3_580_000, true], [60_000, false]] as const) {
+      const fixture = bundleFixture();
+      let clock = NOW;
+      const api = makeApiDouble([
+        { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => {
+          clock += advanceMs;
+          return { status: 200, body: { number: 7, head: { sha: HEAD }, base: { sha: BASE } } };
+        } },
+      ]);
+      const poster = new PerkinsAppPrPoster({ instanceDir: fixture.home, fetchImpl: api.fetchImpl, now: () => clock });
+      const outcome = poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) });
+      if (expectRefusal) {
+        await expect(outcome, String(advanceMs)).rejects.toThrow(/installation token .*(expired|expires too soon).*before the review POST.*not delivered/u);
+        // A stale grant is never used on the wire and never retried.
+        expect(posts(api.calls), String(advanceMs)).toBe(0);
+        expect(api.calls.some((call) => JSON.stringify(call.headers).includes(TOKEN) && call.method === 'POST' && call.url.endsWith('/reviews'))).toBe(false);
+      } else {
+        await expect(outcome).resolves.toEqual(RECEIPT);
+        expect(posts(api.calls)).toBe(1);
+      }
+    }
+  });
+
+  it('classifies the stale-token POST refusal as a definite non-delivery, not an ambiguous publication (#340)', async () => {
+    // The stale token is refused BEFORE any POST: the thrown error names the
+    // no-POST fact so the WaveRunner cannot misclassify it as an unknown
+    // outcome whose retry "could duplicate a real publication".
+    const fixture = bundleFixture();
+    let clock = NOW;
+    const api = makeApiDouble([
+      { method: 'GET', test: /\/repos\/acme\/widget\/pulls\/7$/, handler: async () => {
+        clock += 3_600_001; // the pre-POST probes outlast the minted token
+        return { status: 200, body: { number: 7, head: { sha: HEAD }, base: { sha: BASE } } };
+      } },
+    ]);
+    const poster = new PerkinsAppPrPoster({ instanceDir: fixture.home, fetchImpl: api.fetchImpl, now: () => clock });
+    const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })
+      .then(() => null, (cause: unknown) => cause as Error);
+    expect(error).toBeInstanceOf(DefiniteNonDeliveryError);
+    expect(error?.message).toMatch(/installation token .*(expired|expires too soon).*before the review POST/u);
+    expect(error?.message).toMatch(/no POST was sent/u);
+    // No review POST reached the wire, so a retry cannot duplicate anything.
+    expect(api.calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(0);
+  });
+
   it('fails on an expired token grant and maps mint rejections to actionable named errors', async () => {
     const fixture = bundleFixture();
     const expired = posterWith(fixture, [
@@ -1266,6 +1314,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
@@ -1288,6 +1337,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
@@ -1307,6 +1357,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
@@ -1328,6 +1379,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const link = (pages: ReadonlyArray<[number, string]>): Record<string, string> => ({
       link: pages.map(([page, rel]) => `<https://api.github.com/repos/acme/widget/pulls/7/reviews?per_page=100&page=${page}>; rel="${rel}"`).join(', '),
@@ -1403,7 +1455,7 @@ describe('bounded ambiguous-POST reconciliation', () => {
     const fixture = bundleFixture();
     const { poster, calls } = posterWith(fixture, [
       { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
-      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [MATCHING_REVIEW, null] }) },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [null] }) },
     ]);
     await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
       .rejects.toThrow(/malformed list body/u);
@@ -1446,6 +1498,112 @@ describe('bounded ambiguous-POST reconciliation', () => {
       expect(error?.message ?? '').not.toMatch(/did not land/u);
       await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
         .rejects.toThrow(/malformed list body/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
+  });
+
+  it('accepts a bounded provider-quoted review id on an ambiguous POST — the same receipt as a numeric id, no second POST (#183)', async () => {
+    const fixture = bundleFixture();
+    const quoted = { ...MATCHING_REVIEW, id: '123' };
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [quoted] }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toEqual({ ...RECEIPT, reviewId: '123' });
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }))
+      .resolves.toEqual({ ...RECEIPT, reviewId: '123' });
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('keeps invalid review ids fail-closed: unproven on an ambiguous POST, never absence, no second POST (#183)', async () => {
+    for (const id of ['', 'has space', 'x'.repeat(201), '12/34']) {
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [{ ...MATCHING_REVIEW, id }] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '').not.toMatch(/did not land/u);
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+    }
+  });
+
+  it('never certifies absence from a short list whose only entry omits a delivery-predicate field (#182)', async () => {
+    const complete = {
+      id: 3131,
+      user: { login: 'other-user', type: 'User' },
+      commit_id: HEAD,
+      state: 'COMMENTED',
+      body: 'someone else\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
+    };
+    for (const omitted of ['state', 'commit_id', 'body', 'submitted_at'] as const) {
+      const { [omitted]: _dropped, ...entry } = complete;
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [entry] }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '', omitted).toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '', omitted).not.toMatch(/did not land/u);
+      // The unbounded recovery seam never reads submitted_at, so only the
+      // other three omissions are undecidable there.
+      if (omitted !== 'submitted_at') {
+        await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), omitted).rejects.toThrow(PerkinsAppError);
+      }
+      expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), omitted).toHaveLength(1);
+    }
+  });
+
+  it('still certifies absence from a short list whose entry is fully typed and genuinely differs (#182)', async () => {
+    const fixture = bundleFixture();
+    const foreign = {
+      id: 3132,
+      user: { login: 'other-user', type: 'User' },
+      commit_id: HEAD,
+      state: 'COMMENTED',
+      body: 'someone else\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
+    };
+    const { poster, calls } = posterWith(fixture, [
+      { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+      { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body: [foreign] }) },
+    ]);
+    await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/did not land/u);
+    await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toBeNull();
+    expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+  });
+
+  it('credits a predicate-complete match even when a sibling entry is malformed, at either position, without a second POST (#184)', async () => {
+    const siblings: ReadonlyArray<unknown> = [null, 42, [], {}, { ...MATCHING_REVIEW, id: 'bad id', user: { login: [], type: 'Bot' } }];
+    for (const sibling of siblings) {
+      for (const body of [[MATCHING_REVIEW, sibling], [sibling, MATCHING_REVIEW]]) {
+        const fixture = bundleFixture();
+        const { poster, calls } = posterWith(fixture, [
+          { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+          { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body }) },
+        ]);
+        await expect(poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+        await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).resolves.toEqual(RECEIPT);
+        expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
+      }
+    }
+  });
+
+  it('keeps a malformed-only short page unresolved when no entry matches — never absence, no second POST (#184)', async () => {
+    for (const body of [[null], [{}], [{ ...MATCHING_REVIEW, user: { login: 'other-user', type: 'User' } }, null]]) {
+      const fixture = bundleFixture();
+      const { poster, calls } = posterWith(fixture, [
+        { method: 'POST', test: /\/reviews$/, handler: async () => { throw new Error('socket hang up after send'); } },
+        { method: 'GET', test: /\/reviews\?/, handler: async () => ({ status: 200, body }) },
+      ]);
+      const error = await poster.post({ ...PR_INPUT, repoPath: repoPathOf(fixture) }).then(() => null, (cause: unknown) => cause as Error);
+      expect(error?.message ?? '').toMatch(/delivery stays unproven/u);
+      expect(error?.message ?? '').not.toMatch(/did not land/u);
+      await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) })).rejects.toThrow(/malformed list body/u);
       expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews'))).toHaveLength(1);
     }
   });
@@ -1866,6 +2024,7 @@ describe('idempotent recovery reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       {
@@ -1893,6 +2052,7 @@ describe('idempotent recovery reconciliation', () => {
       commit_id: HEAD,
       state: 'COMMENTED',
       body: 'review body\n',
+      submitted_at: new Date(NOW + 60_000).toISOString(),
     }));
     const { poster, calls } = posterWith(fixture, [
       {
@@ -2335,6 +2495,7 @@ describe('bounded lookup growth and link sanity', () => {
     commit_id: HEAD,
     state: 'COMMENTED',
     body: 'review body\n',
+    submitted_at: new Date(NOW + 60_000).toISOString(),
   }));
 
   const link = (page: string, rel: string, base = 'https://api.github.com/repos/acme/widget/pulls/7/reviews') =>
@@ -3351,5 +3512,95 @@ describe('startup wiring pin (src/main.ts)', () => {
     expect(main).toContain('poster: createStartupVerdictPoster(config),');
     expect(main).not.toContain('poster: new AutoVerdictPoster()');
     expect(main).not.toMatch(/poster:\s*new GhPrPoster\(/u);
+  });
+});
+
+describe('App contract baseline scope (#190)', () => {
+  const script = join(import.meta.dirname, '..', 'tools', 'app-contract-baseline.sh');
+  const repoRoot = join(import.meta.dirname, '..');
+
+  /** A shared-object clone of this repository at its HEAD, so the script's
+   * `git archive`/`git show` run for real without touching this checkout. */
+  function scopeClone(): { readonly dir: string; readonly tmp: string } {
+    const tmp = mkdtempSync(join(tmpdir(), 'app-baseline-scope-'));
+    const dir = join(tmp, 'clone');
+    execFileSync('git', ['clone', '--quiet', '--shared', repoRoot, dir], { stdio: 'ignore' });
+    execFileSync('git', ['-C', dir, 'checkout', '--quiet', '--detach', execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()], { stdio: 'ignore' });
+    return { dir, tmp };
+  }
+
+  function runScope(dir: string, tmp: string, env: Record<string, string> = {}): { status: number; out: string } {
+    try {
+      const out = execFileSync('sh', [script, '--scope-only'], {
+        cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, TMPDIR: tmp, ...env },
+      });
+      return { status: 0, out };
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: string; stderr?: string };
+      return { status: failure.status ?? -1, out: `${failure.stdout ?? ''}${failure.stderr ?? ''}` };
+    }
+  }
+
+  it('accepts the committed current contract, labels an older overlay as a historical subset, and fails when the exercised file or pin disagrees with the checkout', () => {
+    const { dir, tmp } = scopeClone();
+    try {
+      const current = runScope(dir, tmp);
+      expect(current.status, current.out).toBe(0);
+      expect(current.out).toMatch(/match the current pin/u);
+      expect(current.out).not.toMatch(/HISTORICAL/u);
+
+      const historical = runScope(dir, tmp, { APP_BASELINE_HEADREV: '0c4e129725eb1b8f5af0ee40b14ecdbf5bd33221' });
+      expect(historical.status, historical.out).toBe(0);
+      expect(historical.out).toMatch(/HISTORICAL SUBSET/u);
+
+      // The checkout's test file drifts from the committed overlay.
+      const testFile = join(dir, 'test', 'perkins-github-app.test.ts');
+      const original = readFileSync(testFile, 'utf8');
+      writeFileSync(testFile, `${original}\n// drift\n`, 'utf8');
+      const driftedTest = runScope(dir, tmp);
+      expect(driftedTest.status).toBe(3);
+      expect(driftedTest.out).toMatch(/app scope check failed: test\/perkins-github-app\.test\.ts/u);
+      writeFileSync(testFile, original, 'utf8');
+
+      // The checkout's pin drifts from the committed overlay.
+      const pinFile = join(dir, 'test', 'suite-shape.test.ts');
+      const pins = readFileSync(pinFile, 'utf8');
+      writeFileSync(pinFile, pins.replace(/('perkins-github-app\.test\.ts': )\d+/u, '$1999'), 'utf8');
+      const driftedPin = runScope(dir, tmp);
+      expect(driftedPin.status).toBe(3);
+      expect(driftedPin.out).toMatch(/app scope check failed: test\/suite-shape\.test\.ts/u);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('App publication runbook (#191)', () => {
+  const doc = readFileSync(join(import.meta.dirname, '..', 'docs', 'PERKINS-APP-PUBLICATION.md'), 'utf8').replace(/\s+/gu, ' ');
+  const runbook = doc.slice(doc.indexOf('**Runbook for an unproven delivery.**'), doc.indexOf('Recovery across the publisher-identity change'));
+
+  it('does not claim that an invisible review proves non-delivery or that a retry is safe for an unresolved POST', () => {
+    expect(runbook.length).toBeGreaterThan(200);
+    expect(runbook).not.toMatch(/Otherwise it was not delivered/u);
+    expect(doc).not.toMatch(/Otherwise it was not delivered/u);
+    expect(runbook).toMatch(/not\s+(?:a|an)\s+authoritative|never proves|does not prove/iu);
+    expect(runbook).toMatch(/provider visibility can lag/iu);
+  });
+
+  it('distinguishes a verified receipt, authoritative complete-list absence, and an unresolved outcome that needs an operator decision', () => {
+    expect(runbook).toMatch(/Verified positive receipt/u);
+    expect(runbook).toMatch(/Authoritative complete-list absence/u);
+    expect(runbook).toMatch(/Unresolved/u);
+    expect(runbook).toMatch(/explicit operator (?:reconciliation|decision)/iu);
+  });
+
+  it('keeps the frozen-head, bot-author and body comparison guidance and forbids automatic re-POST on an unresolved same or new head', () => {
+    expect(runbook).toMatch(/<slug>\[bot\]/u);
+    expect(runbook).toMatch(/exact frozen head/u);
+    expect(runbook).toMatch(/body matches/u);
+    expect(runbook).toMatch(/never\s+(?:automatically\s+)?re-POST/iu);
+    expect(runbook).toMatch(/same or a new frozen head|same head or a new/iu);
+    expect(runbook).toMatch(/screenshot|UI alone/iu);
   });
 });

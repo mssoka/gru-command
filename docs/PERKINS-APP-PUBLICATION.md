@@ -168,19 +168,40 @@ Independently proved exact matches are still credited, and an ordinary
 last page linking only to first/prev can complete coverage. A foreign author
 with the same bytes is never credited; a malformed list — one with an
 entry that is not a decidable review record (an array, a primitive, or a
-record without the provider's numeric review id) — a failed request, an
+record without a usable provider review id — a number or a bounded quoted id — or with an omitted delivery field) — a failed request, an
 exhausted page bound, or a predicate-complete review that cannot form a
 receipt id is never treated as absence — the delivery stays explicitly
 unproven and the review is never blindly re-posted.
 
-**Runbook for an unproven delivery.** Open the pull request's reviews. A
-COMMENT review authored by `<slug>[bot]` (for this App:
-`perkins-review[bot]`), on the exact frozen head, whose body matches the
-one the round published — and whose submission time falls within this
-round — means it landed: record the receipt manually per the escalation
-(the escalation names the expected bot login and head). Otherwise it was
-not delivered, and a retry on a **new** frozen head is safe; re-running
-against the same head without checking first is what duplicates reviews.
+**Runbook for an unproven delivery.** There are exactly three outcomes of
+an ambiguous POST; treat them differently.
+
+1. **Verified positive receipt.** The poster itself found a COMMENT review
+   authored by `<slug>[bot]` (for this App: `perkins-review[bot]`), of
+   `type: "Bot"`, on the exact frozen head, whose body matches the one the
+   round published, submitted within this round, with a usable provider
+   review id. That is the delivery receipt. If the poster could not verify
+   it but you can (open the pull request's reviews and compare the same
+   four facts: bot author, exact frozen head, byte-identical body, this
+   round's submission time), record the receipt manually per the escalation
+   (it names the expected bot login and head).
+2. **Authoritative complete-list absence.** The poster's own bounded lookup
+   covered the whole review list with fully typed entries and found no
+   match, and said so ("the POST did not land"). Only this outcome supports
+   a retry, and only on a **new** frozen head.
+3. **Unresolved.** Everything else: a failed or malformed lookup, an
+   incomplete or contradictory list, an exhausted page bound, an entry
+   missing delivery fields, or a predicate-complete review that cannot form
+   a receipt. The review may or may not have landed. A review that is not
+   yet visible in the pull request UI is **not** an authoritative
+   non-delivery certificate: provider visibility can lag, and a screenshot
+   or UI alone never proves a negative. This outcome needs explicit
+   operator reconciliation and an operator decision. Perkins and the
+   operator tooling must never automatically re-POST for an unresolved
+   outcome, on the same or a new frozen head, until that ambiguity has been
+   adjudicated (the missing review is confirmed absent from the
+   provider's complete review list, or the landed review is found and
+   recorded). Re-running without that check is what duplicates reviews.
 
 Recovery across the publisher-identity change: a review attempt from the
 historical personal-identity era whose original author cannot be proved

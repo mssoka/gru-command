@@ -21,6 +21,11 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   workspace files, phone camera/gallery files, or clipboard images through
   one path-based flow; text-only models decline image interpretation
   visibly instead of guessing ([CHAT.md](docs/CHAT.md)).
+- **Review source intake** — preview GitHub issues, specs and BMAD documents
+  in the existing chat without executing them. Edit immutable concrete plans,
+  select dependency-complete work, explicitly approve into the existing pipeline,
+  and recover accepted identities after reconnects ([INTAKE.md](docs/INTAKE.md)).
+  No BMAD installation is required; imported statuses are data, not authority.
 - **The live board** — repo-grouped job cards, per-agent state chips,
   review rounds with per-lens live chips, notification center
   ([BOARD.md](docs/BOARD.md)).

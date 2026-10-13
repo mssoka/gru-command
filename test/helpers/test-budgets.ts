@@ -82,6 +82,7 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
     file: 'harness-routing.test.ts',
     workload: 'spawns two real Vitest collection children as the runtime phase-partition guard',
   },
+  { file: 'intake-approval-packaged.test.ts', workload: 'actual npm archive approval and dispatch over disposable git worktrees' },
   { file: 'install-one-line.test.ts', workload: 'install.sh clone/build/service pipelines' },
   { file: 'install.test.ts', workload: 'install.sh CLI contracts through real subprocesses' },
   { file: 'lan-phone-raw-client.test.ts', workload: 'real service over sockets with the raw client' },
@@ -111,6 +112,10 @@ export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   {
     file: 'silas-followthrough.test.ts',
     workload: 'event-driven follow-through over real git/service state',
+  },
+  {
+    file: 'specialist-dispose-bounded.test.ts',
+    workload: 'real CLI child process plus review bridge teardown held to its 5s cap',
   },
   { file: 'uploads-dir.test.ts', workload: 'real service boot against real filesystem state' },
   { file: 'verification-server.test.ts', workload: 'verification runner spawning real declared commands and recreated persisted-server original-PID/no-start reconciliation' },

@@ -310,3 +310,70 @@ describe('service band — consecutive service frames collapse', () => {
     expect(bands[1]?.querySelectorAll('.notice-line')).toHaveLength(1);
   });
 });
+
+describe('service band — replayable wake context (GH-114)', () => {
+  it('a replayed wake notice reconstructs a collapsed band whose expansion shows the bounded trigger', () => {
+    const view = new ChatView(() => true);
+    view.reset(); // fresh page load: the server replays the logged frames
+    view.addFrame(turn('start'), false);
+    view.addFrame(
+      notice('Wake context — minions raised service events:\nAction required (unacknowledged):\n- ⚠ [n1] title="CI failed"'),
+      false,
+    );
+    view.addFrame(delta('On it.'), false);
+    view.addFrame(turn('end'), false);
+
+    const band = log().querySelector('.service-band');
+    expect(band?.querySelector('.service-band__head')?.textContent).toContain('1 service event');
+    const detail = band?.querySelector<HTMLElement>('.service-band__detail');
+    expect(detail?.hidden).toBe(true);
+    band?.querySelector<HTMLButtonElement>('.service-band__head')?.click();
+    expect(detail?.hidden).toBe(false);
+    expect(detail?.textContent).toContain('Wake context');
+    expect(detail?.textContent).toContain('[n1]');
+    expect(detail?.querySelector('.notice-line')?.classList.contains('notice-line--multiline')).toBe(true);
+    // The reply stays visible outside the band.
+    expect(log().querySelector('.msg--gru')?.textContent).toContain('On it.');
+  });
+});
+
+describe('service band — failed control outcome is replayable (GH-105)', () => {
+  const failed = {
+    type: 'control_result',
+    action: 'compact',
+    request_id: 'control-x',
+    ok: false,
+    epoch: 0,
+    code: 'failed',
+    message: 'provider failure',
+  } as const;
+
+  it('rebuilds the failed-control band line from the logged notice on replay', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(notice('⚠️ compact context failed: provider failure'), false);
+    const lines = log().querySelectorAll('.service-band .notice-line');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.textContent).toBe('⚠️ compact context failed: provider failure');
+  });
+
+  it('shows the immediate result once: the live logged echo does not duplicate the band line', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.showControlResult(failed);
+    expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(1);
+    view.addFrame(notice('⚠️ compact context failed: provider failure'), true);
+    expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(1);
+    // A second identical failure is a new event and still renders.
+    view.showControlResult(failed);
+    view.addFrame(notice('⚠️ compact context failed: provider failure'), true);
+    expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(2);
+  });
+
+  it('another client (no local result) renders the live logged notice', () => {
+    const view = new ChatView(() => true);
+    view.reset();
+    view.addFrame(notice('⚠️ compact context failed: provider failure'), true);
+    expect(log().querySelectorAll('.service-band .notice-line')).toHaveLength(1);
+  });
+});

@@ -9,6 +9,8 @@ import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
 import { renderRecordedVerification } from '../src/verify/evidence.js';
 import { assertJobTransition, isJobStatus, isJobTerminal, TERMINAL_JOB_STATUSES } from '../src/ledger/states.js';
+import { reconcileReportClosures } from '../src/dispatch/durable-reconcile.js';
+import { NotificationCenter } from '../src/notifications/center.js';
 
 const cleanupDirs: string[] = [];
 afterAll(() => {
@@ -1218,6 +1220,86 @@ describe('decision memory (issue #218)', () => {
     reason: 'existing ownership/integration hold',
     by: 'gru' as const,
   };
+
+  it('GH-314 preserves long and legacy short signal decisions across ledger restart', () => {
+    const dir = tmpDir();
+    let db = new LedgerDb(dir);
+    try {
+      const ledger = new LedgerApi(db.handle);
+      const signals = ['report-handback.review-old', 'report-handback.', 'report-handback._legacy', 'report-handback..legacy',
+        'pr-conflict', 'a'.repeat(64), `report-handback.${'a'.repeat(128)}`,
+        `report-handback.${'A'.repeat(128)}`];
+      const records = signals.map((signal, index) => ledger.recordDecision({ ...base, subject: `job:report-${index}`,
+        covers: [signal], basisFingerprint: `basis-${index}`, clientKey: `persisted-${index}` }));
+      const overlong = `report-handback.${'a'.repeat(129)}`;
+      expect(() => ledger.recordDecision({ ...base, covers: [overlong] })).toThrow(/signal must be 1-144/);
+      expect(() => ledger.coveringDecision({ subject: base.subject, signal: overlong, basis: 'basis' })).toThrow(/signal must be 1-144/);
+      expect(() => ledger.recordDecision({ ...base, covers: ['a'.repeat(65)] })).toThrow(/signal must be 1-64/);
+      db.close();
+      db = new LedgerDb(dir);
+      const reopened = new LedgerApi(db.handle);
+      for (const record of records) {
+        expect(reopened.getDecision(record.id)).toEqual(record);
+        expect(reopened.coveringDecision({ subject: record.subject, signal: record.covers[0]!, basis: record.basisFingerprint! })).toEqual(record);
+        expect(reopened.coveringDecision({ subject: record.subject, signal: record.covers[0]!, basis: 'changed' })).toBeNull();
+      }
+      expect(reopened.listDecisions()).toHaveLength(records.length);
+    } finally { db.close(); }
+  });
+
+  it('GH-314 deduplicates exact case-sensitive covers and replays reordered retries without conflation', () => {
+    const ledger = fresh();
+    const prefix = `report-handback.${'a'.repeat(127)}`;
+    const lower = `${prefix}a`;
+    const upper = `${prefix}A`;
+    const input = { ...base, subject: 'job:case-exact', covers: [lower, upper, lower], basisFingerprint: 'head', clientKey: 'case-retry' };
+    const decision = ledger.recordDecision(input);
+    expect(decision.covers).toEqual([upper, lower]);
+    expect(ledger.recordDecision({ ...input, covers: [upper, lower, upper] })).toEqual(decision);
+    expect(ledger.listDecisions({ subject: input.subject })).toHaveLength(1);
+    for (const signal of [lower, upper]) {
+      expect(ledger.coveringDecision({ subject: input.subject, signal, basis: 'head' })).toEqual(decision);
+    }
+    expect(() => ledger.recordDecision({ ...input, covers: [lower] })).toThrow(/different decision/);
+  });
+
+  it('GH-314 restores a waiting long-signal mailbox disposition across restart and reopens it on clear', () => {
+    const dir = tmpDir();
+    let db = new LedgerDb(dir);
+    const now = Date.parse('2029-12-31T23:59:59.000Z');
+    try {
+      const ledger = new LedgerApi(db.handle);
+      const jobId = `Review-${'A'.repeat(121)}`;
+      ledger.addJob({ id: jobId, repo: 'r', title: 'Review report', deliverable: 'review', commissioner: 'gru' });
+      ledger.setJobStatus(jobId, 'working');
+      ledger.setJobStatus(jobId, 'delivered');
+      ledger.appendCustomEvent({ kind: 'job.delivered', jobId, payload: { sha: 'reviewed-head' } });
+      expect(reconcileReportClosures({ ledger, notifications: new NotificationCenter({ ledger, bus: new EventBus() }) }))
+        .toMatchObject({ opened: 1, published: 1, failed: 0 });
+      const notificationId = ledger.findNotificationByKind(`silas.report-handback.${jobId}`, 'active')!.id;
+      const mailbox = new GruMailbox(ledger, () => now);
+      const item = mailbox.snapshot().items.find((row) => row.notificationIds.includes(notificationId))!;
+      const decision = ledger.recordDecision({ ...base, subject: item.subject, covers: item.reasons.map((reason) => reason.signal),
+        basisFingerprint: item.basis, recheckAt: '2030-01-01T00:00:00.000Z' });
+      mailbox.disposition(item.id, { basis: item.basis, state: 'waiting', owner: 'owner', detail: 'Await owner authorization',
+        dependency: 'owner report disposition authorization', recheckAt: decision.recheckAt,
+        references: [{ kind: 'decision', id: decision.id }] });
+      const waiting = mailbox.snapshot().items.find((row) => row.id === item.id)!;
+      expect(waiting.state).toBe('waiting');
+      db.close();
+      db = new LedgerDb(dir);
+      const reopened = new LedgerApi(db.handle);
+      const restored = new GruMailbox(reopened, () => now);
+      expect(restored.snapshot().items.find((row) => row.id === item.id)).toEqual(waiting);
+      expect(reopened.getDecision(decision.id)?.covers).toEqual([`report-handback.${jobId}`]);
+      reopened.clearDecision({ id: decision.id, by: 'owner', reason: 'Authorization granted' });
+      expect(restored.snapshot().items.find((row) => row.id === item.id)).toMatchObject({ basis: item.basis, state: 'needs-gru' });
+      expect(reopened.coveringDecision({ subject: item.subject, signal: decision.covers[0]!, basis: item.basis, now: new Date(now).toISOString() })).toBeNull();
+      expect(reopened.getDecision(decision.id)).toMatchObject({ covers: decision.covers, clearedBy: 'owner', clearedReason: 'Authorization granted' });
+      expect(reopened.getJob(jobId)?.status).toBe('delivered');
+      expect(reopened.findReportObligation(jobId)?.state).toBe('open');
+    } finally { db.close(); }
+  });
 
   it('coverage matrix: unchanged basis → covered; changed basis → not covered', () => {
     const a = fresh();
