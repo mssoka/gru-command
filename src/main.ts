@@ -1258,6 +1258,7 @@ async function main(): Promise<number> {
       fixDirectiveSink: (directiveInput) => routeFixDirectiveToMinion({
         workerGate: pacing.gate,
         retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+        observeBlindTurn,
         registry,
         ledger,
         worktrees: worktreeManager,

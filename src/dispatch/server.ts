@@ -1449,6 +1449,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             owner: 'silas-ops',
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
             ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+            ...(options.observeBlindTurn !== undefined ? { observeBlindTurn: options.observeBlindTurn } : {}),
             ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
             ...(options.childWorkers !== undefined
               ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }

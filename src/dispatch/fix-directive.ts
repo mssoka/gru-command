@@ -75,6 +75,13 @@ export interface DirectiveRoutingDeps {
    * only for 'none'/'recovered'; the worker lease is released before the
    * wait so the retry can reacquire admission. Absent = no interlock. */
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  /** Issue #339: observe a directive-continued blind reviewer session so a
+   * prohibited read during the continuation invalidates blind coverage
+   * exactly like the dispatch, re-brief and restart-recovery settle seams.
+   * Forwarded by the caller (the production observer is read-only and owns its
+   * own error boundary); absent = no observation (non-review directives,
+   * tests). */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
 function verdictFields(verdict: PromptTurnVerdict): { readonly outcome: 'completed' | 'error'; readonly error?: string } {
@@ -136,6 +143,11 @@ export async function routeFixDirectiveToMinion(
     ),
   );
   const directive = compose(input.continuation?.block ?? '');
+  // Issue #339: one call-through to the shared, read-only blind-coverage
+  // observer for every directive continuation — the live minion, the evicted
+  // fallback, and the resumed fallback. Absent port = no observation.
+  const observe = (sessionFile: string | null): void =>
+    input.observeBlindTurn?.(input.jobId, sessionFile);
   const minions = input.ledger
     .listImplementerMinions(input.jobId)
     // Defense-in-depth for issue #161's writer rule (the ledger pick
@@ -188,6 +200,9 @@ export async function routeFixDirectiveToMinion(
         // session) — and a 'recovered' disposition is reported as the
         // delivery it is.
         const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+        // Issue #339: the prompt already ran on the evicted handle — observe
+        // its session before any disposition branch returns.
+        observe(handle.sessionFile);
         if (disposition === 'cancelled') return { delivered: false, note: 'review operation aborted', admission: 'unknown' };
         if (disposition === 'recovered') {
           return { delivered: true, minionId: minion.id, ...verdictFields({ ok: true, error: null }) };
@@ -200,6 +215,9 @@ export async function routeFixDirectiveToMinion(
       // the directive, so failure is reported only after the disposition is
       // known (never duplicating a delivery the retry still owns).
       const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+      // Issue #339: the live-minion continuation turn ran — observe its
+      // session before any disposition branch returns.
+      observe(handle.sessionFile);
       if (disposition === 'cancelled') {
         // The prompt call already ran: admission is UNKNOWN, not a no-effect
         // failure — the request stays live for reconciliation.
@@ -321,6 +339,9 @@ export async function routeFixDirectiveToMinion(
       lease = null;
     }
     const disposition = await settleRetries(input.retrySettlement, handle.id, input.signal);
+    // Issue #339: the resumed/fresh fallback continuation turn ran — observe
+    // its session before any disposition branch returns.
+    observe(handle.sessionFile);
     if (disposition === 'cancelled') {
       // The prompt call already ran on the fresh minion: UNKNOWN admission.
       return { delivered: false, note: 'review operation aborted', admission: 'unknown' };

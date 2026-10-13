@@ -420,6 +420,27 @@ describe('retry settlement consumption gate', () => {
     await expect(pendingLate).resolves.toBe('cancelled');
     releaseLate('recovered');
   });
+
+  it('hands the still-running settlement to the callback on a pre-aborted cancellation (issue #339 F4)', async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const abandoned: Promise<void>[] = [];
+    let release!: (value: 'recovered') => void;
+    const outcome = settleRetries(
+      () => new Promise<'recovered'>((resolve) => { release = resolve; }),
+      'agent-preabort',
+      preAborted.signal,
+      (settlement) => { abandoned.push(settlement); },
+    );
+    await expect(outcome).resolves.toBe('cancelled');
+    // The logical disposition resolved (cancelled), but the retry settlement is
+    // still in flight: the caller must be handed it to chain a final physical
+    // observation. Removing this handoff fails here and in the ledger-backed
+    // re-brief regression.
+    expect(abandoned).toHaveLength(1);
+    release('recovered');
+    await abandoned[0];
+  });
 });
 
 
