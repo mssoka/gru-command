@@ -24,10 +24,16 @@ export interface FixtureRepo {
 
 /** Attach a bare `origin` remote for the fixture, created inside the
  * fixture's temp root so it is cleaned up with the repository. Branches
- * are pushed by the caller (the timing matters for freeze tests). */
+ * are pushed by the caller (the timing matters for freeze tests).
+ *
+ * The bare origin's HEAD is named explicitly: the caller publishes `main`
+ * (makeFixtureRepo starts its repo on main), and a clone of an origin whose
+ * HEAD named the HOST's `init.defaultBranch` instead would check out nothing
+ * and leave HEAD unresolvable — a host setting that must never decide what
+ * the fixture under test looks like. */
 export function attachBareOrigin(repo: FixtureRepo): string {
   const origin = join(dirname(repo.path), `${basename(repo.path)}-origin.git`);
-  execFileSync('git', ['init', '--bare', '--quiet', origin], { stdio: 'ignore' });
+  execFileSync('git', ['init', '--bare', '--quiet', '-b', 'main', origin], { stdio: 'ignore' });
   repo.git(['remote', 'add', 'origin', origin]);
   markFixtureStep('fixture bare origin attached');
   return origin;
