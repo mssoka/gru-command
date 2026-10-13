@@ -42,6 +42,7 @@ import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import { BRANCH_STATE_EVENT } from './github-poll.js';
 import type { LogLevel } from '../logger.js';
 import { SILAS_AUTOPILOT_RULE_IDS, type SilasAutopilotRuleId } from './silas-rules.js';
+import type { PreservationReference } from './silas-preservation-reference.js';
 import {
   deliveredTargetSha,
   type ConflictingPrRow,
@@ -133,11 +134,15 @@ export interface SilasAutopilotOps {
   }) => Promise<void>;
   /** The function `POST /api/dispatch/release` calls for a sweep-ack.
    * `hold` carries the row's #218 coverage identity for the final mutation
-   * boundary (issue #243 R2-H1). */
+   * boundary (issue #243 R2-H1). `preservationReference` (issue #243 F-H1) is
+   * the EXPLICIT optional caller-supplied selector for retained evidence: it
+   * is resolved read-only before any release effect and never grants release
+   * by itself. */
   readonly releaseLane: (input: {
     readonly jobId: string;
     readonly ruleId: SilasAutopilotRuleId;
     readonly hold?: DecisionHoldTriple;
+    readonly preservationReference?: PreservationReference;
   }) => Promise<void>;
 }
 

@@ -49,6 +49,7 @@ import {
   type SilasAutopilotOps,
 } from './silas-autopilot.js';
 import { renderFreshRevisionNote, renderRevisionContinuation } from './work-revision.js';
+import { resolvePreservationReference, type PreservationReference } from './silas-preservation-reference.js';
 import { amendmentSupersessions, pendingMaterialAmendments } from '../review-inputs/amendments.js';
 import type { SilasAutopilotRuleId } from './silas-rules.js';
 import type { WorktreePort, WorktreeSweepResult } from './worktree-port.js';
@@ -686,12 +687,44 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     readonly jobId: string;
     readonly ruleId: SilasAutopilotRuleId;
     readonly hold?: DecisionHoldTriple;
+    readonly preservationReference?: PreservationReference;
   }): Promise<void> => {
     requireNotStopping('sweep-ack release');
     const job = deps.ledger.getJob(input.jobId);
     if (job === null) throw new Error(`job "${input.jobId}" not found`);
     if (!isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — sweep-ack releases only terminal lanes`);
+    }
+    // Issue #243 F-H1: when the caller supplies an EXPLICIT preservation
+    // reference it is resolved read-only BEFORE any release effect. A
+    // non-reusable verdict (missing/tampered/escaping/foreign) refuses the
+    // release with precise restoration guidance and retains the tree. The
+    // explicit selector is recorded durably ONCE per record digest; the
+    // reference never grants release by itself.
+    if (input.preservationReference !== undefined) {
+      const verdict = resolvePreservationReference({
+        reference: input.preservationReference,
+        jobId: input.jobId,
+        expectedRepo: job.repo,
+      });
+      if (!verdict.reusable) {
+        throw new Error(`preservation reuse refused: ${verdict.guidance ?? 'the supplied reference is not reusable'}`);
+      }
+      const already = deps.ledger
+        .listJobEventsByKinds(input.jobId, ['silas.preservation-reuse'])
+        .some((event) => typeof event.payload === 'object' && event.payload !== null &&
+          (event.payload as { record_sha256?: unknown }).record_sha256 === verdict.recordSha256);
+      if (!already) {
+        deps.ledger.appendCustomEvent({
+          kind: 'silas.preservation-reuse',
+          jobId: input.jobId,
+          payload: {
+            record_sha256: verdict.recordSha256,
+            verified_assets: verdict.verifiedAssets,
+            ...autopilotReceiptFields(input.ruleId),
+          },
+        });
+      }
     }
     // Final mutation boundary (issue #243 R2-H1): re-prove the decision-hold
     // coverage immediately before the release, after every awaited seam.
