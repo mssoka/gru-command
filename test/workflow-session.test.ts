@@ -413,7 +413,7 @@ describe('registered scheduled verification policy transport', () => {
       const records = { getAgent: () => owner, listAgents: () => [owner],
         getJob: () => ({ id: f.lane.id, deliverable: 'pr' as const }),
         getWorktree: (id: string) => id === f.lane.id ? f.lane : null, listWorktrees: () => [f.lane] };
-      const h = host(runtimeId, f, serviceWorkflowAuthority(f.dataDir, () => records, undefined, f.session.workerVerification!.configFile));
+      const h = host(runtimeId, f, serviceWorkflowAuthority(f.dataDir, () => records, undefined, f.session.workerVerification!.configFile), f.session.workerVerification!.configFile);
       try {
         const handle = await h.registry.spawn('minion', { resumeFile: `file://${file}` });
         expect(handle.id).toBe(owner.id);

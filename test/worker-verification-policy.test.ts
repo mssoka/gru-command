@@ -208,7 +208,7 @@ describe('worker verification policy: bounded producer classification', () => {
   });
 
   it('keeps the native deny catalogue precise for reads and broad for conventional variants (H3/H4)', () => {
-    const policy = policyFixture();
+    const { policy } = retainedFixture(true);
     const rules = ['Bash'];
     expect(rules).toEqual(['Bash']);
     for (const row of nativeCorpus) expect(nativeHostDenial(row.raw, policy), row.raw).toBe(row.refused);
