@@ -2694,6 +2694,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/server.js",
   "dist/service-port-guard.js",
   "dist/sessions/store.js",
+  "dist/shutdown-budget.js",
   "dist/static.js",
   "dist/supervision/supervisor.js",
   "dist/telemetry/yield.js",

@@ -895,8 +895,11 @@ export class RuntimeRegistry {
     // Contain every handle AND adapter (issue #341): a plain sequential await
     // aborts on the first CessationIdleTimeoutError, leaving the remaining
     // handles locked and the adapters' bridges/sockets never torn down.
-    // disposeAll runs them all and fails loud once with the per-target causes.
-    // Handles go through disposeHandle to preserve the override seam.
+    // disposeAll runs them all CONCURRENTLY (one hung session costs a single
+    // bound, not one bound per session) and fails loud once with the
+    // per-target causes. Handles go through disposeHandle to preserve the
+    // override seam; adapters dispose the same underlying handles, so running
+    // them alongside the resident wrappers is single-flight-safe.
     const targets: DisposableTarget[] = [
       ...[...this.handles].map((handle) => ({
         id: handle.id,

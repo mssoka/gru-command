@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { configPathFor, loadConfig, ConfigError } from './config.js';
 import { loadOrCreateIdentity } from './identity.js';
+import { SHUTDOWN_FORCE_EXIT_MS } from './shutdown-budget.js';
 import { Logger } from './logger.js';
 import { RuntimeRegistry, serviceRegistryOptions } from './runtime/registry.js';
 import { resolvePacingPolicy } from './runtime/pacing.js';
@@ -362,7 +363,7 @@ async function main(): Promise<number> {
     const forceExit = setTimeout(() => {
       logger.error('shutdown timeout — forcing exit', { signal });
       process.exit(1);
-    }, 5_000);
+    }, SHUTDOWN_FORCE_EXIT_MS);
     forceExit.unref();
     if (state.handle === undefined) {
       clearTimeout(forceExit);
