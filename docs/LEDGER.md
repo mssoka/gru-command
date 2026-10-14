@@ -383,7 +383,8 @@ claiming success or no-effect: `POST
 /api/silas/directives/{request_id}/retire` runs one ledger transaction
 that re-verifies every live-ownership mark (open agent turns, child
 workers, in-process admissions, re-brief markers, other live requests,
-provider waits, verification runs, review rounds, live lane processes),
+provider waits, verification runs, review rounds, live lane processes,
+unconfirmed restart-cleanup custody),
 binds the caller's `expected_job_id` / `expected_state` /
 `expected_payload_hash` / `expected_head` (freshly resolved from the
 lane) and therefore refuses stale or conflicting intent, preserves any
@@ -399,6 +400,14 @@ stale or missing evidence fails closed; replays of the same canonical
 intent are idempotent with one audit transition. No worker is spawned,
 no job/obligation/approval is rewritten, and activation remains a
 separate owner decision — see [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md).
+Restart-cleanup custody is **generation-bound**: a refused replacement's
+unconfirmed pending entry, refusal audit or fallback (unjournaled) audit
+refuses retirement until the ORIGINAL native owner records a disposal
+acknowledgment plus positive cessation proof carrying the same exact
+physical generation. A same-id successor's clean disposal mints its own
+generation and never releases the predecessor; an ACK, a restart or a
+successor cleanup are not proof, and a hard crash that loses the original
+owner leaves the debt fenced (fail closed).
 
 ### Explicit phase-completion handoffs (migration 12, pr136-chief-handoff)
 
