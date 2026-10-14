@@ -212,6 +212,38 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<voi
 }
 
 describe('POST /api/verify', () => {
+  it('PR334 receipt aggregate verification bounds are enforced without eager payload materialization', async () => {
+    const h = await boot(); const requestId = 'pr334-bounded-receipts';
+    const result = await call(h.port, { job_id: h.jobId, scope: 'full', request_id: requestId });
+    const outcome = outcomeOf(completedFrame(result.frames)); expect(outcome['ok']).toBe(true);
+    const started = h.ledger.latestJobEvent(h.jobId, 'verification.started')!;
+    const facts = started.payload as { pid: number; command: string; cwd: string };
+    const lane = h.worktrees.listWorktrees({ jobId: h.jobId })[0]!;
+    h.ledger.registerWorktree({ id: lane.id, repoName: 'fixture', repoPath: h.repo.path, path: lane.path, branch: lane.branch,
+      sha: h.repo.head(), kind: 'job', jobId: h.jobId });
+    h.ledger.recordWorktreeProcesses({ worktreeId: lane.id, state: 'live', processes: [{ pid: facts.pid, command: `/bin/sh -c ${facts.command}`, evidence: 'registry' }] });
+    for (let i = 0; i < 2; i += 1) h.ledger.appendCustomEvent({ kind: 'verification.process-started', jobId: h.jobId,
+      payload: { ...(started.payload as Record<string, unknown>), untrusted_padding: 'x'.repeat(4 * 1024 * 1024) } });
+    const before = h.ledger.listWorktreeProcesses(lane.id);
+    const prepare = h.db.handle.prepare.bind(h.db.handle); let eagerMaterializations = 0;
+    const spy = vi.spyOn(h.db.handle, 'prepare').mockImplementation((sql) => {
+      const statement = prepare(sql);
+      if (sql.includes('payload_bytes FROM events') && sql.includes('verification.process-started')) {
+        const all = statement.all.bind(statement);
+        vi.spyOn(statement, 'all').mockImplementation((...parameters) => { eagerMaterializations += 1; return all(...parameters); });
+      }
+      return statement;
+    });
+    try {
+      expect(() => h.ledger.reconcileVerificationProcesses({ jobId: h.jobId, runId: String(outcome['runId']), requestId,
+        command: facts.command, cwd: facts.cwd, worktreeId: lane.id })).toThrow(/complete-evidence bounds/);
+      expect(eagerMaterializations).toBe(0);
+      expect(h.ledger.listWorktreeProcesses(lane.id)).toEqual(before);
+      expect(h.ledger.latestJobEvent(h.jobId, 'verification.process-reconciled')).toBeNull();
+    } finally { spy.mockRestore(); }
+    await h.close();
+  });
+
   it('resolves the checked-in full gate through the same manifest resolver as the endpoint', () => {
     const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
     expect(manifest).not.toBeNull();

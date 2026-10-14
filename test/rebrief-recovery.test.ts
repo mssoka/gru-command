@@ -254,6 +254,47 @@ function seedHistoricalCompletion(h: Harness, jobId: string): void {
 }
 
 describe('re-brief restart safety (durable markers)', () => {
+  it('PR334 receipt boolean revisions cannot clear either marked or unmarked historical generations', async () => {
+    for (const marked of [false, true]) {
+      const h = makeHarness(); const jobId = `pr334-boolean-revision-${String(marked)}`;
+      try {
+        await seedPendingRebrief({ h, jobId });
+        if (marked) h.ledger.beginPendingRebrief({ jobId, note: 'original', briefing: 'contract', handoff: { kind: 'gru-decision', decision: 'original phase' } });
+        seedCorrelatedReceipt(h, jobId, 'silas.rebrief', 'original-minion', { work_revision: false });
+        seedCorrelatedReceipt(h, jobId, 'job.delivered', 'original-minion', { work_revision: false });
+        const markers = h.ledger.listPendingRebriefs({ jobId });
+        expect(markers[0]?.workRevision).toBe(0);
+        expect(() => h.ledger.clearPendingRebriefsIfCurrentAndSettle(markers)).toThrow(/guarded event/);
+        const pass = await reconcilePendingRebriefs({ ledger: h.ledger, worktrees: h.worktrees, registry: h.registry, notifications: h.notifications });
+        await pass.settled;
+        expect(pass.completed).toBe(0); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual(markers);
+        expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+        expect(h.registry.workers).toEqual([]); expect(h.registry.disposed).toEqual([]);
+      } finally { h.close(); }
+    }
+  });
+
+  it('PR334 receipt conflicting original completion HEADs cannot mint a selected historical delivery', async () => {
+    const h = makeHarness(); const jobId = 'pr334-conflicting-original-heads';
+    try {
+      await seedPendingRebrief({ h, jobId });
+      const markers = h.ledger.listPendingRebriefs({ jobId });
+      await bindOriginalRebriefSdkOwner(h.ledger, markers, { cwd: h.lanePath!, dataDir: h.dir, agentId: 'original-minion' });
+      const original = seedCorrelatedReceipt(h, jobId, 'silas.rebrief', 'original-minion');
+      seedCorrelatedReceipt(h, jobId, 'silas.rebrief', 'original-minion', { sha: 'f'.repeat(40) });
+      const before = h.ledger.listPendingRebriefs({ jobId });
+      const completion = before.find((row) => row.kind === 'silas.rebrief')!;
+      expect(h.ledger.originalRebriefDeliveryFacts(completion.id)).toBeNull();
+      expect(h.ledger.pendingRebriefReceipt(completion, original.seq)).toBeNull();
+      const pass = await reconcilePendingRebriefs({ ledger: h.ledger, worktrees: h.worktrees, registry: h.registry, notifications: h.notifications });
+      await pass.settled;
+      expect(pass.completed).toBe(0); expect(h.ledger.listPendingRebriefs({ jobId })).toEqual(before);
+      expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).toBeNull();
+      expect(h.ledger.latestJobEvent(jobId, 'silas.rebrief-settled')).toBeNull();
+      expect(h.registry.workers).toEqual([]); expect(h.registry.disposed).toEqual([]);
+    } finally { h.close(); }
+  });
+
   it('production-shaped original marked completion without duplicated revision settles only its exact generation', async () => {
     const h = makeHarness(); const jobId = 'marked-original-no-duplicate-revision';
     await seedPendingRebrief({ h, jobId });

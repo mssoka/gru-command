@@ -154,6 +154,23 @@ function originalDeliveryPayload(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe('restart-recovery-progress — exact native request matrix', () => {
+  it('PR334 receipt structurally exact reordered cessation identity consumes only its original physical start', async () => {
+    const f = await fixture(); f.seed();
+    expect(f.ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(true);
+    const producer = inspectDirectiveProducers(f.file, f.identity)[0]!.producer;
+    const start = f.ledger.startDirectiveProducer(f.identity, producer);
+    expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id).join(';')).toContain(`start ${start}`);
+    const reordered = Object.fromEntries(Object.entries(f.identity).reverse()) as unknown as typeof f.identity;
+    expect(reordered).toEqual(f.identity); expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(f.identity));
+    const ceased = f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: f.intent.jobId, payload: {
+      request_id: f.intent.requestId, agent_id: producer.agentId, session_file: f.file,
+      producer_start_seq: start, producer_identity: reordered, native_producer: producer,
+    } });
+    expect(ceased.payload).toMatchObject({ producer_start_seq: start, producer_identity: f.identity });
+    expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id)).toEqual([]);
+    expect(f.native.continuations).toBe(0); expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+  });
+
   it('observes post-commit lost fresh acceptance without replay and protects the synchronous intake reservation gap', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture intake never submitted' });
     const service = new DirectiveProgressService(f.deps);

@@ -1343,15 +1343,21 @@ export class LedgerApi {
       if (conflictingTerminal !== undefined) return;
       if (terminal === undefined || !this.hasJobEventWithPayloadValues(input.jobId, ['verification.requested', 'verification.attached'],
         [{ key: 'run_id', value: input.runId }, { key: 'request_id', value: input.requestId }], 0)) return;
-      const receipts = this.db.prepare(`SELECT seq, kind,
+      const evidence = this.db.prepare(`SELECT seq, kind,
         CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload ELSE NULL END AS payload,
         length(CAST(payload AS BLOB)) AS payload_bytes FROM events WHERE job_id = ?
         AND kind IN ('verification.started', 'verification.process-started')
         AND json_extract(payload, '$.run_id') = ? ORDER BY seq LIMIT ?`)
-        .all(MAX_VERIFICATION_PROCESS_RECEIPT_BYTES, input.jobId, input.runId, MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS + 1) as Row[];
-      if (receipts.length > MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS || receipts.some((row) => row.payload === null) ||
-          receipts.reduce((bytes, row) => bytes + Number(row.payload_bytes), 0) > MAX_VERIFICATION_PROCESS_RECEIPT_BYTES) {
-        throw new DirectiveCheckpointError('verification process receipt inspection exceeds the original complete-evidence bounds; physical ownership remains UNKNOWN');
+        .iterate(MAX_VERIFICATION_PROCESS_RECEIPT_BYTES, input.jobId, input.runId, MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS + 1);
+      const receipts: Row[] = [];
+      let receiptBytes = 0;
+      for (const row of evidence) {
+        receiptBytes += Number(row.payload_bytes);
+        if (receipts.length === MAX_VERIFICATION_PROCESS_RECEIPT_EVENTS || row.payload === null ||
+            receiptBytes > MAX_VERIFICATION_PROCESS_RECEIPT_BYTES) {
+          throw new DirectiveCheckpointError('verification process receipt inspection exceeds the original complete-evidence bounds; physical ownership remains UNKNOWN');
+        }
+        receipts.push(row);
       }
       const starts = receipts.filter((row) => row.kind === 'verification.started');
       const started = starts[0];
@@ -3889,7 +3895,7 @@ export class LedgerApi {
       const conflicting = this.db.prepare(`SELECT seq FROM events WHERE job_id = ? AND seq > ?
         AND kind IN ('silas.rebrief', 'job.delivered') AND json_extract(payload, '$.phase_id') = ?
         AND json_type(payload, '$.work_revision') IS NOT NULL
-        AND json_extract(payload, '$.work_revision') != ?
+        AND (json_type(payload, '$.work_revision') != 'integer' OR json_extract(payload, '$.work_revision') != ?)
         AND (json_type(payload, '$.payload_hash') IS NULL OR json_extract(payload, '$.payload_hash') = ?)
         AND (json_type(payload, '$.marker_id') IS NULL OR json_extract(payload, '$.marker_id') IN (${peers.map(() => '?').join(',')})) LIMIT 1`)
         .get(marker.jobId, marker.baselineSeq, marker.phaseId, expectedRevision, marker.payloadHash, ...peers.map((peer) => str(peer.id)));
@@ -3914,13 +3920,23 @@ export class LedgerApi {
       params.push(expectedMinion);
     }
     if (expectedRevision !== null) {
-      where.push(phase === null || marker.kind === 'job.delivered' ? "json_extract(payload, '$.work_revision') = ?" :
-        "(json_type(payload, '$.work_revision') IS NULL OR json_extract(payload, '$.work_revision') = ?)");
+      where.push(phase === null || marker.kind === 'job.delivered' ?
+        "(json_type(payload, '$.work_revision') = 'integer' AND json_extract(payload, '$.work_revision') = ?)" :
+        "(json_type(payload, '$.work_revision') IS NULL OR (json_type(payload, '$.work_revision') = 'integer' AND json_extract(payload, '$.work_revision') = ?))");
       params.push(expectedRevision);
     }
-    if (eventSeq !== undefined) { where.push('seq = ?'); params.push(eventSeq); }
-    const row = this.db.prepare(`SELECT * FROM events WHERE ${where.join(' AND ')} ORDER BY seq DESC LIMIT 1`).get(...params) as Row | undefined;
-    return row === undefined ? null : this.eventFromRow(row);
+    const predicate = where.join(' AND ');
+    const row = this.db.prepare(`SELECT * FROM events WHERE ${predicate}${eventSeq === undefined ? '' : ' AND seq = ?'} ORDER BY seq DESC LIMIT 1`)
+      .get(...params, ...(eventSeq === undefined ? [] : [eventSeq])) as Row | undefined;
+    if (row === undefined) return null;
+    const receipt = this.eventFromRow(row);
+    const head = (receipt.payload as { readonly sha?: unknown } | null)?.sha;
+    // A requested event seq is a readback selector, not permission to hide
+    // another correlated receipt's contradictory original completion HEAD.
+    const conflict = this.db.prepare(`SELECT seq FROM events WHERE ${predicate}
+      AND json_type(payload, '$.sha') IS NOT NULL AND json_extract(payload, '$.sha') IS NOT ? LIMIT 1`)
+      .get(...params, typeof head === 'string' ? head : null);
+    return conflict === undefined ? receipt : null;
   }
 
   originalRebriefDeliveryFacts(markerId: string): { readonly completionSeq: number; readonly minionId: string; readonly sha: string; readonly workRevision: number } | null {
@@ -7663,7 +7679,7 @@ export class LedgerApi {
   }
 
   private directiveCleanupBlockers(jobId: string, ownProducerStartSeq?: number): readonly string[] {
-    const rows = this.db.prepare(`SELECT kind, payload FROM events e WHERE e.job_id = ?
+    const rows = this.db.prepare(`SELECT seq, kind, payload FROM events e WHERE e.job_id = ?
       AND e.kind IN ('silas.directive-producer-unknown', 'silas.directive-producer-ceased')
       AND NOT EXISTS (SELECT 1 FROM events newer WHERE newer.job_id = e.job_id AND newer.seq > e.seq
         AND newer.kind IN ('silas.directive-producer-unknown', 'silas.directive-producer-ceased')
@@ -7673,11 +7689,27 @@ export class LedgerApi {
         AND ((json_extract(e.payload, '$.producer_start_seq') IS NOT NULL
           AND json_extract(newer.payload, '$.producer_start_seq') = json_extract(e.payload, '$.producer_start_seq'))
           OR json_extract(newer.payload, '$.producer_unknown_seq') = e.seq))`).all(jobId) as Row[];
-    const starts = this.db.prepare(`SELECT seq, payload FROM events e WHERE e.job_id = ? AND e.kind = 'silas.directive-producer-started'
-      AND NOT EXISTS (SELECT 1 FROM events ceased WHERE ceased.job_id = e.job_id AND ceased.seq > e.seq
-        AND ceased.kind = 'silas.directive-producer-ceased' AND json_extract(ceased.payload, '$.producer_start_seq') = e.seq
-        AND json_extract(ceased.payload, '$.producer_identity') = json_extract(e.payload, '$.producer_identity'))`).all(jobId) as Row[];
-    const pending = starts.filter((row) => Number(row.seq) !== ownProducerStartSeq).map((row) => {
+    type CleanupReceipt = { readonly request_id?: unknown; readonly agent_id?: unknown; readonly session_file?: unknown;
+      readonly producer_start_seq?: unknown; readonly producer_identity?: unknown; readonly native_producer?: DirectiveProducer };
+    const ceasedByStart = new Map<number, readonly { readonly seq: number; readonly receipt: CleanupReceipt }[]>();
+    for (const row of rows) {
+      if (row.kind !== 'silas.directive-producer-ceased') continue;
+      const receipt = JSON.parse(str(row.payload)) as CleanupReceipt;
+      if (typeof receipt.producer_start_seq !== 'number') continue;
+      ceasedByStart.set(receipt.producer_start_seq, [...(ceasedByStart.get(receipt.producer_start_seq) ?? []), { seq: Number(row.seq), receipt }]);
+    }
+    const starts = this.db.prepare(`SELECT seq, payload FROM events WHERE job_id = ? AND kind = 'silas.directive-producer-started'`).all(jobId) as Row[];
+    const pending = starts.filter((row) => {
+      if (Number(row.seq) === ownProducerStartSeq) return false;
+      const start = JSON.parse(str(row.payload)) as CleanupReceipt;
+      // The write boundary accepts structural identity, not JSON property
+      // order. Readback must keep that same exact physical start contract.
+      return !(ceasedByStart.get(Number(row.seq)) ?? []).some(({ seq, receipt }) => seq > Number(row.seq) && start.native_producer !== undefined &&
+        receipt.request_id === start.request_id && receipt.agent_id === start.native_producer.agentId &&
+        receipt.session_file === start.native_producer.sessionFile &&
+        isDeepStrictEqual(receipt.producer_identity, start.producer_identity) &&
+        isDeepStrictEqual(receipt.native_producer, start.native_producer));
+    }).map((row) => {
       const payload = JSON.parse(str(row.payload)) as { request_id: string };
       return `unproven producer cleanup: request ${payload.request_id}, start ${Number(row.seq)} — original-owner cessation receipt required; inspect exact native/controller evidence before Gru judgment`;
     });
