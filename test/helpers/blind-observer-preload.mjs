@@ -74,13 +74,16 @@ async function drive() {
     pendingRecovery: null,
   };
   supervisor.agents.set(spec.agentId, agent);
+  // GH-280 fences replay with both the epoch and native producer identity.
+  // Capture the real current authority; do not invent or bypass that fence.
+  const authority = supervisor.captureJobAuthority(spec.jobId, spec.agentId);
   await supervisor.deliverRecoveredTurn(
     agent,
     handle,
     spec.agentId,
     { text: 'finish the review', owner: `dispatch:${spec.jobId}` },
     'restart',
-    { pending: null, hadOpenTurn: true, originAgentId: spec.agentId, jobId: spec.jobId, authorityEpoch: 0 },
+    { pending: null, hadOpenTurn: true, originAgentId: spec.agentId, ...authority },
   );
   writeFileSync(resultFile, JSON.stringify({ installed: true, observed: true }));
 }
