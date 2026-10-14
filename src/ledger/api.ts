@@ -5750,8 +5750,8 @@ export class LedgerApi {
     const declared = loadWorktreeManifest(lane.path);
     if (declared === null) refuse('requires host declared full verification scope');
     const command = resolveVerifyCommand(declared!, 'full');
-    const git = readGitState(lane.path);
-    if (git.sha !== facts!.sha || git.trackedDirty) refuse('current candidate HEAD moved or tracked tree is dirty');
+    const git = readGitState(lane.path, { includeUntracked: true });
+    if (git.sha !== facts!.sha || git.trackedDirty) refuse('current candidate HEAD moved or tracked/untracked input tree is dirty');
     const attempts = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind = 'verification.requested' AND json_extract(payload, '$.scope') = 'full' ORDER BY seq DESC LIMIT 1").get(row.jobId) as Row | undefined;
     if (attempts === undefined) refuse('requires declared full scheduler attempt');
     const requested = this.eventFromRow(attempts!); const request = requested.payload as Record<string, unknown>;
@@ -5762,7 +5762,19 @@ export class LedgerApi {
     const lifecycle = this.db.prepare("SELECT * FROM events WHERE job_id = ? AND kind LIKE 'verification.%' AND json_extract(payload, '$.run_id') = ? ORDER BY seq").all(row.jobId, request['run_id'] as string) as Row[];
     const events = lifecycle.map((event) => this.eventFromRow(event));
     const starts = events.filter((event) => event.kind === 'verification.started');
-    const terminals = events.filter((event) => ['verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout'].includes(event.kind));
+    const completedReadback = (event: EventRecord): boolean => {
+      if (event.kind !== 'verification.reconciled') return false;
+      const readback = event.payload as Record<string, unknown>;
+      if (readback['state'] !== 'completed' || readback['scope'] !== 'full' || readback['head'] !== facts!.sha || typeof readback['request_id'] !== 'string') return false;
+      // Read-only replays of a bound request are not additional executions.
+      // Contradictory or unbound readbacks remain terminal refusal evidence.
+      return events.some((bound) => {
+        const binding = bound.payload as Record<string, unknown>;
+        return ['verification.requested', 'verification.attached'].includes(bound.kind) && bound.seq < event.seq &&
+          binding['request_id'] === readback['request_id'] && binding['scope'] === 'full' && binding['head'] === facts!.sha;
+      });
+    };
+    const terminals = events.filter((event) => ['verification.completed', 'verification.reconciled', 'verification.no-start', 'verification.stale-released', 'verification.lock-timeout'].includes(event.kind) && !completedReadback(event));
     const terminal = terminals[0]; const start = starts[0]; const run = terminal?.payload as Record<string, unknown> | undefined;
     const started = start?.payload as Record<string, unknown> | undefined;
     if (starts.length !== 1 || terminals.length !== 1 || terminal?.kind !== 'verification.completed' || start!.seq <= requested.seq || terminal.seq <= start!.seq || terminal.seq >= evidenceSeq || !Number.isSafeInteger(started?.['pid']) || Number(started?.['pid']) <= 0 || started?.['command'] !== command || started['cwd'] !== lane.path || started['sha'] !== facts!.sha || run?.['command'] !== command || run['scope'] !== 'full' || run['cwd'] !== lane.path || run['sha'] !== facts!.sha || run['tracked_dirty'] !== false || run['ok'] !== true || run['exit_code'] !== 0 || run['signal'] !== null || run['error'] !== null || run['timed_out'] !== false || !Number.isSafeInteger(run['output_bytes']) || Number(run['output_bytes']) < 0 || typeof run['output_sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(run['output_sha256'])) refuse('newest full scheduler start/terminal/output capture is incomplete, failed or UNKNOWN');

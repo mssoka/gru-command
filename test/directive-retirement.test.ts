@@ -2136,8 +2136,8 @@ describe('exact recovery reserved-owner HTTP lifecycle', () => {
 });
 
 describe('legacy proven completion without fabricated historical delivery', () => {
-  async function completedFixture(full = false, noDirectiveChanges = false) {
-    const h = await boot({ completeReview: full, noDirectiveChanges }); const repo = makeFixtureRepo('completed-control-http'); cleanupRepos.push(repo);
+  async function completedFixture(full = false, noDirectiveChanges = false, pendingProducerBlockers?: (jobId: string) => readonly string[]) {
+    const h = await boot({ completeReview: full, noDirectiveChanges, pendingProducerBlockers }); const repo = makeFixtureRepo('completed-control-http'); cleanupRepos.push(repo);
     if (full) { attachBareOrigin(repo); repo.git(['push', 'origin', 'main']); }
     const jobId = 'completed-control-job'; seedJob(h, jobId); const lane = await seedLane(h, repo, jobId);
     if (full) {
@@ -2191,6 +2191,42 @@ describe('legacy proven completion without fabricated historical delivery', () =
       return { f, h, root, duty, scheduler, evidence };
     } catch (error) { await scheduler.dispose(); throw error; }
   }
+
+  it('PR334 shard01 completed verification replay preserves exact gate settlement', async () => {
+    const { f, h, duty, scheduler, evidence } = await verifiedCurrentGateFixture();
+    try {
+      const replay = await scheduler.submit({ jobId: f.jobId, requestId: 'P37-original-full', scope: 'full',
+        command: 'test ! -f .P37-fail && printf verified', cwd: f.lane.path }, () => {});
+      expect(replay.ok).toBe(true);
+      expect(h.ledger.latestJobEvent(f.jobId, 'verification.reconciled')?.payload).toMatchObject({ state: 'completed', run_id: replay.runId });
+      expect(h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'accepted-evidence',
+        gate: 'original successful full and whole review remain valid after read-only replay', evidenceEventKind: evidence.kind, evidenceEventSeq: evidence.seq } }).state).toBe('settled');
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('PR334 shard01 untracked candidate input refuses gate settlement after approved review', async () => {
+    const { f, h, duty, scheduler, evidence } = await verifiedCurrentGateFixture();
+    try {
+      expect(execFileSync('git', ['-C', f.lane.path, 'status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' }).trim()).toBe('');
+      writeFileSync(join(f.lane.path, 'added-approved-input.ts'), 'export const unreviewed = true;\n');
+      expect(execFileSync('git', ['-C', f.lane.path, 'status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' })).toContain('?? added-approved-input.ts');
+      expect(() => h.ledger.settleObligation({ obligationId: duty.id, settlement: { kind: 'accepted-evidence',
+        gate: 'cannot accept a source input absent from the verified reviewed HEAD', evidenceEventKind: evidence.kind, evidenceEventSeq: evidence.seq } })).toThrow(/dirty|input/);
+      expect(h.ledger.getObligation(duty.id)?.state).toBe('open');
+    } finally { await scheduler.dispose(); }
+  });
+
+  it('PR334 shard02 completed legacy closure preserves pending supervised producer ownership', async () => {
+    const f = await completedFixture(false, false, () => ['exact same-job supervised producer remains pending']);
+    const originalMarkers = f.h.ledger.listPendingRebriefs({ jobId: f.jobId });
+    const originalDebt = f.h.ledger.getObligation(f.debt.id);
+    const response = await call(f.h.port, 'POST', `${f.route}/recover`, f.body(), TOKEN);
+    expect(response.status, JSON.stringify(response.json)).toBe(409);
+    expect(f.h.ledger.listPendingRebriefs({ jobId: f.jobId })).toEqual(originalMarkers);
+    expect(f.h.ledger.getObligation(f.debt.id)).toEqual(originalDebt);
+    expect(f.h.ledger.latestJobEvent(f.jobId, 'silas.rebrief-control-closed')).toBeNull();
+    expect(f.h.spawns).toEqual([]);
+  });
 
   it('P37 unknown newer pending and aborted round remains fenced without fabricated ownership cleanup', async () => {
     const { f, h, root, duty, scheduler, evidence } = await verifiedCurrentGateFixture();

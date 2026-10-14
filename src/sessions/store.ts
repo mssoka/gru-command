@@ -196,7 +196,7 @@ export class SessionStore {
       try {
         withSessionLockCoordination(sessionFile, () => {
           const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
-          if (current.pid === info.pid && current.bootId === info.bootId) {
+          if (current.host === info.host && current.pid === info.pid && current.bootId === info.bootId) {
             const next = `${JSON.stringify({ ...current, heartbeatAt: new Date().toISOString() })}\n`;
             // Fixed-length rewrite keeps the lock file tiny (pid, bootId
             // and ISO heartbeat timestamps are constant width); O_EXCL
@@ -315,7 +315,7 @@ export class SessionStore {
     let ours = false;
     try {
       const current = JSON.parse(readFileSync(lockFile, 'utf-8')) as SessionLockInfo;
-      ours = current.pid === process.pid && current.bootId === this.bootId;
+      ours = current.host === hostname() && current.pid === process.pid && current.bootId === this.bootId;
     } catch {
       ours = false; // gone or unreadable — nothing safe to delete
     }

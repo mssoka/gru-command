@@ -190,11 +190,11 @@ export function recoverInterruptedRebriefFromRoute(input: Omit<Parameters<typeof
   const marker = input.ledger.listPendingRebriefs().find((row) => row.id === input.markerId);
   if (marker === undefined) throw new RecordNotFound(`rebrief marker "${input.markerId}" not found`);
   const lane = resolveRetirementLane(input.worktrees, marker.jobId);
-  if (input.decision.kind === 'successor') {
+  if (input.decision.kind === 'successor' || input.decision.kind === 'reconcile-completed') {
     const supervised = input.pendingProducerBlockers(marker.jobId);
     const ids = new Set(input.ledger.listAgents().filter((agent) => agent.jobId === marker.jobId).map((agent) => agent.id));
     const queued = input.workerGate?.view().worker.queued.filter((entry) => entry.id === marker.jobId || ids.has(entry.id)) ?? [];
-    if (supervised.length + queued.length > 0) throw new DirectiveRetirementError('live_work', 'legacy rebrief successor requires proven producer cessation', [...supervised, ...queued.map((entry) => entry.label)]);
+    if (supervised.length + queued.length > 0) throw new DirectiveRetirementError('live_work', 'legacy rebrief recovery requires proven producer cessation', [...supervised, ...queued.map((entry) => entry.label)]);
   }
   return call({ id: lane.id, resolvedHead: resolveGitCommit(lane.path, 'HEAD') });
 }

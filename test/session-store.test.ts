@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -28,6 +28,35 @@ function seedSession(store: SessionStore, role = 'gru', text = '{"type":"session
 }
 
 describe('SessionStore', () => {
+  function replacementForeignHostLockFixture() {
+    const store = new SessionStore(tmpDataDir());
+    const file = seedSession(store);
+    store.acquireLock(file);
+    const lock = store.lockFileFor(file);
+    const owned = JSON.parse(readFileSync(lock, 'utf8'));
+    const foreign = JSON.stringify({ ...owned, host: 'foreign-owner-must-not-be-mutated' }) + '\n';
+    writeFileSync(lock, foreign);
+    return { store, file, lock, foreign };
+  }
+
+  it('PR334 shard03 heartbeat preserves a replacement foreign owner with matching PID and boot', () => {
+    vi.useFakeTimers();
+    const f = replacementForeignHostLockFixture();
+    try {
+      vi.advanceTimersByTime(5001);
+      expect(readFileSync(f.lock, 'utf8')).toBe(f.foreign);
+    } finally { f.store.dispose(); vi.useRealTimers(); }
+  });
+
+  it('PR334 shard03 release preserves a replacement foreign owner with matching PID and boot', () => {
+    const f = replacementForeignHostLockFixture();
+    try {
+      f.store.releaseLock(f.file);
+      expect(existsSync(f.lock)).toBe(true);
+      expect(readFileSync(f.lock, 'utf8')).toBe(f.foreign);
+    } finally { f.store.dispose(); }
+  });
+
   function assertOrdinaryOwnerFence(mode: 'live' | 'foreign' | 'legacy' | 'eperm' | 'changed') {
     const store = new SessionStore(tmpDataDir()); const file = seedSession(store);
     const holder = { host: mode === 'foreign' ? 'other-owner-host' : mode === 'legacy' ? undefined : hostname(), pid: mode === 'live' ? process.pid : 2_000_000_000, bootId: 'original-ordinary-owner', acquiredAt: '2000-01-01T00:00:00.000Z', heartbeatAt: '2000-01-01T00:00:00.000Z' };
