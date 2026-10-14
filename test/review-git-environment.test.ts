@@ -1,10 +1,11 @@
+import { issueFixtureHandoff } from './helpers/fixture-handoff.js';
 import * as handoffProof from '../src/worktrees/handoff.js';
 import { ChildWorkerService } from '../src/dispatch/child-workers.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
 import { stageSpawnRegistration } from '../src/runtime/spawn-registration.js';
 import { observeDisposalSettlement } from '../src/runtime/disposal-observation.js';
 import { SessionStore } from '../src/sessions/store.js';
-import { loadConfig, type RuntimeId } from '../src/config.js';
+import { loadConfig, type Role, type RuntimeId } from '../src/config.js';
 import type { AgentHandle, AgentRuntime, RuntimeEventListener } from '../src/runtime/types.js';
 import { rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
 import { PacingGate } from '../src/runtime/pacing.js';
@@ -170,6 +171,193 @@ describe('review Git repository environment isolation (GH-270)', () => {
       : h.worktrees.createChildWorktree({ repoPath: repo.path, jobId: parentJob.id, childId: id, parentPath: parent.path, authority });
     return { repo, ...h, id, ref, create };
   }
+
+  it('accepts exhaustive authentic handoff history beyond 1000 and rejects later-page incomplete or duplicate proof (ordinary review)', async () => {
+    const repo = fixture('ordinary-history'), h = manager();
+    const originalJob = h.ledger.addJob({ id: 'history-original', repo: 'assigned', title: 'independent original' });
+    const original = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: originalJob.id });
+    const guardedJob = h.ledger.addJob({ id: 'history-guard', repo: 'assigned', title: 'early-page conflict control' });
+    const guarded = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: guardedJob.id });
+    const guardedFact = h.ledger.listEventsAfter(0, { kinds: ['worktree.handoff-completed'], order: 'desc', limit: 1 })[0]!;
+    const serialRoot = directory();
+    let path = join(serialRoot, 'serial-0');
+    git(repo.path, ['worktree', 'add', '-b', 'fixture-history', path]);
+    const admin = git(path, ['rev-parse', '--absolute-git-dir']);
+    let prior: ReturnType<typeof issueFixtureHandoff> | undefined;
+    for (let index = 0; index < 1001; index += 1) {
+      if (prior !== undefined) {
+        handoffProof.captureLaneHandoff(prior)();
+        const receipt = join(admin, 'gru-creation-handoff.json');
+        const proved = readFileSync(receipt, 'utf8');
+        h.ledger.setWorktreeStatus(prior.id, 'swept', 'fixture retires original registration before serial checkout reuse');
+        const moved = join(serialRoot, `serial-${index}`);
+        git(repo.path, ['worktree', 'move', path, moved]);
+        path = moved;
+        expect(git(path, ['rev-parse', '--absolute-git-dir'])).toBe(admin);
+        expect(realpathSync(readFileSync(join(admin, 'gitdir'), 'utf8').trim())).toBe(realpathSync(join(path, '.git')));
+        expect(readFileSync(receipt, 'utf8')).toBe(proved);
+        rmSync(receipt);
+      }
+      const id = `history-${String(index).padStart(4, '0')}`;
+      h.ledger.addJob({ id, repo: 'assigned', title: 'authentic serial fixture owner' });
+      prior = issueFixtureHandoff({ id, kind: 'job', repoPath: repo.path, repoName: 'assigned', path,
+        branch: 'fixture-history', sha: original.sha, jobId: id, roundId: null, status: 'active' }, h.ledger);
+    }
+    if (prior === undefined) throw new Error('fixture history was not issued');
+    expect(h.ledger.countEvents('worktree.handoff-completed')).toBe(1003);
+    handoffProof.captureLaneHandoff(prior)();
+    const db = new LedgerDb(h.dbPath); dbs.push(db);
+    const ledger = new LedgerApi(db.handle);
+    const reopened = new WorktreeManager({ ledger, root: h.root, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
+    writeFileSync(join(original.path, 'advance'), 'legitimate writer advance');
+    git(original.path, ['add', 'advance']); git(original.path, ['commit', '-qm', 'advance']);
+    handoffProof.capturePortLaneHandoff(reopened, reopened.getWorktree(original.id)!)();
+    const list = ledger.listEventsAfter.bind(ledger);
+    const missing = vi.spyOn(ledger, 'listEventsAfter').mockImplementation((seq, options) => {
+      const page = list(seq, options);
+      return options?.kinds?.includes('worktree.handoff-completed') && seq > 0 ? [] : page;
+    });
+    expect(() => handoffProof.capturePortLaneHandoff(reopened, reopened.getWorktree(original.id)!)()).toThrow(/handoff unresolved/);
+    missing.mockRestore();
+    expect((await reopened.release({ worktreeId: original.id })).status).toBe('swept');
+    expect(existsSync(original.path)).toBe(false);
+    // An early-page match cannot hide a later-page duplicate or conflict.
+    ledger.appendCustomEvent({ kind: guardedFact.kind, jobId: guardedFact.jobId, roundId: guardedFact.roundId, payload: guardedFact.payload });
+    expect(() => handoffProof.capturePortLaneHandoff(reopened, reopened.getWorktree(guarded.id)!)()).toThrow(/handoff unresolved/);
+    const last = ledger.listEventsAfter(0, { kinds: ['worktree.handoff-completed'], order: 'desc', limit: 2 }).find((event) => event.jobId === prior.id)!;
+    if (typeof last?.payload !== 'object' || last.payload === null) throw new Error('last authentic issuance is unavailable');
+    ledger.appendCustomEvent({ kind: last.kind, jobId: last.jobId, roundId: last.roundId, payload: { ...last.payload, repo: 'foreign repository' } });
+    expect(() => handoffProof.capturePortLaneHandoff(reopened, reopened.getWorktree(prior.id)!)()).toThrow(/handoff unresolved/);
+    expect(existsSync(path)).toBe(true); expect(existsSync(guarded.path)).toBe(true);
+  });
+
+  it('guards trusted owning ancestors for descendant cwd aliases awaits and retained or replaced roots (ordinary review)', async () => {
+    const repo = fixture('ordinary-descendant'), h = manager();
+    const job = h.ledger.addJob({ id: 'descendant-owner', repo: 'assigned', title: 'trusted ancestor' });
+    const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    const cwd = join(lane.path, 'nested', 'src'); mkdirSync(cwd, { recursive: true });
+    const alias = join(directory(), 'alias'); symlinkSync(lane.path, alias);
+    const prompted = vi.fn(async () => {});
+    let spawnCount = 0;
+    const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+      health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: vi.fn(async (role: Role): Promise<AgentHandle> => {
+        let ceased = false;
+        const listeners = new Set<RuntimeEventListener>();
+        const id = `descendant-minion-${++spawnCount}`;
+        return { id, role, sessionFile: null, capabilities: adapter.capabilities, prompt: prompted,
+          steer: async () => {}, followUp: async () => {}, health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+          hasLiveProcess: () => !ceased, isCompacting: () => false,
+          subscribe: (listener: RuntimeEventListener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+          dispose: async () => { ceased = true; for (const listener of listeners) listener({ type: 'state', state: 'disposed' }); } };
+      }) };
+    class Registry extends RuntimeRegistry { override runtimeIdFor(): RuntimeId { return 'pi'; } override runtimeFor(): AgentRuntime { return adapter; } }
+    const config = loadConfig({ GRU_COMMAND_HOME: directory() });
+    const registry = new Registry({ config, store: new SessionStore(directory()) });
+    const healthy = await registry.spawn('minion', { cwd: join(alias, 'nested', 'src') });
+    await healthy.prompt('genuine completed descendant');
+    expect(prompted).toHaveBeenCalledTimes(1);
+    const admin = git(lane.path, ['rev-parse', '--absolute-git-dir']);
+    const unsubscribe = registry.onAgentEvent((event) => { if (event.phase === 'spawned') writeFileSync(join(admin, 'locked'), 'foreign observer custody'); });
+    await expect(registry.spawn('minion', { cwd })).rejects.toThrow(/handoff unresolved/);
+    unsubscribe();
+    expect(adapter.spawn).toHaveBeenCalledTimes(2);
+    expect(registry.getHandle('descendant-minion-2')).toBeNull();
+    await expect(healthy.prompt('obsolete descendant prompt')).rejects.toThrow(/handoff unresolved/);
+    await healthy.dispose();
+    for (const path of [cwd, join(alias, 'nested', 'src'), join(lane.path, 'missing', 'descendant')]) {
+      await expect(registry.spawn('minion', { cwd: path })).rejects.toThrow(/handoff unresolved/);
+    }
+    expect(adapter.spawn).toHaveBeenCalledTimes(2); expect(prompted).toHaveBeenCalledTimes(1);
+    rmSync(lane.path, { recursive: true, force: true });
+    expect(() => handoffProof.captureCwdHandoff(cwd)()).toThrow(/handoff unresolved/);
+    mkdirSync(cwd, { recursive: true }); mkdirSync(join(lane.path, '.git'));
+    writeFileSync(join(cwd, 'foreign-data'), 'retain replacement');
+    for (const path of [cwd, join(alias, 'nested', 'src')]) expect(() => handoffProof.captureCwdHandoff(path)()).toThrow(/handoff unresolved/);
+    expect(readFileSync(join(cwd, 'foreign-data'), 'utf8')).toBe('retain replacement');
+    expect(readFileSync(join(admin, 'locked'), 'utf8')).toBe('foreign observer custody');
+    const unmanaged = directory(); mkdirSync(join(unmanaged, 'src'));
+    handoffProof.captureCwdHandoff(join(unmanaged, 'src'))();
+    await registry.dispose();
+  });
+
+  it('refuses FIFO creation and orphan custody metadata before an owned finite unblock is needed (ordinary review)', async () => {
+    for (const orphan of [false, true]) {
+      const repo = fixture(`ordinary-fifo-${orphan}`), h = manager();
+      const job = h.ledger.addJob({ id: 'fifo-owner', repo: 'assigned', title: 'retain foreign FIFO' });
+      const { hook, log } = failingCheckoutHook(repo);
+      const ready = `${log}.ready`, unblocked = `${log}.unblocked`, finished = `${log}.finished`;
+      writeFileSync(hook, '#!/usr/bin/env node\nconst fs=require("node:fs"),cp=require("node:child_process"),p=require("node:path");\n' +
+        `const tree=process.cwd(),admin=cp.execFileSync('git',['rev-parse','--absolute-git-dir'],{encoding:'utf8'}).trim();
+        fs.writeFileSync(${JSON.stringify(log)},tree);fs.writeFileSync(p.join(admin,'retained-data'),'foreign metadata');
+        const file=p.join(admin,'locked');fs.unlinkSync(file);cp.execFileSync('mkfifo',[file]);
+        ${orphan ? 'fs.rmSync(tree,{recursive:true,force:true});' : ''}
+        fs.writeFileSync(${JSON.stringify(ready)},file);process.exit(7);\n`);
+      // This exact owned child opens RDWR/nonblocking after a finite delay;
+      // even the authentic blocking RED must settle and cannot strand Vitest.
+      const child = spawn(process.execPath, ['-e', `const fs=require('node:fs');let attempts=0,writes=0;
+        const done=()=>fs.existsSync(${JSON.stringify(finished)});
+        const unblock=()=>{if(done())return;if(++writes>100){process.exitCode=8;return;}
+          const fd=fs.openSync(fs.readFileSync(${JSON.stringify(ready)},'utf8'),fs.constants.O_RDWR|fs.constants.O_NONBLOCK);
+          fs.writeFileSync(${JSON.stringify(unblocked)},'owned finite unblock');fs.writeSync(fd,'foreign nonce\\n');fs.closeSync(fd);
+          setTimeout(unblock,50);};
+        const poll=setInterval(()=>{if(done()){clearInterval(poll);}else if(fs.existsSync(${JSON.stringify(ready)})){
+          clearInterval(poll);setTimeout(unblock,800);
+        }else if(++attempts===1000){clearInterval(poll);process.exitCode=9;}},10);`], { stdio: 'pipe' });
+      console.error(`[ordinary-fifo] owned unblock child pid=${child.pid}`);
+      const settled = new Promise<number | null>((done, reject) => { child.once('error', reject); child.once('close', (code) => { console.error(`[ordinary-fifo] owned unblock child closed pid=${child.pid} code=${code}`); done(code); }); });
+      try {
+        await expect(h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })).rejects.toThrow(/custody unconfirmed/);
+        expect(existsSync(unblocked)).toBe(false);
+        expect(h.ledger.getWorktree(job.id)).toBeNull();
+        expect(existsSync(join(readFileSync(ready, 'utf8'), '..', 'retained-data'))).toBe(true);
+        expect(git(repo.path, ['rev-parse', `refs/heads/gru/${job.id}`])).toBe(repo.head());
+      } finally {
+        writeFileSync(finished, 'creation settled');
+        try { expect(await settled).toBe(0); }
+        finally {
+          // Teardown must remove only its own deliberately retained FIFO even
+          // when the settled unblock child failed, or Git inventory blocks too.
+          if (existsSync(ready)) rmSync(readFileSync(ready, 'utf8'), { force: true });
+        }
+      }
+    }
+  });
+
+  it('reproves original PR-linked local names independently of live refresh at each admission boundary (ordinary review)', async () => {
+    for (const seam of ['preflight', 'refresh', 'freeze', 'admission', 'unchanged'] as const) for (const mutation of ['delete', 'alias'] as const) {
+      const repo = fixture(`ordinary-pr-identity-${seam}-${mutation}`);
+      origin(repo); repo.git(['checkout', '-b', 'feature/live']);
+      const target = repo.commitFile('src/assigned.ts', 'export const reviewed = true;\n');
+      repo.git(['push', '--quiet', 'origin', 'feature/live']); repo.git(['tag', 'same-target', target]);
+      const h = await waveFixture(repo, async () => ({ headSha: target, headRefName: 'feature/live' }));
+      const candidate = `refs/heads/gru/${h.job.id}`;
+      const mutate = () => {
+        if (mutation === 'delete') git(repo.path, ['update-ref', '-d', candidate]);
+        else git(repo.path, ['symbolic-ref', candidate, 'refs/tags/same-target']);
+      };
+      const original = h.worktrees.createReviewWorktree.bind(h.worktrees);
+      if (seam === 'freeze') vi.spyOn(h.worktrees, 'createReviewWorktree').mockImplementation(async (input) => { const lane = await original(input); mutate(); return lane; });
+      const probe = vi.fn(async () => { if (seam === 'refresh') mutate(); return { headSha: target, headRefName: 'feature/live' }; });
+      const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, spawner: h.runtime.spawner, reviewArtifactRoot: h.artifactRoot,
+        prHeadProbe: probe, reviewPreflight: async () => { if (seam === 'preflight') mutate(); return { ok: true, failures: [] }; },
+        ...(seam === 'admission' ? { reviewFreezeObserver: mutate } : {}) });
+      const request = wave.requestReview({ jobId: h.job.id, targetRef: candidate, noSpec: true });
+      if (seam === 'unchanged') {
+        const admitted = await request; await admitted.run;
+        expect(h.runtime.leadCalls).toHaveLength(1);
+        expect(h.ledger.latestJobEvent(h.job.id, 'round.admission-preflight')?.payload).toMatchObject({ ok: true });
+        expect(probe).toHaveBeenCalledTimes(1);
+      } else {
+        await expect(request).rejects.toThrow(/identity/);
+        expect(h.runtime.leadCalls).toHaveLength(0);
+        expect(h.runtime.childCalls).toHaveLength(0);
+        expect(h.ledger.listJobEvents(h.job.id).some((event) => event.kind === 'round.admission-preflight')).toBe(false);
+        expect(probe).toHaveBeenCalledTimes(seam === 'preflight' ? 0 : 1);
+      }
+      expect(h.ledger.listJobEvents(h.job.id).some((event) => event.kind === 'branch-idle.forced')).toBe(false);
+      await wave.shutdown(); await h.wave.shutdown();
+    }
+  });
 
   it('rechecks original reflog receipt under the prepared deletion lock before touching same-SHA foreign replacements (R8)', async () => {
     const servicePath = process.env.PATH ?? '';

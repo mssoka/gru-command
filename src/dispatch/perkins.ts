@@ -4183,6 +4183,7 @@ export class WaveRunner {
       ...(input.armedTargetRef !== undefined ? { armedTargetRef: input.armedTargetRef } : {}),
       explicitTarget: input.targetRef !== undefined && input.targetRef.trim() !== '',
     });
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
     // R8-18: a shutdown during resolution starts nothing — no round, no worktree.
     if (this.shuttingDown || setupSignal.aborted) {
       throw setupSignal.reason instanceof ReviewSupersededError
@@ -4320,6 +4321,7 @@ export class WaveRunner {
     // R7-10/R8-10: the admission returns this round's OWN provisional
     // status event, read inside its transaction — the restore below undoes
     // exactly it, never a generation a subscriber wrote on publication.
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
     const { round, flipSeq } = this.opts.ledger.admitReviewRoundWithFlip({
       jobId: job.id, expectedLatestRoundId: predecessor?.id ?? null,
       expectedJobStatus: job.status, lenses: canonicalLenses, targetRef: targetSha,
@@ -4343,6 +4345,7 @@ export class WaveRunner {
       if (jobAtFreeze !== null && isJobTerminal(jobAtFreeze.status)) {
         throw new Error(`job "${job.id}" is ${jobAtFreeze.status} — terminal lanes do not go back under review`);
       }
+      if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
       this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
       // Freeze-time close of the race window: a lane may have re-opened
       // between the arm intake and this freeze. The same refusal applies.
@@ -4515,6 +4518,7 @@ export class WaveRunner {
         // material change, or a writer that owns the lane) withdraws here,
         // before any admission effect — the rollback below unwinds it.
         if (setupSignal.reason instanceof ReviewSupersededError) throw setupSignal.reason;
+        if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
         this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
       }
       this.opts.ledger.appendCustomEvent({
@@ -4752,6 +4756,9 @@ export class WaveRunner {
     /** True when the caller explicitly named `candidateRef` (target_ref). */
     explicitTarget: boolean;
   }): Promise<{ readonly targetSha: string; readonly movementRef: string; readonly targetBranch?: string }> {
+    // A PR refresh moves the review target, never the identity the request
+    // originally named. Remote-only/default PR hints have no captured name.
+    if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(input.jobWorktree.path, input.armedTargetRef);
     const armedTargetBranch = input.armedTargetRef !== undefined && /^(?:refs\/heads\/|refs\/remotes\/origin\/)/u.test(input.armedTargetRef)
       ? normalizeBranch(input.armedTargetRef) : null;
     const candidateBranch = input.job.prUrl === null ? null : input.armedTargetRef !== undefined

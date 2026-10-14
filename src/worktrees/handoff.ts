@@ -7,13 +7,14 @@ const receiptName = 'gru-creation-handoff.json';
 const knownLanes = new Map<string, { readonly lane: WorktreeRecord; readonly ledger: LedgerApi }>();
 const managers = new WeakMap<object, LedgerApi>();
 const completionKind = 'worktree.handoff-completed';
-const factLimit = 1000;
+const factPageSize = 1000;
 export function registerHandoffManager(manager: object, ledger: LedgerApi): void {
   managers.set(manager, ledger);
   for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger);
 }
 
-function readMetadata(file: string, limit = 64 * 1024): string {
+/** Internal descriptor-bound metadata proof shared with creation rollback. */
+export function readWorktreeMetadata(file: string, limit = 64 * 1024): string {
   if (!lstatSync(file).isFile()) throw new Error('handoff metadata is not a regular file');
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -85,19 +86,32 @@ export function rememberManagedLane(lane: WorktreeRecord, ledger: LedgerApi): Wo
   return lane;
 }
 
-function completionFacts(ledger: LedgerApi) {
+function* completionFacts(ledger: LedgerApi) {
   const count = ledger.countEvents(completionKind);
-  if (!Number.isSafeInteger(count) || count < 0 || count > factLimit) throw new Error('handoff fact inventory is incomplete or exceeds its bound');
-  const facts = ledger.listEventsAfter(0, { kinds: [completionKind], limit: factLimit + 1 });
-  if (facts.length !== count) throw new Error('handoff fact inventory changed or is incomplete');
-  return facts.map((event) => {
-    if (!isReceipt(event.payload) || event.payload.state !== 'ready' || Buffer.byteLength(JSON.stringify(event.payload)) > 64 * 1024) throw new Error('malformed or oversized service handoff fact');
-    return { ...event, payload: event.payload };
-  });
+  if (!Number.isSafeInteger(count) || count < 0) throw new Error('handoff fact inventory is incomplete');
+  let cursor = 0, observed = 0;
+  for (;;) {
+    const page = ledger.listEventsAfter(cursor, { kinds: [completionKind], limit: factPageSize });
+    if (page.length > factPageSize) throw new Error('handoff fact page exceeds its bound');
+    if (page.length === 0) break;
+    for (const event of page) {
+      if (event.kind !== completionKind || !Number.isSafeInteger(event.seq) || event.seq <= cursor || ++observed > count) throw new Error('handoff fact inventory changed or is incomplete');
+      if (!isReceipt(event.payload) || event.payload.state !== 'ready' || Buffer.byteLength(JSON.stringify(event.payload)) > 64 * 1024) throw new Error('malformed or oversized service handoff fact');
+      cursor = event.seq;
+      yield { ...event, payload: event.payload };
+    }
+  }
+  if (observed !== count || ledger.countEvents(completionKind) !== count) throw new Error('handoff fact inventory changed or is incomplete');
 }
 
 function assertIssued(receipt: Receipt, lane: WorktreeRecord, ledger: LedgerApi): void {
-  const facts = completionFacts(ledger).filter((event) => event.payload['id'] === lane.id || event.payload['token'] === receipt.token);
+  const facts = [];
+  for (const event of completionFacts(ledger)) {
+    if (event.payload.id === lane.id || event.payload.token === receipt.token) {
+      facts.push(event);
+      if (facts.length > 1) throw new Error('conflicting service handoff issuance');
+    }
+  }
   if (facts.length !== 1) throw new Error('original unique service handoff issuance is unavailable');
   const fact = facts[0]!;
   if (fact.jobId !== lane.jobId || fact.roundId !== lane.roundId || JSON.stringify(fact.payload) !== JSON.stringify(receipt) ||
@@ -107,34 +121,34 @@ function assertIssued(receipt: Receipt, lane: WorktreeRecord, ledger: LedgerApi)
 function adminFor(path: string): string {
   const file = join(path, '.git');
   if (!lstatSync(file).isFile()) throw new Error('managed checkout no longer has its linked gitdir file');
-  const text = readMetadata(file).trim();
+  const text = readWorktreeMetadata(file).trim();
   if (!text.startsWith('gitdir: ')) throw new Error('managed checkout lost its linked gitdir');
   return realpathSync(resolve(path, text.slice(8)));
 }
 
 function validate(receipt: Receipt, lane: WorktreeLane): void {
   const admin = adminFor(lane.path);
-  const common = realpathSync(resolve(admin, readMetadata(join(admin, 'commondir')).trim()));
+  const common = realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim()));
   const repoGit = join(lane.repoPath, '.git');
   const repoCommon = lstatSync(repoGit).isDirectory() ? realpathSync(repoGit)
-    : realpathSync(resolve(adminFor(lane.repoPath), readMetadata(join(adminFor(lane.repoPath), 'commondir')).trim()));
+    : realpathSync(resolve(adminFor(lane.repoPath), readWorktreeMetadata(join(adminFor(lane.repoPath), 'commondir')).trim()));
   if (repoCommon !== common || receipt.id !== lane.id || receipt.kind !== lane.kind || receipt.jobId !== lane.jobId || receipt.roundId !== lane.roundId || receipt.branch !== lane.branch || receipt.sha !== lane.sha ||
     receipt.repo !== realpathSync(lane.repoPath) || receipt.path !== realpathSync(lane.path) || receipt.admin !== admin || receipt.common !== common ||
     dirname(admin) !== join(common, 'worktrees') ||
-    realpathSync(resolve(admin, readMetadata(join(admin, 'gitdir')).trim())) !== realpathSync(join(lane.path, '.git'))) throw new Error('handoff binding changed');
+    realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim())) !== realpathSync(join(lane.path, '.git'))) throw new Error('handoff binding changed');
   // Job/writer commits may advance. Attachment must not: a detached lane is
   // frozen, and a writer's reserved name must still be a direct branch.
   if (existsSync(join(common, 'reftable'))) throw new Error('unsupported ref storage — handoff identity unverified');
-  const head = readMetadata(join(admin, 'HEAD')).trim();
+  const head = readWorktreeMetadata(join(admin, 'HEAD')).trim();
   if (lane.branch === null) {
     if (head !== lane.sha) throw new Error('detached handoff identity changed');
   } else {
     if (head !== `ref: refs/heads/${lane.branch}`) throw new Error('writer handoff attachment changed');
     const ref = join(common, 'refs', 'heads', lane.branch);
     if (existsSync(ref)) {
-      if (realpathSync(ref) !== ref || !lstatSync(ref).isFile() || !/^[0-9a-f]{40,64}$/u.test(readMetadata(ref).trim()) || readMetadata(ref).trim().length !== lane.sha.length) throw new Error('writer branch is not direct');
+      if (realpathSync(ref) !== ref || !lstatSync(ref).isFile() || !/^[0-9a-f]{40,64}$/u.test(readWorktreeMetadata(ref).trim()) || readWorktreeMetadata(ref).trim().length !== lane.sha.length) throw new Error('writer branch is not direct');
     } else {
-      const packed = readMetadata(join(common, 'packed-refs'), 16 * 1024 * 1024);
+      const packed = readWorktreeMetadata(join(common, 'packed-refs'), 16 * 1024 * 1024);
       if (packed.split('\n').some((line) => line.startsWith('^') && !/^\^[0-9a-f]{40,64}$/u.test(line))) throw new Error('malformed peeled ref metadata');
       const lines = packed.split('\n').filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith('^'));
       if (lines.some((line) => !/^[0-9a-f]{40,64} refs\//u.test(line))) throw new Error('malformed packed ref metadata');
@@ -147,7 +161,7 @@ function validate(receipt: Receipt, lane: WorktreeLane): void {
 
 export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoPath' | 'path' | 'branch' | 'sha' | 'jobId' | 'roundId'>, admin: string, token: string): void {
   const receipt: Receipt = { state: 'pending', token, id: lane.id, kind: lane.kind, jobId: lane.jobId, roundId: lane.roundId, repo: realpathSync(lane.repoPath),
-    common: realpathSync(resolve(admin, readMetadata(join(admin, 'commondir')).trim())), admin,
+    common: realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())), admin,
     path: realpathSync(lane.path), branch: lane.branch, sha: lane.sha, createdAt: null };
   const file = join(admin, receiptName), temp = `${file}.${token.slice(13)}`;
   writeFileSync(temp, JSON.stringify(receipt), { flag: 'wx' });
@@ -157,7 +171,7 @@ export function beginLaneHandoff(lane: Pick<WorktreeLane, 'id' | 'kind' | 'repoP
 
 export function assertPendingLaneHandoff(lane: WorktreeRecord, admin: string, token: string): Receipt {
   try {
-    const receipt = parseReceipt(readMetadata(join(admin, receiptName)));
+    const receipt = parseReceipt(readWorktreeMetadata(join(admin, receiptName)));
     if (receipt.state !== 'pending' || receipt.token !== token) throw new Error('original pending handoff receipt changed');
     validate(receipt, lane);
     return receipt;
@@ -171,7 +185,9 @@ export function completeLaneHandoff(lane: WorktreeRecord, admin: string, token: 
   if (existsSync(join(admin, 'locked'))) throw new Error('handoff unlock did not settle');
   const registered = ledger.getWorktree(lane.id);
   if (registered === null || JSON.stringify(registered) !== JSON.stringify(lane)) throw new Error('original service registration changed');
-  if (completionFacts(ledger).some((event) => event.payload['id'] === lane.id || event.payload['token'] === token)) throw new Error('handoff issuance already exists or conflicts');
+  for (const event of completionFacts(ledger)) {
+    if (event.payload.id === lane.id || event.payload.token === token) throw new Error('handoff issuance already exists or conflicts');
+  }
   const ready: Receipt = { ...receipt, state: 'ready', createdAt: lane.createdAt };
   const temp = `${file}.${token.slice(13)}`;
   writeFileSync(temp, JSON.stringify(ready), { flag: 'wx' });
@@ -193,13 +209,13 @@ export function captureLaneHandoff(lane: WorktreeLane): () => void {
     if (expected === null || expected.createdAt !== association.lane.createdAt) throw new Error('original registered generation is unavailable');
     const generation = expected.createdAt;
     const admin = adminFor(lane.path), file = join(admin, receiptName);
-    const original = readMetadata(file);
+    const original = readWorktreeMetadata(file);
     const receipt = parseReceipt(original);
     const check = (): void => {
       try {
         const current = ledger.getWorktree(expected.id);
         if (current === null || current.status === 'swept' || current.createdAt !== generation) throw new Error('managed lane generation is unavailable or swept');
-        if (readMetadata(file) !== original || receipt.state !== 'ready' || typeof receipt.createdAt !== 'string' ||
+        if (readWorktreeMetadata(file) !== original || receipt.state !== 'ready' || typeof receipt.createdAt !== 'string' ||
           receipt.createdAt !== generation) throw new Error('completed handoff proof is missing or changed');
         validate(receipt, current);
         validate(receipt, lane);
@@ -225,13 +241,66 @@ export function capturePortLaneHandoff(port: Pick<WorktreePort, 'getWorktree' | 
   return captureLaneHandoff(lane);
 }
 
+function* ancestors(path: string): Generator<string> {
+  let current = resolve(path);
+  for (;;) {
+    yield current;
+    const parent = dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
+/** Resolve missing descendants through their existing ancestor too: replacing
+ * or removing a known root must never turn managed custody into an exemption. */
+function canonicalCwd(cwd: string): string {
+  for (const ancestor of ancestors(cwd)) {
+    try { return resolve(realpathSync(ancestor), resolve(cwd).slice(ancestor.length).replace(/^\//u, '')); }
+    catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    }
+  }
+  throw new Error('cwd has no verifiable existing ancestor');
+}
+
+function owningAssociation(cwd: string) {
+  const lexical = [...ancestors(cwd)].map((path) => knownLanes.get(path)).find((entry) => entry !== undefined);
+  const canonical = canonicalCwd(cwd);
+  const owner = [...ancestors(canonical)].map((path) => knownLanes.get(path)).find((entry) => entry !== undefined);
+  if (lexical !== undefined && (owner === undefined || owner.ledger !== lexical.ledger || owner.lane.id !== lexical.lane.id)) throw new Error('managed cwd escaped or replaced its owning checkout');
+  return { owner, canonical };
+}
+
 export function captureCwdHandoff(cwd: string | undefined): () => void {
   if (cwd === undefined) return () => {};
-  const association = knownLanes.get(cwd);
-  if (association !== undefined) return captureLaneHandoff(association.lane);
-  const file = join(cwd, '.git');
-  if (!existsSync(file) || lstatSync(file).isDirectory()) return () => {}; // truly unassigned, non-linked cwd
-  throw new WorktreeHandoffUnresolvedError(cwd, new Error('registered handoff binding is unavailable'));
+  try {
+    const original = owningAssociation(cwd);
+    const owner = original.owner;
+    if (owner !== undefined) {
+      const check = captureLaneHandoff(owner.lane);
+      return () => {
+        try {
+          const current = owningAssociation(cwd);
+          if (current.canonical !== original.canonical || current.owner?.ledger !== owner.ledger ||
+            current.owner.lane.id !== owner.lane.id || current.owner.lane.createdAt !== owner.lane.createdAt) throw new Error('cwd owning handoff changed');
+          check();
+        } catch (error) { throw new WorktreeHandoffUnresolvedError(cwd, error); }
+      };
+    }
+    const checkUnassigned = (): void => {
+      try {
+        const current = owningAssociation(cwd);
+        if (current.owner !== undefined) throw new Error('cwd acquired a managed handoff after capture');
+        // Linked ancestors without a trusted issuer are unresolved, not unassigned.
+        for (const path of ancestors(current.canonical)) {
+          const file = join(path, '.git');
+          if (existsSync(file) && !lstatSync(file).isDirectory()) throw new Error('registered handoff binding is unavailable');
+        }
+      } catch (error) { throw new WorktreeHandoffUnresolvedError(cwd, error); }
+    };
+    checkUnassigned();
+    return checkUnassigned; // genuinely unassigned cwd is still rechecked at awaits
+  } catch (error) { throw new WorktreeHandoffUnresolvedError(cwd, error); }
 }
 
 function absent(path: string): boolean {
@@ -249,14 +318,14 @@ export function assertLaneResourcesAbsent(lane: WorktreeLane): void {
     const expected = join(realpathSync(dirname(lane.path)), basename(lane.path), '.git');
     const repoGit = join(lane.repoPath, '.git');
     const common = lstatSync(repoGit).isDirectory() ? realpathSync(repoGit)
-      : realpathSync(resolve(adminFor(lane.repoPath), readMetadata(join(adminFor(lane.repoPath), 'commondir')).trim()));
+      : realpathSync(resolve(adminFor(lane.repoPath), readWorktreeMetadata(join(adminFor(lane.repoPath), 'commondir')).trim()));
     const container = join(common, 'worktrees');
     if (absent(container)) return;
     if (!lstatSync(container).isDirectory()) throw new Error('worktree inventory is not canonical');
     for (const entry of readdirSync(container, { withFileTypes: true })) {
       if (!entry.isDirectory()) throw new Error('ambiguous worktree administration inventory');
       const admin = join(container, entry.name);
-      const text = readMetadata(join(admin, 'gitdir')).trim();
+      const text = readWorktreeMetadata(join(admin, 'gitdir')).trim();
       if (text === '' || !text.endsWith('/.git')) throw new Error('malformed worktree backlink');
       const backlink = resolve(admin, text);
       const canonical = join(realpathSync(dirname(dirname(backlink))), basename(dirname(backlink)), '.git');

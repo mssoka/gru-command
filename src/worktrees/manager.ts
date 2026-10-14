@@ -1,4 +1,4 @@
-import { beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
+import { readWorktreeMetadata, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
@@ -8,7 +8,6 @@ import {
   lstatSync,
   mkdirSync,
   readlinkSync,
-  readFileSync,
   readdirSync,
   realpathSync,
   symlinkSync,
@@ -1340,7 +1339,7 @@ export class WorktreeManager {
         // No await after the final nonce/backlink/HEAD proof and before commit.
         const admin = existsSync(ownedPath) ? this.assertCreationCustody(repoPath, ownedPath, custody, common)
           : this.orphanCreationAdmin(repoPath, ownedPath, custody, common);
-        if (admin === null || readFileSync(join(admin, 'HEAD'), 'utf8').trim() !== `ref: ${ref}`) {
+        if (admin === null || readWorktreeMetadata(join(admin, 'HEAD')).trim() !== `ref: ${ref}`) {
           throw new Error(`created branch ${ref} lost its invocation-owned checkout reservation`);
         }
       }
@@ -1386,6 +1385,11 @@ export class WorktreeManager {
   /** Registration requires the requested checkout authority, independently
    * of the receipts that permit destructive rollback. */
   private assertCreationIdentity(path: string, custody: CreationCustody): void {
+    const gitFile = readWorktreeMetadata(join(path, '.git')).trim();
+    if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
+    const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
+    readWorktreeMetadata(join(admin, 'HEAD'));
+    readWorktreeMetadata(join(admin, 'gitdir'));
     const symbolic = spawnGit(path, ['symbolic-ref', '--quiet', 'HEAD']);
     const expected = custody.branch === null ? null : `refs/heads/${custody.branch}`;
     if (runGit(path, ['rev-parse', 'HEAD']) !== custody.sha ||
@@ -1396,12 +1400,13 @@ export class WorktreeManager {
 
   private assertCreationCustody(repoPath: string, path: string, custody: CreationCustody,
     common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string {
-    const gitFile = readFileSync(join(path, '.git'), 'utf8').trim();
+    const gitFile = readWorktreeMetadata(join(path, '.git')).trim();
     if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
     const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
+    readWorktreeMetadata(join(admin, 'HEAD'));
     if (dirname(admin) !== join(common, 'worktrees') ||
-      realpathSync(resolve(admin, readFileSync(join(admin, 'gitdir'), 'utf8').trim())) !== realpathSync(join(path, '.git')) ||
-      readFileSync(join(admin, 'locked'), 'utf8').trim() !== custody.token) {
+      realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim())) !== realpathSync(join(path, '.git')) ||
+      readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
       throw new Error('linked-worktree custody receipt does not match this invocation');
     }
     return admin;
@@ -1417,9 +1422,10 @@ export class WorktreeManager {
     for (const entry of readdirSync(container, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const admin = join(container, entry.name);
-      const backlink = resolve(admin, readFileSync(join(admin, 'gitdir'), 'utf8').trim());
+      const backlink = resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim());
       if (backlink !== expected) continue;
-      if (readFileSync(join(admin, 'locked'), 'utf8').trim() !== custody.token) {
+      readWorktreeMetadata(join(admin, 'HEAD'));
+      if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
         throw new Error('orphaned worktree custody receipt does not match this invocation');
       }
       return admin;
@@ -1480,7 +1486,7 @@ export class WorktreeManager {
         // window for an ordinary external worktree to adopt the same tip.
         // No owned holder means no destructive authority: retain the ref.
         const heldRef = orphanAdmin === null ? (ownedPath === null ? null : runGit(ownedPath, ['symbolic-ref', 'HEAD']))
-          : readFileSync(join(orphanAdmin, 'HEAD'), 'utf8').trim().replace(/^ref: /u, '');
+          : readWorktreeMetadata(join(orphanAdmin, 'HEAD')).trim().replace(/^ref: /u, '');
         if (ownedPath === null || heldRef !== `refs/heads/${custody.branch}`) {
           throw new Error(`created branch ${custody.branch} has no invocation-owned checkout reservation`);
         }
