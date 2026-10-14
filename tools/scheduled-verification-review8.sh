@@ -1,5 +1,6 @@
 #!/bin/sh
-# New R8 cases only. Execute under authenticated declared-scope admission.
+# R8 regressions or the unchanged full component selection, with JSON evidence.
+# Execute under authenticated declared-scope admission; never a local FULL.
 # Keep both runner statuses and immutable JSON reports, including assertion RED.
 set -eu
 root="$PWD"
@@ -13,10 +14,18 @@ if [ "${1:-all}" = version ]; then
   exec npx vitest run test/worker-verification-policy.test.ts -t 'review-8 selected Vitest run' --reporter=json --outputFile="$d/version-results.json"
 fi
 set +e
-npx vitest run test/worker-verification-policy.test.ts test/pi-adapter.test.ts -t 'review-8' --reporter=json --outputFile="$d/fast-results.json"
-a=$?
-npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts -t 'review-8' --reporter=json --outputFile="$d/heavy-results.json"
-b=$?
+if [ "${1:-all}" = focused ]; then
+  # Same files/phases as scheduled-verification-focused, without a title filter.
+  npx vitest run test/classify-scheduled-verification-red.test.ts test/worker-verification-policy.test.ts test/workflow-session.test.ts test/pi-adapter.test.ts test/verification-capture.test.ts test/verification-scheduler.test.ts test/verification-evidence.test.ts test/suite-shape.test.ts --reporter=json --outputFile="$d/fast-results.json"
+  a=$?
+  npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts test/verification-server.test.ts --reporter=json --outputFile="$d/heavy-results.json"
+  b=$?
+else
+  npx vitest run test/worker-verification-policy.test.ts test/pi-adapter.test.ts -t 'review-8' --reporter=json --outputFile="$d/fast-results.json"
+  a=$?
+  npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts -t 'review-8' --reporter=json --outputFile="$d/heavy-results.json"
+  b=$?
+fi
 set -e
 printf 'R8 actual runner exits fast=%s heavy=%s; reports=%s\n' "$a" "$b" "$d"
 # A nonzero status is NOT classified as behavioral RED by this runner.

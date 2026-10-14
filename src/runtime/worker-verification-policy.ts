@@ -102,12 +102,20 @@ export function verificationCommandGroups(command: string): readonly (readonly s
   let words: string[] = [];
   let word = '';
   let started = false;
+  let plainWord = true;
   let quote: string | null = null;
   const heredocs: { delimiter: string; expand: boolean; stripTabs: boolean }[] = [];
   const finishWord = (): void => {
     if (started) words.push(word);
     word = '';
     started = false;
+    plainWord = true;
+  };
+  const finishRedirectWord = (): void => {
+    // Only adjacent, unquoted raw digits are an IO_NUMBER. Quoted/escaped
+    // numeric text and numbers already separated by whitespace are operands.
+    if (plainWord && /^[0-9]+$/u.test(word)) started = false;
+    finishWord();
   };
   const finishGroup = (): void => {
     finishWord();
@@ -136,15 +144,15 @@ export function verificationCommandGroups(command: string): readonly (readonly s
     }
     if (char === '\\') {
       const next = command[++i];
-      if (next !== undefined && next !== '\n') { word += next; started = true; }
+      if (next !== undefined && next !== '\n') { word += next; started = true; plainWord = false; }
       i += 1;
       continue;
     }
-    if (char === '"' || char === "'") { quote = char; started = true; i += 1; continue; }
+    if (char === '"' || char === "'") { quote = char; started = true; plainWord = false; i += 1; continue; }
     // An unquoted `$(...)`/backtick is executed, not literal word text.
     {
       const expansion = takeSubstitution(command, i, substitutions);
-      if (expansion >= 0) { i = expansion; continue; }
+      if (expansion >= 0) { plainWord = false; i = expansion; continue; }
     }
     if (char === '#' && !started) { while (i < command.length && command[i] !== '\n') i += 1; continue; }
     if (char === '<' && command[i + 1] === '<' && command[i + 2] !== '<') {
@@ -164,14 +172,12 @@ export function verificationCommandGroups(command: string): readonly (readonly s
         if (/[\s;&|()]/u.test(c)) break;
         delimiter += c; i += 1;
       }
-      finishWord();
+      finishRedirectWord();
       if (delimiter !== '' || quotedDelim) heredocs.push({ delimiter, expand: !quotedDelim, stripTabs });
       continue;
     }
     if (char === '<' || char === '>') {
-      // A digit sequence adjacent to the operator is a file descriptor, not a word.
-      if (started && /^[0-9]+$/u.test(word)) { word = ''; started = false; }
-      else finishWord();
+      finishRedirectWord();
       while (command[i] === '<' || command[i] === '>') i += 1;
       if (command[i] === '&' || (char === '>' && command[i] === '|')) i += 1; // >&1 / <&0 / >|
       // Whitespace between the operator and its target is insignificant.
@@ -317,6 +323,9 @@ export function normalizedVerificationWords(raw: readonly string[]): readonly st
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i] as string;
     if (arg === '--') { kept.push(...args.slice(i + 1)); break; }
+    // npx parses its own options only before the executable. Its child's
+    // argument tail (especially another --) belongs to that tool unchanged.
+    if (tool === 'npx' && !arg.startsWith('-')) { kept.push(...args.slice(i)); break; }
     if (values.has(arg)) { i += 1; continue; }
     if (flags.has(arg)) {
       if (args[i + 1] === 'true' || args[i + 1] === 'false') i += 1;
@@ -353,6 +362,14 @@ const DIAGNOSTIC_COMPANION_FLAGS = new Set(['--noEmit', '--pretty', '--diagnosti
  * only `--help` and the tool's own inspection flags stay reads.
  */
 function isDiagnosticInvocation(args: readonly string[], selectsVerb: boolean): boolean {
+  // Help short-circuits the action even after ordinary file operands. Do not
+  // interpret a flag consumed as a configuration value, or anything after --.
+  for (let at = 0; at < args.length; at += 1) {
+    const arg = args[at] as string;
+    if (arg === '--') break;
+    if (HELP_FLAGS.has(arg)) return true;
+    if (CONFIG_VALUE_FLAGS.has(arg) || DIAGNOSTIC_VALUE_FLAGS.has(arg)) at += 1;
+  }
   let sawDiagnostic = false;
   let i = 0;
   while (i < args.length) {
@@ -530,8 +547,9 @@ export function isVerificationProducer(command: string, policy: WorkerVerificati
       // Direct tools keep their non-producing inspection modes; npm scripts never do.
       if (prefix[0] !== 'npm') {
         const args = words.slice(prefix.length);
-        const diagnosticArgs = (prefix.at(-1) === 'vitest' && args[0] === 'run') ? args.slice(1) : args;
-        if (isDiagnosticInvocation(diagnosticArgs, prefixSelectsVerb(prefix))) continue;
+        const selectsVitestRun = prefix.at(-1) === 'vitest' && args[0] === 'run';
+        const diagnosticArgs = selectsVitestRun ? args.slice(1) : args;
+        if (isDiagnosticInvocation(diagnosticArgs, selectsVitestRun || prefixSelectsVerb(prefix))) continue;
       }
       return true;
     }
