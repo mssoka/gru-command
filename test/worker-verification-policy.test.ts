@@ -620,7 +620,7 @@ describe('review-8 actual CLI and shell boundaries', () => {
     // The installed CLI only short-circuits version with NO matched command;
     // run remains selected with this operand and proceeds to its test action.
     expect(parsed.options.run).toBe(true);
-    expect(parsed.options.version).toBe(true);
+    expect(Reflect.get(parsed.options, 'version')).toBe(true);
     expect(parsed.filter).toEqual(['example.test.js']);
     for (const command of ['vitest run --version', 'npx vitest run --version', 'npm exec -- vitest run --version']) {
       expect(isVerificationProducer(command, policy), command).toBe(true);
@@ -633,7 +633,7 @@ describe('review-8 actual CLI and shell boundaries', () => {
   it('review-8 package-manager normalization preserves the child tool option terminator', () => {
     const { policy } = retainedFixture();
     const parsed = parseCLI(['vitest', 'run', '--', '--help']);
-    expect(parsed.options.help).not.toBe(true);
+    expect(Reflect.get(parsed.options, 'help')).not.toBe(true);
     expect((parsed.options as Record<string, unknown>)['--']).toEqual(['--help']);
     for (const command of [
       'npx vitest run -- --help', 'npx --no-install vitest run -- --help',
