@@ -260,6 +260,25 @@ export interface PropertyExecutionReceipt {
   readonly budget: ExecutionBudget;
 }
 
+declare const EXECUTOR_SEAL: unique symbol;
+
+/** RUNTIME-ENFORCED provenance (Root planning-record correction, 2026-10-14):
+ * only the host executor module may construct a sealed receipt — the seal
+ * token is a module-closure symbol that is never exported, and every
+ * PRODUCTION consumer (qualification, freeze, metrics, Perkins wiring)
+ * must verify receipts through the executor-exported runtime guard. A
+ * TypeScript brand alone is not unforgeable provenance: callers cannot
+ * construct this type without the symbol, and the runtime guard rejects
+ * any object that was not produced through the executor closure. */
+export interface SealedExecutionReceipt extends PropertyExecutionReceipt {
+  readonly [EXECUTOR_SEAL]: true;
+}
+
+/** The runtime guard the executor exports and every production consumer
+ * calls before trusting a receipt: `(candidate) => candidate is
+ * SealedExecutionReceipt`. */
+export type ExecutionReceiptGuard = (candidate: unknown) => candidate is SealedExecutionReceipt;
+
 // ---------------------------------------------------------------------------
 // Seam C contracts: proposals, qualification, freeze, modes, metrics.
 // ---------------------------------------------------------------------------
