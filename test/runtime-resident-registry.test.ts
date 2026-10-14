@@ -119,6 +119,21 @@ describe('registry resident boundary across adapters', () => {
     } finally { h.cleanup(); }
   });
 
+  it('revokes lookup eligibility for a quarantined handle until disposal (GH-280)', async () => {
+    const h = harness(2);
+    try {
+      const minion = await h.registry.spawn('minion');
+      expect(h.registry.getHandle(minion.id)).toBe(minion);
+      // A supervisor-refused producer must be invisible to every dispatch
+      // lookup the moment it is quarantined — even while it is still live
+      // because its cleanup has not settled.
+      h.registry.quarantineHandle(minion);
+      expect(h.registry.getHandle(minion.id)).toBeNull();
+      await minion.dispose();
+      expect(h.registry.getHandle(minion.id)).toBeNull();
+    } finally { h.cleanup(); }
+  });
+
   it('decorates promptWithVerdict with first-prompt reclaim and the disposal fence (r6 architecture)', async () => {
     const h = harness(1);
     try {
