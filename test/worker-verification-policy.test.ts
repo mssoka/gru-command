@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { parseCLI } from 'vitest/node';
 import { nativeCorpus } from './helpers/verification-native-corpus.mjs';
 import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { PACKAGE_ROOT } from '../src/bmad/runtime.js';
@@ -16,6 +17,7 @@ import { workerVerificationExtension } from '../src/runtime/pi-adapter.js';
 import { workerVerificationHook } from '../src/runtime/worker-verification-hook.js';
 import {
   isVerificationProducer,
+  normalizedVerificationWords,
   verificationCommandGroups,
   workerVerificationPolicy,
   workerVerificationRefusal,
@@ -607,6 +609,75 @@ describe('review-4 conventional settings preserve producer and read boundaries',
     }
     for (const command of ['vite --clearScreen=false build --help', 'vite --clearScreen false build --help', 'npx vite --clearScreen=false build --help']) {
       expect(isVerificationProducer(command, policy), command).toBe(false);
+    }
+  });
+});
+
+describe('review-8 actual CLI and shell boundaries', () => {
+  it('review-8 package-manager normalization preserves the child tool option terminator', () => {
+    const { policy } = retainedFixture();
+    const parsed = parseCLI(['vitest', 'run', '--', '--help']);
+    expect(parsed.options.help).not.toBe(true);
+    expect((parsed.options as Record<string, unknown>)['--']).toEqual(['--help']);
+    for (const command of [
+      'npx vitest run -- --help', 'npx --no-install vitest run -- --help',
+      'npx -- vitest run -- --help', 'npm exec -- vitest run -- --help',
+      'npm x -- vitest run -- --help',
+    ]) {
+      expect(isVerificationProducer(command, policy), command).toBe(true);
+      expect(nativeHostDenial(command, policy), command).toBe(true);
+    }
+    expect(normalizedVerificationWords(['npx', 'vitest', 'run', '--', '--help']))
+      .toEqual(['npx', 'vitest', 'run', '--', '--help']);
+    // npm consumes its own separator; npx must not consume the child's next one.
+    expect(normalizedVerificationWords(['npm', 'exec', '--', 'vitest', 'run', '--', '--help']))
+      .toEqual(['npx', 'vitest', 'run', '--', '--help']);
+    for (const command of ['npx -- vitest run --help', 'npm exec -- vitest run --help']) {
+      expect(isVerificationProducer(command, policy), command).toBe(false);
+    }
+  });
+  it('review-8 adjacent heredoc descriptors are redirects rather than npm operands', () => {
+    const { policy } = retainedFixture();
+    const bin = join(policy.cwd, 'fixture-bin'); mkdirSync(bin);
+    const argv = join(policy.cwd, 'shell-argv.txt');
+    writeFileSync(join(bin, 'npm'), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argv}'\n`, { mode: 0o700 });
+    for (const command of ['npm 0<<EOF test\nEOF\n', '0<<EOF npm test\nEOF\n', 'npm 2<<-EOF test\n\tEOF\n']) {
+      const execution = spawnSync('/bin/sh', ['-c', command], {
+        cwd: policy.cwd, env: { ...process.env, PATH: `${bin}:${process.env['PATH'] ?? ''}` }, encoding: 'utf8',
+      });
+      expect(execution.status, execution.stderr).toBe(0);
+      expect(readFileSync(argv, 'utf8')).toBe('test\n');
+      expect(verificationCommandGroups(command), command).toEqual([['npm', 'test']]);
+      expect(isVerificationProducer(command, policy), command).toBe(true);
+      expect(nativeHostDenial(command, policy), command).toBe(true);
+    }
+    // Whitespace or quoting makes the numeric text a real operand, not an IO number.
+    for (const command of ['npm 0 <<EOF test\nEOF\n', 'npm "0"<<EOF test\nEOF\n', 'npm \\0<<EOF test\nEOF\n']) {
+      expect(verificationCommandGroups(command), command).toEqual([['npm', '0', 'test']]);
+      expect(isVerificationProducer(command, policy), command).toBe(false);
+    }
+  });
+  it('review-8 genuine help after a file operand remains a read before option termination', () => {
+    const { policy } = retainedFixture();
+    const sentinel = join(policy.cwd, 'ordinary-test-ran');
+    const file = join(policy.cwd, 'example.test.js');
+    writeFileSync(file, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(sentinel)}, 'ran');\n`);
+    const cli = join(PACKAGE_ROOT, 'node_modules/vitest/vitest.mjs');
+    const help = spawnSync(process.execPath, [cli, 'run', file, '--help'], { cwd: policy.cwd, encoding: 'utf8' });
+    expect(help.status, help.stderr).toBe(0);
+    expect(help.stdout).toContain('Usage:');
+    expect(existsSync(sentinel)).toBe(false);
+    for (const command of [
+      'vitest run src/example.test.ts --help', 'npx vitest run src/example.test.ts --help',
+      'npm exec -- vitest run src/example.test.ts --help', 'vitest run src/example.test.ts -h',
+      'vitest run --help -- src/example.test.ts',
+    ]) {
+      expect(isVerificationProducer(command, policy), command).toBe(false);
+      expect(workerVerificationHook({ tool_name: 'Bash', tool_input: { command } }, policy), command).toEqual({});
+      expect(nativeHostDenial(command, policy), command).toBe(false);
+    }
+    for (const command of ['vitest run src/example.test.ts -- --help', 'npx vitest run -- --help']) {
+      expect(isVerificationProducer(command, policy), command).toBe(true);
     }
   });
 });

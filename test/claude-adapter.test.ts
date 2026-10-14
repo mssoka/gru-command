@@ -2809,6 +2809,11 @@ describe('scheduled verification ordinary Claude Bash', () => {
   it('review-2 actual prompt registration retains pre-disposal errored original until delayed close', async () => startedChildCustody('prompt'));
   it('review-2 actual compaction registration retains pre-disposal errored original until delayed close', async () => startedChildCustody('compact'));
 
+  it('review-8 Claude host refuses option-terminator and heredoc-FD producers with hook unavailable', async () => {
+    process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
+    try { for (const command of ['npm exec -- vitest run -- --help', 'npm 0<<EOF test\nEOF\n']) await refuses(command); }
+    finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; }
+  });
   it('strict repair every retained producing raw case refuses ordinary Claude with hook unavailable', async () => {
     const { nativeCorpus } = await import('./helpers/verification-native-corpus.mjs');
     process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL'] = '1';
@@ -2899,6 +2904,53 @@ describe('scheduled verification ordinary Claude Bash', () => {
       expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toEqual(['tsc', 'npx']);
       expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused'); await handle.dispose();
     } finally { delete process.env['CLAUDE_DOUBLE_VERIFICATION_HOOK_FAIL']; process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
+  it('review-8 ordinary pre-ACK Bash is denied before prompt and compaction side effects', async () => {
+    for (const operation of ['prompt', 'compact'] as const) {
+      const lane = verificationLane(); cleanupDirs.push(lane.root);
+      const marker = join(lane.lane.path, 'ordinary-pre-ack-side-effect');
+      const start = vi.fn(spawn); const f = fixture({ spawnProcess: start as unknown as typeof spawn });
+      const handle = await f.runtime.spawn('minion', lane.session);
+      if (operation === 'compact') await handle.prompt('establish original conversation');
+      const original = Object.assign(new EventEmitter(), {
+        exitCode: null, signalCode: null, kill: vi.fn(() => true), stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      }) as unknown as ChildProcess;
+      const wire: Record<string, unknown>[] = [];
+      original.stdin!.on('data', (chunk: Buffer) => {
+        const frame = JSON.parse(chunk.toString('utf8')) as Record<string, unknown>; wire.push(frame);
+        const response = frame['response'] as Record<string, unknown> | undefined;
+        const decision = response?.['response'] as Record<string, unknown> | undefined;
+        // The ordinary shell acts only on its original host's approval.
+        if (decision?.['behavior'] === 'allow') {
+          const input = decision['updatedInput'] as { readonly command: string };
+          const execution = childProcesses.spawnSync('/bin/sh', ['-c', input.command], { cwd: lane.lane.path, encoding: 'utf8' });
+          expect(execution.status, execution.stderr).toBe(0);
+        }
+      });
+      start.mockReturnValueOnce(original as ReturnType<typeof spawn>);
+      let running: Promise<void> | undefined;
+      try {
+        running = operation === 'compact' ? handle.compact!() : handle.prompt('ordinary Bash before initialization acknowledgement');
+        const outcome = running.then(() => 'resolved', (error: unknown) => String(error));
+        expect(wire.map((frame) => frame['type'])).toEqual(['control_request', 'user']);
+        original.stdout!.emit('data', Buffer.from(JSON.stringify({
+          type: 'control_request', request_id: 'ordinary-pre-ack-request',
+          request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'ordinary-pre-ack-tool', input: { command: 'touch ordinary-pre-ack-side-effect' } },
+        }) + '\n'));
+        const responseFrame = wire.find((frame) => frame['type'] === 'control_response');
+        const response = responseFrame?.['response'] as Record<string, unknown> | undefined;
+        expect(response?.['request_id']).toBe('ordinary-pre-ack-request');
+        expect(existsSync(marker)).toBe(false);
+        expect(response?.['response']).toMatchObject({ behavior: 'deny' });
+        original.emit('close', 0, null);
+        expect(await outcome).toContain('malformed or foreign worker verification permission request');
+      } finally {
+        original.emit('close', 0, null); await running?.catch(() => undefined);
+        await handle.dispose(); expect(handle.cessationEvidence!()).toBe('ceased');
+        await f.runtime.dispose();
+      }
+    }
   });
 
   async function initializationOrdering(operation: 'prompt' | 'compact', inspectDelivery: boolean): Promise<void> {

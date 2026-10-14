@@ -3750,6 +3750,9 @@ describe('scheduled verification ordinary Pi Bash', () => {
     } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
   });
 
+  it('review-8 Pi SDK refuses option-terminator and heredoc-FD producers before any executable starts', async () => {
+    for (const command of ['npx vitest run -- --help', 'npm 0<<EOF test\nEOF\n']) await refuses(command);
+  });
   it('strict repair every retained producing raw case refuses through ordinary Pi with zero starts', async () => {
     const { nativeCorpus } = await import('./helpers/verification-native-corpus.mjs');
     for (const row of nativeCorpus.filter((row) => row.refused)) await refuses(row.raw, true);
