@@ -40,6 +40,10 @@ export interface HeavyTestEntry {
 }
 
 export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
+  {
+    file: 'property-stateful-pilot.test.ts',
+    workload: 'real fast-check property engine from the provisioned locked fixture (requires materialized toolchain)',
+  },
   { file: 'admission-retry-service.test.ts', workload: 'real service boot resuming a durable admission retry' },
   {
     file: 'attachments.test.ts',
