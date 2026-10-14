@@ -41,6 +41,14 @@ export interface HeavyTestEntry {
 
 export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   {
+    file: 'property-replay.test.ts',
+    workload: 'replays retained counterexamples through real spawned runner processes',
+  },
+  {
+    file: 'property-executor.test.ts',
+    workload: 'spawns real sandboxed runner processes with process-group kills and descendant-cessation checks',
+  },
+  {
     file: 'property-stateful-pilot.test.ts',
     workload: 'real fast-check property engine from the provisioned locked fixture (requires materialized toolchain)',
   },

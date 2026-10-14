@@ -27,3 +27,5 @@ _bmad/render/
 # per-stage evidence area are materialized locally and never committed.
 test/fixtures/property/real-tool/node_modules/
 test/fixtures/property/real-tool/.provisioning/
+# GH350 lane cold-start inputs (positively copied per worktree; see lane board)
+_bmad-inputs/

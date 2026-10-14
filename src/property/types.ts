@@ -222,12 +222,27 @@ export interface OverlayIdentity {
   readonly overlaySha256: string;
 }
 
-/** Everything a receipt binds so later changes invalidate it (issue §7). */
+/** Everything a receipt binds so later changes invalidate it (issue §7).
+ * Identities are DIGESTS, not labels: the executed argv and selection are
+ * recorded verbatim; the source is either a clean commit SHA, a content
+ * digest when dirty-source execution is explicitly supported, or an
+ * explicit refusal (a boolean is not a digest). */
+export type SourceIdentity =
+  | { readonly kind: 'clean-sha'; readonly sha: string }
+  | { readonly kind: 'content-digest'; readonly digest: string; readonly note: string }
+  | { readonly kind: 'refused-dirty' };
+
 export interface ExecutionIdentity {
-  readonly sourceSha: string;
-  readonly treeDirty: boolean;
+  readonly source: SourceIdentity;
+  /** The argv actually executed, verbatim (element 0 = executable). */
+  readonly argv: readonly string[];
+  /** The selection filter the plan bound this run to. */
+  readonly selectionFilter: string;
+  /** sha256 of the governing lockfile bytes when one exists. */
+  readonly lockIdentity: string | null;
+  /** sha256 of .gru-command/property.toml when one exists. */
+  readonly configIdentity: string | null;
   readonly overlay: OverlayIdentity | null;
-  readonly configSha256: string | null;
   readonly adapterProfile: string;
   readonly toolVersions: Readonly<Record<string, string>>;
 }
@@ -248,6 +263,21 @@ export interface ReplayData {
   readonly replayDisclosure: string | null;
 }
 
+/** Capture-completeness state: truncation and stream presence are
+ * explicit — a truncated or incomplete capture is disclosed, never
+ * silently treated as the whole truth. */
+export interface CaptureState {
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
+  readonly complete: boolean;
+}
+
+/** A retained minimized counterexample with its replay controls. */
+export interface RetainedCounterexample {
+  readonly minimizedInput: string;
+  readonly replay: ReplayData;
+}
+
 /** Host-owned execution receipt — the ONLY evidence that tests ran. */
 export interface PropertyExecutionReceipt {
   readonly identity: ExecutionIdentity;
@@ -255,6 +285,8 @@ export interface PropertyExecutionReceipt {
   readonly cwd: string;
   readonly outcome: PropertyRunOutcome;
   readonly outputs: readonly OutputArtefactRef[];
+  readonly capture: CaptureState;
+  readonly counterexample: RetainedCounterexample | null;
   readonly sandbox: SandboxEnforcement;
   readonly replay: ReplayData | null;
   readonly budget: ExecutionBudget;
@@ -262,16 +294,24 @@ export interface PropertyExecutionReceipt {
 
 declare const EXECUTOR_SEAL: unique symbol;
 
-/** RUNTIME-ENFORCED provenance (Root planning-record correction, 2026-10-14):
- * only the host executor module may construct a sealed receipt — the seal
- * token is a module-closure symbol that is never exported, and every
- * PRODUCTION consumer (qualification, freeze, metrics, Perkins wiring)
- * must verify receipts through the executor-exported runtime guard. A
- * TypeScript brand alone is not unforgeable provenance: callers cannot
- * construct this type without the symbol, and the runtime guard rejects
- * any object that was not produced through the executor closure. */
+/** RUNTIME-ENFORCED provenance (Root corrections 2026-10-14): a TypeScript
+ * brand alone is not unforgeable — a symbol property can be reflected and
+ * copied. The required implementation model is PRIVATE HOST ISSUANCE: the
+ * executor module keeps an unexported WeakSet issuance registry, constructs
+ * receipts only through its own closure, and the exported guard accepts a
+ * candidate ONLY when (a) the exact object is registry-issued and (b) its
+ * bound facts (argv, selection, output hashes, capture state) validate.
+ * Forged, cloned, serialized-untrusted and mutated receipts MUST fail the
+ * guard — lane B tests all four. */
 export interface SealedExecutionReceipt extends PropertyExecutionReceipt {
   readonly [EXECUTOR_SEAL]: true;
+}
+
+/** Opaque reference to a host-issued receipt. Qualification and freeze
+ * records bind receipt IDENTITY through these refs — never a caller-
+ * supplied hash or a copied object. */
+export interface ExecutionReceiptRef {
+  readonly receiptId: string;
 }
 
 /** The runtime guard the executor exports and every production consumer
@@ -303,7 +343,10 @@ export type QualificationVerdict =
   | 'rejected-inconclusive'
   | 'escalated';
 
+/** A qualification control outcome, bound to the HOST-ISSUED receipt that
+ * produced it — never a self-supplied hash or a bare boolean story. */
 export interface QualificationControlResult {
+  readonly receiptRef: ExecutionReceiptRef;
   readonly satisfied: boolean;
   readonly detail: string;
 }
@@ -328,10 +371,15 @@ export interface QualificationRecord {
 export type PropertyMode = 'disabled' | 'observation' | 'enforced';
 
 /** Effectiveness metrics (issue §9) — counts that cannot be gamed by
- * generating more cases. */
+ * generating more cases, and that never turn absence into a result:
+ * invalid oracles are OBSERVED vacuous/contradictory verdicts only;
+ * inconclusive/infrastructure/timeout outcomes have UNKNOWN validity and
+ * are counted separately with their denominators. */
 export interface PropertyMetricsSnapshot {
   readonly actionableDefects: number;
   readonly invalidOracles: number;
+  readonly unknownValidity: number;
+  readonly totalQualificationAttempts: number;
   readonly replayReliability: { readonly replayed: number; readonly reproduced: number };
   readonly escapedRegressions: number;
   readonly executedRuns: number;
