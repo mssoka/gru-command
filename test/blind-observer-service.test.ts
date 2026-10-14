@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
-import { admitBlindReview, recordBlindAdmission, BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
+import { admitBlindReview, recordBlindAdmission, BLIND_ACCESS_EVENT, type BlindCoverage } from '../src/dispatch/blind-review.js';
 import { pickFreePort, startRealService } from './helpers/real-service.mjs';
 
 /**
@@ -140,6 +140,18 @@ describe('compiled service: the production blind observer is installed at startu
       extraEnv: { GRU_BLIND_HTTP_MINION_ID: agentId, GRU_BLIND_HTTP_SESSION_FILE: sessionFile },
     });
     try {
+      const coverageUrl = `${service.baseUrl}/api/dispatch/jobs/${encodeURIComponent(jobId)}/blind-coverage`;
+      const beforeResponse = await fetch(coverageUrl, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(beforeResponse.status).toBe(200);
+      const before = (await beforeResponse.json()) as BlindCoverage;
+      expect(before).toMatchObject({
+        jobId, targetSha, role: 'blind', state: 'qualifying', qualifying: true,
+        accessObserved: false, prohibitedAccess: 0, reportPreserved: true,
+      });
+      expect(before.packageSha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(before.ruleSha256).toMatch(/^[0-9a-f]{64}$/);
       const res = await fetch(`${service.baseUrl}/api/silas/directive`, {
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -160,6 +172,20 @@ describe('compiled service: the production blind observer is installed at startu
           read.close();
         }
       }, { timeout: 20_000, interval: 200 });
+      const afterResponse = await fetch(coverageUrl, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(afterResponse.status).toBe(200);
+      const after = (await afterResponse.json()) as BlindCoverage;
+      expect(after).toMatchObject({
+        jobId: before.jobId, targetSha: before.targetSha, role: before.role,
+        packageSha256: before.packageSha256, ruleSha256: before.ruleSha256,
+        state: 'invalidated', qualifying: false, accessObserved: true,
+        reportPreserved: true,
+      });
+      expect(after.prohibitedAccess).toBeGreaterThanOrEqual(1);
+      // reportPreserved is the authenticated projection's metadata, not an
+      // independent assertion about persisted report bytes.
     } finally {
       await service.stop();
     }
