@@ -40,6 +40,13 @@ the caller supplies expectations only:
   worker turn queued under the job or one of its agent IDs; no pending
   supervisor restart/backoff, classification, recovery admission or
   automatic rate-limit retry (idle/error durable state is not cessation).
+- **No unconfirmed restart cleanup**: no generation-bound
+  `supervision.restart-cleanup-pending` / `-confirmed` /
+  `supervision.restart-rejected` custody debt for the job. A refused
+  replacement is quarantined from every registry lookup and its debt
+  refuses retirement until the ORIGINAL native owner records a
+  generation-bound disposal acknowledgment plus positive cessation proof
+  (see [Restart-cleanup custody](#restart-cleanup-custody-events-crash-surviving-producer-proof)).
 - **No in-flight admission**: no process-local admission reserved for the
   job (the boundary every producer crosses before its first await), including
   a pending provider-wall route lookup. The supervisor proof port is a
@@ -165,6 +172,54 @@ healthy holds on other jobs; strict control callers still fail closed.
 A hold on a job that later goes terminal is inert (terminal lanes accept no
 work): it is not projected as board debt and cannot mask a newer live
 hold.
+
+## Restart-cleanup custody events (crash-surviving producer proof)
+
+A supervisor restart/replacement that is refused (superseded, unreadable
+captured authority, terminal job, open retirement hold, failed binding) is
+**quarantined** — revoked from every registry lookup synchronously, before
+the asynchronous disposal — and its physical disposal is tracked by durable
+ledger events, so a crash mid-cleanup cannot hide a live producer from
+retirement:
+
+- `supervision.restart-cleanup-pending` — payload
+  `{generation, replacement_agent_id}`, written *before* the disposal
+  begins. `generation` is the exact **physical-handle** token, minted
+  before the write is attempted so a failed write keeps the same binding.
+- `supervision.restart-cleanup-confirmed` — payload `{generation,
+  origin_seq, replacement_agent_id, disposal_acknowledged,
+  cessation}`, written ONLY by the original native owner once disposal is
+  fulfilled AND the adapter-owned cessation probe returns `ceased`.
+  `disposal_acknowledged` must be `true` and `cessation` must be `ceased`,
+  and the confirmation is otherwise bound to the exact originating
+  `origin_seq` + `generation`: a mismatched job, agent, generation or
+  binding never clears debt.
+- `supervision.restart-rejected` — the refusal audit. Its `disposition` is
+  `disposed` (custody settled), `cleanup-unconfirmed` (a durable pending
+  entry exists but no receipt yet), or `cleanup-unjournaled` (the pending
+  write itself failed; the audit carries the SAME pre-minted `generation`).
+
+While any such debt is unconfirmed the job is a live owner: guarded
+retirement refuses with `409 live_work` naming the blocker. The blocker is
+**generation-bound, not id-bound**: a successor reusing the same logical
+minion id mints its own generation, so its clean disposal never releases the
+predecessor's custody. Only a receipt carrying the SAME exact generation
+(the original custodian's recovered retry) clears it; a legacy audit without
+a generation is never id-clearable.
+
+- **No ACK escape**: acknowledging the needs-owner notice
+  (`supervision.restart-cleanup-unconfirmed`) is presentation-only; it
+  writes no receipt and releases no custody.
+- **No restart escape**: a service restart (or a fresh restart rung) cannot
+  confirm a generation it did not dispose; the durable events replay the
+  debt and re-fence retirement.
+- **No successor-cleanup escape**: a same-id successor's clean disposal is
+  not proof of the predecessor's cessation.
+- **Hard-crash limitation**: if the original native owner is lost before it
+  records `disposal_acknowledged` + `cessation: 'ceased'`, the proof is
+  genuinely unavailable and the debt blocks indefinitely. That is the
+  intended fail-closed behavior — retiring past a possibly-live hidden
+  producer is exactly the state #280 closes.
 
 ## Proof identity to cite
 

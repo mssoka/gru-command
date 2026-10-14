@@ -29,6 +29,8 @@ import { reconcilePendingDirectives, reconcilePendingRebriefs, settleDirectivesF
 import { findBusyLanes, laneIsBusy } from '../src/dispatch/branch-idle.js';
 import { resolveGitCommit } from '../src/dispatch/perkins-review/artifacts.js';
 import type { WorktreeLane } from '../src/dispatch/worktree-port.js';
+import { Supervisor } from '../src/supervision/supervisor.js';
+import { RestartCleanupJournal } from '../src/supervision/restart-cleanup.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { directiveRetirementFingerprint } from '../src/ledger/directives.js';
 import { claimProviderRecoveryContinuation } from '../src/provider-recovery/resume.js';
@@ -337,6 +339,38 @@ async function seededLiveRequest(
 }
 
 describe('directive retirement — evidence-fenced control closure', () => {
+  it('refuses the actual guarded HTTP retirement for restored generation debt despite ACK and absent handles (GH-280)', async () => {
+    const repo = makeFixtureRepo('retire-restored-cleanup'); cleanupRepos.push(repo);
+    let supervisor: Supervisor | null = null;
+    const h = await boot({ pendingProducerBlockers: (jobId) => supervisor!.pendingProducerBlockers(jobId) });
+    const { lane, row } = await seededLiveRequest(h, repo, 'job-cleanup', 'req-cleanup');
+    const physical = { id: 'unpublished-result' } as AgentHandle;
+    const owner = new RestartCleanupJournal(h.ledger);
+    const debt = owner.begin(physical, row.jobId, 'original-minion');
+    const notice = h.notifications.post({ kind: 'supervision.restart-cleanup-unconfirmed', routing: 'needs-owner', severity: 'error',
+      title: 'Missing proof', detail: 'Original owner required' });
+    h.notifications.ack(notice.id, 'owner');
+    h.ledger.resolveNotificationById(notice.id, 'owner');
+    // A fresh ledger connection closes/reopens before constructing the new
+    // watchdog. The actual route reads the same durable database.
+    const old = new LedgerDb(h.dir); old.close();
+    const restored = new LedgerDb(h.dir); const api = new LedgerApi(restored.handle); const bus = new EventBus();
+    supervisor = new Supervisor({ ledger: api, notifications: new NotificationCenter({ ledger: api, bus }),
+      config: { enabled: false, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1 },
+      registry: { getHandle: () => null, quarantineHandle: () => {}, onAgentEvent: () => () => {}, spawn: async () => { throw new Error('must not spawn'); }, disposeHandle: async () => {} } });
+    try {
+      expect(supervisor.pendingProducerBlockers('unrelated')).toEqual([]);
+      const refused = await retire(h, row.requestId, laneHead(lane));
+      expect(refused.status).toBe(409);
+      expect(field<string>(refused.json, 'error')).toBe('live_work');
+      expect(h.ledger.getDirective(row.requestId)?.state).toBe('dispatching');
+      expect(countEvents(h, 'silas.directive-retired')).toBe(0);
+      owner.confirm(debt); // test fixture's exact originating owner receipt
+      const allowed = await retire(h, row.requestId, laneHead(lane));
+      expect(allowed.status).toBe(200);
+    } finally { supervisor.dispose(); restored.close(); }
+  });
+
   it('retires an admission-unknown request: one audit event, truthful readback, open hold', async () => {
     const repo = makeFixtureRepo('retire-success');
     cleanupRepos.push(repo);
