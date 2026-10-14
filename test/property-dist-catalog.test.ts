@@ -33,7 +33,7 @@ const PROPERTY_SOURCE_DIR = 'src/property';
 describe('GH350 dist catalog closure', () => {
   it('registers every property/cli source module as an exact dist catalog entry', () => {
     const sources = sourceFilesUnder(PROPERTY_SOURCE_DIR);
-    sources.push('src/cli/property-report.ts');
+    sources.push('src/cli/property-report.ts', 'src/cli/property-check.ts');
     expect(sources.length).toBeGreaterThan(0);
     for (const source of sources) {
       const output = `dist/${source.replace(/^src\//u, '').replace(/\.ts$/u, '')}.js`;
@@ -43,7 +43,7 @@ describe('GH350 dist catalog closure', () => {
 
   it('keeps no property/cli catalog entry without a corresponding source', () => {
     const stale = [...PUBLIC_REVIEW_EXECUTABLE_PATHS].filter((entry) => {
-      if (!entry.startsWith('dist/property/') && entry !== 'dist/cli/property-report.js') return false;
+      if (!entry.startsWith('dist/property/') && entry !== 'dist/cli/property-report.js' && entry !== 'dist/cli/property-check.js') return false;
       const sourcePath = entry.replace(/^dist\//u, 'src/').replace(/\.js$/u, '.ts');
       try {
         statSync(join(root, sourcePath));
@@ -62,6 +62,7 @@ describe('GH350 dist catalog closure', () => {
       'dist/property/adapters/matrix.js',
       'dist/property/adapters/vitest-fast-check.js',
       'dist/cli/property-report.js',
+      'dist/cli/property-check.js',
     ]) {
       expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.has(output)).toBe(true);
     }

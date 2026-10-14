@@ -40,6 +40,8 @@ export interface HeavyTestEntry {
 }
 
 export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
+  { file: 'property-repair-ci.test.ts', workload: 'real Git and sandboxed fake-runner controls for host approval, modes, bounded repair and CI' },
+  { file: 'property-real-tool-campaign.test.ts', workload: 'real locked Vitest+fast-check qualification, shrinking and replay in the OS sandbox; unsupported hosts assert refusal' },
   {
     file: 'property-perkins-integration.test.ts',
     workload: 'production whole-review lead tools over real frozen Git repositories and durable artifacts',

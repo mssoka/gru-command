@@ -9,6 +9,7 @@ import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/
 import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
 import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, type DeltaSince, type PriorCarryClassification } from './convergence.js';
 import { MAX_PROPERTY_PROPOSALS_PER_ROUND, MAX_PROPERTY_PROPOSALS_PER_SUBMISSION, parsePropertyContractsSubmission, PROPERTY_CONTRACTS_INPUT_SCHEMA, PROPERTY_CONTRACTS_TOOL_NAME, recordPropertyProposals, renderPropertyContractsGuidance } from './property-contracts.js';
+import { propertyEvidenceForReview, renderPropertyCampaignEvidence } from '../../property/pipeline.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -1086,6 +1087,8 @@ export class PerkinsWholeReview {
   async run(input: RunWholeReviewInput): Promise<PerkinsWholeResult> {
     const review = input.frozenReview;
     assertFrozenPromptBounds(review);
+    const propertyEvidence = propertyEvidenceForReview(review.manifest.repoPath, review.manifest.targetSha);
+    if (propertyEvidence !== null) writeReviewArtifact(review, 'property/host-evidence.json', propertyEvidence);
     const catalog = input.noSpec
       ? this.policy.portableContract.rules.noSpecLenses
       : this.policy.portableContract.rules.fullLenses;
@@ -2150,7 +2153,11 @@ export class PerkinsWholeReview {
     };
 
     const baseProofIssue = (verdict: string): SubmissionValidationIssue | null => {
-      if (verdict === 'INCOMPLETE' || input.recoveredBaseTips === undefined || input.recoveredBaseTips.length === 0) return null;
+      if (verdict === 'INCOMPLETE') return null;
+      const currentPropertyEvidence = propertyEvidenceForReview(review.manifest.repoPath, review.manifest.targetSha);
+      if (currentPropertyEvidence !== propertyEvidence) return { subject: 'submission', rule: 'property-evidence-moved', message: 'Host property evidence changed across the review boundary; restart or submit INCOMPLETE' };
+      if (reviewScope === 'whole' && propertyEvidence?.blocking === true && verdict === 'READY TO MERGE') return { subject: 'submission', rule: 'qualified-property-counterexample', message: 'An exact-candidate, qualified, replayed candidate-only counterexample remains in enforced mode. Retain and explain it as a finding; PBT never grants merge authority.' };
+      if (input.recoveredBaseTips === undefined || input.recoveredBaseTips.length === 0) return null;
       try {
         proveRecoveredBaseMergeability(review, input.recoveredBaseTips);
         return null;
@@ -2464,6 +2471,7 @@ export class PerkinsWholeReview {
       '--- PRODUCT-NATIVE TOOL CONTRACT ---',
       'Use perkins_run_specialists to start optional whole-change specialist children; use perkins_store_artifact only for optional lead notes; use perkins_preflight_submission to validate a candidate terminal submission without spending a terminal attempt; finish by calling perkins_submit_review.',
       renderPropertyContractsGuidance(),
+      renderPropertyCampaignEvidence(propertyEvidence),
       ...(priorReview.targetSha === null ? [] : ['On a re-review use perkins_read_prior_revision to list prior-target changes and read bounded path diffs while revisiting prior findings.']),
       'Specialists never inherit these tools. You, the lead, own every retained finding, every prior-finding disposition, and the verdict. Do not write implementation files.',
     ].join('\n');

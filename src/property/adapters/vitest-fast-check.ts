@@ -132,7 +132,7 @@ function installedVersion(context: PropertyDetectionContext, name: string): stri
     const file = join(root, 'node_modules', name, 'package.json');
     try {
       const info = lstatSync(file);
-      if (!info.isFile()) continue;
+      if (!info.isFile() || info.size > 2 * 1024 * 1024 || !contained(realpathSync(context.repoRoot), realpathSync(file))) continue;
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as { version?: unknown };
       if (typeof parsed.version === 'string') return parsed.version;
     } catch {
@@ -262,12 +262,12 @@ export function resolveVitestBinary(repoRoot: string, packageDir: string): { rea
     } catch {
       continue;
     }
-    if (info.isSymbolicLink()) {
+    if (info.isSymbolicLink() || info.isFile()) {
       let target: string;
       try {
         target = realpathSync(bin);
       } catch (error) {
-        return { path: null, reason: `node_modules/.bin/vitest symlink could not be resolved at ${bin}: ${String(error)}` };
+        return { path: null, reason: `node_modules/.bin/vitest path could not be resolved at ${bin}: ${String(error)}` };
       }
       if (!contained(canonicalRoot, target)) {
         return { path: null, reason: `node_modules/.bin/vitest resolves outside the repository (${target}) — refusing uncontained runner binary` };
@@ -283,7 +283,6 @@ export function resolveVitestBinary(repoRoot: string, packageDir: string): { rea
       }
       return { path: target, reason: null };
     }
-    if (info.isFile()) return { path: bin, reason: null };
     return { path: null, reason: `node_modules/.bin/vitest is neither a file nor a symlink at ${bin}` };
   }
   return { path: null, reason: 'no installed vitest binary under the package or repository node_modules — dependency installation is never automatic (see docs/PROPERTY-CONTRACTS.md)' };
@@ -342,15 +341,27 @@ function parseVitestReport(stdout: string): VitestJsonReport | null {
   const attempt = (text: string): VitestJsonReport | null => {
     try {
       const parsed = JSON.parse(text) as Partial<VitestJsonReport>;
-      if (!Array.isArray(parsed.testResults) || typeof parsed.numTotalTests !== 'number') return null;
+      if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.testResults) || typeof parsed.success !== 'boolean') return null;
+      for (const value of [parsed.numTotalTests, parsed.numPassedTests, parsed.numFailedTests, parsed.numPendingTests ?? 0, parsed.numTodoTests ?? 0]) {
+        if (!Number.isSafeInteger(value) || (value as number) < 0) return null;
+      }
+      const assertionStatuses = new Set(['passed', 'failed', 'skipped', 'todo', 'pending']);
+      const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+      if (!parsed.testResults.every((suite: unknown) => {
+        if (!object(suite) || typeof suite.name !== 'string' || typeof suite.status !== 'string' || !Array.isArray(suite.assertionResults)) return false;
+        return suite.assertionResults.every((assertion: unknown) => object(assertion) &&
+          typeof assertion.status === 'string' && assertionStatuses.has(assertion.status) &&
+          typeof assertion.fullName === 'string' && Array.isArray(assertion.failureMessages) &&
+          assertion.failureMessages.every((message: unknown) => typeof message === 'string'));
+      })) return null;
       return {
-        numTotalTests: parsed.numTotalTests,
+        numTotalTests: parsed.numTotalTests!,
         numPassedTests: typeof parsed.numPassedTests === 'number' ? parsed.numPassedTests : 0,
         numFailedTests: typeof parsed.numFailedTests === 'number' ? parsed.numFailedTests : 0,
         numPendingTests: typeof parsed.numPendingTests === 'number' ? parsed.numPendingTests : 0,
         numTodoTests: typeof parsed.numTodoTests === 'number' ? parsed.numTodoTests : 0,
         success: parsed.success === true,
-        testResults: parsed.testResults,
+        testResults: parsed.testResults.map((suite) => ({ ...suite, message: typeof suite.message === 'string' ? suite.message : null })),
       };
     } catch {
       return null;
@@ -427,7 +438,7 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
   const selectionFilter = toPosix(plan.args[plan.args.length - 1] ?? '');
   const suites = report.testResults.map((suite) => ({
     suite,
-    selected: selectionFilter !== '' && toPosix(suite.name).endsWith(selectionFilter),
+    selected: selectionFilter !== '' && (toPosix(suite.name) === selectionFilter || toPosix(suite.name).endsWith(`/${selectionFilter}`)),
   }));
   if (report.testResults.length === 0) {
     return { ...base, kind: 'selection-failure', selected: 0, executed: 0, skipped: 0, failed: 0, passed: 0, failures: [], unselectedFailures: [], reasons: ['parsable report contains zero test results — zero selected tests is never a pass'], matchedDiagnostic: null };
@@ -486,9 +497,9 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
 
   // Contradiction checks: the report must be self-consistent and agree with
   // the direct exit code, or it can never yield pass.
-  const totalsConsistent = report.numTotalTests === executed + skipped && report.numFailedTests === failed && report.numPassedTests === passed;
-  const exitConsistent = (raw.exitCode === 0) === report.success || failed > 0;
-  if (kind === 'pass' && (!totalsConsistent || !exitConsistent || raw.exitCode !== 0 || unselectedFailures.length > 0 || selectedExecuted === 0)) {
+  const totalsConsistent = report.numTotalTests === executed + skipped && executed === passed + failed && report.numFailedTests === failed && report.numPassedTests === passed && report.numPendingTests + report.numTodoTests === skipped;
+  const exitConsistent = raw.exitCode !== null && raw.signal === null && (raw.exitCode === 0) === report.success && (failed === 0 || !report.success);
+  if ((kind === 'pass' || kind === 'property-failure') && (!totalsConsistent || !exitConsistent || (kind === 'pass' && (raw.exitCode !== 0 || unselectedFailures.length > 0 || selectedExecuted === 0 || passed !== executed)))) {
     kind = 'inconclusive';
     if (!totalsConsistent) reasons.push('report totals disagree with per-assertion accounting — contradictory report');
     if (!exitConsistent) reasons.push(`report success=${String(report.success)} disagrees with exit code ${raw.exitCode ?? 'null'} — contradictory report`);

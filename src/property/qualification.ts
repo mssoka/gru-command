@@ -89,17 +89,23 @@ const ESCALATION_NOTE =
 function isCrediblePass(outcome: PropertyRunOutcome): boolean {
   return outcome.selected > 0 &&
     outcome.executed > 0 &&
+    outcome.passed === outcome.executed &&
+    outcome.selected <= outcome.executed &&
     outcome.failed === 0 &&
     outcome.failures.length === 0 &&
     outcome.unselectedFailures.length === 0 &&
     outcome.receipt.exitCode === 0 &&
+    outcome.receipt.signal === null &&
     !outcome.receipt.timedOut;
 }
 
 /** A property-failure is only credible with failing-assertion evidence
  * matched to the selection (an empty failure list is missing evidence). */
 function isCrediblePropertyFailure(outcome: PropertyRunOutcome): boolean {
-  return outcome.failures.length > 0 && outcome.failed > 0;
+  return outcome.failures.length > 0 && outcome.failed > 0 && outcome.selected > 0 &&
+    outcome.passed + outcome.failed === outcome.executed && outcome.unselectedFailures.length === 0 &&
+    outcome.receipt.exitCode !== null && outcome.receipt.exitCode !== 0 &&
+    outcome.receipt.signal === null && !outcome.receipt.timedOut;
 }
 
 function outcomeSummary(outcome: PropertyRunOutcome): string {
@@ -159,6 +165,7 @@ function verdictForControlPair(knownBad: PropertyRunOutcome, healthy: PropertyRu
         };
       }
       case 'property-failure': {
+        if (!isCrediblePropertyFailure(healthy)) return inconclusive(['healthy control claims property-failure without credible matched assertion/exit evidence; validity UNKNOWN']);
         return {
           verdict: 'rejected-contradictory',
           reasons: [
@@ -250,7 +257,18 @@ function resolveSealedEvidence(source: RunEvidenceSource, ref: ExecutionReceiptR
         '(forged, cloned, serialized-untrusted or mutated receipts are never qualification evidence)',
     );
   }
+  if (!candidate.capture.complete || candidate.capture.stdoutTruncated || candidate.capture.stderrTruncated || candidate.sandbox.backend === 'none-found' || !candidate.sandbox.networkDenied || !candidate.sandbox.filesystemIsolated || !candidate.sandbox.credentialsStripped || candidate.identity.source.kind === 'refused-dirty' || !/^[0-9a-f]{64}$/u.test(candidate.identity.workspaceTreeSha256 ?? '') || !/^[0-9a-f]{64}$/u.test(candidate.identity.dependencyTreeSha256 ?? '')) {
+    throw new UntrustedRunEvidenceError(`${role}: incomplete capture, unenforced sandbox or unbound source is not qualification evidence`);
+  }
   return candidate;
+}
+
+function requireCompatibleHarness(left: SealedExecutionReceipt, right: SealedExecutionReceipt): void {
+  if (left.identity.dependencyTreeSha256 !== right.identity.dependencyTreeSha256 || left.identity.lockIdentity !== right.identity.lockIdentity || left.identity.adapterProfile !== right.identity.adapterProfile || left.identity.selectionFilter !== right.identity.selectionFilter || JSON.stringify(left.budget) !== JSON.stringify(right.budget) || left.identity.overlay?.overlaySha256 !== right.identity.overlay?.overlaySha256) throw new UntrustedRunEvidenceError('control/candidate dependency bytes, lock, adapter, selection, budget or oracle differ; requalify on the same harness');
+}
+
+export function requireCompatibleHostEvidence(left: ExecutionReceiptRef, right: ExecutionReceiptRef, source: RunEvidenceSource): void {
+  requireCompatibleHarness(resolveSealedEvidence(source, left, 'left run'), resolveSealedEvidence(source, right, 'right run'));
 }
 
 /** A qualification record plus the host-issued control results it produced. */
@@ -276,6 +294,7 @@ export function qualifyContractWithHostEvidence(
   parsePropertyProposal(proposal);
   const knownBadReceipt = resolveSealedEvidence(source, knownBadRef, 'known-bad control');
   const healthyReceipt = resolveSealedEvidence(source, healthyRef, 'healthy control');
+  requireCompatibleHarness(knownBadReceipt, healthyReceipt);
   const knownBad = knownBadReceipt.outcome;
   const healthy = healthyReceipt.outcome;
   const record = verdictForControlPair(knownBad, healthy);
@@ -327,9 +346,10 @@ export function attributeCounterexampleWithHostEvidence(
   baselineRef: ExecutionReceiptRef | null,
   source: RunEvidenceSource,
 ): BaselineAttribution {
-  const candidate = resolveSealedEvidence(source, candidateRef, 'candidate run').outcome;
-  const baseline = baselineRef === null ? null : resolveSealedEvidence(source, baselineRef, 'baseline run').outcome;
-  return attributeCounterexample(candidate, baseline);
+  const candidate = resolveSealedEvidence(source, candidateRef, 'candidate run');
+  const baseline = baselineRef === null ? null : resolveSealedEvidence(source, baselineRef, 'baseline run');
+  if (baseline !== null) requireCompatibleHarness(candidate, baseline);
+  return attributeCounterexample(candidate.outcome, baseline?.outcome ?? null);
 }
 
 /** Verdicts that policy routes to human escalation. */

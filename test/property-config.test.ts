@@ -1,7 +1,8 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { lockfileIdentity, propertyConfigIdentity } from '../src/property/receipts.js';
 import {
   loadPropertyConfig,
   parsePropertyConfig,
@@ -46,6 +47,36 @@ describe('GH350 property config strict parse', () => {
     const root = mkdtempSync(join(tmpdir(), 'gh350-property-config-empty-'));
     roots.push(root);
     expect(loadPropertyConfig(root)).toBeNull();
+  });
+
+  it('bounds configuration bytes before either parsing or identity hashing', () => {
+    const root = makeRepo(`#${'x'.repeat(64 * 1024)}\nmode = "disabled"`);
+    expect(() => loadPropertyConfig(root)).toThrow(/exceeds/);
+    expect(() => propertyConfigIdentity(root)).toThrow(/exceeds/);
+    expect(() => parsePropertyConfig('x'.repeat(64 * 1024 + 1))).toThrow(/exceeds/);
+  });
+
+  it('binds every local lockfile and refuses oversized or aliased lock bytes', () => {
+    const root = makeRepo('mode = "disabled"');
+    writeFileSync(join(root, 'package-lock.json'), '{}'); const initial = lockfileIdentity(root, root);
+    writeFileSync(join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9');
+    expect(lockfileIdentity(root, root)).not.toBe(initial);
+    writeFileSync(join(root, 'yarn.lock'), '#'.repeat(2 * 1024 * 1024 + 1));
+    expect(() => lockfileIdentity(root, root)).toThrow(/exceeds/);
+    rmSync(join(root, 'yarn.lock')); const outside = makeRepo('mode = "disabled"');
+    symlinkSync(join(outside, PROPERTY_CONFIG_RELATIVE_PATH), join(root, 'yarn.lock'));
+    expect(() => lockfileIdentity(root, root)).toThrow(/ordinary/);
+  });
+
+  it('refuses configuration file and parent symlinks before reading host bytes', () => {
+    const outside = makeRepo('mode = "enforced"');
+    for (const parent of [false, true]) {
+      const root = makeRepo('mode = "disabled"');
+      const target = parent ? '.gru-command' : PROPERTY_CONFIG_RELATIVE_PATH;
+      rmSync(join(root, target), { recursive: true }); symlinkSync(join(outside, target), join(root, target));
+      expect(() => loadPropertyConfig(root)).toThrow(/ordinary/);
+      expect(() => propertyConfigIdentity(root)).toThrow(/ordinary/);
+    }
   });
 
   it('parses mode, budgets and adapter overrides from a full config', () => {

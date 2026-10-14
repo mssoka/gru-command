@@ -9,10 +9,12 @@ independently authorize merging, publication or deployment.
 
 ## Implementation status on the GH350 work branch
 
-Capability resolution, proposal validation/recording and qualification helpers
-are implemented. Executor integration, real-tool/security qualification,
-repair/regression/CI wiring and final whole-change gates are still in progress;
-the contracts described below are not a claim that those gates have passed.
+Capability resolution, host-owned sandbox execution, guarded qualification,
+seed/path replay, Perkins evidence, bounded repair, reviewed regression
+retention, CLI and CI wiring are implemented. The deterministic real-tool
+campaign exercises the complete chain on macOS. Final whole-change review,
+full-suite/exact-head CI and owner merge approval are separate delivery gates;
+the implementation or a focused campaign passing does not claim those gates.
 The lead's `perkins_submit_property_contracts` tool records immutable,
 untrusted-input snapshots (8 proposals per call, 32 per round). It refuses
 late submissions after the terminal review and counts only persisted artifacts.
@@ -104,12 +106,31 @@ process-group termination on budget expiry with descendant cessation.
 Where no qualified backend exists the executor REFUSES (`not-run` /
 `unsupported` naming the gap) — a worktree is not a sandbox, and nothing
 ever executes unsandboxed as a fallback. Approved bounds (iterations,
-shrinking, runtime, repair attempts) are never silently raised.
+shrinking, runtime, repair attempts) are never silently raised. The pilot
+executes one reviewed JavaScript test selection, uses native configuration
+loading with esbuild/cache/watch/API disabled, and permits one active run per
+executor. The workspace is read-only even for generated tests. A 256MiB V8
+heap flag is not a universal native/RSS limit or a global concurrency quota.
+The host supplies iteration/shrink bounds to the reviewed property through
+`GRU_PROPERTY_MAX_ITERATIONS`/`GRU_PROPERTY_MAX_SHRINK_STEPS`; arbitrary JS
+that ignores those values is still bounded by the OS restrictions and wall
+clock, not by a claimed universal assertion-count monitor.
+
+**Owner-defined trust boundary:** Seatbelt denials may return catchable
+`EPERM`/`EACCES`. A hostile runner that catches a denial and prints PASS can
+produce only an unqualified `runner-report-classification`, not product
+proof. The production host must reject fake/vacuous known-bad controls even
+when both raw reports say PASS. No per-operation host audit or fatal-denial
+mode is claimed; fatal denials also break legitimate Node/Tinypool probes.
+The raw-parser distinction and production rejection have separate regression
+controls. See the recorded owner decision in
+`_bmad-output/implementation-artifacts/gh350-security-matrix-decision.md`.
 
 Receipts bind source commit/tree, the explicit overlay identity (per-file
 hashes; the source SHA alone never identifies the tested bytes —
 exact-head/clean-tree verification elsewhere is untouched), configuration,
-dependency and adapter versions, the actual command and working directory,
+copied source and installed dependency byte digests, dependency and adapter
+versions, the actual command and working directory,
 selected/executed/skipped accounting, direct exit/signal/timeout state,
 output hashes, and replay data (seed, shrink path, schedule, environment
 profile). Retained counterexamples replay under the recorded data or
@@ -139,11 +160,50 @@ parsed): `disabled`, `observation` (execute and record, never block) and
 `enforced` (qualified failures may hold the PR through the EXISTING review
 authority — property PASS never independently authorizes anything; the
 original final tests, independent whole-change review, exact-head/remote
-checks and readiness gates remain mandatory). CI runs bounded PR checks
-and optional deeper scheduled exploration with retained replay evidence,
-on the same declared locked fixture setup. Metrics distinguish actionable
-defects and invalid oracles from raw generated-case counts and report total
-execution/token cost.
+checks and readiness gates remain mandatory). Missing configuration defaults
+to disabled. Observation records evidence but cannot block or allocate a
+repair; enforced candidate-only, qualified, actually replayed failures can
+hold an ordinary whole-pass Perkins READY decision. Delta convergence and
+all final verification rules remain unchanged.
+
+The host CLI requires explicit artifact-review approval:
+
+```sh
+node dist/cli/property-check.js --approve-reviewed-campaign reviewed.json \\
+  --artifacts-dir /owned/property-evidence --trigger pull-request
+```
+
+The closed JSON schema contains exactly `proposal`, `overlayFiles`,
+`knownBadRoot`, `healthyRoot`, `candidateRoot`, and nullable `baselineRoot`.
+Artifact references must match reviewed bytes. A baseline must be a real Git
+ancestor, not an unrelated healthy example. There are no command fields or
+installation permissions. Persisted JSON is audit material: it cannot recreate
+in-process execution, report, repair-directive or artifact-review authority.
+A new process must execute and qualify again.
+
+Repairs use the existing minion fix-directive router, with one-use allocations
+and at most three total attempts. Source movement across async boundaries,
+changed dependency/lock/adapter/oracle/budget identities, and deletion of an
+already-present frozen contract require requalification. Each repair validation
+uses both the retained seed and native shrink path, so passing only the random
+cases cannot hide a still-broken minimized edge case. Configuration parsing and
+identity hashing refuse aliased or over-64KiB inputs; lock identity binds all
+recognized package/root lockfiles with a 2MiB per-file ceiling. Reviewed retention
+keeps the original candidate counterexample (not a qualification control's) and
+preserves oracle bytes and adds a closed seed/path regression wrapper plus
+the actual minimized counterexample/replay audit file. Retention changes
+source bytes and invalidates prior review evidence.
+
+`.github/workflows/property-contracts.yml` runs the bounded positive macOS
+campaign for PRs/manual runs and weekly scheduled campaigns, retaining replay
+receipts/counterexamples/metrics. The scheduled campaign uses the same bounds;
+it is not a claim of deeper search or new-contract generation. The Ubuntu
+full suite additionally covers explicit unsupported-host refusal, not positive
+sandbox proof. Both workflows materialize the separately locked fixture under
+the approved provisioning guards; workflow definitions are not green CI.
+Metrics distinguish actionable defects and invalid oracles from raw generated
+case counts, retain unknown validity separately, and report execution time
+and token cost (unknown token costs remain `null`).
 
 ## Real-tool fixture (test-only)
 

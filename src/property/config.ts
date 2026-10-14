@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'smol-toml';
 import type { ExecutionBudget, PropertyMode } from './types.js';
@@ -15,6 +15,7 @@ import type { ExecutionBudget, PropertyMode } from './types.js';
  */
 
 export const PROPERTY_CONFIG_RELATIVE_PATH = '.gru-command/property.toml';
+const MAX_CONFIG_BYTES = 64 * 1024;
 
 /** Upper bounds budgets may not exceed (policy-approved ceilings — budgets
  * are never silently raised, and a config cannot exceed these). */
@@ -84,6 +85,7 @@ export function parsePropertyConfig(
   text: string,
   source: string = PROPERTY_CONFIG_RELATIVE_PATH,
 ): PropertyRepoConfig {
+  if (Buffer.byteLength(text, 'utf8') > MAX_CONFIG_BYTES) throw new PropertyConfigValidationError(`${source} exceeds ${MAX_CONFIG_BYTES} bytes`);
   let raw: Record<string, unknown>;
   try {
     raw = table(parse(text), 'property config document', source);
@@ -157,13 +159,27 @@ export function parsePropertyConfig(
  * the file is absent (defaults are the caller's); every other deviation
  * fails loud naming the file and key. */
 export function loadPropertyConfig(repoRoot: string): PropertyRepoConfig | null {
-  const path = join(repoRoot, PROPERTY_CONFIG_RELATIVE_PATH);
-  if (!existsSync(path)) return null;
-  let text: string;
+  const text = readPropertyConfigText(repoRoot);
+  return text === null ? null : parsePropertyConfig(text, join(repoRoot, PROPERTY_CONFIG_RELATIVE_PATH));
+}
+
+/** Shared bounded input for parsing and identity hashing. Metadata discovery
+ * must not read through repository-planted aliases into host files. */
+export function readPropertyConfigText(repoRoot: string): string | null {
+  const root = realpathSync(repoRoot); const path = join(root, PROPERTY_CONFIG_RELATIVE_PATH);
   try {
-    text = readFileSync(path, 'utf-8');
+    const parent = lstatSync(join(root, '.gru-command'), { throwIfNoEntry: false });
+    if (parent === undefined) return null;
+    if (!parent.isDirectory()) throw new PropertyConfigValidationError(`${path} parent must be an ordinary directory`);
+    const info = lstatSync(path, { throwIfNoEntry: false });
+    if (info === undefined) return null;
+    if (!info.isFile() || info.nlink !== 1) throw new PropertyConfigValidationError(`${path} must be an ordinary unshared file`);
+    if (info.size > MAX_CONFIG_BYTES) throw new PropertyConfigValidationError(`${path} exceeds ${MAX_CONFIG_BYTES} bytes`);
+    const text = readFileSync(path, 'utf8');
+    if (Buffer.byteLength(text, 'utf8') > MAX_CONFIG_BYTES) throw new PropertyConfigValidationError(`${path} exceeds ${MAX_CONFIG_BYTES} bytes`);
+    return text;
   } catch (error) {
+    if (error instanceof PropertyConfigValidationError) throw error;
     throw new PropertyConfigValidationError(`${path} could not be read: ${String(error)}`);
   }
-  return parsePropertyConfig(text, path);
 }

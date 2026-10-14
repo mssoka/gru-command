@@ -183,6 +183,30 @@ describe('GH350 vitest adapter interpretation precedence', () => {
     expect(outcome.reasons.join(' ')).toContain('contradictory report');
   });
 
+  it('never treats unknown assertion statuses as executed passing tests', () => {
+    const stdout = vitestJson({ numTotalTests: 1, numPassedTests: 0, numFailedTests: 0, success: true, testResults: [{ name: `/repo/${FILTER}`, status: 'passed', assertionResults: [{ status: 'running', fullName: 'not completed', failureMessages: [] }] }] });
+    expect(interpretVitestJsonReceipt(receipt({ stdout }), plan()).kind).toBe('inconclusive');
+  });
+
+  it('returns inconclusive for malformed nested report rows rather than throwing', () => {
+    for (const row of [null, { name: FILTER, status: 'passed', assertionResults: null }, { name: FILTER, status: 'passed', assertionResults: [null] }, { name: FILTER, status: 'failed', assertionResults: [{ status: 'failed', fullName: 'bad', failureMessages: null }] }]) {
+      const stdout = vitestJson({ numTotalTests: 1, numPassedTests: 1, numFailedTests: 0, success: true, testResults: [row] });
+      expect(interpretVitestJsonReceipt(receipt({ stdout }), plan()).kind).toBe('inconclusive');
+    }
+  });
+
+  it('rejects contradictory failure reports instead of qualifying fabricated control failures', () => {
+    for (const raw of [receipt({ exitCode: 0, stdout: selectedFailure }), receipt({ exitCode: 1, stdout: selectedFailure.replace('"numFailedTests":1', '"numFailedTests":0') })]) {
+      expect(interpretVitestJsonReceipt(raw, plan()).kind).toBe('inconclusive');
+    }
+  });
+
+  it('requires a path-segment boundary rather than matching a sibling filename suffix', () => {
+    const stdout = selectedFailure.replace(`/repo/${FILTER}`, `/repo/other${FILTER}`);
+    const outcome = interpretVitestJsonReceipt(receipt({ exitCode: 1, stdout }), plan());
+    expect(outcome.kind).toBe('inconclusive'); expect(outcome.selected).toBe(0); expect(outcome.failures).toHaveLength(0); expect(outcome.unselectedFailures).toHaveLength(1);
+  });
+
   it('returns not-run with the refusal reason for a non-executable plan', () => {
     const outcome = interpretVitestJsonReceipt(
       receipt(),
@@ -224,6 +248,13 @@ describe('GH350 vitest adapter planning', () => {
     const planBuilt = buildVitestExecutionPlan(contextFor(root), placement);
     expect(planBuilt.executable).toBe(false);
     expect(planBuilt.refusalReason).toContain('dependency installation is never automatic');
+  });
+
+  it('refuses a regular runner hidden behind an escaping node_modules parent symlink', () => {
+    const root = makeRoot(); const outside = makeRoot();
+    mkdirSync(join(outside, '.bin')); writeFileSync(join(outside, '.bin/vitest'), 'outside runner');
+    symlinkSync(outside, join(root, 'node_modules'));
+    expect(resolveVitestBinary(root, root)).toMatchObject({ path: null, reason: expect.stringContaining('outside the repository') });
   });
 
   it('resolves a contained .bin symlink to the real runner target', () => {

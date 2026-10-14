@@ -234,6 +234,10 @@ export type SourceIdentity =
 
 export interface ExecutionIdentity {
   readonly source: SourceIdentity;
+  /** Additive host binding for copied tracked/dependency bytes. Production
+   * receipts require it; legacy/unissued unit values may omit it. */
+  readonly workspaceTreeSha256?: string;
+  readonly dependencyTreeSha256?: string;
   /** The argv actually executed, verbatim (element 0 = executable). */
   readonly argv: readonly string[];
   /** The selection filter the plan bound this run to. */

@@ -40,6 +40,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Provision locked property test fixture (isolated, no lifecycle scripts)
+        run: node tools/provision-property-real-fixture.mjs materialize
+
       - name: Lint
         run: npm run lint
 

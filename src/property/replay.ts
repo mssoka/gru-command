@@ -80,7 +80,7 @@ export async function replayRetainedCounterexample(request: ReplayRequest): Prom
     repoRoot,
     packageDir,
     overlayFiles,
-    approval: executor.approvePlan({ plan, repoRoot, packageDir }),
+    approval: executor.approvePlan({ plan, repoRoot, packageDir, overlayFiles, replaySeed: seed, replayPath: replay.shrinkPath[0] ?? null }),
     replaySeed: seed,
     replayPath: replay.shrinkPath[0] ?? null,
   });
@@ -114,7 +114,7 @@ export async function replayRetainedCounterexample(request: ReplayRequest): Prom
   );
   const seedMatches = echoedSeed === seed;
   const inputMatches = replayed.input === counterexample.minimizedInput;
-  const identityMatches = JSON.stringify(receipt.identity.source) === JSON.stringify(request.originalReceipt.identity.source) && receipt.identity.overlay?.overlaySha256 === request.originalReceipt.identity.overlay?.overlaySha256 && receipt.identity.selectionFilter === request.originalReceipt.identity.selectionFilter && receipt.identity.adapterProfile === request.originalReceipt.identity.adapterProfile;
+  const identityMatches = JSON.stringify(receipt.identity.source) === JSON.stringify(request.originalReceipt.identity.source) && receipt.identity.workspaceTreeSha256 === request.originalReceipt.identity.workspaceTreeSha256 && receipt.identity.dependencyTreeSha256 === request.originalReceipt.identity.dependencyTreeSha256 && receipt.identity.lockIdentity === request.originalReceipt.identity.lockIdentity && receipt.identity.configIdentity === request.originalReceipt.identity.configIdentity && receipt.identity.overlay?.overlaySha256 === request.originalReceipt.identity.overlay?.overlaySha256 && receipt.identity.selectionFilter === request.originalReceipt.identity.selectionFilter && receipt.identity.adapterProfile === request.originalReceipt.identity.adapterProfile;
   if (seedMatches && inputMatches && replayed.parsed && identityMatches && environmentMatch) {
     return {
       kind: 'reproduced',

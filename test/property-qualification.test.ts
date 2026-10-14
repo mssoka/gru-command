@@ -116,6 +116,8 @@ function receiptFor(outcome: PropertyRunOutcome): PropertyExecutionReceipt {
   return {
     identity: {
       source: { kind: 'clean-sha', sha: 'efd893058693a224a89954d73e39e45e4321b74f' },
+      workspaceTreeSha256: 'a'.repeat(64),
+      dependencyTreeSha256: 'b'.repeat(64),
       argv: ['/repo/node_modules/.bin/vitest', 'run', '--reporter=json', FILTER],
       selectionFilter: FILTER,
       lockIdentity: null,
@@ -196,6 +198,19 @@ describe('GH350 qualification verdicts (injected unit controls)', () => {
     expect(record.verdict).toBe('rejected-vacuous');
     expect(record.reasons.join(' ')).toContain('vacuous');
     expect(record.frozen).toBeNull();
+  });
+
+  it('independently refuses inconsistent pass counts and a zero-exit known-bad failure', () => {
+    const good = outcomeFromFixture('healthy-passes.report.json', 0); const bad = outcomeFromFixture('known-bad-fails.report.json', 1);
+    const incompletePass = bareOutcome({ kind: 'pass', passed: 0 });
+    expect(qualifyContract(proposal, controls(incompletePass, good)).verdict).toBe('rejected-inconclusive');
+    expect(qualifyContract(proposal, controls(bad, incompletePass)).verdict).toBe('rejected-inconclusive');
+    expect(qualifyContract(proposal, controls({ ...bad, receipt: { ...bad.receipt, exitCode: 0 } }, good)).verdict).toBe('rejected-inconclusive');
+  });
+
+  it('keeps validity unknown when a claimed healthy failure has no credible assertion evidence', () => {
+    const bad = outcomeFromFixture('known-bad-fails.report.json', 1);
+    expect(qualifyContract(proposal, controls(bad, bareOutcome({ kind: 'property-failure', failed: 1, failures: [] }))).verdict).toBe('rejected-inconclusive');
   });
 
   it('rejects as inconclusive with validity UNKNOWN when the known-bad control only hit an infrastructure error', () => {
@@ -343,6 +358,22 @@ describe('GH350 production qualification accepts only host-issued evidence', () 
     expect(() => qualifyContractWithHostEvidence(proposal, forgedRef, healthyRef, fake.source)).toThrowError(
       UntrustedRunEvidenceError,
     );
+  });
+
+  it('refuses incomplete capture even when the unit issuance double accepts it', () => {
+    const fake = fakeEvidenceSource();
+    const bad = fake.issue(outcomeFromFixture('known-bad-fails.report.json', 1), 'bad-truncated');
+    const healthy = fake.issue(outcomeFromFixture('healthy-passes.report.json', 0), 'healthy-truncated');
+    Object.assign((fake.source.resolve(bad) as PropertyExecutionReceipt).capture, { complete: false, stdoutTruncated: true });
+    expect(() => qualifyContractWithHostEvidence(proposal, bad, healthy, fake.source)).toThrow(/incomplete capture/);
+  });
+
+  it('refuses different installed dependency bytes rather than qualifying against a different harness', () => {
+    const fake = fakeEvidenceSource();
+    const bad = fake.issue(outcomeFromFixture('known-bad-fails.report.json', 1), 'bad-deps');
+    const healthy = fake.issue(outcomeFromFixture('healthy-passes.report.json', 0), 'healthy-deps');
+    Object.assign((fake.source.resolve(healthy) as PropertyExecutionReceipt).identity, { dependencyTreeSha256: 'c'.repeat(64) });
+    expect(() => qualifyContractWithHostEvidence(proposal, bad, healthy, fake.source)).toThrow(/dependency bytes/);
   });
 
   it('attributes through sealed host evidence (baseline-also-fails via refs)', () => {

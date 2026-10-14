@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import type {
   CaptureState,
   ExecutionBudget,
@@ -17,6 +17,7 @@ import type {
   SourceIdentity,
 } from './types.js';
 import { sha256Hex } from './overlay.js';
+import { readPropertyConfigText } from './config.js';
 
 /**
  * Receipt assembly (GH350 seam B, contract v3): typed receipts binding
@@ -92,26 +93,30 @@ export function buildSourceIdentity(repoRoot: string): SourceIdentity {
   return { kind: 'clean-sha', sha };
 }
 
-/** sha256 of the governing lockfile bytes when one exists, else null. */
+/** Bind all recognized package/root locks, not just the first npm file.
+ * Only absent files are absence; unreadable, aliased or oversized is fatal. */
 export function lockfileIdentity(packageDir: string, repoRoot: string): string | null {
-  for (const dir of unique([packageDir, repoRoot])) {
-    const lock = join(dir, 'package-lock.json');
-    try {
-      return sha256Hex(readFileSync(lock, 'utf-8'));
-    } catch {
-      // Absent at this root — try the next.
+  const root = realpathSync(repoRoot); const entries: { path: string; sha256: string }[] = [];
+  for (const dir of unique([realpathSync(packageDir), root])) {
+    const rel = relative(root, dir);
+    if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) throw new ReceiptCoherenceError('lockfile directory escapes repository');
+    for (const name of ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock']) {
+      const lock = join(dir, name); const info = lstatSync(lock, { throwIfNoEntry: false });
+      if (info === undefined) continue;
+      if (!info.isFile() || info.nlink !== 1) throw new ReceiptCoherenceError(`${lock} must be an ordinary unshared lockfile`);
+      if (info.size > 2 * 1024 * 1024) throw new ReceiptCoherenceError(`${lock} exceeds 2097152 bytes`);
+      const bytes = readFileSync(lock);
+      if (bytes.length > 2 * 1024 * 1024) throw new ReceiptCoherenceError(`${lock} exceeds 2097152 bytes`);
+      entries.push({ path: relative(root, lock), sha256: createHash('sha256').update(bytes).digest('hex') });
     }
   }
-  return null;
+  return entries.length === 0 ? null : sha256Hex(JSON.stringify(entries));
 }
 
 /** sha256 of `.gru-command/property.toml` when one exists, else null. */
 export function propertyConfigIdentity(repoRoot: string): string | null {
-  try {
-    return sha256Hex(readFileSync(join(repoRoot, '.gru-command', 'property.toml'), 'utf-8'));
-  } catch {
-    return null;
-  }
+  const text = readPropertyConfigText(repoRoot);
+  return text === null ? null : sha256Hex(text);
 }
 
 function unique(paths: readonly string[]): readonly string[] {
@@ -178,7 +183,7 @@ export function captureState(stdoutTruncated: boolean, stderrTruncated: boolean)
  * environment POLICY inputs, not the throwaway workspace path.
  */
 export function environmentProfileString(env: Readonly<Record<string, string>>): string {
-  const volatile = new Set(['HOME', 'TMPDIR', 'GRU_PROPERTY_SEED', 'GRU_PROPERTY_PATH']);
+  const volatile = new Set(['HOME', 'TMPDIR', 'CFFIXED_USER_HOME', 'GRU_PROPERTY_SEED', 'GRU_PROPERTY_PATH']);
   const canonical = Object.keys(env)
     .filter((key) => !volatile.has(key))
     .sort()

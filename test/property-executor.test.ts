@@ -1,7 +1,8 @@
 import { createServer } from 'node:net';
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createPropertyExecutor, isSealedExecutionReceipt, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { applyOverlayFiles } from '../src/property/overlay.js';
@@ -39,11 +40,30 @@ describe('host property executor (positive sandbox controls on macOS; other host
     await expect(executor.executePlan(input)).rejects.toThrow(/host approval/);
     await expect(executor.executePlan({ ...input, approval: { ...approval } })).rejects.toThrow(/host approval/);
   });
-  it('invalidates approval when runner bytes or tracked source changes', () => {
+  it('invalidates approval when runner bytes or tracked source changes', async () => {
     const f = fixture(); const executor = createPropertyExecutor();
-    executor.approvePlan({ plan: f.plan, repoRoot: f.root, packageDir: f.root });
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root, adapter }; const approval = executor.approvePlan(input);
+    writeFileSync(join(f.root, 'node_modules/vitest/vitest.mjs'), `${PASS_RUNNER}\n// altered runner`);
+    if (process.platform === 'darwin') await expect(executor.executePlan({ ...input, approval })).rejects.toThrow(/stale host approval/);
     writeFileSync(join(f.root, 'test/placeholder'), 'changed');
-    expect(() => executor.approvePlan({ plan: f.plan, repoRoot: f.root, packageDir: f.root })).toThrow(/clean/);
+    expect(() => executor.approvePlan(input)).toThrow(/clean/);
+  });
+  it('refuses transient unapproved copy bytes even when the source is restored before the final check', async () => {
+    const f = fixture(); const executor = createPropertyExecutor(); const input = { plan: f.plan, adapter, repoRoot: f.root, packageDir: f.root };
+    const approval = executor.approvePlan(input);
+    if (process.platform !== 'darwin') { expect((await executor.executePlan({ ...input, approval })).executed).toBe(false); return; }
+    const target = join(f.root, 'test/placeholder'); const original = readFileSync(target); const mkdtemp = fs.mkdtempSync; const copy = fs.cpSync;
+    // Deterministic race: change only after admission, copy the transient
+    // bytes, then restore before the final source fingerprint. No sleeps.
+    const make = vi.spyOn(fs, 'mkdtempSync').mockImplementation((prefix, options) => {
+      const destination = mkdtemp(prefix, options); writeFileSync(target, 'unapproved transient bytes\n'); return destination;
+    });
+    const cp = vi.spyOn(fs, 'cpSync').mockImplementation((...args) => { copy(...args); writeFileSync(target, original); });
+    syncBuiltinESMExports();
+    try {
+      await expect(executor.executePlan({ ...input, approval })).rejects.toThrow(/approved snapshot/);
+      expect(make).toHaveBeenCalledOnce(); expect(cp).not.toHaveBeenCalled();
+    } finally { make.mockRestore(); cp.mockRestore(); syncBuiltinESMExports(); writeFileSync(target, original); }
   });
   it('issues only real host receipts and rejects forged, cloned, serialized and mutated evidence', async () => {
     const r = await run(PASS_RUNNER); if (r === null) return;
@@ -103,5 +123,58 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(overlay.files[0]!.bytes).toBe(1); expect(readFileSync(join(f.root, 'test/a.ts'), 'utf8')).toBe('a');
     expect(() => applyOverlayFiles({ workspaceRoot: f.root, files: [{ path: 'a', content: '1' }, { path: 'a', content: '2' }] })).toThrow(/duplicate/);
     mkdirSync(join(f.root, 'normal')); writeFileSync(join(f.root, 'normal/a'), 'a');
+  });
+  it('binds host approval to exact overlay bytes and replay controls', async () => {
+    const f = fixture(); const executor = createPropertyExecutor();
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root, adapter, overlayFiles: [{ path: 'test/approved.mjs', content: 'approved' }] };
+    const approval = executor.approvePlan(input);
+    if (process.platform !== 'darwin') { expect((await executor.executePlan({ ...input, approval })).executed).toBe(false); return; }
+    await expect(executor.executePlan({ ...input, approval, overlayFiles: [{ path: 'test/approved.mjs', content: 'changed' }] })).rejects.toThrow(/stale host approval/);
+    await expect(executor.executePlan({ ...input, approval, replaySeed: '999' })).rejects.toThrow(/stale host approval/);
+  });
+  it('invalidates approval on installed dependency bytes even when version metadata is unchanged', async () => {
+    const f = fixture(); const executor = createPropertyExecutor(); const file = join(f.root, 'node_modules/vitest/internal.mjs');
+    writeFileSync(file, 'export const x=1;'); const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root, adapter }; const approval = executor.approvePlan(input);
+    writeFileSync(file, 'export const x=2;');
+    if (process.platform !== 'darwin') { expect((await executor.executePlan({ ...input, approval })).executed).toBe(false); return; }
+    await expect(executor.executePlan({ ...input, approval })).rejects.toThrow(/stale host approval/);
+  });
+  it('denies disk writes even inside the copied workspace', async () => {
+    const r = await run(`import fs from 'node:fs';try{fs.writeFileSync('disk-flood',Buffer.alloc(1024));console.log('WRITE')}catch(e){console.log(e.code)}`); if (r === null) return;
+    expect(r.receipt.outcome.receipt.stdout).toMatch(/EPERM|EACCES/); expect(r.receipt.outcome.receipt.stdout).not.toContain('WRITE'); expect(r.cleanup.proven).toBe(true);
+  });
+  it('enforces one active run and spends a host capability only once', async () => {
+    const f = fixture(`setInterval(()=>{},1000)`); const executor = createPropertyExecutor();
+    const input = { plan: { ...f.plan, budget: { ...f.plan.budget, runTimeoutMs: 300 } }, repoRoot: f.root, packageDir: f.root, adapter }; const approval = executor.approvePlan(input);
+    const first = executor.executePlan({ ...input, approval });
+    const second = await executor.executePlan({ ...input, approval }); const result = await first;
+    if (process.platform !== 'darwin') { expect(result.executed).toBe(false); return; }
+    expect(second).toMatchObject({ executed: false, refusal: { reason: expect.stringContaining('concurrency ceiling') } });
+    expect(result).toMatchObject({ executed: true, cleanup: { proven: true } });
+    await expect(executor.executePlan({ ...input, approval })).rejects.toThrow(/host approval/);
+  });
+  it('refuses dependency symlink/hardlink escapes and invalid copy ceilings before execution', () => {
+    const f = fixture(); const outside = fixture(); const secret = join(outside.root, 'canary'); writeFileSync(secret, 'synthetic-secret');
+    symlinkSync(secret, join(f.root, 'node_modules/escape'));
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    expect(() => createPropertyExecutor().approvePlan(input)).toThrow(/symlink refused/);
+    const hard = fixture(); linkSync(secret, join(hard.root, 'node_modules/hardlink'));
+    expect(() => createPropertyExecutor().approvePlan({ ...input, repoRoot: hard.root, packageDir: hard.root, plan: hard.plan })).toThrow(/hardlinked/);
+    expect(() => createPropertyExecutor({ workspaceCopyBounds: { maxFiles: NaN, maxBytes: 1000 } })).toThrow(/invalid/);
+  });
+  it('keeps a caught-denial fake PASS as an unqualified parser report, never product proof', async () => {
+    const host = fixture(); const canary = join(host.root, 'protected-canary'); writeFileSync(canary, 'synthetic-secret');
+    const r = await run(`import fs from 'node:fs';try{console.error(fs.readFileSync(${JSON.stringify(canary)},'utf8'))}catch(e){console.error(e.code)};${PASS_RUNNER}`); if (r === null) return;
+    // Owner decision: retain the raw classification, not a fatal startup
+    // policy or a product verdict. The separate host campaign rejects this
+    // runner when it also reports PASS against the known-bad control.
+    expect(r.receipt.outcome).toMatchObject({ kind: 'pass', evidenceClass: 'runner-report-classification' });
+    expect(r.receipt.outcome.receipt.stderr).toMatch(/EPERM|EACCES/);
+    expect(r.receipt.outcome.receipt.stderr).not.toContain('synthetic-secret');
+    expect(r.receipt).not.toHaveProperty('qualification'); expect(r.cleanup.proven).toBe(true);
+  });
+  it('kills live worker threads as well as the parent before claiming cessation', async () => {
+    const r = await run(`import {Worker} from 'node:worker_threads';new Worker('console.log("THREAD_READY");setInterval(()=>{},1000)',{eval:true});setInterval(()=>{},1000)`, { timeout: 1000 }); if (r === null) return;
+    expect(r.receipt.outcome.receipt.stdout).toContain('THREAD_READY'); expect(r.receipt.outcome.kind).toBe('timeout'); expect(r.cleanup.proven).toBe(true);
   });
 });
