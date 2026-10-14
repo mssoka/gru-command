@@ -13,7 +13,7 @@ Implementation follows this interpretation without changing the frozen spec bloc
 - The deny-default profile remains in force. There is no per-operation audit claim and no fatal-denial mode or CPU-probe shim.
 - The decision must be included in the draft PR description. Fresh checks follow; historical logs below are not retroactively green.
 
-## Current boundary
+## Boundary when clarification was received (historical)
 
 - Branch: `feat/350-stack-aware-property-contracts`; committed HEAD `1b8247e3eb1e7e216ec148f4bd00c530c2e656fb`, plus substantial uncommitted integration work.
 - Operator's latest publication prerequisite: merge current `origin/main` (including PR344's `a04a3c75`), preserve both sides' intent, then obtain **Full suite (Node 22)** green at the exact published merged head. This has **not** been performed or claimed.
@@ -36,7 +36,7 @@ The frozen row says: **violation attempt ⇒ sandbox denies; receipt records the
 - Does the row require unforgeable **per-operation** auditing and automatic rejection even when an OS denial is caught? If so, the present backend does not establish that guarantee; additional host-auditing design/implementation/qualification is needed. Neither catchable JS instrumentation nor blanket fatal denials that kill healthy startup satisfy it.
 - Or may a caught denial result in an explicitly **unqualified parser report**, provided it can never itself become product proof and production known-bad/healthy qualification rejects vacuous/fabricated controls? If this is the intended boundary, the raw-parser test needs correction with an explicit operator interpretation and a production-qualification regression; not an undocumented expectation change.
 
-The clarification prompt was accepted by `herdr agent prompt wAJ:p1`; acceptance is not proof it was read or answered. A subsequent scoped-verification update was **not delivered**: Herdr returned `agent_blocked` / `agent wAJ:p1 is blocked and requires interactive input` (command exit 1). That communication path is stopped; no retry, alternate input method, or owner-prompt approval was attempted. This historical pause ended when the owner decision above was relayed; no alternate input method or owner-prompt approval was used.
+The owner-transport clarification prompt was accepted; acceptance is not proof it was read or answered. A subsequent scoped-verification update was **not delivered**: the coordination transport returned `agent_blocked` / `agent wAJ:p1 is blocked and requires interactive input` (command exit 1). That communication path is stopped; no retry, alternate input method, or owner-prompt approval was attempted. This historical pause ended when the owner decision above was relayed; no alternate input method or owner-prompt approval was used.
 
 ## Last scoped verification before the decision (dirty inputs, not exact-head acceptance)
 
@@ -52,11 +52,17 @@ The clarification prompt was accepted by `herdr agent prompt wAJ:p1`; acceptance
 
 ## Custody
 
-`/Users/moses/.gru-command/captures/issue-350-perkins-property-contracts/security-matrix-decision-20261014T193503Z/`
+Owner-held capture: `issue-350-perkins-property-contracts/security-matrix-decision-20261014T193503Z/` under the lane's external capture root (personal absolute paths intentionally do not ship).
 
 - 64 captured files, including the current tracked+untracked primary patch, status, diagnostic profiles, raw logs, real-run receipts, and counterexample artifacts.
 - `manifest.json` SHA256: `570684bfff2c8a4ad658ab530e48f2af9bfb7385e0b114736e5d919a81be65fe`.
 - Historical fatal-policy passes and diagnostic nonfatal runs are **not** acceptance evidence for the current input.
+
+## Post-decision receiving checks
+
+Node 22.22.0 scoped gates passed after implementing the interpretation, hostile known-bad rejection, malformed/contradictory-report controls, exact copied-input binding, native-path repair validation, candidate-specific regression retention, and bounded metadata reads. Six HEAVY property files passed **70/70**, including three actual Vitest+fast-check campaigns; the FAST property/catalog/collection checks and typecheck/lint passed. These are scoped checks, not final acceptance.
+
+The clean integration commit `2f2fb8d9` merged local `origin/main` / PR344 `a04a3c75` without conflicts at `f9bdfdc3`. Its first full `npm test` passed lint/types/build/policy verification, **3,453 FAST** and **1,160 HEAVY** tests, but failed one hygiene check on three personal coordination/path references in evidence documentation. Web did not run after that failure. The references were made portable; the hygiene gate was not weakened. A fresh full gate is required after the correction.
 
 ## Sources
 

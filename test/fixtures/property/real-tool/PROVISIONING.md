@@ -1,7 +1,8 @@
 # GH350 real-tool fixture provisioning record
 
-Root-approved 2026-10-14 (bounded guards; decision doc
-`captures/herdr-coordination-20261013/gh350-real-tool-fixture-decision-and-admission-hold.md`).
+Root-approved 2026-10-14 with bounded guards. The fixture-decision and
+admission-approval record is retained in the owner's external coordination
+captures; machine-specific paths do not ship.
 Test-only infrastructure: this fixture is never a Gru runtime or dev
 dependency, ships no installer capability, and touches no other lane.
 
