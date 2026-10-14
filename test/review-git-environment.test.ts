@@ -1,6 +1,8 @@
 import * as handoffProof from '../src/worktrees/handoff.js';
 import { ChildWorkerService } from '../src/dispatch/child-workers.js';
 import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { stageSpawnRegistration } from '../src/runtime/spawn-registration.js';
+import { observeDisposalSettlement } from '../src/runtime/disposal-observation.js';
 import { SessionStore } from '../src/sessions/store.js';
 import { loadConfig, type RuntimeId } from '../src/config.js';
 import type { AgentHandle, AgentRuntime, RuntimeEventListener } from '../src/runtime/types.js';
@@ -649,7 +651,8 @@ describe('review Git repository environment isolation (GH-270)', () => {
       }
       expect(registry.residencySnapshot().occupied).toBe(positive ? 1 : (path === 'pair' ? 3 : 2));
       if (!positive) {
-        expect(registry.getHandle(target.handle.id)).not.toBeNull();
+        expect(registry.getHandle(target.handle.id)).toBeNull(); // refused publication is never dispatchable
+        expect(registry.residencySnapshot().handles).toContainEqual(expect.objectContaining({ agentId: target.handle.id }));
         target.cease();
         round?.reconcileCleanup();
         expect(round?.cleanupDebt() ?? []).toEqual([]);
@@ -714,7 +717,8 @@ describe('review Git repository environment isolation (GH-270)', () => {
       }
       expect(controls).toHaveLength(1); expect(prompted).not.toHaveBeenCalled(); expect(post).not.toHaveBeenCalled();
       if (stop === 'unknown') {
-        expect(registry.getHandle(controls[0]!.id)).not.toBeNull();
+        expect(registry.getHandle(controls[0]!.id)).toBeNull(); // retained ownership is not publication
+        expect(registry.residencySnapshot().handles).toContainEqual(expect.objectContaining({ agentId: controls[0]!.id }));
         controls[0]!.cease();
         expect(registry.residencySnapshot().occupied).toBe(0);
       }
@@ -874,9 +878,11 @@ describe('review Git repository environment isolation (GH-270)', () => {
       }
       const target = controls.at(-1)!;
       const occupied = registry.residencySnapshot().occupied;
+      expect(occupied, `${path}:${mode} retains every acquired resident permit`).toBe(path === 'pair' ? 3 : path === 'extra' ? 4 : 2);
       target.event(); target.event();
       expect(registry.residencySnapshot().occupied).toBe(occupied);
-      expect(registry.getHandle(target.id)).not.toBeNull();
+      expect(registry.getHandle(target.id), `${path}:${mode}`).toBeNull();
+      expect(registry.residencySnapshot().handles).toContainEqual(expect.objectContaining({ agentId: target.id }));
       if (round !== null) {
         expect(round.cleanupDebt()).toContain(target.id);
         await expect(round.spawn({})).rejects.toThrow(/parallelism/);
@@ -891,6 +897,61 @@ describe('review Git repository environment isolation (GH-270)', () => {
       expect(prompted).not.toHaveBeenCalled(); expect(unrelated.health().state).toBe('idle');
       await unrelated.dispose(); expect(registry.residencySnapshot().occupied).toBe(0);
       expect(h.ledger.getWorktree(job.id)?.status).toBe('active'); expect(existsSync(admin)).toBe(true);
+    }
+  });
+
+  it('rechecks delayed supervised publication while preserving exact disposal acknowledgement and unknown resident debt (GH270 main union)', async () => {
+    for (const seam of ['healthy', 'before-publication', 'publication-listener'] as const) {
+      const repo = fixture(`union-publication-${seam}`), h = manager();
+      const job = h.ledger.addJob({ id: 'union-owner', repo: 'assigned', title: 'supervised publication' });
+      const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      const admin = git(lane.path, ['rev-parse', '--absolute-git-dir']);
+      const listeners = new Set<RuntimeEventListener>();
+      let ceased = false;
+      const prompt = vi.fn(async () => {});
+      const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: async (role) => ({
+          id: `union-${seam}`, role, sessionFile: null, capabilities: adapter.capabilities, prompt,
+          steer: async () => {}, followUp: async () => {}, dispose: async () => {},
+          subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+          health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+          hasLiveProcess: () => !ceased, isCompacting: () => false,
+        }) };
+      class Registry extends RuntimeRegistry { override runtimeIdFor(): RuntimeId { return 'pi'; } override runtimeFor(): AgentRuntime { return adapter; } }
+      const registry = new Registry({ config: loadConfig({ GRU_COMMAND_HOME: directory() }), store: new SessionStore(directory()) });
+      const stages: { publish?: () => void } = {};
+      const published: string[] = [];
+      const stopTap = registry.onAgentEvent((event) => {
+        if (event.phase !== 'spawned') return;
+        published.push(event.agentId);
+        if (seam === 'publication-listener') writeFileSync(join(admin, 'locked'), 'foreign publication custody');
+      });
+      const handle = await registry.spawn('minion', stageSpawnRegistration({ cwd: lane.path }, (_handle, publish) => { stages.publish = publish; }));
+      expect(registry.getHandle(handle.id)).toBeNull();
+      expect(published).toEqual([]); expect(registry.residencySnapshot().occupied).toBe(1);
+      const publish = stages.publish;
+      if (publish === undefined) throw new Error('fixture supervised owner never received its publication stage');
+      if (seam === 'before-publication') writeFileSync(join(admin, 'locked'), 'foreign staged custody');
+      if (seam === 'healthy') {
+        publish(); expect(registry.getHandle(handle.id)).toBe(handle);
+        await handle.prompt('authorized original lane'); expect(prompt).toHaveBeenCalledTimes(1);
+      } else {
+        expect(publish).toThrow(/handoff unresolved/);
+        await expect(handle.prompt('never execute')).rejects.toThrow(/handoff unresolved/);
+        expect(prompt).not.toHaveBeenCalled();
+      }
+      expect(published).toEqual(seam === 'before-publication' ? [] : [handle.id]);
+      const acknowledgements: boolean[] = [];
+      const stopSettlement = observeDisposalSettlement(handle, (acknowledged) => { acknowledgements.push(acknowledged); });
+      await handle.dispose();
+      expect(acknowledgements).toEqual([true]); // acknowledgement is not cessation
+      expect(registry.residencySnapshot().occupied).toBe(1);
+      expect(registry.residencySnapshot().handles).toContainEqual(expect.objectContaining({ agentId: handle.id }));
+      ceased = true;
+      for (const listener of listeners) listener({ type: 'state', state: 'disposed' });
+      expect(registry.residencySnapshot().occupied).toBe(0);
+      expect(acknowledgements).toEqual([true]);
+      stopSettlement(); stopTap();
     }
   });
 
