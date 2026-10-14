@@ -13,6 +13,8 @@ import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
+import { publishSpawnRegistration } from './spawn-registration.js';
+import { notifyDisposalSettlement } from './disposal-observation.js';
 
 export { WorkerDisposalInProgressError };
 
@@ -127,6 +129,8 @@ export function serviceRegistryOptions(
  * at tap time (null before the file exists).
  */
 export interface AgentEventEnvelope {
+  /** In-process provenance only; never persisted or serialized as event data. */
+  readonly handle?: AgentHandle;
   readonly agentId: string;
   readonly role: Role;
   readonly sessionFile: string | null;
@@ -172,6 +176,8 @@ export class RuntimeRegistry {
   private readonly adapters = new Map<RuntimeId, AgentRuntime>();
   private readonly nativeAdapters = new Map<RuntimeId, PiRuntime | ClaudeCodeRuntime>();
   private readonly handles = new Set<AgentHandle>();
+  private readonly unpublished = new Set<AgentHandle>();
+  private readonly quarantined = new Set<AgentHandle>();
   private readonly ceasedReviewOwners = new Map<string, string>();
 
   /** Pi isolated review tools and host-native callbacks run inside this
@@ -679,6 +685,8 @@ export class RuntimeRegistry {
         // Missing or failing adapter evidence remains unknown.
       }
       this.handles.delete(resident);
+      this.unpublished.delete(resident);
+      this.quarantined.delete(resident);
       this.residents.unwatch(resident);
       release?.();
       // AFTER the permit is actually released: notify capacity consumers
@@ -713,13 +721,14 @@ export class RuntimeRegistry {
             return probe(target.hasLiveProcess) === 'false' && probe(target.isCompacting) === 'false';
           };
           disposing = Promise.resolve().then(() => target.dispose()).then(
-            () => { if (ceased()) releaseHandle(); },
+            () => { notifyDisposalSettlement(resident, true); if (ceased()) releaseHandle(); },
             (error: unknown) => {
               // A rejected disposal still proves cessation when terminal
               // health says so; otherwise the slot stays owned/debt.
               if (target.health().state === 'disposed') releaseHandle();
               disposing = null;
               disposingNow = false;
+              notifyDisposalSettlement(resident, false);
               throw error;
             },
           );
@@ -785,9 +794,24 @@ export class RuntimeRegistry {
         this.reclaimProbe(handle.id),
       );
     }
-    // E6 event tap: surface spawn/dispose + forward every runtime event to
-    // registry-level subscribers (the board engine's feed).
-    this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+    // An owned recovery result is invisible to dispatch lookups and EVERY
+    // tap consumer until its owner grants publication. Capacity/cessation
+    // tracking remains live while publication is held, including cleanup.
+    this.unpublished.add(resident);
+    let published = false;
+    const buffered: AgentEventEnvelope[] = [];
+    const forward = (envelope: AgentEventEnvelope): void => {
+      if (published) this.emitAgentEvent(envelope);
+      else buffered.push(envelope);
+    };
+    const publish = (): void => {
+      if (published) return;
+      if (released || !this.handles.has(resident)) throw new WorkerDisposalInProgressError();
+      published = true;
+      this.unpublished.delete(resident);
+      this.emitAgentEvent({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+      for (const envelope of buffered.splice(0)) this.emitAgentEvent(envelope);
+    };
     // Self-healing membership: a handle disposed by ANY caller leaves the
     // registry set — the status surface must never contradict itself.
     // Registered FIRST (before the emit tap below) so the disposed event
@@ -801,7 +825,8 @@ export class RuntimeRegistry {
       }
     });
     handle.subscribe((event) => {
-      this.emitAgentEvent({
+      forward({
+        handle: resident,
         agentId: handle.id,
         role,
         sessionFile: handle.sessionFile,
@@ -809,7 +834,7 @@ export class RuntimeRegistry {
         event,
       });
       if (event.type === 'state' && event.state === 'disposed') {
-        this.emitAgentEvent({ agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'disposed' });
+        forward({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'disposed' });
         // REAL production traversal: the existing handle-event flow drives
         // registered cleanup-debt reconcilers (no watcher/timer). Observer
         // failure is contained; shutdown stops traversal without clearing
@@ -824,6 +849,7 @@ export class RuntimeRegistry {
         this.residents.changed();
       }
     });
+    publishSpawnRegistration(options, resident, publish);
     return resident;
   }
 
@@ -834,9 +860,18 @@ export class RuntimeRegistry {
   /** Live handle by agent id (E7 supervision feed), or null. */
   getHandle(agentId: string): AgentHandle | null {
     for (const handle of this.handles) {
-      if (handle.id === agentId) return handle;
+      if (handle.id === agentId && !this.unpublished.has(handle) && !this.quarantined.has(handle)) return handle;
     }
     return null;
+  }
+
+  /** Revoke lookup eligibility for a handle its owner rejected: a quarantined
+   * handle is no longer returned by getHandle, so no dispatch/consumer path
+   * can hand a supervisor-refused producer new work while its cleanup is
+   * outstanding (issue #280 AC1). The quarantine is monotonic — disposal, or
+   * registry shutdown, drops the record (and the quarantined handle with it). */
+  quarantineHandle(handle: AgentHandle): void {
+    if (this.handles.has(handle)) this.quarantined.add(handle);
   }
 
   /** The shared offline pi ModelRuntime for read-only consumers (the
@@ -894,6 +929,7 @@ export class RuntimeRegistry {
     for (const handle of [...this.handles]) await this.disposeHandle(handle);
     for (const adapter of this.adapters.values()) await adapter.dispose();
     this.adapters.clear();
+    this.quarantined.clear();
   }
 }
 
