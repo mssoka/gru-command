@@ -154,6 +154,86 @@ function originalDeliveryPayload(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe('restart-recovery-progress — exact native request matrix', () => {
+  async function pr334CompletedOriginalWithRecoveryDebt() {
+    const f = await fixture(); f.ledger.registerWorktree(f.lane);
+    expect(f.ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(true);
+    f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+    prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
+      sessionFile: f.file, text: 'original accepted native input', authorityManifest: JSON.stringify({ role: 'minion', cwd: f.lane.path, tools: ['read', 'bash'], model: 'fixture/model' }) });
+    f.native.append({ role: 'user', content: [{ type: 'text', text: 'original accepted native input' }] });
+    const producer = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+    const start = f.ledger.startDirectiveProducer(f.identity, producer);
+    f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+    f.native.finish(); const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+    if (proof.state !== 'terminal' || !proof.ok) throw new Error('genuine original native terminal required before testing late publication');
+    const head = resolveGitCommit(f.lane.path, 'HEAD'); recordDirectiveCompletion(producer, proof.checkpointId, head);
+    recordDirectiveProducerCessation(producer);
+    f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: f.intent.jobId,
+      payload: { request_id: f.intent.requestId, agent_id: producer.agentId, session_file: f.file,
+        producer_start_seq: start, producer_identity: f.identity, native_producer: producer, evidence: 'ceased' } });
+    surfaceDirectiveRecovery(f.deps, f.intent.requestId, 'original native completion awaits its original ledger publication');
+    const debt = f.ledger.listObligations({ jobId: f.intent.jobId }).find((item) => item.incidentKey === `directive-recovery:${f.intent.requestId}`)!;
+    const authority = f.ledger.directiveCurrentAuthority(f.intent.jobId);
+    const input = { ledger: f.ledger, worktrees: f.worktrees, pendingProducerBlockers: () => [], requestId: f.intent.requestId,
+      generation: debt.generation, expectedPayloadHash: f.intent.payloadHash, expectedHead: head,
+      expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId), expectedWorkRevision: authority.workRevision,
+      expectedContractSha256: authority.contractSha256, reason: 'recover the exact original request without replay' };
+    const payload = { request_id: f.intent.requestId, agentId: 'logical-minion', source: 'silas-directive', sha: head,
+      work_revision: f.identity.workRevision, candidate_delivery_proven: false, historical_bookkeeping_only: true,
+      native_completion: { identity: f.identity, checkpoint_id: proof.checkpointId, binding: proof.binding,
+        receipt: readDirectiveCompletion(f.file, f.identity, proof.checkpointId), physical_cessation: inspectDirectiveProducers(f.file) } };
+    return { ...f, input, payload, debt };
+  }
+
+  it('PR334 completion successful native truth prevents retirement before its ledger delivery', async () => {
+    const f = await pr334CompletedOriginalWithRecoveryDebt();
+    const original = f.ledger.getDirective(f.intent.requestId); const watermark = f.ledger.latestEventSeq();
+    const bytes = readFileSync(f.file, 'utf8'); const journal = readFileSync(`${f.file}.producers.jsonl`, 'utf8');
+    expect(() => recoverInterruptedDirectiveFromRoute({ ...f.input,
+      decision: { kind: 'successor', requestId: 'must-not-replay-completed-original', directive: 'new effects must not replace original completion' } })).toThrow(/successful native completion/);
+    expect(f.ledger.latestEventSeq()).toBe(watermark); expect(f.ledger.getDirective(f.intent.requestId)).toEqual(original);
+    expect(f.ledger.getDirective('must-not-replay-completed-original')).toBeNull();
+    expect(settleNativeDirective(f.deps, f.identity)).toBe(true);
+    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toHaveLength(1);
+    expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0); expect(f.native.prompts).toEqual([]);
+    expect(readFileSync(f.file, 'utf8')).toBe(bytes); expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(journal);
+  });
+
+  it('PR334 completion original native success prevents obsolete writer clearance preflight', async () => {
+    const f = await pr334CompletedOriginalWithRecoveryDebt(); const watermark = f.ledger.latestEventSeq();
+    expect(() => f.ledger.validateRecoverySuccessorBeforeWriterClearance({ ...f.input, subjectKind: 'directive',
+      lane: { id: f.lane.id, resolvedHead: f.input.expectedHead },
+      decision: { kind: 'successor', requestId: 'must-not-clear-before-completion', directive: 'new effects must not replace original completion' } })).toThrow(/successful native completion/);
+    expect(f.ledger.latestEventSeq()).toBe(watermark); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
+    expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0);
+  });
+
+  async function assertTransferredOwnerBoundary(boundary: 'delivery' | 'settled-marker') {
+    const f = await pr334CompletedOriginalWithRecoveryDebt();
+    const target = f.ledger.recordBlockedObservation(f.intent.jobId, { logicalStep: 'operation', incidentKey: 'original-owner-stop',
+      category: { kind: 'known', category: 'owner-hold' }, observedAtSeq: f.ledger.latestEventSeq(),
+      nextAction: { kind: 'owner-decision', decision: 'owner must resolve this exact stopped recovery context' } });
+    recoverInterruptedDirectiveFromRoute({ ...f.input, expectedEpoch: f.ledger.directiveRecoveryEpoch(f.intent.jobId),
+      decision: { kind: 'owner-decision', obligationId: target.id } });
+    expect(f.ledger.recoveryOwnerBasis('directive', f.intent.requestId).owned).toBe(true);
+    const event = f.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: f.intent.jobId, payload: f.payload });
+    const original = f.ledger.getDirective(f.intent.requestId); const owner = f.ledger.recoveryOwnerReadback('directive', f.intent.requestId);
+    const watermark = f.ledger.latestEventSeq(); const bytes = readFileSync(f.file, 'utf8');
+    expect(() => boundary === 'delivery'
+      ? f.ledger.recordDirectiveDelivery({ requestId: f.intent.requestId, eventSeq: event.seq })
+      : f.ledger.appendCustomEvent({ kind: 'silas.directive-settled', jobId: f.intent.jobId,
+        payload: { request_id: f.intent.requestId, delivery_seq: event.seq, candidate_delivery_proven: false } })).toThrow(/transferred owner context/);
+    expect(f.ledger.latestEventSeq()).toBe(watermark); expect(f.ledger.getDirective(f.intent.requestId)).toEqual(original);
+    expect(f.ledger.recoveryOwnerReadback('directive', f.intent.requestId)).toEqual(owner);
+    expect(f.ledger.recoveryOwnerBasis('directive', f.intent.requestId).owned).toBe(true);
+    expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-settled')).toBeNull();
+    expect(f.ledger.getEvent(event.seq)).toEqual(event); expect(readFileSync(f.file, 'utf8')).toBe(bytes);
+    expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0); expect(f.native.prompts).toEqual([]);
+  }
+  it('PR334 completion transferred owner context fences shared native delivery settlement', () => assertTransferredOwnerBoundary('delivery'));
+  it('PR334 completion transferred owner context fences shared native settled-marker settlement', () => assertTransferredOwnerBoundary('settled-marker'));
+
   it('PR334 isolation ordinary same-owner inputs cannot enter the live exact native directive', async () => {
     const f = await fixture(); f.seed(); f.native.autoFinish = false;
     const entered = deferred<void>(); const originalContinue = f.native.agent.continue.bind(f.native.agent);

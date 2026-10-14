@@ -8141,6 +8141,7 @@ export class LedgerApi {
         if (!owner.confirmed && (changes.length === 0 || changes.some((event) => event.kind !== 'job.amendment-accepted'))) throw new DirectiveCheckpointError('non-amendment authority change cannot revive the old request');
       }
       if (input.decision.requestId === row.requestId || !input.decision.requestId.trim() || !input.decision.directive.trim() || this.getDirective(input.decision.requestId) !== null) throw new DirectiveCheckpointError('successor must name a fresh unused request and nonempty directive');
+      this.assertNoCompletedNativeRetirement(row);
       return row.jobId;
     }
     if (this.getRebriefRecoveryDecision(input.markerId, input.generation) !== null) return null;
@@ -8473,6 +8474,8 @@ export class LedgerApi {
     if (binding === null || row.nativeTarget?.agentId !== binding.agentId || row.nativeTarget.sessionFile !== binding.sessionFile) {
       throw new DirectiveCheckpointError('current directive delivery lacks its exact original native target');
     }
+    const owner = this.recoveryOwnerBasis('directive', row.requestId);
+    if (owner.owned || owner.changed && !owner.confirmed) throw new DirectiveCheckpointError('native completion cannot release original transferred owner context without genuine governing owner resolution');
     const identity = this.directiveTurnIdentity(row.requestId);
     const proof = inspectDirectiveCheckpoint(binding.sessionFile, identity);
     if (proof.state !== 'terminal' || !proof.ok || !isDeepStrictEqual(proof.binding, binding)) {
@@ -8721,6 +8724,16 @@ export class LedgerApi {
     return blockers;
   }
 
+  /** Native terminal truth owns completion even before its ledger delivery.
+   * Current candidacy and current permission never erase accepted history. */
+  private assertNoCompletedNativeRetirement(row: DirectiveRequestRecord): void {
+    if (row.nativeBinding === null || row.nativeTarget === null) return;
+    const proof = inspectDirectiveCheckpoint(row.nativeBinding.sessionFile, this.directiveTurnIdentity(row.requestId));
+    if (proof.state === 'terminal' && proof.ok && isDeepStrictEqual(proof.binding, row.nativeBinding)) {
+      throw new DirectiveRetirementError('terminal_receipt_present', `directive request "${row.requestId}" has successful native completion — normal settlement owns it; do not clear writers or retire it to execute a successor`);
+    }
+  }
+
   /** Guarded control closure. See the block comment above for the contract. */
   retireInterruptedDirective(input: {
     requestId: string;
@@ -8812,6 +8825,7 @@ export class LedgerApi {
           blockers,
         );
       }
+      this.assertNoCompletedNativeRetirement(row);
       // A correlated terminal receipt means normal settlement owns this
       // request; retirement must never overwrite it.
       const delivered = this.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId);
