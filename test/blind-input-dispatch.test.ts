@@ -60,7 +60,7 @@ async function boot(opts: { sessionToolResults?: (file: string | null) => readon
   const db = new LedgerDb(dir);
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const prompts: string[] = [];
   let spawns = 0;
   const spawner = async (role: Role, _options?: SpawnOptions): Promise<AgentHandle> => {

@@ -1,3 +1,4 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { existsSync } from 'node:fs';
 import { LIVE_DIRECTIVE_STATES } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -596,6 +597,7 @@ async function redispatchGroup(
     if (lane === undefined) {
       throw new Error(`job "${jobId}" has no active job lane — a re-brief needs its worktree`);
     }
+    capturePortLaneHandoff(deps.worktrees, lane)();
     const rebriefMarker = group.find((marker) => marker.kind === 'silas.rebrief') ?? group[0];
     const note = rebriefMarker?.note ?? '';
     const expectedPhaseId = group.find((marker) => marker.phaseId !== null)?.phaseId ?? null;

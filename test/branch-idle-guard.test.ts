@@ -144,7 +144,7 @@ async function boot(opts: {
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
   const notifications = new NotificationCenter({ ledger, bus });
-  const basePort = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const basePort = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const worktrees: WorktreePort =
     opts.onReviewLane !== undefined ? new HookedWorktreePort(basePort, opts.onReviewLane) : basePort;
   const spawnCalls: { role: Role; cwd: string | undefined }[] = [];
@@ -253,7 +253,6 @@ async function createLaneJob(
   repo: FixtureRepo,
   input: { jobId: string; status: 'working' | 'delivered' | 'in-review' },
 ): Promise<WorktreeLane> {
-  const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: input.jobId });
   h.ledger.addJob({
     id: input.jobId,
     repo: 'fixture',
@@ -261,6 +260,7 @@ async function createLaneJob(
     baseBranch: 'main',
     briefing: 'review this lane',
   });
+  const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: input.jobId });
   h.ledger.setJobStatus(input.jobId, 'working');
   if (input.status !== 'working') h.ledger.setJobStatus(input.jobId, input.status);
   writeFileSync(join(lane.path, `deliverable-${input.jobId}.txt`), 'delivered\n');

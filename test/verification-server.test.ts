@@ -104,7 +104,7 @@ async function boot(opts: {
   const db = new LedgerDb(dir);
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const repo = makeFixtureRepo('verify-app');
   repos.push(repo);
   if (opts.manifest !== null) {

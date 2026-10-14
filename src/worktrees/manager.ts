@@ -1,3 +1,4 @@
+import { beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
@@ -343,6 +344,7 @@ export class WorktreeManager {
   private tailFailure: string | null = null;
 
   constructor(opts: WorktreeManagerOptions) {
+    registerHandoffManager(this, opts.ledger);
     this.opts = opts;
     this.log = opts.log ?? (() => {});
     this.enumerate = opts.enumerateProcesses ?? psEnumerator;
@@ -716,6 +718,8 @@ export class WorktreeManager {
         await this.bootstrap(repo.repoPath, path);
         this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
+        beginLaneHandoff({ id: input.jobId, kind: 'job', jobId: input.jobId, roundId: null, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
+          this.assertCreationCustody(repo.repoPath, path, custody), custody.token);
         record = this.opts.ledger.registerWorktree({
           id: input.jobId,
           kind: 'job',
@@ -728,10 +732,11 @@ export class WorktreeManager {
           jobId: input.jobId,
         });
       } catch (error) {
+        if (this.opts.ledger.getWorktree(input.jobId) !== null) throw error; // committed publication retains unresolved custody
         await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
-      this.handoffLane(repo.repoPath, path, custody);
+      this.handoffLane(repo.repoPath, path, custody, record);
       this.log('info', 'job worktree created', {
         job: input.jobId,
         path,
@@ -781,6 +786,8 @@ export class WorktreeManager {
         const sha = runGit(path, ['rev-parse', 'HEAD']);
         this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
+        beginLaneHandoff({ id: input.roundId, kind: 'review', jobId: input.jobId ?? null, roundId: input.roundId, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
+          this.assertCreationCustody(repo.repoPath, path, custody), custody.token);
         record = this.opts.ledger.registerWorktree({
           id: input.roundId,
           kind: 'review',
@@ -794,10 +801,11 @@ export class WorktreeManager {
           ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
         });
       } catch (error) {
+        if (this.opts.ledger.getWorktree(input.roundId) !== null) throw error; // committed publication retains unresolved custody
         await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
-      this.handoffLane(repo.repoPath, path, custody);
+      this.handoffLane(repo.repoPath, path, custody, record);
       this.log('info', 'review worktree created (detached)', {
         round: input.roundId,
         path,
@@ -859,6 +867,8 @@ export class WorktreeManager {
         const sha = runGit(path, ['rev-parse', 'HEAD']);
         this.assertCreationIdentity(path, custody);
         this.assertCreationCustody(repo.repoPath, path, custody);
+        beginLaneHandoff({ id: input.childId, kind: 'child', jobId: input.jobId, roundId: null, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
+          this.assertCreationCustody(repo.repoPath, path, custody), custody.token);
         record = this.opts.ledger.registerWorktree({
           id: input.childId,
           kind: 'child',
@@ -873,10 +883,11 @@ export class WorktreeManager {
           jobId: input.jobId,
         });
       } catch (error) {
+        if (this.opts.ledger.getWorktree(input.childId) !== null) throw error; // committed publication retains unresolved custody
         await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
-      this.handoffLane(repo.repoPath, path, custody);
+      this.handoffLane(repo.repoPath, path, custody, record);
       this.log('info', 'child worktree created', {
         child: input.childId,
         job: input.jobId,
@@ -913,11 +924,12 @@ export class WorktreeManager {
     opts: { status?: 'active' | 'paused' | 'swept'; jobId?: string } = {},
   ): readonly WorktreeRecord[] {
     const filtered = opts.status !== undefined || opts.jobId !== undefined;
-    return filtered ? this.opts.ledger.listWorktrees(opts) : this.opts.ledger.listWorktrees();
+    return (filtered ? this.opts.ledger.listWorktrees(opts) : this.opts.ledger.listWorktrees()).map((lane) => rememberManagedLane(lane, this.opts.ledger));
   }
 
   getWorktree(id: string): WorktreeRecord | null {
-    return this.opts.ledger.getWorktree(id);
+    const lane = this.opts.ledger.getWorktree(id);
+    return lane === null ? null : rememberManagedLane(lane, this.opts.ledger);
   }
 
   /**
@@ -954,6 +966,7 @@ export class WorktreeManager {
         };
       }
       return this.withRepoLock(row.repoPath, async () => {
+        assertLaneResourcesAbsent(row);
         let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
         if ((row.kind === 'job' || row.kind === 'child') && row.branch !== null) {
           const present = spawnGit(row.repoPath, [
@@ -965,22 +978,19 @@ export class WorktreeManager {
           if (present.status === 0) {
             // Fresh remote state BEFORE the retry disposal (Perkins r8):
             // the old tracking refs must not witness containment.
-            branchOutcome = this.disposeLaneBranch(
-              row,
-              input.baseBranch,
-              this.safeFreshRemoteBranch(row.repoPath),
-            );
+            const remote = this.safeFreshRemoteBranch(row.repoPath);
+            assertLaneResourcesAbsent(row);
+            branchOutcome = this.disposeLaneBranch(row, input.baseBranch, remote);
           }
         }
-        return {
-          status: 'swept',
-          preserved: null,
-          branch: branchOutcome,
-          freshHead: this.safeFreshHead(row.repoPath),
-        } as const;
+        const freshHead = this.safeFreshHead(row.repoPath);
+        assertLaneResourcesAbsent(row);
+        return { status: 'swept', preserved: null, branch: branchOutcome, freshHead } as const;
       });
     }
+    const assertCleanup = captureCleanupHandoff(rememberManagedLane(row, this.opts.ledger));
     return this.withRepoLock(row.repoPath, async () => {
+      assertCleanup();
       // (0) Crash-window reconciliation (Perkins lane-B r2 c): the tree is
       // gone but the row never flipped (a kill between removal and the
       // registry write). Reconcile — swept + loud event — instead of
@@ -989,13 +999,8 @@ export class WorktreeManager {
         // The reconcile disposes the branch exactly like finishSweep
         // (Perkins lane-B r3): containment-verified delete, or retain +
         // note — and the response reports the TRUE outcome.
-        const branchOutcome = this.reconcileMissingTree(row, input.baseBranch);
-        return {
-          status: 'swept',
-          preserved: null,
-          branch: branchOutcome,
-          freshHead: this.safeFreshHead(row.repoPath),
-        } as const;
+        const reconciled = this.reconcileMissingTree(row, input.baseBranch);
+        return { status: 'swept', preserved: null, ...reconciled } as const;
       }
       // (1) Preserve untracked deliverables FIRST — before any process
       // decision, before any removal. Deliverables are never hostages.
@@ -1009,6 +1014,7 @@ export class WorktreeManager {
       // so a recycled pid can never redirect it; foreign processes keep the
       // full pause-and-ask contract below.
       const reaped = await this.reapTrackedServiceProcesses(row);
+      assertCleanup();
 
       // (2) Enumerate processes rooted in the tree BEFORE removal.
       const processes = this.enumerate(row.path).filter((proc) => !reaped.includes(proc.pid));
@@ -1025,7 +1031,7 @@ export class WorktreeManager {
                 .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence }))
             : [];
         if (input.confirmKill === true && acknowledged.length > 0) {
-          return this.killAcknowledgedAndContinue(row, acknowledged, preserved, input.baseBranch);
+          return this.killAcknowledgedAndContinue(row, acknowledged, preserved, input.baseBranch, assertCleanup);
         }
 
         // (3) PAUSE AND ASK — a live process is never silently killed.
@@ -1059,7 +1065,7 @@ export class WorktreeManager {
       }
 
       // No live processes: straight to the removal tail.
-      return this.finishSweep(row, preserved, input.baseBranch);
+      return this.finishSweep(row, preserved, input.baseBranch, assertCleanup);
     });
   }
 
@@ -1421,11 +1427,14 @@ export class WorktreeManager {
     return null;
   }
 
-  private handoffLane(repoPath: string, path: string, custody: CreationCustody): void {
+  private handoffLane(repoPath: string, path: string, custody: CreationCustody, record: WorktreeRecord): void {
     try {
       this.assertCreationIdentity(path, custody);
-      this.assertCreationCustody(repoPath, path, custody);
+      const admin = this.assertCreationCustody(repoPath, path, custody);
+      assertPendingLaneHandoff(record, admin, custody.token);
       runGit(repoPath, ['worktree', 'unlock', path]);
+      this.assertCreationIdentity(path, custody);
+      completeLaneHandoff(record, admin, custody.token, this.opts.ledger);
     } catch (error) {
       throw new Error(`worktree creation custody handoff failed for ${path}; registered lane retained — inspect before retry`, { cause: error });
     }
@@ -1578,6 +1587,7 @@ export class WorktreeManager {
     acknowledged: readonly { pid: number; command: string; evidence: string }[],
     preserved: SweepPreservation | null,
     baseBranch: string | undefined,
+    assertCleanup: () => void,
   ): Promise<SweepResult> {
     const pids = acknowledged.map((proc) => proc.pid);
     this.opts.ledger.recordWorktreeProcesses({
@@ -1657,7 +1667,7 @@ export class WorktreeManager {
       this.opts.onSweepPaused?.({ worktree: row, processes: unacknowledged });
       return { status: 'paused', processes: unacknowledged, preserved, note };
     }
-    return this.finishSweep(row, preserved, baseBranch);
+    return this.finishSweep(row, preserved, baseBranch, assertCleanup);
   }
 
   /** Removal + containment branch delete + fresh head (shared tail). */
@@ -1665,9 +1675,11 @@ export class WorktreeManager {
     row: WorktreeRecord,
     preserved: SweepPreservation | null,
     baseBranch: string | undefined,
+    assertCleanup: () => void,
   ): SweepResult {
     // (4a) Worktree removal. A failure HERE throws with the tree intact
     // and the row unchanged — retry-safe.
+    assertCleanup();
     runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
 
     // (4b/5) POST-REMOVAL TAIL (Perkins lane-B r1 B2): the tree is GONE —
@@ -1686,6 +1698,7 @@ export class WorktreeManager {
       // branch is retained.)
       const base = this.resolveBase(row.repoPath);
       freshHead = base.sha;
+      assertLaneResourcesAbsent(row);
       // Containment-verified branch delete — job and writer-child lanes;
       // a branch is deleted only when its tip is provably contained in a
       // durable local ref or the freshly verified remote default;
@@ -1698,12 +1711,14 @@ export class WorktreeManager {
         );
       }
     } catch (error) {
+      if (error instanceof WorktreeHandoffUnresolvedError) throw error;
       this.log('error', 'sweep tail failed after removal — row still flips swept', {
         id: row.id,
         error: String(error),
       });
       this.tailFailure = String(error);
     }
+    assertLaneResourcesAbsent(row);
     // FLIP FIRST (Perkins lane-B r2 a/b): the registry must reflect the
     // removed tree even if the EVENT writes then fail — and the flip
     // itself is guarded (a DB-down window reconciles on retry via the
@@ -1730,7 +1745,8 @@ export class WorktreeManager {
   private reconcileMissingTree(
     row: WorktreeRecord,
     baseBranch: string | undefined,
-  ): 'deleted' | 'retained' | 'none' {
+  ): { readonly branch: 'deleted' | 'retained' | 'none'; readonly freshHead: string } {
+    assertLaneResourcesAbsent(row);
     this.log('warn', 'worktree tree missing under a non-swept row — reconciling swept', {
       id: row.id,
       path: row.path,
@@ -1741,11 +1757,11 @@ export class WorktreeManager {
     // flip and the disposal left every retry early-returning 'none').
     // The disposal resolves FRESH remote state first (Perkins r8): a
     // retry must never delete on the witness of stale tracking refs.
-    const branchOutcome = this.disposeLaneBranch(
-      row,
-      baseBranch,
-      this.safeFreshRemoteBranch(row.repoPath),
-    );
+    const remote = this.safeFreshRemoteBranch(row.repoPath);
+    assertLaneResourcesAbsent(row);
+    const branchOutcome = this.disposeLaneBranch(row, baseBranch, remote);
+    const freshHead = this.safeFreshHead(row.repoPath);
+    assertLaneResourcesAbsent(row);
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
       this.opts.ledger.appendCustomEvent({
@@ -1760,7 +1776,7 @@ export class WorktreeManager {
         error: String(error),
       });
     }
-    return branchOutcome;
+    return { branch: branchOutcome, freshHead };
   }
 
   /** Guarded containment-verified disposal for an owner lane's branch.

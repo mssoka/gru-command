@@ -1,3 +1,4 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { LogLevel } from '../logger.js';
@@ -677,6 +678,7 @@ export class ChildWorkerService {
         return;
       }
       lane = await this.ensureLane(record);
+      const assertHandoff = capturePortLaneHandoff(this.opts.worktrees, lane);
       if (this.opts.ledger.getChildWorker(record.id)?.state === 'queued') {
         this.opts.ledger.markChildAdmitted(record.id, { worktreeId: lane.id, branch: lane.branch });
       }
@@ -697,6 +699,7 @@ export class ChildWorkerService {
         residentRelease = await this.opts.reserveResident(childController.signal);
       }
       try {
+        assertHandoff();
         handle = await this.opts.spawner(
           'minion',
           {
@@ -714,6 +717,7 @@ export class ChildWorkerService {
         throw error;
       }
       run.handle = handle;
+      assertHandoff();
       resultRef = handle.sessionFile;
       // The admission row already carries the identity; bind the session
       // file and (idempotently) refresh the parent link.
@@ -725,6 +729,7 @@ export class ChildWorkerService {
         sessionFile: handle.sessionFile,
         parentAgentId: record.parentAgentId,
       });
+      assertHandoff();
       // Resident admission may have waited a long time: revalidate once
       // more before the model acts.
       const postAdmission = this.ineligibility(record);
@@ -778,6 +783,7 @@ export class ChildWorkerService {
         branch: lane.branch,
         baseSha: lane.sha,
       });
+      assertHandoff();
       delivered = true;
       const verdict = await promptWithTerminalVerdict(handle, briefing);
       // Shutdown/cancel takes precedence over a late successful settle:
@@ -954,7 +960,7 @@ export class ChildWorkerService {
    * worker's own lane at the parent lane's current HEAD. */
   private async ensureLane(record: ChildWorkerRecord): Promise<WorktreeLane> {
     const existing = this.opts.worktrees.getWorktree(record.id);
-    if (existing !== null && existing.status !== 'swept') return existing;
+    if (existing !== null && existing.status !== 'swept') { capturePortLaneHandoff(this.opts.worktrees, existing)(); return existing; }
     const parentLane = this.opts.worktrees
       .listWorktrees({ jobId: record.jobId })
       .find((lane) => lane.kind === 'job' && lane.status === 'active');
@@ -963,6 +969,7 @@ export class ChildWorkerService {
         `job "${record.jobId}" has no active parent lane — a child lane must base on a live parent lane`,
       );
     }
+    capturePortLaneHandoff(this.opts.worktrees, parentLane)();
     return this.opts.worktrees.createChildWorktree({
       repoPath: parentLane.repoPath,
       jobId: record.jobId,

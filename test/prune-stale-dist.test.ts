@@ -4,6 +4,8 @@ import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { PUBLIC_REVIEW_EXECUTABLE_PATHS } from '../src/runtime/review-executable-paths.js';
+import { reviewRuntimeVersion } from '../src/runtime/review-build-identity.js';
+import { createHash } from 'node:crypto';
 
 /**
  * tools/prune-stale-dist.mjs contract. `tsc` never deletes outputs of a
@@ -47,6 +49,25 @@ describe('prune-stale-dist', () => {
       .map((path) => `dist/${path.slice(0, -3)}.js`);
     const unaudited = outputs.filter((path) => !PUBLIC_REVIEW_EXECUTABLE_PATHS.has(path));
     expect(unaudited).toEqual([]);
+  });
+  it('catalogs exactly the live handoff executable and includes its bytes in identity while refusing unknown paths (contained B)', () => {
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.has('dist/worktrees/handoff.js')).toBe(true);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5141);
+    expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
+      .toBe('f5b2ca59efcefef9f983b9ac646d9e6d243b6ecd4cef43b532a798da995d045d');
+    const root = fixtureRoot();
+    touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));
+    writeFileSync(join(root, 'dist/review-dependency-identity.json'), JSON.stringify({ schemaVersion: 1, dependencySha256: 'a'.repeat(64) }));
+    const pruned = runTool(root);
+    expect(pruned.status, pruned.stderr).toBe(0); expect(existsSync(join(root, 'dist/worktrees/handoff.js'))).toBe(true);
+    const original = reviewRuntimeVersion(root);
+    writeFileSync(join(root, 'dist/worktrees/handoff.js'), '// changed handoff executable\n');
+    const changed = reviewRuntimeVersion(root); expect(changed).not.toBe(original);
+    touch(root, 'dist/worktrees/unregistered-handoff.js');
+    expect(() => reviewRuntimeVersion(root)).toThrow(/unproven executable path/);
+    rmSync(join(root, 'dist/worktrees/unregistered-handoff.js'));
+    expect(reviewRuntimeVersion(root)).toBe(changed);
   });
   it('removes every tsc output whose source is gone, and the directories it empties', () => {
     const root = fixtureRoot();

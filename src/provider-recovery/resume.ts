@@ -1,3 +1,4 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import { existsSync } from 'node:fs';
 import type {
   LedgerApi,
@@ -234,6 +235,7 @@ async function claimJobMinion(
     return { outcome: 'skipped', waitId: wait.id, why: 'job lane swept — nothing to resume into' };
   }
 
+  capturePortLaneHandoff(deps.worktrees, lane)();
   // One continuation: resume the interrupted session when it still exists,
   // otherwise a fresh worker on the same lane (rebrief machinery).
   const resumeFile =

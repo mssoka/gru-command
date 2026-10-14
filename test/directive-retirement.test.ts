@@ -87,7 +87,7 @@ async function boot(opts: { wrapLedger?: (ledger: LedgerApi) => LedgerApi; worke
   const rawLedger = new LedgerApi(db.handle, { bus });
   const ledger = opts.wrapLedger === undefined ? rawLedger : opts.wrapLedger(rawLedger);
   const notifications = new NotificationCenter({ ledger, bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const reviewSessions = join(dir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
@@ -768,16 +768,7 @@ describe('directive retirement — live ownership fails closed', () => {
     cleanupRepos.push(repo);
     const h = await boot();
     const { lane } = await seededLiveRequest(h, repo, 'job-p', 'req-p');
-    h.ledger.registerWorktree({
-      id: lane.id,
-      kind: 'job',
-      repoPath: repo.path,
-      repoName: 'fixture-app',
-      path: lane.path,
-      branch: lane.branch,
-      sha: laneHead(lane),
-      jobId: 'job-p',
-    });
+    expect(h.ledger.getWorktree(lane.id)).toMatchObject({ id: lane.id, path: lane.path, jobId: 'job-p' });
     h.ledger.recordWorktreeProcesses({
       worktreeId: lane.id,
       processes: [{ pid: 4242, command: 'node dist/main.js', evidence: 'cwd' }],

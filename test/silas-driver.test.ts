@@ -5381,7 +5381,7 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
 
   it('a terminal job still holding its lane is release-eligible and actionable (rule hit)', async () => {
     const h = makeLedger();
-    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')), h.ledger);
     try {
       addTerminalJob(h, 'job-merged', 'merged');
       const lane = await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-merged' });
@@ -5401,7 +5401,7 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
 
   it('a binned (discarded) job still holding its lane is release-eligible on the same rule', async () => {
     const h = makeLedger();
-    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')), h.ledger);
     try {
       addTerminalJob(h, 'job-binned', 'binned');
       const lane = await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-binned' });
@@ -5420,7 +5420,7 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
 
   it('a done job counts exactly like a merged one; the row key is the job id', async () => {
     const h = makeLedger();
-    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')), h.ledger);
     try {
       addTerminalJob(h, 'job-done', 'done');
       await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-done' });
@@ -5434,7 +5434,7 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
 
   it('a terminal job with NO held lane (already swept) lists no row (rule miss)', async () => {
     const h = makeLedger();
-    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')), h.ledger);
     try {
       addTerminalJob(h, 'job-swept', 'merged');
       await worktrees.createJobWorktree({ repoPath: makeRepo(), jobId: 'job-swept' });
@@ -5449,7 +5449,7 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
 
   it('a non-terminal job holding a lane is never release-eligible (rule miss)', async () => {
     const h = makeLedger();
-    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')), h.ledger);
     try {
       h.ledger.addJob({ id: 'job-live', repo: 'fixture-app', title: 't', briefing: 'b' });
       h.ledger.setJobStatus('job-live', 'working');
@@ -5463,7 +5463,7 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
 
   it('a non-terminal child worker fences the row (the release would refuse); settling it releases the fence', async () => {
     const h = makeLedger();
-    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')), h.ledger);
     try {
       // The child is admitted BEFORE the job goes terminal (a terminal job
       // admits no fresh child) and is still non-terminal at sweep time.
@@ -5486,7 +5486,7 @@ describe('silas digest releaseEligible rows (issue #117/g21)', () => {
 
   it('the row is decision-relevant: it moves the fingerprint and rides the delta as added/resolved', async () => {
     const h = makeLedger();
-    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')));
+    const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-silas-release-wt-')), h.ledger);
     try {
       addTerminalJob(h, 'job-fp', 'merged');
       const withoutRow = await digestOf(h, worktrees);

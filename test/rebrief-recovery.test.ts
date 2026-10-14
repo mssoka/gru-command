@@ -139,7 +139,7 @@ function makeHarness(opts: { repo?: FixtureRepo | null; sessionFile?: string | n
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
   const notifications = new NotificationCenter({ ledger, bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
   mkdirSync(worktrees.root, { recursive: true });
   const registry = new FakeAgents(opts.sessionFile ?? null);
   const harness: Harness = {

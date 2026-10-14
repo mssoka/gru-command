@@ -210,7 +210,7 @@ async function bootFollowThrough(input: {
   const db = new LedgerDb(dir);
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
 
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const minionPrompts: string[] = [];

@@ -1,6 +1,14 @@
+import * as handoffProof from '../src/worktrees/handoff.js';
+import { ChildWorkerService } from '../src/dispatch/child-workers.js';
+import { RuntimeRegistry } from '../src/runtime/registry.js';
+import { SessionStore } from '../src/sessions/store.js';
+import { loadConfig, type RuntimeId } from '../src/config.js';
+import type { AgentHandle, AgentRuntime, RuntimeEventListener } from '../src/runtime/types.js';
+import { rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
+import { PacingGate } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -409,6 +417,480 @@ describe('review Git repository environment isolation (GH-270)', () => {
         expect(git(lane.path, ['rev-parse', 'HEAD'])).toBe(repo.head());
         expect(git(repo.path, ['rev-parse', 'refs/heads/foreign-handoff'])).toBe(refs);
       } finally { unsubscribe(); }
+    }
+  });
+
+  it('refuses cached writer reuse of a retained failed handoff during publication and after restart (R9)', async () => {
+    const evidence: { observer: boolean; restart: boolean; directive: boolean; spawns: number; prompts: number }[] = [];
+    const refused = (operation: Promise<unknown>) => operation.then(() => false, (error: unknown) => String(error).includes('handoff unresolved'));
+    for (const mutation of ['identity', 'nonce'] as const) {
+      const repo = fixture(`r9-reuse-${mutation}`);
+      const h = manager();
+      const job = h.ledger.addJob({ id: `r9-${mutation}`, repo: 'assigned', title: 'retained lane', baseBranch: 'main' });
+      h.ledger.setJobStatus(job.id, 'working');
+      repo.git(['branch', 'foreign-handoff']);
+      const prompt = vi.fn(async () => {}), dispose = vi.fn(async () => {});
+      const handle = { id: `r9-worker-${mutation}`, role: 'minion' as const, sessionFile: null,
+        capabilities: { streaming: true, steer: 'native' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        prompt, steer: async () => {}, followUp: async () => {}, dispose, subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }) };
+      const registry = { getHandle: () => null, spawn: vi.fn(async () => handle), disposeHandle: vi.fn(async () => {}) };
+      let observerAttempt: Promise<unknown> | undefined, admin = '';
+      const unsubscribe = h.bus.subscribe((event) => {
+        if (event.kind !== 'worktree.created') return;
+        const lane = h.ledger.getWorktree(job.id)!;
+        admin = git(lane.path, ['rev-parse', '--absolute-git-dir']);
+        writeFileSync(join(lane.path, 'foreign-data'), 'retain');
+        if (mutation === 'identity') git(lane.path, ['symbolic-ref', 'HEAD', 'refs/heads/foreign-handoff']);
+        else writeFileSync(join(admin, 'locked'), 'foreign nonce');
+        observerAttempt = rebriefFreshMinion({ ...h, registry, jobId: job.id, note: 'observer reuse', briefing: null });
+        void observerAttempt.catch(() => {});
+      });
+      await expect(h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })).rejects.toThrow(/registered lane retained/);
+      unsubscribe();
+      if (observerAttempt === undefined) throw new Error('fixture never observed registry publication');
+      const observer = await refused(observerAttempt);
+      const lane = h.ledger.getWorktree(job.id)!;
+      expect(lane.status).toBe('active'); expect(git(lane.path, ['rev-parse', 'HEAD'])).toBe(repo.head());
+      expect(readFileSync(join(lane.path, 'foreign-data'), 'utf8')).toBe('retain');
+      expect(existsSync(join(admin, 'locked'))).toBe(true);
+      // Fresh module instances have no prior manager/readiness cache.
+      vi.resetModules();
+      const { WorktreeManager: RestartedManager } = await import('../src/worktrees/manager.js');
+      const { rebriefFreshMinion: restartRebrief, routeFixDirectiveToMinion: restartDirective } = await import('../src/dispatch/fix-directive.js');
+      const restarted = new RestartedManager({ ledger: h.ledger, root: h.root, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
+      const forwarded = { ...restarted, listWorktrees: (scope?: { jobId?: string }) => restarted.listWorktrees(scope),
+        getWorktree: (id: string) => restarted.getWorktree(id), createJobWorktree: restarted.createJobWorktree.bind(restarted),
+        createReviewWorktree: restarted.createReviewWorktree.bind(restarted), createChildWorktree: restarted.createChildWorktree.bind(restarted),
+        resolveReviewTarget: restarted.resolveReviewTarget.bind(restarted), release: restarted.release.bind(restarted) };
+      const restart = await refused(restartRebrief({ ledger: h.ledger, worktrees: forwarded, registry, jobId: job.id, note: 'boot reuse', briefing: null }));
+      const directive = await refused(restartDirective({ ledger: h.ledger, worktrees: forwarded, registry, jobId: job.id, directive: 'fix', signal: new AbortController().signal }));
+      evidence.push({ observer, restart, directive, spawns: registry.spawn.mock.calls.length, prompts: prompt.mock.calls.length });
+      expect(h.ledger.getWorktree(job.id)?.status).toBe('active');
+      expect(git(repo.path, ['rev-parse', 'refs/heads/foreign-handoff'])).toBe(repo.head());
+      expect(readFileSync(join(lane.path, 'foreign-data'), 'utf8')).toBe('retain');
+    }
+    expect(evidence).toEqual(Array.from({ length: 2 }, () => ({ observer: true, restart: true, directive: true, spawns: 0, prompts: 0 })));
+  });
+
+  it('rechecks captured handoff readiness across admission, spawn and registration with completed writer positives (R9)', async () => {
+    for (const seam of ['unchanged', 'admission', 'spawn', 'registration', 'missing', 'malformed', 'non-linked', 'foreign-admin', 'generation', 'removed-git', 'orphan', 'dangling', 'cleanup-lock', 'refresh-replacement', 'receipt-symlink', 'receipt-fifo', 'receipt-oversized', 'receipt-fields', 'receipt-phase', 'receipt-types', 'receipt-duplicate'] as const) {
+      const repo = fixture(`r9-ready-${seam}`), h = manager();
+      const job = h.ledger.addJob({ id: `r9-${seam}`, repo: 'assigned', title: 'ready lane', baseBranch: 'main' });
+      h.ledger.setJobStatus(job.id, 'working');
+      const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      const admin = git(lane.path, ['rev-parse', '--absolute-git-dir']), receipt = join(admin, 'gru-creation-handoff.json');
+      const original = readFileSync(receipt, 'utf8');
+      const prompt = vi.fn(async () => {}), dispose = vi.fn(async () => {});
+      const handle = { id: `r9-worker-${seam}`, role: 'minion' as const, sessionFile: null,
+        capabilities: { streaming: true, steer: 'native' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        prompt, steer: async () => {}, followUp: async () => {}, dispose, subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }) };
+      const mutate = () => writeFileSync(join(admin, 'locked'), 'foreign nonce');
+      const registry = { getHandle: () => null, spawn: vi.fn(async () => { if (seam === 'spawn') mutate(); return handle; }), disposeHandle: vi.fn(async () => {}) };
+      const unsubscribe = h.bus.subscribe((event) => { if (seam === 'registration' && event.kind === 'agent.spawned') mutate(); });
+      if (seam === 'missing') rmSync(receipt);
+      if (seam === 'receipt-symlink') {
+        const target = join(directory(), 'copied-receipt'); writeFileSync(target, readFileSync(receipt));
+        rmSync(receipt); symlinkSync(target, receipt);
+      }
+      if (seam === 'receipt-fifo') { rmSync(receipt); execFileSync('mkfifo', [receipt]); }
+      if (seam === 'receipt-oversized') writeFileSync(receipt, ' '.repeat(64 * 1024 + 1));
+      if (seam === 'receipt-fields') writeFileSync(receipt, JSON.stringify({ ...JSON.parse(readFileSync(receipt, 'utf8')), authorized: true }));
+      if (seam === 'receipt-phase') writeFileSync(receipt, JSON.stringify({ ...JSON.parse(readFileSync(receipt, 'utf8')), state: 'ready', createdAt: null }));
+      if (seam === 'receipt-types') writeFileSync(receipt, JSON.stringify({ ...JSON.parse(readFileSync(receipt, 'utf8')), token: 123 }));
+      if (seam === 'receipt-duplicate') writeFileSync(receipt, readFileSync(receipt, 'utf8').replace('{', '{"state":"pending",'));
+
+      if (seam === 'malformed') writeFileSync(receipt, '{bad');
+      if (seam === 'generation') writeFileSync(receipt, JSON.stringify({ ...JSON.parse(original), createdAt: 'foreign generation' }));
+      if (seam === 'cleanup-lock') {
+        const cleanup = h.worktrees.release({ worktreeId: job.id }); void cleanup.catch(() => {});
+        mutate(); await expect(cleanup).rejects.toThrow(/handoff unresolved/);
+      }
+      if (seam === 'orphan' || seam === 'dangling') {
+        rmSync(lane.path, { recursive: true });
+        if (seam === 'dangling') symlinkSync(join(directory(), 'missing'), lane.path);
+        await expect(h.worktrees.release({ worktreeId: job.id })).rejects.toThrow(/handoff unresolved/);
+        expect(existsSync(admin)).toBe(true);
+      }
+      if (seam === 'refresh-replacement') {
+        git(repo.path, ['worktree', 'remove', '--force', lane.path]);
+        const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim(), root = directory();
+        const servicePath = process.env.PATH ?? '', marker = join(root, 'created');
+        writeFileSync(join(root, 'git'), '#!/usr/bin/env node\nconst fs=require("node:fs"),cp=require("node:child_process"),a=process.argv.slice(2);\n' +
+          `if(a[0]==='rev-parse'&&a[1]==='HEAD'&&!fs.existsSync(${JSON.stringify(marker)})){fs.writeFileSync(${JSON.stringify(marker)},'actor');cp.execFileSync(${JSON.stringify(realGit)},['worktree','add','--detach',${JSON.stringify(lane.path)},'HEAD']);fs.writeFileSync(${JSON.stringify(join(lane.path, 'replacement-data'))},'retain');}\n` +
+          `const r=cp.spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});process.exit(r.status??1);\n`);
+        chmodSync(join(root, 'git'), 0o755); vi.stubEnv('PATH', `${root}:${servicePath}`);
+        try { await expect(h.worktrees.release({ worktreeId: job.id })).rejects.toThrow(/handoff unresolved/); }
+        finally { vi.stubEnv('PATH', servicePath); }
+        expect(readFileSync(join(lane.path, 'replacement-data'), 'utf8')).toBe('retain');
+        expect(git(repo.path, ['rev-parse', `refs/heads/${lane.branch}`])).toBe(lane.sha);
+      }
+      if (seam === 'removed-git') rmSync(join(lane.path, '.git'));
+      if (seam === 'non-linked') { rmSync(join(lane.path, '.git')); mkdirSync(join(lane.path, '.git')); }
+      if (seam === 'foreign-admin') { const foreign = fixture('r9-foreign-admin'); writeFileSync(join(lane.path, '.git'), `gitdir: ${join(foreign.path, '.git')}\n`); }
+      if (seam === 'unchanged') {
+        writeFileSync(join(lane.path, 'advance.txt'), 'legitimate writer advance'); git(lane.path, ['add', 'advance.txt']); git(lane.path, ['commit', '-qm', 'writer advance']);
+        git(repo.path, ['pack-refs', '--all']);
+      }
+      const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+      let holder = seam === 'admission' ? await gate.acquireWorkerTurn({ id: 'holder', label: 'holder' }) : null;
+      try {
+        const forwarded = new Proxy(h.worktrees, { get(target, property) {
+          if (property === 'listWorktrees') return (scope?: { jobId?: string }) => target.listWorktrees(scope).map((record) => {
+            const copy = { ...record }; Reflect.deleteProperty(copy, 'createdAt'); return copy;
+          });
+          const value: unknown = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+        } });
+        const reuse = rebriefFreshMinion({ ...h, worktrees: seam === 'removed-git' ? forwarded : h.worktrees,
+          registry, jobId: job.id, note: 'fresh reuse', briefing: null, workerGate: gate });
+        void reuse.catch(() => {});
+        if (holder !== null) { await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(1)); mutate(); holder.release(); holder = null; }
+        if (seam === 'unchanged') { await reuse; expect(registry.spawn).toHaveBeenCalledTimes(1); expect(prompt).toHaveBeenCalledTimes(1); }
+        else {
+          await expect(reuse).rejects.toThrow(/handoff unresolved/); expect(prompt).not.toHaveBeenCalled();
+          if (seam === 'spawn' || seam === 'registration') expect(dispose).toHaveBeenCalledTimes(1);
+          else expect(registry.spawn).not.toHaveBeenCalled();
+        }
+        expect(h.ledger.getWorktree(job.id)?.status).toBe('active');
+      } finally { holder?.release(); unsubscribe(); }
+    }
+  });
+
+  it('refuses successful checkout-hook custody loss before registration across all authorities with unchanged positives (R9 coverage gap)', async () => {
+    const repo = fixture('r9-success-hook'), h = manager();
+    const parentJob = h.ledger.addJob({ id: 'r9-parent', repo: 'assigned', title: 'parent', baseBranch: 'main' });
+    const parent = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: parentJob.id });
+    repo.git(['branch', 'foreign-hook']);
+    for (const authority of ['job', 'review', 'writer', 'read-only'] as const) for (const mutation of ['unchanged', 'nonce', 'removed'] as const) {
+      const job = h.ledger.addJob({ id: `r9-hook-${authority}-${mutation}`, repo: 'assigned', title: 'successful hook', baseBranch: 'main' });
+      const round = h.ledger.addRound({ jobId: job.id, targetRef: repo.head() });
+      const id = authority === 'review' ? round.id : job.id;
+      const { hook, log } = failingCheckoutHook(repo);
+      writeFileSync(hook, '#!/usr/bin/env node\nconst fs=require("node:fs"),cp=require("node:child_process"),p=require("node:path");\n' +
+        `fs.writeFileSync(${JSON.stringify(log)},process.cwd());const admin=cp.execFileSync('git',['rev-parse','--absolute-git-dir'],{encoding:'utf8'}).trim();\n` +
+        `fs.writeFileSync('foreign-hook-data','retain');${mutation === 'nonce' ? "fs.writeFileSync(p.join(admin,'locked'),'foreign hook nonce');" : mutation === 'removed' ? "fs.unlinkSync(p.join(admin,'locked'));" : ''}process.exit(0);\n`);
+      let published = 0;
+      const unsubscribe = h.bus.subscribe((event) => { if (event.kind === 'worktree.created') published += 1; });
+      const creation = authority === 'job' ? h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id })
+        : authority === 'review' ? h.worktrees.createReviewWorktree({ repoPath: repo.path, roundId: round.id, ref: repo.head() })
+          : h.worktrees.createChildWorktree({ repoPath: repo.path, jobId: parentJob.id, childId: id, parentPath: parent.path, authority });
+      try {
+        if (mutation === 'unchanged') { await creation; expect(published).toBe(1); }
+        else { await expect(creation).rejects.toThrow(/custody unconfirmed/); expect(published).toBe(0); expect(h.ledger.getWorktree(id)).toBeNull(); }
+        const path = readFileSync(log, 'utf8'), admin = git(path, ['rev-parse', '--absolute-git-dir']);
+        expect(readFileSync(join(path, 'foreign-hook-data'), 'utf8')).toBe('retain');
+        expect(existsSync(admin)).toBe(true); expect(git(repo.path, ['rev-parse', 'refs/heads/foreign-hook'])).toBe(repo.head());
+        if (mutation === 'nonce') expect(readFileSync(join(admin, 'locked'), 'utf8')).toBe('foreign hook nonce');
+        else expect(existsSync(join(admin, 'locked'))).toBe(false);
+      } finally { unsubscribe(); }
+    }
+  });
+
+  it('retains actual resident ownership on post-adapter handoff refusal for single, reserved, pair and extra permits (R9)', async () => {
+    for (const path of ['single', 'reserved', 'pair', 'extra'] as const) for (const mode of ['terminal', 'false-probes', 'live', 'missing', 'throwing', 'rejected'] as const) {
+      const repo = fixture(`r9-resident-${path}-${mode}`), h = manager();
+      const job = h.ledger.addJob({ id: 'r9-resident', repo: 'assigned', title: 'resident fence', baseBranch: 'main' });
+      const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      const admin = git(lane.path, ['rev-parse', '--absolute-git-dir']);
+      const config = loadConfig({ GRU_COMMAND_HOME: directory() });
+      const controls: { handle: AgentHandle; cease: () => void }[] = [];
+      const prompt = vi.fn(async () => {});
+      const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: async (role, options = {}) => {
+          const target = options.cwd === lane.path;
+          let ceased = false;
+          const listeners = new Set<RuntimeEventListener>();
+          const cease = () => { ceased = true; for (const listener of listeners) listener({ type: 'state', state: 'disposed' }); };
+          const probe = () => { if (mode === 'throwing' && target) throw new Error('probe unknown'); return target && mode !== 'terminal' && mode !== 'false-probes'; };
+          const handle: AgentHandle = { id: `r9-resident-${controls.length}`, role, sessionFile: null, capabilities: adapter.capabilities, prompt,
+            steer: async () => {}, followUp: async () => {}, subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+            health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+            ...(target && mode === 'missing' ? {} : { hasLiveProcess: probe, isCompacting: probe }),
+            dispose: async () => { if (!target || mode === 'terminal') cease(); else if (mode === 'rejected') throw new Error('stop unknown'); } };
+          controls.push({ handle, cease });
+          // A real adapter-await boundary, before the registry can publish the resident.
+          if (target) { await Promise.resolve(); writeFileSync(join(admin, 'locked'), 'foreign custody'); }
+          return handle;
+        } };
+      class Registry extends RuntimeRegistry {
+        override runtimeIdFor(): RuntimeId { return 'pi'; }
+        override runtimeFor(): AgentRuntime { return adapter; }
+      }
+      const registry = new Registry({ config: { ...config, concurrency: { ...config.concurrency, maxWorkers: 4 } }, store: new SessionStore(directory()), closeSettleMs: 1000 });
+      const unrelated = await registry.spawn('minion');
+      const round = path === 'pair' || path === 'extra' ? await registry.reserveReviewRound() : null;
+      if (path === 'extra') {
+        await round!.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
+        round!.beginChildren(2);
+        await round!.spawn({});
+      }
+      const callerRelease = path === 'reserved' ? await registry.reserveResident() : null;
+      const operation = path === 'single' ? registry.spawn('minion', { cwd: lane.path })
+        : callerRelease !== null ? registry.spawnWithResident('minion', { cwd: lane.path }, callerRelease)
+          : round!.spawn({ cwd: lane.path, ...(path === 'pair' ? { reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } } : {}) });
+      if (callerRelease !== null) {
+        callerRelease(); // caller catch/finally during the adapter await cannot free the claimed slot
+        expect(registry.residencySnapshot().occupied).toBe(2);
+        await expect(registry.spawnWithResident('minion', {}, callerRelease)).rejects.toThrow(/already claimed/);
+      }
+      await expect(operation).rejects.toThrow(/handoff unresolved/);
+      callerRelease?.(); callerRelease?.(); // outer caller still holds the identical callback after rejection
+      expect(prompt).not.toHaveBeenCalled();
+      expect(unrelated.health().state).toBe('idle');
+      const target = controls[controls.length - 1]!;
+      const positive = mode === 'terminal' || mode === 'false-probes';
+      if (round !== null) {
+        if (!positive) {
+          expect(round.cleanupDebt()).toContain(target.handle.id);
+          if (path === 'pair') await expect(round.spawn({ cwd: lane.path, reviewLead: { systemPrompt: 'duplicate', tools: [], nativeTools: [] } })).rejects.toThrow();
+          await expect(round.close()).rejects.toThrow(/capacity|debt|disposal/);
+        } else await round.close();
+      }
+      expect(registry.residencySnapshot().occupied).toBe(positive ? 1 : (path === 'pair' ? 3 : 2));
+      if (!positive) {
+        expect(registry.getHandle(target.handle.id)).not.toBeNull();
+        target.cease();
+        round?.reconcileCleanup();
+        expect(round?.cleanupDebt() ?? []).toEqual([]);
+        expect(registry.residencySnapshot().occupied).toBe(1);
+      }
+      const unused = await registry.reserveResident(); unused(); unused();
+      await expect(registry.spawnWithResident('minion', {}, unused)).rejects.toThrow(/already claimed or released/);
+      const noResident = await registry.reserveResident();
+      await expect(registry.spawnWithResident('minion', { cwd: lane.path }, noResident)).rejects.toThrow(/handoff unresolved/);
+      noResident();
+      await unrelated.dispose();
+      expect(registry.residencySnapshot().occupied).toBe(0);
+      expect(h.ledger.getWorktree(job.id)?.status).toBe('active');
+      expect(readFileSync(join(admin, 'locked'), 'utf8')).toBe('foreign custody');
+    }
+    for (const consumer of ['child-service', 'wave-round'] as const) for (const stop of ['unknown', 'terminal'] as const) {
+      const repo = fixture(`r9-forwarding-${consumer}-${stop}`), h = manager();
+      const job = h.ledger.addJob({ id: 'r9-forward', repo: 'assigned', title: 'forwarded ownership', baseBranch: 'main' });
+      h.ledger.setJobStatus(job.id, 'working');
+      await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      const controls: { id: string; cease: () => void }[] = [];
+      const prompted = vi.fn(async () => {}), post = vi.fn();
+      const config = loadConfig({ GRU_COMMAND_HOME: directory() });
+      const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: async (role, options = {}) => {
+          let ceased = false;
+          const listeners = new Set<RuntimeEventListener>();
+          const id = `forwarded-${controls.length}`;
+          const cease = () => { ceased = true; for (const listener of listeners) listener({ type: 'state', state: 'disposed' }); };
+          controls.push({ id, cease });
+          const admin = git(options.cwd!, ['rev-parse', '--absolute-git-dir']);
+          await Promise.resolve(); writeFileSync(join(admin, 'locked'), 'foreign post-adapter custody');
+          return { id, role, sessionFile: null, capabilities: adapter.capabilities, prompt: prompted,
+            steer: async () => {}, followUp: async () => {}, subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+            health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+            hasLiveProcess: () => !ceased, isCompacting: () => false,
+            dispose: async () => { if (stop === 'terminal') cease(); } };
+        } };
+      class Registry extends RuntimeRegistry { override runtimeIdFor(): RuntimeId { return 'pi'; } override runtimeFor(): AgentRuntime { return adapter; } }
+      const registry = new Registry({ config: { ...config, concurrency: { ...config.concurrency, maxWorkers: 4 } }, store: new SessionStore(directory()), closeSettleMs: 1000 });
+      if (consumer === 'child-service') {
+        h.ledger.registerAgent({ id: 'r9-parent', role: 'minion', jobId: job.id, parentage: 'top-level' });
+        const children = new ChildWorkerService({ ledger: h.ledger, worktrees: h.worktrees,
+          reserveResident: (signal) => registry.reserveResident(signal),
+          // Same exact callback forwarding as main.ts:1150-1157.
+          spawner: (role, options, release) => release !== undefined ? registry.spawnWithResident(role, options ?? {}, release) : registry.spawn(role, options ?? {}) });
+        const child = children.request({ parentAgentId: 'r9-parent', jobId: job.id, purpose: 'separate task', task: 'do not run', authority: 'writer', idempotencyKey: 'one' });
+        await vi.waitFor(() => expect(h.ledger.getChildWorker(child.record.id)?.resultState).toBe('error'));
+        expect(registry.residencySnapshot().occupied).toBe(stop === 'unknown' ? 1 : 0);
+        await children.dispose();
+      } else {
+        const implementing = h.worktrees.getWorktree(job.id)!;
+        writeFileSync(join(implementing.path, 'review-change.txt'), 'review this committed change');
+        git(implementing.path, ['add', 'review-change.txt']); git(implementing.path, ['commit', '-qm', 'review change']);
+        h.ledger.appendCustomEvent({ kind: 'job.delivered', jobId: job.id, payload: {} });
+        const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, reviewArtifactRoot: directory(), poster: { post },
+          spawner: (role, options) => registry.spawn(role, options ?? {}), reserveReviewRound: (signal) => registry.reserveReviewRound(signal) });
+        const review = await wave.requestReview({ jobId: job.id, targetRef: `refs/heads/gru/${job.id}`, noSpec: true });
+        await Promise.allSettled([review.run]);
+        expect(registry.residencySnapshot().occupied).toBe(stop === 'unknown' ? 2 : 0);
+        await wave.shutdown();
+      }
+      expect(controls).toHaveLength(1); expect(prompted).not.toHaveBeenCalled(); expect(post).not.toHaveBeenCalled();
+      if (stop === 'unknown') {
+        expect(registry.getHandle(controls[0]!.id)).not.toBeNull();
+        controls[0]!.cease();
+        expect(registry.residencySnapshot().occupied).toBe(0);
+      }
+      expect(h.worktrees.listWorktrees({ jobId: job.id }).filter((lane) => lane.kind !== 'job').every((lane) => lane.status === 'active')).toBe(true);
+    }
+  });
+
+  it('rejects valid-shaped forged ready promotion without service issuance across publication restart and forwarding (contained A)', async () => {
+    const observations: { observer: boolean; restart: boolean; directive: boolean; spawns: number; prompts: number }[] = [];
+    for (const forged of [true, false]) {
+      const repo = fixture('contained-promotion'), h = manager();
+      const job = h.ledger.addJob({ id: 'contained-owner', repo: 'assigned', title: 'issued owner', briefing: 'implement the contract' });
+      h.ledger.setJobStatus(job.id, 'working');
+      const prompt = vi.fn(async () => {});
+      const registry = { getHandle: () => null, spawn: vi.fn(async () => ({ id: `issued-${registry.spawn.mock.calls.length}`, role: 'minion' as const,
+        sessionFile: null, capabilities: { streaming: true, steer: 'native' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        prompt, steer: async () => {}, followUp: async () => {}, dispose: async () => {}, subscribe: () => () => {},
+        health: () => ({ state: 'idle' as const, lastActivity: null, sessionFile: null }) })), disposeHandle: async () => {} };
+      const refused = (operation: Promise<unknown>) => operation.then(() => false, (error: unknown) => String(error).includes('handoff unresolved'));
+      let observer: Promise<boolean> | undefined, admin = '';
+      const unsubscribe = h.bus.subscribe((event) => {
+        if (event.kind !== 'worktree.created') return;
+        const row = h.ledger.getWorktree(job.id)!;
+        admin = git(row.path, ['rev-parse', '--absolute-git-dir']);
+        writeFileSync(join(row.path, 'retained-data'), 'retain');
+        if (forged) {
+          const file = join(admin, 'gru-creation-handoff.json');
+          const pending = JSON.parse(readFileSync(file, 'utf8'));
+          writeFileSync(file, JSON.stringify({ ...pending, state: 'ready', createdAt: row.createdAt }));
+          rmSync(join(admin, 'locked'));
+        }
+        observer = refused(rebriefFreshMinion({ ...h, registry, jobId: job.id, note: 'publication reuse', briefing: null }));
+      });
+      const creation = h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      if (forged) await expect(creation).rejects.toThrow(/registered lane retained/); else await creation;
+      unsubscribe();
+      if (observer === undefined) throw new Error('publication control was not observed');
+      const duringPublication = await observer;
+      const row = h.ledger.getWorktree(job.id)!;
+      expect(git(row.path, ['symbolic-ref', 'HEAD'])).toBe(`refs/heads/${row.branch}`);
+      expect(git(row.path, ['rev-parse', 'HEAD'])).toBe(repo.head());
+      vi.resetModules();
+      const { WorktreeManager: FreshManager } = await import('../src/worktrees/manager.js');
+      const { rebriefFreshMinion: freshRebrief, routeFixDirectiveToMinion: freshDirective } = await import('../src/dispatch/fix-directive.js');
+      const reopened = new LedgerDb(h.dbPath); dbs.push(reopened);
+      const ledger = new LedgerApi(reopened.handle);
+      const worktrees = new FreshManager({ ledger, root: h.root, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
+      const forwarded = new Proxy(worktrees, { get(target, key) {
+        if (key === 'listWorktrees') return (scope?: { jobId?: string }) => target.listWorktrees(scope).map((lane) => {
+          const presented = { ...lane }; Reflect.deleteProperty(presented, 'createdAt'); return presented;
+        });
+        const value: unknown = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      const restart = await refused(freshRebrief({ ledger, worktrees: forwarded, registry, jobId: job.id, note: 'reopened service ledger', briefing: null }));
+      const directive = await refused(freshDirective({ ledger, worktrees: forwarded, registry, jobId: job.id, directive: 'accepted repair', signal: new AbortController().signal }));
+      observations.push({ observer: duringPublication, restart, directive, spawns: registry.spawn.mock.calls.length, prompts: prompt.mock.calls.length });
+      expect(ledger.getWorktree(job.id)?.status).toBe('active');
+      expect(readFileSync(join(row.path, 'retained-data'), 'utf8')).toBe('retain');
+      expect(existsSync(admin)).toBe(true); expect(existsSync(join(admin, 'locked'))).toBe(false);
+    }
+    expect(observations).toEqual([
+      { observer: true, restart: true, directive: true, spawns: 0, prompts: 0 },
+      { observer: true, restart: false, directive: false, spawns: 2, prompts: 2 },
+    ]);
+  });
+
+  it('preserves genuine completed issuance across service reopen writer advance and cleanup (contained A healthy)', async () => {
+    const repo = fixture('contained-genuine'), h = manager();
+    const job = h.ledger.addJob({ id: 'genuine-owner', repo: 'assigned', title: 'genuine issuance' });
+    const row = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+    writeFileSync(join(row.path, 'advance'), 'legitimate writer advance'); git(row.path, ['add', 'advance']); git(row.path, ['commit', '-qm', 'advance']);
+    git(repo.path, ['pack-refs', '--all']);
+    const db = new LedgerDb(h.dbPath); dbs.push(db);
+    const ledger = new LedgerApi(db.handle);
+    const worktrees = new WorktreeManager({ ledger, root: h.root, preserveRoot: directory(), setupTimeoutMs: 30_000, enumerateProcesses: () => [] });
+    handoffProof.capturePortLaneHandoff(worktrees, worktrees.getWorktree(job.id)!)();
+    expect((await worktrees.release({ worktreeId: job.id })).status).toBe('swept');
+    expect(existsSync(row.path)).toBe(false);
+  });
+
+  it('requires complete unique owner issuance and preserves committed notification-error facts without retry issuance (contained A)', async () => {
+    for (const mode of ['duplicate', 'stale', 'foreign', 'incomplete', 'notification', 'substitution'] as const) {
+      const repo = fixture(`contained-fact-${mode}`), h = manager();
+      const job = h.ledger.addJob({ id: 'fact-owner', repo: 'assigned', title: 'completion fact' });
+      const publish = h.bus.publish.bind(h.bus);
+      if (mode === 'notification') vi.spyOn(h.bus, 'publish').mockImplementation((event) => {
+        publish(event); if (event.kind === 'worktree.handoff-completed') throw new Error('owned notification failure after commit');
+      });
+      const creation = h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      if (mode === 'notification') await expect(creation).rejects.toThrow(/registered lane retained/); else await creation;
+      const row = h.worktrees.getWorktree(job.id)!;
+      const facts = h.ledger.listEventsAfter(0, { kinds: ['worktree.handoff-completed'], limit: 1001 });
+      expect(facts).toHaveLength(1);
+      const original = facts[0]!;
+      if (typeof original.payload !== 'object' || original.payload === null) throw new Error('fixture completion fact lacks its binding');
+      if (mode === 'duplicate') h.ledger.appendCustomEvent({ kind: original.kind, jobId: row.jobId, roundId: row.roundId, payload: original.payload });
+      if (mode === 'stale' || mode === 'foreign') h.ledger.appendCustomEvent({ kind: original.kind, jobId: row.jobId, roundId: row.roundId,
+        payload: { ...original.payload, [mode === 'stale' ? 'createdAt' : 'repo']: 'unrelated original authority' } });
+      if (mode === 'incomplete') for (let i = 0; i < 1000; i += 1) h.ledger.appendCustomEvent({ kind: original.kind, payload: { owner: `other-${i}` } });
+      if (mode === 'substitution') { git(repo.path, ['branch', 'foreign']); git(row.path, ['symbolic-ref', 'HEAD', 'refs/heads/foreign']); }
+      if (mode === 'notification') {
+        handoffProof.capturePortLaneHandoff(h.worktrees, row)();
+        expect(h.ledger.listEventsAfter(0, { kinds: [original.kind], limit: 1001 })).toHaveLength(1);
+      } else expect(() => handoffProof.capturePortLaneHandoff(h.worktrees, row)()).toThrow(/handoff unresolved/);
+      expect(existsSync(row.path)).toBe(true); expect(h.ledger.getWorktree(job.id)?.status).toBe('active');
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('retains unknown cessation on contrary late disposed across reserved pair extra and actual child forwarding (contained C)', async () => {
+    for (const path of ['single', 'reserved', 'pair', 'extra', 'forwarded'] as const) for (const mode of ['live', 'missing', 'throwing', 'rejected', 'health-missing', 'health-throwing'] as const) {
+      const repo = fixture('contained-contrary'), h = manager();
+      const job = h.ledger.addJob({ id: 'contrary-owner', repo: 'assigned', title: 'contrary event' });
+      h.ledger.setJobStatus(job.id, 'working');
+      const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      const admin = git(lane.path, ['rev-parse', '--absolute-git-dir']);
+      const controls: { id: string; event: () => void; cease: () => void }[] = [];
+      const prompted = vi.fn(async () => {});
+      const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: async (role, options = {}) => {
+          const target = options.cwd !== undefined;
+          let ceased = false;
+          const listeners = new Set<RuntimeEventListener>();
+          const event = () => { for (const listener of listeners) listener({ type: 'state', state: 'disposed' }); };
+          const id = `contrary-${controls.length}`;
+          controls.push({ id, event, cease: () => { ceased = true; event(); } });
+          const handle: AgentHandle = { id, role, sessionFile: null, capabilities: adapter.capabilities, prompt: prompted,
+            steer: async () => {}, followUp: async () => {}, subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+            health: () => {
+              if (!ceased && target && mode === 'health-throwing') throw new Error('unknown health');
+              const snapshot = { state: ceased ? 'disposed' as const : 'idle' as const, lastActivity: null, sessionFile: null };
+              if (!ceased && target && mode === 'health-missing') Reflect.deleteProperty(snapshot, 'state');
+              return snapshot;
+            },
+            ...(target && mode === 'missing' ? {} : { hasLiveProcess: () => { if (target && mode === 'throwing') throw new Error('unknown probe'); return !ceased; }, isCompacting: () => false }),
+            dispose: async () => { if (!target) { ceased = true; event(); } else if (mode === 'rejected') throw new Error('unknown stop'); } };
+          if (target) { await Promise.resolve(); writeFileSync(join(git(options.cwd!, ['rev-parse', '--absolute-git-dir']), 'locked'), 'foreign custody'); }
+          return handle;
+        } };
+      class Registry extends RuntimeRegistry { override runtimeIdFor(): RuntimeId { return 'pi'; } override runtimeFor(): AgentRuntime { return adapter; } }
+      const config = loadConfig({ GRU_COMMAND_HOME: directory() });
+      const registry = new Registry({ config: { ...config, concurrency: { ...config.concurrency, maxWorkers: 4 } }, store: new SessionStore(directory()), closeSettleMs: 1000 });
+      const unrelated = await registry.spawn('minion');
+      const round = path === 'pair' || path === 'extra' ? await registry.reserveReviewRound() : null;
+      if (path === 'extra') { round!.beginChildren(2); await round!.spawn({}); }
+      if (path === 'forwarded') {
+        h.ledger.registerAgent({ id: 'parent', role: 'minion', jobId: job.id, parentage: 'top-level' });
+        const children = new ChildWorkerService({ ledger: h.ledger, worktrees: h.worktrees, reserveResident: (signal) => registry.reserveResident(signal),
+          spawner: (role, options, release) => release !== undefined ? registry.spawnWithResident(role, options ?? {}, release) : registry.spawn(role, options ?? {}) });
+        const child = children.request({ parentAgentId: 'parent', jobId: job.id, task: 'never execute', purpose: 'contrary ownership', authority: 'writer', idempotencyKey: 'one' });
+        await vi.waitFor(() => expect(h.ledger.getChildWorker(child.record.id)?.resultState).toBe('error'));
+        await children.dispose();
+      } else {
+        const release = path === 'reserved' ? await registry.reserveResident() : null;
+        const operation = round !== null ? round.spawn({ cwd: lane.path }) : release !== null ? registry.spawnWithResident('minion', { cwd: lane.path }, release) : registry.spawn('minion', { cwd: lane.path });
+        await expect(operation).rejects.toThrow(mode === 'health-throwing' ? /unknown health|handoff unresolved/ : /handoff unresolved/); release?.(); release?.();
+      }
+      const target = controls.at(-1)!;
+      const occupied = registry.residencySnapshot().occupied;
+      target.event(); target.event();
+      expect(registry.residencySnapshot().occupied).toBe(occupied);
+      expect(registry.getHandle(target.id)).not.toBeNull();
+      if (round !== null) {
+        expect(round.cleanupDebt()).toContain(target.id);
+        await expect(round.spawn({})).rejects.toThrow(/parallelism/);
+        target.cease();
+        if (path === 'extra') controls[1]!.cease(); // finish the already-running pair child before reusing its slot
+        const replacement = await round.spawn({});
+        expect(replacement.id).not.toBe(target.id);
+        await replacement.dispose();
+        if (mode === 'rejected') await expect(round.close()).rejects.toThrow(/disposal/); else await round.close();
+      } else { target.cease(); target.event(); }
+      expect(registry.residencySnapshot().occupied).toBe(1);
+      expect(prompted).not.toHaveBeenCalled(); expect(unrelated.health().state).toBe('idle');
+      await unrelated.dispose(); expect(registry.residencySnapshot().occupied).toBe(0);
+      expect(h.ledger.getWorktree(job.id)?.status).toBe('active'); expect(existsSync(admin)).toBe(true);
     }
   });
 

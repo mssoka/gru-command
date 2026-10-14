@@ -474,7 +474,7 @@ describe('directive requests — the real service path (HTTP 202 + readback)', (
     const bus = new EventBus({});
     const ledger = new LedgerApi(db.handle, { bus });
     const notifications = new NotificationCenter({ ledger, bus });
-    const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+    const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
     const registry = new FakeMinions();
     ledger.addJob({ id: 'job-h1', repo: 'r', title: 'Job H1' });
     ledger.setJobStatus('job-h1', 'working');

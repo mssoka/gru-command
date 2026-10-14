@@ -1,3 +1,4 @@
+import { captureLaneHandoff } from '../worktrees/handoff.js';
 import { join } from 'node:path';
 import { createArtifactContext } from '../artifacts/context.js';
 import { materializeBmadRuntime, PACKAGE_ROOT, readBmadRuntimeBinding } from '../bmad/runtime.js';
@@ -52,6 +53,7 @@ export function registeredWorkflowLane(
     if (options.cwd !== undefined && options.cwd !== assigned.path) {
       throw new WorkflowSessionError(`workflow cwd conflicts with registered assignment ${assigned.id}: ${options.cwd}`);
     }
+    captureLaneHandoff(assigned)();
     return assigned;
   }
   if (agent !== undefined && agent !== null) return null; // never redirect a known owner to another lane
@@ -64,6 +66,7 @@ export function registeredWorkflowLane(
       throw new WorkflowSessionError(`registered job ${candidate.jobId} already has a logical worker; resume its recorded session/identity instead of attaching an unknown worker by cwd`);
     }
   }
+  if (candidate !== undefined) captureLaneHandoff(candidate)();
   return candidate ?? null;
 }
 
@@ -83,6 +86,7 @@ export function createWorkflowSessionBinder(
     if (lane === null || lane.status === 'swept') {
       throw new WorkflowSessionError(`GC workflow requires the live registered assignment for ${options.cwd ?? options.resumeFile ?? options.agentId ?? 'this minion'}; restore its job/worktree records before resuming`);
     }
+    captureLaneHandoff(lane)();
     const agentId = agentFor?.(options) ?? options.agentId;
     const assignment = { cwd: lane.path, ...(agentId !== undefined ? { agentId } : {}) };
     const reference = readBmadRuntimeBinding(lane.path, storeRoot);

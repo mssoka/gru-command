@@ -2711,6 +2711,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/workflows/manifest.js",
   "dist/workflows/runtime.js",
   "dist/workflows/session.js",
+  "dist/worktrees/handoff.js",
   "dist/worktrees/manager.js",
   "dist/worktrees/manifest.js",
   "dist/worktrees/server.js",

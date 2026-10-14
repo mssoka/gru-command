@@ -79,13 +79,13 @@ interface Rig {
   close(): void;
 }
 
-function rig(opts: { wired?: boolean; worktrees?: (root: string) => InMemoryWorktreePort } = {}): Rig {
+function rig(opts: { wired?: boolean; worktrees?: (root: string, ledger: LedgerApi) => InMemoryWorktreePort } = {}): Rig {
   const home = mkdtempSync(join(tmpdir(), 'gru-317-home-'));
   dirs.push(home);
   writeFileSync(join(home, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf-8');
   const db = new LedgerDb(home);
   const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
-  const worktrees = (opts.worktrees ?? ((root) => new InMemoryWorktreePort(root)))(join(home, 'wt'));
+  const worktrees = (opts.worktrees ?? ((root) => new InMemoryWorktreePort(root, ledger)))(join(home, 'wt'), ledger);
   const prompts: string[] = [];
   const spawns = { count: 0 };
   const service = new DispatchService({
@@ -311,7 +311,7 @@ describe('review source preflight (service)', () => {
         return super.createJobWorktree({ ...input, repoPath: f.stale.path });
       }
     }
-    const r = rig({ worktrees: (root) => new WrongStorePort(root) });
+    const r = rig({ worktrees: (root, ledger) => new WrongStorePort(root, ledger) });
     try {
       const error = await refusal(r.service.dispatch(review(f.full.path, f.target)));
       expect(error.message).toContain('not the verified');
