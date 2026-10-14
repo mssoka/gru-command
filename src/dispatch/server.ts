@@ -18,7 +18,7 @@ import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRun
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from './fix-directive.js';
 import { recoverInterruptedDirectiveFromRoute, recoverInterruptedRebriefFromRoute, resolveRetirementLane, retireInterruptedDirectiveFromRoute } from './directive-recovery.js';
-import { executeAcceptedDirective } from './directive-progress.js';
+import { executeAcceptedDirective, type DirectiveProgressDeps } from './directive-progress.js';
 import { surfaceRecoveryOwnerTransfer } from './recovery-owner.js';
 import { resolveGitCommit } from './perkins-review/artifacts.js';
 import type { RecoveryOwnerActionInput } from '../ledger/recovery-owner.js';
@@ -80,7 +80,7 @@ export interface DispatchServerOptions {
    * deliveries and re-briefs. Absent = off. */
   readonly workerGate?: PacingGate;
   /** Supervisor's fresh queued/backoff producer ownership for retirement. */
-  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
+  readonly pendingProducerBlockers: DirectiveProgressDeps['pendingProducerBlockers'];
   /** Provider pacing: bounded settlement of an automatic rate-limit retry
    * covering a just-delivered directive/re-brief turn (supervisor-backed
    * in production). The route records delivered only for 'none'/'recovered'. */

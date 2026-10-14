@@ -1,4 +1,6 @@
 import { existsSync, statSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
+import type { DirectiveProducer } from '../runtime/directive-checkpoint.js';
 import type { Role, SupervisionConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, AgentState, PendingTurn, RuntimeEvent, SpawnOptions } from '../runtime/types.js';
@@ -2993,7 +2995,7 @@ export class Supervisor {
   /** Synchronous cessation evidence for guarded control closure. A timer,
    * queued retry or undecided recovery is still producer ownership even
    * while its durable agent row says idle/error/disposed. */
-  pendingProducerBlockers(jobId: string): readonly string[] {
+  pendingProducerBlockers(jobId: string, currentNative?: { readonly handle: AgentHandle; readonly producer: DirectiveProducer }): readonly string[] {
     const retained: string[] = [];
     for (const [handle, originalJobId] of this.retainedDirectiveProducers) {
       if (originalJobId !== jobId) continue;
@@ -3021,7 +3023,17 @@ export class Supervisor {
       const pending = agent.inRestart || agent.backoffTimer !== null || agent.decisionPending ||
         agent.queuedRecovery !== null || agent.rateLimitRetry !== null || agent.recoveryAdmission !== null ||
         (agent.state !== 'stopped' && !agent.breakerOpen && agent.pendingRecovery !== null);
-      const open = agent.openTurn || agent.openControl || agent.openToolCalls.size > 0;
+      const directive = currentNative === undefined ? null : this.ledger.getDirective(currentNative.producer.identity.requestId);
+      const start = currentNative === undefined ? null : this.ledger.latestJobEventByRequestId(jobId, 'silas.directive-producer-started', currentNative.producer.identity.requestId);
+      const ownNative = currentNative !== undefined && agent.handle === currentNative.handle && this.registry.getHandle(row.id) === currentNative.handle &&
+        currentNative.producer.agentId === row.id && currentNative.producer.identity.jobId === jobId && currentNative.handle.sessionFile === row.sessionFile &&
+        currentNative.producer.sessionFile === row.sessionFile && directive?.nativeTarget?.agentId === row.id && directive.nativeTarget.sessionFile === row.sessionFile &&
+        directive.nativeBinding?.sessionId === currentNative.producer.sessionId &&
+        isDeepStrictEqual(currentNative.handle.pendingTurn?.()?.directive?.identity, currentNative.producer.identity) &&
+        isDeepStrictEqual((start?.payload as { native_producer?: unknown } | undefined)?.native_producer, currentNative.producer);
+      // Only this exact admitted physical turn's own tools are allowed.
+      // Restart/retry/control, competing producers and cleanup fences remain.
+      const open = agent.openControl || !ownNative && (agent.openTurn || agent.openToolCalls.size > 0);
       return pending || open ? [`supervised producer: ${row.id} (${pending ? 'pending recovery/retry' : 'open turn/control/tool'})`] : [];
     });
     const flights = [...this.restartingAgents].flatMap(([agent, flight]) =>

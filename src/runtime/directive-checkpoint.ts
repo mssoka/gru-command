@@ -254,7 +254,7 @@ export function inspectDirectiveCheckpoint(file: string, identity: DirectiveTurn
   syncFile(file);
   const admitted = { ...binding, userEntryId: user.id };
   if (binding.userEntryId === null) appendBinding(admitted);
-  if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive tool boundary refused; exact turn remains incomplete');
+  if (producerReceipts(file).some((row) => row.state === 'guard-refused' && isDeepStrictEqual(row.producer.identity, identity))) return unknown('native directive execution/authority boundary refused; exact turn remains incomplete');
   let parent = user.id;
   const pending = new Map<string, string>();
   let lastMessage = user.message;
@@ -315,7 +315,7 @@ export interface DirectiveProducer {
   readonly sessionId: string;
   readonly sessionFile: string;
 }
-interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent' | 'completed' | 'guard-refused'; readonly producer: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null; readonly toolCallId?: string; readonly reason?: string }
+interface ProducerReceipt { readonly state: 'started' | 'ceased' | 'independent' | 'completed' | 'guard-refused'; readonly producer: DirectiveProducer; readonly checkpointId?: string; readonly head?: string | null; readonly toolCallId?: string; readonly boundary?: 'authority'; readonly reason?: string }
 export interface DirectiveCompletion { readonly producer: DirectiveProducer; readonly checkpointId: string; readonly head: string | null }
 function appendProducer(receipt: ProducerReceipt): void {
   const fd = openSync(`${receipt.producer.sessionFile}.producers.jsonl`, 'a', 0o600);
@@ -343,7 +343,10 @@ function producerReceipts(file: string): readonly ProducerReceipt[] {
       throw new DirectiveCheckpointError('malformed native completion HEAD receipt');
     }
     validateDirectiveIdentity(producer.identity);
-    if (state === 'guard-refused' && (!receipt.toolCallId || !receipt.reason)) throw new DirectiveCheckpointError('malformed native tool refusal receipt');
+    if (state === 'guard-refused' && (typeof receipt.reason !== 'string' || !receipt.reason ||
+        !(typeof receipt.toolCallId === 'string' && receipt.toolCallId.length > 0 || receipt.boundary === 'authority' && receipt.toolCallId === undefined))) {
+      throw new DirectiveCheckpointError('malformed native guard refusal receipt');
+    }
     if (!['started', 'ceased', 'independent', 'completed', 'guard-refused'].includes(state) || !producer.incarnation || !Number.isSafeInteger(producer.pid) || producer.pid <= 0 ||
         !producer.host || !producer.agentId || !producer.sessionId || producer.sessionFile !== file ||
         producer.lockOwner !== undefined && (producer.lockOwner.host !== producer.host || producer.lockOwner.pid !== producer.pid || !producer.lockOwner.bootId)) throw new DirectiveCheckpointError('malformed native producer journal');
@@ -383,6 +386,15 @@ export function recordDirectiveToolRefusal(producer: DirectiveProducer, toolCall
   const rows = producerReceipts(producer.sessionFile);
   if (!toolCallId || !reason || !rows.some((row) => row.state === 'started' && isDeepStrictEqual(row.producer, producer))) throw new DirectiveCheckpointError('native tool refusal requires exact original physical start');
   if (!rows.some((row) => row.state === 'guard-refused' && row.toolCallId === toolCallId && isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'guard-refused', producer, toolCallId, reason });
+  else syncFile(`${producer.sessionFile}.producers.jsonl`);
+}
+
+/** A model/role authority refusal is durable even when no tool was called.
+ * Never invent a tool-call id or let restart reinterpret it as completion. */
+export function recordDirectiveAuthorityRefusal(producer: DirectiveProducer, reason: string): void {
+  const rows = producerReceipts(producer.sessionFile);
+  if (!reason || !rows.some((row) => row.state === 'started' && isDeepStrictEqual(row.producer, producer))) throw new DirectiveCheckpointError('native authority refusal requires exact original physical start');
+  if (!rows.some((row) => row.state === 'guard-refused' && row.boundary === 'authority' && isDeepStrictEqual(row.producer, producer))) appendProducer({ state: 'guard-refused', producer, boundary: 'authority', reason });
   else syncFile(`${producer.sessionFile}.producers.jsonl`);
 }
 

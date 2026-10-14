@@ -4131,6 +4131,123 @@ const guardedSdkTools: readonly StubTurn[] = [
   { deltas: ['genuine guarded correlated delivery'] },
 ];
 
+it('PR334 runtime causal parallel preparation revocation prevents the previously prepared first effect', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const f = await sdkDirectiveExecutionFixture(guardedSdkTools, (session) => {
+    session.agent.toolExecution = 'parallel';
+    const runner = (session as unknown as { _extensionRunner: { hasHandlers(type: string): boolean; emitToolCall(event: { toolCallId: string }): Promise<undefined> } })._extensionRunner;
+    const has = runner.hasHandlers.bind(runner);
+    vi.spyOn(runner, 'hasHandlers').mockImplementation((type) => type === 'tool_call' || has(type));
+    vi.spyOn(runner, 'emitToolCall').mockImplementation(async (event) => {
+      if (event.toolCallId === 'guarded-second') f.scene.ledger.setJobStatus(f.scene.request.jobId, 'parked');
+      return undefined;
+    });
+  });
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    expect(existsSync(join(f.scene.lane.path, 'guarded-effects.txt'))).toBe(false);
+    expect(f.scene.ledger.getDirective(f.scene.request.requestId)?.state).toBe('admitted');
+  } finally { await f.cleanup(); }
+});
+
+it('PR334 runtime causal effective arguments cannot change behind the persisted native tool intent', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const turns: readonly StubTurn[] = [
+    { deltas: [], toolCall: { id: 'effective-arguments', name: 'bash', args: { command: 'printf approved > approved-effect.txt' } } },
+    { deltas: ['original final response'] },
+  ];
+  const f = await sdkDirectiveExecutionFixture(turns, (session) => {
+    const runner = (session as unknown as { _extensionRunner: { hasHandlers(type: string): boolean; emitToolCall(event: { toolCallId: string; input: Record<string, unknown> }): Promise<undefined> } })._extensionRunner;
+    const has = runner.hasHandlers.bind(runner);
+    vi.spyOn(runner, 'hasHandlers').mockImplementation((type) => type === 'tool_call' || has(type));
+    vi.spyOn(runner, 'emitToolCall').mockImplementation(async (event) => {
+      if (event.toolCallId === 'effective-arguments') event.input.command = 'printf unapproved > unapproved-effect.txt';
+      return undefined;
+    });
+  });
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    expect(existsSync(join(f.scene.lane.path, 'unapproved-effect.txt'))).toBe(false);
+    expect(f.scene.ledger.getDirective(f.scene.request.requestId)?.state).toBe('admitted');
+  } finally { await f.cleanup(); }
+});
+
+it('PR334 runtime causal changed next-turn model authority cannot publish tool-free completion', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  let preparations = 0;
+  let authorityChanged = false;
+  const f = await sdkDirectiveExecutionFixture([
+    { deltas: [], toolCall: { id: 'model-authority-preface', name: 'bash', args: { command: 'printf model-authority-preface' } } },
+    { deltas: ['tool-free response under changed model authority'] },
+  ], (session) => {
+    const prepare = session.agent.prepareNextTurnWithContext!.bind(session.agent);
+    session.agent.prepareNextTurnWithContext = async (turn, signal) => {
+      preparations += 1;
+      await Promise.resolve();
+      const previous = session.model!.maxTokens;
+      session.agent.state.model = { ...session.model!, maxTokens: previous - 1 };
+      authorityChanged = session.model!.maxTokens === previous - 1;
+      return prepare(turn, signal);
+    };
+  });
+  try {
+    await executeAcceptedDirective(f.deps, f.scene.request.requestId);
+    expect(preparations).toBe(1);
+    expect(authorityChanged).toBe(true);
+    expect(f.scene.ledger.getDirective(f.scene.request.requestId)?.state).toBe('admitted');
+    expect(f.scene.ledger.latestJobEventByRequestId(f.scene.request.jobId, 'job.delivered', f.scene.request.requestId)).toBeNull();
+    const { inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
+    const row = f.scene.ledger.getDirective(f.scene.request.requestId)!;
+    expect(inspectDirectiveCheckpoint(row.nativeTarget!.sessionFile, f.scene.ledger.directiveTurnIdentity(row.requestId)).state).toBe('unknown');
+    await f.registry.dispose(); f.scene.db.close();
+    const native = readFileSync(row.nativeTarget!.sessionFile, 'utf8');
+    const journal = readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8');
+    expect(journal.split('\n').filter(Boolean).map((line) => JSON.parse(line)).some((receipt) => receipt.state === 'guard-refused' && receipt.boundary === 'authority' && receipt.toolCallId === undefined)).toBe(true);
+    const { DirectiveProgressService } = await import('../src/dispatch/directive-progress.js');
+    const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js');
+    const { EventBus } = await import('../src/events/bus.js'); const { NotificationCenter } = await import('../src/notifications/center.js');
+    for (let restart = 0; restart < 2; restart += 1) {
+      const db = new LedgerDb(f.scene.dir); const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+      const spawn = vi.fn(async () => { throw new Error('refused model authority must never replay'); });
+      const service = new DirectiveProgressService({ ...f.deps, ledger, notifications: new NotificationCenter({ ledger, bus }), registry: { getHandle: () => null, spawn, disposeHandle: async () => {} } });
+      try {
+        service.reconsider(); await service.settled();
+        expect(ledger.getDirective(row.requestId)?.state).toBe('admitted');
+        expect(ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toBeNull();
+        expect(spawn).not.toHaveBeenCalled();
+      } finally { await service.dispose(); db.close(); }
+    }
+    expect(readFileSync(row.nativeTarget!.sessionFile, 'utf8')).toBe(native);
+    expect(readFileSync(`${row.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toBe(journal);
+    expect(f.fx.script.calls).toHaveLength(1);
+  } finally { await f.cleanup(); }
+});
+
+it('PR334 runtime causal real supervisor permits its exact current native tool owner', async () => {
+  const { executeAcceptedDirective } = await import('../src/dispatch/directive-progress.js');
+  const { Supervisor } = await import('../src/supervision/supervisor.js');
+  const f = await sdkDirectiveExecutionFixture(guardedSdkTools);
+  const supervisor = new Supervisor({ config: { enabled: true, turnSilenceMs: 600000, restartWindowMs: 600000, maxRestarts: 3, restartBackoffMs: 10 }, registry: f.registry, ledger: f.scene.ledger, notifications: f.scene.notifications, tickMs: 60000 });
+  supervisor.start();
+  let exactOwnerChecks = 0;
+  const pending = supervisor.pendingProducerBlockers.bind(supervisor);
+  vi.spyOn(supervisor, 'pendingProducerBlockers').mockImplementation((jobId, currentNative) => {
+    const blockers = pending(jobId, currentNative);
+    if (currentNative !== undefined && pending(jobId).length > 0 && blockers.length === 0) {
+      exactOwnerChecks += 1;
+      expect(pending(jobId, { ...currentNative, producer: { ...currentNative.producer, incarnation: `${currentNative.producer.incarnation}-foreign` } }).length).toBeGreaterThan(0);
+      expect(pending(jobId, { ...currentNative, producer: { ...currentNative.producer, agentId: `${currentNative.producer.agentId}-foreign` } }).length).toBeGreaterThan(0);
+    }
+    return blockers;
+  });
+  try {
+    await executeAcceptedDirective({ ...f.deps, pendingProducerBlockers: supervisor.pendingProducerBlockers.bind(supervisor) }, f.scene.request.requestId);
+    expect(exactOwnerChecks).toBeGreaterThan(0);
+    expect(f.scene.ledger.getDirective(f.scene.request.requestId)?.state).toBe('settled');
+    expect(readFileSync(join(f.scene.lane.path, 'guarded-effects.txt'), 'utf8')).toBe('first\nsecond\n');
+  } finally { supervisor.dispose(); await f.cleanup(); }
+});
+
 async function seedSdkUserCheckpoint(f: Awaited<ReturnType<typeof sdkDirectiveExecutionFixture>>) {
   const { prepareDirectiveBinding, inspectDirectiveCheckpoint } = await import('../src/runtime/directive-checkpoint.js');
   const original = await f.registry.spawn('minion', { cwd: f.scene.lane.path, agentId: 'guarded-original-minion' });
@@ -4265,7 +4382,7 @@ async function assertProductionSdkFence(resume: boolean, fault: 'model-await' | 
     expect(f.scene.ledger.getDirective(active.requestId)?.state).toBe('admitted');
     expect(f.scene.ledger.latestJobEventByRequestId(active.jobId, 'job.delivered', active.requestId)).toBeNull();
     if (manifest) {
-      expect(f.fx.script.calls).toHaveLength(2); // SDK caught the refusal; model still returned final stop
+      expect(f.fx.script.calls).toHaveLength(1); // last-effect refusal also fences the next model request
       expect(readFileSync(`${active.nativeTarget!.sessionFile}.producers.jsonl`, 'utf8')).toContain('guard-refused');
       const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js');
       const { EventBus } = await import('../src/events/bus.js'); const { NotificationCenter } = await import('../src/notifications/center.js');
@@ -4298,11 +4415,11 @@ it('R14 real fresh SDK refuses tool effects after a same-HEAD branch change duri
 it('R14 real fresh SDK rechecks the original branch after its awaited prior tool hook', () => assertProductionSdkFence(false, 'branch-hook'));
 it('production shared SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(false, 'foreign-streaming'));
 it('production checkpoint SDK tool guard never exempts a foreign streaming producer', () => assertProductionSdkFence(true, 'foreign-streaming'));
-it('real SDK model authority mutation refuses effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(false, 'manifest-model'));
-it('real resumed SDK system authority mutation refuses effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(true, 'manifest-role'));
+it('real SDK model authority mutation refuses effects and further model requests across persistent restart', () => assertProductionSdkFence(false, 'manifest-model'));
+it('real resumed SDK system authority mutation refuses effects and further model requests across persistent restart', () => assertProductionSdkFence(true, 'manifest-role'));
 it('real SDK tool authority mutation after awaited prior hook retains only its permitted first effect across restart', () => assertProductionSdkFence(false, 'manifest-hook'));
-it('real resumed SDK tool authority mutation after awaited prior hook never gains final-stop delivery on restart', () => assertProductionSdkFence(true, 'manifest-hook'));
-it('real SDK execution-mode mutation refuses native effects and final-stop delivery across persistent restart', () => assertProductionSdkFence(false, 'manifest-execution-mode'));
+it('real resumed SDK tool authority mutation after awaited prior hook never gains further model requests or delivery on restart', () => assertProductionSdkFence(true, 'manifest-hook'));
+it('real SDK execution-mode mutation refuses native effects and further model requests across persistent restart', () => assertProductionSdkFence(false, 'manifest-execution-mode'));
 
 it('restart authority manifest binds closure context for native tools with identical function source', async () => {
   const f = await fixture([]);
@@ -4534,13 +4651,15 @@ async function assertSdkRefusalJournalRetry(postCommit: boolean) {
     const row = f.scene.ledger.getDirective(f.scene.request.requestId)!; const file = row.nativeTarget!.sessionFile;
     const handle = f.registry.getHandle(row.nativeTarget!.agentId)!;
     f.sessions[0]!.agent.state.systemPrompt = 'unapproved current role authority'; release(); await run;
-    expect(existsSync(join(f.scene.lane.path, 'guarded-effects.txt'))).toBe(false); expect(f.fx.script.calls).toHaveLength(2);
+    expect(existsSync(join(f.scene.lane.path, 'guarded-effects.txt'))).toBe(false); expect(f.fx.script.calls).toHaveLength(1);
     expect(handle.cessationEvidence!()).toBe('unknown'); expect(f.fx.store.isHeld(file)).toBe(true); expect(existsSync(`${file}.lock`)).toBe(true);
     expect(f.scene.ledger.latestJobEventByRequestId(row.jobId, 'job.delivered', row.requestId)).toBeNull();
     failing = false; await f.registry.disposeHandle(handle);
     expect(handle.cessationEvidence!()).toBe('ceased'); expect(existsSync(`${file}.lock`)).toBe(false);
-    const receipts = readFileSync(`${file}.producers.jsonl`, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string });
-    expect(receipts.filter((receipt) => receipt.state === 'guard-refused').map((receipt) => receipt.toolCallId).sort()).toEqual(['guarded-first', 'guarded-second']);
+    const receipts = readFileSync(`${file}.producers.jsonl`, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { state: string; toolCallId?: string; boundary?: string });
+    expect(receipts.filter((receipt) => receipt.state === 'guard-refused')).toHaveLength(3);
+    expect(receipts.filter((receipt) => receipt.state === 'guard-refused' && receipt.toolCallId !== undefined).map((receipt) => receipt.toolCallId).sort()).toEqual(['guarded-first', 'guarded-second']);
+    expect(receipts.filter((receipt) => receipt.state === 'guard-refused' && receipt.boundary === 'authority' && receipt.toolCallId === undefined)).toHaveLength(1);
     expect(receipts.filter((receipt) => receipt.state === 'completed')).toHaveLength(0);
     const service = new DirectiveProgressService(f.deps); service.reconsider(); await service.settled(); await service.dispose();
     f.scene.db.close(); const { LedgerDb } = await import('../src/ledger/db.js'); const { LedgerApi } = await import('../src/ledger/api.js');
@@ -4557,8 +4676,8 @@ async function assertSdkRefusalJournalRetry(postCommit: boolean) {
 it('actual SDK pre-commit refusal journal failure retains lock and retries refusal before cessation or restart settlement', () => assertSdkRefusalJournalRetry(false));
 it('actual SDK post-commit refusal journal failure fsync-retries exact receipts without duplicate refusals or delivery', () => assertSdkRefusalJournalRetry(true));
 
-it('real SDK system mutation before native effects remains refused through final stop and restart', () => assertProductionSdkFence(false, 'manifest-role'));
-it('real SDK tools mutation before native effects remains refused through final stop and restart', () => assertProductionSdkFence(false, 'manifest-tools'));
+it('real SDK system mutation before native effects remains refused before the next model request and across restart', () => assertProductionSdkFence(false, 'manifest-role'));
+it('real SDK tools mutation before native effects remains refused before the next model request and across restart', () => assertProductionSdkFence(false, 'manifest-tools'));
 it('real SDK system mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-role-hook'));
 it('real SDK model mutation after awaited prior hook preserves only its first permitted effect', () => assertProductionSdkFence(false, 'manifest-model-hook'));
 

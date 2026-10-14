@@ -1329,7 +1329,7 @@ async function main(): Promise<number> {
   }
   const directiveProgress = new DirectiveProgressService({ ledger, registry, worktrees: worktreeManager, notifications,
     clearLaneForWriter: (input) => wave.clearLaneForWriter(input),
-    pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), signal: serviceStop.signal,
+    pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative), signal: serviceStop.signal,
     workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor,
     ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
   });
@@ -1447,7 +1447,7 @@ async function main(): Promise<number> {
     ledger,
     childWorkers,
     workerGate: pacing.gate,
-    pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId),
+    pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative),
     retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
     ...(pipeline !== null ? { pipeline } : {}),
     ...(config.silas.enabled && silasSlot !== null

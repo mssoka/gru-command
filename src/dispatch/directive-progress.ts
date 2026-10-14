@@ -19,7 +19,7 @@ export interface DirectiveProgressDeps {
   readonly registry: DirectiveRegistry;
   readonly worktrees: WorktreePort;
   readonly notifications: RecoveryNotifications;
-  readonly pendingProducerBlockers: (jobId: string) => readonly string[];
+  readonly pendingProducerBlockers: (jobId: string, currentNative?: { readonly handle: AgentHandle; readonly producer: DirectiveProducer }) => readonly string[];
   readonly signal: AbortSignal;
   readonly workerGate?: PacingGate;
   readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
@@ -90,7 +90,7 @@ function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTu
     .filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
   const own = new Set([`directive ${identity.requestId}`, `directive recovery ${identity.requestId}`, `rebrief ${identity.requestId}`]);
   const reservations = deps.ledger.listJobAdmissions(identity.jobId).filter((kind) => !own.has(kind));
-  const supervised = [...deps.pendingProducerBlockers(identity.jobId), ...cleanupOwnershipBlockers(deps.ledger, identity.jobId)];
+  const supervised = [...deps.pendingProducerBlockers(identity.jobId, handle !== undefined && ownNativeProducer !== undefined ? { handle, producer: ownNativeProducer } : undefined), ...cleanupOwnershipBlockers(deps.ledger, identity.jobId)];
   if (durable.length + reservations.length + supervised.length > 0) throw new DirectiveCheckpointError(`directive producer fences: ${[...durable, ...reservations, ...supervised].join('; ')}`);
 }
 
@@ -459,7 +459,7 @@ export class DirectiveProgressService {
         .filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
       const own = `directive recovery ${requestId}`;
       const admissions = deps.ledger.listJobAdmissions(row.jobId).filter((kind) => kind !== own);
-      const supervised = [...deps.pendingProducerBlockers(row.jobId), ...cleanupOwnershipBlockers(deps.ledger, row.jobId)];
+      const supervised = [...deps.pendingProducerBlockers(row.jobId, handle !== null && ownNativeProducer !== undefined ? { handle, producer: ownNativeProducer } : undefined), ...cleanupOwnershipBlockers(deps.ledger, row.jobId)];
       if (durable.length > 0 || admissions.length > 0 || supervised.length > 0) throw new DirectiveCheckpointError(`producer ownership remains: ${[...durable, ...admissions, ...supervised].join('; ')}`);
     };
     assertProducerFences();

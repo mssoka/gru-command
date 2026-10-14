@@ -47,10 +47,11 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
-import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
+import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 type IsolatedToolName = NonNullable<SpawnOptions['isolatedReview']>['tools'][number];
+type SdkTool = AgentSession['agent']['state']['tools'][number];
 
 function confinedReviewTools(cwd: string, requested: readonly IsolatedToolName[]): {
   readonly names: string[];
@@ -938,6 +939,14 @@ export class PiRuntime implements AgentRuntime {
         throw error;
       }
       this.activeFiles.add(sessionFile);
+      const directiveExecutorOrigins = new Map<SdkTool['execute'], SdkTool['execute']>();
+      const executableIds = new WeakMap<object, number>();
+      let nextExecutableId = 0;
+      const executableId = (execute: object): number => {
+        let id = executableIds.get(execute);
+        if (id === undefined) { id = ++nextExecutableId; executableIds.set(execute, id); }
+        return id;
+      };
       const handle = new PiAgentHandle(
         role,
         session,
@@ -961,12 +970,15 @@ export class PiRuntime implements AgentRuntime {
           return createHash('sha256').update(JSON.stringify({ role, cwd, systemPrompt: session.agent.state.systemPrompt,
             toolExecution: session.agent.toolExecution,
             tools: session.agent.state.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters,
-              executionMode: tool.executionMode ?? null, implementation: tool.execute.toString() })).sort((a, b) => a.name.localeCompare(b.name)),
+              executionMode: tool.executionMode ?? null, guarded: directiveExecutorOrigins.has(tool.execute),
+              implementation: (directiveExecutorOrigins.get(tool.execute) ?? tool.execute).toString(),
+              implementationRef: executableId(directiveExecutorOrigins.get(tool.execute) ?? tool.execute) })).sort((a, b) => a.name.localeCompare(b.name)),
             nativeTools: declaredNativeTools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.inputSchema,
-              authorityManifest: tool.authorityManifest, implementation: tool.execute.toString() })).sort((a, b) => a.name.localeCompare(b.name)),
+              authorityManifest: tool.authorityManifest, implementation: tool.execute.toString(), implementationRef: executableId(tool.execute) })).sort((a, b) => a.name.localeCompare(b.name)),
             model: session.model ?? null })).digest('hex');
         },
         () => resolveGitCommit(cwd, 'HEAD'),
+        directiveExecutorOrigins,
       );
       this.handles.add(handle);
       this.down = undefined;
@@ -1072,7 +1084,8 @@ export class PiAgentHandle implements AgentHandle {
     settled: boolean;
   } | null = null;
   private readonly directiveProducers = new Map<string, DirectiveProducer>();
-  private readonly pendingToolRefusals = new Map<string, { readonly producer: DirectiveProducer; readonly toolCallId: string; readonly reason: string }>();
+  private readonly pendingGuardRefusals = new Map<string, { readonly producer: DirectiveProducer; readonly toolCallId?: string; readonly reason: string }>();
+  private readonly preparedDirectiveEffects = new Map<string, (toolName: string, args: unknown, signal?: AbortSignal) => unknown>();
   private disposed = false;
   private disposalPending: Promise<void> | null = null;
   private cleanupSucceeded = false;
@@ -1125,6 +1138,7 @@ export class PiAgentHandle implements AgentHandle {
     agentId?: string,
     private readonly directiveAuthorityManifest?: () => string,
     private readonly directiveCompletionHead?: () => string,
+    directiveExecutorOrigins = new Map<SdkTool['execute'], SdkTool['execute']>(),
   ) {
     this.role = role;
     // The SDK-minted session identity, retained separately from the
@@ -1143,45 +1157,74 @@ export class PiAgentHandle implements AgentHandle {
     this.toolHeartbeat = new ToolHeartbeat((event) => this.emit(event), toolHeartbeatMs);
     session.subscribe((event) => this.onPiEvent(event));
     if (session instanceof AgentSession) {
+      // Use the SDK's ordinary active tool setup, retaining each real executor
+      // in the authority fingerprint. Preparation is not an effect boundary:
+      // parallel batches prepare every call before any executor is invoked.
+      session.agent.state.tools = session.agent.state.tools.map((tool) => {
+        const originalExecute = tool.execute;
+        const execute: SdkTool['execute'] = (toolCallId, args, signal, onUpdate) => {
+          const guard = this.preparedDirectiveEffects.get(toolCallId);
+          const effectiveArgs = guard !== undefined ? guard(tool.name, args, signal) : args;
+          if (guard === undefined && this.liveDirective !== undefined) {
+            this.refuseDirectiveGuard(this.liveDirective, toolCallId, new DirectiveCheckpointError('native executor lacks its exact prepared directive intent'));
+          }
+          return originalExecute.call(tool, toolCallId, effectiveArgs, signal, onUpdate);
+        };
+        directiveExecutorOrigins.set(execute, originalExecute);
+        return { ...tool, execute };
+      });
+      const beforeNextTurn = session.agent.prepareNextTurnWithContext;
+      session.agent.prepareNextTurnWithContext = async (turn, signal) => {
+        const directive = this.liveDirective;
+        try {
+          if (directive !== undefined) this.assertDirectiveExecutionAuthority(directive, signal);
+          const update = await beforeNextTurn?.(turn, signal);
+          if (directive !== undefined) {
+            this.assertDirectiveExecutionAuthority(directive, signal);
+            const context = update?.context ?? turn.context;
+            if ((update?.model !== undefined && !isDeepStrictEqual(update.model, session.model)) ||
+                context.systemPrompt !== session.agent.state.systemPrompt || !isDeepStrictEqual(context.tools, session.agent.state.tools)) {
+              throw new DirectiveCheckpointError('effective native model/role/tools authority changed during next-turn preparation');
+            }
+          }
+          return update;
+        } catch (error) { this.refuseDirectiveGuard(directive, undefined, error); }
+      };
       const before = session.agent.beforeToolCall;
       session.agent.beforeToolCall = async (input, signal) => {
         const directive = this.liveDirective;
         const batchMode = (): 'sequential' | 'parallel' => session.agent.toolExecution === 'sequential' || input.assistantMessage.content.some((block) =>
           block.type === 'toolCall' && session.agent.state.tools.find((tool) => tool.name === block.name)?.executionMode === 'sequential') ? 'sequential' : 'parallel';
         const executionMode = batchMode();
-        const check = (): void => {
+        const args = directive === undefined ? input.args : structuredClone(input.args);
+        const invocation = directive === undefined ? input.toolCall : structuredClone(input.toolCall);
+        const assistantMessage = directive === undefined ? input.assistantMessage : structuredClone(input.assistantMessage);
+        const check = (effectiveArgs: unknown = input.args, effectSignal = signal): void => {
           if (directive === undefined) return;
-          if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
-          if (this.directiveAdmissionError !== null) {
-            throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(this.directiveAdmissionError)}`);
+          this.assertDirectiveExecutionAuthority(directive, effectSignal);
+          if (!isDeepStrictEqual(input.args, args) || !isDeepStrictEqual(effectiveArgs, args) || !isDeepStrictEqual(args, invocation.arguments) ||
+              !isDeepStrictEqual(input.toolCall, invocation) || !isDeepStrictEqual(input.assistantMessage, assistantMessage)) {
+            throw new DirectiveCheckpointError('effective native tool arguments differ from the exact persisted intent');
           }
-          if (this.publishedDirectiveAdmission !== directive) {
-            throw new DirectiveCheckpointError('native directive actual admission has not been successfully published; tool effects refused');
-          }
-          directive.beforeAdmission();
-          if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) {
-            throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before tool effect');
-          }
+          if (!isDeepStrictEqual(input.context.tools, session.agent.state.tools)) throw new DirectiveCheckpointError('effective native executor authority differs from its accepted tool setup');
           if (batchMode() !== executionMode) throw new DirectiveCheckpointError('native directive batch execution mode changed before tool effect');
-          flushDirectiveToolIntent(this.sessionFile, input.assistantMessage, input.toolCall, directive.identity, executionMode);
+          flushDirectiveToolIntent(this.sessionFile, assistantMessage, invocation, directive.identity, executionMode);
         };
         try {
           check();
           const result = await before?.(input, signal);
           check(); // prior extensions may await or change permission/native intent
-          return result;
-        } catch (error) {
-          const producer = directive === undefined ? undefined : this.directiveProducers.get(directive.identity.requestId);
-          if (producer !== undefined) {
-            const key = `${producer.incarnation}:${input.toolCall.id}`;
-            const refusal = { producer, toolCallId: input.toolCall.id, reason: String(error) };
-            this.pendingToolRefusals.set(key, refusal);
-            this.directiveAdmissionError ??= error;
-            try { recordDirectiveToolRefusal(producer, refusal.toolCallId, refusal.reason); this.pendingToolRefusals.delete(key); }
-            catch (journalError) { throw new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained'); }
+          if (directive !== undefined && !result?.block) {
+            this.preparedDirectiveEffects.set(invocation.id, (name, effectiveArgs, effectSignal) => {
+              try {
+                if (name !== invocation.name) throw new DirectiveCheckpointError('native executor differs from its exact prepared tool');
+                check(effectiveArgs, effectSignal);
+                return structuredClone(args); // no shared extension-mutable argument object reaches the executor
+              } catch (error) { this.refuseDirectiveGuard(directive, invocation.id, error); }
+            });
           }
-          throw error;
-        }
+          return result;
+        } catch (error) { this.refuseDirectiveGuard(directive, invocation.id, error); }
       };
       const executeBash = session.executeBash.bind(session);
       session.executeBash = (...args) => {
@@ -1189,6 +1232,32 @@ export class PiAgentHandle implements AgentHandle {
         return executeBash(...args);
       };
     }
+  }
+
+  private assertDirectiveExecutionAuthority(directive: NonNullable<PromptOptions['directive']>, signal?: AbortSignal, recheckCurrentAdmission = true): void {
+    if (this.disposed || signal?.aborted || this.liveDirective !== directive) throw new DirectiveCheckpointError('native directive tool ownership cancelled or changed');
+    if (this.directiveAdmissionError !== null) throw new DirectiveCheckpointError(`native directive admission/guard failed; further tool effects refused: ${String(this.directiveAdmissionError)}`);
+    if (this.publishedDirectiveAdmission !== directive) throw new DirectiveCheckpointError('native directive actual admission has not been successfully published; tool effects refused');
+    if (recheckCurrentAdmission) directive.beforeAdmission();
+    if (readDirectiveBinding(this.sessionFile, directive.identity.requestId)?.authorityManifest !== this.directiveAuthorityManifest?.()) throw new DirectiveCheckpointError('live native directive role/tools/model authority changed before effect or completion');
+  }
+
+  private refuseDirectiveGuard(directive: PromptOptions['directive'], toolCallId: string | undefined, error: unknown): never {
+    if (directive !== undefined) {
+      this.directiveAdmissionError ??= error;
+      const producer = this.directiveProducers.get(directive.identity.requestId);
+      if (producer !== undefined) {
+        const key = `${producer.incarnation}:${toolCallId === undefined ? 'authority' : `tool:${toolCallId}`}`;
+        const refusal = { producer, ...(toolCallId === undefined ? {} : { toolCallId }), reason: String(error) };
+        this.pendingGuardRefusals.set(key, refusal);
+        try {
+          if (toolCallId === undefined) recordDirectiveAuthorityRefusal(producer, refusal.reason);
+          else recordDirectiveToolRefusal(producer, toolCallId, refusal.reason);
+          this.pendingGuardRefusals.delete(key);
+        } catch (journalError) { throw new AggregateError([error, journalError], 'native guard refusal could not be durably recorded; physical ownership retained'); }
+      }
+    }
+    throw error;
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -1536,9 +1605,10 @@ export class PiAgentHandle implements AgentHandle {
     if (evidence === 'ceased' && !this.ownershipReleased) {
       // Fallible physical receipts precede release of either native lock or
       // runtime owner. A failed/committed-then-thrown append is retryable.
-      for (const [key, refusal] of this.pendingToolRefusals) {
-        recordDirectiveToolRefusal(refusal.producer, refusal.toolCallId, refusal.reason);
-        this.pendingToolRefusals.delete(key);
+      for (const [key, refusal] of this.pendingGuardRefusals) {
+        if (refusal.toolCallId === undefined) recordDirectiveAuthorityRefusal(refusal.producer, refusal.reason);
+        else recordDirectiveToolRefusal(refusal.producer, refusal.toolCallId, refusal.reason);
+        this.pendingGuardRefusals.delete(key);
       }
       for (const producer of this.directiveProducers.values()) recordDirectiveProducerCessation(producer);
       this.store.releaseLock(this.sessionFile);
@@ -1628,6 +1698,7 @@ export class PiAgentHandle implements AgentHandle {
     this.livePromptImages = images;
     this.liveTurnStop = { stopReason: null, error: null };
     this.liveDirective = directive;
+    this.preparedDirectiveEffects.clear();
     this.directiveAdmissionError = null;
     this.publishedDirectiveAdmission = undefined;
     const promptOptions: Record<string, unknown> = {};
@@ -1700,6 +1771,7 @@ export class PiAgentHandle implements AgentHandle {
             }
             if (this.directiveAdmissionError !== null) captured = { ok: false, error: String(this.directiveAdmissionError) };
           }
+          this.preparedDirectiveEffects.clear();
           this.liveDirective = undefined;
           this.liveTurn = null;
           this.liveOwner = null;
@@ -1827,6 +1899,10 @@ export class PiAgentHandle implements AgentHandle {
         if (msg !== undefined && msg['role'] === 'assistant') {
           if (msg['stopReason'] === 'stop' && this.liveDirective !== undefined) {
             const directive = this.liveDirective;
+            // Completed original work may be historical after a park/hold or
+            // material revision. Verify native authority, not today's candidacy.
+            try { this.assertDirectiveExecutionAuthority(directive, undefined, false); }
+            catch (error) { this.refuseDirectiveGuard(directive, undefined, error); }
             const producer = this.directiveProducers.get(directive.identity.requestId);
             let head: string | null = null;
             try { head = this.directiveCompletionHead?.() ?? null; }
