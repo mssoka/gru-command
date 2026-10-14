@@ -614,6 +614,22 @@ describe('review-4 conventional settings preserve producer and read boundaries',
 });
 
 describe('review-8 actual CLI and shell boundaries', () => {
+  it('review-8 selected Vitest run never treats its version flag as a non-producing diagnostic', () => {
+    const { policy } = retainedFixture();
+    const parsed = parseCLI(['vitest', 'run', 'example.test.js', '--version']);
+    // The installed CLI only short-circuits version with NO matched command;
+    // run remains selected with this operand and proceeds to its test action.
+    expect(parsed.options.run).toBe(true);
+    expect(parsed.options.version).toBe(true);
+    expect(parsed.filter).toEqual(['example.test.js']);
+    for (const command of ['vitest run --version', 'npx vitest run --version', 'npm exec -- vitest run --version']) {
+      expect(isVerificationProducer(command, policy), command).toBe(true);
+      expect(nativeHostDenial(command, policy), command).toBe(true);
+    }
+    for (const command of ['vitest --version', 'npx vitest --version', 'vitest run --version --help']) {
+      expect(isVerificationProducer(command, policy), command).toBe(false);
+    }
+  });
   it('review-8 package-manager normalization preserves the child tool option terminator', () => {
     const { policy } = retainedFixture();
     const parsed = parseCLI(['vitest', 'run', '--', '--help']);

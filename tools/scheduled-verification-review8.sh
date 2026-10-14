@@ -8,6 +8,10 @@ d=$(mktemp -d "$root/_bmad-output/gate-prep/gh315-review8.XXXXXX")
 printf 'R8 current source head=%s reports=%s\n' "$(git rev-parse HEAD)" "$d"
 node tools/patch-vitest-rpc-timeout.mjs
 npm run build
+if [ "${1:-all}" = version ]; then
+  # Newly discovered selected-verb defect only; do not replay the five prior REDs.
+  exec npx vitest run test/worker-verification-policy.test.ts -t 'review-8 selected Vitest run' --reporter=json --outputFile="$d/version-results.json"
+fi
 set +e
 npx vitest run test/worker-verification-policy.test.ts test/pi-adapter.test.ts -t 'review-8' --reporter=json --outputFile="$d/fast-results.json"
 a=$?

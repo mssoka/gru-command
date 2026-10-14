@@ -816,4 +816,5 @@ gh315-e9-receiving-native = 'npm run build && node test/helpers/investigate-clau
 gh315-retained-red-classify = "node tools/classify-scheduled-verification-red.mjs 2 _bmad-output/gate-prep/gh315-retained-review2-red/fast-results.json _bmad-output/gate-prep/gh315-retained-review2-red/heavy-results.json"
 # R8 scoped regression checks: no local FULL and no replay of prior evidence.
 gh315-r8-candidates = "sh tools/scheduled-verification-review8.sh"
+gh315-r8-version = "sh tools/scheduled-verification-review8.sh version"
 gh315-r8-preack-mutant = "sh tools/scheduled-verification-review8-preack-mutant.sh"
