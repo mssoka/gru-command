@@ -184,6 +184,7 @@ interface SupervisedAgent {
     allowRestart: boolean;
     runtimeError: boolean;
     source: ProviderErrorSource | null;  // carries .typed (r1 #13)
+    recovery: InterruptedTurn | null;
     handle: AgentHandle | null;
     activityGeneration: number;
     openTurn: boolean;
@@ -284,6 +285,7 @@ interface RejectedRestartCleanup {
 }
 
 interface RecoveryDelivery {
+  retry: RateLimitRetryIncident | null;
   readonly snapshots: Set<InterruptedTurn>;
   readonly errors: WeakSet<RuntimeEvent>;
   readonly classifications: Promise<void>[];
@@ -894,7 +896,7 @@ export class Supervisor {
               model: event.model ?? null,
               error: event.error,
               typed: event.typed ?? null,
-            });
+            }, this.restartErrorSnapshots.get(event) ?? null);
             retry?.classifications.push(classification);
             return classification;
           } else {
@@ -909,7 +911,7 @@ export class Supervisor {
                 model: event.model ?? null,
                 error: event.error,
                 typed: event.typed ?? null,
-              });
+              }, this.restartErrorSnapshots.get(event) ?? null);
               retry?.classifications.push(classification);
               if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(classification);
               return classification;
@@ -1335,6 +1337,8 @@ export class Supervisor {
       resolveSettled,
     };
     agent.rateLimitRetry = fresh;
+    const delivery = agent.handle === null ? undefined : this.recoveryDeliveries.get(agent.handle);
+    if (delivery !== undefined && delivery.retry === null) delivery.retry = fresh;
     return this.scheduleRateLimitRetry(agent, fresh);
   }
 
@@ -1368,7 +1372,10 @@ export class Supervisor {
       max_auto_retries: incident.maxRetries,
       delay_ms: delayMs,
     });
-    void this.deliverRateLimitRetry(agent, incident, delayMs);
+    const retryDelivery = this.deliverRateLimitRetry(agent, incident, delayMs);
+    // The original recovered delivery owns ordinary retry failure settlement.
+    // Incident disposition can resolve before generic/queued guidance finishes.
+    if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(retryDelivery);
     return true;
   }
 
@@ -1609,6 +1616,7 @@ export class Supervisor {
     allowRestart = true,
     runtimeError = false,
     source: ProviderErrorSource | null = null,
+    recovery: InterruptedTurn | null = null,
   ): Promise<void> {
     // Recovery guidance supersedes an in-flight automatic retry. Only an
     // actual stop/restart also transfers restart-delivery admission custody;
@@ -1629,7 +1637,7 @@ export class Supervisor {
     const deterministicWall = deterministicClass === 'authentication_wall' || deterministicClass === 'quota_wall';
     if (this.decisions === null) {
       if (deterministicWall && !agent.breakerOpen && !agent.inRestart && agent.handle !== null) {
-        this.stopForGuidance(agent, deterministicClass, source);
+        this.stopForGuidance(agent, deterministicClass, source, recovery);
       } else if (allowRestart) {
         await this.restartRung(agent, reason);
       }
@@ -1644,6 +1652,7 @@ export class Supervisor {
         allowRestart,
         runtimeError,
         source,
+        recovery,
         handle: agent.handle,
         activityGeneration: agent.activityGeneration,
         openTurn: agent.openTurn,
@@ -1702,7 +1711,7 @@ export class Supervisor {
         },
       });
       if (action.kind === 'stop') {
-        this.stopForGuidance(agent, action.reason, source);
+        this.stopForGuidance(agent, action.reason, source, recovery);
         return;
       }
       if (allowRestart) await this.restartRung(agent, reason);
@@ -1720,7 +1729,7 @@ export class Supervisor {
         (runtimeError || agent.openControl === expectedOpenControl) &&
         !agent.breakerOpen
       ) {
-        if (deterministicWall) this.stopForGuidance(agent, deterministicClass, source);
+        if (deterministicWall) this.stopForGuidance(agent, deterministicClass, source, recovery);
         else if (allowRestart) await this.restartRung(agent, reason);
       }
     } finally {
@@ -1747,7 +1756,7 @@ export class Supervisor {
         // that custody. A fire-and-forget replay would let settlement observe
         // `decisionPending` and give up, silently dropping the turn's orphan
         // notice and leaving a phantom pending-recovery blocker.
-        const replay = this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError, queued.source);
+        const replay = this.evaluateRecovery(agent, queued.reason, queued.allowRestart, queued.runtimeError, queued.source, queued.recovery);
         if (agent.handle !== null) this.recoveryDeliveries.get(agent.handle)?.classifications.push(replay);
         await replay;
       }
@@ -1759,7 +1768,12 @@ export class Supervisor {
    * ALSO reported to the provider-recovery sink (when wired): the sink
    * alone decides whether the stop is an eligible temporary provider wait
    * — the supervisor's stop semantics are identical either way. */
-  private stopForGuidance(agent: SupervisedAgent, failureClass: string, source: ProviderErrorSource | null = null): void {
+  private stopForGuidance(
+    agent: SupervisedAgent,
+    failureClass: string,
+    source: ProviderErrorSource | null = null,
+    recovery: InterruptedTurn | null = null,
+  ): void {
     if (agent.breakerOpen) return;
     this.clearRecoveryAdmission(agent);
     agent.breakerOpen = true;
@@ -1768,7 +1782,15 @@ export class Supervisor {
     agent.stoppedAt = this.now();
     this.rememberStop(agent);
     const handle = agent.handle;
-    const captured = this.captureInterruptedTurn(handle, agent);
+    const recaptured = this.captureInterruptedTurn(handle, agent);
+    // Deferred replay carries the exact native-turn snapshot after adapter
+    // subscribers have cleared pendingTurn. Only that authority-current
+    // canonical turn may strengthen a weak recapture, never an older turn.
+    const canonical = recovery !== null && this.recoveryAuthorityCurrent(agent, recovery) ? recovery : null;
+    const pending = recaptured?.pending;
+    const usableRecapture = pending != null &&
+      (pending.text.trim() !== '' || (pending.images !== undefined && pending.images.length > 0));
+    const captured = usableRecapture ? recaptured : canonical ?? recaptured;
     if (captured !== null) agent.pendingRecovery = captured;
     agent.openTurn = false;
     agent.openControl = false;
@@ -2546,8 +2568,11 @@ export class Supervisor {
     const controller = new AbortController();
     this.clearRecoveryAdmission(agent); // supersede any older recovery wait
     agent.recoveryAdmission = controller;
-    const delivery: RecoveryDelivery = { snapshots: new Set([recovery]), errors: new WeakSet(), classifications: [] };
+    const delivery: RecoveryDelivery = { retry: null, snapshots: new Set([recovery]), errors: new WeakSet(), classifications: [] };
     this.recoveryDeliveries.set(handle, delivery);
+    let settleCancelled!: () => void;
+    const cancelled = new Promise<void>((resolve) => { settleCancelled = resolve; });
+    controller.signal.addEventListener('abort', settleCancelled, { once: true });
     let turnEnded = false;
     const detachDelivery = handle.subscribe((event) => {
       if (event.type === 'turn_end') turnEnded = true;
@@ -2590,14 +2615,10 @@ export class Supervisor {
       // the retry can reacquire admission for its next attempt.
       lease?.release();
       lease = null;
-      const disposition = await this.awaitRetrySettlement(agent.agentId);
+      const disposition = await (delivery.retry?.settled ?? this.awaitRetrySettlement(agent.agentId));
+      if (!stillCurrent()) return;
       if (disposition === 'exhausted' || disposition === 'superseded') {
-        this.log('warn', 'interrupted turn did not resume under its automatic retries', {
-          agent_id: laneAgentId,
-          reason,
-          disposition,
-        });
-        return;
+        throw new Error(`automatic retry ${disposition} without resumed delivery`);
       }
       this.recordEvent('supervision.turn-recovery', laneAgentId, {
         disposition: 'resumed',
@@ -2608,21 +2629,26 @@ export class Supervisor {
         reason,
       });
     } catch (error) {
-      // Deferred error guidance may still be deciding whether another
-      // custodian took this delivery. Wait for its exact classifications.
-      await Promise.all(delivery.classifications);
-      // Cancellation is not an orphan: the attempt was superseded.
-      if (!stillCurrent()) return;
-      // Release the slot before consulting the settlement: the retry
-      // reacquires admission per attempt, exactly like the resolve path.
+      // Release admission before awaiting retry deliveries: they reacquire it.
       lease?.release();
       lease = null;
+      // Include later retry failures and queued guidance in this exact
+      // delivery's lifecycle, not just the classifications present at entry.
+      for (let index = 0; index < delivery.classifications.length; index += 1) {
+        await Promise.race([delivery.classifications[index], cancelled]);
+        if (!stillCurrent()) return;
+      }
+      // Bare retry rejections have no adapter envelope: their guidance is
+      // registered on the exact incident instead of the delivery's tap list.
+      await Promise.race([Promise.all(delivery.retry?.classifications ?? []), cancelled]);
+      // Cancellation is not an orphan: the attempt was superseded.
+      if (!stillCurrent()) return;
       // The rejection may itself have opened a rate-limit incident whose
       // bounded retry is still carrying this turn: consult its settlement
       // before classifying. A recovered retry is recorded as resumed — never
       // escalated to the owner as a failed resume; a spent budget keeps the
       // same ladder truth as the resolve path.
-      const disposition = await this.awaitRetrySettlement(agent.agentId);
+      const disposition = await (delivery.retry?.settled ?? this.awaitRetrySettlement(agent.agentId));
       if (!stillCurrent()) return;
       if (disposition === 'recovered') {
         this.recordEvent('supervision.turn-recovery', laneAgentId, {
@@ -2641,7 +2667,6 @@ export class Supervisor {
           reason,
           disposition,
         });
-        return;
       }
       if (agent.inRestart || agent.breakerOpen || agent.rateLimitRetry !== null || agent.decisionPending || agent.queuedRecovery !== null) return;
       if (agent.pendingRecovery !== null && !delivery.snapshots.has(agent.pendingRecovery)) return;
@@ -2653,6 +2678,7 @@ export class Supervisor {
       });
       this.postOrphanedTurn(laneAgentId, reason, String(error));
     } finally {
+      controller.signal.removeEventListener('abort', settleCancelled);
       detachDelivery();
       if (this.recoveryDeliveries.get(handle) === delivery) this.recoveryDeliveries.delete(handle);
       if (agent.recoveryAdmission === controller) agent.recoveryAdmission = null;
