@@ -1,4 +1,4 @@
-import { readWorktreeMetadata, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
+import { readWorktreeMetadata, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
@@ -839,13 +839,24 @@ export class WorktreeManager {
     if (input.authority !== 'read-only' && input.authority !== 'writer') {
       throw new Error(`unknown child worker authority "${String(input.authority)}"`);
     }
+    // Bind the injected SERVICE ledger's original parent before queuing;
+    // neither later receipt bytes nor a replacement HEAD may choose it.
+    const parent = this.listWorktrees({ jobId: input.jobId }).find((lane) =>
+      lane.path === input.parentPath || existsSync(lane.path) && existsSync(input.parentPath) &&
+        realpathSync.native(lane.path) === realpathSync.native(input.parentPath));
+    if (parent === undefined) throw new WorktreeHandoffUnresolvedError(input.parentPath);
+    const originalParent = capturePortLaneHandoff(this, parent);
+    const originalCwd = captureCwdHandoff(input.parentPath);
+    const assertParent = (): void => { originalParent(); originalCwd(); };
     return this.withRepoLock(input.repoPath, async () => {
+      assertParent();
       const repo = this.assertRepo(input.repoPath);
       if (!existsSync(input.parentPath)) {
         throw new Error(
           `parent lane path ${input.parentPath} does not exist — a child lane must base on a live parent lane`,
         );
       }
+      assertParent();
       const parentHead = runGit(input.parentPath, ['rev-parse', 'HEAD']);
       const path = join(this.opts.root, repo.repoName, `child-${input.childId}`);
       if (existsSync(path)) {
@@ -861,10 +872,12 @@ export class WorktreeManager {
       const custody = this.creationCustody(branch, parentHead);
       let record;
       try {
-        await this.addLane(repo.repoPath, path, custody);
+        await this.addLane(repo.repoPath, path, custody, assertParent);
+        assertParent();
         if (input.authority === 'writer') await this.bootstrap(repo.repoPath, path);
-        const sha = runGit(path, ['rev-parse', 'HEAD']);
+        assertParent();
         this.assertCreationIdentity(path, custody);
+        const sha = runGit(path, ['rev-parse', 'HEAD']);
         this.assertCreationCustody(repo.repoPath, path, custody);
         beginLaneHandoff({ id: input.childId, kind: 'child', jobId: input.jobId, roundId: null, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
           this.assertCreationCustody(repo.repoPath, path, custody), custody.token);
@@ -886,7 +899,9 @@ export class WorktreeManager {
         await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
-      this.handoffLane(repo.repoPath, path, custody, record);
+      assertParent(); // registration observers cannot invalidate the original source
+      this.handoffLane(repo.repoPath, path, custody, record, assertParent);
+      assertParent();
       this.log('info', 'child worktree created', {
         child: input.childId,
         job: input.jobId,
@@ -1140,14 +1155,16 @@ export class WorktreeManager {
     return { token: `gru-creation:${randomUUID()}`, branch, sha, branchCreated: false, addAttempted: false };
   }
 
-  private async addLane(repoPath: string, path: string, custody: CreationCustody): Promise<void> {
+  private async addLane(repoPath: string, path: string, custody: CreationCustody, assertSource?: () => void): Promise<void> {
     if (custody.branch !== null) {
       await this.updateDirectCreationRef(repoPath, custody, 'create');
       custody.branchCreated = true;
     }
+    assertSource?.(); // original parent after the awaited named-ref transaction
     custody.addAttempted = true;
     runGit(repoPath, ['worktree', 'add', '--lock', '--reason', custody.token,
       ...(custody.branch === null ? ['--detach'] : []), path, custody.branch ?? custody.sha]);
+    assertSource?.();
     this.assertCreationIdentity(path, custody);
   }
 
@@ -1388,10 +1405,19 @@ export class WorktreeManager {
     const gitFile = readWorktreeMetadata(join(path, '.git')).trim();
     if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
     const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
-    readWorktreeMetadata(join(admin, 'HEAD'));
-    readWorktreeMetadata(join(admin, 'gitdir'));
-    const symbolic = spawnGit(path, ['symbolic-ref', '--quiet', 'HEAD']);
+    const head = readWorktreeMetadata(join(admin, 'HEAD')).trim();
+    const common = realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim()));
+    if (dirname(admin) !== join(common, 'worktrees') ||
+      realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim())) !== realpathSync(join(path, '.git'))) throw new Error('creation metadata backlink changed');
     const expected = custody.branch === null ? null : `refs/heads/${custody.branch}`;
+    if (head !== (expected === null ? custody.sha : `ref: ${expected}`)) throw new Error(`worktree creation target changed: ${path} — refusing registration or handoff`);
+    if (expected !== null) {
+      const ref = join(common, expected);
+      if (existsSync(ref)) {
+        if (realpathSync(ref) !== ref || readWorktreeMetadata(ref).trim() !== custody.sha) throw new Error(`worktree creation target changed: ${path} — refusing registration or handoff`);
+      } else readWorktreeMetadata(join(common, 'packed-refs'), 16 * 1024 * 1024);
+    }
+    const symbolic = spawnGit(path, ['symbolic-ref', '--quiet', 'HEAD']);
     if (runGit(path, ['rev-parse', 'HEAD']) !== custody.sha ||
       (expected === null ? symbolic.status !== 1 : symbolic.status !== 0 || symbolic.stdout.trim() !== expected)) {
       throw new Error(`worktree creation target changed: ${path} — refusing registration or handoff`);
@@ -1404,6 +1430,7 @@ export class WorktreeManager {
     if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
     const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
     readWorktreeMetadata(join(admin, 'HEAD'));
+    if (realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())) !== common) throw new Error('creation common directory changed');
     if (dirname(admin) !== join(common, 'worktrees') ||
       realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim())) !== realpathSync(join(path, '.git')) ||
       readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
@@ -1425,6 +1452,7 @@ export class WorktreeManager {
       const backlink = resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim());
       if (backlink !== expected) continue;
       readWorktreeMetadata(join(admin, 'HEAD'));
+      if (realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())) !== common) throw new Error('orphan creation common directory changed');
       if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
         throw new Error('orphaned worktree custody receipt does not match this invocation');
       }
@@ -1433,14 +1461,18 @@ export class WorktreeManager {
     return null;
   }
 
-  private handoffLane(repoPath: string, path: string, custody: CreationCustody, record: WorktreeRecord): void {
+  private handoffLane(repoPath: string, path: string, custody: CreationCustody, record: WorktreeRecord, assertSource?: () => void): void {
     try {
+      assertSource?.();
       this.assertCreationIdentity(path, custody);
       const admin = this.assertCreationCustody(repoPath, path, custody);
       assertPendingLaneHandoff(record, admin, custody.token);
+      assertSource?.();
       runGit(repoPath, ['worktree', 'unlock', path]);
       this.assertCreationIdentity(path, custody);
+      assertSource?.();
       completeLaneHandoff(record, admin, custody.token, this.opts.ledger);
+      assertSource?.();
     } catch (error) {
       throw new Error(`worktree creation custody handoff failed for ${path}; registered lane retained — inspect before retry`, { cause: error });
     }

@@ -1,7 +1,8 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { WorktreeBaseSource } from '../../src/ledger/api.js';
+import { issueFixtureHandoff } from './fixture-handoff.js';
+import type { LedgerApi, WorktreeBaseSource } from '../../src/ledger/api.js';
 import type { WorktreeLane, WorktreePort, WorktreeSweepResult } from '../../src/dispatch/worktree-port.js';
 import { isExactOriginBranchSpelling } from '../../src/worktrees/manager.js';
 
@@ -93,7 +94,7 @@ export function resolveReviewTargetReal(
 }
 export class GitReviewPort implements WorktreePort {
   private readonly lanes = new Map<string, WorktreeLane>();
-  constructor(private readonly root: string, private readonly branch: string, private readonly sha: string) {}
+  constructor(private readonly root: string, private readonly branch: string, private readonly sha: string, private readonly ledger: LedgerApi) {}
 
   async resolveReviewTarget(input: { repoPath: string; ref: string }): Promise<{
     readonly sha: string;
@@ -112,13 +113,28 @@ export class GitReviewPort implements WorktreePort {
     return lane;
   }
 
-  async createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
+  private createReviewCheckout(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): WorktreeLane {
     const path = join(this.root, input.roundId);
     execFileSync('git', ['-C', input.repoPath, 'worktree', 'add', '--detach', path, input.ref], { stdio: 'ignore' });
-    const lane: WorktreeLane = {
+    return {
       id: input.roundId, kind: 'review', repoPath: input.repoPath, repoName: 'fixture', path,
-      branch: null, sha: input.ref, jobId: input.jobId ?? null, roundId: input.roundId, status: 'active',
+      branch: null, sha: execFileSync('git', ['-C', path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+      jobId: input.jobId ?? null, roundId: input.roundId, status: 'active',
     };
+  }
+
+  async createReviewWorktree(input: { repoPath: string; roundId: string; ref: string; jobId?: string }): Promise<WorktreeLane> {
+    if (this.ledger.getRound(input.roundId) === null) throw new Error('review fixture requires its actual owning round before issuance');
+    const lane = issueFixtureHandoff(this.createReviewCheckout(input), this.ledger);
+    this.lanes.set(lane.id, lane);
+    return lane;
+  }
+
+  /** ONLY the missing-round orchestration negative: this checkout has NO
+   * service registration/ready receipt/fact and grants no production custody. */
+  async createUnissuedOrphanReview(input: { repoPath: string; roundId: string; ref: string }): Promise<WorktreeLane> {
+    if (this.ledger.getRound(input.roundId) !== null || this.ledger.getWorktree(input.roundId) !== null) throw new Error('unissued orphan fixture must have no service owner');
+    const lane = this.createReviewCheckout(input);
     this.lanes.set(lane.id, lane);
     return lane;
   }
@@ -144,8 +160,9 @@ export class GitReviewPort implements WorktreePort {
       id: input.childId, kind: 'child', repoPath: input.repoPath, repoName: 'fixture', path,
       branch, sha: base, jobId: input.jobId, roundId: null, status: 'active',
     };
-    this.lanes.set(lane.id, lane);
-    return lane;
+    const issued = issueFixtureHandoff(lane, this.ledger);
+    this.lanes.set(lane.id, issued);
+    return issued;
   }
 
   getWorktree(id: string): WorktreeLane | null { return this.lanes.get(id) ?? null; }
@@ -161,6 +178,7 @@ export class GitReviewPort implements WorktreePort {
         execFileSync('git', ['-C', lane.repoPath, 'branch', '-D', lane.branch], { stdio: 'ignore' });
       }
     }
+    if (this.ledger.getWorktree(lane.id) !== null) this.ledger.setWorktreeStatus(lane.id, 'swept', 'fixture-owned release');
     this.lanes.set(lane.id, { ...lane, status: 'swept' });
     return { status: 'swept', preserved: null, branch: 'none', freshHead: this.sha };
   }

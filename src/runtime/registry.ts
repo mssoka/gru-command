@@ -710,6 +710,7 @@ export class RuntimeRegistry {
     let disposalSettled = false;
     let disposalFulfilled = false;
     let released = false;
+    let publicationFailure: { readonly error: unknown } | null = null;
     const releaseHandle = (): void => {
       if (released) return;
       released = true;
@@ -785,6 +786,7 @@ export class RuntimeRegistry {
           }
           const wrapper = (...args: unknown[]) => {
             if (disposingNow || released) return Promise.reject(new WorkerDisposalInProgressError());
+            if (publicationFailure !== null) return Promise.reject(publicationFailure.error);
             pending += 1;
             budget.changed();
             // Invoke SYNCHRONOUSLY: adapter wrappers (e.g. the claude
@@ -836,20 +838,38 @@ export class RuntimeRegistry {
     // tracking remains live while publication is held, including cleanup.
     this.unpublished.add(resident);
     let published = false;
+    let publishing = false;
     const buffered: AgentEventEnvelope[] = [];
+    const duringPublication: AgentEventEnvelope[] = [];
     const forward = (envelope: AgentEventEnvelope): void => {
-      if (published) this.emitAgentEvent(envelope);
+      if (publicationFailure !== null) return;
+      if (publishing) duringPublication.push(envelope);
+      else if (published) this.emitAgentEvent(envelope);
       else buffered.push(envelope);
     };
     const publish = (): void => {
-      if (published) return;
-      if (released || !this.handles.has(resident)) throw new WorkerDisposalInProgressError();
-      assertHandoff();
-      published = true;
-      this.unpublished.delete(resident);
-      this.emitAgentEvent({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
-      assertHandoff();
-      for (const envelope of buffered.splice(0)) this.emitAgentEvent(envelope);
+      if (publicationFailure !== null) throw publicationFailure.error;
+      if (published || publishing) return;
+      try {
+        if (released || !this.handles.has(resident)) throw new WorkerDisposalInProgressError();
+        assertHandoff();
+        publishing = true;
+        published = true;
+        this.unpublished.delete(resident);
+        this.emitAgentEvent({ handle: resident, agentId: handle.id, role, sessionFile: handle.sessionFile, phase: 'spawned' });
+        assertHandoff();
+        publishing = false;
+        // Preserve healthy observer-event ordering, but never forward any
+        // pending event until the post-listener custody proof succeeds.
+        for (const envelope of [...duringPublication.splice(0), ...buffered.splice(0)]) this.emitAgentEvent(envelope);
+      } catch (error) {
+        publicationFailure = { error };
+        published = false;
+        if (this.handles.has(resident)) this.unpublished.add(resident);
+        buffered.length = 0;
+        duringPublication.length = 0;
+        throw error; // delayed Supervisor retries see the same terminal refusal
+      } finally { publishing = false; }
     };
     // Self-healing membership: a handle disposed by ANY caller leaves the
     // registry set — the status surface must never contradict itself.

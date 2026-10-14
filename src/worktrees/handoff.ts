@@ -1,5 +1,5 @@
 import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, openSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { WorktreePort, WorktreeLane } from '../dispatch/worktree-port.js';
 import type { LedgerApi, WorktreeRecord } from '../ledger/api.js';
 
@@ -254,13 +254,28 @@ function* ancestors(path: string): Generator<string> {
 /** Resolve missing descendants through their existing ancestor too: replacing
  * or removing a known root must never turn managed custody into an exemption. */
 function canonicalCwd(cwd: string): string {
-  for (const ancestor of ancestors(cwd)) {
-    try { return resolve(realpathSync(ancestor), resolve(cwd).slice(ancestor.length).replace(/^\//u, '')); }
-    catch (error) {
+  // resolve() and JS realpath collapse symlink-dependent '..' before the
+  // filesystem sees it. Native realpath follows the same traversal as cwd.
+  let path = isAbsolute(cwd) ? cwd : `${process.cwd()}/${cwd}`;
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      const canonical = realpathSync.native(path);
+      if (missing.some((part) => part === '.' || part === '..')) throw new Error('cwd parent traversal through missing metadata is unverifiable');
+      return join(canonical, ...[...missing].reverse());
+    } catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+      try {
+        if (lstatSync(path).isSymbolicLink()) throw new Error('cwd symlink target is missing — custody unresolved');
+      } catch (metadataError) {
+        if (!(metadataError instanceof Error && 'code' in metadataError && metadataError.code === 'ENOENT')) throw metadataError;
+      }
+      const parent = dirname(path);
+      if (parent === path) throw error;
+      missing.push(basename(path));
+      path = parent;
     }
   }
-  throw new Error('cwd has no verifiable existing ancestor');
 }
 
 function owningAssociation(cwd: string) {

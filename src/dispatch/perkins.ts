@@ -1,3 +1,4 @@
+import { capturePortLaneHandoff } from '../worktrees/handoff.js';
 import type { AgentHandle, PromptTurnVerdict } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import { spawnSync } from 'node:child_process';
@@ -4168,6 +4169,7 @@ export class WaveRunner {
     if (job.briefing === null && input.noSpec !== true) {
       throw new Error('complete review requires the job briefing/spec or explicit noSpec=true');
     }
+    const originalJobHandoff = capturePortLaneHandoff(this.opts.worktrees, jobWorktree);
     const canonicalLenses = input.noSpec === true
       ? [...policy.portableContract.rules.noSpecLenses]
       : [...policy.portableContract.rules.fullLenses];
@@ -4329,6 +4331,23 @@ export class WaveRunner {
 
     let reviewWorktree: Awaited<ReturnType<WorktreePort['createReviewWorktree']>> | undefined;
     let frozenReview: FrozenReview;
+    let originalReviewHandoff: (() => void) | null = null;
+    // Keep the arm's immutable map and canonical target through execution.
+    // Later guards refuse new work; they never publish another force audit.
+    const assertReviewAuthority = (): void => {
+      originalJobHandoff();
+      if (originalReviewHandoff === null) throw new Error('original review handoff is unavailable');
+      originalReviewHandoff();
+      if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
+      this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
+      const recheck = {
+        job, jobLane: jobWorktree, targetBranch, phase: 'freeze' as const, roundId: round.id,
+        ...(input.targetRef !== undefined ? { targetRef: input.targetRef } : {}),
+        ...(flippedFrom !== null ? { reviewedStatus: { jobId: job.id, status: flippedFrom } } : {}),
+      };
+      const current = input.force === true ? this.branchIdleBlockers(recheck) : this.enforceBranchIdle(recheck);
+      this.refuseUnauditedBlockers(job.id, round.id, current, input.forceAuthorization ?? new Map());
+    };
     try {
       reviewWorktree = await this.opts.worktrees.createReviewWorktree({
         repoPath: jobWorktree.repoPath,
@@ -4336,6 +4355,7 @@ export class WaveRunner {
         ref: targetSha,
         jobId: job.id,
       });
+      originalReviewHandoff = capturePortLaneHandoff(this.opts.worktrees, reviewWorktree);
       if (this.shuttingDown || setupSignal.aborted) {
         throw setupSignal.reason instanceof ReviewSupersededError
           ? setupSignal.reason
@@ -4619,6 +4639,7 @@ export class WaveRunner {
           frozenReview,
           policy,
           runController.signal,
+          assertReviewAuthority,
           input.reviewModel,
           input.claimedFixedPriors,
         );
@@ -4898,6 +4919,7 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
+    assertReviewAuthority: () => void,
     reviewModel?: ReviewPreflightResult['reviewModel'],
     claimedFixedPriors?: readonly number[],
   ): Promise<WaveOutcome> {
@@ -4913,6 +4935,7 @@ export class WaveRunner {
       }
     };
     try {
+      assertReviewAuthority(); // after the admission publication's synchronous observers
       reservation = this.opts.reserveReviewRound === undefined
         ? undefined : await this.opts.reserveReviewRound(signal);
       if (reservation !== undefined) {
@@ -4925,7 +4948,8 @@ export class WaveRunner {
           payload: { reason: 'lead and child resident slots admitted' },
         });
       }
-      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, reviewModel, beginSpawn, () => spawnInitiated, reservation, claimedFixedPriors);
+      assertReviewAuthority(); // residency awaits and residency-admitted observers
+      const outcome = await this.runOwnedReview(job, round, lenses, movementRef, noSpec, frozenReview, policy, signal, assertReviewAuthority, reviewModel, beginSpawn, () => spawnInitiated, reservation, claimedFixedPriors);
       settledOutcome = outcome;
       return outcome;
     } catch (error) {
@@ -4974,6 +4998,7 @@ export class WaveRunner {
     frozenReview: FrozenReview,
     policy: PerkinsPolicy,
     signal: AbortSignal,
+    assertReviewAuthority: () => void,
     reviewModel: ReviewPreflightResult['reviewModel'] | undefined,
     beginSpawn: () => void,
     spawnInitiated: () => boolean,
@@ -4992,7 +5017,7 @@ export class WaveRunner {
       })).digest('hex') !== frozenReview.manifest.recoveryIdentity.modelSettingsSha256) {
       throw new Error('review thinking/model settings changed since freeze — a new review is required');
     }
-    const spawnWithOptions: AgentSpawner = (role, options) => {
+    const spawnWithOptions: AgentSpawner = async (role, options) => {
       if (frozenThinking !== undefined && this.opts.reviewThinkingLevel?.() !== frozenThinking) {
         throw new Error('review thinking level changed since freeze — a new review is required');
       }
@@ -5007,10 +5032,26 @@ export class WaveRunner {
         ...(reviewModel !== undefined && (options?.isolatedReview !== undefined || options?.reviewLead !== undefined)
           ? { reviewModel } : {}),
       };
+      assertReviewAuthority(); // after provider pacing, before invoking any spawner
       beginSpawn();
-      return reservation === undefined
+      assertReviewAuthority(); // the live-status observer cannot transfer authority
+      const handle = await (reservation === undefined
         ? this.opts.spawner(role, resolved)
-        : reservation.spawn(resolved);
+        : reservation.spawn(resolved));
+      // The same guard applies after spawn/agent observers and every pacing
+      // retry of an existing session. Disposal remains the original owner's.
+      const guarded = new Map<PropertyKey, (...args: unknown[]) => unknown>();
+      return new Proxy(handle, {
+        get(target, property) {
+          const value: unknown = Reflect.get(target, property);
+          if (typeof value !== 'function') return value;
+          if (['prompt', 'promptWithVerdict', 'steer', 'followUp', 'compact'].includes(String(property))) {
+            if (!guarded.has(property)) guarded.set(property, (...args: unknown[]) => { assertReviewAuthority(); return Reflect.apply(value, target, args); });
+            return guarded.get(property);
+          }
+          return value.bind(target);
+        },
+      });
     };
     const workflow = new PerkinsWholeReview({
       spawner: spawnWithOptions,

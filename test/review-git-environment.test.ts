@@ -99,7 +99,7 @@ function manager(): { readonly ledger: LedgerApi; readonly worktrees: WorktreeMa
 }
 
 async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe, linkedPr = true) {
-  const { ledger, worktrees, dbPath } = manager();
+  const { ledger, worktrees, dbPath, bus } = manager();
   const job = ledger.addJob({
     id: 'git-env-job', repo: 'assigned', title: 'review assigned source',
     baseBranch: 'main', briefing: 'Acceptance: the assigned source is reviewed.',
@@ -121,7 +121,7 @@ async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe, linkedPr = tru
     },
     reviewArtifactRoot: artifactRoot, prHeadProbe: probe,
   });
-  return { ledger, worktrees, job, wave, runtime, artifactRoot, dbPath };
+  return { ledger, worktrees, job, wave, runtime, artifactRoot, dbPath, bus };
 }
 
 function registerPrBranchLane(repo: FixtureRepo, ledger: LedgerApi, jobId: string): void {
@@ -171,6 +171,178 @@ describe('review Git repository environment isolation (GH-270)', () => {
       : h.worktrees.createChildWorktree({ repoPath: repo.path, jobId: parentJob.id, childId: id, parentPath: parent.path, authority });
     return { repo, ...h, id, ref, create };
   }
+
+  it('keeps original parent custody through queued bootstrap and registration child boundaries (final review)', async () => {
+    for (const authority of ['writer', 'read-only'] as const) for (const seam of ['queue', 'bootstrap', 'registration', 'healthy'] as const) {
+      if (authority === 'read-only' && seam === 'bootstrap') continue; // readers never bootstrap
+      const repo = fixture(`final-parent-${authority}-${seam}`), h = manager();
+      const job = h.ledger.addJob({ id: 'parent', repo: 'assigned', title: 'original parent' });
+      const parent = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      const admin = git(parent.path, ['rev-parse', '--absolute-git-dir']);
+      writeFileSync(join(parent.path, 'advance'), 'healthy parent advance');
+      git(parent.path, ['add', 'advance']); git(parent.path, ['commit', '-qm', 'advance original writer']);
+      const advanced = git(parent.path, ['rev-parse', 'HEAD']);
+      git(repo.path, ['branch', 'foreign-parent', advanced]);
+      const mutate = () => { writeFileSync(join(admin, 'HEAD'), 'ref: refs/heads/foreign-parent\n'); writeFileSync(join(parent.path, 'foreign-data'), 'retain parent'); };
+      const ready = join(directory(), 'ready'), release = `${ready}.release`, script = `${ready}.cjs`;
+      const blocker = h.ledger.addJob({ id: 'locker', repo: 'assigned', title: 'holds repo lock' });
+      if (seam === 'queue' || seam === 'bootstrap') {
+        writeFileSync(script, `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(ready)},process.cwd());let n=0;const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);}else if(++n===1000){clearInterval(timer);process.exitCode=7;}},10);`);
+        mkdirSync(join(repo.path, '.gru-command'), { recursive: true });
+        writeFileSync(join(repo.path, '.gru-command/worktree.toml'), `[[setup]]\ncommand = ${JSON.stringify(`"${process.execPath}" "${script}"`)}\n`);
+      }
+      const stop = h.bus.subscribe((event) => { if (seam === 'registration' && event.kind === 'worktree.created' && h.ledger.getWorktree('child') !== null) mutate(); });
+      const operations: Promise<unknown>[] = [];
+      try {
+        if (seam === 'queue') {
+          const holding = h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: blocker.id }); operations.push(holding);
+          await vi.waitFor(() => expect(existsSync(ready)).toBe(true));
+        }
+        const child = h.worktrees.createChildWorktree({ repoPath: repo.path, jobId: job.id, childId: 'child', parentPath: parent.path, authority })
+          .then((lane) => ({ lane, error: null }), (error: unknown) => ({ lane: null, error }));
+        operations.push(child);
+        if (seam === 'bootstrap') await vi.waitFor(() => expect(existsSync(ready)).toBe(true));
+        if (seam === 'queue' || seam === 'bootstrap') { mutate(); writeFileSync(release, 'release owned setup'); }
+        const result = await child;
+        if (seam === 'healthy') {
+          expect(result.error).toBeNull(); expect(result.lane?.sha).toBe(advanced);
+          handoffProof.capturePortLaneHandoff(h.worktrees, parent)();
+        } else {
+          expect(String(result.error), `${authority}:${seam}`).toMatch(/handoff unresolved/);
+          expect(result.lane).toBeNull();
+          const row = h.ledger.getWorktree('child');
+          if (seam === 'registration') {
+            expect(row?.status).toBe('active');
+            expect(() => handoffProof.capturePortLaneHandoff(h.worktrees, row!)()).toThrow(/handoff unresolved/);
+          } else expect(row).toBeNull();
+          expect(readFileSync(join(parent.path, 'foreign-data'), 'utf8')).toBe('retain parent');
+          expect(readFileSync(join(admin, 'HEAD'), 'utf8')).toBe('ref: refs/heads/foreign-parent\n');
+          expect(h.ledger.getWorktree(parent.id)?.status).toBe('active');
+          expect(git(repo.path, ['rev-parse', 'refs/heads/foreign-parent'])).toBe(advanced);
+        }
+      } finally { stop(); writeFileSync(release, 'fixture finally'); await Promise.allSettled(operations); }
+    }
+  });
+
+  it('refuses direct ChildWorkerService unresolved parents without a child or prompt and allows original writer advances (final review)', async () => {
+    for (const lost of [false, true]) {
+      const repo = fixture(`final-direct-parent-${lost}`), h = manager();
+      const job = h.ledger.addJob({ id: 'service-parent', repo: 'assigned', title: 'parent', briefing: 'implement parent' });
+      const parent = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
+      h.ledger.setJobStatus(job.id, 'working');
+      h.ledger.registerAgent({ id: 'parent-agent', role: 'minion', jobId: job.id, parentage: 'top-level' });
+      writeFileSync(join(parent.path, 'advance'), 'valid original writer'); git(parent.path, ['add', 'advance']); git(parent.path, ['commit', '-qm', 'advance']);
+      const advanced = git(parent.path, ['rev-parse', 'HEAD']), admin = git(parent.path, ['rev-parse', '--absolute-git-dir']);
+      if (lost) writeFileSync(join(admin, 'locked'), 'foreign retained parent');
+      const sessionFile = join(directory(), 'child.jsonl'); writeFileSync(sessionFile, '');
+      let ceased = false;
+      const prompt = vi.fn(async () => { writeFileSync(sessionFile, JSON.stringify({ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'Final report: completed isolated task.' }] } }) + '\n'); });
+      const spawner = vi.fn(async (role: Role, options?: { agentId?: string }): Promise<AgentHandle> => ({ id: options?.agentId ?? 'child', role, sessionFile,
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        prompt, steer: async () => {}, followUp: async () => {}, subscribe: () => () => {},
+        health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile }), dispose: async () => { ceased = true; } }));
+      const createChild = vi.spyOn(h.worktrees, 'createChildWorktree');
+      const children = new ChildWorkerService({ ledger: h.ledger, worktrees: h.worktrees, spawner });
+      const child = children.request({ parentAgentId: 'parent-agent', jobId: job.id, purpose: 'isolated task', task: 'report completion', authority: 'writer', idempotencyKey: 'one' });
+      try {
+        await vi.waitFor(() => expect(h.ledger.getChildWorker(child.record.id)?.resultState).toBe(lost ? 'error' : 'done'));
+        expect(createChild).toHaveBeenCalledTimes(lost ? 0 : 1);
+        expect(spawner).toHaveBeenCalledTimes(lost ? 0 : 1); expect(prompt).toHaveBeenCalledTimes(lost ? 0 : 1);
+        if (lost) {
+          expect(h.ledger.getWorktree(child.record.id)).toBeNull();
+          expect(existsSync(join(h.root, parent.repoName, `child-${child.record.id}`))).toBe(false);
+          expect(git(repo.path, ['branch', '--list', `gru/${job.id}-child-${child.record.id}`])).toBe('');
+          expect(readFileSync(join(admin, 'locked'), 'utf8')).toBe('foreign retained parent');
+        }
+        else expect(h.ledger.getWorktree(child.record.id)?.sha).toBe(advanced);
+        expect(existsSync(parent.path)).toBe(true); expect(h.ledger.getWorktree(parent.id)?.status).toBe('active');
+      } finally { await children.dispose(); }
+    }
+  });
+
+  it('refuses successful job and writer bootstrap FIFO HEAD before synchronous Git with finite owned unblock (final review)', async () => {
+    for (const authority of ['job', 'writer'] as const) for (const fifo of [false, true]) {
+      const h = await rollbackRaceFixture(`final-success-fifo-${authority}-${fifo}`, authority);
+      const root = directory(), ready = join(root, 'ready.json'), finished = join(root, 'finished'), unblocked = join(root, 'unblocked'), script = join(root, 'setup.cjs');
+      writeFileSync(script, `const fs=require('node:fs'),cp=require('node:child_process'),p=require('node:path');const admin=cp.execFileSync('git',['rev-parse','--absolute-git-dir'],{encoding:'utf8'}).trim(),file=p.join(admin,'HEAD'),head=fs.readFileSync(file,'utf8');fs.writeFileSync(p.join(process.cwd(),'retained-data'),'owned successful setup');${fifo ? "fs.unlinkSync(file);cp.execFileSync('mkfifo',[file]);" : ''}fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({file,head,tree:process.cwd(),admin}));`);
+      mkdirSync(join(h.repo.path, '.gru-command'), { recursive: true });
+      writeFileSync(join(h.repo.path, '.gru-command/worktree.toml'), `[[setup]]\ncommand = ${JSON.stringify(`"${process.execPath}" "${script}"`)}\n`);
+      const child = spawn(process.execPath, ['-e', `const fs=require('node:fs');let n=0;const poll=setInterval(()=>{if(fs.existsSync(${JSON.stringify(finished)})){clearInterval(poll);}else if(fs.existsSync(${JSON.stringify(ready)})){clearInterval(poll);setTimeout(()=>{if(fs.existsSync(${JSON.stringify(finished)}))return;const r=JSON.parse(fs.readFileSync(${JSON.stringify(ready)},'utf8'));if(!fs.lstatSync(r.file).isFIFO())return;const fd=fs.openSync(r.file,fs.constants.O_RDWR|fs.constants.O_NONBLOCK);fs.writeSync(fd,r.head);fs.closeSync(fd);fs.unlinkSync(r.file);fs.writeFileSync(r.file,r.head);fs.writeFileSync(${JSON.stringify(unblocked)},'owned unblock');},800);}else if(++n===1000){clearInterval(poll);process.exitCode=9;}},10);`], { stdio: 'pipe' });
+      console.error(`[final-bootstrap-fifo] owned child pid=${child.pid}`);
+      const settled = new Promise<number | null>((done, reject) => { child.once('error', reject); child.once('close', (code) => { console.error(`[final-bootstrap-fifo] child closed pid=${child.pid} code=${code}`); done(code); }); });
+      try {
+        const creation = h.create();
+        if (fifo) {
+          await expect(creation).rejects.toThrow(/custody unconfirmed/);
+          expect(h.ledger.getWorktree(h.id)).toBeNull(); expect(existsSync(unblocked)).toBe(false);
+          const state = JSON.parse(readFileSync(ready, 'utf8')) as { tree: string; admin: string };
+          expect(readFileSync(join(state.tree, 'retained-data'), 'utf8')).toBe('owned successful setup');
+          expect(existsSync(join(state.admin, 'locked'))).toBe(true);
+          expect(git(h.repo.path, ['rev-parse', h.ref])).toBe(h.repo.head());
+        } else {
+          const lane = await creation; handoffProof.capturePortLaneHandoff(h.worktrees, lane)();
+          expect(readFileSync(join(lane.path, 'retained-data'), 'utf8')).toBe('owned successful setup');
+        }
+      } finally {
+        writeFileSync(finished, 'creation settled');
+        try { expect(await settled).toBe(0); }
+        finally { if (existsSync(ready)) { const state = JSON.parse(readFileSync(ready, 'utf8')) as { file: string; head: string }; rmSync(state.file, { force: true }); writeFileSync(state.file, state.head); } }
+      }
+    }
+  });
+
+  it('retains original forced verification authority after admission resident and pacing waits without rearming (final review)', async () => {
+    for (const seam of ['admission', 'resident', 'pacing'] as const) for (const replacement of [false, true]) {
+      const repo = fixture(`final-force-${seam}-${replacement}`); origin(repo);
+      const h = await waveFixture(repo, async () => { throw new Error('local target must not probe PR'); }, false);
+      const lane = h.worktrees.getWorktree(h.job.id)!;
+      writeFileSync(join(lane.path, 'change'), 'review change'); git(lane.path, ['add', 'change']); git(lane.path, ['commit', '-qm', 'review change']);
+      h.ledger.appendCustomEvent({ kind: 'verification.requested', jobId: h.job.id, payload: { run_id: 'audited-A' } });
+      h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: h.job.id, payload: { run_id: 'audited-A' } });
+      const replace = () => { if (replacement) h.ledger.appendCustomEvent({ kind: 'verification.started', jobId: h.job.id, payload: { run_id: 'new-B' } }); };
+      const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: h.runtime.spawner };
+      class Registry extends RuntimeRegistry { override runtimeIdFor(): RuntimeId { return 'pi'; } override runtimeFor(): AgentRuntime { return adapter; } }
+      const config = loadConfig({ GRU_COMMAND_HOME: directory() });
+      const registry = new Registry({ config: { ...config, concurrency: { ...config.concurrency, maxWorkers: 2 } }, store: new SessionStore(directory()) });
+      const holdOne = seam === 'resident' ? await registry.reserveResident() : null;
+      const holdTwo = seam === 'resident' ? await registry.reserveResident() : null;
+      const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 0, maxConcurrentReviewTurns: 1 });
+      let holdTurn = seam === 'pacing' ? await gate.acquireReviewTurn({ id: 'held', label: 'owned fixture turn' }) : null;
+      let admissionSeen = false;
+      const stop = h.bus.subscribe((event) => { if (event.kind === 'round.admission-preflight') { admissionSeen = true; if (seam === 'admission') replace(); } });
+      const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, spawner: h.runtime.spawner, reviewArtifactRoot: h.artifactRoot,
+        ...(seam === 'resident' ? { reserveReviewRound: (signal: AbortSignal) => registry.reserveReviewRound(signal) } : {}),
+        ...(seam === 'pacing' ? { reviewGate: gate } : {}) });
+      try {
+        const admitted = await wave.requestReview({ jobId: h.job.id, force: true });
+        expect(admitted.route).toBe('perkins');
+        if (admitted.route !== 'perkins') throw new Error('fixture expected native Perkins admission');
+        // Attach immediately: admission-observer refusal can settle before the waiter resumes.
+        const outcome = admitted.run.then((value) => ({ value, error: null }), (error: unknown) => ({ value: null, error }));
+        expect(admissionSeen).toBe(true);
+        if (seam === 'resident') {
+          await vi.waitFor(() => expect(registry.residencySnapshot().queued).toBeGreaterThan(0)); replace(); holdOne!(); holdTwo!();
+        } else if (seam === 'pacing') {
+          await vi.waitFor(() => expect(gate.view().review.queued.length).toBeGreaterThan(0)); replace(); holdTurn!.release(); holdTurn = null;
+        }
+        const settled = await outcome;
+        if (!replacement) {
+          expect(settled.error).toBeNull();
+          expect(h.runtime.leadCalls[0]?.prompt).toEqual(expect.any(String));
+        }
+        expect(h.runtime.leadCalls, `${seam}:${replacement}`).toHaveLength(replacement ? 0 : 1);
+        expect(h.runtime.childCalls).toHaveLength(0);
+        expect(h.ledger.latestRoundEvent(admitted.round.id, 'round.admission-preflight')?.payload).toMatchObject({ ok: true });
+        expect(h.ledger.hasUnsettledVerificationRun(h.job.id)).toBe(true);
+        // A's valid past audit remains; B never receives a new force override.
+        const audits = h.ledger.listJobEvents(h.job.id).filter((event) => event.kind === 'branch-idle.forced');
+        expect(audits.length).toBeGreaterThan(0);
+        const b = h.ledger.latestJobEvent(h.job.id, 'verification.started');
+        if (replacement) expect(audits.every((event) => event.seq < b!.seq)).toBe(true);
+      } finally { stop(); holdOne?.(); holdTwo?.(); holdTurn?.release(); await wave.shutdown(); await h.wave.shutdown(); await registry.dispose(); }
+    }
+  });
 
   it('accepts exhaustive authentic handoff history beyond 1000 and rejects later-page incomplete or duplicate proof (ordinary review)', async () => {
     const repo = fixture('ordinary-history'), h = manager();
@@ -237,6 +409,10 @@ describe('review Git repository environment isolation (GH-270)', () => {
     const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
     const cwd = join(lane.path, 'nested', 'src'); mkdirSync(cwd, { recursive: true });
     const alias = join(directory(), 'alias'); symlinkSync(lane.path, alias);
+    const parentAlias = join(directory(), 'parent-alias'); symlinkSync(join(lane.path, 'nested'), parentAlias);
+    const semanticCwd = `${parentAlias}/..`;
+    expect(execFileSync(process.execPath, ['-e', 'console.log(process.cwd())'], { cwd: semanticCwd, encoding: 'utf8' }).trim()).toBe(realpathSync(lane.path));
+    handoffProof.captureCwdHandoff(join(alias, 'nested', 'src'))();
     const prompted = vi.fn(async () => {});
     let spawnCount = 0;
     const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
@@ -252,19 +428,30 @@ describe('review Git repository environment isolation (GH-270)', () => {
       }) };
     class Registry extends RuntimeRegistry { override runtimeIdFor(): RuntimeId { return 'pi'; } override runtimeFor(): AgentRuntime { return adapter; } }
     const config = loadConfig({ GRU_COMMAND_HOME: directory() });
-    const registry = new Registry({ config, store: new SessionStore(directory()) });
-    const healthy = await registry.spawn('minion', { cwd: join(alias, 'nested', 'src') });
+    const registry = new Registry({ config: { ...config, concurrency: { ...config.concurrency, maxWorkers: 2 } }, store: new SessionStore(directory()) });
+    const healthy = await registry.spawn('minion', { cwd: semanticCwd });
     await healthy.prompt('genuine completed descendant');
     expect(prompted).toHaveBeenCalledTimes(1);
     const admin = git(lane.path, ['rev-parse', '--absolute-git-dir']);
+    const held = await registry.reserveResident();
+    const waiting = registry.spawn('minion', { cwd: semanticCwd }).then(() => false, (error: unknown) => String(error).includes('handoff unresolved'));
+    try {
+      await vi.waitFor(() => expect(registry.residencySnapshot().queued).toBe(1));
+      writeFileSync(join(admin, 'locked'), 'foreign queued custody');
+      held();
+      expect(await waiting).toBe(true);
+      expect(adapter.spawn).toHaveBeenCalledTimes(1);
+      await expect(healthy.prompt('queued alias lost custody')).rejects.toThrow(/handoff unresolved/);
+    } finally { held(); }
+    rmSync(join(admin, 'locked')); // restore only fixture-owned mutation for the independent observer control
     const unsubscribe = registry.onAgentEvent((event) => { if (event.phase === 'spawned') writeFileSync(join(admin, 'locked'), 'foreign observer custody'); });
-    await expect(registry.spawn('minion', { cwd })).rejects.toThrow(/handoff unresolved/);
+    await expect(registry.spawn('minion', { cwd: semanticCwd })).rejects.toThrow(/handoff unresolved/);
     unsubscribe();
     expect(adapter.spawn).toHaveBeenCalledTimes(2);
     expect(registry.getHandle('descendant-minion-2')).toBeNull();
     await expect(healthy.prompt('obsolete descendant prompt')).rejects.toThrow(/handoff unresolved/);
     await healthy.dispose();
-    for (const path of [cwd, join(alias, 'nested', 'src'), join(lane.path, 'missing', 'descendant')]) {
+    for (const path of [cwd, semanticCwd, `${parentAlias}/../missing/descendant`, join(alias, 'nested', 'src'), join(lane.path, 'missing', 'descendant')]) {
       await expect(registry.spawn('minion', { cwd: path })).rejects.toThrow(/handoff unresolved/);
     }
     expect(adapter.spawn).toHaveBeenCalledTimes(2); expect(prompted).toHaveBeenCalledTimes(1);
@@ -1089,7 +1276,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
   });
 
   it('rechecks delayed supervised publication while preserving exact disposal acknowledgement and unknown resident debt (GH270 main union)', async () => {
-    for (const seam of ['healthy', 'before-publication', 'publication-listener'] as const) {
+    for (const seam of ['healthy', 'before-publication', 'publication-listener'] as const) for (const stop of ['live', 'unknown', 'throwing', 'rejected'] as const) {
       const repo = fixture(`union-publication-${seam}`), h = manager();
       const job = h.ledger.addJob({ id: 'union-owner', repo: 'assigned', title: 'supervised publication' });
       const lane = await h.worktrees.createJobWorktree({ repoPath: repo.path, jobId: job.id });
@@ -1099,19 +1286,21 @@ describe('review Git repository environment isolation (GH-270)', () => {
       const prompt = vi.fn(async () => {});
       const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
         health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: async (role) => ({
-          id: `union-${seam}`, role, sessionFile: null, capabilities: adapter.capabilities, prompt,
-          steer: async () => {}, followUp: async () => {}, dispose: async () => {},
+          id: `union-${seam}-${stop}`, role, sessionFile: null, capabilities: adapter.capabilities, prompt,
+          steer: async () => {}, followUp: async () => {}, dispose: async () => { if (stop === 'rejected') throw new Error('owned disposal rejected'); },
           subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
-          health: () => ({ state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
-          hasLiveProcess: () => !ceased, isCompacting: () => false,
+          health: () => { if (!ceased && stop === 'throwing') throw new Error('unknown health'); return { state: ceased ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }; },
+          ...(stop === 'unknown' ? {} : { hasLiveProcess: () => !ceased, isCompacting: () => false }),
         }) };
       class Registry extends RuntimeRegistry { override runtimeIdFor(): RuntimeId { return 'pi'; } override runtimeFor(): AgentRuntime { return adapter; } }
       const registry = new Registry({ config: loadConfig({ GRU_COMMAND_HOME: directory() }), store: new SessionStore(directory()) });
       const stages: { publish?: () => void } = {};
       const published: string[] = [];
+      const forwarded: string[] = [];
       const stopTap = registry.onAgentEvent((event) => {
-        if (event.phase !== 'spawned') return;
+        if (event.phase !== 'spawned') { if (event.event?.type === 'text_delta') forwarded.push(event.event.delta); return; }
         published.push(event.agentId);
+        for (const listener of listeners) listener({ type: 'text_delta', delta: 'inside publication' });
         if (seam === 'publication-listener') writeFileSync(join(admin, 'locked'), 'foreign publication custody');
       });
       const handle = await registry.spawn('minion', stageSpawnRegistration({ cwd: lane.path }, (_handle, publish) => { stages.publish = publish; }));
@@ -1119,6 +1308,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
       expect(published).toEqual([]); expect(registry.residencySnapshot().occupied).toBe(1);
       const publish = stages.publish;
       if (publish === undefined) throw new Error('fixture supervised owner never received its publication stage');
+      for (const listener of listeners) listener({ type: 'text_delta', delta: 'buffered before publication' });
       if (seam === 'before-publication') writeFileSync(join(admin, 'locked'), 'foreign staged custody');
       if (seam === 'healthy') {
         publish(); expect(registry.getHandle(handle.id)).toBe(handle);
@@ -1127,18 +1317,28 @@ describe('review Git repository environment isolation (GH-270)', () => {
         expect(publish).toThrow(/handoff unresolved/);
         await expect(handle.prompt('never execute')).rejects.toThrow(/handoff unresolved/);
         expect(prompt).not.toHaveBeenCalled();
+        expect(registry.getHandle(handle.id)).toBeNull();
+        expect(publish).toThrow(/handoff unresolved/); // Supervisor retries must remain terminal.
+        expect(readFileSync(join(admin, 'locked'), 'utf8')).toMatch(/foreign/);
+        rmSync(join(admin, 'locked')); // fixture actor restores bytes, not publication authority
+        expect(publish).toThrow(/handoff unresolved/);
+        await expect(handle.prompt('still terminal after restoration')).rejects.toThrow(/handoff unresolved/);
+        expect(registry.getHandle(handle.id)).toBeNull();
       }
+      for (const listener of listeners) listener({ type: 'text_delta', delta: 'after publication attempt' });
+      expect(forwarded).toEqual(seam === 'healthy' ? ['inside publication', 'buffered before publication', 'after publication attempt'] : []);
       expect(published).toEqual(seam === 'before-publication' ? [] : [handle.id]);
       const acknowledgements: boolean[] = [];
       const stopSettlement = observeDisposalSettlement(handle, (acknowledged) => { acknowledgements.push(acknowledged); });
-      await handle.dispose();
-      expect(acknowledgements).toEqual([true]); // acknowledgement is not cessation
+      if (stop === 'rejected') await expect(handle.dispose()).rejects.toThrow(/owned disposal rejected/);
+      else await handle.dispose();
+      expect(acknowledgements).toEqual([stop !== 'rejected']); // acknowledgement is not cessation
       expect(registry.residencySnapshot().occupied).toBe(1);
       expect(registry.residencySnapshot().handles).toContainEqual(expect.objectContaining({ agentId: handle.id }));
       ceased = true;
       for (const listener of listeners) listener({ type: 'state', state: 'disposed' });
       expect(registry.residencySnapshot().occupied).toBe(0);
-      expect(acknowledgements).toEqual([true]);
+      expect(acknowledgements).toEqual([stop !== 'rejected']);
       stopSettlement(); stopTap();
     }
   });

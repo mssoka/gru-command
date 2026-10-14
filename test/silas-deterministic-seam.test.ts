@@ -33,7 +33,7 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
     const bus = new EventBus();
     const ledgerBus = new EventBus();
     const ledger = new LedgerApi(db.handle, { bus: ledgerBus });
-    const port = new GitReviewPort(root, 'main', repo.head());
+    const port = new GitReviewPort(root, 'main', repo.head(), ledger);
     const job = ledger.addJob({ id: 'job-seam', repo: 'fixture', title: 'seam', baseBranch: 'main', briefing: 'review' });
     ledger.setJobStatus(job.id, 'working');
     await port.createJobWorktree({ repoPath: repo.path, jobId: job.id });
