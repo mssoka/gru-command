@@ -859,7 +859,7 @@ describe('Perkins whole-PR lead engine', () => {
     expect(consolidated['findings']).toEqual([]);
     const receipt = JSON.parse(readFileSync(join(result.artifactDirectory, 'lead/receipt.json'), 'utf8')) as Record<string, unknown>;
     expect(receipt['nativeTools']).toEqual([
-      'perkins_run_specialists', 'perkins_store_artifact', 'perkins_preflight_submission', 'perkins_submit_review',
+      'perkins_run_specialists', 'perkins_store_artifact', 'perkins_submit_property_contracts', 'perkins_preflight_submission', 'perkins_submit_review',
     ]);
   });
 

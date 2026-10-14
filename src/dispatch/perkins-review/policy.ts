@@ -154,6 +154,9 @@ export function loadPerkinsPolicy(file = PERKINS_POLICY_FILE): PerkinsPolicy {
   if (typeof policy.portableContract.leadWorkflow !== 'string' || !policy.portableContract.leadWorkflow.includes('perkins_submit_review')) {
     throw new Error(`bundled ${PERKINS_POLICY_ID} resource is missing the whole-PR lead workflow`);
   }
+  if (!policy.portableContract.leadWorkflow.includes('perkins_submit_property_contracts')) {
+    throw new Error(`bundled ${PERKINS_POLICY_ID} lead workflow is missing the property-contract proposal tool guidance`);
+  }
   const outputContracts = policy.portableContract.outputContracts;
   for (const key of ['text', 'blindText', 'nativeTool', 'blindNativeTool'] as const) {
     if (typeof outputContracts?.[key] !== 'string' || outputContracts[key].trim() === '') {

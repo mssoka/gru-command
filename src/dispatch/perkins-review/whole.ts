@@ -8,7 +8,7 @@ import type { PacingGate, PacingLease, PacingEventRecorder, RateLimitBackoffPoli
 import { withRateLimitRetries, type RateLimitRetryOptions } from '../../runtime/rate-limit-retry.js';
 import { assertFrozenPromptBounds, compatibleReviewIdentity, repositoryGitEnv, proveRecoveredBaseMergeability, publishedReportMatches, readReviewArtifact, readReviewCheckpoint, sourceMovementSinceFreeze, SPECIALIST_CHECKPOINT_MAX_BYTES, writeReviewArtifact, type FrozenReview, type SourceMovement, type SourceMovementOptions } from './artifacts.js';
 import { applyConvergenceDeferral, classifyPriorFindings, convergedVerdict, deltaSince, type DeltaSince, type PriorCarryClassification } from './convergence.js';
-import { MAX_PROPERTY_PROPOSALS_PER_SUBMISSION, parsePropertyContractsSubmission, PROPERTY_CONTRACTS_TOOL_NAME, recordPropertyProposals, renderPropertyContractsGuidance } from './property-contracts.js';
+import { MAX_PROPERTY_PROPOSALS_PER_ROUND, MAX_PROPERTY_PROPOSALS_PER_SUBMISSION, parsePropertyContractsSubmission, PROPERTY_CONTRACTS_INPUT_SCHEMA, PROPERTY_CONTRACTS_TOOL_NAME, recordPropertyProposals, renderPropertyContractsGuidance } from './property-contracts.js';
 import { readFrozenEvidenceBytes, renderEvidencePromptSection } from '../../review-inputs/evidence.js';
 import { finalAssistantText } from './session-output.js';
 import { PERKINS_FINDING_SOURCES, PERKINS_LENSES, type PerkinsFindingSource, type PerkinsLens, type PerkinsPolicy } from './policy.js';
@@ -1144,6 +1144,7 @@ export class PerkinsWholeReview {
     const envelopes: LensEnvelope[] = [];
     const leadArtifacts = new Set<string>();
     const recordedPropertyProposals: ReturnType<typeof recordPropertyProposals>[] = [];
+    let propertySubmissionsClosed = false;
     const agentIds = new Set<string>();
     const sessionFiles = new Set<string>();
     const failureLog = new Map<string, SpecialistAttemptFailure[]>();
@@ -1983,45 +1984,19 @@ export class PerkinsWholeReview {
 
     const propertyContractsTool: NativeAgentTool = {
       name: PROPERTY_CONTRACTS_TOOL_NAME,
-      description: 'Submit requirement-grounded property-contract proposals (at most ' + String(MAX_PROPERTY_PROPOSALS_PER_SUBMISSION) + ' per call) for findings with a trustworthy executable oracle. UNTRUSTED INPUT: the host validates and records proposals; they are never evidence that tests ran and never authorize merge, execution or dependency installation. Host execution receipts are a separate host-owned artifact.',
-      inputSchema: {
-        type: 'object', additionalProperties: false, required: ['proposals'],
-        properties: {
-          proposals: {
-            type: 'array', minItems: 1, maxItems: MAX_PROPERTY_PROPOSALS_PER_SUBMISSION,
-            items: {
-              type: 'object', additionalProperties: false,
-              required: ['requirementRef', 'invariant', 'inputDomain', 'invalidInputBehavior', 'targetPackageDir', 'adapterId', 'testArtifactRefs', 'establishes', 'doesNotEstablish'],
-              properties: {
-                requirementRef: { type: 'string', minLength: 1, maxLength: 200 },
-                invariant: { type: 'string', minLength: 1, maxLength: 2000 },
-                inputDomain: { type: 'string', minLength: 1, maxLength: 2000 },
-                invalidInputBehavior: { type: 'string', minLength: 1, maxLength: 2000 },
-                targetPackageDir: { type: 'string', minLength: 1, maxLength: 500 },
-                adapterId: { type: 'string', minLength: 1, maxLength: 80 },
-                testArtifactRefs: {
-                  type: 'array', minItems: 1, maxItems: 32,
-                  items: {
-                    type: 'object', additionalProperties: false, required: ['path', 'sha256'],
-                    properties: {
-                      path: { type: 'string', minLength: 1, maxLength: 500 },
-                      sha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
-                    },
-                  },
-                },
-                establishes: { type: 'string', minLength: 1, maxLength: 2000 },
-                doesNotEstablish: { type: 'string', minLength: 1, maxLength: 2000 },
-              },
-            },
-          },
-        },
-      },
+      description: `Submit requirement-grounded property-contract proposals (at most ${MAX_PROPERTY_PROPOSALS_PER_SUBMISSION} per call, ${MAX_PROPERTY_PROPOSALS_PER_ROUND} per round) for findings with a trustworthy executable oracle. UNTRUSTED INPUT: the host validates and records proposals; they are never evidence that tests ran and never authorize merge, execution or dependency installation. Host execution receipts are a separate host-owned artifact.`,
+      inputSchema: PROPERTY_CONTRACTS_INPUT_SCHEMA,
       execute: async (raw, signal) => {
         if (input.signal?.aborted === true || signal?.aborted === true) throw new Error('review operation aborted');
+        if (propertySubmissionsClosed || accepted !== null) throw new Error('Perkins property-contract submissions are closed for this round');
         const proposals = parsePropertyContractsSubmission(raw);
+        const count = recordedPropertyProposals.reduce((total, entry) => total + entry.count, 0);
+        if (count + proposals.length > MAX_PROPERTY_PROPOSALS_PER_ROUND) {
+          throw new Error(`Perkins property-contract round budget is ${MAX_PROPERTY_PROPOSALS_PER_ROUND} proposals`);
+        }
         const recorded = recordPropertyProposals(proposals);
+        const file = writeReviewArtifact(review, `property/proposals-${recordedPropertyProposals.length + 1}.json`, recorded);
         recordedPropertyProposals.push(recorded);
-        const file = writeReviewArtifact(review, `property/proposals-${recordedPropertyProposals.length}.json`, recorded);
         return {
           text: JSON.stringify({ recorded: recorded.count, trust: recorded.trust, artifact: file }),
           details: { recorded: recorded.count, trust: recorded.trust, file, evidenceClass: 'untrusted-reviewer-input' },
@@ -2617,6 +2592,7 @@ export class PerkinsWholeReview {
       });
       return accepted;
     } finally {
+      propertySubmissionsClosed = true;
       try {
         unsubscribe();
         await disposeLead();

@@ -1,5 +1,5 @@
 import type { PropertyProposal } from '../../property/types.js';
-import { parsePropertyProposal, PropertyProposalValidationError } from '../../property/proposal.js';
+import { parsePropertyProposal, PROPERTY_PROPOSAL_LIMITS, PropertyProposalValidationError } from '../../property/proposal.js';
 
 /**
  * GH350 Perkins production wiring (issue §3): a structured, requirement-
@@ -17,6 +17,42 @@ import { parsePropertyProposal, PropertyProposalValidationError } from '../../pr
 
 export const PROPERTY_CONTRACTS_TOOL_NAME = 'perkins_submit_property_contracts';
 export const MAX_PROPERTY_PROPOSALS_PER_SUBMISSION = 8;
+export const MAX_PROPERTY_PROPOSALS_PER_ROUND = 32;
+
+/** Provider-facing hints share the validator's ceilings; runtime parsing
+ * additionally enforces UTF-8 bytes, exact keys and safe paths. */
+export const PROPERTY_CONTRACTS_INPUT_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['proposals'],
+  properties: {
+    proposals: {
+      type: 'array', minItems: 1, maxItems: MAX_PROPERTY_PROPOSALS_PER_SUBMISSION,
+      items: {
+        type: 'object', additionalProperties: false,
+        required: ['requirementRef', 'invariant', 'inputDomain', 'invalidInputBehavior', 'targetPackageDir', 'adapterId', 'testArtifactRefs', 'establishes', 'doesNotEstablish'],
+        properties: {
+          requirementRef: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.requirementRef },
+          invariant: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.invariant },
+          inputDomain: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.inputDomain },
+          invalidInputBehavior: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.invalidInputBehavior },
+          targetPackageDir: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.targetPackageDir },
+          adapterId: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.adapterId },
+          testArtifactRefs: {
+            type: 'array', minItems: 1, maxItems: PROPERTY_PROPOSAL_LIMITS.maxArtifactRefs,
+            items: {
+              type: 'object', additionalProperties: false, required: ['path', 'sha256'],
+              properties: {
+                path: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.artifactPath },
+                sha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+              },
+            },
+          },
+          establishes: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.establishes },
+          doesNotEstablish: { type: 'string', minLength: 1, maxLength: PROPERTY_PROPOSAL_LIMITS.doesNotEstablish },
+        },
+      },
+    },
+  },
+};
 
 /** Bounded lead-facing guidance rendered into the review prompt. */
 export function renderPropertyContractsGuidance(): string {
@@ -73,10 +109,14 @@ export interface RecordedPropertyProposals {
 }
 
 export function recordPropertyProposals(proposals: readonly PropertyProposal[]): RecordedPropertyProposals {
-  return {
+  const snapshot = Object.freeze(parsePropertyContractsSubmission({ proposals }).map((proposal) => Object.freeze({
+    ...proposal,
+    testArtifactRefs: Object.freeze(proposal.testArtifactRefs.map((ref) => Object.freeze({ ...ref }))),
+  })));
+  return Object.freeze({
     schemaVersion: 1,
     trust: 'untrusted-reviewer-input',
-    count: proposals.length,
-    proposals,
-  };
+    count: snapshot.length,
+    proposals: snapshot,
+  });
 }

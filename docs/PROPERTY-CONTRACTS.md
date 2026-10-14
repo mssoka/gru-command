@@ -7,6 +7,17 @@ receipts. Property contracts COMPLEMENT structured findings, explanations,
 existing tests, independent review and readiness checks — they never
 independently authorize merging, publication or deployment.
 
+## Implementation status on the GH350 work branch
+
+Capability resolution, proposal validation/recording and qualification helpers
+are implemented. Executor integration, real-tool/security qualification,
+repair/regression/CI wiring and final whole-change gates are still in progress;
+the contracts described below are not a claim that those gates have passed.
+The lead's `perkins_submit_property_contracts` tool records immutable,
+untrusted-input snapshots (8 proposals per call, 32 per round). It refuses
+late submissions after the terminal review and counts only persisted artifacts.
+Recording never executes a proposal or substitutes for host receipt evidence.
+
 ## Duties: host vs adapter vs reviewer
 
 - **Adapters** (`src/property/types.ts` `PropertyAdapter`) describe how a

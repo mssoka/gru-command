@@ -41,6 +41,10 @@ export interface HeavyTestEntry {
 
 export const HEAVY_TESTS: readonly HeavyTestEntry[] = Object.freeze([
   {
+    file: 'property-perkins-integration.test.ts',
+    workload: 'production whole-review lead tools over real frozen Git repositories and durable artifacts',
+  },
+  {
     file: 'property-replay.test.ts',
     workload: 'replays retained counterexamples through real spawned runner processes',
   },
