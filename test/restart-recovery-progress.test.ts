@@ -154,6 +154,61 @@ function originalDeliveryPayload(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe('restart-recovery-progress — exact native request matrix', () => {
+  it('PR334 isolation ordinary same-owner inputs cannot enter the live exact native directive', async () => {
+    const f = await fixture(); f.seed(); f.native.autoFinish = false;
+    const entered = deferred<void>(); const originalContinue = f.native.agent.continue.bind(f.native.agent);
+    vi.spyOn(f.native.agent, 'continue').mockImplementation(async () => { const pending = originalContinue(); entered.resolve(); await pending; });
+    const steer = vi.spyOn(f.native, 'steer').mockImplementation(async () => { f.native.append({ role: 'user', content: [{ type: 'text', text: 'unbound ordinary steering' }] }); });
+    const followUp = vi.spyOn(f.native, 'followUp').mockImplementation(async () => { f.native.append({ role: 'user', content: [{ type: 'text', text: 'unbound ordinary follow-up' }] }); });
+    const service = new DirectiveProgressService(f.deps);
+    try {
+      service.reconsider();
+      await Promise.race([entered.promise, service.settled().then(() => { throw new Error('original directive did not enter its genuine live continuation'); })]);
+      const handle = f.registry.getHandle('logical-minion')!;
+      let queued = 0; handle.subscribe((event) => { if (event.type === 'queued') queued += 1; });
+      const snapshot = readFileSync(f.file, 'utf8');
+      const outcomes = await Promise.all([
+        handle.steer('unbound ordinary steering', { owner: `directive-recovery:${f.intent.requestId}` }),
+        handle.followUp('unbound ordinary follow-up', { owner: `directive-recovery:${f.intent.requestId}` }),
+      ].map((pending) => pending.then(() => false, (error: unknown) => error instanceof Error && /live exact directive/.test(error.message))));
+      expect(steer).not.toHaveBeenCalled(); expect(followUp).not.toHaveBeenCalled();
+      expect(outcomes).toEqual([true, true]); expect(queued).toBe(0);
+      expect(readFileSync(f.file, 'utf8')).toBe(snapshot);
+      f.native.finish(); await service.settled();
+      expect(f.native.continuations).toBe(1); expect(f.spawns).toHaveLength(1); expect(f.native.prompts).toEqual([]);
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+      expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toHaveLength(1);
+    } finally { if (!f.native.isIdle) f.native.finish(); await service.settled(); await service.dispose(); }
+  });
+
+  it('PR334 isolation retained fail-once SDK cleanup retries the exact handle without replay', async () => {
+    const f = await fixture(); f.seed();
+    const originalDispose = f.native.dispose.bind(f.native);
+    const disposal = vi.spyOn(f.native, 'dispose').mockImplementation(originalDispose).mockRejectedValueOnce(new Error('original SDK cleanup transient failure'));
+    const service = new DirectiveProgressService(f.deps);
+    try {
+      service.reconsider(); await service.settled();
+      const handle = f.registry.getHandle('logical-minion')!;
+      const started = f.ledger.directiveProducerStart(f.identity);
+      expect(disposal).toHaveBeenCalledTimes(1); expect(handle.cessationEvidence?.()).toBe('unknown');
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+      expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id).join(';')).toContain('unproven producer cleanup');
+      const nativeBytes = readFileSync(f.file, 'utf8');
+      service.reconsider(); await service.settled();
+      expect(disposal).toHaveBeenCalledTimes(2); expect(handle.cessationEvidence?.()).toBe('ceased');
+      const cessation = f.ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-ceased', f.intent.requestId);
+      expect(cessation?.payload).toMatchObject({ producer_start_seq: started, producer_identity: f.identity, agent_id: handle.id, session_file: f.file });
+      service.reconsider(); await service.settled(); service.reconsider(); await service.settled();
+      expect(disposal).toHaveBeenCalledTimes(2); expect(f.native.continuations).toBe(1); expect(f.spawns).toHaveLength(1); expect(f.native.prompts).toEqual([]);
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+      const delivered = f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered']);
+      expect(delivered).toHaveLength(1); expect(delivered[0]!.seq).toBeGreaterThan(cessation!.seq);
+      expect(readFileSync(f.file, 'utf8')).toBe(nativeBytes);
+      expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-producer-unknown'])).toHaveLength(1);
+    } finally { await service.dispose(); disposal.mockRestore(); }
+  });
+
   it('PR334 cessation older ceased incarnations do not misidentify the exact latest absent host lock', async () => {
     const f = await fixture(); f.ledger.registerWorktree(f.lane); f.seed();
     const first = inspectDirectiveProducers(f.file, f.identity)[0]!.producer;
@@ -1299,8 +1354,10 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.ledger.getJob(f.intent.jobId)).toMatchObject({ prUrl: 'https://example.test/pull/286' });
     expect(f.worktrees.listWorktrees({ jobId: f.intent.jobId })[0]).toMatchObject({ id: f.lane.id, branch: f.lane.branch, path: f.lane.path });
     expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
-    new DirectiveProgressService(f.deps).reconsider();
-    expect(f.native.continuations).toBe(1);
+    await service.dispose();
+    const restarted = new DirectiveProgressService(f.deps);
+    try { restarted.reconsider(); await restarted.settled(); expect(f.native.continuations).toBe(1); }
+    finally { await restarted.dispose(); }
   });
 
   it('new rebriefs use the same exact checkpoint protocol and correlated completion', async () => {
@@ -1437,11 +1494,17 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     expect(f.native.continuations).toBe(1); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
     expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
     expect(f.ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id).join(';')).toContain('unproven producer cleanup');
-    new DirectiveProgressService(f.deps).reconsider(); await service.settled();
-    expect(f.native.continuations).toBe(1);
-    f.native.isBashRunning = false; service.reconsider(); await service.settled();
-    expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); expect(f.native.continuations).toBe(1);
-    expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-ceased')).not.toBeNull();
+    await service.dispose();
+    const restarted = new DirectiveProgressService(f.deps);
+    try {
+      restarted.reconsider(); await restarted.settled();
+      expect(f.native.continuations).toBe(1);
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+      f.native.isBashRunning = false; restarted.reconsider(); await restarted.settled();
+      expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled'); expect(f.native.continuations).toBe(1);
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'silas.directive-producer-ceased')).not.toBeNull();
+    } finally { await restarted.dispose(); }
   });
 
   async function assertCleanupPublicationRetry(kind: 'unknown' | 'ceased', afterDurability: boolean): Promise<void> {

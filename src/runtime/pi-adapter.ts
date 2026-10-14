@@ -1360,6 +1360,7 @@ export class PiAgentHandle implements AgentHandle {
     }
     const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null && owner === this.liveOwner && options.directive === undefined) {
+      if (this.liveDirective !== undefined) throw new DirectiveCheckpointError('ordinary steering must wait for the live exact directive to settle; submit a separate turn afterward');
       await this.session.steer(text, mapImages(options.images));
       return;
     }
@@ -1377,6 +1378,7 @@ export class PiAgentHandle implements AgentHandle {
     }
     const owner = options.owner ?? this.principal;
     if (this.liveTurn !== null && owner === this.liveOwner && options.directive === undefined) {
+      if (this.liveDirective !== undefined) throw new DirectiveCheckpointError('ordinary follow-up must wait for the live exact directive to settle; submit a separate turn afterward');
       await this.session.followUp(text, mapImages(options.images));
       return;
     }

@@ -38,6 +38,7 @@ interface CleanupOwner {
   readonly unknownRequired: boolean;
   baselineSeq: number | null;
   unknownSeq: number | null;
+  retry: Promise<void> | null;
 }
 const cleanupIncarnations = new WeakMap<AgentHandle, string>();
 const unknownCleanup = new WeakMap<LedgerApi, Map<string, CleanupOwner>>();
@@ -56,7 +57,7 @@ function recordCleanup(deps: DirectiveProgressDeps, identity: DirectiveTurnIdent
   let owner = owned.get(key);
   if (owner === undefined) {
     if (ceased && producerStartSeq === undefined) return;
-    owner = { identity, handle, producerStartSeq, unknownRequired: !ceased, baselineSeq: null, unknownSeq: null };
+    owner = { identity, handle, producerStartSeq, unknownRequired: !ceased, baselineSeq: null, unknownSeq: null, retry: null };
     // Keep the real retry handle BEFORE storage/publication can fail.
     owned.set(key, owner);
   }
@@ -78,6 +79,20 @@ function recordCleanup(deps: DirectiveProgressDeps, identity: DirectiveTurnIdent
   if (!ceased) return;
   publish('silas.directive-producer-ceased', owner.unknownSeq ?? owner.baselineSeq);
   owned.delete(key); // only after genuine cessation AND committed publication
+}
+
+/** Retry only the retained exact physical handle. Coalesce across services;
+ * disposal fulfillment still grants no cessation or work permission. */
+function retryCleanup(deps: DirectiveProgressDeps, owner: CleanupOwner): Promise<void> {
+  if (owner.retry !== null) return owner.retry;
+  owner.retry = Promise.resolve().then(async () => {
+    const failures: unknown[] = [];
+    try { await deps.registry.disposeHandle(owner.handle); } catch (error) { failures.push(error); }
+    try { recordCleanup(deps, owner.identity, owner.handle, owner.producerStartSeq); } catch (error) { failures.push(error); }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, `retained native cleanup retry failed: ${failures.map(String).join('; ')}`);
+  }).finally(() => { owner.retry = null; });
+  return owner.retry;
 }
 
 function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity, handle?: AgentHandle, producerStartSeq?: number, producer?: DirectiveProducer, historicalReceipt = false): void {
@@ -374,7 +389,17 @@ export class DirectiveProgressService {
 
   reconsider(limit = 100): void {
     if (this.disposed || this.deps.signal.aborted) return;
-    for (const { identity, handle, producerStartSeq } of unknownCleanup.get(this.deps.ledger)?.values() ?? []) recordCleanup(this.deps, identity, handle, producerStartSeq);
+    const retained = unknownCleanup.get(this.deps.ledger);
+    for (const [key, owner] of retained ?? []) {
+      recordCleanup(this.deps, owner.identity, owner.handle, owner.producerStartSeq);
+      if (retained?.get(key) !== owner || this.active.has(owner.identity.requestId)) continue;
+      const { identity } = owner;
+      const release = this.deps.ledger.beginJobAdmission(identity.jobId, `directive cleanup ${identity.requestId}`);
+      const run = retryCleanup(this.deps, owner).catch((error: unknown) => {
+        if (!this.deps.signal.aborted) surfaceDirectiveRecovery(this.deps, identity.requestId, String(error));
+      }).finally(() => { release(); this.active.delete(identity.requestId); });
+      this.active.set(identity.requestId, run);
+    }
     const scope = 'directive-native-progress';
     let cursor = this.deps.ledger.readReconcileCursor(scope) ?? 0;
     const rows = this.deps.ledger.listPendingDirectives({ states: LIVE_DIRECTIVE_STATES, rowidCursor: cursor, limit });
