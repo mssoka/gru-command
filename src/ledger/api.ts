@@ -17,7 +17,7 @@ import type { Role } from '../config.js';
 import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import type { AgentState } from '../runtime/types.js';
 import { isDeepStrictEqual } from 'node:util';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, validateDirectiveIdentity, type DirectiveNativeBinding, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import {
   assertAdminCloseoutTransition,
   assertJobTransition,
@@ -5733,7 +5733,7 @@ export class LedgerApi {
     const physical = inspectDirectiveProducers(original!.nativeTarget!.sessionFile, origin.identity);
     if ((originalCompletion?.head ?? null) !== origin.sha || !(originalProof.state === 'terminal' && originalProof.ok && isDeepStrictEqual(originalProof.binding, original!.nativeBinding)) ||
         !physical.some(({ producer }) => isDeepStrictEqual(producer.identity, origin.identity) && producer.agentId === original!.nativeBinding!.agentId && producer.sessionId === original!.nativeBinding!.sessionId) ||
-        physical.some(({ evidence, producer }) => evidence === 'unknown' || directiveProducerLockBlocker(producer) !== null)) refuse('original proof or physical ownership remains UNKNOWN');
+        physical.some(({ evidence }) => evidence === 'unknown') || directiveSessionLockBlocker(original!.nativeTarget!.sessionFile) !== null) refuse('original proof or physical ownership remains UNKNOWN');
     const candidate = this.latestCandidateDelivery(row.jobId);
     const facts = candidate?.payload as { sha?: unknown; work_revision?: unknown; candidate_delivery_proven?: unknown; native_completion?: { identity?: DirectiveTurnIdentity; binding?: unknown } } | undefined;
     const identity = facts?.native_completion?.identity;
@@ -5757,7 +5757,7 @@ export class LedgerApi {
     const currentCompletion = currentProof.state === 'terminal' && currentProof.ok ? readDirectiveCompletion(current!.nativeTarget!.sessionFile, identity!, currentProof.checkpointId) : null;
     if (currentCompletion?.head !== facts!.sha || !(currentProof.state === 'terminal' && isDeepStrictEqual(currentProof.binding, current!.nativeBinding))) refuse('current candidate original completion is unproven');
     const currentPhysical = inspectDirectiveProducers(current!.nativeTarget!.sessionFile, identity!);
-    if (currentPhysical.length === 0 || currentPhysical.some(({ evidence, producer }) => evidence !== 'ceased' || directiveProducerLockBlocker(producer) !== null)) refuse('current candidate physical ownership remains UNKNOWN');
+    if (currentPhysical.length === 0 || currentPhysical.some(({ evidence }) => evidence !== 'ceased') || directiveSessionLockBlocker(current!.nativeTarget!.sessionFile) !== null) refuse('current candidate physical ownership remains UNKNOWN');
     const lanes = this.listWorktrees({ jobId: row.jobId }).filter((lane) => lane.kind === 'job' && lane.status !== 'swept');
     if (lanes.length !== 1) refuse('requires exact current candidate lane');
     const lane = lanes[0]!;
@@ -8393,7 +8393,7 @@ export class LedgerApi {
       const owners = physical.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
       if (owners.length === 0 || owners.some(({ producer }) => producer.agentId !== proof.binding.agentId || producer.sessionId !== proof.binding.sessionId) ||
           completion !== null && !owners.some(({ producer }) => isDeepStrictEqual(producer, completion.producer)) ||
-          physical.some(({ evidence, producer }) => evidence === 'unknown' || directiveProducerLockBlocker(producer) !== null)) throw new DirectiveCheckpointError('historical completion original physical receipt is unbound or UNKNOWN');
+          physical.some(({ evidence }) => evidence === 'unknown') || directiveSessionLockBlocker(row.nativeTarget.sessionFile) !== null) throw new DirectiveCheckpointError('historical completion original physical receipt is unbound or UNKNOWN');
       for (const { producer } of physical) {
         const association = readDirectiveBinding(row.nativeTarget.sessionFile, producer.identity.requestId);
         const checkpoint = inspectDirectiveCheckpoint(row.nativeTarget.sessionFile, producer.identity);
@@ -8481,7 +8481,7 @@ export class LedgerApi {
     const physical = inspectDirectiveProducers(binding.sessionFile);
     const owners = physical.filter(({ producer }) => isDeepStrictEqual(producer.identity, identity));
     if (owners.length === 0 || owners.some(({ producer }) => producer.agentId !== binding.agentId || producer.sessionId !== binding.sessionId) ||
-        physical.some(({ evidence, producer }) => evidence === 'unknown' || directiveProducerLockBlocker(producer) !== null)) {
+        physical.some(({ evidence }) => evidence === 'unknown') || directiveSessionLockBlocker(binding.sessionFile) !== null) {
       throw new DirectiveCheckpointError('current directive delivery retains UNKNOWN native physical ownership');
     }
     const completion = readDirectiveCompletion(binding.sessionFile, identity, proof.checkpointId);

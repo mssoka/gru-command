@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import type { LedgerApi } from '../ledger/api.js';
 import { LIVE_DIRECTIVE_STATES, isDirectiveTerminal } from '../ledger/directives.js';
 import { isJobTerminal } from '../ledger/states.js';
-import { DirectiveCheckpointError, directiveProducerLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
+import { DirectiveCheckpointError, directiveProducerLockBlocker, directiveSessionLockBlocker, inspectDirectiveAdmission, inspectDirectiveCheckpoint, inspectDirectiveProducers, readDirectiveBinding, readDirectiveCompletion, readDirectiveSessionHeader, type DirectiveCheckpoint, type DirectiveProducer, type DirectiveTurnIdentity } from '../runtime/directive-checkpoint.js';
 import type { AgentHandle, NativeAgentTool } from '../runtime/types.js';
 import type { PacingGate, PacingLease, RetrySettlement } from '../runtime/pacing.js';
 import { DirectiveDispatchDeferredError, flipJobToWorking, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion, type DirectiveRegistry } from './fix-directive.js';
@@ -232,7 +232,10 @@ function reconcileNativeProducer(deps: DirectiveProgressDeps, identity: Directiv
   if (start === null) return;
   const ceased = deps.ledger.latestJobEventByRequestId(identity.jobId, 'silas.directive-producer-ceased', identity.requestId);
   if ((ceased?.payload as { producer_start_seq?: unknown } | undefined)?.producer_start_seq === start.seq) return;
-  checkAdmissionFences(deps, identity, undefined, start.seq, undefined, true);
+  // Record this positively proven physical cessation before admission checks:
+  // its own durable UNKNOWN cleanup is precisely the debt being reconciled.
+  // This is no work permission; callers retain all independent fences before
+  // publishing delivery, consuming a checkpoint or starting another producer.
   deps.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: identity.jobId, payload: {
     request_id: identity.requestId, agent_id: owner.producer.agentId, session_file: owner.producer.sessionFile,
     producer_start_seq: start.seq, producer_identity: identity, native_producer: owner.producer, evidence: owner.evidence,
@@ -246,7 +249,7 @@ function assertCompletedNativeOwnership(file: string, identity: DirectiveTurnIde
   const owners = inspectDirectiveProducers(file, identity);
   const sessionOwners = inspectDirectiveProducers(file);
   if (!proof.ok || owners.length === 0 || owners.some(({ producer }) => producer.agentId !== proof.binding.agentId || producer.sessionId !== proof.binding.sessionId) ||
-      sessionOwners.length === 0 || sessionOwners.some(({ evidence, producer }) => evidence === 'unknown' || directiveProducerLockBlocker(producer) !== null)) {
+      sessionOwners.length === 0 || sessionOwners.some(({ evidence }) => evidence === 'unknown') || directiveSessionLockBlocker(file) !== null) {
     throw new DirectiveCheckpointError('correlated delivery retains UNKNOWN native physical ownership');
   }
 }

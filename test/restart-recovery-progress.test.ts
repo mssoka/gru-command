@@ -154,6 +154,100 @@ function originalDeliveryPayload(f: Awaited<ReturnType<typeof fixture>>) {
 }
 
 describe('restart-recovery-progress — exact native request matrix', () => {
+  it('PR334 cessation older ceased incarnations do not misidentify the exact latest absent host lock', async () => {
+    const f = await fixture(); f.ledger.registerWorktree(f.lane); f.seed();
+    const first = inspectDirectiveProducers(f.file, f.identity)[0]!.producer;
+    const firstStart = f.ledger.startDirectiveProducer(f.identity, first);
+    f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-ceased', jobId: f.intent.jobId, payload: {
+      request_id: f.intent.requestId, agent_id: first.agentId, session_file: f.file,
+      producer_start_seq: firstStart, producer_identity: f.identity, native_producer: first,
+    } });
+    const code = `
+      import { readFileSync, appendFileSync } from 'node:fs';
+      import { LedgerDb } from ${JSON.stringify(`${process.cwd()}/dist/ledger/db.js`)};
+      import { LedgerApi } from ${JSON.stringify(`${process.cwd()}/dist/ledger/api.js`)};
+      import { SessionStore } from ${JSON.stringify(`${process.cwd()}/dist/sessions/store.js`)};
+      import { prepareDirectiveProducer, recordDirectiveCompletion } from ${JSON.stringify(`${process.cwd()}/dist/runtime/directive-checkpoint.js`)};
+      const db = new LedgerDb(${JSON.stringify(f.dir)}); const ledger = new LedgerApi(db.handle);
+      const file = ${JSON.stringify(f.file)}; const store = new SessionStore(${JSON.stringify(f.dir)});
+      store.acquireLock(file);
+      const producer = prepareDirectiveProducer({ identity: ${JSON.stringify(f.identity)}, agentId: 'logical-minion',
+        sessionId: 'native-session', sessionFile: file, lockOwner: store.ownedLockIdentity(file) });
+      ledger.startDirectiveProducer(producer.identity, producer);
+      const rows = readFileSync(file, 'utf8').trim().split('\\n').map((line) => JSON.parse(line));
+      const checkpoint = 'pr334-second-host-terminal';
+      appendFileSync(file, JSON.stringify({ type: 'message', id: checkpoint, parentId: rows.at(-1).id,
+        message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'original second physical host genuinely finished' }] } }) + '\\n');
+      recordDirectiveCompletion(producer, checkpoint, ${JSON.stringify(resolveGitCommit(f.lane.path, 'HEAD'))});
+      db.close(); process.exit(0); // genuine host exit, leaving its original exact lock and no invented cessation
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', code], { cwd: process.cwd(), timeout: 30_000, killSignal: 'SIGKILL', stdio: 'pipe' });
+    const physical = inspectDirectiveProducers(f.file, f.identity);
+    expect(physical.map(({ evidence }) => evidence)).toEqual(['ceased', 'host-absent']);
+    const latest = physical.at(-1)!.producer; expect(latest.pid).not.toBe(process.pid);
+    const lockPath = `${f.file}.lock`; const exactLock = readFileSync(lockPath, 'utf8');
+    const lock = JSON.parse(exactLock) as { host: string; pid: number; bootId: string };
+    expect(latest.lockOwner).toEqual({ host: lock.host, pid: lock.pid, bootId: lock.bootId });
+    writeFileSync(lockPath, JSON.stringify({ ...lock, pid: process.pid }));
+    try {
+      expect(() => settleNativeDirective(f.deps, f.identity)).toThrow(/native lock owner/);
+      expect(f.ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+    } finally { writeFileSync(lockPath, exactLock); }
+    const nativeBytes = readFileSync(f.file, 'utf8'); const journal = readFileSync(`${f.file}.producers.jsonl`, 'utf8');
+    let completed = false;
+    expect(() => { completed = settleNativeDirective(f.deps, f.identity); }).not.toThrow();
+    expect(completed).toBe(true); expect(f.ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+    expect(f.ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toHaveLength(1);
+    expect(readFileSync(f.file, 'utf8')).toBe(nativeBytes); expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(journal);
+    expect(readFileSync(lockPath, 'utf8')).toBe(exactLock);
+    expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0); expect(f.native.prompts).toEqual([]);
+  });
+
+  it('PR334 cessation a fresh ledger reconciles only its own exact proven UNKNOWN cleanup before settlement', async () => {
+    for (const independentUnknown of [false, true]) {
+      const f = await fixture(); f.ledger.registerWorktree(f.lane);
+      f.ledger.prepareDirectiveTarget(f.intent.requestId, { agentId: 'logical-minion', sessionFile: f.file });
+      prepareDirectiveBinding({ identity: f.identity, runtime: 'pi', agentId: 'logical-minion', sessionId: f.native.sessionId,
+        sessionFile: f.file, text: 'original admitted native turn', authorityManifest: 'original authority' });
+      f.native.append({ role: 'user', content: [{ type: 'text', text: 'original admitted native turn' }] });
+      const producer = prepareDirectiveProducer({ identity: f.identity, agentId: 'logical-minion', sessionId: f.native.sessionId, sessionFile: f.file });
+      const start = f.ledger.startDirectiveProducer(f.identity, producer);
+      f.ledger.bindDirectiveNativeAdmission(inspectDirectiveAdmission(f.file, f.identity));
+      f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: f.intent.jobId, payload: {
+        request_id: f.intent.requestId, agent_id: producer.agentId, session_file: f.file,
+        producer_start_seq: start, producer_identity: f.identity, native_producer: producer,
+      } });
+      f.native.finish();
+      const proof = inspectDirectiveCheckpoint(f.file, f.identity);
+      if (proof.state !== 'terminal' || !proof.ok) throw new Error('fixture must have genuine original successful native terminal');
+      recordDirectiveCompletion(producer, proof.checkpointId, resolveGitCommit(f.lane.path, 'HEAD'));
+      recordDirectiveProducerCessation(producer);
+      if (independentUnknown) f.ledger.appendCustomEvent({ kind: 'silas.directive-producer-unknown', jobId: f.intent.jobId,
+        payload: { request_id: 'independent-original-request', agent_id: 'independent-original-minion', session_file: null } });
+      const nativeBytes = readFileSync(f.file, 'utf8'); const journal = readFileSync(`${f.file}.producers.jsonl`, 'utf8');
+      f.db.close();
+      const db = new LedgerDb(f.dir); const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+      try {
+        const deps = { ...f.deps, ledger, notifications: new NotificationCenter({ ledger, bus }) };
+        if (independentUnknown) expect(() => settleNativeDirective(deps, f.identity)).toThrow(/producer fences/);
+        else {
+          let completed = false; expect(() => { completed = settleNativeDirective(deps, f.identity); }).not.toThrow();
+          expect(completed).toBe(true); expect(ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
+          expect(ledger.listJobEventsByKinds(f.intent.jobId, ['job.delivered'])).toHaveLength(1);
+        }
+        expect(ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-ceased', f.intent.requestId)?.payload)
+          .toMatchObject({ producer_start_seq: start, producer_identity: f.identity, native_producer: producer });
+        if (independentUnknown) {
+          expect(ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
+          expect(ledger.latestJobEvent(f.intent.jobId, 'job.delivered')).toBeNull();
+          expect(ledger.directiveProgressBlockers(f.intent.requestId, f.lane.id).join(';')).toContain('independent-original-minion');
+        }
+        expect(f.spawns).toEqual([]); expect(f.native.continuations).toBe(0); expect(f.native.prompts).toEqual([]);
+        expect(readFileSync(f.file, 'utf8')).toBe(nativeBytes); expect(readFileSync(`${f.file}.producers.jsonl`, 'utf8')).toBe(journal);
+      } finally { db.close(); }
+    }
+  });
+
   it('PR334 receipt structurally exact reordered cessation identity consumes only its original physical start', async () => {
     const f = await fixture(); f.seed();
     expect(f.ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(true);
@@ -1498,8 +1592,19 @@ describe('restart-recovery-progress — exact native request matrix', () => {
       try {
         resumed.reconsider(); await resumed.settled();
         const landed = ledger.latestJobEvent(f.intent.jobId, 'job.delivered');
-        if (!ceasedBeforeRestart || failedCessationPublication) {
-          expect(landed, 'unpublished UNKNOWN cleanup must survive a fresh LedgerApi without a handle').toBeNull();
+        const repairedCessation = ceasedBeforeRestart && failedCessationPublication
+          ? ledger.latestJobEventByRequestId(f.intent.jobId, 'silas.directive-producer-ceased', f.intent.requestId) : null;
+        if (ceasedBeforeRestart && failedCessationPublication) {
+          // The original publication failure stays loud above. A fresh API
+          // may repair only this exact positively ceased native incarnation,
+          // durably, before any delivery; missing evidence still proves nothing.
+          expect(repairedCessation).not.toBeNull();
+          expect(repairedCessation!.payload).toMatchObject(cleanupHistory[0]!.payload as Record<string, unknown>);
+          expect(repairedCessation!.seq).toBeGreaterThan(cleanupHistory[0]!.seq);
+          expect((repairedCessation!.payload as { evidence: string }).evidence).toBe('ceased');
+        }
+        if (!ceasedBeforeRestart) {
+          expect(landed, 'UNKNOWN native ownership must survive a fresh LedgerApi without a handle').toBeNull();
           expect(ledger.getDirective(f.intent.requestId)?.state).toBe('admitted');
           expect(originalHandles[0]!.cessationEvidence!()).toBe(ceasedBeforeRestart ? 'ceased' : 'unknown');
           expect(ledger.getObligation(debt.id)).toMatchObject({ generation: debt.generation, state: 'open', nextAction: { kind: 'gru-decision' } });
@@ -1507,7 +1612,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
             .toContain(`generation ${debt.generation}`);
         } else {
           expect(landed?.payload).toMatchObject({ request_id: f.intent.requestId, agentId: 'logical-minion', work_revision: f.identity.workRevision });
-          expect(landed!.seq).toBeGreaterThan(cleanupHistory[0]!.seq);
+          expect(landed!.seq).toBeGreaterThan(repairedCessation?.seq ?? cleanupHistory[0]!.seq);
           expect(ledger.getDirective(f.intent.requestId)?.state).toBe('settled');
           expect(ledger.getObligation(debt.id)?.state).toBe('settled');
           resumed.reconsider(); await resumed.settled();
@@ -1518,7 +1623,8 @@ describe('restart-recovery-progress — exact native request matrix', () => {
           contractSha256: request.contractSha256, nativeTarget: request.nativeTarget, nativeBinding: request.nativeBinding,
           admissionSeq: request.admissionSeq, recoveryCheckpoint: request.recoveryCheckpoint });
         expect(ledger.getEvent(request.admissionSeq!)).toEqual(admission);
-        expect(ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-producer-unknown', 'silas.directive-producer-ceased'])).toEqual(cleanupHistory);
+        expect(ledger.listJobEventsByKinds(f.intent.jobId, ['silas.directive-producer-unknown', 'silas.directive-producer-ceased']))
+          .toEqual(repairedCessation === null ? cleanupHistory : [repairedCessation, ...cleanupHistory]);
         expect(readFileSync(f.file, 'utf8')).toBe(nativeBytes);
         expect(readDirectiveBinding(f.file, f.intent.requestId)).toEqual(binding);
         expect(freshRegistry.spawn).not.toHaveBeenCalled(); expect(freshRegistry.disposeHandle).not.toHaveBeenCalled();
@@ -1794,7 +1900,7 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     } finally { gate.resolve(); await execution; }
   });
 
-  it('restart preserves UNKNOWN when genuine original cessation publication failed before durability', async () => {
+  it('restart durably reconciles genuine original cessation after its publication failed without replay', async () => {
     await assertCleanupAcrossLedgerRestart(true, true);
   });
 

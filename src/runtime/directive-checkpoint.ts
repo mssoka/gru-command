@@ -437,6 +437,14 @@ export function directiveProducerLockBlocker(producer: DirectiveProducer): strin
   });
 }
 
+/** The one current lock belongs to the latest durable physical incarnation.
+ * Callers must still prove cessation for EVERY historical producer; matching
+ * the current lock never releases an older UNKNOWN owner. */
+export function directiveSessionLockBlocker(file: string): string | null {
+  const current = inspectDirectiveProducers(file).at(-1);
+  return current === undefined ? 'native session lacks exact physical producer ownership' : directiveProducerLockBlocker(current.producer);
+}
+
 export function recordDirectiveIndependentController(producer: DirectiveProducer): void { appendProducer({ state: 'independent', producer }); }
 /** Called by the real SDK beforeToolCall hook, after its awaited message
  * persistence. No tool can execute unless its exact intent is durably on disk. */
