@@ -219,6 +219,48 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     if (covered !== null) throw new Error(`${covered} — the ${label} is left for LLM Silas`);
   };
 
+  /** A directive-recovery/retirement hold the planner saw can land between
+   * planning and this boundary (the pass awaits gh lookups and the review
+   * preflight on earlier rows). `beginDirectiveIntent`/`beginRebriefIntent`
+   * RELEASE open recovery holds, so a machine writer must refuse here rather
+   * than silently release an owner/recovery fence. */
+  const requireNoRecoveryHold = (jobId: string, label: string): void => {
+    if (deps.ledger.hasOpenDirectiveRecoveryHold(jobId)) {
+      throw new Error(`an open directive-recovery hold owns this lane — the ${label} is left for LLM Silas`);
+    }
+  };
+
+  /** The post-supersession admission proof shared by directive and re-brief:
+   * a hold or verification that took the lane while the supersession awaited
+   * is a PROVEN no-effect refusal (nothing was prompted), so the durable
+   * request fails by name instead of staying live for reconcile. */
+  const supersedeAndProve = async (
+    intent: { readonly requestId: string },
+    input: { readonly jobId: string; readonly hold?: DecisionHoldTriple },
+    label: string,
+    writer: string,
+  ): Promise<boolean> => {
+    try {
+      await deps.wave.clearLaneForWriter({ jobId: input.jobId, writer });
+    } catch (error) {
+      if (!(error instanceof ReviewSupersessionUnconfirmedError)) throw error;
+      deps.ledger.failDirective({ requestId: intent.requestId, reason: `refused before any prompt: ${error.message}` });
+      return false;
+    }
+    // Issue #243 F-H2/F-H3: re-prove family/basis coverage and verification
+    // ownership AFTER the awaited lane supersession and before any
+    // prompt/durable effect; the in-route `beforeWriterSideEffect` repeats
+    // the coverage check at every post-pacing boundary.
+    try {
+      requireHoldUncovered(input.jobId, input.hold, label);
+      requireNoUnsettledVerification(input.jobId, label);
+    } catch (error) {
+      deps.ledger.failDirective({ requestId: intent.requestId, reason: `refused before any prompt: ${String(error instanceof Error ? error.message : error)}` });
+      return false;
+    }
+    return true;
+  };
+
   /** Owner rules 3/5 writer admission: a live review whose candidate is
    * still current REFUSES the writer (the branch stays frozen until the
    * verdict); a review the gate admits is superseded only afterwards. The
@@ -469,6 +511,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     requireWriterAdmissible(input.jobId, 'directive');
     requireNoUnsettledVerification(input.jobId, 'directive');
     requireHoldUncovered(input.jobId, input.hold, 'directive');
+    requireNoRecoveryHold(input.jobId, 'directive');
     const begun = deps.ledger.beginDirectiveIntent({
       jobId: input.jobId,
       directive: input.directive,
@@ -484,22 +527,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     const controller = new AbortController();
     const releaseAdmission = deps.ledger.beginJobAdmission(input.jobId, `directive ${intent.requestId}`);
     const run = (async (): Promise<void> => {
-      try {
-        await deps.wave.clearLaneForWriter({ jobId: input.jobId, writer: `directive ${intent.requestId}` });
-      } catch (error) {
-        if (!(error instanceof ReviewSupersessionUnconfirmedError)) throw error;
-        deps.ledger.failDirective({
-          requestId: intent.requestId,
-          reason: `refused before any prompt: ${error.message}`,
-        });
-        return;
-      }
-      // Issue #243 F-H2/F-H3: re-prove family/basis coverage and verification
-      // ownership AFTER the awaited lane supersession and before any
-      // prompt/durable effect; the in-route `beforeWriterSideEffect` repeats
-      // the coverage check at every post-pacing boundary.
-      requireHoldUncovered(input.jobId, input.hold, 'directive');
-      requireNoUnsettledVerification(input.jobId, 'directive');
+      if (!(await supersedeAndProve(intent, input, 'directive', `directive ${intent.requestId}`))) return;
       await executeAcceptedDirective(acceptedDeps(controller, input.jobId, input.hold, 'directive'), intent.requestId);
     })().catch((error: unknown) => {
       // The native executor owns its own failure/reconcile bookkeeping; a
@@ -543,15 +571,9 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     // gate. The native executor supersedes the lane's reviews itself.
     requireNotStopping('re-brief');
     requireWriterAdmissible(input.jobId, 're-brief');
-    await deps.wave.clearLaneForWriter({ jobId: input.jobId, writer: `re-brief for job ${input.jobId}` });
-    // Re-prove admission after the awaited supersession: a review that armed,
-    // a verification that took the lane, or an owner hold that landed in the
-    // window must refuse BEFORE the durable request exists. (The native
-    // executor repeats the supersession for the accepted request.)
-    requireWriterAdmissible(input.jobId, 're-brief');
     requireNoUnsettledVerification(input.jobId, 're-brief');
-    requireNotStopping('re-brief');
     requireHoldUncovered(input.jobId, input.hold, 're-brief');
+    requireNoRecoveryHold(input.jobId, 're-brief');
     // The durable request is written BEFORE any worker exists (restart-safe)
     // and carries the firing rule AND the autopilot source (issue #243 M3),
     // so the `silas.rebrief` receipt replays both. A different live writer
@@ -568,6 +590,7 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
     const controller = new AbortController();
     const releaseAdmission = deps.ledger.beginJobAdmission(input.jobId, `rebrief ${intent.requestId}`);
     const run = (async (): Promise<void> => {
+      if (!(await supersedeAndProve(intent, input, 're-brief', `rebrief ${intent.requestId}`))) return;
       await executeAcceptedDirective(acceptedDeps(controller, input.jobId, input.hold, 're-brief'), intent.requestId);
     })().catch((error: unknown) => {
       try {

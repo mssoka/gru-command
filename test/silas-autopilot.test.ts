@@ -2785,10 +2785,14 @@ describe('F-H2 the admission boundary re-proves a hold that lands after planning
       gh: { listPullsForHead: async () => [] },
       resolveRemote: () => null,
     });
-    await expect(
-      ops.sendRebrief({ jobId: job.id, note: 'n', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'round-late', hold }),
-    ).rejects.toThrow(/covers verdict-rung-rebrief/);
+    await ops.sendRebrief({ jobId: job.id, note: 'n', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'round-late', hold });
+    await ops.drain();
     expect(held).toBe(true);
+    // Proven no-effect refusal: the durable request FAILS by name (never left
+    // live for reconcile) and nothing was prompted.
+    const [request] = ledger.listPendingDirectives({ jobId: job.id });
+    expect(request?.state).toBe('failed');
+    expect(request?.failReason).toMatch(/refused before any prompt.*covers verdict-rung-rebrief/);
     expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toEqual([]);
   });
 
@@ -3225,4 +3229,78 @@ describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief 
     // lane and a boot reconcile would re-deliver a re-brief the pass refused.
     expect(ledger.listPendingRebriefs({ jobId: job.id })).toEqual([]);
   }, 30_000);
+});
+
+describe('enforce-mode writer admission gaps (PR349 independent review)', () => {
+  const retireWithOpenHold = (ledger: LedgerApi, jobId: string): string => {
+    const begun = ledger.beginDirectiveIntent({ jobId, directive: 'earlier', holder: 'silas-ops' });
+    const { db } = ledger as unknown as { readonly db: import('node:sqlite').DatabaseSync };
+    db.prepare("UPDATE pending_directives SET state = 'retired', hold_released_by = NULL WHERE request_id = ?").run(begun.record.requestId);
+    expect(ledger.hasOpenDirectiveRecoveryHold(jobId)).toBe(true);
+    return begun.record.requestId;
+  };
+  const opsFor = (ledger: LedgerApi, wave = waveStub()) =>
+    createSilasAutopilotOps({
+      ...nativeSeams,
+      ledger,
+      wave,
+      registry: {} as never,
+      worktrees: {} as never,
+      dispatch: { recordPr: () => ({ prUrl: null }) },
+      gh: { listPullsForHead: async () => [] },
+      resolveRemote: () => null,
+    });
+
+  it('a directive refuses (and releases NOTHING) when a recovery hold landed after planning', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-rh-d', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    retireWithOpenHold(ledger, job.id);
+    await expect(
+      opsFor(ledger).sendDirective({ jobId: job.id, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'r' }),
+    ).rejects.toThrow(/directive-recovery hold/);
+    expect(ledger.hasOpenDirectiveRecoveryHold(job.id)).toBe(true);
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toEqual([]);
+  });
+
+  it('a re-brief refuses (and releases NOTHING) when a recovery hold landed after planning', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-rh-r', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    retireWithOpenHold(ledger, job.id);
+    await expect(
+      opsFor(ledger).sendRebrief({ jobId: job.id, note: 'n', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'r' }),
+    ).rejects.toThrow(/directive-recovery hold/);
+    expect(ledger.hasOpenDirectiveRecoveryHold(job.id)).toBe(true);
+    expect(ledger.listPendingDirectives({ jobId: job.id, states: LIVE_DIRECTIVE_STATES, limit: 5 })).toEqual([]);
+  });
+
+  it('a re-brief whose request is refused by the ledger supersedes NO review', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-rb-order', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    // A different live writer request: beginRebriefIntent refuses by name.
+    ledger.beginDirectiveIntent({ jobId: job.id, directive: 'live', holder: 'silas-ops' });
+    let cleared = 0;
+    const ops = opsFor(ledger, waveStub({ clearLaneForWriter: async () => { cleared += 1; return undefined; } }));
+    await expect(
+      ops.sendRebrief({ jobId: job.id, note: 'n', ruleId: 'verdict-rung-rebrief', sourceRoundId: 'r' }),
+    ).rejects.toThrow(/already live/);
+    expect(cleared).toBe(0);
+  });
+
+  it('a directive whose verification took the lane during supersession FAILS by name, not reconcile', async () => {
+    const ledger = newRealLedger();
+    const job = ledger.addJob({ id: 'job-c-fail', repo: 'gru-command', title: 't', baseBranch: 'main', briefing: 'x' });
+    ledger.setJobStatus(job.id, 'working');
+    const wave = waveStub({
+      clearLaneForWriter: async () => {
+        ledger.appendCustomEvent({ kind: 'verification.requested', jobId: job.id, payload: { scope: 'full', run_id: 'run-c', head: 'a'.repeat(40) } });
+        return undefined;
+      },
+    });
+    await opsFor(ledger, wave).sendDirective({ jobId: job.id, directive: 'x', ruleId: 'verdict-rung-directive', sourceRoundId: 'r' });
+    await vi.waitFor(() => expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.state).toBe('failed'));
+    expect(ledger.listPendingDirectives({ jobId: job.id })[0]?.failReason).toMatch(/refused before any prompt.*verification/);
+  });
 });
