@@ -17,6 +17,7 @@ import { lstat, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative } from 'node:path';
 import { finished } from 'node:stream/promises';
 import type { GruCommandConfig, Role } from '../config.js';
+import { repositoryGitEnv } from '../git-env.js';
 import { CLAUDE_CODE_THINKING_LEVELS as CLAUDE_EFFORT_LEVELS, DEFAULT_CLAUDE_MCP_MODE, resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
@@ -160,7 +161,7 @@ export interface ClaudeCodeRuntimeOptions {
  *           (--session-id <uuid> | --resume <uuid>) [--model M] [--effort E]
  *           --permission-mode bypassPermissions --tools <role tools>
  *           --append-system-prompt <role prompt>
- *           [--strict-mcp-config [--mcp-config <cwd>/.mcp.json]]
+ *           [--strict-mcp-config [--mcp-config <session>.jsonl.<handle>.project-mcp.json]]
  * fed with ONE stdin user frame followed by EOF; the turn ends with the
  * `result` frame and the process exits. Session continuity chains through
  * the CLI's own resume substrate keyed by the product-minted session UUID;
@@ -731,7 +732,7 @@ export function claudeInBandError(
 }
 
 /** The first stderr line (or the spawn/timeout failure) of a failed git run. */
-function gitFailure(error: unknown): string {
+export function gitFailure(error: unknown): string {
   const failure = error as { readonly stderr?: Buffer | string; readonly signal?: string | null; readonly message?: string };
   const stderr = failure.stderr === undefined ? '' : String(failure.stderr).trim().split('\n')[0] ?? '';
   if (stderr !== '') return stderr;
@@ -753,21 +754,30 @@ function gitFailure(error: unknown): string {
  * own tools include a shell load project servers at all: a read-only role
  * never runs a command another session committed.
  */
-export async function checkedInProjectMcpConfig(cwd: string): Promise<{ readonly config: Buffer } | { readonly reason: string }> {
+export async function checkedInProjectMcpConfig(
+  cwd: string,
+): Promise<{ readonly config: Buffer } | { readonly reason: string; readonly infrastructure?: true }> {
   const file = join(cwd, '.mcp.json');
+  let size: number;
   try {
-    if (!(await lstat(file)).isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
+    const stat = await lstat(file);
+    if (!stat.isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
+    size = stat.size;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { reason: 'no .mcp.json in the session cwd' };
-    return { reason: `.mcp.json cannot be inspected: ${String(error)}` };
+    return { reason: `.mcp.json cannot be inspected: ${String(error)}`, infrastructure: true };
   }
+  // Routing variables inherited by the service never redirect the check to
+  // another repository: HEAD is the session cwd's own.
   const git = async (args: readonly string[]): Promise<Buffer> =>
-    (await execFileAsync('git', [...args], { cwd, encoding: 'buffer', timeout: 10_000, maxBuffer: 1 << 20, windowsHide: true })).stdout;
+    (await execFileAsync('git', [...args], {
+      cwd, env: repositoryGitEnv(true), encoding: 'buffer', timeout: 10_000, maxBuffer: 1 << 20, windowsHide: true,
+    })).stdout;
   let entry: string;
   try {
     entry = (await git(['ls-tree', '-z', 'HEAD', '--', '.mcp.json'])).toString('utf8');
   } catch (error) {
-    return { reason: `git cannot read HEAD in the session cwd: ${gitFailure(error)}` };
+    return { reason: `git cannot read HEAD in the session cwd: ${gitFailure(error)}`, infrastructure: true };
   }
   if (entry === '') return { reason: '.mcp.json is not committed at HEAD' };
   // "<mode> <type> <object>\t<path>\0" — a committed symlink (120000), tree
@@ -778,23 +788,40 @@ export async function checkedInProjectMcpConfig(cwd: string): Promise<{ readonly
   try {
     committed = await git(['cat-file', 'blob', committedEntry[2]!]);
   } catch (error) {
-    return { reason: `git cannot read the committed .mcp.json: ${gitFailure(error)}` };
+    return { reason: `git cannot read the committed .mcp.json: ${gitFailure(error)}`, infrastructure: true };
   }
+  // A size mismatch already differs: an arbitrarily large lane file is never
+  // read into the service.
+  const crlfGrowth = committed.toString('utf8').split('\n').length - 1;
+  if (size !== committed.length && size !== committed.length + crlfGrowth) return differsFromCommitted(null, committed);
   let working: Buffer;
   try {
     working = await readFile(file);
   } catch (error) {
-    return { reason: `.mcp.json cannot be read: ${String(error)}` };
+    return { reason: `.mcp.json cannot be read: ${String(error)}`, infrastructure: true };
   }
-  if (!working.equals(committed)) return { reason: '.mcp.json differs from its committed version' };
+  if (!working.equals(committed)) return differsFromCommitted(working, committed);
   return { config: committed };
+}
+
+/** The refusal for a working file that is not the committed bytes. The
+ * comparison is byte-exact (git's eol/smudge conversion is never run — it
+ * would execute lane-configured filters), so a line-ending-only difference
+ * gets its own reason instead of looking like an edit. */
+function differsFromCommitted(working: Buffer | null, committed: Buffer): { readonly reason: string } {
+  if (working !== null && working.toString('utf8').replaceAll('\r\n', '\n') === committed.toString('utf8').replaceAll('\r\n', '\n')) {
+    return { reason: '.mcp.json differs from its committed bytes only in line endings (autocrlf/eol conversion); only byte-identical files load' };
+  }
+  return { reason: '.mcp.json differs from its committed version' };
 }
 
 /** The private copy of the verified project servers handed to --mcp-config:
  * beside the session's own transcript (GC-owned; the store lists only
- * `.jsonl`), owner-only, rewritten every turn and removed at disposal. */
-export function projectMcpCopyPath(sessionFile: string): string {
-  return `${sessionFile}.project-mcp.json`;
+ * `.jsonl`), owner-only, rewritten every turn and removed at disposal. Each
+ * handle has its own token, so a disposed handle's late check never touches
+ * the copy of the handle that resumed the same session. */
+export function projectMcpCopyPath(sessionFile: string, handleToken: string): string {
+  return `${sessionFile}.${handleToken}.project-mcp.json`;
 }
 
 /** The stdin user frame for one prompt (image blocks first, then text). */
@@ -861,6 +888,8 @@ export class ClaudeCodeHandle implements AgentHandle {
   private disposalPromise: Promise<void> | null = null;
   /** Last logged reason project MCP loaded nothing (logged once per change). */
   private projectMcpNote: string | null = null;
+  /** This handle's own project-MCP copy (see projectMcpCopyPath). */
+  private readonly projectMcpCopy: string;
   /** A turn is resolving its params (the project-MCP git check): the
    * operation slot is held exactly as by a live child. */
   private preparingTurn = false;
@@ -883,6 +912,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     this.capabilities = capabilities;
     this.id = agentId ?? params.sessionId;
     this.sessionFile = params.sessionFile;
+    this.projectMcpCopy = projectMcpCopyPath(params.sessionFile, randomUUID().slice(0, 8));
     if (params.isolatedReview) this.reviewIsolation = true;
     if (params.reviewTools !== undefined && params.reviewTools.length > 0) {
       this.reviewTools = [...params.reviewTools];
@@ -1130,7 +1160,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   /** The private project-servers copy lives only as long as the session. */
   private cleanupProjectMcpCopy(): void {
     if (this.params.ambientMcp?.mode !== 'project') return;
-    const copy = projectMcpCopyPath(this.params.sessionFile);
+    const copy = this.projectMcpCopy;
     void rm(copy, { force: true }).catch((error: unknown) => {
       this.log('warn', 'project MCP copy cleanup failed', { file: copy, error: String(error) });
     });
@@ -1196,15 +1226,19 @@ export class ClaudeCodeHandle implements AgentHandle {
    * fixed params and never comes here. */
   private async projectTurnParams(): Promise<HandleParams> {
     const resolved = await checkedInProjectMcpConfig(this.params.cwd);
-    const copy = projectMcpCopyPath(this.params.sessionFile);
+    const copy = this.projectMcpCopy;
     if ('reason' in resolved) {
       await rm(copy, { force: true });
       if (this.projectMcpNote !== resolved.reason) {
         this.projectMcpNote = resolved.reason;
-        this.log('info', 'mcp = "project": no project MCP servers loaded', { cwd: this.params.cwd, reason: resolved.reason });
+        // Fails closed either way; a git/file failure is the operator's to fix.
+        this.log(resolved.infrastructure === true ? 'warn' : 'info', 'mcp = "project": no project MCP servers loaded', {
+          cwd: this.params.cwd, reason: resolved.reason,
+        });
       }
       return { ...this.params, ambientMcp: { mode: 'project' } };
     }
+    if (this.disposed) throw new Error('agent session disposed');
     await writeFile(copy, resolved.config, { mode: 0o600 });
     this.projectMcpNote = null;
     return { ...this.params, ambientMcp: { mode: 'project', file: copy } };
@@ -1214,10 +1248,13 @@ export class ClaudeCodeHandle implements AgentHandle {
    * runs off the event loop while the session's one operation slot stays
    * held; the slot is released, and disposal re-checked, in the same step
    * that spawns — never a window for a second operation or a post-disposal
-   * child. A failed check fails the operation loudly. */
+   * child. A refused or unreadable `.mcp.json` fails closed (the process runs
+   * with no project servers, logged); only a failure to write or remove the
+   * private copy fails the operation. `onNotSpawned` hears every path that
+   * spawns nothing: disposal (null) or that failure (its detail). */
   private withTurnParams(
     spawnWith: (params: HandleParams) => Promise<void>,
-    onPrepareFailure?: (detail: string) => void,
+    onNotSpawned?: (failure: string | null) => void,
   ): Promise<void> {
     if (this.params.ambientMcp?.mode !== 'project') return spawnWith(this.params);
     this.preparingTurn = true;
@@ -1227,15 +1264,20 @@ export class ClaudeCodeHandle implements AgentHandle {
         if (this.disposed) {
           // Disposal's own cleanup may have run before this check wrote.
           this.cleanupProjectMcpCopy();
+          onNotSpawned?.(null);
           throw new Error('agent session disposed');
         }
         return spawnWith(params);
       },
       (error: unknown) => {
         this.preparingTurn = false;
-        if (this.disposed) throw new Error('agent session disposed');
+        if (this.disposed) {
+          this.cleanupProjectMcpCopy();
+          onNotSpawned?.(null);
+          throw new Error('agent session disposed');
+        }
         const detail = `claude turn could not be prepared: ${error instanceof Error ? error.message : String(error)}`;
-        onPrepareFailure?.(detail);
+        onNotSpawned?.(detail);
         throw new Error(detail);
       },
     );
@@ -1448,22 +1490,29 @@ export class ClaudeCodeHandle implements AgentHandle {
 
   private runTurn(text: string, owner: string | null, images?: PromptOptions['images']): Promise<void> {
     this.setState('spawning');
-    return this.withTurnParams((params) => this.spawnTurn(params, text, owner, images), (detail) => {
-      if (!this.disposed) {
-        this.emit({ type: 'error', error: detail, fatal: false });
-        this.setState('error', detail);
-      }
-    });
-  }
-
-  private spawnTurn(params: HandleParams, text: string, owner: string | null, images?: PromptOptions['images']): Promise<void> {
-    const translator = new ClaudeTurnTranslator();
-    let turnStarted = false;
+    // The accepted prompt is the pending turn from this moment — through a
+    // project-mode check too — so a supervisor capture never misses it.
     this.livePrompt = {
       text,
       owner,
       ...(images !== undefined && images.length > 0 ? { images } : {}),
     };
+    return this.withTurnParams((params) => this.spawnTurn(params), (failure) => {
+      this.livePrompt = null;
+      if (failure !== null) {
+        this.emit({ type: 'error', error: failure, fatal: false });
+        this.setState('error', failure);
+      }
+    });
+  }
+
+  private spawnTurn(params: HandleParams): Promise<void> {
+    const translator = new ClaudeTurnTranslator();
+    let turnStarted = false;
+    const livePrompt = this.livePrompt;
+    if (livePrompt === null) throw new Error('claude turn spawned without its accepted prompt');
+    const { text } = livePrompt;
+    const images = livePrompt.images;
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;

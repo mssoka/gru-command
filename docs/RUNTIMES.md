@@ -94,7 +94,7 @@ claude -p --output-format stream-json --input-format stream-json \
   (--session-id <uuid> | --resume <uuid>) [--model M] [--effort E] \
   --permission-mode bypassPermissions --tools <role tools> \
   --append-system-prompt <role prompt> \
-  [--strict-mcp-config [--mcp-config <session>.jsonl.project-mcp.json]]
+  [--strict-mcp-config [--mcp-config <session>.jsonl.<handle>.project-mcp.json]]
 ```
 
 fed with ONE stdin user frame (text, or image blocks + text) followed by
@@ -169,9 +169,13 @@ only, so MCP servers are governed separately by `[runtimes.claude-code] mcp`
 committed at HEAD (a regular file, never a symlink), while the working file
 is byte-identical to it — re-checked every turn and compaction (each is a
 fresh CLI process) off the event loop. The CLI reads a private owner-only
-copy of those verified bytes beside the session transcript, never the lane
-path. An untracked, staged-only, edited, symlinked or missing file loads
-nothing that turn, and a git failure is logged with its own reason. HEAD is
+copy of those verified bytes beside the session transcript (one per handle,
+so a resumed session never shares its predecessor's), never the lane path.
+An untracked, staged-only, edited, symlinked or missing file loads nothing
+that turn. The comparison is byte-exact — git's eol/smudge conversion would
+run lane-configured filters — so an autocrlf-converted checkout gets its own
+line-ending reason. A git or file failure is logged at warn with its own
+reason; git runs without inherited repository-routing variables. HEAD is
 lane state a session with a shell can commit to, so only roles whose own
 tools include a shell load project servers (a server is a command such a
 session could already run); a read-only role never runs a command another

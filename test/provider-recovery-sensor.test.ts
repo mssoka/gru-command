@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { LedgerDb } from '../src/ledger/db.js';
@@ -10,6 +10,7 @@ import { DEFAULT_PROVIDER_RECOVERY_CONFIG, type ProviderRecoveryConfig } from '.
 import {
   establishProviderWait,
   ProviderRecoverySensor,
+  bootProviderRecovery,
   isClaudeNativeRouteKey,
   providerRouteKey,
   type MetadataReaderPort,
@@ -1277,47 +1278,130 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
   });
 
+  /** The claude-only sensor with its own center, so needs-owner surfacing
+   * (the chat "For you" hook) is observable. */
+  function surfacingClaudeOnly(h: Harness) {
+    const surfaced: string[] = [];
+    const notifications = new NotificationCenter({ ledger: h.ledger, bus: h.bus, onNeedsOwner: (record) => surfaced.push(record.kind) });
+    const sensor = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, glmGenerationFallback: true, enabled: false, claudeNative: true },
+      ledger: h.ledger, probe: h.probe, notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now + 3_600_000,
+    });
+    return { sensor, surfaced };
+  }
+
+  /** The supervisor's machine-owned stop for a lane, linked to its wait the
+   * way main wires it. */
+  function linkedStop(h: Harness, agentId: string, waitId: string) {
+    const stop = h.notifications.postIncident({ kind: `supervision.provider-wall.${agentId}.quota_wall`, routing: 'action-required',
+      severity: 'error', title: `Agent ${agentId} stopped: quota wall`, agentId, dedupe: 'unacked' });
+    h.ledger.setProviderWaitIncident(waitId, stop.id);
+    return stop;
+  }
+
   it('boot hands the open waits of a provider that is now off back to the owner — never stranded', async () => {
     const h = new Harness();
     const { recovered, waiting } = await glmDebt(h);
-    // The supervisor's machine-owned stop for the waiting lane (linked the
-    // way main wires it); the recovered lane's stop link was never written.
-    const stop = h.notifications.postIncident({ kind: 'supervision.provider-wall.agent-minion-2.quota_wall', routing: 'action-required',
-      severity: 'error', title: 'Agent agent-minion-2 stopped: quota wall', agentId: 'agent-minion-2', dedupe: 'unacked' });
-    h.ledger.setProviderWaitIncident(waiting.id, stop.id);
+    const stop = linkedStop(h, 'agent-minion-2', waiting.id);
+    h.notifications.postIncident({ kind: `provider.waiting.${waiting.routeKey}`, routing: 'fyi', severity: 'info',
+      title: 'watching', detail: 'Automatic recovery watching', dedupe: 'active' });
     const wakes = h.wakes.length;
     const calls = h.probe.calls.length;
-    const claudeOnly = claudeOnlySensor(h);
-    expect(await claudeOnly.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
     expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
     expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
-    // The linked stop is now the owner's (open, needs-owner), not resolved.
-    expect(h.ledger.getNotification(stop.id)).toMatchObject({ routing: 'needs-owner', resolvedAt: null, ackedAt: null });
-    expect(h.ledger.getNotification(stop.id)?.detail).toContain('[provider_recovery] enabled = false');
-    // The unlinked lane gets its own needs-owner stop.
-    const notice = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'unacked');
-    expect(notice).toMatchObject({ routing: 'needs-owner', agentId: 'agent-minion-1' });
-    expect(h.ledger.countPendingNeedsOwner()).toBe(2);
+    // The machine-owned stop is no longer the sensor's: resolved with its wait.
+    expect(h.ledger.getNotification(stop.id)?.resolvedAt).not.toBeNull();
+    // One needs-owner notice per lane, surfaced in chat, naming a real action.
+    const stopped = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'unacked');
+    expect(stopped).toMatchObject({ routing: 'needs-owner', agentId: 'agent-minion-2' });
+    expect(stopped?.detail).toContain('[provider_recovery] enabled = false');
+    expect(stopped?.detail).toContain('ask Gru to resume or re-dispatch the job');
+    const resumed = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'unacked');
+    expect(resumed?.title).toContain('provider recovered, automatic resume off');
+    expect(resumed?.detail).toContain('limit has cleared');
+    expect(surfaced.sort()).toEqual([`provider-recovery.recovery-off.${recovered.id}`, `provider-recovery.recovery-off.${waiting.id}`].sort());
+    // Nothing left to watch: the "watching" notice and the pending delivery retire.
+    expect(h.ledger.findNotificationByKind(`provider.waiting.${waiting.routeKey}`, 'active')).toBeNull();
+    expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
     expect(h.wakes).toHaveLength(wakes);
     expect(h.probe.calls).toHaveLength(calls);
     // Idempotent: a second boot hands nothing back and posts nothing new.
-    expect(claudeOnly.handBackDisabledWaits()).toBe(0);
-    expect(h.ledger.countPendingNeedsOwner()).toBe(2);
+    const owned = h.ledger.countPendingNeedsOwner();
+    expect(sensor.handBackDisabledWaits()).toBe(0);
+    expect(h.ledger.countPendingNeedsOwner()).toBe(owned);
   });
 
-  it('a boot interrupted between re-routing and cancelling never posts a second owner stop', async () => {
+  it('the owner is told once: never twice after a crash, never beside a handled or owner-held stop', async () => {
     const h = new Harness();
-    const { waiting } = await glmDebt(h);
-    const stop = h.notifications.postIncident({ kind: 'supervision.provider-wall.agent-minion-2.quota_wall', routing: 'action-required',
-      severity: 'error', title: 'Agent agent-minion-2 stopped: quota wall', agentId: 'agent-minion-2', dedupe: 'unacked' });
-    h.ledger.setProviderWaitIncident(waiting.id, stop.id);
-    h.ledger.updateNotificationTriage(stop.id, 'needs-owner', 'already handed back before a crash');
+    const { recovered, waiting } = await glmDebt(h);
+    // A boot that posted the notice for the waiting lane, then crashed before
+    // cancelling its wait.
+    linkedStop(h, 'agent-minion-2', waiting.id);
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    h.notifications.postIncident({ kind: `provider-recovery.recovery-off.${waiting.id}`, routing: 'needs-owner', severity: 'error',
+      title: 'posted before a crash', agentId: 'agent-minion-2', dedupe: 'unacked' });
+    // The recovered lane's owner already holds its own stop (the wall's
+    // classification failed, so it was never linked to the wait).
+    h.notifications.postIncident({ kind: 'supervision.provider-wall.agent-minion-1.quota_wall', routing: 'needs-owner', severity: 'error',
+      title: 'owner stop', agentId: 'agent-minion-1', dedupe: 'unacked' });
     const before = h.ledger.countPendingNeedsOwner();
-    expect(claudeOnlySensor(h).handBackDisabledWaits()).toBe(2);
+    expect(sensor.handBackDisabledWaits()).toBe(2);
     expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
-    expect(h.ledger.getNotification(stop.id)?.detail).toBe('already handed back before a crash');
-    // Only the other (unlinked) lane gained a stop.
-    expect(h.ledger.countPendingNeedsOwner()).toBe(before + 1);
+    expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
+    expect(h.ledger.countPendingNeedsOwner()).toBe(before);
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'any')).toBeNull();
+    expect(surfaced).toEqual([]);
+    // A lane whose stop Gru already disposed of was handled: no notice.
+    const h2 = new Harness();
+    const debt = await glmDebt(h2);
+    const disposed = linkedStop(h2, 'agent-minion-2', debt.waiting.id);
+    expect(h2.ledger.disposeMachineNotification(disposed.id, 'Gru re-dispatched the lane')?.resolvedAt).not.toBeNull();
+    expect(surfacingClaudeOnly(h2).sensor.handBackDisabledWaits()).toBe(2);
+    expect(h2.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt.waiting.id}`, 'any')).toBeNull();
+    expect(h2.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt.recovered.id}`, 'unacked')).not.toBeNull();
+  });
+
+  it('with the whole sensor off, service boot still hands every open wait back — job lanes and Silas slots', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    const slot = h.ledger.recordProviderWait({ id: 'wait-silas-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-slot'),
+      provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-slot', waiterKind: 'silas-slot',
+      jobId: null, agentId: null, slotId: 'ops-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+      lineageKey: 'slot:ops-slot', incidentId: 'provider-wall.silas', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    const surfaced: string[] = [];
+    const off = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: false },
+      ledger: h.ledger, probe: h.probe,
+      notifications: new NotificationCenter({ ledger: h.ledger, bus: h.bus, onNeedsOwner: (record) => surfaced.push(record.kind) }),
+      wake: h.wakePort(), slotReArm: h.reArmPort(), silasHosted: () => true, now: () => h.now,
+    });
+    expect(off.enabled).toBe(false);
+    const logs: string[] = [];
+    await bootProviderRecovery(off, (_level, msg) => logs.push(msg));
+    expect(logs).toContain('provider-recovery sensor disabled — owner activation stays manual');
+    for (const wait of [recovered, waiting, slot]) expect(h.ledger.getProviderWait(wait.id)?.status).toBe('cancelled');
+    expect(surfaced).toHaveLength(3);
+    const slotNotice = h.ledger.findNotificationByKind('provider-recovery.recovery-off.wait-silas-slot', 'unacked');
+    expect(slotNotice).toMatchObject({ routing: 'needs-owner', agentId: null });
+    expect(slotNotice?.title).toBe('Agent ops-slot stopped: provider limit (automatic recovery off)');
+    off.stop();
+  });
+
+  it('one failing hand-back never stalls boot reconciliation for the rest', async () => {
+    const h = new Harness();
+    const { recovered, waiting } = await glmDebt(h);
+    const { sensor } = surfacingClaudeOnly(h);
+    const original = h.ledger.setProviderWaitStatus.bind(h.ledger);
+    vi.spyOn(h.ledger, 'setProviderWaitStatus').mockImplementation((id, status, payload) => {
+      if (id === waiting.id) throw new Error('ledger write failed');
+      return original(id, status, payload);
+    });
+    expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting'); // kept for the next boot
   });
 
   it('enabled = true never overrides claude_native = false: no Claude wait and no keychain read', async () => {

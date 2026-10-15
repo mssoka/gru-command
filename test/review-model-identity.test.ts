@@ -38,6 +38,11 @@ describe('publicRecoveryModelIdentity (claude-code)', () => {
     expect(claude('anthropic/claude-5d41402abc4b2a76b9719d911017c592')).toBe(false);
     expect(claude('claude-opus-5-5', { settingsModel: '123e4567-e89b-12d3-a456-426614174000' })).toBe(false);
     expect(isPublicModelToken('us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe(true);
+    // Boundaries: a 23-character run is still a name segment, 24 is not; a
+    // UUID is refused anywhere in the id.
+    expect(isPublicModelToken(`claude-${'a'.repeat(23)}`)).toBe(true);
+    expect(isPublicModelToken(`claude-${'a'.repeat(24)}`)).toBe(false);
+    expect(isPublicModelToken('claude-123e4567-e89b-12d3-a456-426614174000')).toBe(false);
     expect(claude('claude-opus-5-5', { settingsModel: 'has space' })).toBe(false);
     expect(claude('claude-opus-5-5', { thinkingLevel: 'turbo' })).toBe(false);
     expect(publicRecoveryModelIdentity({ runtimeId: 'claude-code', modelRef: 'opus', routingSha256: 'x' })).toBe(false);

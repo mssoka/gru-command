@@ -64,9 +64,11 @@ export interface RuntimeModelPolicy {
  * [runtimes.claude-code] mcp — the MCP servers a non-review claude-code
  * session loads (owner decision 2026-10-15: off by default, opt-in):
  *   none    — no MCP servers; the session gets only its role's tools
- *   project — only the servers in the session cwd's checked-in .mcp.json
+ *   project — only the servers in the session cwd's .mcp.json as committed
+ *             at HEAD (byte-identical working file), for roles with a shell
  *   user    — everything the operator's own Claude configuration loads
- * Isolated review sessions never load ambient MCP regardless.
+ * Isolated review sessions and narrowed role-tool sets never load ambient
+ * MCP regardless.
  */
 export const CLAUDE_MCP_MODES = ['none', 'project', 'user'] as const;
 export type ClaudeMcpMode = (typeof CLAUDE_MCP_MODES)[number];

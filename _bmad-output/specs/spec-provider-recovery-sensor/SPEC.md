@@ -136,8 +136,9 @@ completed acceptance:
   contexts still fail closed), and the route is ON by default through its
   own `[provider_recovery] claude_native` switch, independent of `enabled`.
   Turning either switch off hands that provider's open waits back to the
-  owner at the next boot (the machine-owned stop becomes needs-owner, the
-  wait is cancelled) — boot reconciliation runs even with the sensor off.
+  owner at the next boot: each wait is cancelled (resolving its
+  machine-owned stop) and the owner gets one needs-owner notice per lane,
+  surfaced in chat — boot reconciliation runs even with the sensor off.
 - Progress-gated fan-out still has no production consumer (the cap-owned
   runtime emitter is ungrounded).
 

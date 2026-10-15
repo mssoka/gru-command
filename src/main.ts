@@ -32,7 +32,7 @@ import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/s
 import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
 import { DirectiveProgressService } from './dispatch/directive-progress.js';
-import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
+import { ProviderRecoverySensor, bootProviderRecovery, establishProviderWait } from './provider-recovery/sensor.js';
 import { ModelRuntimeProbe } from './provider-recovery/probe.js';
 import {
   composeMetadataReaders,
@@ -1628,14 +1628,7 @@ async function main(): Promise<number> {
   // recovery whose delivery was lost across a restart — never silently
   // re-baselined away. Boot reconciliation runs even with the sensor off: a
   // provider switch turned off hands its open waits back to the owner.
-  if (providerRecoverySensor.enabled) {
-    providerRecoverySensor.start();
-  } else {
-    logger.info('provider-recovery sensor disabled — owner activation stays manual', {});
-  }
-  void providerRecoverySensor.reconcileAtBoot().catch((error: unknown) => {
-    logger.error('provider-recovery boot reconciliation failed', { error: String(error) });
-  });
+  void bootProviderRecovery(providerRecoverySensor, (level, msg, fields) => logger.log(level, msg, fields));
 
   logger.info('listening', { host: handle.host, port: handle.port });
   return new Promise<number>(() => {

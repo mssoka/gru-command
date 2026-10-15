@@ -5,7 +5,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, copyFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -16,8 +16,8 @@ import {
   ClaudeCodeRuntime,
   checkedInProjectMcpConfig,
   claudeInBandError,
+  gitFailure,
   mapRoleTools,
-  projectMcpCopyPath,
 } from '../src/runtime/claude-adapter.js';
 import { isRateLimitErrorText } from '../src/runtime/pacing.js';
 import { deterministicFailureClass } from '../src/decisions/questions.js';
@@ -39,6 +39,14 @@ import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import { makeFixtureRepo } from './helpers/fixture-repo.js';
+
+/** The project-MCP copies beside a session transcript (one per live handle). */
+function copiesOf(sessionFile: string): string[] {
+  const prefix = `${basename(sessionFile)}.`;
+  return readdirSync(dirname(sessionFile))
+    .filter((name) => name.startsWith(prefix) && name.endsWith('.project-mcp.json'))
+    .map((name) => join(dirname(sessionFile), name));
+}
 
 /**
  * claude-code adapter tests (EPICS E3): a STUBBED CLI double (executable
@@ -1683,7 +1691,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const file = join(repo.path, '.mcp.json');
       const committed = JSON.stringify({ mcpServers: {} });
       const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
-      const copy = projectMcpCopyPath(handle.sessionFile!);
+      let copy = '';
       const mcpConfig = (argv: readonly string[]): string | null => {
         expect(argv).toContain('--strict-mcp-config');
         return argv.includes('--mcp-config') ? argv[argv.indexOf('--mcp-config') + 1]! : null;
@@ -1698,7 +1706,8 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       repo.git(['add', '.mcp.json']);
       expect(await turn()).toBeNull(); // staged, never committed
       repo.commitFile('.mcp.json', committed);
-      expect(await turn()).toBe(copy); // checked in: loads on the next turn, no respawn
+      copy = (await turn())!; // checked in: loads on the next turn, no respawn
+      expect(copiesOf(handle.sessionFile!)).toEqual([copy]); // this handle's own copy beside the transcript
       // The CLI reads a private, owner-only copy of the verified bytes — never
       // the lane path a later write could swap.
       expect(readFileSync(copy, 'utf-8')).toBe(committed);
@@ -1746,7 +1755,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const argv = doubleInvocations(fx).at(-1)!.argv;
       expect(argv).toContain('--strict-mcp-config');
       expect(argv).not.toContain('--mcp-config');
-      expect(existsSync(projectMcpCopyPath(reader.sessionFile!))).toBe(false);
+      expect(copiesOf(reader.sessionFile!)).toEqual([]);
       await reader.dispose();
       expect(fx.logs.some((entry) => entry.msg === 'mcp = "project": a role without a shell loads no project MCP servers' &&
         entry.fields?.['role'] === 'perkins')).toBe(true);
@@ -1761,6 +1770,27 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     writeFileSync(join(plain, '.mcp.json'), '{}');
     const outside = await checkedInProjectMcpConfig(plain);
     expect('reason' in outside && outside.reason).toMatch(/^git cannot read HEAD in the session cwd: .*not a git repository/u);
+    expect(outside).toMatchObject({ infrastructure: true }); // logged at warn, never as a content refusal
+    // An unreadable file or directory is an infrastructure failure, not "absent".
+    const locked = makeFixtureRepo('mcp-project-locked');
+    try {
+      locked.commitFile('.mcp.json', '{}');
+      chmodSync(join(locked.path, '.mcp.json'), 0o000);
+      expect(await checkedInProjectMcpConfig(locked.path)).toMatchObject({ reason: expect.stringMatching(/^\.mcp\.json cannot be read: .*EACCES/u), infrastructure: true });
+      chmodSync(join(locked.path, '.mcp.json'), 0o644);
+      const inner = join(locked.path, 'inner');
+      mkdirSync(inner);
+      writeFileSync(join(inner, '.mcp.json'), '{}');
+      chmodSync(inner, 0o000);
+      expect(await checkedInProjectMcpConfig(inner)).toMatchObject({ reason: expect.stringMatching(/^\.mcp\.json cannot be inspected: .*EACCES/u), infrastructure: true });
+      chmodSync(inner, 0o755);
+    } finally {
+      locked.cleanup();
+    }
+    // A failed git run is named by its first stderr line, else its signal, else its message.
+    expect(gitFailure({ stderr: Buffer.from('fatal: bad object\nmore'), signal: null, message: 'Command failed' })).toBe('fatal: bad object');
+    expect(gitFailure({ stderr: Buffer.from(''), signal: 'SIGTERM', message: 'Command failed' })).toBe('git killed by SIGTERM');
+    expect(gitFailure({ message: 'spawn git ENOENT' })).toBe('spawn git ENOENT');
     const repo = makeFixtureRepo('mcp-project-committed-link');
     try {
       symlinkSync('package.json', join(repo.path, '.mcp.json'));
@@ -1780,17 +1810,101 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     try {
       repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
       const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
+      await handle.prompt('establish the session');
+      expect(handle.canCompact?.()).toBe(true);
       const first = handle.prompt('first');
       await expect(handle.prompt('second')).rejects.toThrow(/one operation at a time/);
       expect(handle.canCompact?.()).toBe(false);
+      await expect(handle.compact!()).rejects.toThrow(/requires an idle session/);
       await first;
       const before = doubleInvocations(fx).length;
-      const late = handle.prompt('raced by disposal');
+      const late = expect(handle.prompt('raced by disposal')).rejects.toThrow('agent session disposed');
       await handle.dispose();
-      await expect(late).rejects.toThrow('agent session disposed');
+      await late;
       expect(doubleInvocations(fx)).toHaveLength(before);
       // The check that finished after disposal leaves no copy behind.
-      await vi.waitFor(() => expect(existsSync(projectMcpCopyPath(handle.sessionFile!))).toBe(false));
+      await vi.waitFor(() => expect(copiesOf(handle.sessionFile!)).toEqual([]));
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('a project-mode turn is the pending turn from acceptance, and a failed copy write fails it loudly', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project-pending');
+    try {
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
+      const handle = await fx.runtime.spawn('minion', { cwd: repo.path });
+      const first = handle.prompt('accepted before the check');
+      // A supervisor capture during the async check sees the accepted turn.
+      expect(handle.pendingTurn?.()).toMatchObject({ text: 'accepted before the check' });
+      await first;
+      const copy = doubleInvocations(fx).at(-1)!.argv.at(doubleInvocations(fx).at(-1)!.argv.indexOf('--mcp-config') + 1)!;
+      rmSync(copy);
+      mkdirSync(copy); // the private copy can no longer be written
+      const events: RuntimeEvent[] = [];
+      handle.subscribe((event) => events.push(event));
+      await expect(handle.prompt('cannot prepare')).rejects.toThrow(/^claude turn could not be prepared: /u);
+      expect(handle.pendingTurn?.()).toBeNull();
+      expect(events.some((event) => event.type === 'error' && /could not be prepared/u.test(event.error))).toBe(true);
+      expect(handle.health()).toMatchObject({ state: 'error' });
+      // Compaction fails the same way, as a failed compaction.
+      await expect(handle.compact!()).rejects.toThrow(/^claude turn could not be prepared: /u);
+      expect(events.some((event) => event.type === 'compaction_end' && !event.success)).toBe(true);
+      // Neither failure kept the session's operation slot.
+      rmSync(copy, { recursive: true });
+      expect(handle.canCompact?.()).toBe(true);
+      await handle.prompt('after the failure');
+      expect(doubleInvocations(fx).at(-1)!.prompt).toBe('after the failure');
+      await handle.dispose();
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('the project-MCP check reads the cwd repository only and names line-ending-only differences', async () => {
+    const repo = makeFixtureRepo('mcp-project-routing');
+    const other = makeFixtureRepo('mcp-project-elsewhere');
+    const saved = process.env['GIT_DIR'];
+    try {
+      const committed = '{\n  "mcpServers": {}\n}\n';
+      repo.commitFile('.mcp.json', committed);
+      // An inherited routing variable never points the check at another repo.
+      process.env['GIT_DIR'] = join(other.path, '.git');
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ config: Buffer.from(committed) });
+      if (saved === undefined) delete process.env['GIT_DIR'];
+      else process.env['GIT_DIR'] = saved;
+      writeFileSync(join(repo.path, '.mcp.json'), committed.replaceAll('\n', '\r\n'));
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({
+        reason: '.mcp.json differs from its committed bytes only in line endings (autocrlf/eol conversion); only byte-identical files load',
+      });
+      writeFileSync(join(repo.path, '.mcp.json'), `${committed}${' '.repeat(4096)}`);
+      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+    } finally {
+      if (saved === undefined) delete process.env['GIT_DIR'];
+      else process.env['GIT_DIR'] = saved;
+      repo.cleanup();
+      other.cleanup();
+    }
+  });
+
+  it('each handle owns its project-MCP copy: a resumed session never shares the predecessor copy', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
+    const repo = makeFixtureRepo('mcp-project-resume');
+    try {
+      repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
+      const copyOf = () => { const argv = doubleInvocations(fx).at(-1)!.argv; return argv[argv.indexOf('--mcp-config') + 1]!; };
+      const first = await fx.runtime.spawn('minion', { cwd: repo.path });
+      await first.prompt('one');
+      const firstCopy = copyOf();
+      const file = first.sessionFile!;
+      await first.dispose();
+      const resumed = await fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file });
+      await resumed.prompt('two');
+      const resumedCopy = copyOf();
+      expect(resumedCopy).not.toBe(firstCopy);
+      expect(copiesOf(file)).toEqual([resumedCopy]);
+      await resumed.dispose();
     } finally {
       repo.cleanup();
     }

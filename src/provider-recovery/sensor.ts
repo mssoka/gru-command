@@ -220,6 +220,27 @@ export async function establishProviderWait(
   return sensor.resolveAndRecordWait(observation, evidence);
 }
 
+/** Service boot for provider recovery: the timer starts only while a switch
+ * is on, but boot reconciliation always runs — a provider switch turned off
+ * hands its open waits back to the owner even with the whole sensor off.
+ * Returns the reconciliation so callers (and tests) can observe it settle. */
+export function bootProviderRecovery(sensor: ProviderRecoverySensor, log: Log): Promise<void> {
+  if (sensor.enabled) {
+    sensor.start();
+  } else {
+    log('info', 'provider-recovery sensor disabled — owner activation stays manual', {});
+  }
+  return sensor.reconcileAtBoot().then(
+    () => undefined,
+    (error: unknown) => { log('error', 'provider-recovery boot reconciliation failed', { error: String(error) }); },
+  );
+}
+
+/** The `[provider_recovery]` switch that governs a provider. */
+function switchFor(provider: string): 'claude_native' | 'enabled' {
+  return provider === CLAUDE_NATIVE_PROVIDER ? 'claude_native' : 'enabled';
+}
+
 /** Rolling budget window (1 h, per the approval's 12/hour pin). */
 const WINDOW_MS = 3_600_000;
 
@@ -333,11 +354,15 @@ export class ProviderRecoverySensor {
    * provider that is off are never waited on, probed or re-woken — exactly
    * as with the whole sensor off. */
   enabledFor(provider: string): boolean {
-    return provider === CLAUDE_NATIVE_PROVIDER ? this.cfg.claudeNative : this.cfg.enabled;
+    return switchFor(provider) === 'claude_native' ? this.cfg.claudeNative : this.cfg.enabled;
   }
 
+  /** A route (pending delivery marker) is judged by the SAME provider as its
+   * waits: the recorded provider of a wait on the route, else the key. */
   private routeEnabled(routeKey: string): boolean {
-    return isClaudeNativeRouteKey(routeKey) ? this.cfg.claudeNative : this.cfg.enabled;
+    const provider = this.ledger.listProviderWaits({ routeKey })[0]?.provider ??
+      (isClaudeNativeRouteKey(routeKey) ? CLAUDE_NATIVE_PROVIDER : routeKey);
+    return this.enabledFor(provider);
   }
 
   /** Start the deterministic service timer (never an OS daemon). */
@@ -805,42 +830,74 @@ export class ProviderRecoverySensor {
 
   /** A provider's switch turned off across a restart (`claude_native` or
    * `enabled`) must never strand the waits it left open: each open wait of a
-   * provider that is now off is handed back to the owner — its machine-owned
-   * stop becomes the needs-owner stop the wall would have posted with
-   * recovery off — and cancelled. Runs at every boot, even with the whole
-   * sensor off. Re-running after a crash between the two steps is safe: an
-   * already re-routed stop is kept, never duplicated. */
+   * provider that is now off is cancelled (which resolves its own
+   * machine-owned stop) and handed to the owner through one needs-owner
+   * notice per wait — posted through the notification center, so it surfaces
+   * in chat, and deduped by kind, so a crash before the cancel never posts it
+   * twice. No notice is posted when the wait's stop was already acked or
+   * resolved (the lane was handled) or the lane already has an open owner
+   * stop. A route left with no open wait retires its "watching" notice and
+   * pending delivery marker. Runs at every boot, even with the sensor off;
+   * one failing wait is logged and kept for the next boot, never blocking
+   * the rest. */
   handBackDisabledWaits(): number {
     let handedBack = 0;
+    const routes = new Set<string>();
     for (const status of ['waiting', 'recovered-pending'] as const) {
       for (const wait of this.ledger.listProviderWaits({ status })) {
         if (this.enabledFor(wait.provider)) continue;
-        const key = wait.provider === CLAUDE_NATIVE_PROVIDER ? 'claude_native' : 'enabled';
-        const detail = `Automatic provider recovery is off for ${wait.provider} ([provider_recovery] ${key} = false). ` +
-          'Blind restart is withheld. Resolve the provider condition, then ack to re-arm the deterministic restart ladder.';
-        const incident = this.ledger.getNotification(wait.incidentId);
-        const open = incident !== null && incident.ackedAt === null && incident.resolvedAt === null;
-        if (open && incident.routing === 'action-required') {
-          this.ledger.updateNotificationTriage(incident.id, 'needs-owner', detail);
-        } else if (!(open && incident.routing === 'needs-owner')) {
-          this.notifications.postIncident({
-            kind: `provider-recovery.recovery-off.${wait.id}`,
-            routing: 'needs-owner',
-            severity: 'error',
-            title: `Agent ${wait.agentId ?? wait.slotId ?? wait.id} stopped: provider limit (automatic recovery off)`,
-            detail,
-            agentId: wait.agentId,
-            dedupe: 'unacked',
-          });
+        try {
+          this.handBack(wait);
+          handedBack += 1;
+          routes.add(wait.routeKey);
+        } catch (error) {
+          this.log('error', 'provider wait hand-back failed — kept for the next boot', { wait_id: wait.id, error: String(error) });
         }
-        this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'recovery-disabled' });
-        handedBack += 1;
+      }
+    }
+    for (const routeKey of routes) {
+      try {
+        if (this.ledger.listProviderWaits({ routeKey }).some((wait) => wait.status === 'waiting' || wait.status === 'recovered-pending')) continue;
+        this.notifications.resolveIncidents(`provider.waiting.${routeKey}`, 'provider-recovery-sensor');
+        for (const pending of this.ledger.listPendingProviderRecoveries()) {
+          if (pending.routeKey === routeKey) this.ledger.clearPendingProviderRecovery(pending.id);
+        }
+      } catch (error) {
+        this.log('error', 'retiring a handed-back route failed', { route: routeKey, error: String(error) });
       }
     }
     if (handedBack > 0) {
       this.log('warn', 'provider waits handed back to the owner — automatic recovery is off for their provider', { handed_back: handedBack });
     }
     return handedBack;
+  }
+
+  private handBack(wait: ProviderWaitRecord): void {
+    const key = switchFor(wait.provider);
+    const who = wait.agentId ?? wait.slotId ?? wait.id;
+    const recovered = wait.status === 'recovered-pending';
+    const linked = this.ledger.getNotification(wait.incidentId);
+    const handled = linked !== null && (linked.ackedAt !== null || linked.resolvedAt !== null);
+    const ownerStop = wait.agentId === null ? null
+      : this.ledger.findNotificationByKind(`supervision.provider-wall.${wait.agentId}.quota_wall`, 'unacked');
+    if (!handled && ownerStop?.routing !== 'needs-owner') {
+      this.notifications.postIncident({
+        kind: `provider-recovery.recovery-off.${wait.id}`,
+        routing: 'needs-owner',
+        severity: 'error',
+        title: recovered
+          ? `Agent ${who}: provider recovered, automatic resume off`
+          : `Agent ${who} stopped: provider limit (automatic recovery off)`,
+        detail: recovered
+          ? `The ${wait.provider} limit has cleared, but automatic provider recovery is now off ([provider_recovery] ${key} = false), ` +
+            'so the lane was not resumed. Ask Gru to resume or re-dispatch the job.'
+          : `Automatic provider recovery is off for ${wait.provider} ([provider_recovery] ${key} = false), so this lane stays ` +
+            'stopped. Once the provider limit clears, ask Gru to resume or re-dispatch the job.',
+        agentId: wait.agentId,
+        dedupe: 'unacked',
+      });
+    }
+    this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'recovery-disabled' });
   }
 
   /** Boot/restart reconciliation: never silently re-baseline away an
