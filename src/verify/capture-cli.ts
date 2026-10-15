@@ -73,12 +73,13 @@ export const CAPTURE_RESPONSE_TIMEOUT_CODE = 'ERESPONSETIMEOUT';
 const MAX_TIMER_MS = 2_147_483_647;
 
 /** A headers bound that cannot time correctly is refused by name (#389):
- * zero/negative/NaN/infinite or past the timer ceiling would fire at once
- * and fail every request with a misleading timeout. */
+ * NaN/infinite, below Node's 1 ms timer floor (which coerces it to 1 ms) or
+ * past the timer ceiling (which overflows) would fire at once and fail every
+ * request with a misleading timeout. */
 export function checkResponseHeadersTimeoutMs(ms: number): number {
-  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_TIMER_MS) {
+  if (!Number.isFinite(ms) || ms < 1 || ms > MAX_TIMER_MS) {
     throw new RangeError(
-      `responseHeadersTimeoutMs must be a positive number of milliseconds no greater than ${String(MAX_TIMER_MS)} (got ${String(ms)})`,
+      `responseHeadersTimeoutMs must be a number of milliseconds from 1 to ${String(MAX_TIMER_MS)} (got ${String(ms)})`,
     );
   }
   return ms;
@@ -229,7 +230,8 @@ export function nodeStreamFetch(input: string, init?: RequestInit, options: Node
         new Error(
           `${method} ${url.origin}${url.pathname}: no response within ${String(responseHeadersTimeoutMs)} ms ` +
             '(connect + response headers) — the service is unreachable or hung. If the request reached it, it may ' +
-            'still have been accepted: the outcome is unknown (check status with the same request id before rerunning)',
+            "still have been accepted: the outcome is unknown (run the capture helper's status action with the same " +
+            '--request-id before rerunning)',
         ),
         { code: CAPTURE_RESPONSE_TIMEOUT_CODE },
       ));
@@ -247,12 +249,10 @@ export function nodeStreamFetch(input: string, init?: RequestInit, options: Node
   });
 }
 
-/** The production transport, with the deps' headers bound when given. A
- * bound that cannot time correctly fails loud here, before any sink or
- * request exists — never as an UNKNOWN receipt mid-run. */
+/** The production transport, with the deps' headers bound when given
+ * (validated at the CLI entry, before any command runs). */
 function defaultTransport(deps: CaptureCliDeps): FetchLike {
-  const bound = deps.responseHeadersTimeoutMs === undefined ? undefined : checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
-  return (input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: bound });
+  return (input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs });
 }
 
 /** Transport errors keep the primary message and add the underlying code
@@ -697,6 +697,11 @@ async function commandWithdraw(
 }
 
 export async function runCaptureCli(argv: readonly string[], deps: CaptureCliDeps = {}): Promise<CaptureExitCode> {
+  // A headers bound that cannot time correctly is a programming error in
+  // the caller's deps: it fails loud here, for every command and whatever
+  // transport is injected — before any sink, request or receipt exists,
+  // never as an UNKNOWN receipt mid-run (#389).
+  if (deps.responseHeadersTimeoutMs !== undefined) checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
   const stdout = deps.stdout ?? ((text: string) => process.stdout.write(text));
   const stderr = deps.stderr ?? ((text: string) => process.stderr.write(text));
   const [command, ...rest] = argv;

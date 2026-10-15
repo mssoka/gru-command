@@ -1679,8 +1679,9 @@ describe('bounded ambiguous-POST reconciliation', () => {
       await expect(poster.reconcile?.({ ...PR_INPUT, repoPath: repoPathOf(fixture) }), nulled).rejects.toThrow(/malformed list body/u);
       expect(calls.filter((call) => call.method === 'POST' && call.url.endsWith('/reviews')), nulled).toHaveLength(1);
     }
-    // Our login with a missing or non-string type is malformed author
-    // evidence, never a decidable non-match, whatever its nulled field.
+    // Regression guard: our login with a missing or non-string type is
+    // malformed author evidence (refused before the author check), so even
+    // with a nulled field it never becomes a decidable non-match.
     for (const type of [undefined, null, 42] as const) {
       const { type: _dropped, ...withoutType } = MATCHING_REVIEW.user;
       const user = type === undefined ? withoutType : { ...withoutType, type };

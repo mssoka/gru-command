@@ -543,6 +543,15 @@ function usableProviderReviewId(id: unknown): string | null {
   return null;
 }
 
+/** The author check every delivery predicate applies: our App bot's login
+ * on a `Bot` account. One definition, so the decidability guard and the
+ * predicates can never drift apart (#390). */
+function isOurBotAuthor(user: unknown, botLogin: string): boolean {
+  if (user === null || typeof user !== 'object') return false;
+  const author = user as { readonly login?: unknown; readonly type?: unknown };
+  return author.login === botLogin && author.type === 'Bot';
+}
+
 /** The delivery predicate without the provider-id requirement: author
  * login+type, the ENACTED state this delivery intended, frozen head, and
  * byte-identical body. With a
@@ -554,15 +563,6 @@ function usableProviderReviewId(id: unknown): string | null {
  * beside an approval intent, an unexpected APPROVED beside a change-request
  * intent) is never a match. A null `wantedState` matches ANY enacted state
  * — the wrong-state evidence test below, never a credit predicate. */
-/** The author check every delivery predicate applies: our App bot's login
- * on a `Bot` account. One definition, so the decidability guard and the
- * predicates can never drift apart (#390). */
-function isOurBotAuthor(user: unknown, botLogin: string): boolean {
-  if (user === null || typeof user !== 'object') return false;
-  const author = user as { readonly login?: unknown; readonly type?: unknown };
-  return author.login === botLogin && author.type === 'Bot';
-}
-
 function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string | null, notBeforeMs: number | null): boolean {
   if (!isOurBotAuthor(review.user, botLogin)) return false;
   if ((wantedState !== null && review.state !== wantedState) || review.commit_id !== targetSha || review.body !== body) return false;

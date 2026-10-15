@@ -27,6 +27,7 @@ import {
   CAPTURE_EXIT,
   CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS,
   CAPTURE_RESPONSE_TIMEOUT_CODE,
+  checkResponseHeadersTimeoutMs,
   describeTransportError,
   nodeStreamFetch,
   parsePsOutput,
@@ -684,24 +685,41 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
   });
 
   it('refuses a headers bound that cannot time correctly by name — a rejection, and before any run starts (#389)', async () => {
-    for (const bound of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 31]) {
+    // The timer's real range is accepted at both edges.
+    expect(checkResponseHeadersTimeoutMs(1)).toBe(1);
+    expect(checkResponseHeadersTimeoutMs(2_147_483_647)).toBe(2_147_483_647);
+    for (const bound of [0, 0.5, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 31]) {
       // A Promise-returning transport rejects; it never throws synchronously.
       const pending = nodeStreamFetch('http://127.0.0.1:9/x', undefined, { responseHeadersTimeoutMs: bound });
-      await expect(pending, String(bound)).rejects.toThrow(/responseHeadersTimeoutMs must be a positive number of milliseconds no greater than 2147483647/u);
+      await expect(pending, String(bound)).rejects.toThrow(/responseHeadersTimeoutMs must be a number of milliseconds from 1 to 2147483647/u);
     }
-    // The CLI refuses it at the boundary: no sink, no receipt, no request.
+    // The CLI refuses it at the boundary for every command, whatever transport
+    // is injected: no sink, no receipt, no request.
     const dir = tempDir();
     const sinkPath = join(dir, 'bad-bound.ndjson');
+    const fetchImpl = vi.fn();
     await expect(runCaptureCli(
       [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-bad-bound', '--url', 'http://127.0.0.1:9', '--token', 't'],
       deps({ stdout: () => {}, responseHeadersTimeoutMs: 0 }),
     )).rejects.toThrow(RangeError);
+    await expect(runCaptureCli(
+      [...BASE_ARGS, '--sink', sinkPath, '--request-id', 'req-bad-bound', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      { ...deps({ stdout: () => {} }), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0.5 },
+    )).rejects.toThrow(RangeError);
+    const errors: string[] = [];
+    await expect(runCaptureCli(
+      ['status', '--request-id', 'req-bad-bound', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      { responseHeadersTimeoutMs: 0, stdout: () => {}, stderr: (text: string) => errors.push(text) },
+    )).rejects.toThrow(RangeError);
+    expect(errors).toEqual([]);
+    expect(fetchImpl).not.toHaveBeenCalled();
     expect(existsSync(sinkPath)).toBe(false);
     expect(existsSync(captureReceiptPath(sinkPath))).toBe(false);
   });
 
   it('the headers bound ends at the response: a body quiet for longer than it still streams to EOF (#389)', async () => {
-    const bound = 200;
+    // Generous against a loaded runner's connect + headers latency.
+    const bound = 1_000;
     let held: ServerResponse | null = null;
     const server = createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/x-ndjson' });
@@ -712,9 +730,10 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     try {
       const port = (server.address() as AddressInfo).port;
       const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/quiet`, undefined, { responseHeadersTimeoutMs: bound });
-      // The body stays quiet past the bound by construction: it is released
-      // only after the bound has elapsed SINCE the headers arrived.
-      await new Promise((resolveWait) => setTimeout(resolveWait, bound * 3));
+      // The body stays quiet past the bound by construction: the timer was
+      // armed before connect, and the body is released only after the whole
+      // bound (plus a margin) has elapsed SINCE the headers arrived.
+      await new Promise((resolveWait) => setTimeout(resolveWait, bound + 250));
       expect(held).not.toBeNull();
       held!.end('second\n');
       expect(await response.text()).toBe('first\nsecond\n');
