@@ -26,6 +26,8 @@ export interface DirectiveProgressDeps {
   readonly parentTools?: (agentId: string) => readonly NativeAgentTool[];
   readonly lessons?: LessonsReferencePort;
   readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
+  /** Job-admission kinds owned by the calling service that legitimately span this directive (e.g. an owner-approved property repair allocation). */
+  readonly ownAdmissionKinds?: readonly string[];
   readonly clearLaneForWriter?: (input: { readonly jobId: string; readonly writer: string }) => Promise<unknown>;
 }
 function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): void {
@@ -104,7 +106,7 @@ function checkAdmissionFences(deps: DirectiveProgressDeps, identity: DirectiveTu
   const ownNativeProducer = handle?.id === producer?.agentId && handle?.sessionFile === producer?.sessionFile ? producer : undefined;
   const durable = deps.ledger.directiveProgressBlockers(identity.requestId, lane?.id ?? '', ownSpawningAgentId, producerStartSeq, ownNativeProducer)
     .filter((blocker) => !blocker.startsWith('in-flight admission(s):'));
-  const own = new Set([`directive ${identity.requestId}`, `directive recovery ${identity.requestId}`, `rebrief ${identity.requestId}`]);
+  const own = new Set([`directive ${identity.requestId}`, `directive recovery ${identity.requestId}`, `rebrief ${identity.requestId}`, ...(deps.ownAdmissionKinds ?? [])]);
   const reservations = deps.ledger.listJobAdmissions(identity.jobId).filter((kind) => !own.has(kind));
   const supervised = [...deps.pendingProducerBlockers(identity.jobId, handle !== undefined && ownNativeProducer !== undefined ? { handle, producer: ownNativeProducer } : undefined), ...cleanupOwnershipBlockers(deps.ledger, identity.jobId)];
   if (durable.length + reservations.length + supervised.length > 0) throw new DirectiveCheckpointError(`directive producer fences: ${[...durable, ...reservations, ...supervised].join('; ')}`);

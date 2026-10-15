@@ -1,0 +1,32 @@
+{
+  "numTotalTestSuites": 1,
+  "numTotalTests": 2,
+  "numPassedTests": 0,
+  "numFailedTests": 2,
+  "numPendingTests": 0,
+  "numTodoTests": 0,
+  "success": false,
+  "testResults": [
+    {
+      "name": "/repo/test/property/ratio.test.ts",
+      "status": "failed",
+      "message": "",
+      "assertionResults": [
+        {
+          "status": "failed",
+          "fullName": "ratio stays within the declared bounds",
+          "failureMessages": [
+            "Property failed after 34 tests\nseed: -1731691812\ncounterexample: [7, 13]"
+          ]
+        },
+        {
+          "status": "failed",
+          "fullName": "ratio respects the denominator sign",
+          "failureMessages": [
+            "Property failed after 12 tests\nseed: 884123765\ncounterexample: [-5, 9]"
+          ]
+        }
+      ]
+    }
+  ]
+}
