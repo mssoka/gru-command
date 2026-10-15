@@ -1866,9 +1866,53 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       expect(refreshed?.detail).not.toBe(open!.detail);
       expect(h.ledger.latestNotificationByKind('provider-recovery.hand-back-failed')?.id).toBe(open!.id); // nothing new posted
       // Even once Gru disposed of it too, the wait's notice reads that latest
-      // report (insertion order, not the newer-ts resolved row).
+      // report (insertion order), though the newest-ts row still predates
+      // the wait.
       expect(h.ledger.disposeMachineNotification(open!.id, 'Gru checked')).toMatchObject({ resolvedAt: expect.any(String) });
+      expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'any')?.id).toBe(ahead!.id);
+      expect(Date.parse(ahead!.ts)).toBeLessThan(Date.parse(late.createdAt));
       vi.setSystemTime(new Date(now + 10_800_000));
+      // The two waits glmDebt opened and the late one.
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a clock step back the other way — a report after the wait opened, then a repost that sorts older — still marks the wait', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      const failingBoot = (): void => {
+        const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+        try {
+          expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+        } finally {
+          reads.mockRestore();
+        }
+      };
+      const now = Date.now();
+      vi.setSystemTime(new Date(now + 7_200_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      // A failing boot reports after the wait opened; Gru disposes of it.
+      vi.setSystemTime(new Date(now + 10_800_000));
+      failingBoot();
+      const reported = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(h.ledger.disposeMachineNotification(reported!.id, 'Gru checked')).toMatchObject({ resolvedAt: expect.any(String) });
+      // The clock steps back; a failing boot reposts — the latest inserted row
+      // now carries an EARLIER time than the wait.
+      vi.setSystemTime(new Date(now + 60_000));
+      failingBoot();
+      const repost = h.ledger.latestNotificationByKind('provider-recovery.hand-back-failed');
+      expect(repost?.id).not.toBe(reported!.id);
+      expect(Date.parse(repost!.ts)).toBeLessThan(Date.parse(late.createdAt));
+      vi.setSystemTime(new Date(now + 14_400_000));
+      // The two waits glmDebt opened and the late one.
       expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
       expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
         .toContain('A boot hand-back failure was reported since this wait opened');

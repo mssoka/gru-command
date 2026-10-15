@@ -1088,14 +1088,21 @@ export class ProviderRecoverySensor {
         : 'resume it (dispose its re-arm control once a live agent is adopted) or re-dispatch the job';
       // Told before — this wait's own notice (Gru disposed of it while the
       // wait stayed open, or the switch was on again in between), or a boot
-      // hand-back failure reported since the wait opened — the last report
-      // time of the most recently inserted notice (only the open notice is
-      // ever refreshed, so it carries the latest report whatever the clock
-      // did), resolved or not: Gru may have acted on it; an unreadable time
-      // counts as reported. Say so, so a re-dispatch is never doubled.
+      // hand-back failure reported since the wait opened, resolved or not
+      // (Gru may have acted on it): say so, so a re-dispatch is not doubled.
+      // The open, the most recently inserted and the newest-ts notice are
+      // each asked, so a clock step back in either direction between two
+      // notices still marks (conservatively); an unreadable time counts as
+      // reported. Report times are wall-clock against the wait's creation
+      // time, so a step back between a wait opening and a report can still
+      // leave it unmarked — waits record no event order to compare against.
       const announced = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') !== null;
-      const failure = this.ledger.latestNotificationByKind(HAND_BACK_FAILED);
-      const failureSince = failure !== null && !(lastReportedAt(failure) < Date.parse(wait.createdAt));
+      const opened = Date.parse(wait.createdAt);
+      const failureSince = [
+        this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'active'),
+        this.ledger.latestNotificationByKind(HAND_BACK_FAILED),
+        this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'any'),
+      ].some((row) => row !== null && !(lastReportedAt(row) < opened));
       const repeat = announced
         ? 'Announced before and the wait is still open — check whether the lane already resumed before you act. '
         : failureSince
