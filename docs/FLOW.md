@@ -479,6 +479,19 @@ verification budget.
   evidence for its captured exact head, not paid-model behavior or native
   Perkins READY. Final integrated/FULL/remote CI acceptance remains separate.
 
+- **Integration rounds retain coverage only under proof, and never stall the
+  final pass (#392, #393, #397).** When the merge base moves under a
+  reviewed candidate, an integration round may retain the prior coverage
+  and review only the integration unit — but only after the engine itself
+  re-proves the lineage (the reviewed head descends into the candidate, the
+  prior base into the new one) and the unit is bounded (at most 4000
+  changed paths, 8 MiB of diff, strict UTF-8 paths, every `git diff --raw`
+  record parsed); any failed proof reviews the whole change instead, with
+  the reason disclosed as `deltaUnavailable`. A partial integration READY
+  still owes the final whole-change pass; if the base moves again before
+  that pass runs, the next round reviews whole (whatever the candidate,
+  policy or lineage), so a moving base can never defer approval forever.
+
 - **Fail-before baselines are declared scopes, not hand runs (#394).** A
   repair's fail-before claim is proved by a declared `[verify]` scope (for
   this repository, the `perkins-int*-baseline*` scopes in

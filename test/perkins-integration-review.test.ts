@@ -9,6 +9,7 @@ import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/per
 import { planPerkinsReviewScope, readPriorConvergenceMeta } from '../src/dispatch/perkins-review/convergence.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { commitManyPaths, LARGE_UNIT_TIMEOUT_MS } from './helpers/large-integration-unit.js';
 
 /**
  * Native integration review with retained prior coverage — exercised through
@@ -449,7 +450,8 @@ describe('native integration review retains prior coverage', () => {
     // head merges main but does not descend from the reviewed H0. A direct
     // engine caller still asks for an integration round.
     const { b1 } = integrateClean(harness.repo);
-    harness.repo.git(['checkout', '-B', 'feature/integration', b0]);
+    const featureBranch = harness.repo.git(['rev-parse', '--abbrev-ref', 'HEAD']);
+    harness.repo.git(['checkout', '-B', featureBranch, b0]);
     harness.repo.commitFile('src/feature.ts', 'export const feature = 2;\n');
     harness.repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
     const h1 = harness.repo.head();
@@ -459,14 +461,18 @@ describe('native integration review retains prior coverage', () => {
       roundId: 'lineage-round-2', roundNumber: 2, frozen: frozen2,
       reviewScope: 'integration', priorConsolidatedFile: consolidated1,
     });
-    const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
+    const lead = harness.leadCalls.at(-1);
+    expect(lead, 'round 2 prompted its lead').toBeDefined();
+    const prompt = lead?.prompt ?? '';
     expect(round2.convergence?.reviewScope).toBe('whole');
     expect(round2.convergence?.deltaUnavailable).toContain('integration lineage could not be re-proven');
     expect(round2.convergence?.scopeReason).toContain('whole-change re-verification');
     expect(round2.convergence?.integrationFromSha).toBeUndefined();
     expect(prompt).toContain('REVIEW SCOPE: WHOLE CHANGE');
     expect(prompt).not.toContain('--- INTEGRATION UNIT');
-    expect(b1).toMatch(/^[0-9a-f]{40}$/u);
+    // The rewritten candidate did integrate the advanced base: only the
+    // reviewed head's lineage is broken, which is exactly what is re-proven.
+    expect(() => harness.repo.git(['merge-base', '--is-ancestor', b1, h1])).not.toThrow();
   });
 
   it('an integration unit over its path bound falls back to a disclosed whole round, never a truncated unit (#393)', async () => {
@@ -478,14 +484,7 @@ describe('native integration review retains prior coverage', () => {
     await runRound(harness, { roundId: 'bound-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'bound-round-1'), 'consolidated.json');
     integrateClean(harness.repo);
-    // Thousands of new objects must not start a detached background gc /
-    // maintenance that is still writing .git while the fixture is removed.
-    harness.repo.git(['config', 'gc.auto', '0']);
-    harness.repo.git(['config', 'maintenance.auto', 'false']);
-    mkdirSync(join(harness.repo.path, 'many'));
-    for (let index = 0; index < 4001; index += 1) writeFileSync(join(harness.repo.path, 'many', `f${String(index)}.ts`), `export const v${String(index)} = ${String(index)};\n`);
-    harness.repo.git(['add', 'many']);
-    harness.repo.git(['commit', '-m', 'touch 4001 paths']);
+    commitManyPaths(harness.repo, 4001);
     const frozen2 = freeze(harness, 'bound-round-2', harness.repo.head());
     const round2 = await runRound(harness, {
       roundId: 'bound-round-2', roundNumber: 2, frozen: frozen2,
@@ -494,8 +493,10 @@ describe('native integration review retains prior coverage', () => {
     expect(round2.convergence?.reviewScope).toBe('whole');
     expect(round2.convergence?.deltaUnavailable).toContain('over the 4000-path bound');
     expect(round2.convergence?.scopeReason).toContain('whole-change re-verification');
-    expect(harness.leadCalls.at(-1)!.prompt ?? '').not.toContain('--- INTEGRATION UNIT');
-  });
+    const lead = harness.leadCalls.at(-1);
+    expect(lead, 'round 2 prompted its lead').toBeDefined();
+    expect(lead?.prompt ?? '').not.toContain('--- INTEGRATION UNIT');
+  }, LARGE_UNIT_TIMEOUT_MS);
 
   it('records whole-candidate coverage even when the whole round requests changes', async () => {
     const harness = makeEngine({

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,6 +28,7 @@ import { PerkinsWholeReview, type PerkinsWholeResult } from '../src/dispatch/per
 import type { VerifiedFinding } from '../src/dispatch/perkins-review/types.js';
 import { fakeWholeSpawner, groundedFinding, type WholeLeadOptions } from './helpers/perkins-whole-double.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { commitManyPaths, LARGE_UNIT_TIMEOUT_MS } from './helpers/large-integration-unit.js';
 
 const repos: FixtureRepo[] = [];
 const temporaryDirectories: string[] = [];
@@ -504,21 +505,15 @@ describe('integration unit fail-loud guards (#393)', () => {
 
   it('refuses an integration unit over the path bound instead of truncating it', () => {
     const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-paths');
-    // Thousands of new objects must not start a detached background gc /
-    // maintenance that is still writing .git while the fixture is removed.
-    repo.git(['config', 'gc.auto', '0']);
-    repo.git(['config', 'maintenance.auto', 'false']);
-    mkdirSync(join(repo.path, 'many'));
-    for (let index = 0; index < 4001; index += 1) writeFileSync(join(repo.path, 'many', `f${String(index)}.ts`), `export const v${String(index)} = ${String(index)};\n`);
-    repo.git(['add', 'many']);
-    repo.git(['commit', '-m', 'touch 4001 paths']);
+    commitManyPaths(repo, 4001);
     expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/integration unit touches 4001 paths, over the 4000-path bound/u);
-  });
+  }, LARGE_UNIT_TIMEOUT_MS);
 
   it('refuses an integration unit whose diff exceeds the byte cap', () => {
     const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-bytes');
     repo.commitFile('src/huge.ts', `${'x'.repeat(1023)}\n`.repeat(9 * 1024));
-    expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/exceeds 8388608 UTF-8 bytes/u);
+    // The unit's own diff cap (diffForPaths), not another guard's message.
+    expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/^integration unit for [0-9a-f]{12} exceeds 8388608 UTF-8 bytes$/u);
   });
 
   it('refuses a changed path that is not valid UTF-8 rather than mangling it', () => {
@@ -541,6 +536,12 @@ describe('integration unit fail-loud guards (#393)', () => {
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} M\0`))).toThrow(/record with no path/u);
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} M`))).toThrow(/record with no path/u);
     expect(() => parseRawChanges(Buffer.from([0x3a, 0xff, 0x00]))).toThrow(/not valid UTF-8/u);
+    // Only the trailing NUL's empty field is skipped: stray output and a
+    // repeated path fail closed instead of shrinking the reviewed unit.
+    expect(() => parseRawChanges(Buffer.from(`garbage\0:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`))).toThrow(/unexpected field outside a record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0\0`))).toThrow(/unexpected field outside a record/u);
+    const record = `:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`;
+    expect(() => parseRawChanges(Buffer.from(record + record))).toThrow(/duplicate path/u);
   });
 });
 
@@ -1011,6 +1012,22 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
     expect(scope(meta({ reviewScope: 'integration', canonicalVerdict: 'NEEDS CHANGES' }), integratedForward).scope).toBe('integration');
     // With the final whole pass disabled by policy there is no owed pass.
     expect(scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), { ...integratedForward, finalWholePassAtReady: false }).scope).toBe('integration');
+    // An UNCHANGED candidate adopting the new base would defer the owed pass
+    // just the same: the bound covers it too.
+    const sameHead = { ...integratedForward, currentTargetSha: meta({}).targetSha,
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: false, sameHeadAdoptedBase: true } };
+    expect(scope(meta({ reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE' }), sameHead).scope).toBe('integration');
+    const sameHeadBounded = scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), sameHead);
+    expect(sameHeadBounded.scope).toBe('whole');
+    expect(sameHeadBounded.reason).toContain('still owes the final whole-change pass');
+    // The bound wins whatever the policy or lineage would otherwise say.
+    for (const variant of [{ integrationCoverage: false }, { integrationLineage: null }, { acceptanceCompatible: false }]) {
+      const bounded2 = scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), { ...integratedForward, ...variant });
+      expect(bounded2.reason, JSON.stringify(variant)).toContain('still owes the final whole-change pass');
+    }
+    // Liveness: the bounded whole round records COMPLETE coverage whatever its
+    // verdict, so the next base move retains coverage instead of looping.
+    expect(scope({ ...meta({ reviewScope: 'whole', canonicalVerdict: 'NEEDS CHANGES' }), coverageComplete: true }, integratedForward).scope).toBe('integration');
   });
 
   it('falls back to whole when integration coverage is unsafe', () => {

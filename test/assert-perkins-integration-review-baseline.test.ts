@@ -1,10 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   BASELINE_TITLES,
   assertPerkinsIntegrationBaseline,
   isBehavioralAssertion,
 } from '../tools/assert-perkins-integration-review-baseline.mjs';
+import { loadWorktreeManifest } from '../src/worktrees/manifest.js';
 
 const FAST_TITLE = BASELINE_TITLES.fast[0]!;
 const [HEAVY_CRASH_TITLE, HEAVY_CRASH_PROMOTION_TITLE, HEAVY_PIN_TITLE] = BASELINE_TITLES.heavy;
@@ -134,19 +135,54 @@ describe('perkins integration R4 fail-before classifier', () => {
     expect(isBehavioralAssertion(`${RESOLVED_INSTEAD}\n    at /repo/test/perkins-integration-review.test.ts:77:9`)).toBe(true);
   });
 
-  it('every classifier leg is wired to a declared verification scope that runs exactly its named regressions (#394)', () => {
+  it('judges real Vitest stack shapes: machinery frames skipped, file:// and odd paths located, unlocatable stacks refused (#394)', () => {
+    // Real report shape: the assertion machinery's file:// frames come first.
+    const machineryFirst = [
+      `${RESOLVED_INSTEAD}`,
+      '    at _Assertion.__VITEST_RESOLVES__ (file:///repo/node_modules/@vitest/expect/dist/index.js:1577:17)',
+      '    at Reflect.get (<anonymous>)',
+      '    at Object.proxyGetter [as get] (file:///repo/node_modules/chai/index.js:1645:22)',
+      '    at file:///repo/test/perkins-integration-review.test.ts:146:29',
+      '    at processTicksAndRejections (node:internal/process/task_queues:105:5)',
+    ].join('\n');
+    expect(isBehavioralAssertion(machineryFirst)).toBe(true);
+    // The same shape with a helper as the first non-machinery frame is setup.
+    expect(isBehavioralAssertion(machineryFirst.replace('/repo/test/perkins-integration-review.test.ts', '/repo/test/helpers/fixture-repo.ts'))).toBe(false);
+    // Windows drive paths, parentheses in paths and CRLF line endings.
+    expect(isBehavioralAssertion('AssertionError: x\r\n    at C:\\repo\\test\\a (copy).test.ts:3:4')).toBe(true);
+    expect(isBehavioralAssertion('AssertionError: x\r\n    at fn (file:///repo/test/helpers/h (1).ts:3:4)')).toBe(false);
+    // A stack present but nothing in it locatable (or only machinery) is refused.
+    expect(isBehavioralAssertion('AssertionError: x\n    at async Promise.all (index 0)\n    at <anonymous>')).toBe(false);
+    expect(isBehavioralAssertion('AssertionError: x\n    at processTicksAndRejections (node:internal/process/task_queues:105:5)')).toBe(false);
+    // A report with no stack lines at all is judged by its head.
+    expect(isBehavioralAssertion('AssertionError: expected 1 to be 2')).toBe(true);
+  });
+
+  it('every classifier leg is wired to declared verification scopes that run exactly its named regressions (#394)', () => {
     // The fail-before claim never depends on someone running the classifier
-    // by hand: each leg is invoked by a declared [verify] scope.
-    const manifest = readFileSync(new URL('../.gru-command/worktree.toml', import.meta.url), 'utf8');
-    const scopes = manifest.split('\n').filter((line) => line.includes('assert-perkins-integration-review-baseline.mjs'));
+    // by hand: each leg is invoked by declared [verify] scopes, parsed from
+    // the manifest (comments never count), and EVERY scope of a leg checks
+    // out its uncorrected base, emits a JSON report and selects that leg's
+    // named regressions and no other leg's.
+    const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'))!;
+    const scopes = Object.entries(manifest.verify).filter(([, command]) => command.includes('assert-perkins-integration-review-baseline.mjs'));
+    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs" (\S+) /u.exec(command)?.[1];
     for (const [leg, titles] of Object.entries(BASELINE_TITLES)) {
-      const scope = scopes.find((line) => line.includes(`assert-perkins-integration-review-baseline.mjs" ${leg} `));
-      expect(scope, `leg ${leg} has a declared verification scope`).toBeDefined();
-      const filter = /-t "([^"]+)"/u.exec(scope!)?.[1];
-      expect(filter, `leg ${leg} selects its regressions by name`).toBeDefined();
-      const pattern = new RegExp(filter!, 'u');
-      for (const title of titles) expect(pattern.test(title), `${leg}: ${title}`).toBe(true);
+      const own = scopes.filter(([, command]) => legOf(command) === leg);
+      expect(own.length, `leg ${leg} has a declared verification scope`).toBeGreaterThan(0);
+      const others = Object.entries(BASELINE_TITLES).filter(([other]) => other !== leg).flatMap(([, list]) => list).filter((title) => !titles.includes(title));
+      for (const [name, command] of own) {
+        expect(command, `${name} checks out its uncorrected base`).toMatch(/\bbase=[0-9a-f]{40}\b[\s\S]*git archive "\$base"/u);
+        expect(command, `${name} emits a JSON report`).toContain('--reporter=json');
+        const filter = /-t "([^"]+)"/u.exec(command)?.[1];
+        expect(filter, `${name} selects its regressions by name`).toBeDefined();
+        const pattern = new RegExp(filter!, 'u');
+        for (const title of titles) expect(pattern.test(title), `${name}: ${title}`).toBe(true);
+        for (const title of others) expect(pattern.test(title), `${name} must not select ${title}`).toBe(false);
+      }
     }
+    // No scope invokes an unknown leg.
+    for (const [name, command] of scopes) expect(Object.keys(BASELINE_TITLES), name).toContain(legOf(command));
   });
 
   it('refuses an unparseable report, a missing named regression and an unknown leg', () => {

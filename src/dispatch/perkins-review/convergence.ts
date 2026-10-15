@@ -412,7 +412,10 @@ export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
   const fields = output.split('\0');
   for (let index = 0; index < fields.length; index += 1) {
     const header = fields[index]!;
-    if (!header.startsWith(':')) continue;
+    // `-z` output ends with a NUL: only that final empty field is skipped;
+    // any other stray field is unexpected output and fails closed.
+    if (header === '' && index === fields.length - 1) continue;
+    if (!header.startsWith(':')) throw new Error('git diff --raw produced an unexpected field outside a record');
     const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) [A-Z]\d*$/u.exec(header);
     // A header that starts a raw record but does not parse is unexpected
     // output: fail closed (the caller reviews whole) rather than silently
@@ -422,6 +425,9 @@ export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
     // A missing/empty path field is the same fail-open class: refuse it.
     if (path === undefined || path === '') throw new Error('git diff --raw produced a record with no path');
     index += 1;
+    // One record per path: a repeated path would silently drop a record from
+    // the carry-scope comparison, so it fails closed too.
+    if (changes.has(path)) throw new Error('git diff --raw produced a duplicate path');
     changes.set(path, { oldMode: match[1]!, newMode: match[2]!, oldSha: match[3]!, newSha: match[4]! });
   }
   return changes;
@@ -720,12 +726,15 @@ export function planReviewScope(input: {
   if (prior.diffBaseSha !== input.currentDiffBaseSha) {
     // Liveness (#397): a partial-coverage INTEGRATION round that posted READY
     // owes the final whole-change pass, normally chained at the same
-    // candidate. When the candidate moved on before that pass ran, another
-    // integration round would retain the same partial coverage and owe the
-    // pass again — a base that keeps moving could defer it forever and the PR
-    // would stall (approval is never credited without it). So the chain is
-    // bounded at one integration round: this round reviews whole, and once it
-    // is READY later base moves retain COMPLETE coverage.
+    // candidate. When the merge base moved again before that pass ran —
+    // whether or not the candidate moved too (an unchanged head adopting the
+    // new base included) — another integration round would retain the same
+    // partial coverage and owe the pass again: a base that keeps moving could
+    // defer it forever and the PR would stall (approval is never credited
+    // without it). So the chain is bounded at one integration round, whatever
+    // the policy or lineage: this round reviews whole, and a whole round
+    // records complete coverage whatever its verdict, so later base moves
+    // retain COMPLETE coverage again.
     if (input.finalWholePassAtReady && prior.reviewScope === 'integration' && !prior.coverageComplete &&
       prior.canonicalVerdict === 'READY TO MERGE') {
       return {

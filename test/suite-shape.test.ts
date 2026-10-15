@@ -154,7 +154,7 @@ const PINS: Record<string, number> = {
   'classify-baseline.test.ts': 32,
   'assert-merge-authority-baseline.test.ts': 8,
   'assert-notification-card-baseline.test.ts': 8,
-  'assert-perkins-integration-review-baseline.test.ts': 7,
+  'assert-perkins-integration-review-baseline.test.ts': 8,
   'assert-repo-overview-baseline.test.ts': 4,
   'assert-restart-recovery-baseline.test.ts': 7,
   'assert-verify-keepalive-baseline.test.ts': 7,

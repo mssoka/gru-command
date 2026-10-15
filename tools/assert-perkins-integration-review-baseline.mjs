@@ -63,21 +63,36 @@ export const BASELINE_TITLES = {
 
 const ASSERTION_HEAD = /^AssertionError: /u;
 const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|rejected) .* instead of (?:rejecting|resolving)$/u;
-const STACK_FRAME = /^\s+at (?:.*\()?((?:[A-Za-z]:)?[^():]+):\d+:\d+\)?$/u;
+/** A stack line, and the location of a stack frame that names one: a plain
+ * path, a Windows drive path or a file:// URL, with or without a function
+ * name; paths may contain parentheses or colons. */
+const STACK_LINE = /^\s+at /u;
+const STACK_FRAME = /^\s+at (?:.*?\()?(?:file:\/\/)?(.+?):\d+:\d+\)?$/u;
+/** Runtime and assertion-machinery frames sit between a matcher and its
+ * caller; they never decide who raised the assertion. */
+const MACHINERY_FRAME = /^node:|\/node_modules\/(?:@vitest\/|vitest\/|chai\/|tinyspy\/|@jest\/expect)/u;
 
 /** A behavioral RED: the failure's OWN first line is a Vitest matcher
  * failure or a rejects/resolves report — never a timeout, import,
  * collection or setup error that merely embeds that text (#394). When the
- * message carries a stack, the assertion must also have been raised in a
- * test file: an assertion inside a shared helper module (test/helpers/…)
- * or a dependency is setup, not the named regression's claim. */
+ * message carries a stack, its first non-machinery frame must be a test
+ * file: an assertion inside a shared helper module (test/helpers/…) or a
+ * dependency is setup, not the named regression's claim, and a stack nothing
+ * in which can be located is refused. */
 export function isBehavioralAssertion(message) {
   if (typeof message !== 'string') return false;
-  const [head = '', ...rest] = message.split('\n');
+  const [head = '', ...rest] = message.split(/\r?\n/u);
   if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return false;
-  const frame = rest.map((line) => STACK_FRAME.exec(line)).find((match) => match !== null);
-  if (frame === undefined) return true; // stackless report: the head decides
-  const file = frame[1].replaceAll('\\', '/');
+  const stack = rest.filter((line) => STACK_LINE.test(line));
+  // A report without any stack lines is judged by its head alone.
+  if (stack.length === 0) return true;
+  // The first frame outside the runtime and assertion machinery decides. A
+  // stack whose frames are all unparseable or all machinery is refused —
+  // never an open door for a helper-raised assertion (#394).
+  const file = stack
+    .map((line) => STACK_FRAME.exec(line)?.[1]?.replaceAll('\\', '/'))
+    .find((location) => location !== undefined && !MACHINERY_FRAME.test(location));
+  if (file === undefined) return false;
   return /\.test\.[cm]?[jt]s$/u.test(file) && !file.includes('/node_modules/') && !file.includes('/test/helpers/');
 }
 
