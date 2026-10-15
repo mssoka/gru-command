@@ -455,10 +455,13 @@ child.on('error', (error) => report({ outcome: 'spawn-error', message: String(er
 child.on('exit', (code, signal) => {
   if (done) return;
   // Only what is already in the pipes when git exits can complete its
-  // answer (#262): read it synchronously, without ever waiting. A pipe that
+  // answer (#262): read it synchronously at this exit observation — the
+  // earliest point the runner can know — without ever waiting. A pipe that
   // is not at end-of-file by the first would-block is still held open by
   // another process, possibly still writing — the answer is incomplete, and
-  // later data or EOF can never revive it. No writer is waited for or signalled.
+  // later data or EOF can never revive it. No writer is waited for or
+  // signalled. (A writer that already finished and closed before this
+  // observation is indistinguishable from git's own output.)
   const drain = (stream, take) => {
     if (stream.destroyed || stream.readableEnded) return true;
     const fd = stream._handle && stream._handle.fd;
