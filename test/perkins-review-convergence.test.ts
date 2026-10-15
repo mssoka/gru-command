@@ -504,6 +504,10 @@ describe('integration unit fail-loud guards (#393)', () => {
 
   it('refuses an integration unit over the path bound instead of truncating it', () => {
     const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-paths');
+    // Thousands of new objects must not start a detached background gc /
+    // maintenance that is still writing .git while the fixture is removed.
+    repo.git(['config', 'gc.auto', '0']);
+    repo.git(['config', 'maintenance.auto', 'false']);
     mkdirSync(join(repo.path, 'many'));
     for (let index = 0; index < 4001; index += 1) writeFileSync(join(repo.path, 'many', `f${String(index)}.ts`), `export const v${String(index)} = ${String(index)};\n`);
     repo.git(['add', 'many']);

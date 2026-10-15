@@ -478,6 +478,10 @@ describe('native integration review retains prior coverage', () => {
     await runRound(harness, { roundId: 'bound-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
     const consolidated1 = join(reviewArtifactDirectory(harness.root, 'bound-round-1'), 'consolidated.json');
     integrateClean(harness.repo);
+    // Thousands of new objects must not start a detached background gc /
+    // maintenance that is still writing .git while the fixture is removed.
+    harness.repo.git(['config', 'gc.auto', '0']);
+    harness.repo.git(['config', 'maintenance.auto', 'false']);
     mkdirSync(join(harness.repo.path, 'many'));
     for (let index = 0; index < 4001; index += 1) writeFileSync(join(harness.repo.path, 'many', `f${String(index)}.ts`), `export const v${String(index)} = ${String(index)};\n`);
     harness.repo.git(['add', 'many']);
