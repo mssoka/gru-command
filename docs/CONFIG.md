@@ -393,8 +393,8 @@ enabled = false
 # resets. ON by default, independent of `enabled`. Off — and always for
 # API-key/override contexts — Claude quota walls are left to Gru. Turning
 # either switch off hands that provider's open waits to Gru at the next
-# boot (one action-required notice per wait, unless the lane already
-# holds a stop) — never stranded.
+# boot (an action-required notice per wait; none where the owner already
+# holds the lane's stop) — never stranded.
 claude_native = true
 # Sensor tick (how often routes are re-examined). The check cadence
 # itself cannot go below the approved 300 s floor.

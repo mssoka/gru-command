@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -590,7 +590,7 @@ describe('supervisor ⇄ sensor seam', () => {
     h.supervisor.dispose();
     h.sensor.stop();
     const off = new ProviderRecoverySensor({
-      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: false },
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false },
       ledger: h.ledger, probe: h.probe, notifications: h.notifications,
       wake: { trigger: async () => {} }, silasHosted: () => true,
     });
@@ -612,10 +612,25 @@ describe('supervisor ⇄ sensor seam', () => {
       expect(control).toMatchObject({ routing: 'action-required', agentId: handle.id });
       expect(restarted.onNotificationDisposed(control!.id)).toEqual({ ok: false,
         reason: 'restored breaker has not been adopted by a live agent yet; keep this control open and retry after adoption' });
+      // Once a live agent is adopted, Gru's disposition re-arms the lane.
+      const live = new FakeHandle('minion', handle.id, handle.sessionFile!);
+      h.registry.handles.set(live.id, live);
+      h.registry.emit({ agentId: live.id, role: 'minion', sessionFile: handle.sessionFile!, phase: 'spawned' });
+      expect(restarted.onNotificationDisposed(control!.id)).toEqual({ ok: true, rearmed: true });
     } finally {
       restarted.dispose();
       off.stop();
     }
+  });
+
+  it('the main assembly hands provider waits back before supervision starts (assembly alarm)', () => {
+    // Factory-only tests cannot catch a replaced main wiring: the repo's
+    // source-drift alarm pattern.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).not.toMatch(/supervisorLive\.start\(\)/);
+    const handBack = mainSource.indexOf('handBackThenStartSupervision(providerRecoverySensor, supervisorLive,');
+    expect(handBack).toBeGreaterThan(-1);
+    expect(handBack).toBeLessThan(mainSource.indexOf('await service.start()'));
   });
 
   it('exhausted pacing retries hand the latest typed provider evidence to the recovery sensor', async () => {

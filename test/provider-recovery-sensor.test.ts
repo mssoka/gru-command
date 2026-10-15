@@ -11,6 +11,7 @@ import {
   establishProviderWait,
   ProviderRecoverySensor,
   bootProviderRecovery,
+  handBackThenStartSupervision,
   isClaudeNativeRouteKey,
   providerRouteKey,
   type MetadataReaderPort,
@@ -1323,7 +1324,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     const stopped = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'unacked');
     expect(stopped).toMatchObject({ routing: 'action-required', agentId: 'agent-minion-2' });
     expect(stopped?.detail).toContain('[provider_recovery] enabled = false');
-    expect(stopped?.detail).toContain('Once the provider limit clears, resume it (dispose its re-arm control) or re-dispatch the job.');
+    expect(stopped?.detail).toContain('Once the provider limit clears, resume it (dispose its re-arm control once a live agent is adopted) or re-dispatch the job.');
     expect(stopped?.detail).not.toContain('ask Gru');
     expect(stopped?.detail).not.toContain('Announced before');
     const resumed = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'unacked');
@@ -1374,17 +1375,31 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(surfacingClaudeOnly(h2).sensor.handBackDisabledWaits()).toBe(2);
     expect(h2.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt.waiting.id}`, 'unacked')).not.toBeNull();
     expect(h2.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt.recovered.id}`, 'unacked')).not.toBeNull();
-    // Gru already holds the recovered lane through an unlinked machine stop
-    // (its classification failed, so it was never linked to the wait),
-    // posted through the center: the cancel leaves it open, so no notice joins.
+    // An unlinked machine stop (a failed link write leaves the sensor-owned
+    // text on it), posted through the center, survives the cancel — and Gru
+    // is still told: a redundant notice is cheaper than a stranded lane.
     const h3 = new Harness();
     const debt3 = await glmDebt(h3);
     h3.notifications.postIncident({ kind: 'supervision.provider-wall.agent-minion-1.quota_wall', routing: 'action-required',
-      severity: 'error', title: 'Agent agent-minion-1 stopped: quota wall', agentId: 'agent-minion-1', dedupe: 'unacked' });
+      severity: 'error', title: 'Agent agent-minion-1 stopped: quota wall', agentId: 'agent-minion-1', dedupe: 'unacked',
+      detail: 'Machine-owned temporary provider limit: the recovery sensor owns this stop (no owner ACK required).' });
     const s3 = surfacingClaudeOnly(h3);
     expect(s3.sensor.handBackDisabledWaits()).toBe(2);
-    expect(h3.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt3.recovered.id}`, 'any')).toBeNull();
-    expect(s3.surfaced).toEqual([`provider-recovery.recovery-off.${debt3.waiting.id}`]);
+    expect(h3.ledger.findNotificationByKind('supervision.provider-wall.agent-minion-1.quota_wall', 'unacked')).not.toBeNull();
+    expect(s3.surfaced.sort()).toEqual([`provider-recovery.recovery-off.${debt3.recovered.id}`, `provider-recovery.recovery-off.${debt3.waiting.id}`].sort());
+    // A needs-owner stop LINKED to the wait (the re-triage left it in place):
+    // the cancel never resolves owner attention, so the owner still holds the
+    // lane and no notice joins it.
+    const h5 = new Harness();
+    const debt5 = await glmDebt(h5);
+    h5.ledger.recordNotification({ id: 'linked-owner-stop', kind: 'supervision.provider-wall.agent-minion-2.quota_wall',
+      routing: 'needs-owner', severity: 'error', title: 'owner stop', agentId: 'agent-minion-2' });
+    h5.ledger.setProviderWaitIncident(debt5.waiting.id, 'linked-owner-stop');
+    const s5 = surfacingClaudeOnly(h5);
+    expect(s5.sensor.handBackDisabledWaits()).toBe(2);
+    expect(h5.ledger.findNotificationByKind(`provider-recovery.recovery-off.${debt5.waiting.id}`, 'any')).toBeNull();
+    expect(h5.ledger.getNotification('linked-owner-stop')?.resolvedAt).toBeNull();
+    expect(s5.surfaced).toEqual([`provider-recovery.recovery-off.${debt5.recovered.id}`]);
     // An owner-ACKED legacy stop is not held (the re-triage skips acked
     // rows, so it survives as history): the lane is still handed to Gru.
     const h4 = new Harness();
@@ -1436,6 +1451,25 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     off.stop();
   });
 
+  it('a boot hand-back that fails before supervision start is logged, never blocks supervision, and is not retried after hydration', async () => {
+    const h = new Harness();
+    const { waiting } = await glmDebt(h);
+    const { sensor } = surfacingClaudeOnly(h);
+    const failing = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+    let starts = 0;
+    const errors: string[] = [];
+    handBackThenStartSupervision(sensor, { start: () => { starts += 1; } }, (_level, msg) => errors.push(msg));
+    failing.mockRestore();
+    expect(starts).toBe(1);
+    expect(errors).toEqual(['provider wait hand-back failed before supervision start — kept for the next boot']);
+    // The boot reconciliation runs after hydration, so it never hands back:
+    // the wait is kept for the next boot's pre-start hand-back.
+    expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(2); // the next boot
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
+  });
+
   it('route retirement works from durable state: a route whose waits an earlier boot cancelled still retires', async () => {
     const h = new Harness();
     const { recovered, waiting } = await glmDebt(h);
@@ -1467,7 +1501,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     sensor.handBackDisabledWaits(); // the next boot retries the kept wait...
     expect(h.ledger.findNotificationByKind(kind, 'active')?.id).toBe(notice!.id); // ...never posting it twice
     expect(surfaced.filter((posted) => posted === kind)).toHaveLength(1);
-    expect(notice?.detail).not.toContain('Announced before');
+    expect(h.ledger.findNotificationByKind(kind, 'active')?.detail).not.toContain('Announced before');
     // Gru disposes of it, but the wait is still open (its cancel failed): a
     // disposition does not prove the lane resumed, so the next boot tells
     // Gru again — never stranded.

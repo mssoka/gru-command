@@ -226,12 +226,13 @@ export async function establishProviderWait(
  * the hand-back runs FIRST: the stop then hydrates with no open control and
  * the supervisor raises a fresh re-arm control — Gru's "resume" — instead of
  * binding one the hand-back is about to resolve. A failure is logged, never
- * fatal: the later boot reconciliation retries the hand-back. */
+ * fatal, and never retried in this process (a cancel after hydration would
+ * resolve a row the supervisor already bound): the next boot retries it. */
 export function handBackThenStartSupervision(sensor: ProviderRecoverySensor, supervisor: { start(): void }, log: Log): void {
   try {
-    sensor.handBackDisabledWaits();
+    sensor.handBackAtBoot();
   } catch (error) {
-    log('error', 'provider wait hand-back failed before supervision start — retried by the boot reconciliation', { error: String(error) });
+    log('error', 'provider wait hand-back failed before supervision start — kept for the next boot', { error: String(error) });
   }
   supervisor.start();
 }
@@ -271,6 +272,7 @@ export class ProviderRecoverySensor {
   private readonly slotReArm: SlotReArmPort | null;
   private readonly silasHosted: () => boolean;
   private readonly log: Log;
+  private bootHandBackRan = false;
   private readonly now: () => number;
   private readonly setIntervalImpl: typeof setInterval;
   private readonly clearIntervalImpl: typeof clearInterval;
@@ -854,15 +856,25 @@ export class ProviderRecoverySensor {
    * it is open (once Gru has disposed of it, a boot that still finds the wait
    * open tells Gru again: a disposition does not prove the lane resumed; one
    * resolved because the switch came back on lets a later hand-back be
-   * announced, marked as a repeat). No notice is posted when the lane holds
-   * another open stop the cancel does not resolve (Gru's unlinked machine
-   * stop, or a legacy needs-owner row the boot's re-triage left in place —
-   * the lane is already held); an open wait is never assumed handled — a lane Gru already re-dispatched may get a
+   * announced, marked as a repeat). No notice is posted when the owner
+   * already holds the lane's stop (a legacy needs-owner row the boot's
+   * re-triage left in place); an open wait is never assumed handled — a lane Gru already re-dispatched may get a
    * redundant notice, which is cheaper than a stranded one. A
    * route left with no open wait retires its "watching" notice and
    * pending delivery marker. Runs at every boot, even with the sensor off;
    * one failing wait is logged and kept for the next boot, never blocking
    * the rest. */
+  /** The boot hand-back: once per process, before the supervisor hydrates
+   * (`handBackThenStartSupervision`; `reconcileAtBoot` reuses it). A wait it
+   * cannot hand back is kept for the NEXT boot — never cancelled after
+   * hydration, which would resolve a row the supervisor already bound as the
+   * lane's re-arm control. */
+  handBackAtBoot(): number {
+    if (this.bootHandBackRan) return 0;
+    this.bootHandBackRan = true;
+    return this.handBackDisabledWaits();
+  }
+
   handBackDisabledWaits(): number {
     let handedBack = 0;
     for (const status of ['waiting', 'recovered-pending'] as const) {
@@ -943,14 +955,16 @@ export class ProviderRecoverySensor {
     const key = switchFor(wait.provider);
     const recovered = wait.status === 'recovered-pending';
     // The wait's own quota-wall stop is the only kind a wait is established
-    // for (establishProviderWait requires failureClass quota_wall). The
-    // cancel below resolves the machine stop linked to this wait; any other
-    // open stop of the lane survives it, so the lane is already held — by
-    // Gru (an unlinked machine stop: its classification failed) or, for a
-    // legacy needs-owner row, by the owner — and no notice joins it.
-    const laneStop = wait.agentId === null ? null
+    // for (establishProviderWait requires failureClass quota_wall). Only an
+    // owner-held stop (a needs-owner row the boot's re-triage left in place;
+    // the cancel never resolves owner attention) suppresses the notice. Any
+    // machine stop gets it — linked (the cancel resolves it) or not (a failed
+    // link write can leave the sensor-owned text on it): a redundant notice
+    // to Gru is cheaper than a stranded lane. The center's per-kind dedupe
+    // keeps one open stop per lane, so this one row decides.
+    const ownerStop = wait.agentId === null ? null
       : this.ledger.findNotificationByKind(`supervision.provider-wall.${wait.agentId}.quota_wall`, 'unacked');
-    if (laneStop === null || (laneStop.routing !== 'needs-owner' && laneStop.id === wait.incidentId)) {
+    if (ownerStop?.routing !== 'needs-owner') {
       const slot = wait.waiterKind === 'silas-slot';
       const subject = slot ? `Silas slot ${wait.slotId ?? wait.id}` : `Agent ${wait.agentId ?? wait.id}`;
       // Any Silas turn re-arms a stopped slot, so a directive resumes it; a
@@ -960,9 +974,10 @@ export class ProviderRecoverySensor {
       // asks the owner only through a typed reserved decision.
       const resume = slot
         ? 'send Silas a directive (any Silas turn re-arms its slot)'
-        : 'resume it (dispose its re-arm control) or re-dispatch the job';
-      // Announced before and still open (its cancel failed after Gru
-      // disposed of the notice): say so, so a re-dispatch is never doubled.
+        : 'resume it (dispose its re-arm control once a live agent is adopted) or re-dispatch the job';
+      // Announced before (Gru disposed of it while the wait stayed open, or
+      // the switch was on again in between): say so, so a re-dispatch is
+      // never doubled.
       const repeat = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') === null
         ? '' : 'Announced before and the wait is still open — check whether the lane already resumed before you act. ';
       this.notifications.postIncident({
@@ -993,7 +1008,7 @@ export class ProviderRecoverySensor {
    * recovery that was recorded but never delivered re-wakes. Waits of a
    * provider whose recovery is now off are handed back first. */
   async reconcileAtBoot(): Promise<{ rewoken: number }> {
-    this.handBackDisabledWaits();
+    this.handBackAtBoot();
     if (!this.enabled) return { rewoken: 0 };
     let rewoken = 0;
     for (const pending of this.ledger.listPendingProviderRecoveries().filter((p) => this.routeEnabled(p.routeKey))) {
