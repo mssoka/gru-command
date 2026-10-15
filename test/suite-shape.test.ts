@@ -186,10 +186,10 @@ const PINS: Record<string, number> = {
   'awareness-adversarial.test.ts': 2,
 
 
-  'blind-input-dispatch.test.ts': 13,
-  'blind-input.test.ts': 16,
+  'blind-input-dispatch.test.ts': 15,
+  'blind-input.test.ts': 17,
   'blind-observer-service.test.ts': 2,
-  'blind-review.test.ts': 3,
+  'blind-review.test.ts': 4,
   'bmad-legacy-retirement.test.ts': 5,
   'bmad-onboarding.test.ts': 13,
   'gc-bootstrap-retirement.test.ts': 6,

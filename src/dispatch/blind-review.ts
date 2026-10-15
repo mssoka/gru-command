@@ -329,8 +329,14 @@ export function blindCoverageOf(ledger: LedgerApi, jobId: string): BlindCoverage
       reasons: ['no blind-input admission was recorded for this job (historical or unclassified review)'],
     };
   }
-  const access = ledger.countJobEventsAndArrayFieldLength(jobId, BLIND_ACCESS_EVENT, 'prohibited');
-  const prohibited = access.total;
+  // Distinct reads (#355): a re-scan of the same transcript (a settle scan
+  // plus a late physical-completion scan) re-reports a read without growing
+  // the count; a read in another session, or a new one, still counts.
+  const access = ledger.countJobEventsAndDistinctArrayEntries(jobId, BLIND_ACCESS_EVENT, 'prohibited', {
+    event: ['source', 'session'],
+    entry: ['index', 'toolName', 'code', 'path', 'excerptSha256'],
+  });
+  const prohibited = access.distinct;
   const base = {
     jobId,
     role: admitted.role,
@@ -376,6 +382,9 @@ export function recordObservedAccess(
   jobId: string,
   results: readonly ObservedToolResult[],
   source: 'session' | 'operator',
+  /** The transcript the results were read from (session scans): the same
+   * index in another session is another read. */
+  session: string | null = null,
 ): BlindCoverage {
   const admitted = admittedOf(ledger, jobId);
   if (admitted === null || admitted.role !== 'blind' || admitted.rule === null) {
@@ -386,7 +395,7 @@ export function recordObservedAccess(
   ledger.appendCustomEvent({
     kind: BLIND_ACCESS_EVENT,
     jobId,
-    payload: { source, scanned: results.length, rule_sha256: rule.sha256, prohibited },
+    payload: { source, session, scanned: results.length, rule_sha256: rule.sha256, prohibited },
   });
   return blindCoverageOf(ledger, jobId);
 }
@@ -406,15 +415,15 @@ export function isAdmittedBlind(ledger: LedgerApi, jobId: string): boolean {
  * records nothing rather than inventing a clean pass.
  *
  * A resumed session's jsonl is cumulative, so a settle scan re-reads results
- * an earlier scan already saw. The derived verdict is idempotent (a nonzero
- * prohibited count invalidates either way), but `blindCoverageOf` SUMS the
- * prohibited arrays across every observation event, so the informational
- * `prohibitedAccess` count is cumulative, not distinct reads (issue #339,
- * accepted tradeoff: a delta scan would need persisted per-job offset state).
- * The same session can therefore be observed MORE THAN ONCE (a settle scan plus
- * a chained or independent physical-completion scan): scan scheduling is NOT
- * exactly-once. The single owner of the scan/classification logic is this
- * helper; the summoning schedule is not deduplicated.
+ * an earlier scan already saw, and the same session can be observed MORE THAN
+ * ONCE (a settle scan plus a chained or independent physical-completion
+ * scan): scan scheduling is deliberately NOT exactly-once, so a late retry or
+ * cancellation observation is never lost. Every scan appends its fact; the
+ * derived verdict is idempotent, and `blindCoverageOf` counts DISTINCT reads
+ * (session + tool-result index + classification + excerpt digest), so a
+ * re-scan never inflates the informational `prohibitedAccess` count
+ * (issue #355). The single owner of the scan/classification logic is this
+ * helper.
  */
 export function observeBlindSessionAccess(
   ledger: LedgerApi,
@@ -425,7 +434,7 @@ export function observeBlindSessionAccess(
   if (!isAdmittedBlind(ledger, jobId)) return;
   const results = readResults(sessionFile);
   if (results === null) return;
-  recordObservedAccess(ledger, jobId, results, 'session');
+  recordObservedAccess(ledger, jobId, results, 'session', sessionFile);
 }
 
 const MAX_SESSION_BYTES = 64 * 1024 * 1024;

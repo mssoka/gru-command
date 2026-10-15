@@ -523,6 +523,11 @@ export class DispatchService {
           (value) => ({ ok: true as const, value }),
           (error: unknown) => ({ ok: false as const, error }),
         );
+        // Issue #316/#356: whatever the reviewer's tools actually returned is
+        // judged against the rule it was admitted under — observed here,
+        // before every disposition-specific exit, so a read-then-reject turn
+        // still invalidates coverage. The observer never throws.
+        this.observeBlindSession(job.id, handle.sessionFile);
         if (!settlement.ok) {
           if (!(settlement.error instanceof RetrySettlementUnavailableError)) throw settlement.error;
           // A settlement-system fault is not a rate-limit narrative: block
@@ -620,9 +625,6 @@ export class DispatchService {
           disposition === 'recovered'
             ? ({ ok: true, error: null } as const)
             : (verdict ?? promptVerdictFromHealth(handle));
-        // Issue #316: whatever the reviewer's tools actually returned is
-        // judged against the rule it was admitted under, success or not.
-        this.observeBlindSession(job.id, handle.sessionFile);
         if (!evidence.ok) {
           return this.recordTurnFailure(
             job.id,

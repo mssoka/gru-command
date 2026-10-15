@@ -17,7 +17,7 @@ import type { ObservedToolResult } from '../src/dispatch/blind-input.js';
 /**
  * The shared blind-access observer (`observeBlindSessionAccess`) is the one
  * seam every resume/re-brief/settle path calls. These pin its two documented
- * no-op promises and its cumulative-count semantics directly, at the helper
+ * no-op promises and its distinct-read count semantics directly, at the helper
  * rather than through a delivery harness (issue #339 N8/N9).
  */
 
@@ -92,30 +92,46 @@ describe('observeBlindSessionAccess — no-op contracts (issue #339 N9)', () => 
   });
 });
 
-describe('observeBlindSessionAccess — cumulative count semantics (issue #339 N8)', () => {
-  it('sums prohibited access across observation events while the verdict stays invalidated', () => {
+describe('observeBlindSessionAccess — repeated scans count distinct reads (issue #339 N8, #355)', () => {
+  it('re-scanning the same transcript never inflates the count, while a late new read still lands', () => {
     const h = blindLedger();
     h.admit('job-cumulative');
     const clean = [result(0, PERMITTED)];
-    observeBlindSessionAccess(h.ledger, 'job-cumulative', null, () => clean);
+    observeBlindSessionAccess(h.ledger, 'job-cumulative', '/s/a.jsonl', () => clean);
     expect(blindCoverageOf(h.ledger, 'job-cumulative')).toMatchObject({
       state: 'qualifying', qualifying: true, accessObserved: true, prohibitedAccess: 0,
     });
     // The resumed transcript is cumulative: the same whole-file rescan now
     // sees the prohibited read the first scan could not.
     const dirty = [result(0, PERMITTED), result(1, PROHIBITED)];
-    observeBlindSessionAccess(h.ledger, 'job-cumulative', null, () => dirty);
+    observeBlindSessionAccess(h.ledger, 'job-cumulative', '/s/a.jsonl', () => dirty);
     expect(blindCoverageOf(h.ledger, 'job-cumulative')).toMatchObject({
       state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
     });
-    // A further rescan of the SAME transcript re-reports the read: the
-    // informational count is the sum across events (documented tradeoff), and
-    // the derived verdict stays invalidated.
-    observeBlindSessionAccess(h.ledger, 'job-cumulative', null, () => dirty);
+    // A duplicate scan of the SAME transcript (settle + physical completion)
+    // appends its fact but re-reports the same read: the count stays distinct.
+    observeBlindSessionAccess(h.ledger, 'job-cumulative', '/s/a.jsonl', () => dirty);
     expect(blindCoverageOf(h.ledger, 'job-cumulative')).toMatchObject({
-      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 2,
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
     });
-    expect(h.ledger.countJobEventsAndArrayFieldLength('job-cumulative', BLIND_ACCESS_EVENT, 'prohibited')).toMatchObject({ events: 3, total: 2 });
+    expect(h.ledger.countJobEventsAndDistinctArrayEntries('job-cumulative', BLIND_ACCESS_EVENT, 'prohibited', {
+      event: ['source', 'session'], entry: ['index', 'toolName', 'code', 'path', 'excerptSha256'],
+    })).toEqual({ events: 3, distinct: 1 });
+    // A late retry's new read in the same transcript is a new read...
+    observeBlindSessionAccess(h.ledger, 'job-cumulative', '/s/a.jsonl', () => [...dirty, result(2, PROHIBITED)]);
+    expect(blindCoverageOf(h.ledger, 'job-cumulative').prohibitedAccess).toBe(2);
+    // ...and the same index in ANOTHER session is another physical read.
+    observeBlindSessionAccess(h.ledger, 'job-cumulative', '/s/b.jsonl', () => dirty);
+    expect(blindCoverageOf(h.ledger, 'job-cumulative').prohibitedAccess).toBe(3);
+    h.dispose();
+  });
+
+  it('refuses a malformed identity key by name instead of interpolating it', () => {
+    const h = blindLedger();
+    expect(() => h.ledger.countJobEventsAndDistinctArrayEntries('j', BLIND_ACCESS_EVENT, 'prohibited', { event: ["x') OR 1"], entry: [] }))
+      .toThrow(/payload key must be a simple JSON key/u);
+    expect(() => h.ledger.countJobEventsAndDistinctArrayEntries('j', BLIND_ACCESS_EVENT, 'prohibited', { event: [], entry: [] }))
+      .toThrow(/at least one identity key/u);
     h.dispose();
   });
 });

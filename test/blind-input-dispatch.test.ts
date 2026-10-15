@@ -53,6 +53,8 @@ interface Harness {
 
 async function boot(opts: {
   sessionToolResults?: (file: string | null) => readonly ObservedToolResult[] | null;
+  /** The briefing prompt of this job rejects after its tools ran (#356). */
+  rejectPromptOf?: string;
   log?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 } = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-blind-'));
@@ -72,7 +74,11 @@ async function boot(opts: {
     const id = `agent-${spawns}`;
     return {
       role, id, sessionFile: null, capabilities: CAPS,
-      async prompt(text: string) { if (role === 'minion') prompts.push(text); },
+      async prompt(text: string) {
+        if (role !== 'minion') return;
+        prompts.push(text);
+        if (opts.rejectPromptOf !== undefined && text.includes(opts.rejectPromptOf)) throw new Error('provider closed the stream mid-turn');
+      },
       async steer() {}, async followUp() {},
       subscribe() { return () => {}; },
       health() { return { state: 'idle' as const, lastActivity: null, sessionFile: null }; },
@@ -389,6 +395,50 @@ describe('blind review commissioning (issue #316)', () => {
     await waitFor(() => h.ledger.latestJobEvent('rev-seen', 'review.blind-access-observed') !== null);
     expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-seen/blind-coverage')).json).toMatchObject({
       state: 'invalidated', qualifying: false, accessObserved: true,
+    });
+  });
+
+  it('observes a reviewer whose initial prompt read prohibited material and then rejected (#356)', async () => {
+    const h = await boot({
+      rejectPromptOf: 'rev-reject',
+      sessionToolResults: () => [
+        { index: 0, toolName: 'bash', text: '_bmad-output/implementation-artifacts/deferred-work.md:3:- old finding' },
+      ],
+    });
+    await dispatchParent(h);
+    const created = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-reject', { repo_path: h.repo.path, input_package: validPackage() }));
+    expect(created.status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent('rev-reject', 'job.minion-error') !== null);
+    // The failure bookkeeping is unchanged: blocked, the original error, no delivery.
+    expect(h.ledger.latestJobEvent('rev-reject', 'job.minion-error')?.payload).toMatchObject({ error: expect.stringContaining('provider closed the stream mid-turn') });
+    expect(h.ledger.getJob('rev-reject')?.status).toBe('blocked');
+    expect(h.ledger.latestJobEvent('rev-reject', 'job.delivered')).toBeNull();
+    // ...and the read it made before rejecting still invalidates coverage.
+    expect(h.ledger.latestJobEvent('rev-reject', BLIND_ACCESS_EVENT)).not.toBeNull();
+    expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-reject/blind-coverage')).json).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true,
+    });
+  });
+
+  it('observes session grep results whose excluded path contains spaces, and keeps a spaced permitted path qualifying (#357)', async () => {
+    const seen = await boot({
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: 'docs/issues/prior review.md:1:plain text' }],
+    });
+    await dispatchParent(seen);
+    expect((await call(seen.port, 'POST', '/api/dispatch', blindReview('rev-spaced', { repo_path: seen.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => seen.ledger.latestJobEvent('rev-spaced', BLIND_ACCESS_EVENT) !== null);
+    expect((await call(seen.port, 'GET', '/api/dispatch/jobs/rev-spaced/blind-coverage')).json).toMatchObject({
+      state: 'invalidated', qualifying: false, prohibitedAccess: 1,
+    });
+
+    const control = await boot({
+      sessionToolResults: () => [{ index: 0, toolName: 'bash', text: 'src/my feature.ts:1:export const feature = 1;' }],
+    });
+    await dispatchParent(control);
+    expect((await call(control.port, 'POST', '/api/dispatch', blindReview('rev-permitted', { repo_path: control.repo.path, input_package: validPackage() }))).status).toBe(202);
+    await waitFor(() => control.ledger.latestJobEvent('rev-permitted', BLIND_ACCESS_EVENT) !== null);
+    expect((await call(control.port, 'GET', '/api/dispatch/jobs/rev-permitted/blind-coverage')).json).toMatchObject({
+      qualifying: true, prohibitedAccess: 0,
     });
   });
 

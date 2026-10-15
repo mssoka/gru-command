@@ -277,6 +277,29 @@ describe('observed reviewer access', () => {
   });
 });
 
+describe('observed reviewer access — grep paths with spaces (#357)', () => {
+  it('flags an excluded grep path containing spaces, keeps ordinary paths, and leaves permitted paths alone', () => {
+    const prohibited = scanObservedAccess(
+      [
+        { index: 1, toolName: 'bash', text: 'docs/issues/prior review.md:1:plain text' },
+        { index: 2, toolName: 'bash', text: './docs/issues/prior review.md:4-context line' },
+        { index: 3, toolName: 'bash', text: 'docs/issues/305-review.md:1:plain text' },
+        { index: 4, toolName: 'bash', text: 'src/my feature.ts:10:const x = 1;' },
+        { index: 5, toolName: 'bash', text: '    at docs/issues/prior review.md:1:2' },
+        { index: 6, toolName: 'bash', text: 'src/feature.ts:2:const y = 2;' },
+      ],
+      DEFAULT_BLIND_ISOLATION_RULE,
+    );
+    expect(prohibited.map((p) => `${p.index}:${p.code}:${p.path ?? ''}`)).toEqual([
+      '1:excluded-path-read:docs/issues/prior review.md',
+      '2:excluded-path-read:./docs/issues/prior review.md',
+      '3:excluded-path-read:docs/issues/305-review.md',
+    ]);
+    // Private text never rides the record: digest only.
+    expect(JSON.stringify(prohibited)).not.toContain('plain text');
+  });
+});
+
 describe('package request parsing', () => {
   it('rejects malformed packages loudly', () => {
     expect(() => parseBlindInputPackage('nope')).toThrow(BlindInputRefusal);

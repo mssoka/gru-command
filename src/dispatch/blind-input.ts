@@ -572,7 +572,10 @@ export interface ProhibitedAccess {
   readonly excerptSha256: string;
 }
 
-const GREP_LINE = /^((?:\.\/)?[^\s:]+):\d+[:-]/u;
+/** A grep result line: `path:LINE:` (or `path:LINE-` context). The path may
+ * contain spaces (#357) — it ends at the numeric line delimiter — but never
+ * starts with whitespace (an indented stack frame is not a grep result). */
+const GREP_LINE = /^((?:\.\/)?[^\s:][^:\n]*):\d+[:-]/u;
 
 /**
  * What the reviewer actually SAW: tool results whose grep lines land in an
