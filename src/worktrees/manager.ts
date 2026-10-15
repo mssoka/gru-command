@@ -1,4 +1,4 @@
-import { readWorktreeMetadata, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
+import { readWorktreeMetadata, commonDirectoryOfGitdir, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
@@ -1522,8 +1522,9 @@ export class WorktreeManager {
     if (lstatSync(canonical).isDirectory()) return canonical;
     const gitFile = readWorktreeMetadata(git).trim();
     if (!gitFile.startsWith('gitdir: ')) throw new Error('missing repository gitdir');
-    const admin = realpathSync(resolve(repoPath, gitFile.slice('gitdir: '.length)));
-    return realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim()));
+    // A linked worktree resolves through `commondir`; a --separate-git-dir
+    // checkout's gitdir is the common directory itself (#372).
+    return commonDirectoryOfGitdir(realpathSync(resolve(repoPath, gitFile.slice('gitdir: '.length))));
   }
 
   private assertRollbackBranchMetadata(repoPath: string, custody: CreationCustody, common: string): void {

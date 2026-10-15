@@ -361,6 +361,7 @@ const PINS: Record<string, number> = {
   'wizard-interactive.test.ts': 18,
   'wizard-register.test.ts': 2,
   'wizard.test.ts': 36,
+  'worktree-handoff-layouts.test.ts': 7,
   'worktree-manager.test.ts': 73,
   'worktree-manifest.test.ts': 11,
   'worktree-port.test.ts': 4,

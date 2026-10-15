@@ -126,12 +126,30 @@ function adminFor(path: string): string {
   return realpathSync(resolve(path, text.slice(8)));
 }
 
+/** The common git directory a `.git` FILE's gitdir resolves to (#372): a
+ * linked worktree's administration names it in `commondir`; a
+ * `--separate-git-dir` checkout's gitdir IS the full git directory (no
+ * `commondir`). Anything else is not a supported layout and fails loud. */
+export function commonDirectoryOfGitdir(gitdir: string): string {
+  const commondir = join(gitdir, 'commondir');
+  if (!absent(commondir)) return realpathSync(resolve(gitdir, readWorktreeMetadata(commondir).trim()));
+  if (!lstatSync(gitdir).isDirectory() || absent(join(gitdir, 'HEAD')) || absent(join(gitdir, 'objects')) || absent(join(gitdir, 'refs'))) {
+    throw new Error('repository gitdir is neither a linked worktree administration nor a git directory');
+  }
+  return gitdir;
+}
+
+/** The repository's common git directory: its `.git` directory, or what its
+ * `.git` file's gitdir resolves to (linked worktree or separate git dir). */
+export function repositoryCommonDirectory(repoPath: string): string {
+  const repoGit = join(repoPath, '.git');
+  return lstatSync(repoGit).isDirectory() ? realpathSync(repoGit) : commonDirectoryOfGitdir(adminFor(repoPath));
+}
+
 function validate(receipt: Receipt, lane: WorktreeLane): void {
   const admin = adminFor(lane.path);
   const common = realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim()));
-  const repoGit = join(lane.repoPath, '.git');
-  const repoCommon = lstatSync(repoGit).isDirectory() ? realpathSync(repoGit)
-    : realpathSync(resolve(adminFor(lane.repoPath), readWorktreeMetadata(join(adminFor(lane.repoPath), 'commondir')).trim()));
+  const repoCommon = repositoryCommonDirectory(lane.repoPath);
   if (repoCommon !== common || receipt.id !== lane.id || receipt.kind !== lane.kind || receipt.jobId !== lane.jobId || receipt.roundId !== lane.roundId || receipt.branch !== lane.branch || receipt.sha !== lane.sha ||
     receipt.repo !== realpathSync(lane.repoPath) || receipt.path !== realpathSync(lane.path) || receipt.admin !== admin || receipt.common !== common ||
     dirname(admin) !== join(common, 'worktrees') ||
@@ -331,9 +349,7 @@ export function assertLaneResourcesAbsent(lane: WorktreeLane): void {
   try {
     if (!absent(lane.path)) throw new Error('checkout is present or replaced');
     const expected = join(realpathSync(dirname(lane.path)), basename(lane.path), '.git');
-    const repoGit = join(lane.repoPath, '.git');
-    const common = lstatSync(repoGit).isDirectory() ? realpathSync(repoGit)
-      : realpathSync(resolve(adminFor(lane.repoPath), readWorktreeMetadata(join(adminFor(lane.repoPath), 'commondir')).trim()));
+    const common = repositoryCommonDirectory(lane.repoPath);
     const container = join(common, 'worktrees');
     if (absent(container)) return;
     if (!lstatSync(container).isDirectory()) throw new Error('worktree inventory is not canonical');
