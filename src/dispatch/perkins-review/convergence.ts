@@ -373,7 +373,7 @@ export interface IntegrationDelta extends DeltaSince {
   readonly droppedFeaturePaths: readonly string[];
 }
 
-interface RawChange {
+export interface RawChange {
   readonly oldMode: string;
   readonly newMode: string;
   readonly oldSha: string;
@@ -393,6 +393,12 @@ function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<strin
   } catch (error) {
     throw new Error(`change set ${fromSha.slice(0, 12)}..${toSha.slice(0, 12)} could not be read: ${String(error)}`);
   }
+  return parseRawChanges(bytes);
+}
+
+/** Parse `git diff --raw -z --abbrev=40` bytes (exported for the guard
+ * tests, #393). Every malformed shape refuses so the caller reviews whole. */
+export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
   // Paths are raw bytes: decode strictly so an invalid UTF-8 path fails
   // closed instead of being silently mangled into a path that matches
   // nothing. A legitimate U+FFFD is valid UTF-8 and is preserved.
@@ -712,6 +718,23 @@ export function planReviewScope(input: {
     return { scope: 'whole', reason: 're-review at an unchanged candidate (target and merge base unchanged)', priorCoverageComplete: prior.coverageComplete };
   }
   if (prior.diffBaseSha !== input.currentDiffBaseSha) {
+    // Liveness (#397): a partial-coverage INTEGRATION round that posted READY
+    // owes the final whole-change pass, normally chained at the same
+    // candidate. When the candidate moved on before that pass ran, another
+    // integration round would retain the same partial coverage and owe the
+    // pass again — a base that keeps moving could defer it forever and the PR
+    // would stall (approval is never credited without it). So the chain is
+    // bounded at one integration round: this round reviews whole, and once it
+    // is READY later base moves retain COMPLETE coverage.
+    if (input.finalWholePassAtReady && prior.reviewScope === 'integration' && !prior.coverageComplete &&
+      prior.canonicalVerdict === 'READY TO MERGE') {
+      return {
+        scope: 'whole',
+        reason: `merge base moved again while the partial integration READY at ${prior.targetSha.slice(0, 12)} still owes the final ` +
+          'whole-change pass — whole-change re-verification instead of another partial integration round',
+        priorCoverageComplete: false,
+      };
+    }
     const lineage = input.integrationLineage ?? null;
     const integratedForward = prior.targetSha !== input.currentTargetSha &&
       lineage !== null && lineage.baseAdvanced && lineage.featureIntegrated && lineage.commonBasePinned;

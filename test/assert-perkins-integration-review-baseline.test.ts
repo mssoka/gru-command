@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   BASELINE_TITLES,
@@ -99,6 +100,53 @@ describe('perkins integration R4 fail-before classifier', () => {
     ))).toThrow(/2 failure message\(s\); exactly one assertion failure/u);
     expect(() => assertPerkinsIntegrationBaseline('fast', report(red(FAST_TITLE, []))))
       .toThrow(/0 failure message\(s\)/u);
+  });
+
+  it('refuses a setup-stage failure that merely embeds an assertion string, and a helper-raised assertion (#394)', () => {
+    // A wrapped setup error carrying an inner AssertionError text.
+    for (const wrapped of [
+      'Error: fixture setup failed: AssertionError: expected false to be true',
+      'TypeError: cannot read properties of undefined (reading \'AssertionError: x\')',
+      'Error: beforeEach hook failed\nCaused by: AssertionError: expected 1 to be 2',
+    ]) {
+      expect(isBehavioralAssertion(wrapped), wrapped).toBe(false);
+      expect(() => assertPerkinsIntegrationBaseline('fast', report(red(FAST_TITLE, [wrapped])))).toThrow(/before its assertion/u);
+    }
+    // An assertion raised inside a shared helper module is setup, not the claim.
+    const helperRaised = [
+      'AssertionError: expected false to be true // Object.is equality',
+      '    at stageFixture (/repo/test/helpers/fixture-repo.ts:41:22)',
+      '    at /repo/test/perkins-integration-review.test.ts:120:5',
+    ].join('\n');
+    expect(isBehavioralAssertion(helperRaised)).toBe(false);
+    const dependencyRaised = [
+      'AssertionError: expected 1 to be 2',
+      '    at Object.check (/repo/node_modules/some-lib/index.js:9:3)',
+    ].join('\n');
+    expect(isBehavioralAssertion(dependencyRaised)).toBe(false);
+    // The named test's own assertion, with its stack, still qualifies.
+    const testRaised = [
+      "AssertionError: expected 'd19d…' to be '83b5…' // Object.is equality",
+      '    at /repo/test/perkins-integration-recovery.test.ts:812:40',
+      '    at processTicksAndRejections (node:internal/process/task_queues:105:5)',
+    ].join('\n');
+    expect(isBehavioralAssertion(testRaised)).toBe(true);
+    expect(isBehavioralAssertion(`${RESOLVED_INSTEAD}\n    at /repo/test/perkins-integration-review.test.ts:77:9`)).toBe(true);
+  });
+
+  it('every classifier leg is wired to a declared verification scope that runs exactly its named regressions (#394)', () => {
+    // The fail-before claim never depends on someone running the classifier
+    // by hand: each leg is invoked by a declared [verify] scope.
+    const manifest = readFileSync(new URL('../.gru-command/worktree.toml', import.meta.url), 'utf8');
+    const scopes = manifest.split('\n').filter((line) => line.includes('assert-perkins-integration-review-baseline.mjs'));
+    for (const [leg, titles] of Object.entries(BASELINE_TITLES)) {
+      const scope = scopes.find((line) => line.includes(`assert-perkins-integration-review-baseline.mjs" ${leg} `));
+      expect(scope, `leg ${leg} has a declared verification scope`).toBeDefined();
+      const filter = /-t "([^"]+)"/u.exec(scope!)?.[1];
+      expect(filter, `leg ${leg} selects its regressions by name`).toBeDefined();
+      const pattern = new RegExp(filter!, 'u');
+      for (const title of titles) expect(pattern.test(title), `${leg}: ${title}`).toBe(true);
+    }
   });
 
   it('refuses an unparseable report, a missing named regression and an unknown leg', () => {

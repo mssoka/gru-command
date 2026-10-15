@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import {
   deltaSince,
   findingIntersectsDelta,
   integrationSince,
+  parseRawChanges,
   planReviewScope,
   planPerkinsReviewScope,
   probeIntegrationLineage,
@@ -483,6 +484,62 @@ describe('integration unit (retained coverage across an advanced base)', () => {
   });
 });
 
+describe('integration unit fail-loud guards (#393)', () => {
+  /** H0 on B0, main advances to B1, and the feature merges it cleanly; the
+   * caller then commits the integration work that makes H1. */
+  function integratedFeature(name: string): { repo: FixtureRepo; b0: string; h0: string; b1: string } {
+    const repo = makeFixtureRepo(name);
+    repos.push(repo);
+    repo.git(['config', 'user.name', 'Fixture Tests']);
+    repo.git(['config', 'user.email', 'tests@example.invalid']);
+    const b0 = repo.head();
+    repo.git(['checkout', '-b', 'feature/guards']);
+    const h0 = repo.commitFile('src/feature.ts', 'export const feature = 1;\n');
+    repo.git(['checkout', 'main']);
+    const b1 = repo.commitFile('src/mainonly.ts', 'export const mainonly = 1;\n');
+    repo.git(['checkout', 'feature/guards']);
+    repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    return { repo, b0, h0, b1 };
+  }
+
+  it('refuses an integration unit over the path bound instead of truncating it', () => {
+    const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-paths');
+    mkdirSync(join(repo.path, 'many'));
+    for (let index = 0; index < 4001; index += 1) writeFileSync(join(repo.path, 'many', `f${String(index)}.ts`), `export const v${String(index)} = ${String(index)};\n`);
+    repo.git(['add', 'many']);
+    repo.git(['commit', '-m', 'touch 4001 paths']);
+    expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/integration unit touches 4001 paths, over the 4000-path bound/u);
+  });
+
+  it('refuses an integration unit whose diff exceeds the byte cap', () => {
+    const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-bytes');
+    repo.commitFile('src/huge.ts', `${'x'.repeat(1023)}\n`.repeat(9 * 1024));
+    expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/exceeds 8388608 UTF-8 bytes/u);
+  });
+
+  it('refuses a changed path that is not valid UTF-8 rather than mangling it', () => {
+    const { repo, b0, h0, b1 } = integratedFeature('perkins-guard-utf8');
+    const realBlob = execFileSync('git', ['-C', repo.path, 'hash-object', '-w', '--stdin'], { input: 'export const odd = 1;\n' }).toString().trim();
+    // A raw non-UTF-8 byte path, staged through the index (no filesystem
+    // name involved, so this works on UTF-8-only volumes too).
+    execFileSync('git', ['-C', repo.path, 'update-index', '--add', '--index-info'], {
+      input: Buffer.concat([Buffer.from(`100644 blob ${realBlob}\tsrc/`), Buffer.from([0xff, 0xfe]), Buffer.from('.ts\n')]),
+    });
+    execFileSync('git', ['-C', repo.path, 'commit', '-m', 'non-utf8 path'], { stdio: 'ignore' });
+    expect(() => integrationSince(repo.path, h0, b0, b1, repo.head())).toThrow(/a changed path is not valid UTF-8/u);
+  });
+
+  it('refuses an unparseable or path-less git diff --raw record', () => {
+    const sha = 'a'.repeat(40);
+    const ok = parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${'b'.repeat(40)} M\0src/a.ts\0`));
+    expect([...ok.keys()]).toEqual(['src/a.ts']);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short M\0src/a.ts\0`))).toThrow(/unparseable record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} M\0`))).toThrow(/record with no path/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} M`))).toThrow(/record with no path/u);
+    expect(() => parseRawChanges(Buffer.from([0x3a, 0xff, 0x00]))).toThrow(/not valid UTF-8/u);
+  });
+});
+
 describe('integration scope: same-head adopted base and identical base adoption', () => {
   it('retains coverage (no whole reset) when an unchanged candidate adopts a descendant base', () => {
     const repo = makeFixtureRepo('perkins-same-head-adopted');
@@ -928,6 +985,28 @@ describe('review scope planning (final whole pass at a READY candidate)', () => 
     });
     expect(integrated.scope).toBe('integration');
     expect(integrated.reason).toContain('prior coverage retained');
+  });
+
+  it('bounds the partial-coverage chain: a moved base after a partial integration READY reviews whole (#397)', () => {
+    const integratedForward = {
+      currentTargetSha: 'c'.repeat(40), currentDiffBaseSha: 'e'.repeat(40), integrationCoverage: true,
+      integrationLineage: { baseAdvanced: true, featureIntegrated: true, commonBasePinned: true, sameHeadAdoptedBase: false },
+    } as const;
+    // The designed first step: a partial (delta) READY whose base then moves
+    // runs ONE integration round (its READY chains the final whole pass).
+    expect(scope(meta({ reviewScope: 'delta', canonicalVerdict: 'READY TO MERGE' }), integratedForward).scope).toBe('integration');
+    // That integration READY was still partial and the candidate moved on
+    // before the pass ran: the next base move reviews whole, never another
+    // partial integration round that would owe the pass again.
+    const bounded = scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), integratedForward);
+    expect(bounded.scope).toBe('whole');
+    expect(bounded.reason).toContain('still owes the final whole-change pass');
+    // Complete coverage, or an integration round that has not reached READY,
+    // keeps retaining coverage as before.
+    expect(scope({ ...meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), coverageComplete: true }, integratedForward).scope).toBe('integration');
+    expect(scope(meta({ reviewScope: 'integration', canonicalVerdict: 'NEEDS CHANGES' }), integratedForward).scope).toBe('integration');
+    // With the final whole pass disabled by policy there is no owed pass.
+    expect(scope(meta({ reviewScope: 'integration', canonicalVerdict: 'READY TO MERGE' }), { ...integratedForward, finalWholePassAtReady: false }).scope).toBe('integration');
   });
 
   it('falls back to whole when integration coverage is unsafe', () => {

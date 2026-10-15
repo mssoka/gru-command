@@ -61,12 +61,24 @@ export const BASELINE_TITLES = {
   ],
 };
 
-/** A behavioral RED: a Vitest matcher failure or a rejects/resolves report —
- * never a timeout, import, collection or setup error text. */
+const ASSERTION_HEAD = /^AssertionError: /u;
+const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|rejected) .* instead of (?:rejecting|resolving)$/u;
+const STACK_FRAME = /^\s+at (?:.*\()?((?:[A-Za-z]:)?[^():]+):\d+:\d+\)?$/u;
+
+/** A behavioral RED: the failure's OWN first line is a Vitest matcher
+ * failure or a rejects/resolves report — never a timeout, import,
+ * collection or setup error that merely embeds that text (#394). When the
+ * message carries a stack, the assertion must also have been raised in a
+ * test file: an assertion inside a shared helper module (test/helpers/…)
+ * or a dependency is setup, not the named regression's claim. */
 export function isBehavioralAssertion(message) {
-  return message.includes('AssertionError:') ||
-    message.includes('instead of rejecting') ||
-    message.includes('instead of resolving');
+  if (typeof message !== 'string') return false;
+  const [head = '', ...rest] = message.split('\n');
+  if (!ASSERTION_HEAD.test(head) && !PROMISE_REPORT_HEAD.test(head)) return false;
+  const frame = rest.map((line) => STACK_FRAME.exec(line)).find((match) => match !== null);
+  if (frame === undefined) return true; // stackless report: the head decides
+  const file = frame[1].replaceAll('\\', '/');
+  return /\.test\.[cm]?[jt]s$/u.test(file) && !file.includes('/node_modules/') && !file.includes('/test/helpers/');
 }
 
 /**

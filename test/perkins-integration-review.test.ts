@@ -438,6 +438,61 @@ describe('native integration review retains prior coverage', () => {
     expect(b1).toMatch(/^[0-9a-f]{40}$/u);
   });
 
+  it('re-proves the integration lineage in the engine: a non-descendant candidate falls back to whole (#392)', async () => {
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    const { b0, h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'lineage-round-1', h0);
+    const round1 = await runRound(harness, { roundId: 'lineage-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    expect(round1.convergence?.coverageComplete).toBe(true);
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'lineage-round-1'), 'consolidated.json');
+    // Main advances, and the feature is REWRITTEN from the old base: its new
+    // head merges main but does not descend from the reviewed H0. A direct
+    // engine caller still asks for an integration round.
+    const { b1 } = integrateClean(harness.repo);
+    harness.repo.git(['checkout', '-B', 'feature/integration', b0]);
+    harness.repo.commitFile('src/feature.ts', 'export const feature = 2;\n');
+    harness.repo.git(['merge', '--no-ff', '-m', 'merge main', 'main']);
+    const h1 = harness.repo.head();
+    expect(() => harness.repo.git(['merge-base', '--is-ancestor', h0, h1])).toThrow();
+    const frozen2 = freeze(harness, 'lineage-round-2', h1);
+    const round2 = await runRound(harness, {
+      roundId: 'lineage-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    const prompt = harness.leadCalls.at(-1)!.prompt ?? '';
+    expect(round2.convergence?.reviewScope).toBe('whole');
+    expect(round2.convergence?.deltaUnavailable).toContain('integration lineage could not be re-proven');
+    expect(round2.convergence?.scopeReason).toContain('whole-change re-verification');
+    expect(round2.convergence?.integrationFromSha).toBeUndefined();
+    expect(prompt).toContain('REVIEW SCOPE: WHOLE CHANGE');
+    expect(prompt).not.toContain('--- INTEGRATION UNIT');
+    expect(b1).toMatch(/^[0-9a-f]{40}$/u);
+  });
+
+  it('an integration unit over its path bound falls back to a disclosed whole round, never a truncated unit (#393)', async () => {
+    // (The unit's byte cap is defence in depth: the frozen diff carries the
+    // same cap and refuses first, so the path bound is the reachable guard.)
+    const harness = makeEngine({ childAnswer: () => '[]', specialists: [] });
+    const { h0 } = featureHead(harness.repo, 'src/feature.ts', 'export const feature = 1;\n');
+    const frozen1 = freeze(harness, 'bound-round-1', h0);
+    await runRound(harness, { roundId: 'bound-round-1', roundNumber: 1, frozen: frozen1, reviewScope: 'whole' });
+    const consolidated1 = join(reviewArtifactDirectory(harness.root, 'bound-round-1'), 'consolidated.json');
+    integrateClean(harness.repo);
+    mkdirSync(join(harness.repo.path, 'many'));
+    for (let index = 0; index < 4001; index += 1) writeFileSync(join(harness.repo.path, 'many', `f${String(index)}.ts`), `export const v${String(index)} = ${String(index)};\n`);
+    harness.repo.git(['add', 'many']);
+    harness.repo.git(['commit', '-m', 'touch 4001 paths']);
+    const frozen2 = freeze(harness, 'bound-round-2', harness.repo.head());
+    const round2 = await runRound(harness, {
+      roundId: 'bound-round-2', roundNumber: 2, frozen: frozen2,
+      reviewScope: 'integration', priorConsolidatedFile: consolidated1,
+    });
+    expect(round2.convergence?.reviewScope).toBe('whole');
+    expect(round2.convergence?.deltaUnavailable).toContain('over the 4000-path bound');
+    expect(round2.convergence?.scopeReason).toContain('whole-change re-verification');
+    expect(harness.leadCalls.at(-1)!.prompt ?? '').not.toContain('--- INTEGRATION UNIT');
+  });
+
   it('records whole-candidate coverage even when the whole round requests changes', async () => {
     const harness = makeEngine({
       childAnswer: () => '[]',
