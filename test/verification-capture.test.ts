@@ -694,32 +694,43 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       const pending = nodeStreamFetch('http://127.0.0.1:9/x', undefined, { responseHeadersTimeoutMs: bound });
       await expect(pending, String(bound)).rejects.toThrow(/responseHeadersTimeoutMs must be a number of milliseconds from 1 to 2147483647/u);
     }
-    // The CLI refuses it before any command runs, whatever transport is
-    // injected: no request, no sink, no receipt, no output. Help stays usable.
+    // Every command that talks to the service refuses it after its own usage
+    // checks, whatever transport is injected: no request, no sink, no
+    // receipt, no output — a named error a caller can act on.
     const dir = tempDir();
     const fetchImpl = vi.fn();
+    const named = /responseHeadersTimeoutMs must be a number of milliseconds from 1 to 2147483647/u;
     const cases = [
-      { label: 'run/default transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-1', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { responseHeadersTimeoutMs: 0 } },
-      { label: 'run/injected transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-2', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0.5 } },
-      { label: 'status', argv: () => ['status', '--request-id', 'req-bad-3', '--url', 'http://127.0.0.1:9', '--token', 't'], extra: { fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0 } },
-      { label: 'withdraw', argv: (sink: string) => ['withdraw', '--owner', `${sink}.owner.json`], extra: { responseHeadersTimeoutMs: Number.NaN } },
-    ] as const;
+      { label: 'run/default transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-1', '--url', 'http://127.0.0.1:9', '--token', 't'], bound: 0, injected: false },
+      { label: 'run/injected transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-2', '--url', 'http://127.0.0.1:9', '--token', 't'], bound: 0.5, injected: true },
+      { label: 'status/default transport', argv: () => ['status', '--request-id', 'req-bad-3', '--url', 'http://127.0.0.1:9', '--token', 't'], bound: Number.NaN, injected: false },
+      { label: 'status/injected transport', argv: () => ['status', '--request-id', 'req-bad-4', '--url', 'http://127.0.0.1:9', '--token', 't'], bound: 2 ** 31, injected: true },
+    ];
     for (const [index, entry] of cases.entries()) {
       const sinkPath = join(dir, `bad-bound-${String(index)}.ndjson`);
       const out: string[] = [];
-      await expect(runCaptureCli(entry.argv(sinkPath), { ...deps({ stdout: (text: string) => out.push(text) }), stderr: (text: string) => out.push(text), ...entry.extra }), entry.label)
-        .rejects.toThrow(RangeError);
+      const cliDeps: CaptureCliDeps = { ...deps({ stdout: (text: string) => out.push(text) }), stderr: (text: string) => out.push(text), responseHeadersTimeoutMs: entry.bound,
+        ...(entry.injected ? { fetchImpl: fetchImpl as never } : {}) };
+      await expect(runCaptureCli(entry.argv(sinkPath), cliDeps), entry.label).rejects.toThrow(named);
       expect(out, entry.label).toEqual([]);
       expect(existsSync(sinkPath), entry.label).toBe(false);
       expect(existsSync(captureReceiptPath(sinkPath)), entry.label).toBe(false);
     }
     expect(fetchImpl).not.toHaveBeenCalled();
-    // Help, no command, flag-parse errors and unknown commands keep their usage exit.
-    for (const argv of [['--help'], ['-h'], [], ['run', '--bogus'], ['frobnicate']]) {
-      const help: string[] = [];
-      expect(await runCaptureCli(argv, { responseHeadersTimeoutMs: 0, stderr: (text: string) => help.push(text) }), argv.join(' ')).toBe(CAPTURE_EXIT.usage);
-      expect(help.join(''), argv.join(' ')).not.toBe('');
+    // Usage errors keep their usage exit: help, no command, flag-parse errors,
+    // unknown commands and a known command's missing required flags.
+    for (const argv of [['--help'], ['-h'], [], ['run', '--bogus'], ['frobnicate'], ['run'], ['status']]) {
+      const usage: string[] = [];
+      expect(await runCaptureCli(argv, { responseHeadersTimeoutMs: 0, fetchImpl: fetchImpl as never, stderr: (text: string) => usage.push(text) }), argv.join(' ')).toBe(CAPTURE_EXIT.usage);
+      expect(usage.join(''), argv.join(' ')).toMatch(/usage:|required|unknown command/u);
     }
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // withdraw makes no request: a bad bound never blocks owner recovery.
+    const withdraw: string[] = [];
+    const ownerPath = join(dir, 'absent.owner.json');
+    await expect(runCaptureCli(['withdraw', '--owner', ownerPath], { responseHeadersTimeoutMs: 0, stdout: (text: string) => withdraw.push(text), stderr: (text: string) => withdraw.push(text) }))
+      .resolves.not.toBe(undefined);
+    expect(withdraw.join('')).not.toMatch(named);
   });
 
   it('the headers bound ends at the response: a body quiet for longer than it still streams to EOF (#389)', async () => {

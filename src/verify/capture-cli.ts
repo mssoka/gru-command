@@ -249,11 +249,15 @@ export function nodeStreamFetch(input: string, init?: RequestInit, options: Node
   });
 }
 
-/** The production transport, with the deps' headers bound when given.
- * `runCaptureCli` refuses a bad bound before any command runs, and
- * `nodeStreamFetch` rejects one on its own for any other caller. */
-function defaultTransport(deps: CaptureCliDeps): FetchLike {
-  return (input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs });
+/** The transport of every command that talks to the verify service. A
+ * headers bound that cannot time correctly is a programming error in the
+ * caller's deps: it fails loud here — after the command's own usage checks,
+ * before any sink, request or receipt exists, whatever transport is injected
+ * — and never surfaces as an UNKNOWN receipt mid-run (#389). Commands that
+ * make no request (withdraw) never consult it. */
+function transportFor(deps: CaptureCliDeps): FetchLike {
+  if (deps.responseHeadersTimeoutMs !== undefined) checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
+  return deps.fetchImpl ?? ((input, init) => nodeStreamFetch(input, init, { responseHeadersTimeoutMs: deps.responseHeadersTimeoutMs }));
 }
 
 /** Transport errors keep the primary message and add the underlying code
@@ -459,7 +463,7 @@ async function commandRun(
   const expectedHead = flags.get('expected-head') ?? null;
   const { baseUrl, token } = resolveOps(flags);
   const probe = deps.probe ?? systemProcessProbe;
-  const fetchImpl: FetchLike = deps.fetchImpl ?? defaultTransport(deps);
+  const fetchImpl = transportFor(deps);
   const now = deps.now ?? Date.now;
   const ownerPath = captureOwnerPath(sinkPath);
 
@@ -643,7 +647,7 @@ async function commandStatus(
 ): Promise<CaptureExitCode> {
   const requestId = required(flags, 'request-id');
   const { baseUrl, token } = resolveOps(flags);
-  const fetchImpl: FetchLike = deps.fetchImpl ?? defaultTransport(deps);
+  const fetchImpl = transportFor(deps);
   let response: Response;
   try {
     response = await fetchImpl(
@@ -713,14 +717,6 @@ export async function runCaptureCli(argv: readonly string[], deps: CaptureCliDep
     stderr(`capture: ${error instanceof Error ? error.message : String(error)}\n`);
     printUsage(stderr);
     return CAPTURE_EXIT.usage;
-  }
-  // A headers bound that cannot time correctly is a programming error in
-  // the caller's deps: it fails loud before any known command runs, whatever
-  // transport is injected — no sink, request or receipt exists, and it never
-  // surfaces as an UNKNOWN receipt mid-run (#389). Help, flag-parse and
-  // unknown-command usage exits stay reachable.
-  if (deps.responseHeadersTimeoutMs !== undefined && (command === 'run' || command === 'status' || command === 'withdraw')) {
-    checkResponseHeadersTimeoutMs(deps.responseHeadersTimeoutMs);
   }
   try {
     switch (command) {
