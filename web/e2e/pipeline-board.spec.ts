@@ -362,8 +362,10 @@ interface HitTarget {
  * half a CSS pixel on any edge: browsers scroll in whole pixels while layout
  * positions are fractional, so a focus/scroll that aligns an edge can leave
  * a sub-pixel sliver outside (Linux font metrics put the 1440 SETTLED and
- * 768 PIPELINE disclosures 0.1875px past the bottom edge — #402). A real
- * overhang, an empty box or any occluder still fails (pinned below). */
+ * 768 PIPELINE disclosures 0.1875px past the bottom edge — #402). Under half
+ * a CSS pixel rounds away at 1x device pixels, so nothing visible is
+ * clipped; a real overhang, an empty box or any occluder still fails
+ * (every edge and the exact boundary are pinned below). */
 async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   return page.evaluate((sel) => {
     const element = document.querySelector<HTMLElement>(sel);
@@ -665,15 +667,23 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
   test('containment tolerates only a sub-pixel sliver: a real overhang or an empty box fails (#402)', async ({ page }) => {
     await page.setViewportSize({ width: 400, height: 300 });
     await page.setContent([
-      '<div id="sliver" style="position:fixed;left:10px;top:250.1875px;width:20px;height:50px"></div>',
-      '<div id="overhang" style="position:fixed;left:60px;top:251px;width:20px;height:50px"></div>',
-      '<div id="left-overhang" style="position:fixed;left:-1px;top:10px;width:20px;height:20px"></div>',
-      '<div id="empty" style="position:fixed;left:100px;top:10px;width:0;height:0"></div>',
+      '<style>html,body{margin:0;padding:0;overflow:hidden}div{position:fixed;box-sizing:border-box;background:#888}</style>',
+      '<div id="sliver" style="left:10px;top:250.1875px;width:20px;height:50px"></div>',
+      '<div id="boundary" style="left:40px;top:250.5px;width:20px;height:50px"></div>',
+      '<div id="overhang" style="left:70px;top:251px;width:20px;height:50px"></div>',
+      '<div id="left-overhang" style="left:-1px;top:10px;width:20px;height:20px"></div>',
+      '<div id="top-overhang" style="left:40px;top:-1px;width:20px;height:20px"></div>',
+      '<div id="right-overhang" style="left:381px;top:40px;width:20px;height:20px"></div>',
+      '<div id="right-boundary" style="left:380.5px;top:80px;width:20px;height:20px"></div>',
+      '<div id="empty" style="left:100px;top:10px;width:0;height:0"></div>',
     ].join(''));
-    expect((await hitTarget(page, '#sliver')).inViewport).toBe(true);
-    expect((await hitTarget(page, '#overhang')).inViewport).toBe(false);
-    expect((await hitTarget(page, '#left-overhang')).inViewport).toBe(false);
-    expect((await hitTarget(page, '#empty')).inViewport).toBe(false);
+    expect(await hitTarget(page, '#sliver')).toEqual({ found: true, inViewport: true, hit: true });
+    expect((await hitTarget(page, '#boundary')).inViewport, 'exactly half a pixel past the bottom').toBe(true);
+    expect((await hitTarget(page, '#right-boundary')).inViewport, 'exactly half a pixel past the right').toBe(true);
+    for (const id of ['#overhang', '#left-overhang', '#top-overhang', '#right-overhang', '#empty']) {
+      expect((await hitTarget(page, id)).inViewport, id).toBe(false);
+    }
+    expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
   });
 
   test('desktop 1440: exact six-section order, bounded previews, reversible disclosures', async ({ page }) => {

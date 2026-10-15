@@ -208,11 +208,21 @@ test('real native compact preserves history and New chat starts unresumed behind
   await sendAndWaitReply(page, 'real context control old words');
   const pointerFile = join(durableHome, 'chat', 'gru-session.json');
   const readPointer = (): { sessionFile: string; epoch: number } => {
-    const value = JSON.parse(readFileSync(pointerFile, 'utf-8')) as { sessionFile?: unknown; epoch?: unknown };
-    if (typeof value.sessionFile !== 'string' || !Number.isSafeInteger(value.epoch)) {
-      throw new Error(`malformed chat session pointer ${pointerFile}: ${JSON.stringify(value)}`);
+    let raw: string;
+    let value: unknown;
+    try {
+      raw = readFileSync(pointerFile, 'utf-8');
+      value = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`unreadable chat session pointer ${pointerFile}: ${String(error)}`);
     }
-    return { sessionFile: value.sessionFile, epoch: value.epoch as number };
+    const record = typeof value === 'object' && value !== null ? value as { sessionFile?: unknown; epoch?: unknown } : null;
+    const epoch = record?.epoch;
+    if (record === null || typeof record.sessionFile !== 'string' || record.sessionFile === '' ||
+        typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0) {
+      throw new Error(`malformed chat session pointer ${pointerFile}: ${raw}`);
+    }
+    return { sessionFile: record.sessionFile, epoch };
   };
 
   await expect(page.locator('#chat-compact')).toBeEnabled();
@@ -229,7 +239,12 @@ test('real native compact preserves history and New chat starts unresumed behind
   // epoch pointer (the write is asynchronous): wait for the durable advance
   // rather than reading once — reading once made this test order/timing
   // sensitive (#402).
-  await expect.poll(() => readPointer().epoch, {
+  // A read failure is reported as the polled value, so a persistently
+  // unreadable pointer still fails with this message and its cause.
+  const polledEpoch = (): number | string => {
+    try { return readPointer().epoch; } catch (error) { return String(error); }
+  };
+  await expect.poll(polledEpoch, {
     message: 'New chat never durably advanced the chat session epoch pointer',
     timeout: 10_000,
   }).toBe(oldPointer.epoch + 1);

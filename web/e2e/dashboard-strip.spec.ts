@@ -977,28 +977,40 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
       await page.locator('#theme-toggle').click();
       await expect(page.locator('html')).toHaveClass(/dark/);
       // Measure the THEME, never a mid-animation blend: body color and the
-      // surface backgrounds transition on different elements. Each running
-      // CSS transition is jumped to its END state (finish()) rather than
-      // awaited — headless Chromium on Linux can stall a transition's
-      // `finished` promise past the test timeout (#402) — and the check
-      // repeats until nothing is still running.
+      // surface backgrounds transition on different elements. Every
+      // unsettled CSS transition is jumped to its END state (finish())
+      // rather than awaited — headless Chromium on Linux can stall a
+      // transition's `finished` promise past the test timeout (#402) — and
+      // the sweep repeats, bounded, until nothing is left unsettled.
       await page.evaluate(() => {
-        // Every unsettled transition — running (pending play included) or
-        // paused — is jumped to its end; finished and idle ones are done.
+        const SETTLE_PASSES = 60;
+        // Running (pending play included) or paused transitions are
+        // unsettled; finished and idle ones are done.
         const unsettled = (): CSSTransition[] => document
           .getAnimations()
           .filter((a): a is CSSTransition => a instanceof CSSTransition && a.playState !== 'finished' && a.playState !== 'idle');
-        for (let pass = 0; pass < 60; pass += 1) {
+        const nameOf = (t: CSSTransition): string => {
+          const effect = t.effect instanceof KeyframeEffect ? t.effect : null;
+          const target = effect?.target ?? null;
+          const element = target instanceof Element
+            ? `${target.tagName.toLowerCase()}${target.id === '' ? '' : `#${target.id}`}${[...target.classList].map((c) => `.${c}`).join('')}`
+            : 'unknown';
+          return `${element}${effect?.pseudoElement ?? ''} ${t.transitionProperty}`;
+        };
+        const failures: string[] = [];
+        for (let pass = 0; pass < SETTLE_PASSES; pass += 1) {
           const live = unsettled();
-          if (live.length === 0) return;
-          for (const transition of live) transition.finish();
+          if (live.length === 0) break;
+          for (const transition of live) {
+            try { transition.finish(); } catch (error) { failures.push(`${nameOf(transition)}: ${String(error)}`); }
+          }
+          if (failures.length > 0) break;
         }
-        const culprits = unsettled().map((t) => {
-          const target = t.effect instanceof KeyframeEffect ? t.effect.target : null;
-          const name = target instanceof Element ? `${target.tagName.toLowerCase()}${target.id === '' ? '' : `#${target.id}`}` : 'unknown';
-          return `${name} ${t.transitionProperty}`;
-        });
-        throw new Error(`CSS transitions kept restarting after 60 settle passes; the theme never settled: ${culprits.join(', ')}`);
+        if (failures.length > 0) throw new Error(`a CSS transition could not be finished; the theme was never measured settled: ${failures.join('; ')}`);
+        const stuck = [...new Set(unsettled().map(nameOf))];
+        if (stuck.length > 0) {
+          throw new Error(`CSS transitions kept restarting after ${String(SETTLE_PASSES)} settle passes; the theme never settled: ${stuck.join(', ')}`);
+        }
       });
     }
     const ratios = await measure();
