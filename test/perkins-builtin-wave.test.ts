@@ -3141,8 +3141,8 @@ describe('WaveRunner built-in Perkins production path', () => {
     ledger.setJobPr(job.id, 'https://git.example.invalid/acme/fixture/pull/39');
     attachOrigin(repo, 'feature/final-stuck', root);
     const receiptPoster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9002', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9002', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
@@ -9750,8 +9750,8 @@ describe('automatic admission retry (owner decisions 2026-10-08: in memory; a st
     const f = await transientFixture('identity-matrix');
     const noSpecCatalog = ['blind', 'edge', 'security', 'architecture', 'codebase', 'tests', 'performance', 'operations'];
     const receiptPoster = {
-      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string }) => ({
-        reviewId: '9003', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+      post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+        reviewId: '9003', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
         headSha: call.targetSha, baseSha: 'b'.repeat(40),
         bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
       })),
