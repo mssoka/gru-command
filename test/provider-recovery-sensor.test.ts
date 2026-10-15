@@ -1561,7 +1561,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       detail: expect.stringContaining('(for some or all of them)'),
     });
     expect(first?.detail).toContain("until a restart's hand-back succeeds — see the service log.");
-    expect(first?.detail).toMatch(/Last reported \S+\.$/u);
+    expect(first?.detail).toMatch(/Last reported \S+ \(after ledger event \d+\)\.$/u);
     expect(first?.detail).not.toContain('Gru was told before');
     // Every provider back on: a clean pass hands nothing back — and retires it.
     expect(h.sensor.handBackAtBoot()).toBe(0);
@@ -1789,7 +1789,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.ledger.getNotification(open.id)).toMatchObject({ resolvedAt: expect.any(String), detail: earlier });
   });
 
-  it('a failure notice whose detail carries no report time counts as reported; one with no detail at all uses its insert time', async () => {
+  it('a failure notice whose detail carries no report stamp, or no detail at all, counts as reported', async () => {
     try {
       const h = new Harness();
       await glmDebt(h);
@@ -1799,7 +1799,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
         jobId: null, agentId: null, slotId: 'early-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
         lineageKey: 'slot:early-slot', incidentId: 'provider-wall.early', incidentGeneration: 1, reasonClass: 'temporary-limit' });
       vi.setSystemTime(new Date(Date.now() + 60_000));
-      // A row with no detail at all (written as history): its insert time.
+      // A row with no detail at all (written as history): no stamp to read.
       h.ledger.recordNotification({ id: 'bare-failure', kind: 'provider-recovery.hand-back-failed', routing: 'action-required',
         severity: 'error', title: 'Provider waits not handed back at boot' });
       vi.setSystemTime(new Date(Date.now() + 60_000));
@@ -1810,8 +1810,9 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(4);
       expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${early.id}`, 'active')?.detail)
         .toContain('A boot hand-back failure was reported since this wait opened');
-      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail).not.toContain('reported since');
-      // A detail without its report time is unreadable: counted as reported.
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+      // A detail without its report stamp is unreadable: counted as reported.
       const h2 = new Harness();
       await glmDebt(h2);
       h2.ledger.recordNotification({ id: 'unstamped-failure', kind: 'provider-recovery.hand-back-failed', routing: 'action-required',
@@ -1871,6 +1872,38 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       expect(h.ledger.disposeMachineNotification(open!.id, 'Gru checked')).toMatchObject({ resolvedAt: expect.any(String) });
       expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'any')?.id).toBe(ahead!.id);
       expect(Date.parse(ahead!.ts)).toBeLessThan(Date.parse(late.createdAt));
+      vi.setSystemTime(new Date(now + 10_800_000));
+      // The two waits glmDebt opened and the late one.
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a report made after a wait opened marks it even when the clock stepped back in between (ledger order, not wall-clock time)', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      const now = Date.now();
+      vi.setSystemTime(new Date(now + 7_200_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      // The clock steps back BEFORE the failing boot reports: its wall-clock
+      // time is earlier than the wait's, its ledger order later.
+      vi.setSystemTime(new Date(now + 60_000));
+      const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+      try {
+        expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+      } finally {
+        reads.mockRestore();
+      }
+      const reported = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(Date.parse(reported!.ts)).toBeLessThan(Date.parse(late.createdAt));
+      expect(h.ledger.disposeMachineNotification(reported!.id, 'Gru checked')).toMatchObject({ resolvedAt: expect.any(String) });
       vi.setSystemTime(new Date(now + 10_800_000));
       // The two waits glmDebt opened and the late one.
       expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
