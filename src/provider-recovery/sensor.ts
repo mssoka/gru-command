@@ -49,12 +49,14 @@ export function providerRouteKey(provider: string, model: string, fingerprint: s
   return `${provider}/${model}@${fingerprint}`;
 }
 
-/** The provider segment of a key built by providerRouteKey (fail-loud on any
- * other shape: provider ids never contain "/"). */
-export function providerOfRouteKey(routeKey: string): string {
-  const slash = routeKey.indexOf('/');
-  if (slash <= 0) throw new Error(`provider route key "${routeKey}" is not "<provider>/<model>@<fingerprint>"`);
-  return routeKey.slice(0, slash);
+/** Whether a route key names the native claude.ai route. Exact and total:
+ * provider ids never contain "/", so a key starts with the native provider
+ * followed by "/" exactly when providerRouteKey built it for that provider.
+ * Any other key (including a legacy or hand-written one) belongs to the
+ * `enabled` switch — it never throws, so one odd persisted key cannot stall
+ * settlement or boot reconciliation for every other route. */
+export function isClaudeNativeRouteKey(routeKey: string): boolean {
+  return routeKey.startsWith(`${CLAUDE_NATIVE_PROVIDER}/`);
 }
 
 /** The notifications surface the sensor needs (NotificationCenter fits).
@@ -334,7 +336,7 @@ export class ProviderRecoverySensor {
   }
 
   private routeEnabled(routeKey: string): boolean {
-    return this.enabledFor(providerOfRouteKey(routeKey));
+    return isClaudeNativeRouteKey(routeKey) ? this.cfg.claudeNative : this.cfg.enabled;
   }
 
   /** Start the deterministic service timer (never an OS daemon). */

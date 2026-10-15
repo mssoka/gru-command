@@ -10,7 +10,7 @@ import { DEFAULT_PROVIDER_RECOVERY_CONFIG, type ProviderRecoveryConfig } from '.
 import {
   establishProviderWait,
   ProviderRecoverySensor,
-  providerOfRouteKey,
+  isClaudeNativeRouteKey,
   providerRouteKey,
   type MetadataReaderPort,
   type ProviderWallObservation,
@@ -1296,9 +1296,12 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.wakes.filter((wake) => wake.routeKey === wait!.routeKey).length).toBeGreaterThan(0);
   });
 
-  it('route keys parse strictly: provider ids never contain "/"', () => {
-    expect(providerOfRouteKey(providerRouteKey('anthropic-claude-native', 'claude-opus-5-5', 'fp'))).toBe('anthropic-claude-native');
-    expect(() => providerOfRouteKey('no-provider-segment')).toThrow(/is not "<provider>\/<model>@<fingerprint>"/);
+  it('route keys classify exactly and never throw: only a native-provider key is the claude_native route', () => {
+    expect(isClaudeNativeRouteKey(providerRouteKey('anthropic-claude-native', 'claude-opus-5-5', 'fp'))).toBe(true);
+    expect(isClaudeNativeRouteKey(providerRouteKey('zai-coding-plan', 'glm-5', 'fp'))).toBe(false);
+    expect(isClaudeNativeRouteKey(providerRouteKey('anthropic-claude-native-x', 'm', 'fp'))).toBe(false);
+    expect(isClaudeNativeRouteKey('no-provider-segment')).toBe(false);
+    expect(isClaudeNativeRouteKey('anthropic-claude-native')).toBe(false);
   });
 
   it('API-key/override and missing-keychain contexts resolve no native route — owner control preserved', async () => {
