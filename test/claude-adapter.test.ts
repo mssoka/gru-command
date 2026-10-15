@@ -1786,12 +1786,13 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     // labels, that lacks its server segment or that does not start the name;
     // and any character outside the label — never a denylist.
     for (const name of ['', 'me@host', 'https://u:p@h/m', 'user:sk-secret', 'ok\nuser', 'a/b', '-lead',
-      'plugin:a:b:c', 'plugin:x', 'plugin:_a:b', 'x/plugin:a:b', `ghp_${'a'.repeat(36)}`,
-      '123e4567-e89b-12d3-a456-426614174000', `${'ab-'.repeat(27)}`, `${'\u{20000}'.repeat(79)}ab`,
+      'plugin:a:b:c', 'plugin:x', 'plugin:_a:b', 'db.plugin:a:b', `ghp_${'a'.repeat(36)}`,
+      '123e4567-e89b-12d3-a456-426614174000', `plugin:p:${'a'.repeat(24)}`, 'plugin:p:123e4567-e89b-12d3-a456-426614174000',
+      `${'ab-'.repeat(27)}`, `${'\u{20000}'.repeat(79)}ab`,
       'a'.repeat(24), 'zZ9'.repeat(8), 'a\u0301'.repeat(24), 'a\u093e'.repeat(24), 'a\u20dd'.repeat(24),
       '123E4567-E89B-12D3-A456-426614174000', '123e4567-E89B-12d3-A456-4266141740aF',
       '123e\u03014567-e89b-12d3-a456-426614174000', 'db-123e4567-e89b-12d3-a456-426614174000',
-      '\u0301a', '\u093ea', '\u20dda', '\na', '\u202ea', '@a', ' a', '+15551234567',
+      '\u0301a', '\u093ea', '\u20dda', '\na', '\u202ea', '@a', ' a', '.a', '(a', '+15551234567',
       '_internal', 'a+b=', 'a\u202eb', 'a\u2028b', 'a"b', 'a$b']) {
       expect(loggableMcpServerName(name), name).toBe(false);
     }

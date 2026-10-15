@@ -21,7 +21,7 @@ import type {
 } from '../src/runtime/types.js';
 import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import { publishSpawnRegistration } from '../src/runtime/spawn-registration.js';
-import { establishProviderWait, ProviderRecoverySensor, type MetadataReaderPort } from '../src/provider-recovery/sensor.js';
+import { establishProviderWait, handBackThenStartSupervision, ProviderRecoverySensor, type MetadataReaderPort } from '../src/provider-recovery/sensor.js';
 import { composeMetadataReaders, type NativeCommandPort } from '../src/provider-recovery/composition.js';
 import { CLAUDE_METADATA_ENDPOINT } from '../src/provider-recovery/metadata.js';
 import { claudeInBandError } from '../src/runtime/claude-adapter.js';
@@ -577,6 +577,44 @@ describe('supervisor ⇄ sensor seam', () => {
     } finally {
       h.supervisor.dispose();
       h.sensor.stop();
+    }
+  });
+
+  it('a provider switch turned off across a restart hands the stopped lane to Gru with a re-arm control — the hand-back runs before hydration', async () => {
+    const h = new SeamHarness();
+    const handle = await h.runMinionIntoQuotaWall('job-recovery-off');
+    await h.settle();
+    const wait = h.ledger.openProviderWaitForAgent(handle.id);
+    expect(wait).not.toBeNull();
+    // The service restarts with automatic GLM recovery now off.
+    h.supervisor.dispose();
+    h.sensor.stop();
+    const off = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: false },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications,
+      wake: { trigger: async () => {} }, silasHosted: () => true,
+    });
+    const restarted = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+      registry: h.registry, ledger: h.ledger, notifications: h.notifications,
+      tickMs: 5_000, now: () => Date.parse('2026-09-28T10:00:00Z'),
+    });
+    try {
+      handBackThenStartSupervision(off, restarted, () => {});
+      (restarted as unknown as { tick(): void }).tick();
+      expect(h.ledger.getProviderWait(wait!.id)?.status).toBe('cancelled');
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait!.id}`, 'unacked')?.routing).toBe('action-required');
+      // The stop hydrated with no open control, so Gru holds a fresh re-arm
+      // control — its "resume" — rather than one bound to a resolved row.
+      // Like every restored stop's, it re-arms once a live agent is adopted;
+      // the cancelled wait no longer fences it.
+      const control = h.ledger.findNotificationByKind('supervision.rearm-fenced', 'active');
+      expect(control).toMatchObject({ routing: 'action-required', agentId: handle.id });
+      expect(restarted.onNotificationDisposed(control!.id)).toEqual({ ok: false,
+        reason: 'restored breaker has not been adopted by a live agent yet; keep this control open and retry after adoption' });
+    } finally {
+      restarted.dispose();
+      off.stop();
     }
   });
 

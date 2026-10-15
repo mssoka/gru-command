@@ -125,7 +125,8 @@ retries, the supervisor's quota-wall stop, and — by default
 `enabled` switch) — a provider wait read from the claude.ai usage endpoint
 that resumes the lane when the window resets (API-key/override contexts
 are left to Gru; turning a provider's switch off hands its open waits to
-Gru at the next boot as action-required notices, never stranded)
+Gru at the next boot as action-required notices — none where the lane
+already holds a stop — never stranded)
 (`sessions/<role>/--<dashed-cwd>--<hash8>/<ISO-ts>_<session-uuid>.jsonl`),
 so the lock / hourly backup / boot growth-detection machinery applies
 unchanged (SPEC ruling 12). Resume by `resumeFile` reads the session id
