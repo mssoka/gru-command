@@ -2936,7 +2936,7 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
     } finally { rig.dispose(); vi.useRealTimers(); }
   });
 
-  it('a captured obsolete turn stays fenced after a later handoff releases the hold (GH-279)', async () => {
+  it('a captured obsolete turn never replays after a later handoff releases the hold; the stop closes as superseded (GH-279, #385)', async () => {
     vi.useFakeTimers();
     const rig = boot(undefined, { maxRestarts: 1 });
     try {
@@ -2971,7 +2971,12 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
       await flushMicrotasks();
       expect(rig.registry.spawnCalls).toHaveLength(before);
       expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
-      expect(rig.supervisor.viewFor(idle.id)?.breakerOpen).toBe(true);
+      // Owner decision (#385, 2026-10-15): the fresh authority supersedes the
+      // obsolete captured turn, so Gru's disposition closes the stop — the
+      // stale turn never replays and the lane continues with the fresh work.
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded')).toHaveLength(1);
+      expect(rig.supervisor.viewFor(idle.id)).toBeNull();
+      expect(idle.promptCalls).toHaveLength(0);
     } finally { rig.dispose(); vi.useRealTimers(); }
   });
 });
@@ -5964,22 +5969,55 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
       await flushMicrotasks();
       expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
-      expect(pending()).toBeNull();
-      expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({
-        state: 'stopped',
-        stopReason: expect.stringContaining('captured turn was superseded'),
-      });
+      expect(pending()).toBeUndefined();
+      // CLOSED, not held: the supervision record is retired in-process exactly
+      // as durably, so the lane no longer reads as stopped.
+      expect(rig.supervisor.viewFor(rig.handle.id)).toBeNull();
       const closed = rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded');
       expect(closed).toHaveLength(1);
-      expect(closed[0]!.payload).toMatchObject({ notification_id: stop!.id, job_id: 'fenced-job', had_open_turn: true });
+      expect(closed[0]!.payload).toMatchObject({ notification_id: stop!.id, job_id: 'fenced-job', had_open_turn: true,
+        producer_changed: false, stop_reason: expect.stringContaining('captured turn was superseded') });
       const payload = closed[0]!.payload as { current_epoch: number; captured_epoch: number };
       expect(payload.current_epoch).toBeGreaterThan(payload.captured_epoch);
       expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
       // The closed stop is no longer a durable stop: a restart never raises a
       // fresh control for it.
       expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(false);
-      // The alert is no longer bound: a repeat disposition is a pure record.
-      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false });
+      // A retried disposition reports the same closure, never a bare record.
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      // A fresh re-brief/directive adopts the same logical id as a NEW watching
+      // record: never disposed as a restored stop, never re-alerted.
+      const alertsBefore = rig.api.listNotifications({ limit: 100 }).length;
+      const fresh = new FakeHandle('minion', 'fenced-agent', null);
+      rig.registry.adopt(fresh);
+      await flushMicrotasks();
+      expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'watching', breakerOpen: false });
+      expect(fresh.disposed).toBe(false);
+      expect(rig.api.listNotifications({ limit: 100 })).toHaveLength(alertsBefore);
+      // A later breaker on the same agent makes it a durable stop again.
+      rig.api.appendCustomEvent({ kind: 'supervision.breaker', agentId: rig.handle.id, payload: { reason: 'later stop' } });
+      expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(true);
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('a fresh producer alone (unchanged epoch) supersedes the captured turn and closes the stop (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+      const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+      const epoch = rig.api.directiveRecoveryEpoch('fenced-job');
+      // A settled re-brief moves the native producer history, not the epoch.
+      rig.api.appendCustomEvent({ kind: 'silas.rebrief-retired', jobId: 'fenced-job', payload: { reason: 'fixture: superseding producer' } });
+      expect(rig.api.directiveRecoveryEpoch('fenced-job')).toBe(epoch);
+      const spawnsBefore = rig.registry.spawnCalls.length;
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
+      const closed = rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded');
+      expect(closed).toHaveLength(1);
+      expect(closed[0]!.payload).toMatchObject({ producer_changed: true, captured_epoch: epoch, current_epoch: epoch });
     } finally {
       rig.close();
     }

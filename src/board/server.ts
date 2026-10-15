@@ -631,7 +631,14 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                 // an identical replay upgrades it in place when it is still
                 // open; a closed legacy row is a typed conflict.
                 try {
-                  json(res, 200, notifications.adoptLegacyDecision(id, decision, 'gru'));
+                  // The shared bearer proves a paired caller, never an actor
+                  // (decision #99): record exactly that.
+                  const adopted = notifications.adoptLegacyDecision(id, decision, { credential: 'shared-bearer', declaredActor: null });
+                  if (adopted === null) {
+                    json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+                    return;
+                  }
+                  json(res, 200, adopted);
                 } catch (error) {
                   if (!(error instanceof NotificationDecisionRefusal)) throw error;
                   json(res, 409, {

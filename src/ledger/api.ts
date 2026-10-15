@@ -5174,7 +5174,9 @@ export class LedgerApi {
   resolveOwnerDecision(
     id: string,
     detail: string,
-    provenance: { readonly credential: string; readonly declaredActor: string | null } = { credential: 'internal', declaredActor: null },
+    // Required, never defaulted (#396): every caller states the credential
+    // that authenticated it and any actor it declared.
+    provenance: { readonly credential: string; readonly declaredActor: string | null },
   ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('owner-decision resolution detail must be non-empty');
     return this.transaction(() => {
@@ -5413,8 +5415,12 @@ export class LedgerApi {
    * typed options on the ONE existing FOR YOU item instead of a 409 forever
    * (or a second item). A closed (acked/resolved) legacy row is refused —
    * a decision can never be attached to an already-closed question. */
-  adoptLegacyOwnerDecision(id: string, decision: NotificationDecision, by: string): NotificationRecord | null {
-    if (by.trim() === '') throw new Error('decision adoption by must be non-empty');
+  adoptLegacyOwnerDecision(
+    id: string,
+    decision: NotificationDecision,
+    provenance: { readonly credential: string; readonly declaredActor: string | null },
+  ): NotificationRecord | null {
+    if (provenance.credential.trim() === '') throw new Error('decision adoption credential must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
@@ -5424,7 +5430,10 @@ export class LedgerApi {
           `notification "${id}" is ${current.routing}; only owner decisions adopt a typed decision`,
         );
       }
-      if (current.decision !== null) {
+      // Legacy means the STORED column is empty — never a stored decision
+      // that merely failed to parse — and nothing was ever decided on it.
+      const stored = this.db.prepare('SELECT decision_json FROM notifications WHERE id = ?').get(id) as { decision_json: unknown } | undefined;
+      if (current.decision !== null || stored?.decision_json !== null || current.decidedOption !== null) {
         throw new NotificationDecisionRefusal(
           'decision_present',
           `notification "${id}" already carries a typed decision — it is never replaced`,
@@ -5442,7 +5451,7 @@ export class LedgerApi {
       this.appendEvent({
         kind: 'notification.decision-adopted',
         agentId: current.agentId,
-        payload: { id, by, option_ids: decision.options.map((option) => option.id) },
+        payload: { id, credential: provenance.credential, declared_actor: provenance.declaredActor, option_ids: decision.options.map((option) => option.id) },
       });
       return this.getNotification(id) as NotificationRecord;
     });

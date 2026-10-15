@@ -565,7 +565,7 @@ describe('board server — HTTP API', () => {
     expect(api.getNotification('owner-escalation:legacy-open')?.decision?.options.map((option) => option.id)).toEqual(['approve']);
     expect(count()).toBe(start); // the ONE existing item, never a second
     expect(api.listEventsAfter(0, { kinds: ['notification.decision-adopted'] })).toMatchObject([
-      { payload: { id: 'owner-escalation:legacy-open', by: 'gru', option_ids: ['approve'] } },
+      { payload: { id: 'owner-escalation:legacy-open', credential: 'shared-bearer', declared_actor: null, option_ids: ['approve'] } },
     ]);
     // The adopted row now replays like any typed escalation.
     expect((await postJson(port, path, 'board-test-token', body)).status).toBe(200);
@@ -583,6 +583,24 @@ describe('board server — HTTP API', () => {
       body: { error: 'idempotency_conflict', code: 'legacy_closed' },
     });
     expect(api.getNotification('owner-escalation:legacy-acked')?.decision).toBeNull();
+    // A STORED decision that merely fails to parse is never legacy: it is
+    // refused, and its bytes are kept.
+    legacy('legacy-corrupt');
+    const db = (api as unknown as { db: { prepare(sql: string): { run(...args: unknown[]): unknown; get(...args: unknown[]): unknown } } }).db;
+    db.prepare('UPDATE notifications SET decision_json = ? WHERE id = ?').run('{corrupt', 'owner-escalation:legacy-corrupt');
+    expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-corrupt' })).toMatchObject({
+      status: 409,
+      body: { error: 'idempotency_conflict', code: 'decision_present' },
+    });
+    expect(db.prepare('SELECT decision_json FROM notifications WHERE id = ?').get('owner-escalation:legacy-corrupt')).toEqual({ decision_json: '{corrupt' });
+    // A row that vanished before adoption is a 404, never a 200 with no body.
+    legacy('legacy-vanished');
+    const adopt = vi.spyOn(NotificationCenter.prototype, 'adoptLegacyDecision').mockReturnValueOnce(null);
+    try {
+      expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-vanished' })).toMatchObject({ status: 404, body: { error: 'not_found' } });
+    } finally {
+      adopt.mockRestore();
+    }
   });
 
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {

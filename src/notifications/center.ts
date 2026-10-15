@@ -293,8 +293,12 @@ export class NotificationCenter {
 
   /** A pre-upgrade owner row adopts a replayed typed decision (see
    * LedgerApi.adoptLegacyOwnerDecision, #395). */
-  adoptLegacyDecision(id: string, decision: NotificationDecision, by: string): NotificationRecord | null {
-    return this.ledger.adoptLegacyOwnerDecision(id, decision, by);
+  adoptLegacyDecision(
+    id: string,
+    decision: NotificationDecision,
+    provenance: { readonly credential: string; readonly declaredActor: string | null },
+  ): NotificationRecord | null {
+    return this.ledger.adoptLegacyOwnerDecision(id, decision, provenance);
   }
 
   /** Refresh an open incident's detail (same id, same ack state). */
