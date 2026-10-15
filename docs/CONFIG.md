@@ -17,7 +17,7 @@ The config file is always `<instance dir>/config.toml`.
 
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
 the supported installation path. It reads prompts from `/dev/tty`, so a
-`curl | bash` install remains one invocation, probes runtime CLIs, asks
+`curl | bash` install remains one invocation, probes runtime CLIs, defaults new installs to Claude Code (`pi` stays selectable; a missing CLI for the chosen runtime stops setup with the fix, never a silent fallback; an existing config keeps its runtime), asks
 which real repository directories to validate during setup, checks Git roots and GC worktree setup without provisioning
 or inspecting independent BMAD ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same
 **complete teaching config** as the generator below. Every concrete
@@ -112,7 +112,8 @@ port = 7665
 token = "a-random-pairing-token"
 
 [runtimes]
-# Session host runtime: "pi" or "claude-code".
+# Session host runtime: "claude-code" (default for new installs) or "pi".
+# Existing installs keep whatever is set here; switch by editing this line.
 default = "pi"
 
 [runtimes.roles]
@@ -305,8 +306,10 @@ sweep_interval_ms = 300000
 # Sweep wake gate (issue #217): a sweep whose digest fingerprint is
 # unchanged does not re-wake Silas until this much time has passed
 # since the last delivered wake (a bounded safety re-look). 0 = never
-# re-wake on an unchanged digest; a changed digest, an event trigger
-# or a passed decision recheck always wakes. The wake prompt carries
+# re-wake on an unchanged digest; a changed digest, an event whose
+# digest is non-empty, or a passed decision recheck always wakes (an
+# empty digest never wakes on its own; a due decision recheck still
+# does). The wake prompt carries
 # digest DELTA rows plus a pointer to GET /api/silas/digest, and the
 # static operating brief (orders, ops surface, skills) is injected
 # once per session — re-injected only when the brief hash changes,
@@ -327,6 +330,17 @@ stall_threshold_ms = 1800000
 directive_at = 2
 rebrief_at = 3
 escalate_at = 4
+
+[silas.autopilot]
+# Issue #243: the unambiguous rule families executed in code, BEFORE any
+# LLM wake. `enabled` is the global kill switch (default off); every rule
+# defaults to `dry-run`, so enabling the autopilot never enforces a family
+# by itself.
+enabled = false
+
+[silas.autopilot.rules]
+# Per-family mode: "off" (records nothing, calls nothing), "dry-run"
+# (records the would-call), or "enforce" (performs exactly one call).
 
 [provider_recovery]
 # Provider-recovery sensor (owner-approved 2026-09-28): watches EXPLICIT

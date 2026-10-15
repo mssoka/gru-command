@@ -57,7 +57,7 @@ describe('wizard answers', () => {
     const answers = parseAnswers('{}');
     expect(answers.workspaceRoot).toBe('~/code');
     expect(answers.repos).toEqual([]);
-    expect(answers.runtime).toBe('pi');
+    expect(answers.runtime).toBe('claude-code');
     expect(answers.model).toBe('default'); // SPEC ruling 16: never hardcode a model
     expect(answers.thinkingLevel).toBe('default');
     expect(answers.roles).toEqual({});
@@ -341,8 +341,8 @@ describe('wizard pairing QR + repo discovery + runtime probe', () => {
       expect(result.installed).toBe(false);
       expect(result.path).toBeNull();
     }
-    // And the answers layer is unaffected — the wizard proceeds with 'pi'.
-    expect(parseAnswers('{}').runtime).toBe('pi');
+    // And the answers layer is unaffected — parseAnswers still defaults to claude-code (the CLI layer fails loud).
+    expect(parseAnswers('{}').runtime).toBe('claude-code');
   });
 });
 
@@ -558,6 +558,28 @@ describe('wizard CLI surface', () => {
     );
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout).toContain('Runtime probe:');
+  });
+
+  it('claude-code default with no claude CLI fails LOUD naming the fix and pi, nothing written (#374)', async () => {
+    const instance = tempDir('gru-command-wizard-noclaude-');
+    const run = (answers: object) =>
+      runOwnedCommand(
+        process.execPath,
+        [join(import.meta.dirname, '..', 'dist', 'wizard', 'main.js'), '--answers', JSON.stringify({ smoke: false, port: 0, ...answers })],
+        { label: 'wizard no claude', deadlineMs: 30_000, env: { ...process.env, PATH: '/usr/bin:/bin', GRU_COMMAND_HOME: instance } },
+      );
+    const failed = await run({});
+    const text = `${failed.stdout}\n${failed.stderr}`;
+    expect(failed.status, text).toBe(1);
+    expect(text).toContain('`claude` was not found on PATH');
+    expect(text).toContain('"runtime":"pi"');
+    expect(failed.stdout).toContain('pi can still be configured');
+    expect(failed.stdout).not.toContain('refuses to write a config for a');
+    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+
+    const pi = await run({ runtime: 'pi' });
+    expect(pi.status, `${pi.stdout}\n${pi.stderr}`).toBe(0);
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toContain('default = "pi"');
   });
 
   it('pre-flight port check: an occupied fixed port fails LOUD with stop-first guidance, nothing written (Perkins r2 H2)', async () => {

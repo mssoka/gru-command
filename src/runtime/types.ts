@@ -1,5 +1,7 @@
 import type { Role } from '../config.js';
+import type { WorkerVerificationPolicy } from './worker-verification-policy.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
+import type { DirectiveCheckpoint, DirectiveNativeBinding, DirectiveProducer, DirectiveTurnIdentity } from './directive-checkpoint.js';
 import type { WorkflowContext, WorkflowInvocation } from '../workflows/runtime.js';
 
 /**
@@ -96,6 +98,9 @@ export interface NativeAgentTool {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Readonly<Record<string, unknown>>;
+  /** Stable, non-secret identity for authority-bearing values captured by execute().
+   * Required by restartable native turns; omitted declarations cannot prove the same closure authority. */
+  readonly authorityManifest?: string;
   execute(input: unknown, signal?: AbortSignal): Promise<NativeAgentToolResult>;
 }
 
@@ -144,6 +149,8 @@ export interface ManagedSkillSet {
 
 export interface ManagedWorkflowSession {
   readonly cwd: string;
+  /** Host-owned verification admission for this registered lane (issue #315). */
+  readonly workerVerification?: WorkerVerificationPolicy;
   /** Recorded logical owner, including resumes that supplied only a file. */
   readonly agentId?: string;
   readonly managedSkills?: ManagedSkillSet;
@@ -151,6 +158,12 @@ export interface ManagedWorkflowSession {
 
 /** Options for spawn(). */
 export interface SpawnOptions {
+  /**
+   * Host-owned registered-lane verification admission (issue #315): a
+   * minion on a lane that declares `[verify]` scopes must not run the known
+   * producer commands directly. Omitted = no declared scopes to enforce.
+   */
+  readonly workerVerification?: WorkerVerificationPolicy;
   /** Cancel a queued resident admission without starting an adapter spawn. */
   readonly signal?: AbortSignal;
   /**
@@ -158,6 +171,9 @@ export interface SpawnOptions {
    * When omitted a fresh session is created.
    */
   readonly resumeFile?: string;
+  /** Exact physical predecessor, inspected by the checkpoint coordinator.
+   * Only original host absence permits reclaiming its native session lock. */
+  readonly directiveRecoveryProducer?: DirectiveProducer;
   /**
    * Working directory for the session (SPEC ruling 17): the dispatch
    * flow roots minions and reviewers in the PROJECT they serve. Must be
@@ -299,6 +315,12 @@ export interface PromptOptions {
    * supervision watchdog owns un-hanging the turn itself.
    */
   readonly timeoutMs?: number;
+  /** Exact accepted request correlation; retained while queued. */
+  readonly directive?: {
+    readonly identity: DirectiveTurnIdentity;
+    readonly beforeAdmission: () => void;
+    readonly onAdmitted: (binding: DirectiveNativeBinding) => void;
+  };
 }
 
 /**
@@ -312,6 +334,7 @@ export interface PendingTurn {
   /** Single-writer owner the prompt was delivered under, when known. */
   readonly owner: string | null;
   readonly images?: PromptOptions['images'];
+  readonly directive?: PromptOptions['directive'];
 }
 
 /** Terminal evidence for the turn a prompt call settled. Captured by the
@@ -371,6 +394,10 @@ export interface AgentHandle {
    * (`promptWithTerminalVerdict` encodes that fallback).
    */
   promptWithVerdict?(text: string, options?: PromptOptions): Promise<PromptTurnVerdict>;
+  /** Adapter-owned safe native continuation: never replays a user prompt. */
+  prepareDirectiveProducer?(identity: DirectiveTurnIdentity): DirectiveProducer;
+  inspectDirective?(identity: DirectiveTurnIdentity): DirectiveCheckpoint;
+  resumeDirective?(identity: DirectiveTurnIdentity, checkpointId: string, beforeContinuation: () => void, claimContinuation?: () => void): Promise<PromptTurnVerdict>;
   /**
    * Interrupt/redirect the live turn. Native on pi; runtimes declaring
    * steer 'queued' get the fallback wrapper's queue-until-idle behavior.
@@ -404,6 +431,31 @@ export interface AgentHandle {
   subscribe(listener: RuntimeEventListener): () => void;
   health(): AgentHealth;
   dispose(): Promise<void>;
+}
+
+/**
+ * Contained adapter-owned cessation query (issue #341, Option A; F60-P1/P2/P3).
+ * Ownership (resident permits, review-pair proof, child lane/terminal
+ * finalization, restart replacement) may be released ONLY when the adapter
+ * itself attests `'ceased'`. A missing method, a throwing adapter, or any
+ * other value is `'unknown'` — never proof. Terminal health, disposed
+ * metadata, dispose fulfillment/rejection settlement, lock release and native
+ * retirement are NEVER evidence of cessation.
+ *
+ * Runtime-neutral: each adapter owns its own proof. pi: a bounded native
+ * abort/waitForIdle plus an inactive independent-bash controller set
+ * (`CESSATION_IDLE_TIMEOUT_MS`). claude-code: the ORIGINAL child's observed
+ * `close` (live, or late after the kill deadline) with the review bridge
+ * settled; an error/deadline exit stays 'unknown' until a late close.
+ */
+export function adapterCessationEvidence(
+  handle: Pick<AgentHandle, 'cessationEvidence'>,
+): 'ceased' | 'unknown' {
+  try {
+    return handle.cessationEvidence?.() === 'ceased' ? 'ceased' : 'unknown';
+  } catch {
+    return 'unknown'; // throwing evidence is unknown, never false
+  }
 }
 
 /** A runtime adapter (pi today; claude-code in E3). */

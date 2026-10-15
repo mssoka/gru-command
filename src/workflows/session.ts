@@ -1,9 +1,11 @@
+import { captureLaneHandoff } from '../worktrees/handoff.js';
 import { join } from 'node:path';
 import { createArtifactContext } from '../artifacts/context.js';
 import { materializeBmadRuntime, PACKAGE_ROOT, readBmadRuntimeBinding } from '../bmad/runtime.js';
 import type { WorktreeLane, WorktreePort } from '../dispatch/worktree-port.js';
 import type { AgentRecord, JobRecord } from '../ledger/api.js';
 import type { ManagedSkillSet, ManagedWorkflowSession, SpawnOptions } from '../runtime/types.js';
+import { workerVerificationPolicy } from '../runtime/worker-verification-policy.js';
 import { WORKFLOW_SOURCE } from './manifest.js';
 import { verifiedWorkflowResourceText, createWorkflowRuntimeBinder, loadBundledWorkflowRuntime, renderWorkflow, validateWorkflowContext, workflowRuntimeForInvocation, type WorkflowContext } from './runtime.js';
 
@@ -52,6 +54,7 @@ export function registeredWorkflowLane(
     if (options.cwd !== undefined && options.cwd !== assigned.path) {
       throw new WorkflowSessionError(`workflow cwd conflicts with registered assignment ${assigned.id}: ${options.cwd}`);
     }
+    captureLaneHandoff(assigned)();
     return assigned;
   }
   if (agent !== undefined && agent !== null) return null; // never redirect a known owner to another lane
@@ -64,6 +67,7 @@ export function registeredWorkflowLane(
       throw new WorkflowSessionError(`registered job ${candidate.jobId} already has a logical worker; resume its recorded session/identity instead of attaching an unknown worker by cwd`);
     }
   }
+  if (candidate !== undefined) captureLaneHandoff(candidate)();
   return candidate ?? null;
 }
 
@@ -75,6 +79,7 @@ export function createWorkflowSessionBinder(
   packageRoot = PACKAGE_ROOT,
   runsBuildFor: (lane: WorktreeLane) => boolean = () => true,
   agentFor?: (options: SpawnOptions) => string | undefined,
+  verificationConfigFile?: string,
 ): (options: SpawnOptions) => ManagedWorkflowSession {
   const storeRoot = join(dataDir, 'bmad-runtime'); // retain the historical store and private Git binding
   const bind = createWorkflowRuntimeBinder(storeRoot, packageRoot);
@@ -83,8 +88,13 @@ export function createWorkflowSessionBinder(
     if (lane === null || lane.status === 'swept') {
       throw new WorkflowSessionError(`GC workflow requires the live registered assignment for ${options.cwd ?? options.resumeFile ?? options.agentId ?? 'this minion'}; restore its job/worktree records before resuming`);
     }
+    captureLaneHandoff(lane)();
     const agentId = agentFor?.(options) ?? options.agentId;
-    const assignment = { cwd: lane.path, ...(agentId !== undefined ? { agentId } : {}) };
+    // Host-owned policy is derived from the registered lane's own declaration,
+    // never from the prompt or the workflow binding (issue #315).
+    const workerVerification = workerVerificationPolicy(lane, verificationConfigFile);
+    const assignment = { cwd: lane.path, ...(agentId !== undefined ? { agentId } : {}),
+      ...(workerVerification !== undefined ? { workerVerification } : {}) };
     const reference = readBmadRuntimeBinding(lane.path, storeRoot);
     let retained: ManagedSkillSet | undefined;
     if (reference !== null) {
@@ -144,7 +154,7 @@ export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<Wo
   getAgent(id: string): WorkflowAgent | null;
   listAgents(): readonly WorkflowAgent[];
   getJob(id: string): Pick<JobRecord, 'id' | 'deliverable'> | null;
-}, packageRoot = PACKAGE_ROOT): {
+}, packageRoot = PACKAGE_ROOT, verificationConfigFile?: string): {
   readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
   readonly workflowBuildFor: (lane: WorktreeLane) => boolean;
   readonly workflowAgentFor: (options: SpawnOptions) => string | undefined;
@@ -166,7 +176,7 @@ export function serviceWorkflowAuthority(dataDir: string, records: () => Pick<Wo
       }
       // Resource selection is authorized by the explicit registered JOB, not
       // permission to spawn a replacement implementation worker by its cwd.
-      const session = createWorkflowSessionBinder(dataDir, () => lane, packageRoot)({ cwd: lane.path });
+      const session = createWorkflowSessionBinder(dataDir, () => lane, packageRoot, undefined, undefined, verificationConfigFile)({ cwd: lane.path });
       return ownedFallbackReviewResources(session, dataDir, packageRoot);
     },
   };

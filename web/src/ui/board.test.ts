@@ -3223,6 +3223,36 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(pointer.textContent).toContain('Review the changes and decide in FOR YOU');
   });
 
+  it('"Go to For You" with no destination left closes the panel, returns focus to the notification bell, and never fetches or decides (#278)', async () => {
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    const bell = document.getElementById('notification-bell') as HTMLButtonElement;
+    const panel = document.getElementById('notification-panel')!;
+    panel.hidden = true; // as in the page: closed until the bell opens it
+    const pointer = (): HTMLButtonElement => document.getElementById('notification-list')!.querySelector<HTMLButtonElement>('.board-owner__goto')!;
+    // A first visit expands the owner list, so a later activation rebuilds nothing.
+    bell.click();
+    pointer().click();
+    expect(panel.hidden).toBe(true);
+    bell.click();
+    expect(panel.hidden).toBe(false);
+    const goto = pointer();
+    goto.focus();
+    expect(document.activeElement).toBe(goto); // already focused, inside the panel about to hide
+    // The destination disappears (decided elsewhere) before the pointer is activated.
+    const band = document.getElementById('board-owner')!;
+    band.querySelector('[data-proposal-id="lp-1"]')!.remove();
+    expect(band.querySelector('[data-proposal-id="lp-1"]')).toBeNull();
+    goto.click();
+    expect(panel.hidden).toBe(true);
+    expect(bell.dataset.open).toBe('false');
+    expect(document.activeElement).toBe(bell); // never left inside the hidden panel
+    await flush();
+    expect(client.getLessonProposal).not.toHaveBeenCalled();
+    expect(client.decideLessonProposal).not.toHaveBeenCalled();
+  });
+
   it('"Go to For You" reveals a proposal six newer obligations hid, and never fetches or decides (C3)', async () => {
     const client = proposalClient();
     const view = new BoardView(() => {}, client);

@@ -1020,6 +1020,40 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
   },
   {
+    // Approved GH-286 integration-only ordinal change: unshipped candidate
+    // 26 becomes 28; landed main 25–27 and original native SQL stay intact.
+    id: 28,
+    name: 'directive-native-progress',
+    sql: `
+      ALTER TABLE pending_directives ADD COLUMN request_kind TEXT CHECK (request_kind IS NULL OR request_kind IN ('directive','rebrief'));
+      ALTER TABLE pending_directives ADD COLUMN source_context TEXT;
+      ALTER TABLE pending_directives ADD COLUMN authority_epoch INTEGER;
+      ALTER TABLE pending_directives ADD COLUMN contract_snapshot TEXT;
+      ALTER TABLE pending_directives ADD COLUMN contract_sha256 TEXT;
+      ALTER TABLE pending_directives ADD COLUMN dispatch_started_at TEXT;
+      ALTER TABLE pending_directives ADD COLUMN native_target TEXT;
+      ALTER TABLE pending_directives ADD COLUMN native_binding TEXT;
+      ALTER TABLE pending_directives ADD COLUMN recovery_checkpoint TEXT;
+      ALTER TABLE pending_directives ADD COLUMN recovery_decision TEXT;
+      CREATE TABLE rebrief_recovery_decisions (
+        marker_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+        fingerprint TEXT NOT NULL, successor_id TEXT, event_seq INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX directive_recovery_generation ON events(
+        json_extract(payload, '$.request_id'), json_extract(payload, '$.generation'))
+        WHERE kind = 'silas.directive-recovery-decided';
+      CREATE UNIQUE INDEX rebrief_recovery_generation ON events(
+        json_extract(payload, '$.marker_id'), json_extract(payload, '$.generation'))
+        WHERE kind = 'silas.rebrief-recovery-decided';
+      CREATE UNIQUE INDEX recovery_owner_resolution_identity ON events(
+        json_extract(payload, '$.subject_kind'), json_extract(payload, '$.subject_id'), json_extract(payload, '$.resolution_id'))
+        WHERE kind = 'ruling.recorded' AND json_extract(payload, '$.permission') = 'fresh-current-approved-recovery-successor';
+      CREATE UNIQUE INDEX recovery_owner_confirmation_identity ON events(
+        json_extract(payload, '$.subject_kind'), json_extract(payload, '$.subject_id'), json_extract(payload, '$.resolution_id'))
+        WHERE kind = 'silas.recovery-owner-stop-confirmed';
+    `,
+  },
+  {
     // Owner decisions (owner release 2026-10-11): a needs-owner
     // notification may carry typed decision metadata (question, context,
     // recommendation, reserved class, options) supplied at the write
@@ -1028,9 +1062,9 @@ export const MIGRATIONS: readonly Migration[] = [
     // recorded choice). Decided state is deliberately distinct from ack
     // and resolution — recording a decision never proves its follow-on
     // operation succeeded.
-    // LANDING COLLISION: main landed migrations 26-27, so this never-applied
-    // migration takes id 28; the schema remains contiguous and forward-only.
-    id: 28,
+    // LANDING COLLISION: main landed migrations 26-28, so this never-applied
+    // migration takes id 29; the schema remains contiguous and forward-only.
+    id: 29,
     name: 'notification-owner-decisions',
     sql: `
       ALTER TABLE notifications ADD COLUMN decision_json TEXT;

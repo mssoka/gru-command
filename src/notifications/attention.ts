@@ -37,6 +37,9 @@ const OWNER_REQUIRED_KINDS: readonly string[] = [
   'port-squat',
   'roll-port-squat',
   'worktree-sweep-paused',
+  // Unconfirmed native cleanup after a refused replacement can need a human
+  // when the original owner is lost (issue #280): main's owner-facing notice.
+  'supervision.restart-cleanup-unconfirmed',
 ];
 
 /** Kinds that are always owner-facing, prefix match (dynamic suffixes,

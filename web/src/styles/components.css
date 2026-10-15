@@ -2975,10 +2975,16 @@ a.repo-row__name:hover {
   display: inline-block;
 }
 
+/* position: fixed (not absolute): a document-absolute panel slid under the
+   sticky command bar as soon as the board scrolled (#28). Its top is
+   derived from the MEASURED chrome height (--chrome-h), so a nav that
+   wraps to 2 or 3 rows still clears at every width. */
 .notification-panel {
-  position: absolute;
+  position: fixed;
   right: 16px;
   top: calc(var(--chrome-h, 100px) + 8px);
+  max-height: calc(100vh - var(--chrome-h, 100px) - 16px);
+  overflow-y: auto;
   width: min(420px, calc(100vw - 32px));
   z-index: 40;
   display: grid;
@@ -3496,6 +3502,10 @@ a.repo-row__name:hover {
   font-weight: 600;
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+.notice-line--multiline {
+  white-space: pre-wrap;
 }
 
 .board-notification__ack {

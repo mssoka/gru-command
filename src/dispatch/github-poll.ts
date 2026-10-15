@@ -125,6 +125,12 @@ export interface GhCheckRun {
 /** The outbound GitHub port (real implementation: {@link GhCliApi}). */
 export interface GhApiPort {
   listPulls(input: { readonly repo: RepoRef; readonly limit: number }): Promise<readonly GhPull[]>;
+  /** Open pulls whose head branch is `head` — the `gh pr list --repo <repo>
+   * --head <branch> --state open` filter the delivered→PR registration rule
+   * (issue #243) asks through this port instead of shelling out itself. The
+   * API filters head by `owner:branch`, so the repo's owner is part of the
+   * query, never assumed from the branch name. */
+  listPullsForHead(input: { readonly repo: RepoRef; readonly head: string }): Promise<readonly GhPull[]>;
   getPull(input: { readonly repo: RepoRef; readonly number: number }): Promise<GhPull>;
   listCheckRuns(input: { readonly repo: RepoRef; readonly sha: string }): Promise<readonly GhCheckRun[]>;
 }
@@ -685,6 +691,17 @@ export class GhCliApi implements GhApiPort {
     const parsed = await this.apiJson(`list pulls ${repoFullName(input.repo)}`, input.repo, path);
     if (!Array.isArray(parsed)) {
       throw new GhApiError(`list pulls ${repoFullName(input.repo)}: expected a JSON array`);
+    }
+    return parsed.map(mapPull).filter((pull): pull is GhPull => pull !== null);
+  }
+
+  async listPullsForHead(input: { readonly repo: RepoRef; readonly head: string }): Promise<readonly GhPull[]> {
+    const path =
+      `repos/${input.repo.owner}/${input.repo.repo}/pulls` +
+      `?state=open&per_page=20&head=${encodeURIComponent(`${input.repo.owner}:${input.head}`)}`;
+    const parsed = await this.apiJson(`list pulls head ${repoFullName(input.repo)}#${input.head}`, input.repo, path);
+    if (!Array.isArray(parsed)) {
+      throw new GhApiError(`list pulls head ${repoFullName(input.repo)}: expected a JSON array`);
     }
     return parsed.map(mapPull).filter((pull): pull is GhPull => pull !== null);
   }

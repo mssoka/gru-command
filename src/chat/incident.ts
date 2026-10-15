@@ -117,6 +117,8 @@ export function incidentBasisOf(row: IncidentRow): string {
 export function isHardFloorRow(row: IncidentRow): boolean {
   if (row.routing === 'needs-owner') return true;
   return (
+    row.kind.startsWith('silas.directive-unreconciled.') ||
+    row.kind.startsWith('silas.rebrief-unreconciled.') ||
     row.kind.startsWith('supervision.breaker') ||
     row.kind.startsWith('supervision.rearm-fenced') ||
     row.kind.startsWith('supervision.provider-wall.') ||

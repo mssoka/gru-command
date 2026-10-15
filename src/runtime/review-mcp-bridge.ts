@@ -9,12 +9,26 @@ import type { NativeAgentTool } from './types.js';
 const MAX_BRIDGE_MESSAGE_BYTES = 1024 * 1024;
 const PARTIAL_FRAME_TIMEOUT_MS = 5_000;
 /** Soft byte bound on successfully settled results retained for re-attach.
- * Only the newest execution matters for a re-attach, so the oldest settled
- * entries are evicted first; a single oversized result is still retained. */
+ * Each entry is charged its text, its serialized structured details, its
+ * request key and a fixed overhead, so no settled success is free. The
+ * entries settled LONGEST AGO are evicted first (never in-flight ones); the
+ * most recently settled result is always retained even when oversized. */
 const MAX_RETAINED_EXECUTION_BYTES = 16 * 1024 * 1024;
+/** Entry-count cap on retained successes, so tiny or zero-text results
+ * cannot grow the map without bound. */
+const MAX_RETAINED_EXECUTIONS = 256;
+/** Fixed per-entry bookkeeping charge (record, promise, map slot). */
+const RETAINED_ENTRY_OVERHEAD_BYTES = 256;
+
+export interface ReviewMcpRetention {
+  readonly maxBytes: number;
+  readonly maxEntries: number;
+}
 const MAX_BUNDLED_SERVER_BYTES = 2 * 1024 * 1024;
 const MAX_BRIDGE_CONNECTIONS = 16;
-const BRIDGE_CLOSE_TIMEOUT_MS = 5_000;
+/** Cap on bridge teardown during disposal. Exported so the service shutdown
+ * force-exit budget can be reconciled with the bounded teardown (issue #341). */
+export const BRIDGE_CLOSE_TIMEOUT_MS = 5_000;
 export const PERKINS_MCP_SERVER_SHA256 = '06e42a2dfd7330c6b2a7377c0423371907956d52ba56baeb5227caf3e21e1618';
 
 interface BridgeRequest {
@@ -32,14 +46,17 @@ interface BridgeToolResult {
 /** The settled outcome of one host-side tool execution. Failures are never
  * retained: a later identical request must execute for real. */
 type BridgeOutcome =
-  | { readonly ok: true; readonly result: BridgeToolResult }
+  | { readonly ok: true; readonly result: BridgeToolResult; readonly retainedBytes: number }
   | { readonly ok: false; readonly error: string };
 
 interface ExecutionRecord {
   readonly promise: Promise<BridgeOutcome>;
   settled: boolean;
-  /** Retained text bytes; nonzero only for a settled success. */
+  /** Retained cost (text + details + key + overhead); nonzero only for a
+   * settled success. */
   retainedBytes: number;
+  /** Monotonic settlement order of a retained success (0 until settled). */
+  settledSeq: number;
 }
 
 /** Canonical request identity: object key order must not split one logical
@@ -91,6 +108,8 @@ export class ReviewMcpBridge {
    * to the SAME work instead of cancelling or duplicating it. */
   private readonly executions = new Map<string, ExecutionRecord>();
   private retainedExecutionBytes = 0;
+  private retainedExecutionCount = 0;
+  private settlementSeq = 0;
   /** Per-connection request handlers in flight (teardown awaits them). */
   private readonly handlers = new Set<Promise<void>>();
 
@@ -99,6 +118,7 @@ export class ReviewMcpBridge {
     private readonly directory: string,
     private readonly server: Server,
     private readonly tools: ReadonlyMap<string, NativeAgentTool>,
+    private readonly retention: ReviewMcpRetention,
   ) {
     this.toolNames = [...tools.keys()];
     // The plain-JS server must ship beside this module in both src/ tests
@@ -137,8 +157,18 @@ export class ReviewMcpBridge {
 
   static async start(
     definitions: readonly NativeAgentTool[],
-    startup: { chmod?: typeof chmodSync } = {},
+    startup: { chmod?: typeof chmodSync; retention?: ReviewMcpRetention } = {},
   ): Promise<ReviewMcpBridge> {
+    const retention = startup.retention ?? {
+      maxBytes: MAX_RETAINED_EXECUTION_BYTES,
+      maxEntries: MAX_RETAINED_EXECUTIONS,
+    };
+    if (
+      !Number.isSafeInteger(retention.maxBytes) || retention.maxBytes < 1 ||
+      !Number.isSafeInteger(retention.maxEntries) || retention.maxEntries < 1
+    ) {
+      throw new Error('review bridge retention bounds must be positive safe integers');
+    }
     const tools = new Map<string, NativeAgentTool>();
     for (const definition of definitions) {
       // Product-native tool names (review leads and, since issue #161,
@@ -201,7 +231,7 @@ export class ReviewMcpBridge {
           void execution.finally(() => current.handlers.delete(execution));
         });
       });
-      bridge = new ReviewMcpBridge(socketPath, directory, server, tools);
+      bridge = new ReviewMcpBridge(socketPath, directory, server, tools, retention);
       bridgeRef.current = bridge;
       await new Promise<void>((resolve, reject) => {
         server!.once('error', reject);
@@ -292,6 +322,11 @@ export class ReviewMcpBridge {
         if (result.terminate !== undefined && typeof result.terminate !== 'boolean') {
           throw new Error('native review tool returned an invalid termination state');
         }
+        // The result is serialized onto the socket anyway; measuring it here
+        // makes a non-serializable details object a loud tool error.
+        const detailsBytes = result.details === undefined
+          ? 0
+          : Buffer.byteLength(JSON.stringify(result.details) ?? '', 'utf8');
         return {
           ok: true,
           result: {
@@ -299,6 +334,8 @@ export class ReviewMcpBridge {
             ...(result.details !== undefined ? { details: result.details } : {}),
             ...(result.terminate !== undefined ? { terminate: result.terminate } : {}),
           },
+          retainedBytes: Buffer.byteLength(result.text, 'utf8') + detailsBytes +
+            Buffer.byteLength(key, 'utf8') + RETAINED_ENTRY_OVERHEAD_BYTES,
         };
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -306,7 +343,7 @@ export class ReviewMcpBridge {
         this.abort.signal.removeEventListener('abort', abort);
       }
     })();
-    const record: ExecutionRecord = { promise, settled: false, retainedBytes: 0 };
+    const record: ExecutionRecord = { promise, settled: false, retainedBytes: 0, settledSeq: 0 };
     this.executions.set(key, record);
     void promise.then((outcome) => {
       record.settled = true;
@@ -316,23 +353,37 @@ export class ReviewMcpBridge {
         if (this.executions.get(key) === record) this.executions.delete(key);
         return;
       }
-      record.retainedBytes = Buffer.byteLength(outcome.result.text, 'utf8');
+      if (this.executions.get(key) !== record) return;
+      this.settlementSeq += 1;
+      record.settledSeq = this.settlementSeq;
+      record.retainedBytes = outcome.retainedBytes;
       this.retainedExecutionBytes += record.retainedBytes;
+      this.retainedExecutionCount += 1;
       this.evictRetainedExecutions();
     });
     return record;
   }
 
-  /** Keep retained bytes bounded by evicting the OLDEST settled successes
-   * first; pending executions are never evicted. Eviction only degrades a
-   * stale re-attach into a fresh execution, never into a duplicate. */
+  /** Keep retained successes bounded by bytes AND entry count, evicting the
+   * entries SETTLED longest ago first. Start order is irrelevant: a wave that
+   * started early but just settled is the newest retained result and the one
+   * a re-attach needs. Pending executions are never evicted, and the most
+   * recently settled success is always kept. Eviction only degrades a stale
+   * re-attach into a fresh execution, never a just-settled one. */
   private evictRetainedExecutions(): void {
-    if (this.retainedExecutionBytes <= MAX_RETAINED_EXECUTION_BYTES) return;
-    for (const [key, record] of this.executions) {
-      if (this.retainedExecutionBytes <= MAX_RETAINED_EXECUTION_BYTES) break;
-      if (!record.settled || record.retainedBytes === 0) continue;
+    const over = () =>
+      this.retainedExecutionBytes > this.retention.maxBytes ||
+      this.retainedExecutionCount > this.retention.maxEntries;
+    if (!over()) return;
+    const settled = [...this.executions.entries()]
+      .filter(([, record]) => record.settled && record.retainedBytes > 0)
+      .sort(([, a], [, b]) => a.settledSeq - b.settledSeq);
+    // Never evict the newest settled success.
+    for (const [key, record] of settled.slice(0, -1)) {
+      if (!over()) break;
       this.executions.delete(key);
       this.retainedExecutionBytes -= record.retainedBytes;
+      this.retainedExecutionCount -= 1;
     }
   }
 

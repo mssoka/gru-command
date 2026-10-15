@@ -1,3 +1,4 @@
+import { bindOriginalRebriefSdkOwner } from './helpers/directive-native-fixture.js';
 import { afterAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -327,19 +328,30 @@ describe('unmarked blocked-phase hand-back crash-window recovery (r4 blocker 2)'
     expect(h.ledger.listNotifications({ limit: 200 }).filter((row) => row.kind === kind)).toHaveLength(1);
   });
 
-  it('leaves marked deliveries and unblocked lanes to their own owners', () => {
+  it('leaves marked deliveries and unblocked lanes to their own owners', async () => {
     const h = makeHarness();
     const worktrees = new InMemoryWorktreePort(join(tmpDir(), 'wt'));
     // A marked phase on a blocked lane: the phase path owns it; the unmarked
     // backstop must not double-publish the event-sequence card.
     seedJob(h.ledger, 'job-uwc3', 'blocked');
-    h.ledger.beginPendingRebrief({
+    const markers = h.ledger.beginPendingRebrief({
       jobId: 'job-uwc3',
       note: 'n',
       briefing: 'b',
       handoff: { kind: 'gru-decision', decision: 'marked' },
     });
-    finalizeRebriefRequest({ ledger: h.ledger, worktrees, jobId: 'job-uwc3', minionId: 'm1', lanePath: null, note: 'n' });
+    const finalize = (): void => { finalizeRebriefRequest({ ledger: h.ledger, worktrees, jobId: 'job-uwc3', minionId: 'm1', lanePath: null, note: 'n' }); };
+    expect(finalize).toThrow('historical rebrief completion is unproven');
+    expect(h.ledger.listPendingRebriefs({ jobId: 'job-uwc3' })).toEqual(markers);
+    expect(h.ledger.latestJobEvent('job-uwc3', 'job.delivered')).toBeNull();
+    // Seed an actual historical completion receipt for this marked phase;
+    // the finalizer may record its lost delivery, never invent completion.
+    const originalRoot = tmpDir();
+    await bindOriginalRebriefSdkOwner(h.ledger, markers, { cwd: originalRoot, dataDir: tmpDir(), agentId: 'm1' });
+    h.ledger.appendCustomEvent({ kind: 'silas.rebrief', jobId: 'job-uwc3',
+      payload: { minion_id: 'm1', note: 'n', phase_id: markers[0]!.phaseId, work_revision: markers[0]!.workRevision,
+        sha: 'a'.repeat(40) } });
+    finalize();
     const markedPass = reconcileUnmarkedHandbacks({ ledger: h.ledger, notifications: h.notifications });
     expect(markedPass.deliveries).toBe(0);
     expect(markedPass.published).toBe(0);

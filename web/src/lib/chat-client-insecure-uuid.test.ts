@@ -17,9 +17,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatClient } from './chat-client.js';
 import type { StorageLike } from '../theme.js';
 import type { ChatClientEvents } from './chat-client.js';
-
-/** 8-4-4-4-12 hex, version nibble 4, variant high bits 10xx → [89ab]. */
-const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+import { stubInsecureCrypto, UUID_V4_RE } from './uuid-test-support.js';
 
 function memStorage(): StorageLike {
   const map = new Map<string, string>();
@@ -38,16 +36,6 @@ const noopEvents: ChatClientEvents = {
   replayEnd: () => {},
   fatal: () => {},
 };
-
-/** Simulate an insecure-context browser: crypto exists, getRandomValues
- * works, and randomUUID is simply not on the object. */
-function stubInsecureCrypto(): void {
-  const real = globalThis.crypto;
-  vi.stubGlobal('crypto', {
-    getRandomValues: <T extends ArrayBufferView>(array: T): T => real.getRandomValues(array),
-  });
-  expect((globalThis.crypto as { randomUUID?: unknown }).randomUUID).toBeUndefined();
-}
 
 function newInsecureClient(idgen?: () => string): ChatClient {
   return new ChatClient(
@@ -86,5 +74,41 @@ describe('chat send over plain HTTP (crypto.randomUUID unavailable, no idgen)', 
     const client = newInsecureClient(() => `m${++calls}`);
     expect(client.send('injected wins').client_msg_id).toBe('m1');
     expect(client.send('still injected').client_msg_id).toBe('m2');
+  });
+
+  it('send() with no Web Crypto at all throws the actionable error and queues nothing (boundary)', () => {
+    vi.stubGlobal('crypto', undefined);
+    const storage = memStorage();
+    const client = new ChatClient(
+      { token: 't', host: 'h.local:1', secure: false, storage },
+      noopEvents,
+    );
+    expect(() => client.send('no crypto here')).toThrow(
+      'Web Crypto is unavailable in this context; cannot mint message ids',
+    );
+    expect(client.getMessages()).toEqual([]);
+    expect(storage.getItem('gru-outbox')).toBeNull();
+  });
+
+  it('send() propagates a throwing native randomUUID rather than hiding it', () => {
+    vi.stubGlobal('crypto', {
+      randomUUID: () => {
+        throw new Error('native randomUUID exploded');
+      },
+    });
+    const client = newInsecureClient();
+    expect(() => client.send('boom')).toThrow('native randomUUID exploded');
+    expect(client.getMessages()).toEqual([]);
+  });
+
+  it('an idgen returning an empty id is refused loudly, before anything is queued', () => {
+    const storage = memStorage();
+    const client = new ChatClient(
+      { token: 't', host: 'h.local:1', secure: false, storage, idgen: () => '' },
+      noopEvents,
+    );
+    expect(() => client.send('dropped on reload otherwise')).toThrow(/idgen returned an empty id/);
+    expect(client.getMessages()).toEqual([]);
+    expect(storage.getItem('gru-outbox')).toBeNull();
   });
 });

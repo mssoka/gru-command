@@ -8,7 +8,7 @@ import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
 import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
-import { parseDecisionOptions, parseNotificationDecision } from '../ledger/notification-decision.js';
+import { parseDecisionOptions, parseNotificationDecision, serializeNotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -613,6 +613,37 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           // here, so an operational chore can never be posted to FOR YOU as
           // a bare acknowledgement notice.
           const decision = parseNotificationDecision(body['decision']);
+          // Retry identity (decision #100, 2026-10-12): an optional client-
+          // supplied idempotency key names ONE escalation. The same key with
+          // the same title/detail/decision returns the existing row (200, no
+          // second FOR YOU item or bell); the same key with a changed request
+          // is refused (409). Without a key every request is a distinct decision.
+          const rawKey = body.idempotencyKey;
+          if (rawKey !== undefined && (typeof rawKey !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(rawKey))) {
+            throw new Error('idempotencyKey must be 1-128 chars of [A-Za-z0-9._:-]');
+          }
+          if (typeof rawKey === 'string') {
+            const id = `owner-escalation:${rawKey}`;
+            const existing = ledger.getNotification(id);
+            if (existing !== null) {
+              if (
+                existing.title !== title ||
+                existing.detail !== detail ||
+                existing.decision === null ||
+                serializeNotificationDecision(existing.decision) !== serializeNotificationDecision(decision)
+              ) {
+                json(res, 409, {
+                  error: 'idempotency_conflict',
+                  detail: `idempotencyKey "${rawKey}" already names a different escalation; use a new key for a new decision`,
+                });
+                return;
+              }
+              json(res, 200, existing);
+              return;
+            }
+            json(res, 201, notifications.post({ id, kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail, decision }));
+            return;
+          }
           const row = notifications.post({
             kind: 'gru.owner-escalation',
             routing: 'needs-owner',
@@ -714,6 +745,15 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               json(res, 400, { error: 'bad_request', detail: 'disposition detail must be non-empty' });
               return;
             }
+            // The board has ONE shared bearer for owner and agent callers, so
+            // the credential proves "a paired caller", not "Gru". A caller may
+            // declare its actor; only 'gru' is a valid declaration for a
+            // machine disposition, and the audit labels it caller-declared.
+            const declaredActor = optStrField(body, 'actor') ?? null;
+            if (declaredActor !== null && declaredActor !== 'gru') {
+              json(res, 400, { error: 'bad_request', detail: `actor "${declaredActor}" cannot produce a Gru disposition; omit actor or declare "gru"` });
+              return;
+            }
             const target = ledger.getNotification(id);
             const closer = target === null ? null : producerResolvedBy(target.kind);
             if (target !== null && closer !== null) {
@@ -764,7 +804,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             }
             const row = ownerFollowThrough
               ? ledger.resolveOwnerDecision(id, detail)
-              : ledger.disposeMachineNotification(id, detail);
+              : ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;

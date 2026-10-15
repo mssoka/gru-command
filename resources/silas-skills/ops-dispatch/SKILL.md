@@ -31,6 +31,37 @@ draft first, never a later draft-to-ready conversion. This corrects HOW
 an already-authorized PR is created; it grants no publication permission
 to a lane that has none, and existing drafts are left untouched.
 
+## Review source preflight (issue #317)
+
+A `deliverable: "review"` dispatch may bind the exact source it will
+review. Three optional fields, valid only on review jobs:
+
+- `"target_base"` — focused-delta base; the range reviewed is
+  `target_base..target_sha`, both exact commit ids (a symbolic name like
+  `"main"` is refused).
+- `"required_inputs"` — `[{ "path": "<repo-relative file>", "lens":
+  "claims" }]` content the review needs. Only the `claims` lens accepts
+  inputs; a `blind` lens is a 400, so a missing spec is never a reason to
+  feed claims or old assessments to a blind reviewer (#316).
+- `"source_package"` — `{ "path": "<absolute bundle path>", "sha256":
+  "<64 hex>" }` of a git bundle. It authorizes ONE repair: the service
+  verifies the pinned hash and that the bundle carries the target, then
+  fetches it into the SELECTED repository under a private ref — never a
+  checkout, reset or unrelated worktree.
+
+Before any job row, worktree or reviewer spawn, the service proves the
+ACTUAL selected object store holds the named target, base/range and
+inputs. When it cannot, `POST /api/dispatch` answers `422`:
+
+```json
+{"error":"review_source_unavailable","detail":"...","problems":["..."],"retry_authorized":false}
+```
+
+That is a concrete, named refusal — never a no-findings report, a
+completed review, or authority for an automatic retry. Re-dispatch to the
+repository that holds the commits, or re-dispatch with an explicit
+`source_package`.
+
 ## No tool-call ceilings in briefings or directives (issue #158)
 
 A worker's tool-call count is telemetry, never a boundary. You never
@@ -71,6 +102,18 @@ only for the marked phase's correlated, admitted terminal delivery. Never
 re-mark historical work; a changed decision needs a NEW request id.
 
 ## Mechanical reactions vs judgment (owner mandate split 2026-09-23; rules codified for issue #117/g21)
+
+**The autopilot executes the unambiguous families in code** (issue #243):
+before you are woken, Silas's deterministic pass reads the same digest and
+runs `verdict-rung-directive`, `verdict-rung-rebrief`,
+`verification-repair`, `pr-conflict-rebase`, `clean-abort-service-restart`,
+`sweep-ack`, `delivered-pr-register` and `pr-review-trigger` directly. You
+are woken for the rows it could not resolve — every refusal listed below
+leaves its row to you, and `verdict-rung-escalate` is yours by design.
+While the autopilot runs in `dry-run` (its default) it makes no call: it
+records a `silas.autopilot-decision` event naming the action it would take,
+and the row is still yours to act on. Act normally on a family in
+`dry-run` — that agreement is what promotes it to `enforce`.
 
 The chief keeps the judgments: rulings, merge presentations, and novel failures. The
 mechanical reactions are YOURS — execute them without asking. Each named
@@ -128,6 +171,25 @@ without a named rule is not yours to invent:
   nothing and stays eligible for the next sweep. Preserve-before-remove
   and the pause-and-ask rule remain absolute: a paused release is a
   refusal, never an override.
+- **`delivered-pr-register` — register the one PR the lane actually has.**
+  Fires on a `deliveredWithoutPr` row whose deliverable is `pr`. Ask GitHub
+  once for the lane branch (`gh pr list --repo <repo> --head <branch>
+  --state open --json number,url`, or the same listing through the
+  service's gh port). Exactly ONE open PR → register it through
+  `POST /api/dispatch/pr` with `"by":"silas"` and
+  `"rule_id":"delivered-pr-register"`; the `silas.pr-registered` receipt
+  carries the rule. ZERO or SEVERAL → a real exception: fall back to the
+  transcript/lane search in step 1 below, or escalate — never guess a URL.
+- **`pr-review-trigger` — arm the review on a green delivered head.**
+  Fires on a `prWithoutReview` row that carries NO `cleanAbort` and whose
+  delivered head has a `github.ci-green` observation. After the eligibility
+  rechecks (freeze-r1 idle branch; the final-head freshness check) pass,
+  arm ONE review through `POST /api/dispatch/review` with
+  `"by":"silas"` and `"rule_id":"pr-review-trigger"`; the
+  `silas.review-triggered` receipt carries the rule when a Perkins round
+  arms. Any recheck failure, a 409 `branch_busy` deferral, or a fallback
+  route answers nothing — the row stays for the next sweep. The clean-abort
+  rule above is the re-arm-specific form of the same request.
 - **`freeze-r1` — one standing gate.** Never arm a review round on a branch
   while any lane is ACTIVE on the same target — a rebase/force-push or an
   ordinary conflict-integration push; the round
@@ -151,7 +213,9 @@ without a named rule is not yours to invent:
    digest) for a pull-request or merge-request URL, or run
    `git -C <lane_path> log --oneline -5` and
    `gh pr list --head <branch> --json url,number,title` in the lane. Pick
-   the PR whose head branch is the job's lane branch. Before arming,
+   the PR whose head branch is the job's lane branch. (When the autopilot
+   resolved this row under `delivered-pr-register`, the row is gone and
+   this step is not yours.) Before arming,
    confirm no lane is actively moving the target — rebase/force-push or an
    integration push (freeze-r1 —
    an armed round races the push and dies obsolete). Then register it and

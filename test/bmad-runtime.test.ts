@@ -1,3 +1,4 @@
+import { issueFixtureHandoff, standaloneFixtureLedger } from './helpers/fixture-handoff.js';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
@@ -546,8 +547,7 @@ describe('job binding', () => {
     const home = tempDir('gru-command-bmad-service-');
     const config = loadConfig({ GRU_COMMAND_HOME: home });
     const options = serviceRegistryOptions({ config, store: {} as SessionStore,
-      workflowLaneFor: () => ({ id: 'j-service', jobId: 'j-service', kind: 'job', repoPath: repo, repoName: 'fixture',
-        path: serviceLane, branch: 'gru/service', sha: git(repo, ['rev-parse', 'HEAD']), roundId: null, status: 'active' }),
+      workflowLaneFor: () => serviceRecord,
     });
     const seen: Array<ManagedSkillSet | undefined> = [];
     const caps = { streaming: false, steer: 'queued' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
@@ -570,6 +570,8 @@ describe('job binding', () => {
     }
     const serviceLane = join(tempDir('gru-command-bmad-service-lane-'), 'lane');
     git(repo, ['worktree', 'add', '-q', '-b', 'gru/service', serviceLane]);
+    const serviceRecord = issueFixtureHandoff({ id: 'j-service', jobId: 'j-service', kind: 'job', repoPath: repo, repoName: 'fixture',
+      path: serviceLane, branch: 'gru/service', sha: git(repo, ['rev-parse', 'HEAD']), roundId: null, status: 'active' }, standaloneFixtureLedger('j-service'));
     const handle = await new ServiceRegistry(options).spawn('minion', { cwd: serviceLane });
     await handle.dispose();
     expect(seen[0]).toMatchObject({ runtimeId: loadBundledWorkflowRuntime().id, laneBound: true, skills: ['gc-build'] });

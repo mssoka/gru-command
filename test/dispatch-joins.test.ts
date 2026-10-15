@@ -54,7 +54,7 @@ async function makeJoinHarness(turns: readonly StubTurn[] = []): Promise<JoinHar
   const repo = makeFixtureRepo('fixture-joins');
   const ledgerDb = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-command-joinsdata-')));
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
-  const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-joinsroot-')));
+  const worktrees = new InMemoryWorktreePort(mkdtempSync(join(tmpdir(), 'gru-command-joinsroot-')), ledger);
   const dispatch = new DispatchService({
     ledger,
     worktrees,

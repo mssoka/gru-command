@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { DirectiveNativeBinding } from '../runtime/directive-checkpoint.js';
 
 /**
  * Durable directive requests — typed vocabulary (phase 3 slice).
@@ -166,6 +167,18 @@ export interface DirectiveRequestRecord {
    * rule 4): its delivery carries it as the service-bound acknowledgement.
    * null = accepted before work revisions existed. */
   readonly workRevision: number | null;
+  /** NULL remains legacy/unprovable, never inferred from current authority. */
+  readonly requestKind: 'directive' | 'rebrief' | null;
+  readonly sourceContext: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } | null;
+  readonly authorityEpoch: number | null;
+  readonly contractSha256: string | null;
+  readonly contractSnapshot: string | null;
+  readonly dispatchStartedAt: string | null;
+  readonly nativeTarget: { readonly agentId: string; readonly sessionFile: string } | null;
+  readonly nativeBinding: DirectiveNativeBinding | null;
+  /** A claimed checkpoint is never reissued by clock/lease expiry. */
+  readonly recoveryCheckpoint: string | null;
+  readonly recoveryDecision: { readonly fingerprint: string; readonly successorId: string | null; readonly eventSeq: number } | null;
 }
 
 /** One open (or released) continuation hold created by a retirement. The

@@ -2,7 +2,7 @@ import { GruMailbox } from '../gru-mailbox/service.js';
 import type { MailboxSnapshot } from '../ledger/mailbox.js';
 import type { Role } from '../config.js';
 import type { LogLevel } from '../logger.js';
-import type { AgentState } from '../runtime/types.js';
+import type { AgentHandle, AgentState } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { EventBus } from '../events/bus.js';
 import type { AgentSupervisionView } from '../supervision/supervisor.js';
@@ -554,6 +554,8 @@ export class BoardEngine {
   private readonly pipeline: () => PipelineBoardView | null;
   private readonly selfHeal: () => SelfHealView | null;
   private readonly now: () => number;
+  private readonly runtimeSources = new Map<string, symbol>();
+  private readonly runtimeHandleSources = new WeakMap<AgentHandle, symbol>();
 
   /** Fired after any event that may have changed the board. */
   onChange(listener: () => void): () => void {
@@ -579,14 +581,34 @@ export class BoardEngine {
 
   onRuntimeEvent(envelope: AgentEventEnvelope): void {
     try {
+      // A logical id survives replacement; the old object's late disposal
+      // must not retire the newer writer's durable session/state.
+      const current = this.runtimeSources.get(envelope.agentId);
+      const source = envelope.handle === undefined ? undefined : this.runtimeHandleSources.get(envelope.handle);
+      if (envelope.handle !== undefined && envelope.phase === 'spawned') {
+        if (source !== undefined && current !== undefined && source !== current) return;
+        const token = source ?? Symbol();
+        this.runtimeHandleSources.set(envelope.handle, token);
+        this.runtimeSources.set(envelope.agentId, token);
+      } else if (current !== undefined && source !== current) {
+        return;
+      } else if (envelope.handle !== undefined && current === undefined) {
+        const token = source ?? Symbol();
+        this.runtimeHandleSources.set(envelope.handle, token);
+        this.runtimeSources.set(envelope.agentId, token);
+      }
       switch (envelope.phase) {
-        case 'spawned':
+        case 'spawned': {
+          const known = this.ledger.getAgent(envelope.agentId);
           this.ledger.registerAgent({
             id: envelope.agentId,
-            role: envelope.role,
+            // A controlled recovery may have explicitly restored a job-bound
+            // fallback role before granting this neutral registration tap.
+            role: envelope.handle !== undefined && known?.jobId != null ? known.role : envelope.role,
             sessionFile: envelope.sessionFile,
           });
           break;
+        }
         case 'disposed':
           if (this.ledger.getAgent(envelope.agentId) !== null) {
             this.ledger.setAgentState(envelope.agentId, 'disposed');

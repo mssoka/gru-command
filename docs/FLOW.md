@@ -375,6 +375,13 @@ verification budget.
   `[verify] worker_budget` (default: CPU cores − 2), enforced by the run
   wrapper through the vitest pool knobs and `GRU_VERIFY_*` variables for
   other runners.
+- **Compatible gates reuse one build.** A declared `npm run build` step
+  may be satisfied by the immediately preceding successful build in the
+  same lane when head, clean tree, configuration, environment and the
+  whole `dist/` tree digest are all unchanged — every other step still
+  runs and is reported. A second gate that arrives while that lane's
+  build is in flight never inherits it (`build-in-flight`) and runs its
+  own build.
 - **Project harness budgets compose with the run budget.** A repo may
   classify process-heavy integration files with their own finite ceilings
   and a smaller worker cap (gru-command: 120s and two workers, see
@@ -416,6 +423,48 @@ verification budget.
   consumer must tolerate a leading `ping` (and must never count it as a
   producer frame). The protection assumes the event loop services the
   timer; a stall longer than the client's idle limit is outside it.
+
+- **Workers cannot bypass a declared contract (issue #315).** A job lane
+  whose `.gru-command/worktree.toml` declares `[verify]` scopes carries a
+  host-owned admission policy into both runtime adapters. A normal worker
+  Bash call that runs a known unscheduled producer (the raw `npm test`,
+  `npx vitest run …`, declared `npm run …` scripts, or their bare/local-bin
+  equivalents) is refused BEFORE any child process starts: the pi runtime
+  blocks the SDK `tool_call`, and claude-code loads a private PreToolUse
+  hook plus native Bash ask routing to the host policy. The refusal names the declared
+  scopes and the authenticated capture helper's `run`/`status` actions, so
+  the supported path and the timeout-reconcile step are always one message
+  away. The guard never rewrites the command string, never submits a run
+  itself and never infers coverage; ordinary reads, Git operations and the
+  capture helper run normally. It is a bounded refusal for the known
+  conventional producer forms, NOT a general-purpose shell sandbox — opaque
+  scripts, interpreters and adversarial evasion are out of scope.
+
+  Claude's private native `permissions.ask: ["Bash"]` routes each Bash
+  permission to an original-child-bound host stdio handler, including in
+  bypass mode and when the explanatory hook fails or is unavailable. The host
+  applies the immutable manifest policy, returning unchanged valid input for
+  source/Git/helper/diagnostic reads and denying known producers; malformed,
+  foreign or failed permission transport fails closed. No MCP authority or new
+  tools are granted. Private files survive disposal until every original
+  policy child actually closes. Error settlement and deadlines are not close.
+
+  Supported conventional normalization includes assignments, nested simple
+  env/command/time/exec/nohup/nice wrappers, npm aliases/options/workspace
+  operands, npx flags and known lane-local tool paths. Literal quoted text and
+  plaintext heredoc bodies remain data; supported executable substitutions in
+  expanding text are checked. Help/config inspection (including `vitest run
+  --help`) remains an ordinary read; `--` ends option interpretation. This
+  bounded grammar does not inspect arbitrary script/interpreter bodies.
+
+  The independent offline CLI double proves raw corpus dispositions, settings
+  and stdio wiring, not execution by a vendor CLI or paid model. The declared
+  native component scope exercises installed Claude 2.1.296 with the configured
+  `gpt-6-luna`/`max`, isolated state, fake credentials and deterministic
+  loopback upstream; it verifies matching successful Bash read results and
+  zero refused producer starts. That is actual vendor permission-engine
+  evidence for its captured exact head, not paid-model behavior or native
+  Perkins READY. Final integrated/FULL/remote CI acceptance remains separate.
 
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
@@ -652,8 +701,10 @@ the judgment; the dispatch surface is the mechanical hand.
   prompted them), and driver start seeds the gate from the newest
   delivered event, so a restart never re-wakes what Silas has already
   seen. A queued event trigger is never displaced by a later sweep —
-  only a newer event supersedes it. Event triggers always deliver,
-  whatever the gate says.
+  only a newer event supersedes it. An event trigger whose digest is empty
+  does not wake either (issue #243): with the autopilot enforced the code
+  already handled the rows the event raised, and LLM Silas wakes only when
+  rows remain that need judgment.
 - **The GitHub signal poll (POLL-ONLY; owner ruling 2026-09-23)** rides
   the same driver on its own faster interval (`[silas] poll_interval_ms`,
   default 60 s; 0 disables) and needs no model turn: every tracked job

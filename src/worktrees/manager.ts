@@ -1,4 +1,6 @@
-import { execFileSync, spawnSync } from 'node:child_process';
+import { readWorktreeMetadata, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   copyFileSync,
   cpSync,
@@ -11,11 +13,12 @@ import {
   symlinkSync,
   type Stats,
 } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { LogLevel } from '../logger.js';
 import type { LedgerApi, WorktreeBaseSource, WorktreeRecord } from '../ledger/api.js';
 import { applyWorktreeManifest, assertWorktreeBootstrapSupported, loadWorktreeManifest } from './manifest.js';
 import { redactedText } from '../decisions/questions.js';
+import { repositoryGitEnv } from '../dispatch/perkins-review/artifacts.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -283,7 +286,10 @@ function spawnGit(
     encoding: 'utf-8',
     maxBuffer: 16 * 1024 * 1024,
     ...(opts.timeoutMs !== undefined ? { timeout: opts.timeoutMs } : {}),
-    ...(opts.noPrompt === true ? { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } } : {}),
+    env: {
+      ...repositoryGitEnv(false),
+      ...(opts.noPrompt === true ? { GIT_TERMINAL_PROMPT: '0' } : {}),
+    },
   });
   return {
     status: result.status,
@@ -291,6 +297,17 @@ function spawnGit(
     stderr: result.stderr ?? '',
     error: result.error !== undefined ? String(result.error) : null,
   };
+}
+
+/** Git's locked worktree reason survives a failed post-checkout hook and
+ * identifies this invocation, unlike a pre-add absence check. Branches are
+ * created atomically with a matching reflog receipt, never claimed via DWIM. */
+interface CreationCustody {
+  readonly token: string;
+  readonly branch: string | null;
+  readonly sha: string;
+  branchCreated: boolean;
+  addAttempted: boolean;
 }
 
 /** A lane base resolved to a concrete commit, with its provenance. */
@@ -330,6 +347,7 @@ export class WorktreeManager {
   private tailFailure: string | null = null;
 
   constructor(opts: WorktreeManagerOptions) {
+    registerHandoffManager(this, opts.ledger);
     this.opts = opts;
     this.log = opts.log ?? (() => {});
     this.enumerate = opts.enumerateProcesses ?? psEnumerator;
@@ -579,13 +597,14 @@ export class WorktreeManager {
   private resolveReviewRef(
     repoPath: string,
     ref: string,
-  ): { sha: string; baseSource: WorktreeBaseSource | null } {
+  ): { sha: string; baseSource: WorktreeBaseSource | null; trackingRef: string | null } {
     const prefix = 'refs/remotes/origin/';
     const strip = /^(?:refs\/)?remotes\/origin\/|^origin\//u;
     /** The fetch discipline one origin-branch spelling always gets. */
     const fetchedOriginBranch = (branch: string | null, namedAs: string, unverifiedDetail: string | null = null): {
       sha: string;
       baseSource: WorktreeBaseSource | null;
+      trackingRef: string;
     } => {
       if (branch === null) {
         throw new Error(
@@ -608,7 +627,7 @@ export class WorktreeManager {
             'refusing to check out a possibly stale origin tip; verify the remote and retry',
         );
       }
-      return { sha: fetched.sha, baseSource: 'origin' };
+      return { sha: fetched.sha, baseSource: 'origin', trackingRef: `refs/remotes/origin/${branch}` };
     };
     // (1) An EXACT origin-branch spelling classifies FIRST (Perkins R5):
     // git's ambiguous DWIM lets a local refs/heads/origin/topic or
@@ -643,7 +662,7 @@ export class WorktreeManager {
       const branch = suffix === 'HEAD' ? this.resolveDefaultBranch(repoPath).branch : suffix;
       return fetchedOriginBranch(branch, ref);
     }
-    return { sha: runGit(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]), baseSource: null };
+    return { sha: runGit(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`]), baseSource: null, trackingRef: null };
   }
 
   /** Resolve a review target exactly as `createReviewWorktree` does —
@@ -656,7 +675,7 @@ export class WorktreeManager {
   async resolveReviewTarget(input: {
     repoPath: string;
     ref: string;
-  }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null }> {
+  }): Promise<{ readonly sha: string; readonly baseSource: WorktreeBaseSource | null; readonly trackingRef: string | null }> {
     return this.withRepoLock(input.repoPath, async () => this.resolveReviewRef(input.repoPath, input.ref));
   }
 
@@ -695,15 +714,15 @@ export class WorktreeManager {
       // not actually branch from (the 'freshHead lie' of 2026-09-23).
       const base = this.resolveBase(repo.repoPath);
       const sha = base.sha;
-      runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, sha]);
-      // Perkins lane-B r1 B1: the guard covers BOOTSTRAP *AND REGISTRATION*
-      // — a registration failure (missing owner row, DB error) used to
-      // leave tree+branch on disk with no registry row: retries wedged on
-      // 'path already exists' and registry-paths-only sweeps never saw
-      // the debris.
+      const custody = this.creationCustody(branch, sha);
       let record;
       try {
+        await this.addLane(repo.repoPath, path, custody);
         await this.bootstrap(repo.repoPath, path);
+        this.assertCreationIdentity(path, custody);
+        this.assertCreationCustody(repo.repoPath, path, custody);
+        beginLaneHandoff({ id: input.jobId, kind: 'job', jobId: input.jobId, roundId: null, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
+          this.assertCreationCustody(repo.repoPath, path, custody), custody.token);
         record = this.opts.ledger.registerWorktree({
           id: input.jobId,
           kind: 'job',
@@ -716,9 +735,11 @@ export class WorktreeManager {
           jobId: input.jobId,
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, branch, error);
+        if (this.opts.ledger.getWorktree(input.jobId) !== null) throw error; // committed publication retains unresolved custody
+        await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
+      this.handoffLane(repo.repoPath, path, custody, record);
       this.log('info', 'job worktree created', {
         job: input.jobId,
         path,
@@ -759,14 +780,17 @@ export class WorktreeManager {
         throw new Error(`worktree path already exists: ${path}`);
       }
       const resolved = this.resolveReviewRef(repo.repoPath, input.ref);
-      runGit(repo.repoPath, ['worktree', 'add', '--detach', path, resolved.sha]);
-      // Same guard as job lanes (Perkins lane-B r1 B1): registration
-      // failures roll the detached tree back — no unregistered debris.
+      const custody = this.creationCustody(null, resolved.sha);
       let record;
       try {
+        await this.addLane(repo.repoPath, path, custody);
         // Review lanes must contain only bytes tracked by the frozen commit.
         // Job bootstrap links/setup outputs are intentionally not applied.
         const sha = runGit(path, ['rev-parse', 'HEAD']);
+        this.assertCreationIdentity(path, custody);
+        this.assertCreationCustody(repo.repoPath, path, custody);
+        beginLaneHandoff({ id: input.roundId, kind: 'review', jobId: input.jobId ?? null, roundId: input.roundId, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
+          this.assertCreationCustody(repo.repoPath, path, custody), custody.token);
         record = this.opts.ledger.registerWorktree({
           id: input.roundId,
           kind: 'review',
@@ -780,9 +804,11 @@ export class WorktreeManager {
           ...(input.jobId !== undefined ? { jobId: input.jobId } : {}),
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, null, error);
+        if (this.opts.ledger.getWorktree(input.roundId) !== null) throw error; // committed publication retains unresolved custody
+        await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
+      this.handoffLane(repo.repoPath, path, custody, record);
       this.log('info', 'review worktree created (detached)', {
         round: input.roundId,
         path,
@@ -817,13 +843,24 @@ export class WorktreeManager {
     if (input.authority !== 'read-only' && input.authority !== 'writer') {
       throw new Error(`unknown child worker authority "${String(input.authority)}"`);
     }
+    // Bind the injected SERVICE ledger's original parent before queuing;
+    // neither later receipt bytes nor a replacement HEAD may choose it.
+    const parent = this.listWorktrees({ jobId: input.jobId }).find((lane) =>
+      lane.path === input.parentPath || existsSync(lane.path) && existsSync(input.parentPath) &&
+        realpathSync.native(lane.path) === realpathSync.native(input.parentPath));
+    if (parent === undefined) throw new WorktreeHandoffUnresolvedError(input.parentPath);
+    const originalParent = capturePortLaneHandoff(this, parent);
+    const originalCwd = captureCwdHandoff(input.parentPath);
+    const assertParent = (): void => { originalParent(); originalCwd(); };
     return this.withRepoLock(input.repoPath, async () => {
+      assertParent();
       const repo = this.assertRepo(input.repoPath);
       if (!existsSync(input.parentPath)) {
         throw new Error(
           `parent lane path ${input.parentPath} does not exist — a child lane must base on a live parent lane`,
         );
       }
+      assertParent();
       const parentHead = runGit(input.parentPath, ['rev-parse', 'HEAD']);
       const path = join(this.opts.root, repo.repoName, `child-${input.childId}`);
       if (existsSync(path)) {
@@ -835,16 +872,19 @@ export class WorktreeManager {
         if (existing.status === 0) {
           throw new Error(`branch ${branch} already exists — one lane per child, never a reused held branch`);
         }
-        runGit(repo.repoPath, ['worktree', 'add', '-b', branch, path, parentHead]);
-      } else {
-        runGit(repo.repoPath, ['worktree', 'add', '--detach', path, parentHead]);
       }
-      // Same guard as job/review lanes: registration failures roll the
-      // tree AND the branch back — no unregistered debris, no wedge.
+      const custody = this.creationCustody(branch, parentHead);
       let record;
       try {
+        await this.addLane(repo.repoPath, path, custody, assertParent);
+        assertParent();
         if (input.authority === 'writer') await this.bootstrap(repo.repoPath, path);
+        assertParent();
+        this.assertCreationIdentity(path, custody);
         const sha = runGit(path, ['rev-parse', 'HEAD']);
+        this.assertCreationCustody(repo.repoPath, path, custody);
+        beginLaneHandoff({ id: input.childId, kind: 'child', jobId: input.jobId, roundId: null, repoPath: repo.repoPath, path, branch: custody.branch, sha: custody.sha },
+          this.assertCreationCustody(repo.repoPath, path, custody), custody.token);
         record = this.opts.ledger.registerWorktree({
           id: input.childId,
           kind: 'child',
@@ -859,9 +899,13 @@ export class WorktreeManager {
           jobId: input.jobId,
         });
       } catch (error) {
-        this.rollbackPartialLane(repo.repoPath, path, branch, error);
+        if (this.opts.ledger.getWorktree(input.childId) !== null) throw error; // committed publication retains unresolved custody
+        await this.rollbackPartialLane(repo.repoPath, path, custody, error);
         throw error;
       }
+      assertParent(); // registration observers cannot invalidate the original source
+      this.handoffLane(repo.repoPath, path, custody, record, assertParent);
+      assertParent();
       this.log('info', 'child worktree created', {
         child: input.childId,
         job: input.jobId,
@@ -898,11 +942,12 @@ export class WorktreeManager {
     opts: { status?: 'active' | 'paused' | 'swept'; jobId?: string } = {},
   ): readonly WorktreeRecord[] {
     const filtered = opts.status !== undefined || opts.jobId !== undefined;
-    return filtered ? this.opts.ledger.listWorktrees(opts) : this.opts.ledger.listWorktrees();
+    return (filtered ? this.opts.ledger.listWorktrees(opts) : this.opts.ledger.listWorktrees()).map((lane) => rememberManagedLane(lane, this.opts.ledger));
   }
 
   getWorktree(id: string): WorktreeRecord | null {
-    return this.opts.ledger.getWorktree(id);
+    const lane = this.opts.ledger.getWorktree(id);
+    return lane === null ? null : rememberManagedLane(lane, this.opts.ledger);
   }
 
   /**
@@ -918,6 +963,11 @@ export class WorktreeManager {
     worktreeId: string;
     confirmKill?: boolean;
     baseBranch?: string;
+    /** Issue #243 F-H1: the UNATTENDED autopilot release must prove tracked
+     * cleanliness and fresh required containment BEFORE any forced removal —
+     * an operator release keeps its current answer/confirm authority and
+     * leaves this false. */
+    requireReleaseProofs?: boolean;
   }): Promise<SweepResult> {
     const row = this.opts.ledger.getWorktree(input.worktreeId);
     if (row === null) {
@@ -950,6 +1000,7 @@ export class WorktreeManager {
         };
       }
       return this.withRepoLock(row.repoPath, async () => {
+        assertLaneResourcesAbsent(row);
         let branchOutcome: 'deleted' | 'retained' | 'none' = 'none';
         if ((row.kind === 'job' || row.kind === 'child') && row.branch !== null) {
           const present = spawnGit(row.repoPath, [
@@ -961,11 +1012,9 @@ export class WorktreeManager {
           if (present.status === 0) {
             // Fresh remote state BEFORE the retry disposal (Perkins r8):
             // the old tracking refs must not witness containment.
-            branchOutcome = this.disposeLaneBranch(
-              row,
-              input.baseBranch,
-              this.safeFreshRemoteBranch(row.repoPath),
-            );
+            const remote = this.safeFreshRemoteBranch(row.repoPath);
+            assertLaneResourcesAbsent(row);
+            branchOutcome = this.disposeLaneBranch(row, input.baseBranch, remote);
           }
         }
         if (treeGone) {
@@ -975,15 +1024,14 @@ export class WorktreeManager {
             this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
           }
         }
-        return {
-          status: 'swept',
-          preserved: null,
-          branch: branchOutcome,
-          freshHead: this.safeFreshHead(row.repoPath),
-        } as const;
+        const freshHead = this.safeFreshHead(row.repoPath);
+        assertLaneResourcesAbsent(row);
+        return { status: 'swept', preserved: null, branch: branchOutcome, freshHead } as const;
       });
     }
+    const assertCleanup = captureCleanupHandoff(rememberManagedLane(row, this.opts.ledger));
     return this.withRepoLock(row.repoPath, async () => {
+      assertCleanup();
       // (0) Crash-window reconciliation (Perkins lane-B r2 c): the tree is
       // gone but the row never flipped (a kill between removal and the
       // registry write). Reconcile — swept + loud event — instead of
@@ -992,13 +1040,16 @@ export class WorktreeManager {
         // The reconcile disposes the branch exactly like finishSweep
         // (Perkins lane-B r3): containment-verified delete, or retain +
         // note — and the response reports the TRUE outcome.
-        const branchOutcome = this.reconcileMissingTree(row, input.baseBranch);
-        return {
-          status: 'swept',
-          preserved: null,
-          branch: branchOutcome,
-          freshHead: this.safeFreshHead(row.repoPath),
-        } as const;
+        const reconciled = this.reconcileMissingTree(row, input.baseBranch);
+        return { status: 'swept', preserved: null, ...reconciled } as const;
+      }
+      // (0.9) AUTOMATIC RELEASE PROOFS (issue #243 F-H1): an unattended sweep
+      // must refuse BEFORE the forced removal when tracked work would be
+      // destroyed or fresh required containment cannot be proven. The real
+      // removal is `worktree remove --force`, which preserves only `??`
+      // untracked entries — dirty TRACKED work is not retained, so it refuses.
+      if (input.requireReleaseProofs === true) {
+        this.assertAutomaticReleaseProofs(row);
       }
       // (1) Preserve untracked deliverables FIRST — before any process
       // decision, before any removal. Deliverables are never hostages.
@@ -1012,6 +1063,7 @@ export class WorktreeManager {
       // so a recycled pid can never redirect it; foreign processes keep the
       // full pause-and-ask contract below.
       const reaped = await this.reapTrackedServiceProcesses(row);
+      assertCleanup();
 
       // (2) Enumerate processes rooted in the tree BEFORE removal.
       const processes = this.enumerate(row.path).filter((proc) => !reaped.includes(proc.pid));
@@ -1028,7 +1080,7 @@ export class WorktreeManager {
                 .map((proc) => ({ pid: proc.pid, command: proc.command, evidence: proc.evidence }))
             : [];
         if (input.confirmKill === true && acknowledged.length > 0) {
-          return this.killAcknowledgedAndContinue(row, acknowledged, preserved, input.baseBranch);
+          return this.killAcknowledgedAndContinue(row, acknowledged, preserved, input.baseBranch, assertCleanup);
         }
 
         // (3) PAUSE AND ASK — a live process is never silently killed.
@@ -1062,7 +1114,7 @@ export class WorktreeManager {
       }
 
       // No live processes: straight to the removal tail.
-      return this.finishSweep(row, preserved, input.baseBranch);
+      return this.finishSweep(row, preserved, input.baseBranch, assertCleanup);
     });
   }
 
@@ -1134,34 +1186,476 @@ export class WorktreeManager {
     return killed;
   }
 
-  /** Roll back a failed creation: remove the tree; delete a branch only
-   * when THIS call created it (reviews are detached — nothing to delete).
-   * Rollback failures are logged loudly but never mask the original error. */
-  private rollbackPartialLane(
-    repoPath: string,
-    path: string,
-    branchCreatedByThisCall: string | null,
-    originalError: unknown,
-  ): void {
-    try {
-      runGit(repoPath, ['worktree', 'remove', '--force', path]);
-    } catch (rollbackError) {
-      this.log('error', 'rollback failed to remove the partial worktree', {
-        path,
-        error: String(rollbackError),
-      });
+  private creationCustody(branch: string | null, sha: string): CreationCustody {
+    return { token: `gru-creation:${randomUUID()}`, branch, sha, branchCreated: false, addAttempted: false };
+  }
+
+  private async addLane(repoPath: string, path: string, custody: CreationCustody, assertSource?: () => void): Promise<void> {
+    if (custody.branch !== null) {
+      await this.updateDirectCreationRef(repoPath, custody, 'create');
+      custody.branchCreated = true;
     }
-    if (branchCreatedByThisCall !== null) {
-      try {
-        runGit(repoPath, ['branch', '-D', branchCreatedByThisCall]);
-      } catch (rollbackError) {
-        this.log('error', 'rollback failed to delete the partial branch (job id may be wedged)', {
-          branch: branchCreatedByThisCall,
-          error: String(rollbackError),
-        });
+    assertSource?.(); // original parent after the awaited named-ref transaction
+    custody.addAttempted = true;
+    runGit(repoPath, ['worktree', 'add', '--lock', '--reason', custody.token,
+      ...(custody.branch === null ? ['--detach'] : []), path, custody.branch ?? custody.sha]);
+    assertSource?.();
+    this.assertCreationIdentity(path, custody);
+  }
+
+  /** Read-only creation metadata while a ref transaction owns its lock.
+   * Bound output and settlement without blocking the event loop or signalling
+   * any process other than this invocation's exact child handle. */
+  private async creationMetadata(repoPath: string, args: readonly string[]): Promise<{ readonly status: number | null; readonly stdout: string }> {
+    const child = spawn('git', [...args], { cwd: repoPath, env: repositoryGitEnv(false), stdio: ['ignore', 'pipe', 'pipe'] });
+    const limit = 16 * 1024 * 1024;
+    const stdout: Buffer[] = [];
+    let stdoutBytes = 0, stderrBytes = 0;
+    let stderrTail = Buffer.alloc(0);
+    let failure: Error | undefined;
+    let exited = false, closed = false;
+    let status: number | null = null;
+    let signal: NodeJS.Signals | null = null;
+    let wake: () => void = () => {};
+    const failed = new Promise<void>((done) => { wake = done; });
+    const fail = (detail: string): void => {
+      failure ??= new Error(`creation metadata ${args[0]}: ${detail} — authority unconfirmed; resources retained`);
+      wake();
+    };
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (failure !== undefined) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > limit) fail('stdout output exceeded 16 MiB');
+      else if (stdoutBytes + stderrBytes > limit) fail('combined output exceeded 16 MiB');
+      else stdout.push(chunk);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (failure !== undefined) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > limit) fail('stderr output exceeded 16 MiB');
+      else if (stdoutBytes + stderrBytes > limit) fail('combined output exceeded 16 MiB');
+      else stderrTail = Buffer.concat([stderrTail, chunk.subarray(-4096)]).subarray(-4096);
+    });
+    child.on('error', (error) => fail(error.message));
+    child.stdout.on('error', (error: Error) => fail(error.message));
+    child.stderr.on('error', (error: Error) => fail(error.message));
+    child.on('exit', (code, killedBy) => { exited = true; status = code; signal = killedBy; });
+    const stopped = new Promise<void>((done) => child.on('close', () => { closed = true; done(); }));
+    const timer = setTimeout(() => fail('query timed out after 30000ms'), 30_000);
+    await Promise.race([stopped, failed]);
+    clearTimeout(timer);
+    const wait = async (): Promise<void> => {
+      if (closed) return;
+      await new Promise<void>((done) => {
+        const bound = setTimeout(done, 1_000);
+        void stopped.then(() => { clearTimeout(bound); done(); });
+      });
+    };
+    if (!closed) {
+      for (const killSignal of ['SIGTERM', 'SIGKILL'] as const) {
+        if (!exited && child.pid !== undefined) {
+          try { child.kill(killSignal); } catch (error) { fail(String(error)); }
+        }
+        await wait();
+        if (closed) break;
       }
     }
-    void originalError;
+    child.stdout.destroy(); child.stderr.destroy();
+    if (!closed) {
+      const detail = exited ? 'owned pipes did not settle' : 'termination unconfirmed';
+      failure = new AggregateError([failure, new Error(detail)], `${failure?.message ?? 'creation metadata settlement failed'}; ${detail}`);
+      child.unref();
+    }
+    if (signal !== null || status === null) fail(`exit ${status}, signal ${signal}: ${stderrTail.toString('utf8').trim()}`);
+    if (failure !== undefined) throw failure;
+    return { status, stdout: Buffer.concat(stdout).toString('utf8') };
+  }
+
+  /** A prepared no-deref transaction holds the exact ref-name lock. Git's
+   * zero-old/create guard alone accepts dangling symrefs, even with no-deref;
+   * inspect the still-unmodified name UNDER that lock before committing. */
+  private async updateDirectCreationRef(repoPath: string, custody: CreationCustody, operation: 'create' | 'delete', ownedPath?: string): Promise<void> {
+    if (custody.branch === null) throw new Error('branchless creation cannot mutate a branch ref');
+    const ref = `refs/heads/${custody.branch}`;
+    // Ref names enter Git's line-oriented transaction protocol, not argv.
+    runGit(repoPath, ['check-ref-format', ref]);
+    const child = spawn('git', ['update-ref', '--stdin', '--no-deref', '--create-reflog', '-m', custody.token], {
+      cwd: repoPath, env: repositoryGitEnv(false),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const outputLimit = 16 * 1024 * 1024;
+    const confirmationTimeoutMs = 30_000;
+    const stopTimeoutMs = 1_000;
+    let stderrBytes = 0;
+    let stdoutBytes = 0;
+    let stderrTail = Buffer.alloc(0);
+    let pending = Buffer.alloc(0);
+    const expected = ['start', 'prepare'];
+    const confirmed = new Set<string>();
+    let notify: (() => void) | undefined;
+    let failure: Error | undefined;
+    let exited = false;
+    let closed = false;
+    let status: number | null = null;
+    let signal: NodeJS.Signals | null = null;
+    const transactionError = (detail: string): Error => new Error(
+      `git update-ref ${operation} ${ref}: ${detail} — transaction authority unconfirmed; resources retained`,
+    );
+    const fail = (error: Error): void => {
+      failure ??= error;
+      notify?.();
+    };
+    // Count bytes even when retaining only a diagnostic tail. Hooks still run
+    // normally, but neither an unterminated line nor queued replies can grow.
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (failure !== undefined) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > outputLimit) fail(transactionError('stderr output exceeded 16 MiB'));
+      else stderrTail = Buffer.concat([stderrTail, chunk.subarray(-4096)]).subarray(-4096);
+    });
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (failure !== undefined) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > outputLimit) return fail(transactionError('stdout output exceeded 16 MiB'));
+      pending = Buffer.concat([pending, chunk]);
+      let newline = pending.indexOf(10);
+      while (newline !== -1) {
+        if (newline > 64) return fail(transactionError('stdout confirmation exceeded 64 bytes'));
+        const reply = pending.subarray(0, newline).toString('utf8').replace(/\r$/u, '');
+        pending = pending.subarray(newline + 1);
+        const phase = expected.shift();
+        if (phase === undefined || reply !== `${phase}: ok`) {
+          return fail(transactionError(`invalid ${phase ?? 'unsolicited'} confirmation`));
+        }
+        confirmed.add(phase);
+        notify?.();
+        newline = pending.indexOf(10);
+      }
+      if (pending.length > 64) fail(transactionError('stdout confirmation exceeded 64 bytes'));
+    });
+    child.on('error', (error) => { fail(transactionError(error.message)); });
+    child.stdin.on('error', (error: Error) => { fail(transactionError(error.message)); });
+    child.stdout.on('error', (error: Error) => { fail(transactionError(error.message)); });
+    child.stderr.on('error', (error: Error) => { fail(transactionError(error.message)); });
+    child.on('exit', (code, killedBy) => { exited = true; status = code; signal = killedBy; });
+    const stopped = new Promise<void>((done) => child.on('close', () => {
+      closed = true;
+      if (expected.length > 0 || pending.length > 0) {
+        fail(transactionError(`missing or unterminated confirmation: ${stderrTail.toString('utf8').trim()}`));
+      }
+      done();
+    }));
+    const confirm = async (phase: string): Promise<void> => {
+      if (failure !== undefined) throw failure;
+      if (confirmed.has(phase)) return;
+      await new Promise<void>((done, reject) => {
+        const timer = setTimeout(() => fail(transactionError(`${phase} confirmation timed out after 30000ms`)), confirmationTimeoutMs);
+        notify = () => {
+          if (failure === undefined && !confirmed.has(phase)) return;
+          clearTimeout(timer);
+          notify = undefined;
+          if (failure !== undefined) reject(failure);
+          else done();
+        };
+      });
+    };
+    const waitForStop = async (): Promise<boolean> => {
+      if (closed) return true;
+      return new Promise<boolean>((done) => {
+        const timer = setTimeout(() => done(false), stopTimeoutMs);
+        void stopped.then(() => { clearTimeout(timer); done(true); });
+      });
+    };
+    let committed = false;
+    let stopFailure: Error | undefined;
+    try {
+      child.stdin.write(`start\n${operation} ${ref} ${custody.sha}\nprepare\n`);
+      await confirm('start');
+      await confirm('prepare');
+      const symbolic = await this.creationMetadata(repoPath, ['symbolic-ref', '--quiet', '--no-recurse', ref]);
+      if (symbolic.status !== 1) {
+        throw new Error(`branch name ${ref} is symbolic or unverifiable — refusing ${operation} without changing its alias or referent`);
+      }
+      if (operation === 'delete') {
+        if (ownedPath === undefined) throw new Error('deletion has no invocation-owned checkout reservation');
+        const query = async (path: string, args: readonly string[]): Promise<string> => {
+          const result = await this.creationMetadata(path, args);
+          if (result.status !== 0) throw new Error(`creation custody query ${args[0]} failed`);
+          return result.stdout.trim();
+        };
+        const common = realpathSync(await query(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']));
+        const trees = await query(repoPath, ['worktree', 'list', '--porcelain', '-z']);
+        if (this.branchHasForeignHolder(trees, ref, ownedPath)) throw new Error(`created branch ${ref} acquired a foreign holder`);
+        const receipt = await query(repoPath, ['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
+        if (receipt !== `${custody.sha}\0${custody.token}`) throw new Error(`created branch ${ref} receipt changed under deletion lock`);
+        this.assertRollbackBranchMetadata(repoPath, custody, common);
+        // No await after the final nonce/backlink/HEAD proof and before commit.
+        const admin = existsSync(ownedPath) ? this.assertCreationCustody(repoPath, ownedPath, custody, common)
+          : this.orphanCreationAdmin(repoPath, ownedPath, custody, common);
+        if (admin === null || readWorktreeMetadata(join(admin, 'HEAD')).trim() !== `ref: ${ref}`) {
+          throw new Error(`created branch ${ref} lost its invocation-owned checkout reservation`);
+        }
+      }
+      if (failure !== undefined) throw failure;
+      expected.push('commit');
+      child.stdin.write('commit\n');
+      await confirm('commit');
+      if (failure !== undefined) throw failure;
+      committed = true;
+    } catch (error) {
+      fail(error instanceof Error ? error : transactionError(String(error)));
+    } finally {
+      try { child.stdin.end(committed ? '' : 'abort\n'); }
+      catch (error) { fail(transactionError(String(error))); }
+      if (!await waitForStop()) {
+        stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} did not close within 1000ms`);
+        // Signal only the ChildProcess we spawned, never a group, discovered
+        // PID or ref lock. An exited child may just have inherited pipes open.
+        if (!exited && child.pid !== undefined) {
+          try { child.kill('SIGTERM'); } catch (error) { fail(transactionError(String(error))); }
+        }
+        if (!await waitForStop() && !exited && child.pid !== undefined) {
+          try { child.kill('SIGKILL'); } catch (error) { fail(transactionError(String(error))); }
+          await waitForStop();
+        }
+      }
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (!closed && !exited) {
+        stopFailure = transactionError(`owned Git child ${child.pid ?? 'unspawned'} termination unconfirmed`);
+        child.unref();
+      }
+    }
+    if (stopFailure !== undefined) {
+      throw new AggregateError([...(failure === undefined ? [] : [failure]), stopFailure],
+        `${failure?.message ?? 'Git transaction settlement failed'}; ${stopFailure.message}`);
+    }
+    if (failure !== undefined) throw failure;
+    if (status !== 0 || signal !== null) throw transactionError(`exit ${status}, signal ${signal}: ${stderrTail.toString('utf8').trim()}`);
+  }
+
+  /** Registration requires the requested checkout authority, independently
+   * of the receipts that permit destructive rollback. */
+  private assertCreationIdentity(path: string, custody: CreationCustody): void {
+    const gitFile = readWorktreeMetadata(join(path, '.git')).trim();
+    if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
+    const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
+    const head = readWorktreeMetadata(join(admin, 'HEAD')).trim();
+    const common = realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim()));
+    if (dirname(admin) !== join(common, 'worktrees') ||
+      realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim())) !== realpathSync(join(path, '.git'))) throw new Error('creation metadata backlink changed');
+    const expected = custody.branch === null ? null : `refs/heads/${custody.branch}`;
+    if (head !== (expected === null ? custody.sha : `ref: ${expected}`)) throw new Error(`worktree creation target changed: ${path} — refusing registration or handoff`);
+    if (expected !== null) {
+      const ref = join(common, expected);
+      if (existsSync(ref)) {
+        if (realpathSync(ref) !== ref || readWorktreeMetadata(ref).trim() !== custody.sha) throw new Error(`worktree creation target changed: ${path} — refusing registration or handoff`);
+      } else readWorktreeMetadata(join(common, 'packed-refs'), 16 * 1024 * 1024);
+    }
+    const symbolic = spawnGit(path, ['symbolic-ref', '--quiet', 'HEAD']);
+    if (runGit(path, ['rev-parse', 'HEAD']) !== custody.sha ||
+      (expected === null ? symbolic.status !== 1 : symbolic.status !== 0 || symbolic.stdout.trim() !== expected)) {
+      throw new Error(`worktree creation target changed: ${path} — refusing registration or handoff`);
+    }
+  }
+
+  private assertCreationCustody(repoPath: string, path: string, custody: CreationCustody,
+    common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string {
+    const gitFile = readWorktreeMetadata(join(path, '.git')).trim();
+    if (!gitFile.startsWith('gitdir: ')) throw new Error('missing linked-worktree gitdir');
+    const admin = realpathSync(resolve(path, gitFile.slice('gitdir: '.length)));
+    readWorktreeMetadata(join(admin, 'HEAD'));
+    if (realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())) !== common) throw new Error('creation common directory changed');
+    if (dirname(admin) !== join(common, 'worktrees') ||
+      realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim())) !== realpathSync(join(path, '.git')) ||
+      readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
+      throw new Error('linked-worktree custody receipt does not match this invocation');
+    }
+    return admin;
+  }
+
+  /** A failed hook can remove the checkout while leaving Git's locked
+   * administration entry. Its backlink and nonce still prove custody. */
+  private orphanCreationAdmin(repoPath: string, path: string, custody: CreationCustody,
+    common = realpathSync(runGit(repoPath, ['rev-parse', '--path-format=absolute', '--git-common-dir']))): string | null {
+    const container = join(common, 'worktrees');
+    if (!existsSync(container)) return null;
+    const expected = join(realpathSync(dirname(path)), basename(path), '.git');
+    for (const entry of readdirSync(container, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const admin = join(container, entry.name);
+      const backlink = resolve(admin, readWorktreeMetadata(join(admin, 'gitdir')).trim());
+      if (backlink !== expected) continue;
+      readWorktreeMetadata(join(admin, 'HEAD'));
+      if (realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim())) !== common) throw new Error('orphan creation common directory changed');
+      if (readWorktreeMetadata(join(admin, 'locked')).trim() !== custody.token) {
+        throw new Error('orphaned worktree custody receipt does not match this invocation');
+      }
+      return admin;
+    }
+    return null;
+  }
+
+  private handoffLane(repoPath: string, path: string, custody: CreationCustody, record: WorktreeRecord, assertSource?: () => void): void {
+    try {
+      assertSource?.();
+      this.assertCreationIdentity(path, custody);
+      const admin = this.assertCreationCustody(repoPath, path, custody);
+      assertPendingLaneHandoff(record, admin, custody.token);
+      assertSource?.();
+      runGit(repoPath, ['worktree', 'unlock', path]);
+      this.assertCreationIdentity(path, custody);
+      assertSource?.();
+      completeLaneHandoff(record, admin, custody.token, this.opts.ledger);
+      assertSource?.();
+    } catch (error) {
+      throw new Error(`worktree creation custody handoff failed for ${path}; registered lane retained — inspect before retry`, { cause: error });
+    }
+  }
+
+  /** Derive the assigned common directory without letting Git read an
+   * unproven ref/HEAD before rollback's finite metadata checks. */
+  private creationCommonDirectory(repoPath: string): string {
+    const git = join(repoPath, '.git');
+    const canonical = realpathSync(git);
+    if (lstatSync(canonical).isDirectory()) return canonical;
+    const gitFile = readWorktreeMetadata(git).trim();
+    if (!gitFile.startsWith('gitdir: ')) throw new Error('missing repository gitdir');
+    const admin = realpathSync(resolve(repoPath, gitFile.slice('gitdir: '.length)));
+    return realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim()));
+  }
+
+  private assertRollbackBranchMetadata(repoPath: string, custody: CreationCustody, common: string): void {
+    if (this.creationCommonDirectory(repoPath) !== common) throw new Error('creation common directory changed during rollback');
+    if (custody.branch === null) return;
+    const ref = `refs/heads/${custody.branch}`, file = join(common, ref);
+    if (existsSync(file)) {
+      if (realpathSync(file) !== file || readWorktreeMetadata(file).trim() !== custody.sha) throw new Error(`created branch ${ref} changed`);
+    } else readWorktreeMetadata(join(common, 'packed-refs'), 16 * 1024 * 1024);
+  }
+
+  private async assertBranchCreationCustody(repoPath: string, custody: CreationCustody, ownedPath: string | null, common: string, assertResources: () => void): Promise<void> {
+    if (!custody.branchCreated || custody.branch === null) return;
+    const ref = `refs/heads/${custody.branch}`;
+    const query = async (args: readonly string[]) => {
+      assertResources();
+      this.assertRollbackBranchMetadata(repoPath, custody, common);
+      const result = await this.creationMetadata(repoPath, args);
+      assertResources();
+      this.assertRollbackBranchMetadata(repoPath, custody, common); // reprove after every awaited query
+      return result;
+    };
+    if ((await query(['symbolic-ref', '--quiet', '--no-recurse', ref])).status !== 1) {
+      throw new Error(`created branch ${ref} is no longer a direct ref`);
+    }
+    const read = async (args: readonly string[]): Promise<string> => {
+      const result = await query(args);
+      if (result.status !== 0) throw new Error(`creation custody query ${args[0]} failed`);
+      return result.stdout.trim();
+    };
+    const receipt = await read(['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
+    const tip = await read(['rev-parse', '--verify', ref]);
+    const trees = await read(['worktree', 'list', '--porcelain', '-z']);
+    if (tip !== custody.sha || receipt !== `${custody.sha}\0${custody.token}` || this.branchHasForeignHolder(trees, ref, ownedPath)) {
+      throw new Error(`created branch ${ref} changed or is held by another worktree`);
+    }
+  }
+
+  private branchHasForeignHolder(trees: string, ref: string, ownedPath: string | null): boolean {
+    return trees.split('\0\0').some((entry) => {
+      const fields = entry.split('\0');
+      if (!fields.includes(`branch ${ref}`)) return false;
+      const tree = fields.find((field) => field.startsWith('worktree '))?.slice('worktree '.length);
+      return ownedPath === null || tree === undefined ||
+        join(realpathSync(dirname(tree)), basename(tree)) !== join(realpathSync(dirname(ownedPath)), basename(ownedPath));
+    });
+  }
+
+  /** Only matching Git-native invocation receipts permit destructive
+   * rollback. Check ALL custody before any cleanup; uncertainty retains the
+   * resources and reports both the original failure and the missing proof. */
+  private async rollbackPartialLane(repoPath: string, path: string, custody: CreationCustody, originalError: unknown): Promise<void> {
+    try {
+      const common = this.creationCommonDirectory(repoPath);
+      const present = custody.addAttempted && existsSync(path);
+      const orphanAdmin = custody.addAttempted && !present ? this.orphanCreationAdmin(repoPath, path, custody, common) : null;
+      const ownedPath = present || orphanAdmin !== null ? path : null;
+      const assertResources = (): void => {
+        if (this.creationCommonDirectory(repoPath) !== common) throw new Error('creation common directory changed during rollback');
+        if (present) this.assertCreationCustody(repoPath, path, custody, common);
+        else if (orphanAdmin !== null && this.orphanCreationAdmin(repoPath, path, custody, common) !== orphanAdmin) throw new Error('orphaned worktree custody changed during rollback');
+      };
+      assertResources();
+      await this.assertBranchCreationCustody(repoPath, custody, ownedPath, common, assertResources);
+      assertResources();
+      if (custody.branchCreated && custody.branch !== null) {
+        // Keep the invocation-owned checkout holding this branch until its
+        // compare-and-delete finishes. Dropping the checkout first opens a
+        // window for an ordinary external worktree to adopt the same tip.
+        // No owned holder means no destructive authority: retain the ref.
+        let heldRef: string | null = null;
+        if (orphanAdmin !== null) heldRef = readWorktreeMetadata(join(orphanAdmin, 'HEAD')).trim().replace(/^ref: /u, '');
+        else if (ownedPath !== null) {
+          const result = await this.creationMetadata(ownedPath, ['symbolic-ref', 'HEAD']);
+          if (result.status !== 0) throw new Error('creation custody HEAD query failed');
+          heldRef = result.stdout.trim();
+        }
+        assertResources();
+        if (ownedPath === null || heldRef !== `refs/heads/${custody.branch}`) {
+          throw new Error(`created branch ${custody.branch} has no invocation-owned checkout reservation`);
+        }
+        this.assertRollbackBranchMetadata(repoPath, custody, common);
+        await this.updateDirectCreationRef(repoPath, custody, 'delete', ownedPath);
+      }
+      if (ownedPath !== null) {
+        // The awaited transaction may run configured hooks or external actors.
+        // Never remove a path/admin entry using the pre-await custody proof.
+        if (this.creationCommonDirectory(repoPath) !== common) throw new Error('creation common directory changed during rollback');
+        if (existsSync(path)) this.assertCreationCustody(repoPath, path, custody, common);
+        else if (this.orphanCreationAdmin(repoPath, path, custody, common) !== orphanAdmin || orphanAdmin === null) {
+          throw new Error('orphaned worktree custody changed during rollback');
+        }
+        // Git protects locked lanes even against a single --force.
+        runGit(repoPath, ['worktree', 'remove', '--force', '--force', path]);
+      }
+    } catch (error) {
+      this.log('error', 'creation rollback custody unconfirmed; resources retained', { path, error: String(error) });
+      throw new AggregateError([originalError, error],
+        `worktree creation failed (${String(originalError)}); rollback custody unconfirmed for ${path} — inspect retained resources before retry`);
+    }
+  }
+
+  /** Issue #243 F-H1: the pre-removal proofs an UNATTENDED release owes
+   * BEFORE `worktree remove --force`. Refuses (tree retained) when:
+   *  - tracked work is dirty — the forced removal destroys it, since only
+   *    `??` untracked entries are preserved; or
+   *  - fresh required containment cannot be proven (the base cannot be
+   *    freshly resolved, so the missing-fresh-evidence removal is refused).
+   * A live process is NOT handled here: the preserve/pause-and-ask tail owns
+   * it and the human answer stays absolute. */
+  private assertAutomaticReleaseProofs(row: WorktreeRecord): void {
+    const status = runGit(row.path, ['status', '--porcelain', '-z', '--untracked-files=all']);
+    const tracked = status
+      .split('\0')
+      .filter((entry) => entry !== '')
+      .filter((entry) => !entry.startsWith('?? '))
+      .map((entry) => (entry.length > 3 ? entry.slice(3).trim() : entry.trim()))
+      .filter((entry) => entry !== '');
+    if (tracked.length > 0) {
+      throw new Error(
+        `automatic sweep refused: ${tracked.length} tracked change(s) in ${row.path} would be destroyed ` +
+          `(only untracked deliverables are preserved) — commit, stash or discard them and re-release; ` +
+          `tracked: ${tracked.slice(0, 5).join(', ')}`,
+      );
+    }
+    try {
+      this.resolveBase(row.repoPath);
+    } catch (error) {
+      throw new Error(
+        `automatic sweep refused: fresh required containment cannot be proven for ${row.path} (${String(error)}) — the tree is retained`,
+      );
+    }
   }
 
   /** Copy untracked-not-ignored deliverables into the preserve root.
@@ -1248,6 +1742,7 @@ export class WorktreeManager {
     acknowledged: readonly { pid: number; command: string; evidence: string }[],
     preserved: SweepPreservation | null,
     baseBranch: string | undefined,
+    assertCleanup: () => void,
   ): Promise<SweepResult> {
     const pids = acknowledged.map((proc) => proc.pid);
     this.opts.ledger.recordWorktreeProcesses({
@@ -1327,7 +1822,7 @@ export class WorktreeManager {
       this.opts.onSweepPaused?.({ worktree: row, processes: unacknowledged });
       return { status: 'paused', processes: unacknowledged, preserved, note };
     }
-    return this.finishSweep(row, preserved, baseBranch);
+    return this.finishSweep(row, preserved, baseBranch, assertCleanup);
   }
 
   /** Removal + containment branch delete + fresh head (shared tail). */
@@ -1335,9 +1830,11 @@ export class WorktreeManager {
     row: WorktreeRecord,
     preserved: SweepPreservation | null,
     baseBranch: string | undefined,
+    assertCleanup: () => void,
   ): SweepResult {
     // (4a) Worktree removal. A failure HERE throws with the tree intact
     // and the row unchanged — retry-safe.
+    assertCleanup();
     runGit(row.repoPath, ['worktree', 'remove', '--force', row.path]);
 
     // (4b/5) POST-REMOVAL TAIL (Perkins lane-B r1 B2): the tree is GONE —
@@ -1356,6 +1853,7 @@ export class WorktreeManager {
       // branch is retained.)
       const base = this.resolveBase(row.repoPath);
       freshHead = base.sha;
+      assertLaneResourcesAbsent(row);
       // Containment-verified branch delete — job and writer-child lanes;
       // a branch is deleted only when its tip is provably contained in a
       // durable local ref or the freshly verified remote default;
@@ -1368,12 +1866,14 @@ export class WorktreeManager {
         );
       }
     } catch (error) {
+      if (error instanceof WorktreeHandoffUnresolvedError) throw error;
       this.log('error', 'sweep tail failed after removal — row still flips swept', {
         id: row.id,
         error: String(error),
       });
       this.tailFailure = String(error);
     }
+    assertLaneResourcesAbsent(row);
     // FLIP FIRST (Perkins lane-B r2 a/b): the registry must reflect the
     // removed tree even if the EVENT writes then fail — and the flip
     // itself is guarded (a DB-down window reconciles on retry via the
@@ -1406,7 +1906,8 @@ export class WorktreeManager {
   private reconcileMissingTree(
     row: WorktreeRecord,
     baseBranch: string | undefined,
-  ): 'deleted' | 'retained' | 'none' {
+  ): { readonly branch: 'deleted' | 'retained' | 'none'; readonly freshHead: string } {
+    assertLaneResourcesAbsent(row);
     this.log('warn', 'worktree tree missing under a non-swept row — reconciling swept', {
       id: row.id,
       path: row.path,
@@ -1417,11 +1918,11 @@ export class WorktreeManager {
     // flip and the disposal left every retry early-returning 'none').
     // The disposal resolves FRESH remote state first (Perkins r8): a
     // retry must never delete on the witness of stale tracking refs.
-    const branchOutcome = this.disposeLaneBranch(
-      row,
-      baseBranch,
-      this.safeFreshRemoteBranch(row.repoPath),
-    );
+    const remote = this.safeFreshRemoteBranch(row.repoPath);
+    assertLaneResourcesAbsent(row);
+    const branchOutcome = this.disposeLaneBranch(row, baseBranch, remote);
+    const freshHead = this.safeFreshHead(row.repoPath);
+    assertLaneResourcesAbsent(row);
     try {
       this.opts.ledger.setWorktreeStatus(row.id, 'swept');
       this.opts.ledger.appendCustomEvent({
@@ -1441,7 +1942,7 @@ export class WorktreeManager {
     } catch (error) {
       this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
     }
-    return branchOutcome;
+    return { branch: branchOutcome, freshHead };
   }
 
   /** Guarded containment-verified disposal for an owner lane's branch.

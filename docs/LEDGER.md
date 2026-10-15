@@ -147,7 +147,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `round.created` / `round.status` / `round.verdict` / `round.target` | seq, lenses / from→to / verdict / ref |
 | `lens.bound` / `lens.status` | agentId / from→to (+note) |
 | `agent.spawned` / `agent.state` / `agent.error` | role, label / from→to (+error) / error, fatal |
-| `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail |
+| `verification.started` / `verification.completed` | run id, scope, command, sha, workers, queued ms / ok, exit code, duration, bounded output hash+tail, per-check status (`passed`/`failed`/`reused`/`not-run`). A `reused` build step never ran; a same-lane build already in flight is refused as `build-in-flight` |
 | `verification.requested` / `verification.attached` | admitted single-flight attempt: request id, run id, dedupe key (job+lane+scope+head+command) / a duplicate submission attached to that producer |
 | `verification.reconciled` | a completed request identity replayed its recorded outcome — no rerun |
 | `verification.lock-timeout` / `verification.stale-released` | wait ms + holder counts + request id / pid, reason (`holder-dead` \| `no-runner` \| `max-age`), age, interrupted request ids |
@@ -164,6 +164,7 @@ publishes it on the in-process event bus (`src/events/bus.ts`).
 | `round.admission-preflight` | ok, full check list (`head-binding`, `frozen-packet:<file>`, `spec-context`, `verification-evidence`, `ci-evidence`, `evidence:<id>`), and on refusal the exhaustive named missing-input list — recorded after the freeze receipts and BEFORE any lead/child spawn (gh-169) |
 | `round.parent-incident` | exactly ONE per parent-aborted round: note, startedAttempts, startedLenses, notStartedLenses — a lead disconnect is one parent incident; never-started lenses keep their `pending` chip (not-started ≠ failed execution) (gh-169) |
 | `job.review-handoff-conflict` / `job.review-handoff-superseded` | request seq + folded scope; a differing evidence set is recorded as count + opaque request fingerprint, never paths |
+| `job.review-source-verified` | the admission binding recorded AFTER the review-source preflight proves the actual selected object store, BEFORE any job row/worktree/spawn completes: `object_store` (canonical git common dir), `target_sha` (resolved full oid), `target_base`, `range_commits`, `inputs` (path/lens/blob), `source` (`repository`/`source-package`), `package_sha256` — issue #317 |
 
 Events are appended for **state changes**; idempotent enrichment writes
 (re-registering an agent, same-state activity refreshes) update rows
@@ -385,7 +386,8 @@ claiming success or no-effect: `POST
 /api/silas/directives/{request_id}/retire` runs one ledger transaction
 that re-verifies every live-ownership mark (open agent turns, child
 workers, in-process admissions, re-brief markers, other live requests,
-provider waits, verification runs, review rounds, live lane processes),
+provider waits, verification runs, review rounds, live lane processes,
+unconfirmed restart-cleanup custody),
 binds the caller's `expected_job_id` / `expected_state` /
 `expected_payload_hash` / `expected_head` (freshly resolved from the
 lane) and therefore refuses stale or conflicting intent, preserves any
@@ -401,6 +403,14 @@ stale or missing evidence fails closed; replays of the same canonical
 intent are idempotent with one audit transition. No worker is spawned,
 no job/obligation/approval is rewritten, and activation remains a
 separate owner decision — see [DIRECTIVE-RECOVERY.md](./DIRECTIVE-RECOVERY.md).
+Restart-cleanup custody is **generation-bound**: a refused replacement's
+unconfirmed pending entry, refusal audit or fallback (unjournaled) audit
+refuses retirement until the ORIGINAL native owner records a disposal
+acknowledgment plus positive cessation proof carrying the same exact
+physical generation. A same-id successor's clean disposal mints its own
+generation and never releases the predecessor; an ACK, a restart or a
+successor cleanup are not proof, and a hard crash that loses the original
+owner leaves the debt fenced (fail closed).
 
 ### Explicit phase-completion handoffs (migration 12, pr136-chief-handoff)
 
@@ -641,6 +651,71 @@ decision id that held the incident, `duplicate` the incident key already
 woken, `failed` the bounded-retry exhaustion that escalated. The board
 wakes tracker and the #214 yield report (wakes/day, avoided share) read
 this stream; nothing avoids a wake silently.
+
+### Exact directive/rebrief restart progress
+
+Migration 26 (`directive-native-progress`) is additive/nullable. Historical
+request rows retain NULL request kind/contract SHA/native target/native admission/
+checkpoint/authority epoch: NULL is unprovable, not safe-to-replay. New
+requests bind kind, immutable contract snapshot, revision and native
+control epoch at acceptance. Exact native target and admission binding
+cannot be replaced; actual admission and per-turn terminal readback are
+adapter-owned, not inferred from spawn, turn-start, health or Promise
+fulfillment. Native association precedes the ledger callback, so restart
+can restore a lost ledger bind without repeating a consumed request.
+
+A durable recovery checkpoint claim has no expiry-based retry. Recovery
+judgment is a generation-fenced `restart-recovery` Gru obligation, settled
+only by correlated actual handoff/completion or a concrete reserved-owner
+decision. `silas.directive-recovery-decided` plus the retired request and
+fresh successor acceptance commit transactionally. Historical marker
+recovery uses `rebrief_recovery_decisions` for exact decision replay and
+records the marker pair in `silas.rebrief-retired` audit; the fresh
+`silas.rebrief-recovery-handoff` advances the control epoch. No historical
+outcomes, native transcripts, verification run IDs/partial UNKNOWN
+captures, or review readiness are rewritten. Native error/abort is not a
+successful delivery, and retirement is neither completion nor no-effect.
+See `DIRECTIVE-RECOVERY.md` for readback and authenticated decision fields.
+
+Current-approved revision/contract expectations are distinct from the
+predecessor generation/hash. Amendment acceptance fences the old native
+request through the control epoch. Only an amendment-only mismatch can
+permit exact retirement plus a fresh current-snapshot successor; stops,
+holds and other/unprovable control changes do not. Durable
+`silas.directive-producer-unknown` cleanup events continue to fence the
+lane across restart, until an actual adapter cessation query records the
+matching `silas.directive-producer-ceased`; disposal fulfillment alone
+cannot release that ownership or mint readiness.
+
+### Restart-recovery historical evidence and reserved-owner lineage
+
+Migration 26 adds nullable native progress and latest recovery pointers without inferring old facts. Immutable `silas.{directive,rebrief}-recovery-decided` events are uniquely indexed by exact subject + debt generation; pointers are compatibility/latest views, never mutable history. Audits retain canonical decision fingerprint, full exact marker/native subject snapshot, versioned legacy accepted/unproven receipt evidence and any concrete reserved-owner target binding.
+
+Legacy receipt SHA is server-computed and compared inside judgment transactions; clocks/watermarks alone are not correlation. Missing historical HEAD/revision are never supplied from current state. `silas.rebrief-control-closed` is non-executing administrative closure of proven-completed control with absent delivery facts: full immutable evidence remains; a concrete current-inspection obligation owns the next fresh directive/verification action. No historical delivery/current revision/verification/READY is emitted by closure.
+
+`ruling.recorded` with permission `fresh-current-approved-recovery-successor` and separate `silas.recovery-owner-stop-confirmed` are explicit owner-attributed records bound to transfer/subject/target generation/plan/current scope/stop lineage. Shared bearer attribution is not independently verified identity. Confirmation legally resumes/settles only its exact suspended real owner target; neither writer changes job parking, notification Ack, other holds or execution. Nongenuine target closure/plan changes create new suspended Gru incarnations, not permission. Original-generation decision replay remains immutable after subsequent incarnations.
+
+### GH-286 physical restart and verification evidence
+
+`silas.directive-producer-reserved` is only a pre-effect dispatch reservation.
+`silas.directive-producer-started` binds a prepared physical native incarnation
+(UUID/host/PID/request/session plus accepted authority); neither proves prompt
+admission. The exact native user receipt owns `silas.directive-sent` admission.
+Cleanup receipts consume only their exact producer start, or an explicitly
+named original UNKNOWN receipt. Logical minion reuse cannot erase older debt.
+The adapter's append-only `.producers.jsonl` journal precedes native execution;
+legacy, torn, live, foreign-host and uncertain tool evidence stays unknown.
+Original host ESRCH plus a safe persisted checkpoint and independent producer
+fences permits bounded same-session continuation, never original prompt replay.
+
+`verification.no-start` durably settles only scheduler-owned queued/granted
+attempts that shutdown revoked before spawn. Original request/run IDs remain
+readable across restart; no completion/PASS is invented. Same-ID terminal
+readback may append `verification.process-reconciled` and close a matching
+registry PID row only when both original PID and detached process group are
+absent. Terminal failures/SIGTERM, partial output and native review provenance
+are unchanged. Unsupported historical evidence stays actionable UNKNOWN.
+These controls authorize no owner Ack, production restart/deploy or merge.
 
 ## FOR GRU mailbox metadata (GH-305)
 

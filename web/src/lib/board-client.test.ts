@@ -832,6 +832,67 @@ describe('board client', () => {
     }
   });
 
+  it('an ordinary success retires a hung trailing request that was overtaken — a fresh failure recovers at once, the old continuation never starts a chain, timers drain; before and after the backoff was spent (#275)', async () => {
+    for (const spent of [false, true]) {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const { client, requests, delivered, settle, open } = scriptedClient();
+        const push = await open();
+        // A refresh loses to a push: a trailing refetch (run 1) is asked for.
+        void client.refetchSnapshot();
+        push('stale-1');
+        requests[1]!.answer(tagged('discarded-1'));
+        await settle();
+        expect(requests).toHaveLength(3);
+        if (spent) {
+          // The burst of two is spent: run 2 is discarded too, run 3 waits out its 1 s backoff.
+          push('stale-2');
+          requests[2]!.answer(tagged('discarded-2'));
+          await settle();
+          expect(requests).toHaveLength(4);
+          push('stale-3');
+          requests[3]!.answer(tagged('discarded-3'));
+          await settle();
+          expect(requests).toHaveLength(4);
+          await vi.advanceTimersByTimeAsync(1_000);
+          expect(requests).toHaveLength(5);
+        }
+        const hung = requests.length - 1; // the trailing request nobody ever answers
+        // An ordinary refresh now delivers an authoritative snapshot.
+        void client.refetchSnapshot();
+        requests[hung + 1]!.answer(tagged('ordinary'));
+        await settle();
+        expect(delivered.at(-1)).toBe('ordinary');
+        const before = requests.length;
+        // A later failure must start a fresh chain AT ONCE, not after the hung request's deadline.
+        void client.refetchSnapshot();
+        requests[before]!.fail();
+        await settle();
+        expect(requests, `spent=${spent}: recovery starts at once`).toHaveLength(before + 2);
+        // The fresh chain has its whole burst again: the 2nd run is immediate, the 3rd backs off.
+        requests[before + 1]!.fail();
+        await settle();
+        expect(requests, `spent=${spent}: burst reset`).toHaveLength(before + 3);
+        requests[before + 2]!.fail();
+        await settle();
+        expect(requests, `spent=${spent}: third waits`).toHaveLength(before + 3);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(requests).toHaveLength(before + 4);
+        requests[before + 3]!.answer(tagged('authoritative'));
+        await settle();
+        expect(delivered.at(-1)).toBe('authoritative');
+        // The overtaken request reaches its deadline: cancelled, and it starts nothing.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(requests[hung]!.signal?.aborted, `spent=${spent}`).toBe(true);
+        expect(requests, `spent=${spent}: no old continuation`).toHaveLength(before + 4);
+        expect(vi.getTimerCount(), `spent=${spent}: timers drained`).toBe(0);
+        client.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  });
+
   it('a trailing refetch that fails or times out keeps the owed answer — retried on the bounded schedule with no further push or wake; a delivery cancels a waiting retry (R8-02)', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
