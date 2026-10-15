@@ -17,6 +17,9 @@ import { loadConfig } from '../src/config.js';
 import { DecisionRuntime } from '../src/decisions/runtime.js';
 import { DREAM_FAILED_KIND, dreamFailureIncidents } from '../src/lessons/dream.js';
 import { ROLE_DEFINITIONS } from '../src/roles.js';
+import { bindSupervisorNotificationDisposition } from '../src/supervision/notification-disposition.js';
+import { Supervisor, type SupervisorRegistry } from '../src/supervision/supervisor.js';
+import type { AgentEventEnvelope } from '../src/runtime/registry.js';
 import type { RepoOverviewView } from '../src/repos/overview.js';
 import type { DecisionRecord } from '../src/ledger/decision-memory.js';
 import type { MailboxItem } from '../src/ledger/mailbox.js';
@@ -38,6 +41,7 @@ async function boot(
   overrides: Partial<{
     heartbeatMs: number;
     repoOverview: () => RepoOverviewView | null;
+    onNotificationDisposition: (id: string, detail: string) => { readonly ok: boolean; readonly reason?: string } | void;
   }> = {},
 ): Promise<{
   port: number;
@@ -45,6 +49,7 @@ async function boot(
   bus: EventBus;
   board: ReturnType<typeof createBoardServer>;
   engine: BoardEngine;
+  notifications: NotificationCenter;
   close: () => Promise<void>;
 }> {
   const dir = tmpDir();
@@ -103,6 +108,7 @@ async function boot(
     bus,
     board,
     engine,
+    notifications,
     async close() {
       decisions.dispose();
       await board.dispose();
@@ -345,7 +351,12 @@ describe('board server — HTTP API', () => {
     expect((await postJson(port, path, 'wrong-token', { detail: 'Fixed' })).status).toBe(401);
     expect((await postJson(port, path, 'board-test-token', {})).status).toBe(400);
     expect((await postJson(port, path, 'board-test-token', { detail: '   ' })).status).toBe(400);
-    expect((await postJson(port, `/api/notifications/${owner.id}/disposition`, 'board-test-token', { detail: 'No' })).status).toBe(400);
+    // An UNDECIDED owner stop is refused with a typed 409 (a decided row
+    // resolves through the same route after its follow-through).
+    expect((await postJson(port, `/api/notifications/${owner.id}/disposition`, 'board-test-token', { detail: 'No' }))).toMatchObject({
+      status: 409,
+      body: { error: 'decision_refused', code: 'undecided' },
+    });
     expect(api.getNotification(machine.id)?.resolvedAt).toBeNull();
     const resolved = await postJson(port, path, 'board-test-token', { detail: 'Opened repair lane' });
     expect(resolved).toMatchObject({ status: 200, body: { resolvedBy: 'gru', ackedAt: null } });
@@ -387,16 +398,91 @@ describe('board server — HTTP API', () => {
     for (const token of [null, 'wrong-token']) {
       expect((await postJson(port, path, token, { title: 'Owner call', detail: 'Approve external merge' })).status).toBe(401);
     }
-    for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }]) {
+    for (const body of [{}, { title: '  ', detail: 'x' }, { title: 'x', detail: '\n' }, { title: 'x'.repeat(501), detail: 'y' }, { title: 'Owner call', detail: 'Approve external merge' }]) {
       expect((await postJson(port, path, 'board-test-token', body)).status).toBe(400);
     }
     const before = api.countPendingActionRequiredIncludingReceipts();
-    const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge' });
-    expect(created).toMatchObject({ status: 201, body: { kind: 'gru.owner-escalation', routing: 'needs-owner', title: 'Owner call', ackedAt: null } });
+    const decision = {
+      question: 'Approve the external merge?',
+      context: 'PR256 needs an owner-controlled integration route.',
+      recommendation: 'Approve it.',
+      reservedClass: 'merge',
+      whyNotDelegable: 'All merges remain owner-performed.',
+      options: [
+        { id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' },
+        { id: 'keep', label: 'Keep it parked', consequence: 'Nothing changes.' },
+      ],
+      discussion: false,
+    };
+    const created = await postJson(port, path, 'board-test-token', { title: 'Owner call', detail: 'Approve external merge', decision });
+    expect(created).toMatchObject({
+      status: 201,
+      body: {
+        kind: 'gru.owner-escalation',
+        routing: 'needs-owner',
+        title: 'Owner call',
+        ackedAt: null,
+        decidedAt: null,
+        decision: { question: 'Approve the external merge?', reservedClass: 'merge' },
+      },
+    });
     expect(api.countPendingActionRequiredIncludingReceipts()).toBe(before); // never loops into Gru's machine queue
     const row = created.body as { id: string };
     expect(api.getNotification(row.id)).toMatchObject({ detail: 'Approve external merge', shownAt: null });
     expect((await getJson(port, '/api/board', 'board-test-token')).body).toMatchObject({ unackedNeedsOwner: expect.any(Number) });
+    // Decision submission carries the displayed decision snapshot so a
+    // reused option id cannot silently bind an old label to new meaning.
+    // Recording remains idempotent and never resolves the row — a decision
+    // receipt is not follow-through.
+    const missingDisplayedDecision = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', { optionId: 'approve', by: 'web' });
+    expect(missingDisplayedDecision).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+    const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+      optionId: 'approve', by: 'web', expectedDecision: decision,
+    });
+    expect(decided).toMatchObject({ status: 200, body: { decidedOption: 'approve', decidedBy: 'web', resolvedAt: null, ackedAt: null } });
+    expect((decided.body as { decidedAt: string | null }).decidedAt).not.toBeNull();
+    const replay = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+      optionId: 'approve', expectedDecision: decision,
+    });
+    expect(replay.status).toBe(200); // idempotent replay
+    const changed = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+      optionId: 'keep', expectedDecision: decision,
+    });
+    expect(changed).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'decision_recorded' } });
+    const unknownOption = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+      optionId: 'nope', expectedDecision: decision,
+    });
+    expect(unknownOption).toMatchObject({ status: 400, body: { error: 'decision_refused', code: 'unknown_option' } });
+    const notOwner = await postJson(port, '/api/notifications/does-not-exist/decision', 'board-test-token', {
+      optionId: 'approve', expectedDecision: decision,
+    });
+    expect(notOwner.status).toBe(404);
+    const decisionEvents = api
+      .listEvents({ limit: 100 })
+      .filter((event) => event.kind === 'notification.decision' && (event.payload as { id?: string }).id === row.id);
+    expect(decisionEvents).toHaveLength(1);
+    // The snapshot projection carries the typed decision and its recorded
+    // state to BOTH owner surfaces (the only server→web transport).
+    const board = (await getJson(port, '/api/board', 'board-test-token')).body as {
+      notifications: { id: string; decision?: { question?: string } | null; decidedAt?: string | null; decidedOption?: string | null }[];
+    };
+    const projected = board.notifications.find((entry) => entry.id === row.id);
+    expect(projected?.decision).toMatchObject({ question: 'Approve the external merge?' });
+    expect(projected?.decidedAt).toBeTruthy();
+    expect(projected?.decidedOption).toBe('approve');
+    // An ack can never erase a typed owner question.
+    const ackRefused = await postJson(port, `/api/notifications/${row.id}/ack`, 'board-test-token', { by: 'web' });
+    expect(ackRefused).toMatchObject({ status: 409, body: { error: 'decision_required' } });
+    // Follow-through resolution: a DECIDED row resolves with the action
+    // detail; an UNDECIDED owner row refuses (resolution never silences an
+    // unanswered question).
+    const undecided = await postJson(port, path, 'board-test-token', { title: 'Second call', detail: 'evidence', decision });
+    const undecidedId = (undecided.body as { id: string }).id;
+    const refusedResolve = await postJson(port, `/api/notifications/${undecidedId}/disposition`, 'board-test-token', { detail: 'premature' });
+    expect(refusedResolve).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'undecided' } });
+    const resolved = await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'Executed the approved prep' });
+    expect(resolved).toMatchObject({ status: 200, body: { resolvedBy: 'gru', decidedOption: 'approve', ackedAt: null } });
+    expect(api.getNotification(row.id)).toMatchObject({ resolvedBy: 'gru' });
   });
 
   it('needs-owner escalation retries with the same idempotency key yield one row; distinct escalations stay distinct (#100)', async () => {
@@ -404,7 +490,16 @@ describe('board server — HTTP API', () => {
     const path = '/api/notifications/needs-owner';
     const count = () => api.listNotifications({ limit: 500 }).filter((n) => n.kind === 'gru.owner-escalation').length;
     const start = count();
-    const body = { title: 'Retry call', detail: 'Approve merge', idempotencyKey: 'esc-1' };
+    const decision = {
+      question: 'Approve the external merge?',
+      context: 'The merge needs an owner-controlled integration route.',
+      recommendation: 'Approve it.',
+      reservedClass: 'merge',
+      whyNotDelegable: 'All merges remain owner-performed.',
+      options: [{ id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' }],
+      discussion: false,
+    };
+    const body = { title: 'Retry call', detail: 'Approve merge', idempotencyKey: 'esc-1', decision };
     const first = await postJson(port, path, 'board-test-token', body);
     const retry = await postJson(port, path, 'board-test-token', body);
     expect(first.status).toBe(201);
@@ -415,19 +510,23 @@ describe('board server — HTTP API', () => {
     const changed = await postJson(port, path, 'board-test-token', { ...body, detail: 'Different decision' });
     expect(changed.status).toBe(409);
     expect(count()).toBe(start + 1);
+    // Same key and text but a changed typed decision is also a different escalation.
+    const changedDecision = await postJson(port, path, 'board-test-token', { ...body, decision: { ...decision, recommendation: 'Do not approve it.' } });
+    expect(changedDecision.status).toBe(409);
+    expect(count()).toBe(start + 1);
     // A different key is a genuinely new decision, even with identical text.
     const other = await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'esc-2' });
     expect(other.status).toBe(201);
     expect((other.body as { id: string }).id).not.toBe((first.body as { id: string }).id);
     // No key: every valid request is its own row (unchanged behavior).
-    const a = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same' });
-    const b = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same' });
+    const a = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same', decision });
+    const b = await postJson(port, path, 'board-test-token', { title: 'No key', detail: 'same', decision });
     expect([a.status, b.status]).toEqual([201, 201]);
     expect((a.body as { id: string }).id).not.toBe((b.body as { id: string }).id);
     expect(count()).toBe(start + 4);
     // Malformed keys fail loud.
     for (const key of ['', 'has space', 'x'.repeat(129), 7]) {
-      expect((await postJson(port, path, 'board-test-token', { title: 't', detail: 'd', idempotencyKey: key })).status).toBe(400);
+      expect((await postJson(port, path, 'board-test-token', { title: 't', detail: 'd', decision, idempotencyKey: key })).status).toBe(400);
     }
     expect(count()).toBe(start + 4);
   });
@@ -1080,6 +1179,7 @@ describe('board server — WS push', () => {
 describe('board server — empty token config locks every door', () => {
   it('notification shown/ack round-trip (E7): receipts idempotent, ack fires the hook, 404 unknown', async () => {
     const acked: string[] = [];
+    const dispositions: string[] = [];
     const dir = tmpDir();
     const { writeFileSync } = await import('node:fs');
     writeFileSync(
@@ -1101,6 +1201,9 @@ describe('board server — empty token config locks every door', () => {
       bus,
       notifications,
       onNotificationAck: (id) => acked.push(id),
+      onNotificationDisposition: (id) => {
+        dispositions.push(id);
+      },
       pushDebounceMs: 10,
     });
     const http: HttpServer = createServer((req, res) => {
@@ -1113,12 +1216,11 @@ describe('board server — empty token config locks every door', () => {
     const port = (http.address() as AddressInfo).port;
     try {
       const row = notifications.post({
-        kind: 'supervision.breaker',
+        kind: 'port-squat',
         routing: 'needs-owner',
         severity: 'error',
-        title: 'Crash-loop breaker tripped: agent a1 stopped',
-        detail: 'ack to re-arm',
-        agentId: 'a1',
+        title: 'Foreign process holds port 7665 (pid a1)',
+        detail: 'stop it, then restart the service',
       });
       // Auth door on the notification endpoints too.
       const anon = await postJson(port, `/api/notifications/${row.id}/ack`, null, { by: 'web' });
@@ -1140,6 +1242,13 @@ describe('board server — empty token config locks every door', () => {
       expect(illegal.status).toBe(400);
       expect(api.getNotification(machine.id)).toMatchObject({ ackedAt: null, resolvedAt: null });
       expect(api.countPendingActionRequiredIncludingReceipts()).toBeGreaterThan(0);
+      // Machine disposition fires the disposition hook exactly once (the
+      // supervisor's guarded breaker re-arm rides this in production).
+      const disposedRow = await postJson(port, `/api/notifications/${machine.id}/disposition`, 'ack-token', { detail: 'repair lane opened' });
+      expect(disposedRow).toMatchObject({ status: 200, body: { resolvedBy: 'gru', ackedAt: null } });
+      const disposedAgain = await postJson(port, `/api/notifications/${machine.id}/disposition`, 'ack-token', { detail: 'repeat' });
+      expect(disposedAgain.status).toBe(200);
+      expect(dispositions).toEqual([machine.id]);
       // Owner Ack fires the hook exactly once, idempotently.
       const ack1 = await postJson(port, `/api/notifications/${row.id}/ack`, 'ack-token', { by: 'web' });
       expect(ack1.status).toBe(200);
@@ -1513,6 +1622,460 @@ describe('board server — decision memory (issue #218)', () => {
       expect(afterClear.activeDecisionCount).toBe(0);
     } finally {
       await harness.close();
+    }
+  });
+});
+describe('board server — guarded machine re-arm and the discussion bridge (R1 fixes)', () => {
+  it('a refused re-arm is a typed 409 that consumes nothing; the same control retries once the fence clears', async () => {
+    let refusal: { ok: boolean; reason?: string } | null = {
+      ok: false,
+      reason: 'job "parked-lane" is parked (owner/ops hold)',
+    };
+    const hookCalls: string[] = [];
+    const { port, api, close } = await boot('board-test-token', {
+      onNotificationDisposition: (id) => {
+        hookCalls.push(id);
+        return refusal ?? { ok: true };
+      },
+    });
+    try {
+      api.recordNotification({
+        id: 'machine-rearm',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped: restart ladder tripped',
+        detail: 'breaker open',
+      });
+      const refused = await postJson(port, '/api/notifications/machine-rearm/disposition', 'board-test-token', {
+        detail: 'fix landed',
+      });
+      expect(refused).toMatchObject({ status: 409, body: { error: 'rearm_refused', code: 'rearm_refused' } });
+      // Nothing was recorded: the alert, its ack state and its retryable
+      // debt all survive the refusal.
+      expect(api.getNotification('machine-rearm')?.resolvedAt).toBeNull();
+      expect(api.getNotification('machine-rearm')?.ackedAt).toBeNull();
+      expect(
+        api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-refused'),
+      ).toHaveLength(1);
+      // The fence clears: the SAME control (no new alert, no new id) is
+      // accepted and the row closes with the truthful re-arm outcome.
+      refusal = null;
+      const accepted = await postJson(port, '/api/notifications/machine-rearm/disposition', 'board-test-token', {
+        detail: 'hold lifted',
+      });
+      expect(accepted).toMatchObject({ status: 200, body: { rearm: 'accepted' } });
+      expect((accepted.body as { resolvedAt: string | null }).resolvedAt).not.toBeNull();
+      expect(api.getNotification('machine-rearm')?.resolvedBy).toBe('gru');
+      // A repeat disposition of the resolved row is idempotent and never
+      // re-runs the guarded re-arm (the hook is skipped).
+      const repeat = await postJson(port, '/api/notifications/machine-rearm/disposition', 'board-test-token', {
+        detail: 'duplicate',
+      });
+      expect(repeat).toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
+      expect(hookCalls).toEqual(['machine-rearm', 'machine-rearm']);
+    } finally {
+      await close();
+    }
+  });
+
+  it('the production supervisor binding preserves a real refusal through the authenticated disposition route', async () => {
+    let disposition: ((id: string) => ReturnType<Supervisor['onNotificationDisposed']>) | null = null;
+    const harness = await boot('board-test-token', {
+      onNotificationDisposition: (id) => (disposition === null ? undefined : disposition(id)),
+    });
+    const registryTap: { listener: ((envelope: AgentEventEnvelope) => void) | null } = { listener: null };
+    const registry: SupervisorRegistry = {
+      onAgentEvent: (listener) => {
+        registryTap.listener = listener;
+        return () => { registryTap.listener = null; };
+      },
+      getHandle: () => null,
+      quarantineHandle: () => {},
+      spawn: async () => { throw new Error('parked re-arm must refuse before spawn'); },
+      disposeHandle: async () => {},
+    };
+    const supervisor = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+      registry,
+      ledger: harness.api,
+      notifications: harness.notifications,
+      tickMs: 5_000,
+    });
+    disposition = bindSupervisorNotificationDisposition(supervisor);
+    try {
+      supervisor.start();
+      harness.api.addJob({ id: 'real-parked-lane', repo: 'fixture', title: 'parked lane' });
+      harness.api.setJobStatus('real-parked-lane', 'parked');
+      harness.api.registerAgent({ id: 'real-stopped-agent', role: 'minion', jobId: 'real-parked-lane' });
+      registryTap.listener?.({ agentId: 'real-stopped-agent', role: 'minion', sessionFile: null, phase: 'spawned' });
+      const internals = supervisor as unknown as { agents: Map<string, unknown>; tripBreaker(agent: unknown): void };
+      const agent = internals.agents.get('real-stopped-agent');
+      if (agent === undefined) throw new Error('supervisor did not adopt the fixture agent');
+      internals.tripBreaker(agent);
+      const stop = harness.api.listNotifications({ limit: 50 }).find((row) => row.agentId === 'real-stopped-agent' && row.kind === 'supervision.breaker');
+      if (stop === undefined) throw new Error('supervisor did not post the breaker control');
+
+      const response = await postJson(harness.port, `/api/notifications/${encodeURIComponent(stop.id)}/disposition`, 'board-test-token', {
+        detail: 'retry after hold review',
+      });
+      expect(response).toMatchObject({ status: 409, body: { error: 'rearm_refused', code: 'rearm_refused' } });
+      expect(harness.api.getNotification(stop.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+    } finally {
+      supervisor.dispose();
+      await harness.close();
+    }
+  });
+
+  it('keeps a restored breaker control open when disposition precedes agent adoption', async () => {
+    let disposition: ((id: string) => ReturnType<Supervisor['onNotificationDisposed']>) | null = null;
+    const harness = await boot('board-test-token', {
+      onNotificationDisposition: (id) => (disposition === null ? undefined : disposition(id)),
+    });
+    const registryTap: { listener: ((envelope: AgentEventEnvelope) => void) | null } = { listener: null };
+    const registry: SupervisorRegistry = {
+      onAgentEvent: (listener) => {
+        registryTap.listener = listener;
+        return () => { registryTap.listener = null; };
+      },
+      getHandle: () => null,
+      quarantineHandle: () => {},
+      spawn: async () => { throw new Error('an unadopted restored stop must refuse before spawn'); },
+      disposeHandle: async () => {},
+    };
+    const config = { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 };
+    const supervisor = new Supervisor({
+      config,
+      registry,
+      ledger: harness.api,
+      notifications: harness.notifications,
+      tickMs: 5_000,
+    });
+    let originalDisposed = false;
+    let restored: Supervisor | null = null;
+    disposition = bindSupervisorNotificationDisposition(supervisor);
+    try {
+      supervisor.start();
+      harness.api.addJob({ id: 'restore-before-adopt-job', repo: 'fixture', title: 'restored breaker control' });
+      harness.api.setJobStatus('restore-before-adopt-job', 'working');
+      harness.api.registerAgent({ id: 'restore-before-adopt-agent', role: 'minion', jobId: 'restore-before-adopt-job' });
+      registryTap.listener?.({ agentId: 'restore-before-adopt-agent', role: 'minion', sessionFile: null, phase: 'spawned' });
+      const internals = supervisor as unknown as { agents: Map<string, unknown>; tripBreaker(agent: unknown): void };
+      const agent = internals.agents.get('restore-before-adopt-agent');
+      if (agent === undefined) throw new Error('supervisor did not adopt the fixture agent');
+      internals.tripBreaker(agent);
+      const stop = harness.api.listNotifications({ limit: 50 }).find(
+        (row) => row.agentId === 'restore-before-adopt-agent' && row.kind === 'supervision.breaker',
+      );
+      if (stop === undefined) throw new Error('supervisor did not post the breaker control');
+
+      supervisor.dispose();
+      originalDisposed = true;
+      restored = new Supervisor({ config, registry, ledger: harness.api, notifications: harness.notifications, tickMs: 5_000 });
+      disposition = bindSupervisorNotificationDisposition(restored);
+      restored.start();
+      expect(restored.viewFor('restore-before-adopt-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+
+      const response = await postJson(
+        harness.port,
+        `/api/notifications/${encodeURIComponent(stop.id)}/disposition`,
+        'board-test-token',
+        { detail: 'retry after adoption' },
+      );
+      expect(response).toMatchObject({ status: 409, body: { error: 'rearm_refused', code: 'rearm_refused' } });
+      expect(harness.api.getNotification(stop.id)).toMatchObject({ resolvedAt: null, ackedAt: null });
+      expect(restored.viewFor('restore-before-adopt-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+    } finally {
+      restored?.dispose();
+      if (!originalDisposed) supervisor.dispose();
+      await harness.close();
+    }
+  });
+
+  it('re-fences a pre-spawn re-arm failure through the authenticated disposition route', async () => {
+    let disposition: ((id: string) => ReturnType<Supervisor['onNotificationDisposed']>) | null = null;
+    const harness = await boot('board-test-token', {
+      onNotificationDisposition: (id) => (disposition === null ? undefined : disposition(id)),
+    });
+    const registryTap: { listener: ((envelope: AgentEventEnvelope) => void) | null } = { listener: null };
+    let spawnCalls = 0;
+    const registry: SupervisorRegistry = {
+      onAgentEvent: (listener) => {
+        registryTap.listener = listener;
+        return () => { registryTap.listener = null; };
+      },
+      getHandle: () => null,
+      quarantineHandle: () => {},
+      spawn: async () => {
+        spawnCalls += 1;
+        throw new Error('pre-spawn notification failure must prevent spawn');
+      },
+      disposeHandle: async () => {},
+    };
+    const supervisor = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 60_000, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+      registry,
+      ledger: harness.api,
+      notifications: harness.notifications,
+      tickMs: 5_000,
+    });
+    disposition = bindSupervisorNotificationDisposition(supervisor);
+    const originalPost = harness.notifications.post.bind(harness.notifications);
+    harness.notifications.post = ((input: Parameters<NotificationCenter['post']>[0]) => {
+      if (input.kind === 'supervision.restart') throw new Error('restart notice unavailable');
+      return originalPost(input);
+    }) as typeof harness.notifications.post;
+    try {
+      supervisor.start();
+      harness.api.addJob({ id: 'pre-spawn-rearm-job', repo: 'fixture', title: 'pre-spawn re-arm failure' });
+      harness.api.setJobStatus('pre-spawn-rearm-job', 'working');
+      harness.api.registerAgent({ id: 'pre-spawn-rearm-agent', role: 'minion', jobId: 'pre-spawn-rearm-job' });
+      registryTap.listener?.({ agentId: 'pre-spawn-rearm-agent', role: 'minion', sessionFile: null, phase: 'spawned' });
+      const internals = supervisor as unknown as { agents: Map<string, unknown>; tripBreaker(agent: unknown): void };
+      const agent = internals.agents.get('pre-spawn-rearm-agent');
+      if (agent === undefined) throw new Error('supervisor did not adopt the fixture agent');
+      internals.tripBreaker(agent);
+      const stop = harness.api.listNotifications({ limit: 50 }).find(
+        (row) => row.agentId === 'pre-spawn-rearm-agent' && row.kind === 'supervision.breaker',
+      );
+      if (stop === undefined) throw new Error('supervisor did not post the breaker control');
+
+      const response = await postJson(
+        harness.port,
+        `/api/notifications/${encodeURIComponent(stop.id)}/disposition`,
+        'board-test-token',
+        { detail: 'retry after the restart notice failure' },
+      );
+      expect(response).toMatchObject({ status: 200, body: { rearm: 'accepted' } });
+      expect(harness.api.getNotification(stop.id)?.resolvedAt).not.toBeNull();
+      await vi.waitFor(() =>
+        expect(supervisor.viewFor('pre-spawn-rearm-agent')).toMatchObject({ state: 'stopped', breakerOpen: true }),
+      );
+      expect(spawnCalls).toBe(0);
+      const retryControl = harness.api.listNotifications({ limit: 50, unackedOnly: true }).find(
+        (row) => row.agentId === 'pre-spawn-rearm-agent' && row.kind === 'supervision.rearm-fenced',
+      );
+      expect(retryControl).toMatchObject({ routing: 'action-required', ackedAt: null, resolvedAt: null });
+      expect(retryControl?.id).not.toBe(stop.id);
+      expect(harness.api.latestSupervisionEvent('pre-spawn-rearm-agent')?.kind).toBe('supervision.rearm-fenced');
+    } finally {
+      supervisor.dispose();
+      await harness.close();
+    }
+  });
+
+  it('an alert that re-arms nothing reports the record-only outcome (rearmed: false)', async () => {
+    const { port, api, close } = await boot('board-test-token', {
+      onNotificationDisposition: () => ({ ok: true, rearmed: false }),
+    });
+    try {
+      api.recordNotification({
+        id: 'machine-unbound',
+        kind: 'supervision.hang',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Already resumed lane',
+        detail: 'no stopped breaker is bound here',
+      });
+      const res = await postJson(port, '/api/notifications/machine-unbound/disposition', 'board-test-token', {
+        detail: 'verified the lane resumed',
+      });
+      expect(res).toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
+      expect((res.body as { resolvedAt: string | null }).resolvedAt).not.toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  it('a blank disposition detail is refused BEFORE the guarded hook can consume the control', async () => {
+    const hookCalls: string[] = [];
+    const { port, api, close } = await boot('board-test-token', {
+      onNotificationDisposition: (id) => {
+        hookCalls.push(id);
+        return { ok: true, rearmed: true };
+      },
+    });
+    try {
+      api.recordNotification({
+        id: 'machine-blank-detail',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Stopped',
+        detail: 'breaker open',
+      });
+      const res = await postJson(port, '/api/notifications/machine-blank-detail/disposition', 'board-test-token', {
+        detail: '   ',
+      });
+      expect(res).toMatchObject({ status: 400, body: { error: 'bad_request' } });
+      expect(hookCalls).toEqual([]);
+      expect(api.getNotification('machine-blank-detail')?.resolvedAt).toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  it('a throwing re-arm fails LOUD (502) and never records the disposition', async () => {
+    const { port, api, close } = await boot('board-test-token', {
+      onNotificationDisposition: () => {
+        throw new Error('supervisor unavailable');
+      },
+    });
+    try {
+      api.recordNotification({
+        id: 'machine-fail',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped',
+        detail: 'breaker open',
+      });
+      const res = await postJson(port, '/api/notifications/machine-fail/disposition', 'board-test-token', { detail: 'try' });
+      expect(res).toMatchObject({ status: 502, body: { error: 'rearm_failed' } });
+      expect(api.getNotification('machine-fail')?.resolvedAt).toBeNull();
+      expect(api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.rearm-failed')).toHaveLength(1);
+    } finally {
+      await close();
+    }
+  });
+
+  it('without a supervisor hook a machine disposition still records (rearm not_applicable)', async () => {
+    const { port, api, close } = await boot('board-test-token');
+    try {
+      api.recordNotification({
+        id: 'machine-plain',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Lane stopped',
+        detail: 'breaker open',
+      });
+      const res = await postJson(port, '/api/notifications/machine-plain/disposition', 'board-test-token', { detail: 'ok' });
+      expect(res).toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
+      expect((res.body as { resolvedAt: string | null }).resolvedAt).not.toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  it('the discussion bridge attaches agreed options, records nothing, and the typed path then settles', async () => {
+    const { port, api, close } = await boot('board-test-token');
+    try {
+      const created = await postJson(port, '/api/notifications/needs-owner', 'board-test-token', {
+        title: 'Which shape should the dashboard take?',
+        detail: 'Talk it through with Gru before a choice is recorded',
+        decision: {
+          question: 'Which shape should the dashboard take?',
+          context: 'The discussion has not converged on a concrete option.',
+          recommendation: null,
+          reservedClass: 'scope-design',
+          whyNotDelegable: 'It changes the agreed product scope.',
+          options: [],
+          discussion: true,
+        },
+      });
+      expect(created.status).toBe(201);
+      const row = created.body as { id: string; decision: Record<string, unknown> };
+      // No option exists yet: the typed path cannot invent an approval.
+      expect(
+        (await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+          optionId: 'go', expectedDecision: row.decision,
+        })).status,
+      ).toBe(400);
+      const attached = await postJson(port, `/api/notifications/${row.id}/decision-options`, 'board-test-token', {
+        options: [
+          { id: 'go', label: 'Go with shape A', consequence: 'Gru commissions shape A.' },
+          { id: 'stop', label: 'Stop here', consequence: 'Nothing moves.' },
+        ],
+        by: 'gru',
+      });
+      expect(attached).toMatchObject({ status: 200, body: { decidedAt: null, resolvedAt: null } });
+      expect((attached.body as { decision: { options: readonly unknown[] } }).decision.options).toHaveLength(2);
+      const staleDisplayedDecision = (attached.body as { decision: Record<string, unknown> }).decision;
+      const refreshed = await postJson(port, `/api/notifications/${row.id}/decision-options`, 'board-test-token', {
+        options: [
+          { id: 'go', label: 'Go with shape B', consequence: 'Gru commissions shape B.' },
+          { id: 'stop', label: 'Stop here', consequence: 'Nothing moves.' },
+        ],
+        by: 'gru',
+      });
+      expect(refreshed.status).toBe(200);
+      const currentDisplayedDecision = (refreshed.body as { decision: Record<string, unknown> }).decision;
+      const staleChoice = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+        optionId: 'go', by: 'web', expectedDecision: staleDisplayedDecision,
+      });
+      expect(staleChoice).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'decision_changed' } });
+      expect(api.getNotification(row.id)).toMatchObject({
+        decidedAt: null,
+        decision: { options: [
+          { id: 'go', label: 'Go with shape B' },
+          { id: 'stop', label: 'Stop here' },
+        ] },
+      });
+      // Attaching options records NO choice: follow-through stays refused
+      // until the owner decides.
+      expect(
+        (await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'premature' })).status,
+      ).toBe(409);
+      const events = api.listEvents({ limit: 100 }).filter((event) => event.kind === 'notification.decision-options');
+      expect(events).toHaveLength(2);
+      expect(events[0]?.payload).toMatchObject({ id: row.id, by: 'gru', option_ids: ['go', 'stop'] });
+      const decided = await postJson(port, `/api/notifications/${row.id}/decision`, 'board-test-token', {
+        optionId: 'go', by: 'web', expectedDecision: currentDisplayedDecision,
+      });
+      expect(decided).toMatchObject({ status: 200, body: { decidedOption: 'go', resolvedAt: null } });
+      expect((await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'executed' })).status).toBe(200);
+      // Refusal shapes: a typed (non-discussion) decision keeps its
+      // producer-authored options; malformed/empty lists and unknown rows
+      // are refused without touching anything.
+      const typed = await postJson(port, '/api/notifications/needs-owner', 'board-test-token', {
+        title: 'Typed decision',
+        detail: 'producer-authored options',
+        decision: {
+          question: 'Q?',
+          context: 'C',
+          recommendation: null,
+          reservedClass: 'scope-design',
+          whyNotDelegable: 'W',
+          options: [{ id: 'one', label: 'One', consequence: 'c' }],
+          discussion: false,
+        },
+      });
+      const typedId = (typed.body as { id: string }).id;
+      const replaced = await postJson(port, `/api/notifications/${typedId}/decision-options`, 'board-test-token', {
+        options: [{ id: 'two', label: 'Two', consequence: 'c' }],
+      });
+      expect(replaced).toMatchObject({ status: 409, body: { code: 'not_discussion' } });
+      expect(api.getNotification(typedId)?.decision?.options.map((option) => option.id)).toEqual(['one']);
+      expect(
+        (await postJson(port, '/api/notifications/missing/decision-options', 'board-test-token', {
+          options: [{ id: 'two', label: 'Two', consequence: 'c' }],
+        })).status,
+      ).toBe(404);
+      // A needs-owner row with NO typed decision refuses the bridge with
+      // the documented typed code.
+      api.recordNotification({
+        id: 'notice-without-decision',
+        kind: 'port-squat',
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Port occupied',
+        detail: 'bind refused',
+      });
+      const noDecision = await postJson(port, '/api/notifications/notice-without-decision/decision-options', 'board-test-token', {
+        options: [{ id: 'two', label: 'Two', consequence: 'c' }],
+      });
+      expect(noDecision).toMatchObject({ status: 409, body: { code: 'no_decision' } });
+      expect(
+        (await postJson(port, `/api/notifications/${typedId}/decision-options`, 'board-test-token', { options: [] })).status,
+      ).toBe(400);
+      expect(
+        (await postJson(port, `/api/notifications/${typedId}/decision-options`, 'board-test-token', {
+          options: [{ id: 'BAD', label: 'x', consequence: 'c' }],
+        })).status,
+      ).toBe(400);
+    } finally {
+      await close();
     }
   });
 });

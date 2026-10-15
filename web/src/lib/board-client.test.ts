@@ -201,6 +201,47 @@ describe('board client', () => {
     await waitFor(() => seen.includes('still-alive'), 'live after noise');
   });
 
+  it('preserves the domain conflict code from a refused owner-decision HTTP response', async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          error: 'decision_refused',
+          code: 'decision_recorded',
+          detail: 'the decision was already recorded elsewhere',
+        }),
+        { status: 409 },
+      ),
+    ) as unknown as typeof fetch;
+    client = new BoardClient(
+      { token: TOKEN, host: `127.0.0.1:${server.port}`, fetchImpl },
+      { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+    );
+    const expectedDecision = {
+      question: 'Approve the merge?',
+      context: 'It needs an owner choice.',
+      recommendation: null,
+      reservedClass: 'merge',
+      whyNotDelegable: 'The merge remains owner-controlled.',
+      options: [{ id: 'approve', label: 'Approve', consequence: 'Prepare the merge.' }],
+      discussion: false,
+    } as const;
+
+    await expect(client.decideNotification('decision-1', 'approve', expectedDecision)).rejects.toMatchObject({
+      path: '/api/notifications/decision-1/decision',
+      status: 409,
+      code: 'decision_recorded',
+      detail: 'the decision was already recorded elsewhere',
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      '/api/notifications/decision-1/decision',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ authorization: `Bearer ${TOKEN}` }),
+        body: JSON.stringify({ optionId: 'approve', by: 'web', expectedDecision }),
+      }),
+    );
+  });
+
   it('posts an authenticated decision recheck and rejects malformed status replies', async () => {
     const ready = { ...snapshotFor('recheck').decisions, enabled: true, status: 'ready' as const, reason: null, credentialPresent: true, credentialSource: 'file' as const, generation: 4 };
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(ready), { status: 200 })) as unknown as typeof fetch;
@@ -419,7 +460,7 @@ describe('board client', () => {
       expect(tracked.getState()).not.toBe('open');
       second.onmessage!({ data: JSON.stringify({ type: 'board', snapshot: tagged('recovered') }) });
       expect(tracked.getState()).toBe('open');
-      expect(received).toHaveBeenLastCalledWith(tagged('recovered'));
+      expect(received).toHaveBeenLastCalledWith(tagged('recovered'), 'push');
       expect(fatal).not.toHaveBeenCalled();
     } finally { tracked.stop(); vi.useRealTimers(); }
   });
@@ -471,6 +512,45 @@ describe('board client', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(delivered).toEqual(['second', 'pushed']);
+    tracked.stop();
+  });
+
+  it('drops a pre-disconnect HTTP snapshot and only delivers a post-disconnect refresh', async () => {
+    const answers: Array<(response: Response) => void> = [];
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { answers.push(resolve); })) as unknown as typeof fetch;
+    const sockets: { onopen: (() => void) | null; onmessage: ((event: { data: string }) => void) | null; onclose: (() => void) | null }[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() { sockets.push(this); }
+      send(): void {}
+      close(): void {}
+    }
+    const delivered: string[] = [];
+    const ok = (snapshot: BoardSnapshot) => new Response(JSON.stringify(snapshot), { status: 200 });
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const tracked = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl, webSocketCtor: FakeSocket as unknown as new (url: string) => WebSocket },
+      { connection: () => {}, snapshot: (snapshot) => delivered.push(snapshot.decisions.incarnation), fatal: () => {} },
+    );
+    tracked.connect();
+    answers[0]!(ok(tagged('boot')));
+    await tick();
+    const socket = sockets[0]!;
+    socket.onopen!();
+    socket.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) });
+
+    const beforeDisconnect = tracked.refetchSnapshot();
+    socket.onclose!();
+    answers[1]!(ok(tagged('pre-disconnect')));
+    await beforeDisconnect;
+    await tick();
+    expect(answers).toHaveLength(3); // the invalidated answer owed a fresh HTTP request
+    answers[2]!(ok(tagged('post-disconnect')));
+    await tick();
+    expect(delivered).toEqual(['boot', 'post-disconnect']);
     tracked.stop();
   });
 
@@ -964,6 +1044,94 @@ describe('board client', () => {
       expect(hung.requests).toHaveLength(2);
       expect(hung.fatals).toHaveLength(1);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a lesson proposal review fetch honors cancellation from a stale owner row', async () => {
+    const controller = new AbortController();
+    const requestSignals: AbortSignal[] = [];
+    const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal === undefined || signal === null) throw new Error('review request did not carry its abort signal');
+        requestSignals.push(signal);
+        signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      }),
+    ) as unknown as typeof fetch;
+    const client = new BoardClient(
+      { token: TOKEN, host: 'localhost', fetchImpl },
+      { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+    );
+    const pending = client.getLessonProposal(controller.signal);
+    expect(requestSignals[0]?.aborted).toBe(false);
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    expect(requestSignals[0]?.aborted).toBe(true);
+    client.stop();
+  });
+
+  it('a hung lesson proposal review is abandoned at the bounded request deadline', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const requestSignals: AbortSignal[] = [];
+      const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal === undefined || signal === null) throw new Error('review request did not carry its deadline signal');
+          requestSignals.push(signal);
+          signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+        }),
+      ) as unknown as typeof fetch;
+      const client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      const pending = client.getLessonProposal();
+      const timedOut = expect(pending).rejects.toThrow('lesson proposal review timed out after 15 seconds');
+      await vi.advanceTimersByTimeAsync(15_000);
+      await timedOut;
+      expect(requestSignals[0]?.aborted).toBe(true);
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a stalled lesson proposal response body is bounded by the deadline too', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let client: BoardClient | null = null;
+    try {
+      const requestSignals: AbortSignal[] = [];
+      const json = vi.fn(() => new Promise<unknown>(() => {}));
+      const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const signal = init?.signal;
+        if (signal === undefined || signal === null) throw new Error('review request did not carry its deadline signal');
+        requestSignals.push(signal);
+        return Promise.resolve({ ok: true, json } as unknown as Response);
+      }) as unknown as typeof fetch;
+      client = new BoardClient(
+        { token: TOKEN, host: 'localhost', fetchImpl },
+        { connection: () => {}, snapshot: () => {}, fatal: () => {} },
+      );
+      let settled: 'pending' | 'resolved' | 'rejected' = 'pending';
+      let rejectionMessage = '';
+      const pending = client.getLessonProposal().then(
+        () => { settled = 'resolved'; },
+        (error: unknown) => {
+          settled = 'rejected';
+          rejectionMessage = error instanceof Error ? error.message : String(error);
+        },
+      );
+      void pending;
+      await vi.advanceTimersByTimeAsync(15_000);
+      await Promise.resolve();
+      expect(json).toHaveBeenCalledTimes(1);
+      expect(requestSignals[0]?.aborted).toBe(true);
+      expect(settled).toBe('rejected');
+      expect(rejectionMessage).toBe('lesson proposal review timed out after 15 seconds');
+    } finally {
+      client?.stop();
       vi.useRealTimers();
     }
   });

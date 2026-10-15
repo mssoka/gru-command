@@ -126,6 +126,60 @@ describe('board server-frame validator', () => {
     expect(isValidSnapshot(board)).toBe(false);
   });
 
+  it('accepts absent/nullable owner-decision fields and refuses junk decisions outright', () => {
+    const board = snapshot();
+    const row: Record<string, unknown> = {
+      id: 'n1',
+      ts: '2026-01-01T00:00:00.000Z',
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Approve?',
+      detail: 'evidence',
+      agentId: null,
+      shownAt: null,
+      ackedAt: null,
+      resolvedAt: null,
+      resolvedBy: null,
+    };
+    (board as unknown as { notifications: unknown[] }).notifications = [row];
+    expect(isValidSnapshot(board)).toBe(true); // pre-upgrade server: no decision fields
+    row['decision'] = null;
+    row['decidedAt'] = null;
+    row['decidedBy'] = null;
+    row['decidedOption'] = null;
+    expect(isValidSnapshot(board)).toBe(true);
+    row['decision'] = {
+      question: 'Approve?',
+      context: 'context',
+      recommendation: null,
+      reservedClass: 'merge',
+      whyNotDelegable: 'owner-only',
+      discussion: false,
+      options: [{ id: 'approve', label: 'Approve', consequence: 'moves' }],
+    };
+    row['decidedAt'] = '2026-01-01T00:05:00.000Z';
+    row['decidedBy'] = 'web';
+    row['decidedOption'] = 'approve';
+    expect(isValidSnapshot(board)).toBe(true);
+    // A junk decision must never render as a readable question or an
+    // executable option (fail closed at the boundary).
+    const valid = { ...(row['decision'] as Record<string, unknown>) };
+    row['decision'] = { ...valid, question: 7 };
+    expect(isValidSnapshot(board)).toBe(false);
+    row['decision'] = { ...valid, discussion: 'yes' };
+    expect(isValidSnapshot(board)).toBe(false);
+    row['decision'] = { ...valid, options: [{ id: 'approve', label: 2, consequence: 'moves' }] };
+    expect(isValidSnapshot(board)).toBe(false);
+    row['decision'] = { ...valid, options: 'approve' };
+    expect(isValidSnapshot(board)).toBe(false);
+    row['decision'] = valid;
+    row['decidedOption'] = 3;
+    expect(isValidSnapshot(board)).toBe(false);
+    row['decidedOption'] = 'approve';
+    expect(isValidSnapshot(board)).toBe(true);
+  });
+
   it('rejects malformed frames (wrong shapes, missing fields, non-objects)', () => {
     expect(parseBoardServerFrame(null)).toBeNull();
     expect(parseBoardServerFrame('board')).toBeNull();

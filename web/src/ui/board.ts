@@ -33,7 +33,6 @@ import {
   jobStatusTone,
   lensChipState,
   lensChipTone,
-  LESSONS_PROPOSAL_KIND,
   type AgentView,
   type BoardSnapshot,
   type JobView,
@@ -83,13 +82,29 @@ import {
   type RoundSummary,
 } from '../lib/board-signals.js';
 import {
+  decidedOptionLabel,
+  ownerNoticeGuidance,
   ownerRows,
   ownerWindow,
   safePrUrl,
-  type OwnerAckRow,
+  type OwnerDecisionRow,
+  type OwnerNoticeRow,
   type OwnerPrRow,
   type OwnerProposalRow,
 } from '../lib/owner-band.js';
+import type { NotificationDecisionView } from '../lib/board-protocol.js';
+
+/** Detail text shown verbatim on the card face when it is short and
+ * single-paragraph; anything longer lives behind the Details disclosure
+ * in full. A mechanical length rule — never a semantic summary. */
+const DETAIL_FACE_LIMIT = 160;
+
+/** Attention-channel labels — the band a row lives in. */
+const ROUTING_LABEL: Readonly<Record<NotificationView['routing'], string>> = {
+  fyi: 'FEED',
+  'action-required': 'NEEDS GRU',
+  'needs-owner': 'FOR YOU',
+};
 
 /** Truthful lens progress for whole-PR rounds: show what actually ran —
  * including lenses that ran and failed — and name unused lenses instead of
@@ -104,7 +119,7 @@ function lensProgressLabel(summary: RoundSummary): string {
   }
   return parts.join(' · ');
 }
-import { BoardApiError, type BoardClient } from '../lib/board-client.js';
+import { BoardApiError, type BoardClient, type BoardSnapshotSource } from '../lib/board-client.js';
 import type { StorageLike } from '../theme.js';
 import { DECISION_LABELS, decisionChipTone } from './decisions-status.js';
 import { el, mustGet } from './dom.js';
@@ -185,6 +200,12 @@ export class BoardView {
   /** Toast + browser-notification surface (E7). */
   private onToast: ((notification: NotificationView) => void) | null = null;
   private snapshot: BoardSnapshot | null = null;
+  /** Actions and receipts are live only for a snapshot from the currently bound client. */
+  private snapshotIsCurrent = false;
+  /** Invalidates work started before a same-client disconnect, even if the
+   * reconnect snapshot arrives before that work's HTTP reply. */
+  private snapshotFreshnessGeneration = 0;
+  private snapshotRevision = 0;
   private unavailableReason: string | null = null;
   /** ONE sections derivation per render (classification truth is shared
    * by the shortcut strip and the section bodies — computed from the SAME
@@ -198,6 +219,19 @@ export class BoardView {
   } | null = null;
   /** D3: older receipt pages fetched on demand (merged into FEED). */
   private extraReceipts: NotificationView[] = [];
+  /** Open Details disclosures, keyed by notification id — a snapshot push
+   * never collapses what the operator opened. */
+  private readonly openNotificationDetails = new Set<string>();
+  /** Authoritative rows returned by a decision submission, applied until
+   * the next snapshot carries the same state. */
+  private readonly decisionOverrides = new Map<string, NotificationView>();
+  /** In-flight decision submissions, keyed by notification id and SHARED
+   * by the band and the bell: a live push mid-submit re-renders the same
+   * phase on both surfaces, no duplicate action can start anywhere, and
+   * the refusal or unconfirmed message survives the push (it lives here,
+   * never in the DOM). Entries are generation-scoped — a re-pair drops
+   * work begun for the old client. */
+  private readonly decisionSubmissions = new Map<string, DecisionSubmission>();
   private receiptsNextOffset = 0;
   private receiptsLoading = false;
   private receiptsExhausted = false;
@@ -265,15 +299,8 @@ export class BoardView {
       this.notificationPanel.hidden = !this.notificationPanel.hidden;
       this.notificationBell.dataset.open = String(!this.notificationPanel.hidden);
       if (!this.notificationPanel.hidden) {
-        // Opening the panel proves display of every current row: mark
-        // seen (badge) AND send one receipt per surface (shown:true).
-        for (const notification of this.snapshot?.notifications ?? []) {
-          if (notification.routing === 'needs-owner') {
-            this.seenOwnerIds.add(notification.id);
-          }
-          this.sendShown(notification, 'web-panel');
-        }
-        this.updateBadge(this.snapshot?.notifications ?? []);
+        // Opening the panel proves display only against a current snapshot.
+        this.markNotificationPanelShown(this.snapshot?.notifications ?? []);
       }
     });
   }
@@ -290,17 +317,35 @@ export class BoardView {
   bindClient(client: BoardClient): void {
     this.boardClient = client;
     this.clientGeneration += 1;
-    this.proposalStates.clear();
+    for (const [id, state] of this.proposalStates) {
+      if (state.pendingDecision === null) {
+        this.invalidateProposalState(state);
+        this.proposalStates.delete(id);
+        continue;
+      }
+      // The old client may still deliver a submitted decision after re-pair.
+      // Keep its choice as the only retryable action until the new server
+      // confirms what happened; an opposite POST must never race it.
+      this.invalidateProposalState(state, true);
+      const label = state.pendingDecision === 'accept' ? 'Accept' : 'Reject';
+      state.message ??= `Your ${label} may have been recorded. The opposite choice is locked until the server confirms the outcome.`;
+    }
+    this.decisionSubmissions.clear();
+    this.decisionOverrides.clear();
     this.sentShown.clear();
     this.extraReceipts = [];
     this.receiptsNextOffset = 0;
     this.receiptsExhausted = false;
     this.receiptsLoading = false;
+    this.snapshotIsCurrent = false;
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
-  render(snapshot: BoardSnapshot): void {
+  render(snapshot: BoardSnapshot, source: BoardSnapshotSource = 'http'): void {
     this.unavailableReason = null;
-    this.renderSnapshot(snapshot);
+    this.snapshotIsCurrent = true;
+    this.snapshotRevision += 1;
+    this.renderSnapshot(snapshot, source);
   }
 
   markUnavailable(message: string): void {
@@ -308,29 +353,102 @@ export class BoardView {
     if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
   }
 
-  private renderSnapshot(snapshot: BoardSnapshot): void {
+  /** A disconnected board cannot authorize actions from its last-known snapshot. */
+  markSnapshotStale(): void {
+    if (!this.snapshotIsCurrent) return;
+    this.snapshotIsCurrent = false;
+    this.snapshotFreshnessGeneration += 1;
+    for (const state of this.proposalStates.values()) {
+      // A submitted decision stays locked. Retire review work begun against
+      // stale text, but preserve an ambiguous submitted choice as the only
+      // retryable action until its outcome is reconciled.
+      if (state.decisionSubmitting) continue;
+      this.invalidateProposalState(state, state.pendingDecision !== null);
+    }
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
+  }
+
+  private invalidateProposalState(state: ProposalRowState, preservePendingDecision = false): void {
+    state.loadGeneration += 1;
+    state.actionGeneration += 1;
+    state.loadController?.abort();
+    state.loadController = null;
+    state.loading = null;
+    state.review = null;
+    state.inFlight = null;
+    state.decisionSubmitting = false;
+    if (!preservePendingDecision) state.pendingDecision = null;
+    state.loadFailed = false;
+    if (state.recorded === null && !preservePendingDecision) state.message = null;
+    state.open = false;
+    state.nested.clear();
+  }
+
+  private renderSnapshot(snapshot: BoardSnapshot, source: BoardSnapshotSource | 'local' = 'local'): void {
+    // The RAW snapshot is kept; decision overrides are DERIVED per render,
+    // so a stale override can never compound across pushes (the override
+    // dies the moment the snapshot carries the recorded state).
+    const effective = this.withDecisionOverrides(snapshot);
     const previous = this.snapshot;
     this.snapshot = snapshot;
+    // Submissions end only when an authoritative snapshot carries an
+    // outcome, removes the row, or an HTTP refresh after an option-state refusal
+    // proves the current state (even when it matches the old content).
+    for (const [id, submission] of [...this.decisionSubmissions]) {
+      const row = snapshot.notifications.find((notification) => notification.id === id);
+      const optionsReconciled =
+        source === 'http' &&
+        submission.reconcileAfterSnapshotRevision !== null &&
+        this.snapshotRevision > submission.reconcileAfterSnapshotRevision;
+      if (row === undefined || row.resolvedAt !== null || (row.decidedAt !== null && row.decidedAt !== undefined) || optionsReconciled) {
+        this.decisionSubmissions.delete(id);
+      }
+    }
     const pendingProposals = new Set(
-      ownerRows(snapshot).filter((row) => row.kind === 'proposal').map((row) => row.notification.id),
+      ownerRows(effective).filter((row) => row.kind === 'proposal').map((row) => row.notification.id),
     );
-    for (const id of this.proposalStates.keys()) if (!pendingProposals.has(id)) this.proposalStates.delete(id);
+    for (const [id, state] of this.proposalStates) {
+      if (!pendingProposals.has(id)) {
+        this.invalidateProposalState(state);
+        this.proposalStates.delete(id);
+      }
+    }
     // Focus preservation across live pushes: the control the operator was
     // on keeps its place (stable focus keys), so a snapshot update never
     // steals focus or resets a disclosure mid-interaction.
     const focusKey = this.captureFocusKey();
-    const ownerFocus = captureOwnerFocusKey();
+    const ownerFocus = captureOwnerFocusKey(this.ownerMount);
     this.currentSections = null; // one fresh derivation per render
-    this.renderOwnerActions(snapshot);
-    this.renderRail(snapshot);
-    this.renderNav(snapshot);
-    this.renderJobs(snapshot);
+    this.renderOwnerActions(effective);
+    this.renderRail(effective);
+    this.renderNav(effective);
+    this.renderJobs(effective);
     this.restoreFocusKey(focusKey);
-    this.renderAgents(snapshot.agents);
-    this.repoOverview.render(snapshot.repoOverview);
-    this.renderNotifications(snapshot);
-    restoreOwnerFocusKey(ownerFocus);
-    this.surfaceNewNotifications(previous, snapshot.notifications);
+    this.renderAgents(effective.agents);
+    this.repoOverview.render(effective.repoOverview);
+    this.renderNotifications(effective);
+    restoreOwnerFocusKey(ownerFocus, this.ownerMount);
+    this.surfaceNewNotifications(previous, effective.notifications);
+  }
+
+  /** Apply decision overrides until the next authoritative snapshot
+   * carries the same state — the server's reply IS authoritative, and the
+   * snapshot replaces it as soon as it arrives. */
+  private withDecisionOverrides(snapshot: BoardSnapshot): BoardSnapshot {
+    if (this.decisionOverrides.size === 0) return snapshot;
+    const byId = new Map(snapshot.notifications.map((row) => [row.id, row]));
+    let changed = false;
+    for (const [id, override] of [...this.decisionOverrides]) {
+      const current = byId.get(id);
+      if (current === undefined) continue; // keep until the row is seen again
+      if (current.decidedAt !== null && current.decidedAt !== undefined) {
+        this.decisionOverrides.delete(id); // the snapshot now carries it
+        continue;
+      }
+      byId.set(id, override);
+      changed = true;
+    }
+    return changed ? { ...snapshot, notifications: [...byId.values()] } : snapshot;
   }
 
   // ------------------------------------------------------------------
@@ -483,9 +601,13 @@ export class BoardView {
     const active = document.activeElement;
     const focusId =
       active instanceof HTMLElement && mount.contains(active)
-        ? active.dataset.actionId ?? null
+        ? active.dataset.ownerFocusKey ?? active.dataset.focusKey ?? active.dataset.actionId ?? null
         : null;
     const bandVisible = !mount.hidden && mount.closest('[hidden]') === null;
+    // Sync the open-Details state from the live DOM BEFORE the rebuild: the
+    // browser's toggle event timing must never collapse what the operator
+    // opened on the next snapshot push.
+    this.captureOpenDetails(mount);
     mount.replaceChildren();
     const head = el('h2', 'board-band__head');
     head.id = 'board-owner-head';
@@ -509,8 +631,10 @@ export class BoardView {
       const window = ownerWindow(rows, this.ownerExpanded);
       const list = el('div', 'board-band__rows board-owner__rows');
       for (const row of window.rows) {
-        if (row.kind === 'ack') {
-          list.append(this.ownerAckRow(row, bandVisible));
+        if (row.kind === 'decision') {
+          list.append(this.ownerDecisionRow(row, bandVisible));
+        } else if (row.kind === 'notice') {
+          list.append(this.ownerNoticeRow(row, bandVisible));
         } else if (row.kind === 'proposal') {
           list.append(this.ownerProposalRow(row, bandVisible));
         } else {
@@ -532,58 +656,32 @@ export class BoardView {
     if (focusId !== null) this.refocusAction(focusId);
   }
 
-  private refocusAction(actionId: string): void {
-    for (const node of this.ownerMount.querySelectorAll<HTMLElement>('[data-action-id]')) {
-      if (node.dataset.actionId === actionId) {
+  private refocusAction(focusKey: string): void {
+    for (const node of this.ownerMount.querySelectorAll<HTMLElement>('[data-action-id],[data-owner-focus-key]')) {
+      if (node.dataset.actionId === focusKey || node.dataset.ownerFocusKey === focusKey) {
         node.focus();
         return;
       }
     }
+    // The focused control may have changed state (an option just recorded):
+    // land on its card so focus stays inside the item the operator acted on.
+    const id = notificationIdFromFocusKey(focusKey);
+    if (id !== null) this.focusNotification(id, this.ownerMount);
   }
 
-  /** One pending ack obligation: what it is, why it is owed, what the
-   * Ack does AND does not do. The control stays pending on any HTTP
-   * ambiguity — only the authoritative snapshot closes the row. */
-  private ownerAckRow(row: OwnerAckRow, bandVisible: boolean): HTMLElement {
-    const item = row.notification;
-    // The interactive control carries the action id (focus/addressing
-    // target); the wrapper stays anonymous so a query always lands on
-    // the control, never a lookalike parent.
-    const node = el('article', `board-owner__row board-owner__row--${item.severity}`);
-    node.append(
-      el('div', 'board-owner__title', `🔔 ${item.title}`),
-      el(
-        'div',
-        'board-owner__meta lbl',
-        `${formatTs(item.ts)} · owner ack owed${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
-      ),
-      el('div', 'lbl board-owner__consequence', row.consequence),
-    );
-    const ack = document.createElement('button');
-    ack.type = 'button';
-    ack.className = 'board-owner__ack';
-    ack.textContent = 'Ack';
-    ack.dataset.actionId = row.actionId;
-    ack.addEventListener('click', () => {
-      ack.disabled = true;
-      ack.textContent = 'acking…';
-      void this.boardClient
-        ?.ackNotification(item.id)
-        .then(() => {
-          /* Success is NOT completion — the row closes only when the
-           * authoritative snapshot carries ackedAt (any device). */
-        })
-        .catch(() => {
-          // Ambiguous/failed HTTP: the obligation stands. Restore the
-          // control; the next snapshot reconciles one authoritative truth.
-          ack.disabled = false;
-          ack.textContent = 'Ack';
-        });
-    });
-    node.append(ack);
-    // Display receipt for what the band actually displayed (shown:true
-    // doctrine) — a receipt is proof of display, never of completion.
-    if (bandVisible) this.sendShown(item, 'web-board');
+  /** One pending owner decision or owner-only notice (owner release
+   * 2026-10-11): the SHARED readable card, wrapped for band layout. A
+   * decision's option buttons record the choice; a notice carries no
+   * in-app control (its action is outside the app) and no generic Ack. */
+  private ownerDecisionRow(row: OwnerDecisionRow, bandVisible: boolean): HTMLElement {
+    const node = el('article', `board-owner__row board-owner__row--${row.notification.severity} board-owner__row--decision`);
+    node.append(this.notificationCard(row.notification, false, bandVisible));
+    return node;
+  }
+
+  private ownerNoticeRow(row: OwnerNoticeRow, bandVisible: boolean): HTMLElement {
+    const node = el('article', `board-owner__row board-owner__row--${row.notification.severity} board-owner__row--notice`);
+    node.append(this.notificationCard(row.notification, false, bandVisible));
     return node;
   }
 
@@ -599,7 +697,21 @@ export class BoardView {
     const item = row.notification;
     let state = this.proposalStates.get(item.id);
     if (state === undefined) {
-      state = { open: false, review: null, loading: null, inFlight: null, recorded: null, message: null, loadFailed: false, nested: new Set() };
+      state = {
+        open: false,
+        review: null,
+        loading: null,
+        loadController: null,
+        loadGeneration: 0,
+        actionGeneration: 0,
+        inFlight: null,
+        decisionSubmitting: false,
+        pendingDecision: null,
+        recorded: null,
+        message: null,
+        loadFailed: false,
+        nested: new Set(),
+      };
       this.proposalStates.set(item.id, state);
     }
     const current = state;
@@ -608,19 +720,20 @@ export class BoardView {
     node.dataset.proposalId = item.id;
     node.append(
       el('div', 'board-owner__title', `📖 ${item.title}`),
-      el(
-        'div',
-        'board-owner__meta lbl',
-        `${formatTs(item.ts)} · owner decision owed${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
-      ),
-      el('div', 'lbl board-owner__consequence', row.consequence),
+      el('div', 'board-owner__meta lbl', `${formatTs(item.ts)} · owner decision owed`),
     );
+    if (item.detail !== null && item.detail !== '') {
+      // Prose stays readable prose: only the short metadata line wears the
+      // uppercase label treatment (R1 blocker: the detail went through .lbl).
+      node.append(el('div', 'board-owner__context', item.detail));
+    }
+    node.append(el('div', 'board-owner__consequence', row.consequence));
     const review = document.createElement('details');
     review.className = 'board-owner__review';
     const summary = document.createElement('summary');
     summary.textContent = 'Review changes';
     summary.dataset.ownerFocusKey = `${focusBase}:review`;
-    const body = el('div', 'board-owner__review-body lbl');
+    const body = el('div', 'board-owner__review-body');
     if (current.review !== null) body.replaceChildren(renderProposalReview(current.review, current.nested, focusBase));
     else body.textContent = current.loading !== null ? 'loading…' : 'not loaded — close and reopen to retry';
     review.append(summary, body);
@@ -631,10 +744,17 @@ export class BoardView {
       if (current.review !== null) return Promise.resolve(current.review);
       if (current.loading !== null) return current.loading;
       const client = this.boardClient;
+      const freshnessGeneration = this.snapshotFreshnessGeneration;
+      const loadGeneration = ++current.loadGeneration;
+      const controller = new AbortController();
+      current.loadController = controller;
       const pending: Promise<LessonProposalView> =
         client === null
           ? Promise.reject(new Error('board is not connected'))
-          : client.getLessonProposal().then((proposal) => {
+          : client.getLessonProposal(controller.signal).then((proposal) => {
+            if (freshnessGeneration !== this.snapshotFreshnessGeneration || loadGeneration !== current.loadGeneration) {
+              throw new Error('the board went stale while the proposal was loading; wait for a fresh review');
+            }
             if (proposal.notificationId !== item.id) {
               throw new Error('this notice belongs to an older proposal — the next snapshot retires it');
             }
@@ -643,8 +763,12 @@ export class BoardView {
       current.loading = pending.then(
         (proposal) => {
           if (!live()) throw new Error('re-paired');
+          if (freshnessGeneration !== this.snapshotFreshnessGeneration || loadGeneration !== current.loadGeneration) {
+            throw new Error('the board went stale while the proposal was loading; wait for a fresh review');
+          }
           current.review = proposal;
           current.loading = null;
+          current.loadController = null;
           if (current.loadFailed) {
             // A retry that worked: the earlier failure no longer applies.
             current.loadFailed = false;
@@ -652,17 +776,24 @@ export class BoardView {
           }
           if (proposal.decision !== null) {
             // Recorded elsewhere (another device, or before a restart): only
-            // the same decision can finish it.
+            // the same decision can finish it. This authoritative review also
+            // releases any ambiguous local submission lock.
             const recorded = proposal.decision.kind === 'accepted' ? 'accept' : 'reject';
             current.recorded = recorded;
+            current.pendingDecision = null;
+            current.inFlight = null;
+            current.decisionSubmitting = false;
             current.message ??= recordedMessage(recorded, proposal.recovery?.conflict ?? null);
           }
           this.rerenderOwner();
           return proposal;
         },
         (error: unknown) => {
-          if (!live()) throw error;
+          if (!live() || freshnessGeneration !== this.snapshotFreshnessGeneration || loadGeneration !== current.loadGeneration) {
+            throw error;
+          }
           current.loading = null; // a later open/decision retries the fetch
+          current.loadController = null;
           current.loadFailed = true;
           if (error instanceof BoardApiError && error.status === 404) {
             // Decided elsewhere before this page loaded it: an unknown
@@ -678,10 +809,19 @@ export class BoardView {
       );
       return current.loading;
     };
+    summary.addEventListener('click', (event) => {
+      if (!this.snapshotIsCurrent && !current.open) event.preventDefault();
+    });
     review.addEventListener('toggle', () => {
-      // Only the owner opening it fetches: restoring an open disclosure on
-      // re-render (which also fires toggle) must never refetch in a loop.
+      // A stale row may keep an already-open review readable, but it cannot
+      // start a new fetch against the newly bound or reconnecting client.
       const wasOpen = current.open;
+      if (!this.snapshotIsCurrent && review.open && !wasOpen) {
+        review.open = false;
+        return;
+      }
+      // Restoring an open disclosure on re-render (which also fires toggle)
+      // must never refetch in a loop.
       current.open = review.open;
       if (review.open && !wasOpen) void load().catch(() => {});
     });
@@ -698,8 +838,10 @@ export class BoardView {
     accept.textContent = current.inFlight === 'accept' ? 'accepting…' : 'Accept';
     reject.textContent = current.inFlight === 'reject' ? 'rejecting…' : 'Reject';
     // A recorded decision can only be finished, never flipped.
-    accept.disabled = current.inFlight !== null || current.recorded === 'reject';
-    reject.disabled = current.inFlight !== null || current.recorded === 'accept';
+    accept.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'reject' ||
+      (current.pendingDecision !== null && current.pendingDecision !== 'accept');
+    reject.disabled = !this.snapshotIsCurrent || current.inFlight !== null || current.recorded === 'accept' ||
+      (current.pendingDecision !== null && current.pendingDecision !== 'reject');
     /** An unconfirmed decision (#277): the cached proposal metadata may be
      * stale — the server may have recorded the choice and lost only the
      * reply. Reload it; the FETCHED durable decision (never the choice
@@ -711,7 +853,15 @@ export class BoardView {
       current.review = null;
       void load()
         .then((proposal) => {
-          if (!live() || proposal.decision === null || current.recorded === null) return;
+          if (!live()) return;
+          // The read answered the ambiguity, so the pending-choice fence ends:
+          // a recorded decision locks the opposite action itself, and no
+          // recorded decision leaves both choices available (#277).
+          current.pendingDecision = null;
+          if (proposal.decision === null || current.recorded === null) {
+            this.rerenderOwner();
+            return;
+          }
           if (current.message === uncertain) current.message = recordedMessage(current.recorded, proposal.recovery?.conflict ?? null);
           this.rerenderOwner();
         })
@@ -728,27 +878,45 @@ export class BoardView {
         });
     };
     const decide = (decision: 'accept' | 'reject'): void => {
-      if (current.inFlight !== null) return;
+      if (!this.snapshotIsCurrent || current.inFlight !== null ||
+        (current.pendingDecision !== null && current.pendingDecision !== decision)) return;
       const client = this.boardClient;
       if (client === null) return;
+      const freshnessGeneration = this.snapshotFreshnessGeneration;
+      const actionGeneration = ++current.actionGeneration;
+      const currentAction = (): boolean => live() && actionGeneration === current.actionGeneration;
       current.inFlight = decision;
+      current.decisionSubmitting = false;
       current.message = null;
       this.rerenderOwner();
       void load()
         .then((proposal) => {
-          if (!live()) throw new Error('re-paired');
-          if (current.recorded !== null && current.recorded !== decision) return null; // never flip a recorded decision
+          if (!currentAction()) return null;
+          if (!this.snapshotIsCurrent || freshnessGeneration !== this.snapshotFreshnessGeneration) {
+            current.message = 'The board is catching up; your choice was not sent. Wait for a fresh snapshot and review it again.';
+            return null;
+          }
+          if (current.recorded !== null && current.recorded !== decision) {
+            current.message = `Not applied — this lesson proposal was already ${current.recorded === 'accept' ? 'accepted' : 'rejected'}.`;
+            return null; // never flip a recorded decision
+          }
+          if (current.pendingDecision !== null && current.pendingDecision !== decision) return null;
+          current.pendingDecision = decision;
+          current.decisionSubmitting = true;
           return client.decideLessonProposal(proposal.id, decision);
         })
         .then((result) => {
-          if (!live()) return;
+          if (!currentAction()) return;
           if (result === null) {
             current.inFlight = null;
+            current.decisionSubmitting = false;
             this.rerenderOwner();
             return;
           }
           if (result.incomplete === true) {
             current.inFlight = null;
+            current.decisionSubmitting = false;
+            current.pendingDecision = null;
             current.recorded = decision;
             current.message =
               `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded, but finishing it hit a problem` +
@@ -756,27 +924,40 @@ export class BoardView {
             this.rerenderOwner();
             return;
           }
-          // Success is NOT completion — the row closes only when the
-          // authoritative snapshot carries the resolution (any device). Ask
-          // for that snapshot now rather than wait for a push.
+          // A successful response confirms this recorded choice, but only
+          // the authoritative snapshot closes the row. Releasing the local
+          // lock still leaves the opposite choice disabled via `recorded`.
+          current.inFlight = null;
+          current.decisionSubmitting = false;
+          current.pendingDecision = null;
+          current.recorded = decision;
+          current.review = null;
+          current.message = `Your ${decision === 'accept' ? 'Accept' : 'Reject'} is recorded; the board is refreshing.`;
+          this.rerenderOwner();
           client.wake();
         })
         .catch((error: unknown) => {
-          if (!live()) return;
+          if (!currentAction()) return;
           current.inFlight = null;
-          // Decided elsewhere: drop the cached review so the next load
-          // brings the recorded decision (and its lock) with it.
-          if (error instanceof BoardApiError && error.code === 'proposal_decided') current.review = null;
-          // Gone, or an outcome nobody confirmed: maybe decided here (a
-          // lost reply) or on another device — refresh, so the snapshot
-          // shows what actually happened. A recorded intent is kept.
-          const proven = error instanceof BoardApiError &&
-            ['proposal_stale', 'proposal_decided', 'proposal_mismatch'].includes(error.code ?? '');
-          if (!proven) client.wake();
+          current.decisionSubmitting = false;
+          // Never reuse review text after a failed submission. An ambiguous
+          // result keeps its original choice as the only retryable action;
+          // proven stale/mismatch refusals explicitly release that intent.
+          const provenNotApplied = error instanceof BoardApiError &&
+            ['proposal_stale', 'proposal_mismatch'].includes(error.code ?? '');
+          const decidedElsewhere = error instanceof BoardApiError && error.code === 'proposal_decided';
+          // An unconfirmed outcome is reconciled below: the reload either
+          // learns the durable decision or hands back the review the owner
+          // was reading, so its text is only kept when a read confirmed it.
+          if (provenNotApplied || decidedElsewhere) current.review = null;
+          if (provenNotApplied || decidedElsewhere) current.pendingDecision = null;
+          // A refusal or lost reply needs an authoritative catch-up; the
+          // pending-choice fence remains until that read confirms a result.
+          client.wake();
           current.message = describeDecisionFailure(error, current.recorded);
           const uncertain = current.message;
           this.rerenderOwner();
-          if (!proven) reconcile(uncertain);
+          if (!provenNotApplied && !decidedElsewhere) reconcile(uncertain);
         });
     };
     accept.addEventListener('click', () => decide('accept'));
@@ -800,7 +981,8 @@ export class BoardView {
     const node = el('article', 'board-owner__row board-owner__row--pointer');
     node.append(
       el('div', 'board-owner__title', `📖 ${item.title}`),
-      el('div', 'board-owner__meta lbl', `${formatTs(item.ts)} · waiting for you in For You — review the changes and decide there`),
+      el('div', 'board-owner__meta lbl', `${formatTs(item.ts)} · waiting for you`),
+      el('div', 'board-owner__pointer-text', 'Review the changes and decide in FOR YOU — the bell is only a pointer.'),
     );
     const go = document.createElement('button');
     go.type = 'button';
@@ -1476,7 +1658,7 @@ export class BoardView {
         `worker stopped by supervision` +
         (workerStop.reason === null ? '' : ` (${workerStop.reason.replaceAll('_', ' ')})`) +
         `${workerStop.restarts > 0 ? ` after ${workerStop.restarts} restart${workerStop.restarts === 1 ? '' : 's'}` : ''} — ` +
-        'the lane is not running: resolve the condition, then ack the escalation to re-arm';
+        'the lane is not running: resolve the condition, then Gru dispositions the machine alert to re-arm';
     }
     toggle.append(status);
     head.append(toggle);
@@ -2062,6 +2244,14 @@ export class BoardView {
   private renderNotifications(snapshot: BoardSnapshot): void {
     const notifications = snapshot.notifications;
     const list = mustGet('notification-list');
+    // Focus preservation across live pushes; a control that no longer
+    // renders (a recorded option) falls back to its card.
+    const active = document.activeElement;
+    const listFocusKey =
+      active instanceof HTMLElement && list.contains(active)
+        ? active.dataset.focusKey ?? active.dataset.ownerFocusKey ?? null
+        : null;
+    this.captureOpenDetails(list);
     list.replaceChildren();
     this.updateBadge(notifications);
     this.notificationBell.hidden = false;
@@ -2101,8 +2291,8 @@ export class BoardView {
     } else {
       for (const row of ownerRowsForBell) {
         forYou.append(
-          row.kind === 'ack'
-            ? this.notificationRow(row.notification)
+          row.kind === 'decision' || row.kind === 'notice'
+            ? this.notificationCard(row.notification)
             : row.kind === 'proposal'
               ? this.ownerProposalPointer(row)
               : this.ownerPrRow(row),
@@ -2132,6 +2322,30 @@ export class BoardView {
         list.append(more);
       }
     }
+    if (listFocusKey !== null) this.restoreListFocus(list, listFocusKey);
+    this.markNotificationPanelShown(notifications);
+  }
+
+  private markNotificationPanelShown(notifications: readonly NotificationView[]): void {
+    if (this.notificationPanel.hidden || this.notificationPanel.closest('[hidden]') !== null || !this.snapshotIsCurrent) return;
+    // An open panel can start displaying new current rows after a reconnect;
+    // receipt that render just as we do an explicit open.
+    for (const notification of notifications) {
+      if (notification.routing === 'needs-owner') this.seenOwnerIds.add(notification.id);
+      this.sendShown(notification, 'web-panel');
+    }
+    this.updateBadge(notifications);
+  }
+
+  private restoreListFocus(list: HTMLElement, key: string): void {
+    for (const node of list.querySelectorAll<HTMLElement>('[data-focus-key],[data-owner-focus-key]')) {
+      if (node.dataset.focusKey === key || node.dataset.ownerFocusKey === key) {
+        node.focus();
+        return;
+      }
+    }
+    const id = notificationIdFromFocusKey(key);
+    if (id !== null) this.focusNotification(id, list);
   }
 
   /** D3: fetch the next page of closed receipts and merge it into FEED.
@@ -2140,7 +2354,8 @@ export class BoardView {
     const client = this.boardClient;
     if (client === null || this.receiptsLoading) return;
     this.receiptsLoading = true;
-    if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+    const current = this.effectiveSnapshot();
+    if (current !== null) this.renderNotifications(current);
     try {
       const page = await client.fetchReceipts(this.receiptsNextOffset);
       // Re-paired mid-fetch: the page belongs to the previous server's record.
@@ -2155,7 +2370,8 @@ export class BoardView {
     } finally {
       if (this.boardClient === client) {
         this.receiptsLoading = false;
-        if (this.snapshot !== null) this.renderNotifications(this.snapshot);
+        const effective = this.effectiveSnapshot();
+        if (effective !== null) this.renderNotifications(effective);
       }
     }
   }
@@ -2172,63 +2388,354 @@ export class BoardView {
     if (rows.length === 0) {
       if (empty !== null) section.append(el('div', 'board-notification-section__empty lbl', empty));
     } else {
-      for (const item of rows) section.append(this.notificationRow(item, receipts.has(item.id)));
+      for (const item of rows) section.append(this.notificationCard(item, receipts.has(item.id)));
     }
     list.append(section);
   }
 
-  private notificationRow(item: NotificationView, closedReceipt = false): HTMLElement {    const row = el(
-      'div',
-      `board-notification board-notification--${item.severity}${closedReceipt ? ' board-notification--receipt' : ''}`,
+  /** ONE readable notification card (owner release 2026-10-11), shared
+   * by the board's FOR YOU band and the bell. The face is scannable —
+   * icon, title, a short metadata label, typed context/decision — and the
+   * full diagnostic text stays available verbatim behind Details. Controls
+   * match supported server behavior: option buttons submit a typed
+   * decision, `Mark seen` is a feed receipt, and machine or owner-notice
+   * rows carry no control at all. */
+  private notificationCard(item: NotificationView, closedReceipt = false, bandVisible = false): HTMLElement {
+    const receipt = closedReceipt;
+    const decided = item.decidedAt !== null && item.decidedAt !== undefined;
+    const card = el(
+      'article',
+      `board-notification board-notification--${item.severity}${receipt ? ' board-notification--receipt' : ''}${decided ? ' board-notification--decided' : ''}`,
     );
-    if (closedReceipt) row.dataset.receipt = 'closed';
-    const icon = item.routing === 'needs-owner' ? '🔔' : item.routing === 'action-required' ? '🛠' : item.severity === 'error' ? '🚨' : 'ℹ️';
-    const suffix = closedReceipt
-      ? ' · closed receipt'
+    card.dataset.notificationId = item.id;
+    card.dataset.focusTarget = 'card';
+    // Stable card key: when the focused control no longer renders (an
+    // option just recorded, a push replaced it), focus lands HERE.
+    card.dataset.focusKey = `notif:${item.id}:card`;
+    if (bandVisible) card.dataset.ownerFocusKey = `notif:${item.id}:card`;
+    card.tabIndex = -1;
+    if (receipt) card.dataset.receipt = 'closed';
+    const icon =
+      item.routing === 'needs-owner' ? '🔔' : item.routing === 'action-required' ? '🛠' : item.severity === 'error' ? '🚨' : 'ℹ️';
+    const head = el('header', 'board-notification__head');
+    head.append(
+      el('span', 'board-notification__icon', icon),
+      el('div', 'board-notification__title', item.title),
+    );
+    const state = receipt
+      ? 'closed receipt'
       : item.resolvedAt !== null
-        ? ' · resolved'
-        : item.ackedAt !== null
-          ? ' ✓'
-          : '';
-    row.append(
-      el('div', 'board-notification__title', `${icon} ${item.title}${suffix}`),
-      el(
-        'div',
-        'board-notification__meta lbl',
-        `${formatTs(item.ts)} · ${item.routing}${item.detail !== null && item.detail !== '' ? ` — ${item.detail}` : ''}`,
-      ),
-    );
-    // Only an owner stop or FYI row has a human Ack/Mark seen control.
-    // Gru records a machine disposition through the authenticated API
-    // after acting; a human click must not silently clear NEEDS GRU.
-    // A closed receipt is machine-attention history: same rule, no Ack.
-    // A lesson proposal closes only through Accept/Reject (its own row);
-    // the server refuses a plain ack for it.
-    if (
-      item.routing !== 'action-required' &&
-      item.kind !== LESSONS_PROPOSAL_KIND &&
-      item.ackedAt === null &&
-      item.resolvedAt === null
-    ) {
-      const ack = document.createElement('button');
-      ack.type = 'button';
-      ack.className = 'board-notification__ack';
-      ack.textContent = item.routing === 'fyi' ? 'Mark seen' : 'Ack';
-      ack.addEventListener('click', () => {
+        ? 'resolved'
+        : decided
+          ? 'decision recorded'
+          : item.ackedAt !== null
+            ? 'seen'
+            : null;
+    if (state !== null) head.append(el('span', 'pp-chip board-notification__state', state));
+    card.append(head);
+    // Metadata stays a SHORT label line: timestamp + attention channel —
+    // never prose, never the long detail.
+    card.append(el('div', 'board-notification__meta lbl', `${formatTs(item.ts)} · ${ROUTING_LABEL[item.routing]}`));
+    const detail = item.detail === null || item.detail === '' ? null : item.detail;
+    const decision = item.decision ?? null;
+    const shortDetail = detail !== null && detail.length <= DETAIL_FACE_LIMIT && !detail.includes('\n');
+    if (decision !== null) card.append(el('div', 'board-notification__context', decision.context));
+    else if (shortDetail && detail !== null) card.append(el('div', 'board-notification__context', detail));
+    const submission = this.decisionSubmissions.get(item.id) ?? null;
+    if (decision !== null) {
+      card.append(this.decisionBlock(item, decision, submission, bandVisible, !receipt && item.routing === 'needs-owner'));
+      if (submission !== null && !decided && item.resolvedAt === null) {
+        // The submission state lives in BoardView, not in the DOM: a live
+        // push mid-submit re-renders the SAME phase on both surfaces.
+        const status = el(
+          'div',
+          `board-notification__submission board-notification__submission--${submission.phase}`,
+          submission.phase === 'submitting'
+            ? `Recording “${submission.label}”…`
+            : (submission.message ?? 'The outcome is unconfirmed — the board will show the recorded state.'),
+        );
+        status.setAttribute('role', submission.phase === 'submitting' || submission.phase === 'reconciling' ? 'status' : 'alert');
+        card.append(status);
+      }
+      if (decided) {
+        card.append(
+          el(
+            'div',
+            'board-notification__decided',
+            item.resolvedAt === null
+              ? `Decision recorded: “${decidedOptionLabel(decision, item.decidedOption)}” — awaiting follow-through.`
+              : `Decision recorded: “${decidedOptionLabel(decision, item.decidedOption)}” — follow-through resolved.`,
+          ),
+        );
+      }
+    } else if (item.routing === 'needs-owner' && !receipt && item.resolvedAt === null) {
+      // Owner-only notice: the action is outside the app; say so plainly
+      // and offer no fake control.
+      card.append(el('div', 'board-notification__guidance', ownerNoticeGuidance(item.kind)));
+    }
+    if (detail !== null && !(decision === null && shortDetail)) {
+      card.append(this.detailsDisclosure(item.id, item.kind, detail, bandVisible));
+    }
+    // A feed row earns a receipt-style "Mark seen" only where an ack has
+    // meaning; machine and owner rows never show it.
+    if (item.routing === 'fyi' && !receipt && item.ackedAt === null && item.resolvedAt === null && this.snapshotIsCurrent) {
+      const seen = document.createElement('button');
+      seen.type = 'button';
+      seen.className = 'board-notification__ack';
+      seen.textContent = 'Mark seen';
+      seen.dataset.actionId = `fyi-seen:${item.id}`;
+      seen.dataset.focusKey = `notif:${item.id}:seen`;
+      seen.addEventListener('click', () => {
+        if (!this.snapshotIsCurrent) return;
+        seen.disabled = true;
         void this.boardClient
           ?.ackNotification(item.id)
           .then(() => {
             this.seenOwnerIds.add(item.id);
-            ack.textContent = '✓';
-            ack.disabled = true;
+            seen.textContent = '✓';
           })
           .catch(() => {
-            /* the row re-renders on the next snapshot push */
+            seen.disabled = false;
           });
       });
-      row.append(ack);
+      card.append(seen);
     }
-    return row;
+    if (bandVisible) this.sendShown(item, 'web-board');
+    return card;
+  }
+
+  /** Full diagnostics, verbatim — never truncated, never upper-cased and
+   * never letter-spaced. Open state survives snapshot pushes. */
+  private detailsDisclosure(notificationId: string, kind: string, detail: string, bandVisible = false): HTMLElement {
+    const details = document.createElement('details');
+    details.className = 'board-notification__details';
+    details.open = this.openNotificationDetails.has(notificationId);
+    const summary = document.createElement('summary');
+    summary.textContent = 'Details';
+    summary.dataset.focusKey = `notif:${notificationId}:details`;
+    // Owner-band focus addressing only: the bell keeps its own focus key so
+    // the two surfaces' restore passes can never steal each other's focus.
+    if (bandVisible) summary.dataset.ownerFocusKey = `notif:${notificationId}:details`;
+    const body = el('div', 'board-notification__detail');
+    body.append(el('div', 'board-notification__detail-kind', `kind: ${kind}`), el('div', 'board-notification__detail-text', detail));
+    details.append(summary, body);
+    details.addEventListener('toggle', () => {
+      if (details.open) this.openNotificationDetails.add(notificationId);
+      else this.openNotificationDetails.delete(notificationId);
+    });
+    return details;
+  }
+
+  /** The typed decision block: the question, Gru's recommendation, why it
+   * cannot be delegated, and the concrete options with consequences. Every
+   * option RECORDS the owner's choice; nothing here executes a fix. */
+  private decisionBlock(
+    item: NotificationView,
+    decision: NotificationDecisionView,
+    submission: DecisionSubmission | null,
+    bandVisible: boolean,
+    allowOptions: boolean,
+  ): HTMLElement {
+    const block = el('section', 'board-notification__decision');
+    block.append(el('div', 'board-notification__question', decision.question));
+    if (decision.recommendation !== null) {
+      block.append(el('div', 'board-notification__recommendation', `Gru recommends: ${decision.recommendation}`));
+    }
+    block.append(el('div', 'board-notification__why', `Why this needs you: ${decision.whyNotDelegable}`));
+    const decided = item.decidedAt !== null && item.decidedAt !== undefined;
+    // Options are live only on an open OWNER row: machine queue rows and
+    // closed receipts render their options read-only (no fake control).
+    const open = allowOptions && this.snapshotIsCurrent && !decided && item.resolvedAt === null && item.ackedAt === null;
+    if (open && decision.discussion && decision.options.length === 0) {
+      // A discussion-only decision: chat is the supported way forward, and
+      // the action actually OPENS the composer — the card stays pending
+      // until a choice is recorded through the typed path.
+      const discuss = el('div', 'board-notification__discuss');
+      discuss.append(
+        el(
+          'div',
+          'board-notification__discuss-text',
+          'This decision needs a conversation with Gru — open the chat and agree the options. The card stays pending until a choice is recorded.',
+        ),
+      );
+      const chat = document.createElement('button');
+      chat.type = 'button';
+      chat.className = 'board-notification__option-button board-notification__discuss-open';
+      chat.textContent = 'Discuss with Gru';
+      const key = `notif:${item.id}:discuss`;
+      chat.dataset.focusKey = key;
+      if (bandVisible) chat.dataset.ownerFocusKey = key;
+      chat.addEventListener('click', () => this.openChatComposer());
+      discuss.append(chat);
+      block.append(discuss);
+    } else if (open) {
+      const options = el('div', 'board-notification__options');
+      for (const option of decision.options) {
+        const optionNode = el('div', 'board-notification__option');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'board-notification__option-button';
+        button.textContent = option.label;
+        const key = `notif:${item.id}:option:${option.id}`;
+        button.dataset.actionId = key;
+        button.dataset.focusKey = key;
+        if (bandVisible) button.dataset.ownerFocusKey = key;
+        if (submission !== null && (submission.phase === 'submitting' || submission.phase === 'reconciling')) {
+          // No duplicate action from ANY surface: the chosen button keeps
+          // focus (aria-disabled, never the disabled property) while the
+          // others are plain-disabled; the shared state guard also refuses
+          // repeats. Reconciliation also locks choices until authoritative
+          // state arrives after a stale-state conflict.
+          if (submission.optionId === option.id) {
+            button.setAttribute('aria-disabled', 'true');
+            button.textContent = `recording “${option.label}”…`;
+          } else {
+            button.disabled = true;
+          }
+        }
+        button.addEventListener('click', () => {
+          const surfaceRoot = button.closest<HTMLElement>('#notification-list, #board-owner') ?? document.body;
+          this.submitDecision(item, option.id, surfaceRoot);
+        });
+        optionNode.append(button, el('div', 'board-notification__option-consequence', option.consequence));
+        options.append(optionNode);
+      }
+      block.append(options);
+    } else if (decision.options.length > 0) {
+      // Read-only rows keep the options and their consequences visible.
+      const options = el('div', 'board-notification__options board-notification__options--readonly');
+      for (const option of decision.options) {
+        const optionNode = el('div', 'board-notification__option');
+        optionNode.append(
+          el('div', 'board-notification__option-label', option.label),
+          el('div', 'board-notification__option-consequence', option.consequence),
+        );
+        options.append(optionNode);
+      }
+      block.append(options);
+    }
+    return block;
+  }
+
+  /** Submit an owner decision through the SHARED submission state
+   * (surface-independent and generation-scoped): a live push mid-submit
+   * re-renders the same phase on both surfaces, no duplicate action can
+   * start anywhere, and the outcome message survives the push. On success
+   * the server's row (authoritative) applies until the next snapshot; known
+   * stale-state conflicts refresh before the board offers another choice. */
+  private submitDecision(item: NotificationView, optionId: string, surfaceRoot: HTMLElement): void {
+    const client = this.boardClient;
+    if (client === null || !this.snapshotIsCurrent) return;
+    const existing = this.decisionSubmissions.get(item.id);
+    if (existing !== undefined && (existing.phase === 'submitting' || existing.phase === 'reconciling')) {
+      return; // one action; no retries until authoritative refresh resolves the conflict
+    }
+    const expectedDecision = item.decision;
+    if (expectedDecision === undefined || expectedDecision === null) return;
+    const option = expectedDecision.options.find((candidate) => candidate.id === optionId);
+    if (option === undefined) return; // the card no longer offers this choice
+    const submission: DecisionSubmission = {
+      optionId,
+      label: option.label,
+      generation: this.clientGeneration,
+      phase: 'submitting',
+      message: null,
+      reconcileAfterSnapshotRevision: null,
+    };
+    this.decisionSubmissions.set(item.id, submission);
+    this.rerenderNotifications();
+    void client
+      .decideNotification(item.id, optionId, expectedDecision)
+      .then((row) => {
+        if (submission.generation !== this.clientGeneration) return; // re-paired: old work is dropped
+        this.decisionSubmissions.delete(item.id);
+        this.decisionOverrides.set(item.id, row);
+        this.rerenderNotifications();
+        this.focusNotification(item.id, surfaceRoot);
+      })
+      .catch((error: unknown) => {
+        if (submission.generation !== this.clientGeneration || this.decisionSubmissions.get(item.id) !== submission) return;
+        // A conflict can mean the open card is stale because another view
+        // recorded/resolved it or changed a discussion's supported options.
+        // Do not offer a dead-end choice: clear any local success override,
+        // lock both surfaces, and fetch authoritative board state. Ordinary refusals remain retryable;
+        // transport failures are still ambiguous and same-option retry-safe.
+        if (
+          error instanceof BoardApiError &&
+          (error.code === 'decision_recorded' || error.code === 'decision_changed' || error.code === 'not_open' || error.code === 'unknown_option')
+        ) {
+          submission.phase = 'reconciling';
+          if (error.code === 'unknown_option' || error.code === 'decision_changed') {
+            // Only a post-refusal HTTP snapshot can discharge this lock. A
+            // changed content signature is not proof: options may change
+            // A→B→A while the authoritative refresh is in flight.
+            submission.reconcileAfterSnapshotRevision = this.snapshotRevision;
+          }
+          submission.message = 'The decision changed elsewhere. Refreshing the board before showing current choices.';
+          this.decisionOverrides.delete(item.id);
+          this.rerenderNotifications();
+          this.focusNotification(item.id, surfaceRoot);
+          void client.refetchSnapshot();
+          return;
+        }
+        submission.phase = error instanceof BoardApiError ? 'refused' : 'unconfirmed';
+        submission.message =
+          error instanceof BoardApiError
+            ? `Not recorded — ${error.detail ?? 'the server refused the choice'}. Press a choice to retry.`
+            : 'Outcome unconfirmed — the request failed before the server replied. The board will show the recorded state; retrying the same choice is safe.';
+        this.rerenderNotifications();
+        this.focusNotification(item.id, surfaceRoot);
+      });
+  }
+
+  /** Re-render both notification surfaces from the last RAW snapshot
+   * (submission state changed between pushes). */
+  private rerenderNotifications(): void {
+    if (this.snapshot !== null) this.renderSnapshot(this.snapshot);
+  }
+
+  /** The EFFECTIVE view of the last snapshot (decision overrides applied):
+   * every re-render path that bypasses render() must use this — the raw
+   * snapshot alone resurrects an already-recorded decision on one surface. */
+  private effectiveSnapshot(): BoardSnapshot | null {
+    return this.snapshot === null ? null : this.withDecisionOverrides(this.snapshot);
+  }
+
+  /** The discussion action: reveal the console/chat pane and focus the
+   * composer so the conversation can actually start. */
+  private openChatComposer(): void {
+    // aria-expanded describes the desktop pane; it is intentionally false
+    // in overlay mode. Clicking the FAB is idempotent there and opens the
+    // sheet even when the persisted desktop preference is already expanded.
+    const openChat = document.getElementById('gru-fab');
+    if (openChat instanceof HTMLElement && openChat.getAttribute('aria-expanded') !== 'true') {
+      openChat.click();
+    }
+    const input = document.getElementById('chat-input');
+    if (input instanceof HTMLElement) {
+      input.scrollIntoView?.({ block: 'nearest' });
+      input.focus();
+    }
+  }
+
+  /** Persist every currently-open notification Details before a rebuild. */
+  private captureOpenDetails(root: HTMLElement): void {
+    for (const details of root.querySelectorAll<HTMLDetailsElement>('.board-notification__details')) {
+      const id = details.closest<HTMLElement>('[data-notification-id]')?.dataset.notificationId;
+      if (id === undefined) continue;
+      if (details.open) this.openNotificationDetails.add(id);
+      else this.openNotificationDetails.delete(id);
+    }
+  }
+
+  /** Sane focus after a state-changing submit: land on the item's card
+   * within the SURFACE that owned the interaction (the band and the bell
+   * render the same card; an unscoped lookup would jump surfaces). */
+  private focusNotification(notificationId: string, root: ParentNode): void {
+    const target = [...root.querySelectorAll<HTMLElement>('[data-focus-target="card"]')].find(
+      (node) => node.dataset.notificationId === notificationId,
+    );
+    target?.focus();
   }
 
   /**
@@ -2259,6 +2766,7 @@ export class BoardView {
    * server upgrades shown_at per surface, so a toast receipt never
    * suppresses a later panel receipt. */
   private sendShown(notification: NotificationView, surface: string): void {
+    if (!this.snapshotIsCurrent) return;
     let surfaces = this.sentShown.get(notification.id);
     if (surfaces === undefined) {
       surfaces = new Set<string>();
@@ -2488,7 +2996,13 @@ interface ProposalRowState {
   open: boolean;
   review: LessonProposalView | null;
   loading: Promise<LessonProposalView> | null;
+  loadController: AbortController | null;
+  loadGeneration: number;
+  actionGeneration: number;
   inFlight: 'accept' | 'reject' | null;
+  decisionSubmitting: boolean;
+  /** Submitted intent preserved while its outcome is ambiguous. */
+  pendingDecision: 'accept' | 'reject' | null;
   /** A decision the server recorded but has not finished (202). */
   recorded: 'accept' | 'reject' | null;
   message: string | null;
@@ -2498,19 +3012,73 @@ interface ProposalRowState {
   nested: Set<string>;
 }
 
-/** Owner-surface focus (FOR YOU band + bell): stable keys survive the
- * re-render a snapshot push causes, so focus never falls to <body>. */
-function captureOwnerFocusKey(): string | null {
-  const active = document.activeElement;
-  return active instanceof HTMLElement ? active.dataset.ownerFocusKey ?? null : null;
+/** ONE decision submission, shared by every surface that renders the
+ * card. Phases: submitting (buttons locked everywhere), refused (an
+ * ordinary server refusal; retry is safe), unconfirmed (transport failure;
+ * same-choice retry is idempotent), or reconciling (known stale-state
+ * conflict; choices stay locked until fresh state arrives). */
+interface DecisionSubmission {
+  readonly optionId: string;
+  readonly label: string;
+  readonly generation: number;
+  phase: 'submitting' | 'refused' | 'unconfirmed' | 'reconciling';
+  message: string | null;
+  reconcileAfterSnapshotRevision: number | null;
 }
 
-function restoreOwnerFocusKey(key: string | null): void {
+/** Owner-surface focus (FOR YOU band + bell): stable keys survive the
+ * re-render a snapshot push causes, so focus never falls to <body>. */
+/** The notification id inside a focus key. Keys are `notif:<id>:…` or the
+ * band's `owner-<kind>:<id>` forms — and a notification id may itself
+ * contain ':' (e.g. `lessons-proposal-withdrawn:<uuid>`), so a fixed
+ * split(':')[1] parses the wrong segment and drops focus to <body>. */
+function notificationIdFromFocusKey(key: string): string | null {
+  // The key suffix is known (`:details`, `:seen`, `:option:<id>`); parse it
+  // from the RIGHT so an id containing ':' survives intact.
+  if (key.startsWith('notif:')) {
+    const rest = key.slice('notif:'.length);
+    const optionAt = rest.lastIndexOf(':option:');
+    if (optionAt !== -1) return rest.slice(0, optionAt) || null;
+    if (rest.endsWith(':details')) return rest.slice(0, -':details'.length) || null;
+    if (rest.endsWith(':seen')) return rest.slice(0, -':seen'.length) || null;
+    if (rest.endsWith(':card')) return rest.slice(0, -':card'.length) || null;
+    if (rest.endsWith(':discuss')) return rest.slice(0, -':discuss'.length) || null;
+    return rest || null;
+  }
+  const parts = key.split(':');
+  return parts.length >= 2 && parts[1] !== '' ? parts[1]! : null;
+}
+
+function captureOwnerFocusKey(root: HTMLElement): string | null {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !root.contains(active)) return null;
+  return active.dataset.ownerFocusKey ?? null;
+}
+
+function restoreOwnerFocusKey(key: string | null, root: HTMLElement): void {
   if (key === null) return;
-  const target = [...document.querySelectorAll<HTMLElement>('[data-owner-focus-key]')].find(
+  // Scoped to the owner band: the bell renders its own copies of the same
+  // cards, and a global lookup would jump focus from the open bell to the
+  // band's lookalike (shared builder, distinct surfaces).
+  const target = [...root.querySelectorAll<HTMLElement>('[data-owner-focus-key]')].find(
     (node) => node.dataset.ownerFocusKey === key,
   );
-  if (target !== undefined && document.activeElement !== target) target.focus();
+  if (target !== undefined) {
+    // Already on the restored control: never re-run the fallback (which
+    // would steal focus to the card the moment the control is focused).
+    if (document.activeElement !== target) target.focus();
+    return;
+  }
+  // The focused control may no longer render (an option just recorded, or
+  // a live push dropped it): land on the item's card so focus stays inside
+  // the item the operator acted on instead of falling to <body>.
+  const id = notificationIdFromFocusKey(key);
+  if (id !== null) {
+    const fallback = [...root.querySelectorAll<HTMLElement>('[data-focus-target="card"]')].find(
+      (node) => node.dataset.notificationId === id,
+    );
+    fallback?.focus();
+  }
 }
 
 /** A decision the server holds but has not finished: what to press. */

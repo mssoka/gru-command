@@ -1053,4 +1053,24 @@ export const MIGRATIONS: readonly Migration[] = [
         WHERE kind = 'silas.recovery-owner-stop-confirmed';
     `,
   },
+  {
+    // Owner decisions (owner release 2026-10-11): a needs-owner
+    // notification may carry typed decision metadata (question, context,
+    // recommendation, reserved class, options) supplied at the write
+    // boundary, and a recorded owner decision on that row. Additive and
+    // nullable: pre-existing rows keep exact meaning (no decision, no
+    // recorded choice). Decided state is deliberately distinct from ack
+    // and resolution — recording a decision never proves its follow-on
+    // operation succeeded.
+    // LANDING COLLISION: main landed migrations 26-28, so this never-applied
+    // migration takes id 29; the schema remains contiguous and forward-only.
+    id: 29,
+    name: 'notification-owner-decisions',
+    sql: `
+      ALTER TABLE notifications ADD COLUMN decision_json TEXT;
+      ALTER TABLE notifications ADD COLUMN decided_at TEXT;
+      ALTER TABLE notifications ADD COLUMN decided_by TEXT;
+      ALTER TABLE notifications ADD COLUMN decided_option TEXT;
+    `,
+  },
 ];

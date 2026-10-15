@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { withMailboxFixture } from '../lib/mailbox-fixture.test-support.js';
 
+import { request as nodeHttpRequest } from 'node:http';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   AgentView,
@@ -16,7 +17,10 @@ import type {
 import { memoryStorage } from '../lib/chat-storage.js';
 import { boardKpis, collectJobs } from '../lib/board-kpi.js';
 import { snapshotSections } from '../lib/board-sections.js';
+import { ConsoleShell } from './console.js';
 import { BoardView, RailIdentityError, jobFailing, makeGraphemeSplitter, minionSuffixes, railSuffix, visibleWord } from './board.js';
+import { BoardApiError, BoardClient } from '../lib/board-client.js';
+import { startBoardServerHarness } from '../test-support/board-server-harness.js';
 
 type DecisionsOverrides = Partial<BoardSnapshot['decisions']>;
 
@@ -34,6 +38,22 @@ function notification(id: string, overrides: Partial<NotificationView> = {}): No
     ackedAt: null,
     resolvedAt: null,
     resolvedBy: null,
+    ...overrides,
+  };
+}
+
+function ownerDecision(overrides: Partial<import('../lib/board-protocol.js').NotificationDecisionView> = {}) {
+  return {
+    question: 'Approve the slim contract?',
+    context: 'PR256 needs an owner-controlled integration route.',
+    recommendation: 'Approve the slim contract.',
+    reservedClass: 'scope-design',
+    whyNotDelegable: 'It changes the agreed product scope.',
+    options: [
+      { id: 'approve', label: 'Approve the slim contract', consequence: 'Gru commissions the slim lane.' },
+      { id: 'keep', label: 'Keep the current approach', consequence: 'The lane stays parked.' },
+    ],
+    discussion: false,
     ...overrides,
   };
 }
@@ -172,7 +192,7 @@ function mountBoardDom(): void {
     <section id="board-repos" data-rail-panel="agents"></section>
     <span id="rail-agents-count">0</span>
     <button id="notification-bell"><span id="notification-badge">0</span></button>
-    <div id="notification-panel"><div id="notification-list"></div></div>
+    <div id="notification-panel" hidden><div id="notification-list"></div></div>
   `;
 }
 
@@ -387,13 +407,13 @@ describe('board view resolved-notification rendering', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
     view.setToastHandler(toast);
-    const first = notification('first', { routing: 'needs-owner' });
+    const first = notification('first', { routing: 'fyi' });
     view.render(snapshot({ notifications: [first] }));
-    expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
+    expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1); // Mark seen on a feed row
 
     const resolved = { ...first, resolvedAt: '2026-01-01T00:01:00.000Z', resolvedBy: 'runtime' };
     view.render(snapshot({ notifications: [resolved] }));
-    expect(document.querySelector('.board-notification__title')?.textContent).toContain('resolved');
+    expect(document.querySelector('.board-notification__state')?.textContent).toBe('resolved');
     expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(0);
     expect(document.querySelector<HTMLElement>('#notification-bell')?.dataset.unread).toBe('0');
     expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('0');
@@ -410,17 +430,30 @@ describe('board view resolved-notification rendering', () => {
     );
     expect(toast).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith(expect.objectContaining({ id: 'active' }));
-    expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(1);
+    // Owner rows and resolved rows carry no generic Ack.
+    expect(document.querySelectorAll('.board-notification__ack')).toHaveLength(0);
   });
 
-  it('an informational owner stop remains in the bell until seen and is ackable; machine rows have no manual Ack', () => {
+  it('an informational owner notice stays in the bell with no Ack; machine rows have no manual Ack; feed rows can be marked seen', () => {
     const view = new BoardView(() => {});
-    view.render(snapshot({ notifications: [notification('owner-stop', { routing: 'needs-owner', severity: 'info' }), notification('machine')] }));
+    view.render(
+      snapshot({
+        notifications: [
+          notification('owner-stop', { routing: 'needs-owner', kind: 'port-squat', severity: 'info' }),
+          notification('machine'),
+          notification('feed', { routing: 'fyi' }),
+        ],
+      }),
+    );
     expect(document.querySelector<HTMLElement>('#notification-badge')?.textContent).toBe('1');
     const sections = [...document.querySelectorAll<HTMLElement>('.board-notification-section')];
     expect(sections[0]?.querySelector('.board-notification__title')?.textContent).toContain('owner-stop');
-    expect(sections[0]?.querySelector('.board-notification__ack')).not.toBeNull();
+    // Owner notices carry their manual-step guidance and NO generic Ack.
+    expect(sections[0]?.querySelector('.board-notification__guidance')?.textContent).toContain('Stop the foreign process yourself');
+    expect(sections[0]?.querySelector('.board-notification__ack')).toBeNull();
     expect(sections[1]?.querySelector('.board-notification__ack')).toBeNull();
+    // The feed row's explicit receipt control remains.
+    expect(sections[2]?.querySelector('.board-notification__ack')?.textContent).toBe('Mark seen');
   });
 
   it('places pre-disposition acknowledged machine rows in FEED, not an unresolvable NEEDS GRU queue', () => {
@@ -2450,7 +2483,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(
       snapshot({
         notifications: [
-          notification('owner-stop', { routing: 'needs-owner', kind: 'supervision.breaker', severity: 'info' }),
+          notification('owner-stop', { routing: 'needs-owner', kind: 'gru.owner-escalation', severity: 'info', decision: ownerDecision() }),
           notification('machine', { routing: 'action-required' }),
         ],
         unackedActionRequired: 1,
@@ -2462,7 +2495,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.querySelector('.board-band__label')?.textContent).toBe('FOR YOU');
     expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
     const actionIds = [...band.querySelectorAll('[data-action-id]')].map((node) => (node as HTMLElement).dataset.actionId);
-    expect(actionIds).toEqual(['owner-ack:owner-stop']);
+    expect(actionIds).toEqual(['notif:owner-stop:option:approve', 'notif:owner-stop:option:keep']);
+    expect(band.textContent).toContain('Approve the slim contract?');
     // The machine row is in the bell panel's NEEDS GRU section, never in the band.
     expect(document.getElementById('notification-list')?.textContent).toContain('Notice machine');
     expect(band.textContent).not.toContain('Notice machine');
@@ -2493,37 +2527,225 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('0 pending');
   });
 
-  it('ack click: optimistic pending state, stays pending on failure (control reverts), closes only on the authoritative snapshot', async () => {
-    const client = stubClient(new Error('network ambiguity'));
-    const view = new BoardView(() => {}, client);
-    const stop = notification('ack-me', { routing: 'needs-owner', kind: 'supervision.provider-wall.a1.quota_exceeded' });
+  it('decision click: optimistic pending state, stays pending on failure (control reverts), settles only on the authoritative reply', async () => {
+    const stop = notification('decide-me', { routing: 'needs-owner', kind: 'gru.owner-escalation', decision: ownerDecision() });
+    const failing = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.reject(new Error('network ambiguity'))),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, failing);
     view.render(snapshot({ notifications: [stop] }));
     const band = document.getElementById('board-owner')!;
-    const button = band.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:ack-me"]')!;
-    // Honest consequence copy rides the row (quota ack scope).
-    expect(band.textContent).toContain('does NOT clear code/test/review holds');
+    const button = band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!;
+    // The decision face names the question, the recommendation and the why.
+    expect(band.textContent).toContain('Approve the slim contract?');
+    expect(band.textContent).toContain('Gru recommends');
+    expect(band.textContent).toContain('Why this needs you');
     button.click();
-    expect(button.textContent).toBe('acking…');
-    expect(button.disabled).toBe(true);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(client.ackNotification).toHaveBeenCalledWith('ack-me');
-    // Failed HTTP → the obligation stands and the control returns.
-    expect(button.textContent).toBe('Ack');
-    expect(button.disabled).toBe(false);
-    view.render(snapshot({ notifications: [stop] }));
-    expect(band.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
-    // Success → STILL pending until the authoritative snapshot lands.
-    const okClient = stubClient();
-    const view2 = new BoardView(() => {}, okClient);
+    const busy = band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!;
+    // The submission state is re-rendered from BoardView (shared by both
+    // surfaces): the chosen button keeps focus (aria-disabled, never the
+    // disabled property) and every other option is plain-disabled.
+    expect(busy.textContent).toBe('recording “Approve the slim contract”…');
+    expect(busy.getAttribute('aria-disabled')).toBe('true');
+    expect(busy.disabled).toBe(false);
+    expect(band.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:keep"]')!.disabled).toBe(true);
+    expect(band.querySelector('.board-notification__submission--submitting')?.textContent).toContain('ecording');
+    busy.click(); // duplicate click on the in-flight option: no second request
+    await vi.waitFor(() => expect(failing.decideNotification).toHaveBeenCalledWith('decide-me', 'approve', stop.decision));
+    expect(failing.decideNotification).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(band.querySelector('.board-notification__submission--unconfirmed')).not.toBeNull());
+    // Ambiguous transport failure → the copy must NOT claim nothing was
+    // recorded (the server may have committed before the reply was lost).
+    expect(band.querySelector('.board-notification__submission')?.textContent).toContain('Outcome unconfirmed');
+    expect(band.querySelector('[data-action-id="notif:decide-me:option:approve"]')?.textContent).toBe('Approve the slim contract');
+    // A server refusal PROVES nothing was recorded and shows the reason.
+    const refused = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.reject(new BoardApiError('/decision', 400, 'bad_request', 'the request was malformed'))),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view3 = new BoardView(() => {}, refused);
+    view3.render(snapshot({ notifications: [stop] }));
+    const band3 = document.getElementById('board-owner')!;
+    band3.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!.click();
+    await vi.waitFor(() =>
+      expect(band3.querySelector('.board-notification__submission--refused')?.textContent).toContain('the request was malformed'),
+    );
+    expect(band3.textContent).toContain('Not recorded');
+    // Success → the server's authoritative row applies; the row stays
+    // visible as decided — awaiting follow-through, never "completed".
+    const decidedRow = { ...stop, decidedAt: '2026-01-01T00:09:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const ok = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decidedRow)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view2 = new BoardView(() => {}, ok);
     view2.render(snapshot({ notifications: [stop] }));
-    const button2 = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__ack')!;
-    button2.click();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).not.toBeNull();
-    view2.render(snapshot({ notifications: [{ ...stop, ackedAt: '2026-01-01T00:09:00.000Z' }] }));
-    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="owner-ack:ack-me"]')).toBeNull();
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="notif:decide-me:option:approve"]')!.click();
+    await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+    expect(document.getElementById('board-owner')!.textContent).toContain('awaiting follow-through');
+    expect(document.getElementById('board-owner')!.querySelector('[data-action-id="notif:decide-me:option:approve"]')).toBeNull();
+    expect(document.getElementById('board-owner')!.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+  });
+
+  it('a decided row reloaded from the snapshot renders decided with no controls, and Details survives re-renders', () => {
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    const stop = notification('decided-row', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'Full evidence line retained behind Details.',
+      decision: ownerDecision(),
+      decidedAt: '2026-01-01T00:09:00.000Z',
+      decidedBy: 'web',
+      decidedOption: 'approve',
+    });
+    view.render(snapshot({ notifications: [stop] }));
+    const band = document.getElementById('board-owner')!;
+    expect(band.textContent).toContain('Decision recorded: “Approve the slim contract” — awaiting follow-through.');
+    expect(band.querySelector('[data-action-id^="notif:decided-row:option:"]')).toBeNull();
+    expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
+    expect(client.decideNotification).not.toHaveBeenCalled();
+    // Reload (fresh render of the same authoritative row): still decided.
+    view.render(snapshot({ notifications: [stop] }));
+    expect(band.textContent).toContain('Decision recorded');
+
+    // Details: opening is a view action, never a decision; the open state
+    // survives the next snapshot push.
+    const details = band.querySelector<HTMLDetailsElement>('.board-notification__details')!;
+    expect(details).not.toBeNull();
+    details.open = true;
+    details.dispatchEvent(new Event('toggle'));
+    view.render(snapshot({ notifications: [stop] }));
+    expect(document.getElementById('board-owner')!.querySelector<HTMLDetailsElement>('.board-notification__details')?.open).toBe(true);
+    // Follow-through resolved: the row leaves FOR YOU and its FEED copy must
+    // never claim it is still awaiting completion (decision vs completion
+    // stay distinct).
+    view.render(snapshot({ notifications: [{ ...stop, resolvedAt: '2026-01-01T00:12:00.000Z', resolvedBy: 'gru' }] }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const feedCard = document.getElementById('notification-list')!;
+    expect(feedCard.textContent).toContain('follow-through resolved');
+    expect(feedCard.textContent).not.toContain('awaiting follow-through');
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    expect(client.decideNotification).not.toHaveBeenCalled();
+    expect(client.ackNotification).not.toHaveBeenCalled();
+  });
+
+  it('board band and bell render the SAME decision question, recommendation and options', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [notification('parity', { routing: 'needs-owner', kind: 'gru.owner-escalation', detail: 'evidence', decision: ownerDecision() })],
+        unackedNeedsOwner: 1,
+      }),
+    );
+    const band = document.getElementById('board-owner')!;
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const panel = document.getElementById('notification-list')!;
+    for (const text of ['Approve the slim contract?', 'Gru recommends: Approve the slim contract.', 'Why this needs you: It changes the agreed product scope.']) {
+      expect(band.textContent, `band: ${text}`).toContain(text);
+      expect(panel.textContent, `bell: ${text}`).toContain(text);
+    }
+    expect(band.querySelectorAll('.board-notification__option-button')).toHaveLength(2);
+    expect(panel.querySelectorAll('.board-notification__option-button')).toHaveLength(2);
+    // The bell's copy shares the same authoritative question — never a
+    // second interpretation.
+    expect(panel.textContent).not.toContain('Ack');
+  });
+
+  it('a discussion-only decision offers the chat route and opens a collapsed chat pane', () => {
+    const consoleRoot = document.createElement('div');
+    consoleRoot.id = 'console';
+    const fab = document.createElement('button');
+    fab.id = 'gru-fab';
+    const rail = document.createElement('button');
+    rail.id = 'chat-rail';
+    const collapseButton = document.createElement('button');
+    collapseButton.id = 'chat-collapse';
+    document.body.append(consoleRoot, fab, rail, collapseButton);
+    const chat = {
+      setPaneCollapsed: vi.fn(),
+      focusComposer: vi.fn(),
+      openSheet: vi.fn(),
+      closeSheet: vi.fn(),
+    };
+    const shell = new ConsoleShell({
+      root: consoleRoot,
+      fab,
+      rail,
+      collapseButton,
+      chat: chat as unknown as ConstructorParameters<typeof ConsoleShell>[0]['chat'],
+      storage: null,
+      matchMedia: () => ({ matches: true }),
+    });
+    shell.setCollapsed(true);
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [
+          notification('discuss', {
+            routing: 'needs-owner',
+            kind: 'gru.owner-escalation',
+            detail: 'evidence',
+            decision: ownerDecision({ options: [], discussion: true }),
+          }),
+        ],
+      }),
+    );
+    const band = document.getElementById('board-owner')!;
+    expect(band.querySelector('.board-notification__discuss-text')?.textContent).toContain('conversation with Gru');
+    // No invented one-click option: the single control is the real chat
+    // action, and clicking it focuses the composer (a genuine route, not
+    // a dead paragraph).
+    expect(band.querySelectorAll('.board-notification__option-button')).toHaveLength(1);
+    expect(band.querySelector('.board-notification__discuss-open')?.textContent).toBe('Discuss with Gru');
+    expect(band.querySelector('.board-notification__ack')).toBeNull();
+    const chatInput = document.createElement('textarea');
+    chatInput.id = 'chat-input';
+    document.body.append(chatInput);
+    expect(shell.collapsed).toBe(true);
+    band.querySelector<HTMLButtonElement>('.board-notification__discuss-open')!.click();
+    expect(shell.collapsed).toBe(false);
+    expect(consoleRoot.classList.contains('console--chat-collapsed')).toBe(false);
+    expect(document.activeElement).toBe(chatInput);
+    chatInput.remove();
+    consoleRoot.remove();
+    fab.remove();
+    rail.remove();
+    collapseButton.remove();
+  });
+
+  it('a long diagnostic card keeps mixed case on its face and the full text behind Details', () => {
+    const view = new BoardView(() => {});
+    const longDetail =
+      `Decisions for job job-1234567890abcdef are blocked: the SHA ` +
+      `a40e6a963f8c2b1d4e5f60718293a4b5c6d7e8f9 does not match the recorded head, ` +
+      `and /home/tester/.gru-command/captures/ops-sweep-20261009T000000Z/manifest.json is missing. ` +
+      'No replay was attempted; the lane stays stopped until the cause is addressed.';
+    view.render(
+      snapshot({
+        notifications: [notification('long', { routing: 'action-required', kind: 'supervision.provider-wall.a1.auth', detail: longDetail })],
+      }),
+    );
+    const card = document.querySelector<HTMLElement>('[data-notification-id="long"]')!;
+    // The face does NOT show the wall of prose; the full text is inside Details.
+    expect(card.querySelector('.board-notification__context')).toBeNull();
+    const detailText = card.querySelector('.board-notification__detail-text')?.textContent;
+    expect(detailText).toBe(longDetail);
+    expect(card.querySelector('.board-notification__detail-kind')?.textContent).toBe('kind: supervision.provider-wall.a1.auth');
+    expect(card.querySelector('.board-notification__meta')?.textContent).not.toContain('blocked');
+    // A short detail renders verbatim on the face (metadata stays separate).
+    view.render(snapshot({ notifications: [notification('short', { routing: 'fyi', detail: 'Automatic recovery watching the route.' })] }));
+    const shortCard = document.querySelector<HTMLElement>('[data-notification-id="short"]')!;
+    expect(shortCard.querySelector('.board-notification__context')?.textContent).toBe('Automatic recovery watching the route.');
+    expect(shortCard.querySelector('.board-notification__details')).toBeNull();
   });
 
   // ---- Book of Lessons proposals (owner decision 2026-10-07) ----
@@ -2602,7 +2824,12 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const band = document.getElementById('board-owner')!;
     expect(band.querySelector('.board-band__count')?.textContent).toBe('1 pending');
     expect(band.textContent).toContain('Accept writes these changes into the Book of Lessons');
-    expect(band.querySelector('[data-action-id="owner-ack:lp-1"]')).toBeNull();
+    // No generic Ack on the proposal row: the real controls are the
+    // review disclosure and Accept/Reject (the action-id family is
+    // `owner-proposal:<id>`).
+    expect(band.querySelector('.board-owner__ack.board-owner__accept')).not.toBeNull();
+    expect(band.querySelector('.board-owner__ack.board-owner__reject')).not.toBeNull();
+    expect(band.querySelector('[data-action-id^="owner-ack:"]')).toBeNull();
     openReview();
     await flush();
     expect(band.textContent).toContain('Close the shell first.\nThen restart.');
@@ -2951,12 +3178,49 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const bell = document.getElementById('notification-list')!;
     const pointer = bell.querySelector('.board-owner__row--pointer')!;
     expect(pointer.textContent).toContain('Book of Lessons: 2 lesson changes proposed');
-    expect(pointer.textContent).toContain('waiting for you in For You — review the changes and decide there');
+    expect(pointer.textContent).toContain('Review the changes and decide in FOR YOU');
+    expect(pointer.querySelector('.board-owner__pointer-text')?.classList.contains('lbl')).toBe(false);
     expect(bell.querySelector('.board-owner__accept, .board-owner__reject, .board-owner__review')).toBeNull();
     pointer.querySelector<HTMLButtonElement>('.board-owner__goto')!.click();
     expect(document.getElementById('notification-panel')!.hidden).toBe(true);
     expect(document.activeElement).toBe(document.getElementById('board-owner')!.querySelector('.board-owner__review > summary'));
     expect(client.getLessonProposal).not.toHaveBeenCalled();
+  });
+
+  it('proposal prose and the pointer are readable mixed-case text, never the uppercase label treatment (R1)', async () => {
+    const detailed = {
+      ...proposalNotice,
+      detail: 'Two lessons changed in the execution chapter — review the exact before/after text.',
+    };
+    const client = proposalClient();
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [detailed] }));
+    const band = document.getElementById('board-owner')!;
+    // The detail is readable prose in its own readable class...
+    const context = band.querySelector('.board-owner__context')!;
+    expect(context.textContent).toContain('Two lessons changed');
+    expect(context.classList.contains('lbl')).toBe(false);
+    // ...and the short metadata line carries ONLY the timestamp + state.
+    const meta = band.querySelector('.board-owner__meta')!;
+    expect(meta.classList.contains('lbl')).toBe(true);
+    expect(meta.textContent).toContain('owner decision owed');
+    expect(meta.textContent).not.toContain('Two lessons changed');
+    // The consequence line stays readable prose too.
+    expect(band.querySelector('.board-owner__consequence')!.classList.contains('lbl')).toBe(false);
+    // The review body (the lesson text itself) is never uppercase/label-spaced.
+    openReview();
+    await flush();
+    const reviewBody = band.querySelector('.board-owner__review-body')!;
+    expect(reviewBody.classList.contains('lbl')).toBe(false);
+    expect(reviewBody.textContent).toContain('Close the shell first');
+    // The real controls survive the readability fix.
+    expect(band.querySelector('.board-owner__accept')).not.toBeNull();
+    expect(band.querySelector('.board-owner__reject')).not.toBeNull();
+    // The bell copy is a readable pointer, not a label line.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const pointer = document.getElementById('notification-list')!.querySelector('.board-owner__pointer-text')!;
+    expect(pointer.classList.contains('lbl')).toBe(false);
+    expect(pointer.textContent).toContain('Review the changes and decide in FOR YOU');
   });
 
   it('"Go to For You" with no destination left closes the panel, returns focus to the notification bell, and never fetches or decides (#278)', async () => {
@@ -3194,15 +3458,147 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     await flush();
     expect(oldClient.getLessonProposal).toHaveBeenCalledTimes(1);
     view.bindClient(newClient);
+    let band = document.getElementById('board-owner')!;
+    const staleAccept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    const staleReject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect(staleAccept.disabled).toBe(true);
+    expect(staleReject.disabled).toBe(true);
+    const staleReview = band.querySelector<HTMLDetailsElement>('.board-owner__review')!;
+    staleReview.open = true;
+    staleReview.dispatchEvent(new Event('toggle'));
+    await flush();
+    expect(staleReview.open).toBe(false);
+    expect(newClient.getLessonProposal).not.toHaveBeenCalled();
+    staleAccept.dispatchEvent(new Event('click', { bubbles: true }));
+    staleReject.dispatchEvent(new Event('click', { bubbles: true }));
+    expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
+    expect(newClient.markNotificationShown).not.toHaveBeenCalled();
+
     view.render(snapshot({ notifications: [proposalNotice] }));
     release(proposalReview());
     await flush();
     expect(oldClient.decideLessonProposal).not.toHaveBeenCalled();
     expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
-    const band = document.getElementById('board-owner')!;
+    band = document.getElementById('board-owner')!;
     expect(band.querySelector('[role="alert"]')).toBeNull();
     const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
     expect([accept.textContent, accept.disabled]).toEqual(['Accept', false]);
+    expect(newClient.markNotificationShown).toHaveBeenCalled();
+  });
+
+  it('a submitted proposal decision remains locked across a same-client disconnect', async () => {
+    let release!: (result: unknown) => void;
+    const client = proposalClient(() => new Promise((resolve) => { release = resolve; }));
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+
+    view.markSnapshotStale();
+    view.render(snapshot({ notifications: [proposalNotice] }), 'http');
+    const accept = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect([accept.textContent, accept.disabled]).toEqual(['accepting…', true]);
+
+    release({ id: 'prop-1', decision: 'accepted' });
+    await flush();
+    expect(client.wake).toHaveBeenCalled();
+    expect(document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled).toBe(true);
+  });
+
+  it('a re-pair with a submitted proposal decision preserves its choice lock and retries only that choice', async () => {
+    let releaseOld!: (result: unknown) => void;
+    const oldClient = proposalClient(() => new Promise((resolve) => { releaseOld = resolve; }));
+    const newClient = proposalClient();
+    const view = new BoardView(() => {}, oldClient);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(oldClient.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+
+    view.markSnapshotStale();
+    view.bindClient(newClient);
+    view.render(snapshot({ notifications: [proposalNotice] }), 'push');
+    let band = document.getElementById('board-owner')!;
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect([accept.disabled, reject.disabled]).toEqual([false, true]);
+    reject.click();
+    await flush();
+    expect(newClient.decideLessonProposal).not.toHaveBeenCalled();
+
+    accept.click();
+    await flush();
+    expect(newClient.getLessonProposal).toHaveBeenCalledTimes(1);
+    expect(newClient.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(newClient.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+    releaseOld({ id: 'prop-1', decision: 'accepted' });
+    await flush();
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled).toBe(true);
+  });
+
+  it('an ambiguous proposal decision is reconciled by a reload, leaves both choices open when nothing is recorded, and reloads before retry (#277)', async () => {
+    const outcomes: Array<() => Promise<unknown>> = [
+      () => Promise.reject(new Error('connection lost after submission')),
+      () => Promise.resolve({ id: 'prop-1', decision: 'accepted' }),
+    ];
+    const client = proposalClient(() => outcomes.shift()!());
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    // The submit's own load plus the unconfirmed-outcome reconcile read (#277).
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(2);
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
+    expect(client.wake).toHaveBeenCalled();
+
+    view.markSnapshotStale();
+    view.render(snapshot({ notifications: [proposalNotice] }), 'push');
+    let band = document.getElementById('board-owner')!;
+    const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
+    expect([accept.disabled, reject.disabled]).toEqual([false, false]);
+    accept.click();
+    await flush();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(3);
+    expect(client.decideLessonProposal).toHaveBeenNthCalledWith(2, 'prop-1', 'accept');
+    band = document.getElementById('board-owner')!;
+    expect(band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled).toBe(true);
+  });
+
+  it('a same-client reconnect retires a hung proposal fetch and allows a fresh review decision', async () => {
+    let release!: (review: ReturnType<typeof proposalReview>) => void;
+    let staleSignal: AbortSignal | undefined;
+    const client = proposalClient();
+    client.getLessonProposal.mockImplementationOnce((signal?: AbortSignal) => {
+      staleSignal = signal;
+      return new Promise((resolve) => { release = resolve; });
+    });
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [proposalNotice] }));
+    document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
+    await flush();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+
+    view.markSnapshotStale();
+    expect(staleSignal?.aborted).toBe(true);
+    expect(document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.disabled).toBe(true);
+    // The fresh snapshot restores controls and a new review request even
+    // though the abandoned GET is still unresolved.
+    view.render(snapshot({ notifications: [proposalNotice] }), 'http');
+    const accept = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!;
+    expect(accept.disabled).toBe(false);
+    accept.click();
+    await flush();
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(2);
+    expect(client.decideLessonProposal).toHaveBeenCalledWith('prop-1', 'accept');
+
+    // A late completion from before disconnect cannot replace the fresh review
+    // or send a duplicate decision.
+    release(proposalReview());
+    await flush();
+    expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
   });
 
   it('the phone layout keeps the proposal review inside the single column', async () => {
@@ -3214,7 +3610,42 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     const css = readFileSync(file, 'utf8');
     const phone = css.slice(css.indexOf('@media (max-width: 560px) {'));
     const rule = /\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(phone.slice(0, phone.indexOf('\n}\n')))?.[1] ?? '';
-    expect(rule.replace(/\s+/gu, ' ')).toContain("grid-template-areas: 'title' 'meta' 'note' 'review' 'action' 'error';");
+    expect(rule.replace(/\s+/gu, ' ')).toContain(
+      "grid-template-areas: 'title' 'meta' 'context' 'note' 'review' 'action' 'error';",
+    );
+  });
+
+  it('the proposal context has its OWN grid track (never stacked on the meta label) and the pointer control is themed', async () => {
+    const { existsSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const file = [join(process.cwd(), 'src/styles/components.css'), join(process.cwd(), 'web/src/styles/components.css')].find((path) =>
+      existsSync(path),
+    )!;
+    const css = readFileSync(file, 'utf8');
+    const contextRule = /\.board-owner__context,\s*\.board-owner__pointer-text\s*\{([^}]*)\}/u.exec(css)?.[1] ?? '';
+    expect(contextRule.replace(/\s+/gu, ' ')).toContain('grid-area: context;');
+    // EACH desktop template carries the track by name, so the prose can
+    // never share the label's cell (the R1 overlap). A global toContain
+    // would pass while one of the two templates regressed.
+    const compact = (block: string | undefined): string => (block ?? '').replace(/\s+/gu, ' ');
+    const desktopBase = /\.board-owner__row\s*\{([^}]*)\}/u.exec(css)?.[1];
+    const desktopProposal = /\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(css)?.[1];
+    expect(compact(desktopBase)).toContain("'context action'");
+    expect(compact(desktopProposal)).toContain("'context action'");
+    const narrowStart = css.indexOf('@media (max-width: 560px) {');
+    const narrow = css.slice(narrowStart, css.indexOf('\n}\n', narrowStart));
+    expect(compact(/\.board-owner__row\s*\{([^}]*)\}/u.exec(narrow)?.[1])).toContain("'context'");
+    expect(compact(/\.board-owner__row--proposal\s*\{([^}]*)\}/u.exec(narrow)?.[1])).toContain("'context'");
+    // The themed Go-to control follows the narrow alignment group too:
+    // resolve the RULE BODY (not a substring), so the pin fails if the
+    // declaration or the membership goes away (and never on comma order).
+    const narrowGotoRule = /([^{}]*\.board-owner__goto[^{}]*)\{([^}]*)\}/u.exec(narrow);
+    expect(narrowGotoRule?.[1]).toContain('.board-owner__goto');
+    expect(compact(narrowGotoRule?.[2])).toContain('justify-self: start;');
+    // The bell pointer's Go-to control is not the one unstyled button.
+    const gotoRule = /\.board-owner__goto\s*\{([^}]*)\}/u.exec(css)?.[1] ?? '';
+    expect(gotoRule).toContain('grid-area: action;');
+    expect(gotoRule).toContain('border');
   });
 
   it('ready PR row: affected heist + exact-head reason + OPEN PR external link; non-https URLs fail closed', () => {
@@ -3251,22 +3682,85 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(document.getElementById('board-owner')!.querySelectorAll('.board-owner__row')).toHaveLength(9);
   });
 
+  it('a colon-bearing notification id still resolves its card in the focus fallback', () => {
+    const view = new BoardView(() => {});
+    const row = notification('lessons-proposal-withdrawn:abc-123', { routing: 'fyi', detail: 'short notice' });
+    view.render(snapshot({ notifications: [row] }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const button = document.querySelector<HTMLButtonElement>('#notification-list [data-action-id="fyi-seen:lessons-proposal-withdrawn:abc-123"]')!;
+    button.focus();
+    // The control disappears on the next push (acked elsewhere): the
+    // fallback must parse the id through the first ':' after `notif:`,
+    // not a fixed segment index.
+    view.render(snapshot({ notifications: [{ ...row, ackedAt: '2026-01-01T00:05:00.000Z' }] }));
+    const active = document.activeElement as HTMLElement | null;
+    expect(active).not.toBeNull();
+    expect(document.getElementById('notification-list')!.contains(active)).toBe(true);
+  });
+
+  it('recording a decision from the bell keeps focus inside the bell after the option disappears', async () => {
+    const stop = notification('bell-decide', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision(),
+    });
+    const decidedRow = { ...stop, decidedAt: '2026-01-01T00:09:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decidedRow)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [stop], unackedNeedsOwner: 1 }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    document.querySelector<HTMLButtonElement>('#notification-list [data-action-id="notif:bell-decide:option:approve"]')!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')!.textContent).toContain('Decision recorded'),
+    );
+    const active = document.activeElement as HTMLElement | null;
+    expect(active).not.toBeNull();
+    // The vanished option's surface owns the fallback: focus stays in the
+    // bell, never on the band's lookalike card.
+    expect(document.getElementById('notification-list')!.contains(active)).toBe(true);
+    expect(document.getElementById('board-owner')!.contains(active)).toBe(false);
+  });
+
+  it('focus on the open bell copy of a shared decision card survives a re-render (never jumps to the band lookalike)', () => {
+    const view = new BoardView(() => {});
+    const stop = notification('focus-bell', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision(),
+    });
+    view.render(snapshot({ notifications: [stop], unackedNeedsOwner: 1 }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const bellButton = document.querySelector<HTMLButtonElement>('#notification-list [data-action-id="notif:focus-bell:option:approve"]')!;
+    expect(bellButton).not.toBeNull();
+    bellButton.focus();
+    expect(document.activeElement).toBe(bellButton);
+    view.render(snapshot({ notifications: [stop], unackedNeedsOwner: 1 }));
+    const refocused = document.querySelector<HTMLElement>('#notification-list [data-action-id="notif:focus-bell:option:approve"]');
+    expect(document.activeElement).toBe(refocused);
+  });
+
   it('a snapshot re-render preserves focus on the same action and fires no toast', () => {
     const toast = vi.fn();
     const view = new BoardView(() => {});
     view.setToastHandler(toast);
-    const stop = notification('focus-me', { routing: 'needs-owner' });
+    const stop = notification('focus-me', { routing: 'needs-owner', kind: 'gru.owner-escalation', decision: ownerDecision() });
     view.render(snapshot({ notifications: [stop] }));
-    const button = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="owner-ack:focus-me"]')!;
+    const button = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('[data-action-id="notif:focus-me:option:approve"]')!;
     button.focus();
     expect(document.activeElement).toBe(button);
     // A refresh of the SAME data re-renders the band: no new arrival, so
     // no toast — and the focused control keeps its place.
     view.render(snapshot({ notifications: [stop] }));
     expect(toast).not.toHaveBeenCalled();
-    const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="owner-ack:focus-me"]');
+    const refocused = document.getElementById('board-owner')!.querySelector<HTMLElement>('[data-action-id="notif:focus-me:option:approve"]');
     expect(document.activeElement).toBe(refocused);
-    expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('owner-ack:focus-me');
+    expect((document.activeElement as HTMLElement)?.dataset.actionId).toBe('notif:focus-me:option:approve');
   });
 
   it('g10: an owner row already acked on another device arrives with no toast and no web-toast receipt', () => {
@@ -3324,7 +3818,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
 
       const band = document.getElementById('board-owner')!;
       expect(band.querySelector('.board-band__count')?.textContent, status).toBe('2 pending');
-      expect(band.querySelector('[data-action-id="owner-ack:owner-stop"]')).not.toBeNull();
+      expect(band.querySelector('[data-notification-id="owner-stop"]')).not.toBeNull();
+      expect(band.querySelector('.board-notification__guidance')).not.toBeNull();
       expect(band.querySelector('[data-action-id="owner-pr:ready"]')).not.toBeNull();
       const sections = [...document.querySelectorAll('.board-notification-section')];
       const section = (label: string) => sections.find((node) =>
@@ -3364,6 +3859,15 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(client.markNotificationShown).toHaveBeenCalledTimes(1);
     expect(client.markNotificationShown).toHaveBeenCalledWith('show-me', 'web-board');
 
+    // Re-pair renders retained content while stale, but only a fresh snapshot
+    // may prove that the replacement client displayed the notification.
+    const replacement = stubClient();
+    view.bindClient(replacement);
+    expect(replacement.markNotificationShown).not.toHaveBeenCalled();
+    view.render(snapshot({ notifications: [stop] }));
+    expect(replacement.markNotificationShown).toHaveBeenCalledTimes(1);
+    expect(replacement.markNotificationShown).toHaveBeenCalledWith('show-me', 'web-board');
+
     // Hidden ancestor (pre-pairing board) → nothing was displayed.
     const client2 = stubClient();
     document.body.innerHTML = `<div hidden><section id="board-owner"></section></div>
@@ -3371,10 +3875,28 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       <div id="board-jobs"></div><div id="board-agents"></div><section id="board-repos" data-rail-panel="agents"></section><span id="rail-agents-count">0</span>
       <nav id="board-nav" hidden></nav>
       <button id="notification-bell"><span id="notification-badge">0</span></button>
-      <div id="notification-panel"><div id="notification-list"></div></div>`;
+      <div id="notification-panel" hidden><div id="notification-list"></div></div>`;
     const view2 = new BoardView(() => {}, client2);
     view2.render(snapshot({ notifications: [stop] }));
     expect(client2.markNotificationShown).not.toHaveBeenCalled();
+  });
+
+  it('an open stale panel records receipts when a fresh snapshot updates what it displays', () => {
+    const client = stubClient();
+    const stop = notification('panel-show-me', { routing: 'needs-owner' });
+    const view = new BoardView(() => {}, client);
+    document.getElementById('notification-panel')!.hidden = true;
+    view.render(snapshot({ notifications: [stop] }));
+    view.markSnapshotStale();
+
+    // Opening the retained stale panel is not a receipt for the new client truth.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    expect(client.markNotificationShown).not.toHaveBeenCalledWith('panel-show-me', 'web-panel');
+
+    // The panel stays open; rendering the authoritative snapshot displays the
+    // current row and should record it without requiring close/reopen.
+    view.render(snapshot({ notifications: [stop] }), 'http');
+    expect(client.markNotificationShown).toHaveBeenCalledWith('panel-show-me', 'web-panel');
   });
 });
 
@@ -4014,6 +4536,530 @@ describe('board — megaminions nest under their heist', () => {
     const view = new BoardView(() => {});
     view.render(value);
     expect(document.querySelector('#chip-rail [data-kpi="jobs.total"]')?.textContent).toContain('2');
+  });
+});
+
+describe('R1: shared decision submissions, read-only gating and focus', () => {
+  const stop = () =>
+    notification('shared-submit', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision(),
+    });
+
+  it('a live push mid-submit keeps the same phase on both surfaces and refuses duplicates', async () => {
+    let resolveCall!: (row: NotificationView) => void;
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveCall = resolve;
+          }),
+      ),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    const row = stop();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    const bell = document.getElementById('notification-list')!;
+    bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!.click();
+    // A live authoritative push arrives mid-submit: the phase survives on
+    // BOTH surfaces because it lives in BoardView, not in the DOM.
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    const bandButton = document.getElementById('board-owner')!.querySelector<HTMLButtonElement>(
+      '[data-action-id="notif:shared-submit:option:approve"]',
+    )!;
+    const bellButton = bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!;
+    expect(bandButton.textContent).toContain('ecording');
+    expect(bellButton.textContent).toContain('ecording');
+    expect(bandButton.getAttribute('aria-disabled')).toBe('true');
+    expect(bellButton.getAttribute('aria-disabled')).toBe('true');
+    expect(bell.querySelector('.board-notification__submission--submitting')).not.toBeNull();
+    // The other surface cannot start a duplicate action either.
+    bellButton.click();
+    expect(client.decideNotification).toHaveBeenCalledTimes(1);
+    resolveCall({
+      ...row,
+      decidedAt: '2026-01-01T00:10:00.000Z',
+      decidedBy: 'web',
+      decidedOption: 'approve',
+    });
+    await vi.waitFor(() =>
+      expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'),
+    );
+  });
+
+  it.each(['decision_recorded', 'decision_changed', 'not_open', 'unknown_option'] as const)(
+    'a stale %s conflict refreshes shared owner and bell state before choices return',
+    async (code) => {
+      let resolveRefresh!: () => void;
+      const refresh = new Promise<void>((resolve) => {
+        resolveRefresh = resolve;
+      });
+      const client = {
+        ackNotification: vi.fn(() => Promise.resolve()),
+        markNotificationShown: vi.fn(() => Promise.resolve(true)),
+        decideNotification: vi.fn(() =>
+          Promise.reject(new BoardApiError('/decision', code === 'unknown_option' ? 400 : 409, code, 'the decision state changed')),
+        ),
+        refetchSnapshot: vi.fn(() => refresh),
+      } as unknown as import('../lib/board-client.js').BoardClient;
+      const view = new BoardView(() => {}, client);
+      const row = stop();
+      view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+      (document.getElementById('notification-bell') as HTMLButtonElement).click();
+      document
+        .getElementById('notification-list')!
+        .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!
+        .click();
+      await vi.waitFor(() =>
+        expect(document.getElementById('board-owner')!.querySelector('.board-notification__submission--reconciling')).not.toBeNull(),
+      );
+      expect(client.refetchSnapshot).toHaveBeenCalledTimes(1);
+      const band = document.getElementById('board-owner')!;
+      const bell = document.getElementById('notification-list')!;
+      expect(band.querySelector('.board-notification__submission--reconciling')?.textContent).toContain('Refresh');
+      expect(bell.querySelector('.board-notification__submission--reconciling')?.textContent).toContain('Refresh');
+      expect(band.textContent).not.toContain('Not recorded');
+      expect(bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')?.getAttribute('aria-disabled')).toBe('true');
+      band.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!.click();
+      bell.querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!.click();
+      expect(client.decideNotification).toHaveBeenCalledTimes(1);
+
+      const reconciled =
+        code === 'decision_recorded'
+          ? { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'other-view', decidedOption: 'keep' }
+          : code === 'not_open'
+            ? { ...row, resolvedAt: '2026-01-01T00:10:00.000Z', resolvedBy: 'producer' }
+            : {
+                ...row,
+                decision: {
+                  ...row.decision!,
+                  options: [{ id: 'revised', label: 'Revised choice', consequence: 'Use the authoritative choices.' }],
+                },
+              };
+      if (code === 'unknown_option' || code === 'decision_changed') {
+        // A WebSocket push may have been queued before the refusal; it is
+        // not the post-conflict authoritative HTTP refresh we are awaiting.
+        view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: 1 }), 'push');
+        expect(band.querySelector('.board-notification__submission--reconciling')).not.toBeNull();
+      }
+      view.render(snapshot({ notifications: [reconciled], unackedNeedsOwner: code === 'not_open' ? 0 : 1 }), 'http');
+      resolveRefresh();
+      expect(band.querySelector('.board-notification__submission--reconciling')).toBeNull();
+      expect(band.querySelector('[data-action-id="notif:shared-submit:option:approve"]')).toBeNull();
+      if (code === 'unknown_option' || code === 'decision_changed') {
+        expect(band.querySelector('[data-action-id="notif:shared-submit:option:revised"]')).not.toBeNull();
+        expect(band.textContent).toContain('Revised choice');
+      }
+    },
+  );
+
+  it('reconciles A→B→A option changes through the real server and BoardClient on both owner surfaces', async () => {
+    const server = await startBoardServerHarness();
+    const nativeFetch: typeof fetch = (input, init) => new Promise((resolve, reject) => {
+      const target = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url, server.url);
+      const request = nodeHttpRequest(target, {
+        method: init?.method ?? 'GET',
+        headers: init?.headers as Record<string, string> | undefined,
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: response.statusCode ?? 500 })));
+      });
+      request.on('error', reject);
+      if (init?.signal?.aborted) request.destroy(new Error('request aborted'));
+      init?.signal?.addEventListener('abort', () => request.destroy(new Error('request aborted')), { once: true });
+      if (typeof init?.body === 'string') request.write(init.body);
+      request.end();
+    });
+    const notificationId = 'joined-stale-options';
+    const optionA = { id: 'alpha', label: 'Keep Alpha', consequence: 'Leave the current plan in place.' };
+    const optionB = { id: 'alpha', label: 'Choose Beta', consequence: 'Use the revised plan.' };
+    const notification = server.notifications.post({
+      id: notificationId,
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'info',
+      title: 'Confirm the plan',
+      detail: 'The discussion options may have changed.',
+      decision: {
+        question: 'Which plan should continue?',
+        context: 'The discussion is being converted into a recordable choice.',
+        recommendation: 'Review the current choices.',
+        reservedClass: 'scope-design',
+        whyNotDelegable: 'Only the owner may select the plan.',
+        options: [],
+        discussion: true,
+      },
+    });
+    let refreshPausedObserved = false;
+    let refreshIsPaused!: () => void;
+    const refreshPaused = new Promise<void>((resolve) => { refreshIsPaused = resolve; });
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    let pauseNextBoardRead = false;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const path = typeof input === 'string' ? input : input instanceof URL ? input.pathname : input.url;
+      if (pauseNextBoardRead && path === '/api/board') {
+        pauseNextBoardRead = false;
+        refreshPausedObserved = true;
+        refreshIsPaused();
+        await refreshGate;
+      }
+      return nativeFetch(new URL(path, server.url), init);
+    };
+    const view = new BoardView(() => {});
+    const client = new BoardClient(
+      { token: server.token, host: '127.0.0.1', fetchImpl },
+      {
+        connection: () => {},
+        snapshot: (current, source) => view.render(current, source),
+        fatal: (message) => { throw new Error(message); },
+      },
+    );
+    view.bindClient(client);
+
+    const attachOptions = async (
+      options: readonly { readonly id: string; readonly label: string; readonly consequence: string }[],
+    ): Promise<void> => {
+      const response = await nativeFetch(
+        new URL(`/api/notifications/${notification.id}/decision-options`, server.url),
+        {
+          method: 'POST',
+          headers: { authorization: `Bearer ${server.token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ options, by: 'gru' }),
+        },
+      );
+      expect(response.status).toBe(200);
+    };
+
+    try {
+      await attachOptions([optionA]);
+      await client.refetchSnapshot();
+      const band = document.getElementById('board-owner')!;
+      const bell = document.getElementById('notification-bell') as HTMLButtonElement;
+      const panel = document.getElementById('notification-list')!;
+      const action = `[data-action-id="notif:${notification.id}:option:alpha"]`;
+      expect(band.querySelector(action)?.textContent).toBe('Keep Alpha');
+      bell.click();
+      expect(panel.querySelector(action)?.textContent).toBe('Keep Alpha');
+      await vi.waitFor(() => expect(server.api.getNotification(notificationId)?.shownAt).not.toBeNull());
+
+      // The client still holds option id alpha with label A while the
+      // authoritative server reuses alpha for B. The stale submission must
+      // be refused, and its post-refusal GET is paused so the server can
+      // return to A before that snapshot is served.
+      await attachOptions([optionB]);
+      pauseNextBoardRead = true;
+      band.querySelector<HTMLButtonElement>(action)!.click();
+      await vi.waitFor(() => expect(refreshPausedObserved).toBe(true));
+      await refreshPaused;
+      expect(server.api.getNotification(notificationId)).toMatchObject({
+        decidedAt: null,
+        decision: { options: [{ id: 'alpha', label: 'Choose Beta', consequence: 'Use the revised plan.' }] },
+      });
+      expect(band.querySelector('.board-notification__submission--reconciling')).not.toBeNull();
+      expect(panel.querySelector('.board-notification__submission--reconciling')).not.toBeNull();
+      expect(band.querySelector<HTMLButtonElement>(action)?.getAttribute('aria-disabled')).toBe('true');
+      expect(panel.querySelector<HTMLButtonElement>(action)?.getAttribute('aria-disabled')).toBe('true');
+
+      await attachOptions([optionA]);
+      releaseRefresh();
+      await vi.waitFor(() => {
+        expect(band.querySelector('.board-notification__submission--reconciling')).toBeNull();
+        expect(panel.querySelector('.board-notification__submission--reconciling')).toBeNull();
+      });
+      for (const surface of [band, panel]) {
+        expect(surface.querySelector(action)?.textContent).toBe('Keep Alpha');
+        expect(surface.querySelector('[data-action-id*="option:beta"]')).toBeNull();
+        expect(surface.querySelector<HTMLButtonElement>(action)?.disabled).toBe(false);
+      }
+    } finally {
+      releaseRefresh();
+      client.stop();
+      await server.close();
+    }
+  });
+
+  it('a re-pair keeps prior decision controls read-only until the new client snapshot arrives', async () => {
+    mountBoardDom();
+    const row = notification('shared-decision-id', { routing: 'needs-owner', decision: ownerDecision() });
+    const decided = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const replacement = notification('shared-decision-id', {
+      routing: 'needs-owner',
+      decision: ownerDecision({
+        question: 'Approve the replacement route?',
+        options: [{ id: 'approve', label: 'Approve the replacement route', consequence: 'Gru prepares only this route.' }],
+      }),
+    });
+    const replacementDecided = {
+      ...replacement,
+      decidedAt: '2026-01-01T00:11:00.000Z',
+      decidedBy: 'web',
+      decidedOption: 'approve',
+    };
+    const oldClient = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decided)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const newClient = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(replacementDecided)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {});
+    view.bindClient(oldClient);
+    view.render(snapshot({ notifications: [row] }));
+    const staleChoice = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-decision-id:option:approve"]')!;
+    staleChoice.click();
+    await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+    expect(oldClient.decideNotification).toHaveBeenCalledTimes(1);
+
+    view.bindClient(newClient);
+    expect(staleChoice.isConnected).toBe(false);
+    expect(document.getElementById('board-owner')!.textContent).toContain('Approve the slim contract?');
+    expect(document.getElementById('board-owner')!.textContent).not.toContain('Decision recorded');
+    expect(
+      document.getElementById('board-owner')!.querySelector('[data-action-id="notif:shared-decision-id:option:approve"]'),
+    ).toBeNull();
+    expect(
+      document.getElementById('notification-list')!.querySelector('[data-action-id="notif:shared-decision-id:option:approve"]'),
+    ).toBeNull();
+    staleChoice.click();
+    expect(oldClient.decideNotification).toHaveBeenCalledTimes(1); // detached button issued no second POST through its former client
+    expect(newClient.decideNotification).not.toHaveBeenCalled();
+
+    view.render(snapshot({ notifications: [replacement] }));
+    const currentChoice = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-decision-id:option:approve"]');
+    expect(currentChoice?.textContent).toBe('Approve the replacement route');
+    expect(currentChoice?.disabled).toBe(false);
+    expect(
+      document.getElementById('notification-list')!.querySelector<HTMLButtonElement>(
+        '[data-action-id="notif:shared-decision-id:option:approve"]',
+      )?.textContent,
+    ).toBe('Approve the replacement route');
+    currentChoice?.click();
+    expect(newClient.decideNotification).toHaveBeenCalledWith('shared-decision-id', 'approve', replacement.decision);
+  });
+
+  it('a re-pair drops in-flight work begun for the old client (late replies change nothing)', async () => {
+    let rejectCall!: (error: Error) => void;
+    const oldClient = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectCall = reject;
+          }),
+      ),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, oldClient);
+    const row = stop();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:shared-submit:option:approve"]')!
+      .click();
+    view.bindClient({
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(row)),
+    } as unknown as import('../lib/board-client.js').BoardClient);
+    rejectCall(new Error('late failure from the old client'));
+    await Promise.resolve();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    // No stale phase and no stale refusal text from the retired client.
+    expect(document.querySelector('.board-notification__submission')).toBeNull();
+    expect(document.getElementById('board-owner')!.textContent).not.toContain('Not recorded');
+  });
+
+  it('machine rows and closed receipts keep typed options read-only — no fake controls', () => {
+    const view = new BoardView(() => {});
+    view.render(
+      snapshot({
+        notifications: [
+          notification('machine-typed', { routing: 'action-required', kind: 'supervision.breaker', decision: ownerDecision() }),
+          notification('closed-typed', {
+            routing: 'needs-owner',
+            kind: 'gru.owner-escalation',
+            decision: ownerDecision(),
+            resolvedAt: '2026-01-01T00:05:00.000Z',
+            resolvedBy: 'gru',
+          }),
+        ],
+      }),
+    );
+    const bell = document.getElementById('notification-list')!;
+    // The machine card renders in NEEDS GRU and the resolved owner row in
+    // FEED — neither may offer a decision button its API refuses.
+    const machineCard = bell.querySelector<HTMLElement>('[data-notification-id="machine-typed"]')!;
+    const closedCard = bell.querySelector<HTMLElement>('[data-notification-id="closed-typed"]')!;
+    expect(machineCard.querySelectorAll('[data-action-id]')).toHaveLength(0);
+    expect(closedCard.querySelectorAll('[data-action-id]')).toHaveLength(0);
+    // The options stay visible as information (read-only list).
+    expect(machineCard.querySelector('.board-notification__options--readonly')).not.toBeNull();
+    expect(closedCard.querySelector('.board-notification__options--readonly')).not.toBeNull();
+  });
+
+  it('a local re-render is not mistaken for incoming confirmation: the override dies only on a raw decided snapshot', async () => {
+    const row = notification('override-race', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      decision: ownerDecision(),
+    });
+    const decidedRow = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decidedRow)),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    view.render(snapshot({ notifications: [row] }));
+    document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:override-race:option:approve"]')!
+      .click();
+    await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+    // Local re-renders (proposal state, receipt pages) must NOT count as
+    // the server confirming: the override stays until a RAW snapshot
+    // carries the recorded state.
+    const localRerender = (view as unknown as { rerenderNotifications(): void }).rerenderNotifications.bind(view);
+    localRerender();
+    localRerender();
+    // A delayed STALE snapshot arrives (undecided): the recorded state and
+    // the hidden options must hold.
+    view.render(snapshot({ notifications: [row] }));
+    expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded');
+    expect(
+      document.getElementById('board-owner')!.querySelector('[data-action-id="notif:override-race:option:approve"]'),
+    ).toBeNull();
+    // Only an authoritative snapshot that carries the recorded state
+    // retires the override.
+    view.render(snapshot({ notifications: [decidedRow] }));
+    expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded');
+  });
+
+  it('focus falls back to the card when the discuss control is replaced by attached options', () => {
+    const discussion = notification('discuss-focus', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision({ options: [], discussion: true }),
+    });
+    const bridged = { ...discussion, decision: ownerDecision() };
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [discussion] }));
+    const button = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('.board-notification__discuss-open')!;
+    button.focus();
+    // Gru attached agreed options through the bridge: the push replaces the
+    // chat action with the real options, and focus stays inside the item.
+    view.render(snapshot({ notifications: [bridged] }));
+    const active = document.activeElement as HTMLElement;
+    expect(document.getElementById('board-owner')!.contains(active)).toBe(true);
+    expect(
+      document.getElementById('board-owner')!.querySelector('[data-action-id="notif:discuss-focus:option:approve"]'),
+    ).not.toBeNull();
+  });
+
+  it('focus falls back to the full notification id when its option marker is part of the id', () => {
+    const id = 'notice:option:embedded';
+    const row = notification(id, { routing: 'needs-owner', decision: ownerDecision() });
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [row] }));
+    const option = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:notice:option:embedded:option:approve"]')!;
+    option.focus();
+    view.render(
+      snapshot({
+        notifications: [
+          { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' },
+        ],
+      }),
+    );
+    expect((document.activeElement as HTMLElement).dataset.notificationId).toBe(id);
+  });
+
+  it('the receipts pager keeps the effective view: a recorded decision stays recorded', async () => {
+    const row = notification('pager-decide', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      decision: ownerDecision(),
+    });
+    const decidedRow = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const client = {
+      ackNotification: vi.fn(() => Promise.resolve()),
+      markNotificationShown: vi.fn(() => Promise.resolve(true)),
+      decideNotification: vi.fn(() => Promise.resolve(decidedRow)),
+      fetchReceipts: vi.fn(() => Promise.resolve({ receipts: [notification('older-pager')], nextOffset: 1, hasMore: false })),
+    } as unknown as import('../lib/board-client.js').BoardClient;
+    const view = new BoardView(() => {}, client);
+    view.bindClient(client);
+    view.render(
+      snapshot({
+        jobs: [baseJob({ id: 'pager-lane', status: 'merged', rounds: [] })],
+        agents: [agent('minion-pager-lane', { role: 'minion', jobId: 'pager-lane' })],
+        notifications: [row, notification('pager-receipt', { agentId: 'minion-pager-lane' })],
+      }),
+    );
+    document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:pager-decide:option:approve"]')!
+      .click();
+    await vi.waitFor(() => expect(document.getElementById('board-owner')!.textContent).toContain('Decision recorded'));
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    document.querySelector<HTMLButtonElement>('.board-notification__more')!.click();
+    await vi.waitFor(() =>
+      expect(document.getElementById('notification-list')!.textContent).toContain('Notice older-pager'),
+    );
+    // The pagination re-render derived the effective view: the override
+    // survives and no live option buttons resurrect on the bell copy.
+    const bellCard = document.querySelector('#notification-list [data-notification-id="pager-decide"]')!;
+    expect(bellCard.textContent).toContain('Decision recorded');
+    expect(bellCard.querySelector('[data-action-id="notif:pager-decide:option:approve"]')).toBeNull();
+  });
+
+  it('focus lands on the card when a push removes the recorded option (band and bell)', async () => {
+    const row = notification('focus-removed', {
+      routing: 'needs-owner',
+      kind: 'gru.owner-escalation',
+      detail: 'evidence',
+      decision: ownerDecision(),
+    });
+    const decidedRow = { ...row, decidedAt: '2026-01-01T00:10:00.000Z', decidedBy: 'web', decidedOption: 'approve' };
+    const view = new BoardView(() => {});
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    // Band: focus the option, then a push reports the decision was recorded.
+    const bandOption = document
+      .getElementById('board-owner')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:focus-removed:option:approve"]')!;
+    bandOption.focus();
+    view.render(snapshot({ notifications: [decidedRow], unackedNeedsOwner: 1 }));
+    const bandActive = document.activeElement as HTMLElement;
+    expect(document.getElementById('board-owner')!.contains(bandActive)).toBe(true);
+    // Bell: same guarantee, and never the band's lookalike.
+    (document.getElementById('notification-bell') as HTMLButtonElement).click();
+    view.render(snapshot({ notifications: [row], unackedNeedsOwner: 1 }));
+    const bellOption = document
+      .getElementById('notification-list')!
+      .querySelector<HTMLButtonElement>('[data-action-id="notif:focus-removed:option:approve"]')!;
+    bellOption.focus();
+    view.render(snapshot({ notifications: [decidedRow], unackedNeedsOwner: 1 }));
+    const bellActive = document.activeElement as HTMLElement;
+    expect(document.getElementById('notification-list')!.contains(bellActive)).toBe(true);
+    expect(document.getElementById('board-owner')!.contains(bellActive)).toBe(false);
   });
 });
 

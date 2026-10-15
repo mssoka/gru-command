@@ -249,6 +249,10 @@ export interface WorktreeManagerOptions {
     readonly worktree: WorktreeRecord;
     readonly processes: readonly TreeProcess[];
   }) => void;
+  /** Positive evidence that a lane tree is gone and its row is swept:
+   * producer-side resolution for any pause notice about that worktree
+   * (owner release 2026-10-11) — the condition ended, so the notice does. */
+  readonly onSwept?: (input: { readonly worktree: WorktreeRecord }) => void;
   readonly enumerateProcesses?: ProcessEnumerator;
   readonly log?: Log;
 }
@@ -976,7 +980,18 @@ export class WorktreeManager {
       // job branch when a dispose-then-flip window crashed between the
       // two, or when an older build flipped first. Verify-and-dispose on
       // every swept retry — never early-return 'none' over debris.
+      // A GONE tree is positive evidence the worktree is swept: re-fire the
+      // producer-resolution hook so a pause notice whose first resolution
+      // was lost (crash between the flip and the hook) still settles.
+      const treeGone = !existsSync(row.path);
       if (!existsSync(row.repoPath)) {
+        if (treeGone) {
+          try {
+            this.opts.onSwept?.({ worktree: row });
+          } catch (error) {
+            this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
+          }
+        }
         return {
           status: 'swept',
           preserved: null,
@@ -1000,6 +1015,13 @@ export class WorktreeManager {
             const remote = this.safeFreshRemoteBranch(row.repoPath);
             assertLaneResourcesAbsent(row);
             branchOutcome = this.disposeLaneBranch(row, input.baseBranch, remote);
+          }
+        }
+        if (treeGone) {
+          try {
+            this.opts.onSwept?.({ worktree: row });
+          } catch (error) {
+            this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
           }
         }
         const freshHead = this.safeFreshHead(row.repoPath);
@@ -1866,6 +1888,12 @@ export class WorktreeManager {
     }
     this.recordSweepEvent(row, preserved, branchOutcome, freshHead);
     this.log('info', 'worktree swept', { id: row.id, branch: branchOutcome, freshHead });
+    try {
+      this.opts.onSwept?.({ worktree: row });
+    } catch (error) {
+      // The sweep already completed; a notification hiccup must not undo it.
+      this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
+    }
     return { status: 'swept', preserved, branch: branchOutcome, freshHead };
   }
 
@@ -1908,6 +1936,11 @@ export class WorktreeManager {
         id: row.id,
         error: String(error),
       });
+    }
+    try {
+      this.opts.onSwept?.({ worktree: row });
+    } catch (error) {
+      this.log('warn', 'sweep-completion notice resolution failed', { id: row.id, error: String(error) });
     }
     return { branch: branchOutcome, freshHead };
   }

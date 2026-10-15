@@ -32,7 +32,7 @@ this lane; remote default verified `main`).
 | Config | `src/config.ts` (`SilasConfig`/`DEFAULT_SILAS_CONFIG` pattern, `GruCommandConfig`), `src/config-reference.ts`, `docs/CONFIG.md` | New `[provider_recovery]` section follows the SilasConfig pattern (enabled, cadence, budgets); reference/docs updated in the same change. |
 | Board/job surfaces | `src/board/engine.ts`, `src/dispatch/silas-driver.ts` digest rows | Concise wait fields ride existing job rows/attention feed; no board redesign. |
 | Restart-safe recovery precedent | `src/dispatch/rebrief-recovery.ts` | Durable marker + guarded event + boot reconciliation + `activeClaims` single-flight; escalation pattern for failed recovery. The sensor's pending-delivery/claim follows this shape. |
-| Notification center | `src/notifications/center.ts`, ledger notifications API | `postIncident(dedupe:'unacked'|'active'|'all')`; `isOwnerHeldNotificationKind` pins `supervision.provider-wall.*` owner-held; `disposeMachineNotification` rejects non-action-required. Confirms: no ack spoofing path exists; recovery uses its own transition. |
+| Notification center | `src/notifications/center.ts`, ledger notifications API | `postIncident(dedupe:'unacked'|'active'|'all')`; the owner-attention registry (`src/notifications/attention.ts`) classifies `supervision.provider-wall.*` as machine attention (action-required); `disposeMachineNotification` rejects non-action-required and a decided owner row resolves via `resolveOwnerDecision`. Confirms: no ack spoofing path exists; recovery uses its own transition. |
 
 ## Shared-hook integration map (before touching supervisor/registry/main/config seams)
 
