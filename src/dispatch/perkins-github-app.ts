@@ -543,6 +543,15 @@ function usableProviderReviewId(id: unknown): string | null {
   return null;
 }
 
+/** The author check every delivery predicate applies: our App bot's login
+ * on a `Bot` account. One definition, so the decidability guard and the
+ * predicates can never drift apart (#390). */
+function isOurBotAuthor(user: unknown, botLogin: string): boolean {
+  if (user === null || typeof user !== 'object') return false;
+  const author = user as { readonly login?: unknown; readonly type?: unknown };
+  return author.login === botLogin && author.type === 'Bot';
+}
+
 /** The delivery predicate without the provider-id requirement: author
  * login+type, the ENACTED state this delivery intended, frozen head, and
  * byte-identical body. With a
@@ -555,7 +564,7 @@ function usableProviderReviewId(id: unknown): string | null {
  * intent) is never a match. A null `wantedState` matches ANY enacted state
  * — the wrong-state evidence test below, never a credit predicate. */
 function matchesDeliveryPredicates(review: ProviderReview, botLogin: string, targetSha: string, body: string, wantedState: string | null, notBeforeMs: number | null): boolean {
-  if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
+  if (!isOurBotAuthor(review.user, botLogin)) return false;
   if ((wantedState !== null && review.state !== wantedState) || review.commit_id !== targetSha || review.body !== body) return false;
   if (notBeforeMs === null) return true;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
@@ -598,7 +607,7 @@ function isMatchingAppReviewWithUnusableId(review: ProviderReview, botLogin: str
  * POST did not land. A PENDING draft is undelivered and is skipped. */
 function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogin: string, targetSha: string, body: string, notBeforeMs: number | null): boolean {
   if (notBeforeMs === null) return false;
-  if (review.user?.login !== botLogin || review.user?.type !== 'Bot') return false;
+  if (!isOurBotAuthor(review.user, botLogin)) return false;
   if (review.state === 'PENDING' || review.commit_id !== targetSha || review.body !== body) return false;
   const submittedAt = typeof review.submitted_at === 'string' ? Date.parse(review.submitted_at) : Number.NaN;
   return !Number.isFinite(submittedAt);
@@ -619,8 +628,17 @@ function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogi
  * keeps its documented three-way shape (string when serialized, null or
  * absent otherwise): an unprovable time on OUR publication is held by the
  * recency rules on its own, and an unrelated review's absent time is not a
- * delivery predicate. */
-function isDecidableReviewEntry(entry: unknown, windowed: boolean): entry is ProviderReview {
+ * delivery predicate.
+ *
+ * An explicit provider `null` in state/commit_id/body is a typed non-value
+ * (GitHub nulls a review's commit_id once its commit is garbage-collected):
+ * it can never satisfy a delivery predicate, so on a review whose author
+ * fails the predicates' own author check (login AND `Bot` type) it is a
+ * decidable non-match and an unrelated review cannot hold the walk
+ * unresolved forever (#390, main's #182 rule). On a review that passes the
+ * author check it may be this publication with a nulled field, so it stays
+ * undecidable. */
+function isDecidableReviewEntry(entry: unknown, windowed: boolean, botLogin: string): entry is ProviderReview {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
   const record = entry as Record<string, unknown>;
   const id = record['id'];
@@ -642,8 +660,12 @@ function isDecidableReviewEntry(entry: unknown, windowed: boolean): entry is Pro
       if (typeof author[field] !== 'string') return false;
     }
   }
+  const mayBeOurs = isOurBotAuthor(user, botLogin);
   for (const field of ['state', 'commit_id', 'body'] as const) {
-    if (typeof record[field] !== 'string') return false;
+    const value = record[field];
+    if (typeof value === 'string') continue;
+    if (value === null && !mayBeOurs) continue;
+    return false;
   }
   // submitted_at is a delivery predicate only under a recency bound (the
   // ambiguous-POST window); the unbounded recovery seam never reads it.
@@ -1419,7 +1441,7 @@ export class PerkinsAppPrPoster implements VerdictPoster {
       // the predicates re-check every field they read.
       const records = list.filter((entry): entry is ProviderReview => entry !== null && typeof entry === 'object' && !Array.isArray(entry));
       const match = records.find((review) => isMatchingAppReview(review, botLogin, targetSha, body, wantedState, notBeforeMs));
-      if (match === undefined && list.some((entry) => !isDecidableReviewEntry(entry, notBeforeMs !== null))) {
+      if (match === undefined && list.some((entry) => !isDecidableReviewEntry(entry, notBeforeMs !== null, botLogin))) {
         // No provable match, and a null, primitive, array-valued or
         // otherwise undecidable entry is a broken list, not absence: a
         // lookup we cannot trust must never become a certificate.
