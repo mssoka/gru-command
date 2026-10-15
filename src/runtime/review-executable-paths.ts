@@ -2745,6 +2745,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/wizard/answers.js",
   "dist/wizard/main.js",
   "dist/wizard/repository-setup.js",
+  "dist/wizard/runtime-cli.js",
   "dist/wizard/steps.js",
   "dist/workflows/manifest.js",
   "dist/workflows/runtime.js",

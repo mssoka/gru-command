@@ -2,7 +2,7 @@
 
 A standalone, installable multi-agent orchestrator. One Node.js service
 hosts every agent as a headless session behind a pluggable runtime
-adapter (`pi` or Claude Code), with a web front-end for chat with the
+adapter (Claude Code, the default for new installs, or `pi`), with a web front-end for chat with the
 single Gru, the live heist board, and per-agent transcripts. The browser
 is the only required window.
 
@@ -51,7 +51,7 @@ waves), and OS service install — see [docs/EPICS.md](docs/EPICS.md).
   deduplicated bible with provenance; briefings and directives carry
   pointer lines only, and agents read the pointed section on demand
   ([LESSONS.md](docs/LESSONS.md)).
-- **Pluggable runtimes** — `pi` (reference) and Claude Code adapters;
+- **Pluggable runtimes** — Claude Code (default for new installs) and `pi` adapters;
   models/thinking default to each runtime's own configuration
   ([RUNTIMES.md](docs/RUNTIMES.md)).
 - **Robustness** — durable sessions with resume, restart ladders,
@@ -137,7 +137,7 @@ See [the prerequisite decision](docs/decisions/gh-168-darwin-python-review-enume
 That single invocation clones to `~/gru-command`, installs dependencies,
 builds the service and web UI, and runs the setup wizard through
 `/dev/tty` even though the script itself is piped. The wizard detects
-`pi`/Claude Code, selects real repository directories for setup validation
+Claude Code/`pi` (new installs default to Claude Code; pick `pi` explicitly if you use it), selects real repository directories for setup validation
 (not a management whitelist; the board discovers workspace repos live), writes the complete commented
 live config at `~/.gru-command/config.toml`, smoke-tests first boot, and
 can register/start the owned OS service. A truly headless environment
@@ -211,7 +211,7 @@ that exact package, not recreating the worker/worktree/PR. Perkins (GitHub/GitLa
 remains the exact-head native release gate, and the owner performs every final PR
 merge.
 
-You need the selected runtime CLI (`pi` or `claude`) for agents. Only retained
+You need the selected runtime CLI (`claude` by default, or `pi`) for agents. Setup fails loud, naming the missing CLI and how to select the other runtime, instead of silently falling back. Existing installs keep the runtime their `config.toml` already says; only newly generated configs default to Claude Code. Only retained
 historical BMAD rendering uses `uv`; current setup and owned GC execution do not.
 Installing, breaking or removing independent BMAD does not affect GC setup or
 workflow selection. [docs/BMAD-RUNTIME.md](docs/BMAD-RUNTIME.md) covers:
