@@ -137,12 +137,15 @@ See [the prerequisite decision](docs/decisions/gh-168-darwin-python-review-enume
 That single invocation clones to `~/gru-command`, installs dependencies,
 builds the service and web UI, and runs the setup wizard through
 `/dev/tty` even though the script itself is piped. The wizard detects
-Claude Code/`pi` (new installs default to Claude Code; pick `pi` explicitly if you use it), selects real repository directories for setup validation
-(not a management whitelist; the board discovers workspace repos live), writes the complete commented
-live config at `~/.gru-command/config.toml`, smoke-tests first boot, and
-can register/start the owned OS service. A truly headless environment
-fails immediately with the exact `--no-interact` command instead of
-hanging.
+Claude Code/`pi` (new installs default to Claude Code; pick `pi` explicitly if you use it), offers Git repositories under the configured
+`workspace_root`, and persists the exact selected subset as `managed_repos`
+in `~/.gru-command/config.toml`. The root may contain unselected sibling
+projects; only configured names appear in the GitHub overview. An older
+config without the list manages none until the owner edits the explicit
+names and restarts the service ([CONFIG.md](docs/CONFIG.md)). The wizard
+smoke-tests first boot and can register/start the owned OS service. A truly
+headless environment fails immediately with the exact `--no-interact`
+command instead of hanging.
 
 Or clone it yourself and run the wizard in one go:
 

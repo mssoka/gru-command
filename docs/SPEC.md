@@ -28,7 +28,10 @@ integrated. Other users can install it on their laptops from GitHub.
    10min → stop + escalate); /health exposes 3-signal liveness and an
    identity fingerprint.
 6. **Workspace root is config, default `~/code`.** Never hardcoded; the
-   setup wizard asks. Holds ONLY the user's managed repos/projects.
+   setup wizard asks. It may be a shared project directory containing
+   unrelated repositories. Root-level `managed_repos` stores the explicit
+   direct-child subset; missing/empty means none, and runtime never enrolls
+   siblings discovered later.
 7. **Instance state lives in `~/.gru-command/`** — config, ledger DB,
    session files, notification log. NEVER inside the workspace root.
 8. **Repo hygiene:** the shared product repo ships orchestration only —
@@ -91,7 +94,8 @@ integrated. Other users can install it on their laptops from GitHub.
     project skills (`.agents/skills`) and BMAD project state (`_bmad`:
     settings in `_bmad/custom/`, a self-ignoring `_bmad/render/`) plus its
     generated work (`_bmad-output/`); the workspace root carries neither
-    (it holds managed repos only — rulings 6/8). The BMAD *framework* is
+    as a product-wide requirement (ruling 6 permits unrelated projects;
+    only `managed_repos` controls management). The BMAD *framework* is
     not per-project (amended by issue #283): Gru Command ships a pinned
     GC-managed BMAD runtime (`resources/bmad-runtime/`, upstream files
     unchanged plus a small GC customization layer) and the setup wizard

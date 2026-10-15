@@ -17,16 +17,16 @@ The config file is always `<instance dir>/config.toml`.
 
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
 the supported installation path. It reads prompts from `/dev/tty`, so a
-`curl | bash` install remains one invocation, probes runtime CLIs, defaults new installs to Claude Code (`pi` stays selectable; a missing CLI for the chosen runtime stops setup with the fix, never a silent fallback; an existing config keeps its runtime), asks
-which real repository directories to validate during setup, checks Git roots and GC worktree setup without provisioning
-or inspecting independent BMAD ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same
-**complete teaching config** as the generator below. Every concrete
-default is active; optional role/runtime overrides are shown commented
-because activating a placeholder would change precedence. The selection is not
-a management whitelist: the board discovers workspace Git entries live. Interactive
-setup excludes linked repo entries from validation defaults, without changing their
-links or the board's discovery behavior; explicit headless selection of a linked
-repo still fails before writes.
+`curl | bash` install remains one invocation, probes runtime CLIs, defaults new installs to Claude Code (`pi` stays selectable; a missing CLI for the chosen runtime stops setup with the fix, never a silent fallback; an existing config keeps its runtime), offers
+real Git repository directories as candidates, validates selected Git roots
+and GC worktree setup without provisioning or inspecting independent BMAD
+([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same **complete
+teaching config** as the generator below. The exact selection is persisted
+as root-level `managed_repos`; discovery does not enroll unselected siblings.
+Every concrete default is active; optional role/runtime overrides are shown
+commented because activating a placeholder would change precedence. Interactive
+setup excludes linked repo entries from choices; explicit headless selection
+of a linked repo still fails before writes.
 
 True headless use is explicit: `--no-interact` accepts documented
 defaults, and optional `--answers '<json>'` may contain only non-secret
@@ -58,6 +58,30 @@ also instance state: it is read from `perkins/` under the instance dir
 a fallback for relocated deployments — see
 [PERKINS-APP-PUBLICATION.md](./PERKINS-APP-PUBLICATION.md).
 
+## Managed repositories
+
+`workspace_root` is a shared project directory and may contain unrelated
+repositories. `managed_repos` is the explicit subset Gru Command treats as
+managed (including GitHub overview membership and intake root validation);
+names are exact direct-child directory names relative to `workspace_root`,
+for example:
+
+```toml
+workspace_root = "~/code"
+managed_repos = ["project-a", "project-c"]
+```
+
+A missing `managed_repos` field in an older config and an explicit empty list
+both mean **no managed repositories**. Discovery only supplies installer
+choices; new siblings are never enrolled automatically. To configure an
+existing installation, choose the intended names yourself, edit the live
+`<instance>/config.toml` list without changing unrelated settings, save it,
+and restart Gru Command through the normal service lifecycle. No selection is
+inferred or written for you, and there is no hot reload. A selected but
+unavailable directory stays selected and is shown as unavailable rather than
+being replaced by another workspace child. Existing jobs and history are not
+removed when the overview list changes.
+
 ## Load & validation behavior
 
 - **No config file** → the service boots on the documented defaults below.
@@ -69,7 +93,7 @@ a fallback for relocated deployments — see
 - `~` and `~/…` expand to the user's home directory in path fields.
 - All path fields must resolve to absolute paths after expansion.
 - **`data_dir` must not live inside `workspace_root`** (and must not equal
-  it) — instance state stays out of the managed-repos tree (SPEC ruling 7).
+  it) — instance state stays out of the shared workspace tree (SPEC ruling 7).
 - Model policy: `[models].default` and `[thinking].default` may be empty
   or `"default"` (both mean "the runtime harness's own" — SPEC ruling
   16); any `[models.roles]` / `[thinking.roles]` override must be a
@@ -92,8 +116,11 @@ example line activates that override.
 # and a one-line purpose comment. Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # Edit values in place, then restart only your Gru Command service.
 
-# Root: the directory containing only managed project repositories.
+# Shared project directory; it may also contain repositories Gru Command does not manage.
 workspace_root = "~/code"
+# Explicit project directory names relative to workspace_root; only these are managed.
+# An empty list manages none. Add names here deliberately, then restart the service.
+managed_repos = ["project-a", "project-c"]
 # Root: per-instance state. ~-anchored so a restored config re-anchors to
 # the NEW machine's home — an absolute machine-specific path would
 # redirect all state to the old machine on restore. Explicit
@@ -456,6 +483,9 @@ example.
 | Unknown top-level key | `unknown top-level key \`x\` (valid keys: …)` |
 | Unknown key in a table | `unknown key \`x\` in [server] (valid keys: …)` |
 | Wrong type | `workspace_root must be a string, got number` |
+| Wrong managed list type | `managed_repos must be an array of repository names` |
+| Invalid managed name | `managed_repos[0] must be a plain directory name under workspace_root` |
+| Duplicate managed name | `managed_repos must not contain duplicate repository names` |
 | Empty required string | `auth.token must not be empty` |
 | Unknown runtime id | `unknown runtime \`x\` (valid runtimes: pi, claude-code)` |
 | Unknown role | `unknown role \`x\` (valid roles: gru, silas, minion, perkins, bob)` |
@@ -478,9 +508,11 @@ happens: model references resolve fail-loud, thinking levels validate
 per runtime, and the `"default"` sentinel passes through to the
 harness's own configuration. The chat epic (E4) spawns the single Gru
 session in production: `/ws` authenticates against `[auth].token`, and
-`[server]` host/port bind both the web UI (served from `web/dist` when
-built) and the chat socket. `/health` surfaces a summary
-(`workspace_root`, `data_dir`) plus real liveness. See
+`managed_repos` and `workspace_root` feed the server-side managed GitHub
+overview; an absent/empty list makes no repository provider calls. `[server]`
+host/port bind both the web UI (served from `web/dist` when built) and the
+chat socket. `/health` surfaces a summary (`workspace_root`, `data_dir`) plus
+real liveness. See
 [CHAT.md](./CHAT.md) for the chat protocol and reconnect contract,
 [RUNTIMES.md](./RUNTIMES.md) for the capability matrix, fallback
 semantics, and the session-store contract, and

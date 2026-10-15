@@ -1256,7 +1256,7 @@ describe('byte-correct bounded gh command transport', () => {
       mkdirSync(repoPath, { recursive: true });
       execFileSync('git', ['init', '-q', repoPath]);
       const dataDir = join(root, 'private-home');
-      const service = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }) });
+      const service = new IntakeService({ dataDir, workspaceRoot: join(root, 'workspace'), uploadsDir: join(dataDir, 'uploads'), managedRepos: () => [repoPath], remote: () => ({ host: 'github.com', owner: 'owner', repo: 'demo' }) });
       const request = { repoPath, intakeId: 'intake-296', requestId: 'r1', source: { kind: 'issue' as const, reference: '#296' } };
       const child = childFixture();
       const pending = service.preview(request);

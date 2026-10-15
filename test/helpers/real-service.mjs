@@ -121,6 +121,7 @@ export async function startRealService({
   requireWebDist = true,
   home: existingHome,
   workspace: existingWorkspace,
+  managedRepos = [],
   model = 'anthropic/claude-sonnet-4-5',
   decisionsEnabled = false,
   decisionSurfaceMode,
@@ -157,6 +158,7 @@ export async function startRealService({
     join(home, 'config.toml'),
     [
       `workspace_root = "${workspace}"`,
+      `managed_repos = ${JSON.stringify(managedRepos)}`,
       '[server]',
       'host = "127.0.0.1"',
       `port = ${port}`,

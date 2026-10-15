@@ -6,6 +6,11 @@ command = "npm ci"
 full = "npm test"
 
 typecheck = "npm run typecheck"
+managed-repositories-docs = "npm run build && npm run config:docs"
+managed-repositories-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/config.test.ts test/config-generate.test.ts test/intake.test.ts test/intake-approval.test.ts test/intake-server.test.ts test/github-poll.test.ts test/managed-repositories-runtime.test.ts test/repo-overview.test.ts test/board-engine.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/bmad-onboarding.test.ts test/intake-approval-packaged.test.ts test/workflow-runtime-packaged.test.ts test/wizard.test.ts test/wizard-interactive.test.ts && cd web && ../node_modules/.bin/vitest run src/ui/repo-overview.test.ts"
+managed-repositories-before = 'set -e; base=79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37; headrev=$(git rev-parse HEAD); root="$PWD"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-managed-repositories-before.XXXXXX"); git archive "$base" | tar -x -C "$d"; git show "$headrev":test/config-generate.test.ts > "$d/test/config-generate.test.ts"; ln -s "$root/node_modules" "$d/node_modules"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/config-generate.test.ts -t "config generation persists the explicit selected repository list"'
+managed-repositories-static = "npm run lint && npm run typecheck && npm run build"
+managed-repositories-browser = "npm run e2e"
 # Integration correction: GH-314 decisions never close GH-313 producer-owned custody.
 report-signal-custody = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/board-server.test.ts test/report-handback-mailbox.test.ts test/gru-mailbox.test.ts"
 # GH-270 fixed-main reconciliation: shared arm authority, canonical idleness,

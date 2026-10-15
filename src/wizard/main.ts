@@ -53,6 +53,11 @@ import {
   writeConfigText,
 } from './steps.js';
 import { validateRepositorySetup } from './repository-setup.js';
+import {
+  displayManagedRepoName as displayRepositoryName,
+  managedRepoNameError,
+  resolveManagedRepoPathSync,
+} from '../repos/managed-names.js';
 
 const WIZARD_USAGE =
   'usage: node dist/wizard/main.js [--no-interact] [--answers <json>] [--force]';
@@ -60,6 +65,15 @@ const WIZARD_USAGE =
 function fail(message: string, code = 1): never {
   process.stderr.write(`wizard: ${message}\n`);
   process.exit(code);
+}
+
+function workspaceIdentity(workspaceRoot: string, home: string): string {
+  const absolute = resolve(expandTilde(workspaceRoot, home));
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
 }
 
 /** The repo root = two levels up from dist/wizard/main.js. */
@@ -142,6 +156,7 @@ interface CollectedAnswers {
   readonly answers: WizardAnswers;
   /** The exact JSON handed to parseAnswers — what an interrupted run saves. */
   readonly draftJson: string;
+  readonly reposInherited: boolean;
 }
 
 async function interactiveAnswers(
@@ -182,7 +197,7 @@ async function interactiveAnswers(
     );
     if (reuse.toLowerCase() !== 'n' && reuse.toLowerCase() !== 'no') {
       rl.close();
-      return { answers: parseAnswers(draft), draftJson: draft };
+      return { answers: parseAnswers(draft), draftJson: draft, reposInherited: false };
     }
   }
 
@@ -190,7 +205,7 @@ async function interactiveAnswers(
   for (;;) {
     const answer = await ask(
       rl,
-      `\nWorkspace root (holds ONLY your managed repos) [${workspaceRoot}]: `,
+      `\nWorkspace root (shared project directory; may contain unmanaged projects) [${workspaceRoot}]: `,
     );
     workspaceRoot = answer === '' ? workspaceRoot : answer;
     try {
@@ -203,25 +218,85 @@ async function interactiveAnswers(
 
   const workspaceAbs = workspaceRoot.replace(/^~(?=\/|$)/, homedir());
   const discovered = discoverManagedRepos(workspaceAbs);
-  // The board still discovers linked entries; setup only validates real
-  // repository directories and must not offer defaults it then rejects.
-  const found = discovered.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
-  const linked = discovered.filter((name) => !found.includes(name));
+  // Discovery supplies installer candidates only. Reject names that runtime
+  // management cannot safely represent before offering the default-all choice.
+  const invalidNameCandidates = discovered.flatMap((name) => {
+    const reason = managedRepoNameError(name);
+    return reason === null ? [] : [{ name, reason }];
+  });
+  const validCandidates = discovered.filter((name) => managedRepoNameError(name) === null);
+  // Symlink entries stay excluded, matching repository setup's real-root boundary.
+  const realCandidates = validCandidates.filter((name) => !lstatSync(join(workspaceAbs, name)).isSymbolicLink());
+  const linked = validCandidates.filter((name) => !realCandidates.includes(name));
+  const rootResults = new Map(
+    realCandidates.map((name) => [name, resolveManagedRepoPathSync(workspaceAbs, name)] as const),
+  );
+  const unusableGitRoots = realCandidates.filter((name) => rootResults.get(name)?.kind === 'unavailable');
+  const rootProbeFailures = realCandidates.flatMap((name) => {
+    const result = rootResults.get(name);
+    return result?.kind === 'error' ? [{ name, error: result.error }] : [];
+  });
+  const found = realCandidates.filter((name) => rootResults.get(name)?.kind === 'available');
+  if (invalidNameCandidates.length > 0) {
+    out.write('\nGit repository entries excluded from installer choices because their names are unsupported:\n');
+    for (const { name, reason } of invalidNameCandidates) {
+      out.write(`  ${JSON.stringify(displayRepositoryName(name))}: ${reason}\n`);
+    }
+  }
+  if (unusableGitRoots.length > 0) {
+    out.write('\nGit repository entries excluded from installer choices because their Git roots are unusable:\n');
+    for (const name of unusableGitRoots) {
+      out.write(
+        `  ${JSON.stringify(displayRepositoryName(name))}: .git does not identify this exact usable repository root; ` +
+          'repair Git metadata and rerun setup.\n',
+      );
+    }
+  }
+  if (rootProbeFailures.length > 0) {
+    out.write('\nGit repository entries excluded from installer choices because Git root validation failed:\n');
+    for (const { name, error } of rootProbeFailures) {
+      out.write(
+        `  ${JSON.stringify(displayRepositoryName(name))}: Git root probe failed: ` +
+          `${displayRepositoryName(error)}; verify Git access and metadata, then rerun setup.\n`,
+      );
+    }
+  }
   if (linked.length > 0) {
-    out.write(`\nLinked repo entries excluded from setup validation: ${linked.join(', ')}.\n` +
-      'Use their real directory under the workspace root to validate them; links stay unchanged.\n');
+    out.write(`\nLinked repo entries excluded from installer choices: ${linked.map(displayRepositoryName).join(', ')}.\n` +
+      'Select a real directory under workspace_root; links stay unchanged.\n');
+  }
+  out.write(
+    '\nOnly explicitly selected names are managed; workspace_root may contain unrelated projects.\n' +
+      'An empty/unconfigured managed_repos list means none. Edit config.toml and restart to add names later.\n',
+  );
+
+  const existingSelection = prior === null ? [...found] : [...prior.managedRepos];
+  const missingExisting = existingSelection.filter((name) => !found.includes(name));
+  if (missingExisting.length > 0) {
+    const displayMissingExisting = missingExisting.map(displayRepositoryName).join(', ');
+    out.write(`Configured selections not currently available remain selected on Enter: ${displayMissingExisting}.\n`);
   }
   let repos: string[] = [];
-  if (found.length > 0) {
-    out.write('\nRepos under the workspace root:\n');
-    found.forEach((name, index) => out.write(`  ${index + 1}. ${name}\n`));
+  let reposInherited = false;
+  if (found.length > 0 || existingSelection.length > 0) {
+    out.write('\nGit repository candidates under workspace_root (not auto-enrolled on re-run):\n');
+    found.forEach((name, index) => out.write(`  ${index + 1}. ${displayRepositoryName(name)}\n`));
+    if (found.length === 0) out.write('  (none currently available)\n');
     for (;;) {
+      const defaultLabel = prior === null
+        ? `all ${found.length}`
+        : existingSelection.length > 0 ? existingSelection.map(displayRepositoryName).join(', ') : 'none';
       const answer = await ask(
         rl,
-        `Repos to validate — comma-separated numbers or names [all ${found.length}]: `,
+        `Repos to manage — comma-separated numbers or names; type none to clear [${defaultLabel}]: `,
       );
       if (answer === '') {
-        repos = [...found];
+        repos = [...existingSelection];
+        reposInherited = prior !== null;
+        break;
+      }
+      if (answer.toLowerCase() === 'none') {
+        repos = [];
         break;
       }
       const picks = answer.split(',').map((part) => part.trim()).filter((part) => part !== '');
@@ -234,7 +309,7 @@ async function interactiveAnswers(
         else if (!resolvedRepos.includes(name)) resolvedRepos.push(name);
       }
       if (bad !== null) {
-        out.write(`  ✗ not a discovered repo: ${bad}\n`);
+        out.write(`  ✗ not an available Git repository candidate: ${displayRepositoryName(bad)}\n`);
         continue;
       }
       repos = resolvedRepos;
@@ -242,8 +317,8 @@ async function interactiveAnswers(
     }
   } else {
     out.write(
-      `\nNo real repository directories available for setup validation under ${workspaceRoot}.\n` +
-        'The board discovers Git entries independently; add a real repository here to validate it.\n',
+      `\nNo Git repository candidates are available under ${workspaceRoot}.\n` +
+        'No repository will be managed automatically; add explicit names to managed_repos in config.toml later.\n',
     );
   }
 
@@ -326,7 +401,7 @@ async function interactiveAnswers(
 
   const draftJson = JSON.stringify({
     workspace_root: workspaceRoot,
-    repos,
+    repos: repos.filter((name) => found.includes(name)),
     runtime,
     model,
     thinking_level: thinkingLevel,
@@ -336,7 +411,8 @@ async function interactiveAnswers(
     register_service: registerService,
     smoke,
   });
-  return { answers: parseAnswers(draftJson), draftJson };
+  const parsed = parseAnswers(draftJson);
+  return { answers: { ...parsed, repos }, draftJson, reposInherited };
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +672,7 @@ async function main(argv: readonly string[]): Promise<number> {
   // non-interactive validation below therefore runs first, and every probe
   // is loaded dynamically at its use site.
   let answers: WizardAnswers;
+  let reposInherited = false;
   let terminal: WizardTerminal | null = null;
   let draftPath: string | null = null;
   if (noInteract) {
@@ -609,12 +686,24 @@ async function main(argv: readonly string[]): Promise<number> {
       if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
         rawKeys = new Set(Object.keys(parsed as Record<string, unknown>));
       }
+      // Validate a new `repos` choice against the existing workspace when
+      // the repeat invocation omits workspace_root; parseAnswers must not
+      // probe the hard-coded first-install default before seeding.
+      const sourceAnswers =
+        prior !== null &&
+        !rawKeys.has('workspace_root') &&
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        !Array.isArray(parsed)
+          ? JSON.stringify({ ...(parsed as Record<string, unknown>), workspace_root: prior.workspaceRoot })
+          : answersJson ?? '{}';
       // Secrets never belong on the command line (documented contract):
       // the wizard generates or preserves the pairing token itself.
       if (rawKeys.has('token')) {
         fail('secrets are forbidden in --answers: token — the wizard generates or preserves the pairing token', 1);
       }
-      answers = seedAnswersFromConfig(parseAnswers(answersJson ?? '{}'), prior, rawKeys);
+      answers = seedAnswersFromConfig(parseAnswers(sourceAnswers), prior, rawKeys);
+      reposInherited = prior !== null && !rawKeys.has('repos');
     } catch (error) {
       if (error instanceof AnswersError) fail(String(error.message), 1);
       throw error;
@@ -647,6 +736,7 @@ async function main(argv: readonly string[]): Promise<number> {
     }
     const collected = await interactiveAnswers(probe, terminal, prior, draft);
     answers = collected.answers;
+    reposInherited = collected.reposInherited;
     // Everything the operator typed survives any later abort (#33).
     draftPath = saveWizardDraft(instanceDir, collected.draftJson);
   }
@@ -667,7 +757,7 @@ async function main(argv: readonly string[]): Promise<number> {
   const configText = generateConfigToml({ answers, instanceDir, prior });
 
   stdout.write(
-    `\nRepositories selected for setup validation: ${answers.repos.length > 0 ? answers.repos.join(', ') : '(none)'}\n`,
+    `\nManaged repositories selected: ${answers.repos.length > 0 ? answers.repos.map(displayRepositoryName).join(', ') : '(none)'}\n`,
   );
 
   if (answers.port !== 0) {
@@ -678,13 +768,30 @@ async function main(argv: readonly string[]): Promise<number> {
   }
 
   const workspaceAbs = expandTilde(answers.workspaceRoot, homedir());
+  const samePriorWorkspace = prior !== null &&
+    workspaceIdentity(answers.workspaceRoot, homedir()) === workspaceIdentity(prior.workspaceRoot, homedir());
+  if (reposInherited && prior !== null && prior.managedRepos.length > 0 && !samePriorWorkspace) {
+    fail('workspace_root changed; explicitly select managed_repos for the new workspace binding');
+  }
   for (const repo of answers.repos) {
+    const inheritedBinding = reposInherited && samePriorWorkspace &&
+      prior?.managedRepos.includes(repo) === true;
+    const unavailable = inheritedBinding &&
+      resolveManagedRepoPathSync(workspaceAbs, repo).kind === 'unavailable';
+    if (unavailable) {
+      stdout.write(
+        `Previously selected repository ${displayRepositoryName(repo)} is currently ` +
+          'unavailable; keeping it in managed_repos. ' +
+          'Restore it or remove it from config.toml deliberately.\n',
+      );
+      continue;
+    }
     try {
       validateRepositorySetup(workspaceAbs, repo);
     } catch (error) {
       fail((error as Error).message + abortNote);
     }
-    stdout.write(`Repository ready in ${repo}: GC setup validated; project files unchanged.\n`);
+    stdout.write(`Repository ready in ${displayRepositoryName(repo)}: GC setup validated; project files unchanged.\n`);
   }
 
   // Recheck the fixed port immediately
