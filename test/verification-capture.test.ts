@@ -802,7 +802,8 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
   it('with a valid bound, a stale owner is removed and the run proceeds through the injected transport (#389)', async () => {
     const dir = tempDir();
     const fetchImpl = vi.fn(async (): Promise<Response> => { throw new Error('fixture transport unreachable'); });
-    for (const bound of [1, 30_000, 2_147_483_647]) {
+    const bounds = [1, 30_000, 2_147_483_647];
+    for (const bound of bounds) {
       const sinkPath = join(dir, `stale-valid-${String(bound)}.ndjson`);
       writeCaptureOwner(captureOwnerPath(sinkPath), ownerRecord(sinkPath));
       const code = await runCaptureCli([...BASE_ARGS, '--sink', sinkPath, '--request-id', `req-stale-${String(bound)}`, ...OPS],
@@ -815,7 +816,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       // reconciliation after an UNKNOWN outcome.
       expect(JSON.parse(readFileSync(captureOwnerPath(sinkPath), 'utf-8')), String(bound)).toMatchObject({ request_id: `req-stale-${String(bound)}` });
     }
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl).toHaveBeenCalledTimes(bounds.length);
   });
 
   it('accepts the bound at both timer edges and uses the injected transport (#389)', async () => {
