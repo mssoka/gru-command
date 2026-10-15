@@ -372,7 +372,13 @@ describe('decision follow-through and cross-route guards', () => {
       .listEvents({ limit: 100 })
       .filter((event) => event.kind === 'notification.resolved' && (event.payload as { id?: string }).id === id);
     expect(events).toHaveLength(1);
-    expect(events[0]?.payload).toMatchObject({ detail: 'Executed the approved plan', owner_decision: 'approve' });
+    expect(events[0]?.payload).toMatchObject({
+      detail: 'Executed the approved plan',
+      owner_decision: 'approve',
+      // An in-process caller is labelled `internal`, never a bearer (#396).
+      credential: 'internal',
+      declaredActor: null,
+    });
     // Machine attention keeps its own path.
     const machine = rig.center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Breaker' });
     expect(() => rig.api.resolveOwnerDecision(machine.id, 'nope')).toThrow(/use the disposition route/u);

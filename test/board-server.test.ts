@@ -480,9 +480,17 @@ describe('board server — HTTP API', () => {
     const undecidedId = (undecided.body as { id: string }).id;
     const refusedResolve = await postJson(port, `/api/notifications/${undecidedId}/disposition`, 'board-test-token', { detail: 'premature' });
     expect(refusedResolve).toMatchObject({ status: 409, body: { error: 'decision_refused', code: 'undecided' } });
-    const resolved = await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'Executed the approved prep' });
+    const resolved = await postJson(port, `/api/notifications/${row.id}/disposition`, 'board-test-token', { detail: 'Executed the approved prep', actor: 'gru' });
     expect(resolved).toMatchObject({ status: 200, body: { resolvedBy: 'gru', decidedOption: 'approve', ackedAt: null } });
     expect(api.getNotification(row.id)).toMatchObject({ resolvedBy: 'gru' });
+    // #396: owner follow-through records the same bearer provenance as a
+    // machine disposition (#99) — the role, the credential class and the
+    // caller-declared actor, never a claimed identity.
+    const followThrough = api.listEventsAfter(0, { kinds: ['notification.resolved'] })
+      .filter((event) => (event.payload as { id?: string }).id === row.id);
+    expect(followThrough).toMatchObject([
+      { payload: { by: 'gru', owner_decision: 'approve', credential: 'shared-bearer', declaredActor: 'gru' } },
+    ]);
   });
 
   it('needs-owner escalation retries with the same idempotency key yield one row; distinct escalations stay distinct (#100)', async () => {
@@ -529,6 +537,52 @@ describe('board server — HTTP API', () => {
       expect((await postJson(port, path, 'board-test-token', { title: 't', detail: 'd', decision, idempotencyKey: key })).status).toBe(400);
     }
     expect(count()).toBe(start + 4);
+  });
+
+  it('an identical replay onto a pre-upgrade bare owner row upgrades it in place; a closed legacy row is a typed conflict (#395)', async () => {
+    const { api, port } = harness;
+    const path = '/api/notifications/needs-owner';
+    const decision = {
+      question: 'Approve the external merge?',
+      context: 'The merge needs an owner-controlled integration route.',
+      recommendation: 'Approve it.',
+      reservedClass: 'merge',
+      whyNotDelegable: 'All merges remain owner-performed.',
+      options: [{ id: 'approve', label: 'Approve', consequence: 'Gru prepares the merge.' }],
+      discussion: false,
+    };
+    // A row written before typed decisions were required: decision null.
+    const legacy = (key: string) => api.recordNotification({
+      id: `owner-escalation:${key}`, kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error',
+      title: 'Legacy call', detail: 'Approve merge',
+    });
+    const count = () => api.listNotifications({ limit: 500 }).filter((n) => n.kind === 'gru.owner-escalation').length;
+    expect(legacy('legacy-open').decision).toBeNull();
+    const start = count();
+    const body = { title: 'Legacy call', detail: 'Approve merge', idempotencyKey: 'legacy-open', decision };
+    const adopted = await postJson(port, path, 'board-test-token', body);
+    expect(adopted).toMatchObject({ status: 200, body: { id: 'owner-escalation:legacy-open', decision: { question: 'Approve the external merge?' } } });
+    expect(api.getNotification('owner-escalation:legacy-open')?.decision?.options.map((option) => option.id)).toEqual(['approve']);
+    expect(count()).toBe(start); // the ONE existing item, never a second
+    expect(api.listEventsAfter(0, { kinds: ['notification.decision-adopted'] })).toMatchObject([
+      { payload: { id: 'owner-escalation:legacy-open', by: 'gru', option_ids: ['approve'] } },
+    ]);
+    // The adopted row now replays like any typed escalation.
+    expect((await postJson(port, path, 'board-test-token', body)).status).toBe(200);
+    expect((await postJson(port, path, 'board-test-token', { ...body, decision: { ...decision, recommendation: 'Do not.' } })).status).toBe(409);
+    expect(api.listEventsAfter(0, { kinds: ['notification.decision-adopted'] })).toHaveLength(1);
+    // Changed text onto a legacy row is still a different escalation.
+    legacy('legacy-changed');
+    expect((await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-changed', detail: 'Other' })).status).toBe(409);
+    expect(api.getNotification('owner-escalation:legacy-changed')?.decision).toBeNull();
+    // A legacy row the owner already closed cannot have a decision attached.
+    legacy('legacy-acked');
+    api.ackNotification('owner-escalation:legacy-acked', 'web');
+    expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-acked' })).toMatchObject({
+      status: 409,
+      body: { error: 'idempotency_conflict', code: 'legacy_closed' },
+    });
+    expect(api.getNotification('owner-escalation:legacy-acked')?.decision).toBeNull();
   });
 
   it('decision status and recheck are authenticated and return the durable disabled state', async () => {
@@ -1627,7 +1681,7 @@ describe('board server — decision memory (issue #218)', () => {
 });
 describe('board server — guarded machine re-arm and the discussion bridge (R1 fixes)', () => {
   it('a refused re-arm is a typed 409 that consumes nothing; the same control retries once the fence clears', async () => {
-    let refusal: { ok: boolean; reason?: string } | null = {
+    let refusal: { ok: boolean; reason?: string; rearmed?: boolean; superseded?: boolean } | null = {
       ok: false,
       reason: 'job "parked-lane" is parked (owner/ops hold)',
     };
@@ -1674,6 +1728,18 @@ describe('board server — guarded machine re-arm and the discussion bridge (R1 
       });
       expect(repeat).toMatchObject({ status: 200, body: { rearm: 'not_applicable' } });
       expect(hookCalls).toEqual(['machine-rearm', 'machine-rearm']);
+      // #385: a stop closed as superseded (its captured turn will never
+      // replay) records the disposition WITHOUT a restart, and says so.
+      api.recordNotification({
+        id: 'machine-superseded', kind: 'supervision.breaker', routing: 'action-required', severity: 'error',
+        title: 'Lane stopped: restart ladder tripped', detail: 'breaker open',
+      });
+      refusal = { ok: true, rearmed: false, superseded: true };
+      const superseded = await postJson(port, '/api/notifications/machine-superseded/disposition', 'board-test-token', {
+        detail: 'parked then resumed; re-briefing the lane',
+      });
+      expect(superseded).toMatchObject({ status: 200, body: { rearm: 'superseded' } });
+      expect(api.getNotification('machine-superseded')?.resolvedBy).toBe('gru');
     } finally {
       await close();
     }

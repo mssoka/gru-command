@@ -115,7 +115,15 @@ is **stopped** (no further restarts), an **action-required** machine alert
 wakes Gru, and the board marks the agent (`⛔ stopped` on the rail + the
 alert). Gru **re-arms** supervision through the guarded disposition on
 that alert (or an operator resumes the lane by using its slot): the ring
-clears, a fresh window opens, one restart attempt resumes the agent. A
+clears, a fresh window opens, one restart attempt resumes the agent. When
+the stopped turn's captured prompt was SUPERSEDED — the job was parked and
+resumed, or a fresh directive/re-brief took over — that prompt never
+replays, so the disposition instead **closes the stop** (owner decision
+2026-10-15, #385): no restart of the stale worker, a
+`supervision.stop-superseded` event records the dropped turn, the response
+says `rearm: superseded`, and the lane continues through a fresh re-brief or
+directive. Any other fence (an active park, a hold, a live producer, an
+unreadable authority) still refuses with the debt retained. A
 service restart also resets breaker state (in-memory by design) — the
 resolution record is durable, an open breaker is not, so a re-arm can
 never strand an agent across a service restart. The owner is never asked

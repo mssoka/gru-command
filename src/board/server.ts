@@ -58,7 +58,7 @@ export interface BoardServerOptions {
   readonly onNotificationDisposition?: (
     id: string,
     detail: string,
-  ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly reason?: string } | void;
+  ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly superseded?: boolean; readonly reason?: string } | void;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
@@ -626,6 +626,22 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             const id = `owner-escalation:${rawKey}`;
             const existing = ledger.getNotification(id);
             if (existing !== null) {
+              if (existing.title === title && existing.detail === detail && existing.decision === null) {
+                // A row written before typed decisions were required (#395):
+                // an identical replay upgrades it in place when it is still
+                // open; a closed legacy row is a typed conflict.
+                try {
+                  json(res, 200, notifications.adoptLegacyDecision(id, decision, 'gru'));
+                } catch (error) {
+                  if (!(error instanceof NotificationDecisionRefusal)) throw error;
+                  json(res, 409, {
+                    error: 'idempotency_conflict',
+                    code: error.code,
+                    detail: `idempotencyKey "${rawKey}": ${error.message}`,
+                  });
+                }
+                return;
+              }
               if (
                 existing.title !== title ||
                 existing.detail !== detail ||
@@ -773,7 +789,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             // recorded. A refused or failed re-arm returns an honest
             // outcome and keeps the alert open with its retryable debt —
             // settlement is never reported before the control accepts it.
-            let rearm: 'accepted' | 'not_applicable' = 'not_applicable';
+            let rearm: 'accepted' | 'not_applicable' | 'superseded' = 'not_applicable';
             if (!ownerFollowThrough && target !== null && target.resolvedAt === null) {
               try {
                 const outcome = onNotificationDisposition(id, detail);
@@ -790,8 +806,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
                   return;
                 }
                 // Truthful typed outcome: `rearmed: false` means no
-                // stopped breaker matched this alert (pure record).
-                if (outcome !== undefined) rearm = outcome.rearmed === false ? 'not_applicable' : 'accepted';
+                // stopped breaker matched this alert (pure record);
+                // `superseded` means the stop closed WITHOUT a restart because
+                // its captured turn was superseded (#385) — the lane needs a
+                // fresh re-brief or directive to continue.
+                if (outcome !== undefined) {
+                  rearm = outcome.superseded === true ? 'superseded' : outcome.rearmed === false ? 'not_applicable' : 'accepted';
+                }
               } catch (error) {
                 const message = String(error instanceof Error ? error.message : error);
                 ledger.appendCustomEvent({
@@ -803,7 +824,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               }
             }
             const row = ownerFollowThrough
-              ? ledger.resolveOwnerDecision(id, detail)
+              ? ledger.resolveOwnerDecision(id, detail, { credential: 'shared-bearer', declaredActor })
               : ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });

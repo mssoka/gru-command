@@ -3151,8 +3151,71 @@ export class Supervisor {
    * and its retryable debt intact. */
   onNotificationDisposed(
     notificationId: string,
-  ): { ok: true; rearmed: boolean } | { ok: false; reason: string } {
+  ): { ok: true; rearmed: boolean; superseded?: true } | { ok: false; reason: string } {
     return this.reArmFromNotification(notificationId);
+  }
+
+  /** #385 (owner decision 2026-10-15: close as superseded): a stopped lane's
+   * captured turn whose native authority was SUPERSEDED — the job's directive
+   * epoch or producer identity moved since capture (an owner park then resume
+   * moves the epoch; a fresh directive/re-brief moves the producer) — never
+   * replays, so the guarded re-arm can never accept it. When that supersession
+   * is the ONLY fence (every other check clears for this live, unheld job),
+   * Gru's disposition closes the stop instead of being refused forever: the
+   * stale worker is NOT restarted, the parked-over prompt is dropped (it will
+   * never replay) and the lane continues through a fresh re-brief/directive.
+   * An unreadable capture or current authority, a moved job binding, or any
+   * other fence keeps the stop refused with its debt retained. */
+  private supersededStopClosure(agent: SupervisedAgent): {
+    readonly jobId: string;
+    readonly capturedEpoch: number;
+    readonly currentEpoch: number;
+    readonly producerChanged: boolean;
+  } | null {
+    const recovery = agent.pendingRecovery;
+    if (recovery === null || recovery.jobId === null || recovery.authorityEpoch === null) return null;
+    const jobId = recovery.jobId;
+    try {
+      if ((this.ledger.getAgent(agent.agentId)?.jobId ?? null) !== jobId) return null;
+      const currentEpoch = this.ledger.directiveRecoveryEpoch(jobId);
+      const producer = this.nativeProducerIdentity(jobId);
+      if (recovery.authorityEpoch === currentEpoch && recovery.producerIdentity === producer) return null; // current: replay path
+      if (this.rearmRefusal(agent, null) !== null) return null; // another fence owns the stop
+      return { jobId, capturedEpoch: recovery.authorityEpoch, currentEpoch, producerChanged: recovery.producerIdentity !== producer };
+    } catch {
+      return null; // unreadable authority is never waived
+    }
+  }
+
+  private closeSupersededStop(
+    agent: SupervisedAgent,
+    notificationId: string,
+    closure: NonNullable<ReturnType<Supervisor['supersededStopClosure']>>,
+  ): void {
+    const recovery = agent.pendingRecovery;
+    agent.pendingRecovery = null;
+    agent.breakerNotificationId = null;
+    agent.pendingRearmFenceAlert = null;
+    agent.state = 'stopped';
+    agent.stopReason = `stop closed: its captured turn was superseded on job "${closure.jobId}" — it will never replay; continue the lane with a fresh re-brief or directive`;
+    agent.stoppedAt = agent.stoppedAt ?? this.now();
+    this.rememberStop(agent);
+    this.restoredRearmControls.delete(agent.agentId);
+    this.recordEvent('supervision.stop-superseded', agent.agentId, {
+      notification_id: notificationId,
+      job_id: closure.jobId,
+      captured_epoch: closure.capturedEpoch,
+      current_epoch: closure.currentEpoch,
+      producer_changed: closure.producerChanged,
+      had_open_turn: recovery?.hadOpenTurn ?? false,
+      prompt_named: recovery?.pending !== null && recovery?.pending !== undefined,
+      stop_reason: agent.stopReason,
+    });
+    this.log('info', 'breaker stop closed as superseded — the stale captured turn never replays', {
+      agent_id: agent.agentId,
+      job_id: closure.jobId,
+      notification_id: notificationId,
+    });
   }
 
   /** The fences a NOTIFICATION-DRIVEN re-arm must re-prove (never a new
@@ -3374,10 +3437,15 @@ export class Supervisor {
 
   private reArmFromNotification(
     notificationId: string,
-  ): { ok: true; rearmed: boolean } | { ok: false; reason: string } {
+  ): { ok: true; rearmed: boolean; superseded?: true } | { ok: false; reason: string } {
     if (this.disposed || !this.cfg.enabled) return { ok: true, rearmed: false }; // off = acks are pure records
     for (const agent of this.agents.values()) {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
+      const superseded = this.supersededStopClosure(agent);
+      if (superseded !== null) {
+        this.closeSupersededStop(agent, notificationId, superseded);
+        return { ok: true, rearmed: false, superseded: true };
+      }
       const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
       if (refusal !== null) {
         this.log('info', 'breaker re-arm refused by the recovery authority fence', {

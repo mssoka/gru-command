@@ -553,7 +553,9 @@ export type NotificationDecisionRefusalCode =
   | 'decision_recorded'
   | 'not_open'
   | 'undecided'
-  | 'not_discussion';
+  | 'not_discussion'
+  | 'decision_present'
+  | 'legacy_closed';
 
 export class NotificationDecisionRefusal extends Error {
   constructor(
@@ -3256,7 +3258,7 @@ export class LedgerApi {
 
   latestSupervisionEvent(agentId: string): EventRecord | null {
     const row = this.db.prepare(`SELECT * FROM events WHERE agent_id = ?
-      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
+      AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced', 'supervision.stop-superseded') ORDER BY seq DESC LIMIT 1`).get(agentId) as Row | undefined;
     return row === undefined ? null : this.eventFromRow(row);
   }
 
@@ -3306,7 +3308,7 @@ export class LedgerApi {
              SELECT agent_id, MAX(seq) AS seq
                FROM events
               WHERE agent_id IS NOT NULL
-                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced')
+                AND kind IN ('supervision.escalated', 'supervision.breaker', 'supervision.rearmed', 'supervision.rearm-fenced', 'supervision.stop-superseded')
               GROUP BY agent_id
            ) latest ON latest.agent_id = e.agent_id AND latest.seq = e.seq
            JOIN agents a ON a.id = e.agent_id
@@ -5153,8 +5155,17 @@ export class LedgerApi {
    * UNDECIDED owner row is refused — resolution may never silence a
    * question the owner has not answered, and no display receipt or age
    * ever closes one. Distinct from `disposeMachineNotification` (machine
-   * attention) and from `ackNotification` (feed/notice only). */
-  resolveOwnerDecision(id: string, detail: string): NotificationRecord | null {
+   * attention) and from `ackNotification` (feed/notice only).
+   *
+   * `by: 'gru'` names the follow-through ROLE, exactly as a machine
+   * disposition does: the audit event carries the authorising credential
+   * class and any caller-declared actor, never a claimed identity (#99,
+   * #396). */
+  resolveOwnerDecision(
+    id: string,
+    detail: string,
+    provenance: { readonly credential: string; readonly declaredActor: string | null } = { credential: 'internal', declaredActor: null },
+  ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('owner-decision resolution detail must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
@@ -5177,7 +5188,14 @@ export class LedgerApi {
       this.appendEvent({
         kind: 'notification.resolved',
         agentId: current.agentId,
-        payload: { id, by: 'gru', detail, owner_decision: current.decidedOption },
+        payload: {
+          id,
+          by: 'gru',
+          detail,
+          owner_decision: current.decidedOption,
+          credential: provenance.credential,
+          declaredActor: provenance.declaredActor,
+        },
       });
       return this.getNotification(id) as NotificationRecord;
     });
@@ -5374,6 +5392,47 @@ export class LedgerApi {
         kind: 'notification.decision-options',
         agentId: current.agentId,
         payload: { id, by, option_ids: validated.map((option) => option.id) },
+      });
+      return this.getNotification(id) as NotificationRecord;
+    });
+  }
+
+  /** Upgrade-in-place for an idempotent owner-escalation replay (#395): a
+   * row written before typed decisions were required (decision null) and
+   * still OPEN adopts the replayed typed decision, so the owner gets the
+   * typed options on the ONE existing FOR YOU item instead of a 409 forever
+   * (or a second item). A closed (acked/resolved) legacy row is refused —
+   * a decision can never be attached to an already-closed question. */
+  adoptLegacyOwnerDecision(id: string, decision: NotificationDecision, by: string): NotificationRecord | null {
+    if (by.trim() === '') throw new Error('decision adoption by must be non-empty');
+    return this.transaction(() => {
+      const current = this.getNotification(id);
+      if (current === null) return null;
+      if (current.routing !== 'needs-owner') {
+        throw new NotificationDecisionRefusal(
+          'not_owner_decision',
+          `notification "${id}" is ${current.routing}; only owner decisions adopt a typed decision`,
+        );
+      }
+      if (current.decision !== null) {
+        throw new NotificationDecisionRefusal(
+          'decision_present',
+          `notification "${id}" already carries a typed decision — it is never replaced`,
+        );
+      }
+      if (current.resolvedAt !== null || current.ackedAt !== null) {
+        throw new NotificationDecisionRefusal(
+          'legacy_closed',
+          `notification "${id}" was closed before it carried a typed decision — use a new key for a new decision`,
+        );
+      }
+      this.db
+        .prepare('UPDATE notifications SET decision_json = ? WHERE id = ?')
+        .run(serializeNotificationDecision(decision), id);
+      this.appendEvent({
+        kind: 'notification.decision-adopted',
+        agentId: current.agentId,
+        payload: { id, by, option_ids: decision.options.map((option) => option.id) },
       });
       return this.getNotification(id) as NotificationRecord;
     });

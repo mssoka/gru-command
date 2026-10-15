@@ -5948,14 +5948,62 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       const fenced = rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearm-fenced');
       expect(fenced.length).toBeGreaterThanOrEqual(1);
       expect((fenced[0]!.payload as { reason?: string }).reason).toContain('parked');
-      // The hold lifts, but parking is a native control event: the captured
-      // interrupted prompt is superseded (issue #279/#280) and never replays,
-      // so the same control stays refused with its debt retained.
+      // Supersession is never waived while another fence owns the stop: the
+      // captured turn is retained, nothing is closed (#385).
+      const pending = () => (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> })
+        .agents.get(rig.handle.id)?.pendingRecovery;
+      expect(pending()).not.toBeNull();
+      // The hold lifts. Parking is a native control event: the captured
+      // interrupted prompt is superseded (issue #279/#280) and never replays.
+      // Owner decision (#385, 2026-10-15): Gru's disposition CLOSES the stop
+      // as superseded — no restart of the stale worker, the prompt is
+      // dropped, and the lane continues through a fresh re-brief/directive.
       rig.api.setJobStatus('fenced-job', 'working');
-      rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'fenced-agent-resumed', null);
-      const stillFenced = rig.supervisor.onNotificationDisposed(stop!.id);
-      expect(stillFenced.ok).toBe(false);
-      if (!stillFenced.ok) expect(stillFenced.reason).toContain('no longer current');
+      const spawnsBefore = rig.registry.spawnCalls.length;
+      rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'must-not-spawn', null);
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
+      expect(pending()).toBeNull();
+      expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({
+        state: 'stopped',
+        stopReason: expect.stringContaining('captured turn was superseded'),
+      });
+      const closed = rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded');
+      expect(closed).toHaveLength(1);
+      expect(closed[0]!.payload).toMatchObject({ notification_id: stop!.id, job_id: 'fenced-job', had_open_turn: true });
+      const payload = closed[0]!.payload as { current_epoch: number; captured_epoch: number };
+      expect(payload.current_epoch).toBeGreaterThan(payload.captured_epoch);
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
+      // The closed stop is no longer a durable stop: a restart never raises a
+      // fresh control for it.
+      expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(false);
+      // The alert is no longer bound: a repeat disposition is a pure record.
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false });
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('an unreadable current authority never closes a captured turn as superseded: the stop stays fenced (#385)', async () => {
+    const rig = tripBreaker();
+    try {
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+      const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+      rig.api.setJobStatus('fenced-job', 'parked');
+      rig.api.setJobStatus('fenced-job', 'working');
+      const realEpoch = rig.api.directiveRecoveryEpoch.bind(rig.api);
+      rig.api.directiveRecoveryEpoch = () => {
+        throw new Error('directive audit unreadable');
+      };
+      try {
+        expect(rig.supervisor.onNotificationDisposed(stop!.id).ok).toBe(false);
+      } finally {
+        rig.api.directiveRecoveryEpoch = realEpoch;
+      }
+      const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get(rig.handle.id);
+      expect(agent?.pendingRecovery).not.toBeNull();
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded')).toEqual([]);
       expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
       expect(rig.api.getNotification(stop!.id)?.resolvedAt).toBeNull();
     } finally {
@@ -6153,12 +6201,16 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       const fresh = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
       expect(fresh).toMatchObject({ routing: 'action-required', resolvedAt: null });
 
-      // Parking superseded the captured prompt (native control epoch): the
-      // fence control stays refused after the job resumes; nothing replays.
+      // Parking superseded the captured prompt (native control epoch): after
+      // the job resumes the fence control closes the stop as superseded
+      // (#385) — nothing replays and nothing respawns.
       rig.api.setJobStatus('replay-park-job', 'working');
-      const stillFenced = rig.supervisor.onNotificationDisposed(fresh!.id);
-      expect(stillFenced.ok).toBe(false);
+      const spawnsBefore = rig.registry.spawnCalls.length;
+      expect(rig.supervisor.onNotificationDisposed(fresh!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
       expect(first.promptCalls).toHaveLength(0);
+      expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded')).toHaveLength(1);
     } finally {
       releaseHolder();
       rig.dispose();
