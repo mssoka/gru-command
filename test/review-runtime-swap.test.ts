@@ -11,6 +11,7 @@ const seam = vi.hoisted(() => ({
   rewriteIno: 0, rewriteFile: '', rewriteBytes: '', rewriteAtDigest: '', rewrites: 0,
   invalidReadIno: 0, invalidRead: false, updatesAfterInvalid: 0,
   addAtDigest: '', addFile: '', additions: 0,
+  ancestorIno: 0, ancestorSibling: '', ancestorAdditions: 0, ancestorFiles: [] as string[],
 }));
 vi.mock('node:fs', async (importOriginal) => {
   const fs = await importOriginal<typeof import('node:fs')>();
@@ -18,6 +19,15 @@ vi.mock('node:fs', async (importOriginal) => {
     ...fs,
     openSync: ((...args: Parameters<typeof fs.openSync>) => {
       const path = String(args[0]);
+      // #399: an unrelated sibling appears in a shared ancestor between the
+      // walk's receipt of that ancestor and its post-open check.
+      const ancestorChild = seam.ancestorIno !== 0 ? /^\/proc\/self\/fd\/(\d+)\/[^/]+$/u.exec(path) : null;
+      if (ancestorChild !== null && fs.fstatSync(Number(ancestorChild[1])).ino === seam.ancestorIno) {
+        seam.ancestorAdditions += 1;
+        const sibling = `${seam.ancestorSibling}-${seam.ancestorAdditions}`;
+        seam.ancestorFiles.push(sibling);
+        fs.writeFileSync(sibling, '');
+      }
       const heldPackage = seam.target === ':held-package.json'
         ? /^\/proc\/self\/fd\/(\d+)\/package\.json$/u.exec(path) : null;
       const hoistedParent = seam.target === ':hoisted-parent'
@@ -87,8 +97,9 @@ afterEach(() => {
     swapAfterOpen: false, checkedIno: 0, openedUnknownIno: 0, unknownReads: 0, unknownDigestUpdates: 0,
     rewriteIno: 0, rewriteFile: '', rewriteBytes: '', rewriteAtDigest: '', rewrites: 0,
     invalidReadIno: 0, invalidRead: false, updatesAfterInvalid: 0,
-    addAtDigest: '', addFile: '', additions: 0 });
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+    addAtDigest: '', addFile: '', additions: 0,
+    ancestorIno: 0, ancestorSibling: '', ancestorAdditions: 0 });
+  for (const root of [...roots.splice(0), ...seam.ancestorFiles.splice(0)]) rmSync(root, { recursive: true, force: true });
 });
 
 function fixture(): string {
@@ -111,6 +122,28 @@ it.skipIf(process.platform !== 'linux')('keeps a checked installation valid when
   Object.assign(seam, { addAtDigest: 'dist/review-dependency-identity.json', addFile: neighbor });
   expect(reviewRuntimeVersion(root)).toBe(original);
   expect(seam.additions).toBe(1);
+  expect(seam.unknownDigestUpdates).toBe(0);
+});
+
+it.skipIf(process.platform !== 'linux')('keeps the identity when a sibling appears in a shared ancestor while a missing optional dependency climbs past it (#399)', async () => {
+  const { reviewRuntimeVersion } = await import('../src/runtime/review-build-identity.js');
+  const root = fixture();
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: { tslib: '1.0.0' } }));
+  const installed = join(root, 'node_modules', 'tslib');
+  mkdirSync(installed, { recursive: true });
+  // A missing optional dependency is looked up in every ancestor's
+  // node_modules, so the walk climbs `..` through the shared tmpdir.
+  writeFileSync(join(installed, 'package.json'), JSON.stringify({
+    name: 'tslib', version: '1.0.0', optionalDependencies: { '@esbuild/linux-x64': '1.0.0' },
+  }));
+  writeFileSync(join(installed, 'tslib.js'), 'export const checked = true;');
+  const original = reviewRuntimeVersion(root);
+  Object.assign(seam, {
+    ancestorIno: statSync(dirname(root)).ino,
+    ancestorSibling: join(dirname(root), `gru-review-ancestor-sibling-${basename(root)}`),
+  });
+  expect(reviewRuntimeVersion(root)).toBe(original);
+  expect(seam.ancestorAdditions).toBeGreaterThan(0);
   expect(seam.unknownDigestUpdates).toBe(0);
 });
 

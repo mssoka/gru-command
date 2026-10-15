@@ -84,6 +84,27 @@ function temp(prefix: string): string {
   return dir;
 }
 
+/** A shim fragment that prints nothing itself but leaves a helper in its
+ * OWN session holding git's stdout open; the helper prints `rest` only once
+ * `release` exists — after the step has answered. Gating on the verdict
+ * rather than a fixed sleep keeps the pipe held open at git's exit however
+ * loaded the runner is (#398): a 100 ms head start was not always enough. */
+function gatedDetachedWriter(helperFile: string, release: string, rest: string): string {
+  return `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sh', ['-c', 'while [ ! -e ${release} ]; do sleep 0.02; done; printf ${rest}'], { detached: true, stdio: 'inherit' }); require('node:fs').writeFileSync('${helperFile}', String(c.pid)); c.unref()"`;
+}
+
+/** Releases a gated helper and waits (bounded) for it to end by itself. */
+async function releaseAndAwaitEnd(release: string, helperFile: string): Promise<void> {
+  writeFileSync(release, '');
+  const helper = Number(readFileSync(helperFile, 'utf8'));
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try { process.kill(helper, 0); } catch { return; } // ESRCH: it ended by itself
+    if (Date.now() > deadline) throw new Error(`gated helper ${helper} did not end after its release`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 const IMAGE = minimalPng(Buffer.from('admission-preflight-reference-pixels'));
 
 function makeUpload(uploadsDir: string, name: string, bytes: Buffer): string {
@@ -1605,15 +1626,20 @@ describe('Perkins admission preflight (gh-169)', () => {
     const review = branchTargetReview('detached-writer');
     const repo = review.manifest.repoPath;
     const helperFile = pidFileFor('admission-detached-writer-', 'helper.pid');
-    // git prints a prefix and exits 0; a helper in its OWN session prints the rest 100 ms later.
-    const writer = `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sh', ['-c', 'sleep 0.1; printf in/feature/detached-writer'], { detached: true, stdio: 'inherit' }); require('node:fs').writeFileSync('${helperFile}', String(c.pid)); c.unref()"`;
+    const release = join(temp('admission-detached-release-'), 'release');
+    // git prints a prefix and exits 0; a helper in its OWN session prints the
+    // rest only after the step has answered (gated, #398).
+    const writer = gatedDetachedWriter(helperFile, release, 'in/feature/detached-writer');
     const restore = gitShim('rev-parse', `printf 'refs/remotes/orig'; ${writer}; exit 0`);
     try {
       await expect(defaultProbeExec(repo, ['rev-parse', 'x'], 5_000)).rejects.toThrow(/output was still held open — the answer is incomplete/);
       expect(() => runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000)).toThrow(/the answer is incomplete/);
       expect((await probeAdvertisedTipMovementAsync(review, 5_000, { evidence: NO_SUSPEND }))?.cause).toBe('check-failed');
+      // The helper is left alone: still running (not signalled by any step).
+      expect(() => process.kill(Number(readFileSync(helperFile, 'utf8')), 0)).not.toThrow();
     } finally {
       restore();
+      await releaseAndAwaitEnd(release, helperFile);
     }
   });
 
@@ -1624,24 +1650,36 @@ describe('Perkins admission preflight (gh-169)', () => {
     // reviewer's repro); inherited by the runner through NODE_OPTIONS.
     const preload = join(temp('admission-slow-turns-'), 'slow-turns.cjs');
     writeFileSync(preload, 'globalThis.setImmediate = (fn, ...args) => setTimeout(fn, 25, ...args);\n');
+    // A loaded runner (#398): the runner observes git's exit 300 ms late —
+    // longer than any fixed head start a writer could be given.
+    const lateExit = join(temp('admission-late-exit-'), 'late-exit.cjs');
+    writeFileSync(lateExit, [
+      "const { ChildProcess } = require('node:child_process');",
+      'const emit = ChildProcess.prototype.emit;',
+      "ChildProcess.prototype.emit = function (event, ...args) { if (event === 'exit') { const until = Date.now() + 300; while (Date.now() < until) {} } return emit.call(this, event, ...args); };",
+      '',
+    ].join('\n'));
     const oldOptions = process.env.NODE_OPTIONS;
     try {
-      for (const turns of ['fast', 'stalled'] as const) {
+      for (const turns of ['fast', 'stalled', 'late-exit'] as const) {
         if (turns === 'stalled') process.env.NODE_OPTIONS = `--require ${preload}`;
+        if (turns === 'late-exit') process.env.NODE_OPTIONS = `--require ${lateExit}`;
         const helperFile = pidFileFor('admission-post-exit-', `helper-${turns}.pid`);
-        // git prints a prefix and exits 0; a helper in its OWN session writes the rest 100 ms later.
-        const writer = `"${process.execPath}" -e "const c = require('node:child_process').spawn('/bin/sh', ['-c', 'sleep 0.1; printf in/feature/post-exit'], { detached: true, stdio: 'inherit' }); require('node:fs').writeFileSync('${helperFile}', String(c.pid)); c.unref()"`;
+        const release = join(temp('admission-post-exit-release-'), `release-${turns}`);
+        // git prints a prefix and exits 0; a helper in its OWN session writes
+        // the rest only after the step has answered (gated, #398).
+        const writer = gatedDetachedWriter(helperFile, release, 'in/feature/post-exit');
         let restore = gitShim('rev-parse', `printf 'refs/remotes/orig'; ${writer}; exit 0`);
         try {
           await expect(defaultProbeExec(repo, ['rev-parse', 'x'], 5_000), turns).rejects.toThrow(/output was still held open — the answer is incomplete/);
           expect(() => runOwnedGitSync(repo, ['rev-parse', 'x'], 5_000), turns).toThrow(/the answer is incomplete/);
+          // The helper is left alone: still running, not signalled by the step.
+          expect(() => process.kill(Number(readFileSync(helperFile, 'utf8')), 0), turns).not.toThrow();
         } finally {
           restore();
+          // Released, it finishes its write afterwards and ends by itself.
+          await releaseAndAwaitEnd(release, helperFile);
         }
-        // The helper is left alone: it was not signalled by the step.
-        const helper = Number(readFileSync(helperFile, 'utf8'));
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        expect(() => process.kill(helper, 0), turns).toThrow(/ESRCH/); // it ended by itself
         // An ordinary, already-buffered, complete answer is accepted under the same conditions.
         restore = gitShim('rev-parse', `printf 'refs/remotes/origin/feature/post-exit\\n'; head -c 200000 /dev/zero | tr '\\0' x; exit 0`);
         try {
