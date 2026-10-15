@@ -830,11 +830,10 @@ export async function checkedInProjectMcpConfig(
     // Never the parser's message: V8 quotes source text, and .mcp.json files
     // carry tokens. Only the location from V8's own anchored suffix (never
     // digits from its quoted snippet): line and column as an editor shows
-    // them, else the character offset in the file (BOM included).
-    const at = / at position (\d+)(?: \(line (\d+) column (\d+)\))?$/u.exec(error instanceof Error ? error.message : '');
-    const where = at === null ? '' : at[2] !== undefined && at[3] !== undefined
-      ? ` (at line ${at[2]}, column ${at[3]})` : ` (at character ${Number(at[1]) + bom})`;
-    return { reason: `the committed .mcp.json is not valid JSON${where}` };
+    // them (a BOM is invisible there, so stripping it shifts nothing). A
+    // message without that suffix (V8 quoted the source instead) gives none.
+    const at = / at position \d+ \(line (\d+) column (\d+)\)$/u.exec(error instanceof Error ? error.message : '');
+    return { reason: `the committed .mcp.json is not valid JSON${at === null ? '' : ` (at line ${at[1]}, column ${at[2]})`}` };
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { reason: 'the committed .mcp.json is not a JSON object' };
@@ -845,23 +844,6 @@ export async function checkedInProjectMcpConfig(
     return { reason: 'the committed .mcp.json has no "mcpServers" object' };
   }
   return { config: committed };
-}
-
-/** A CLI diagnostic with every value it may echo removed: quoted spans of
- * any quote style (escapes included), URLs, and long token-like runs. The
- * CLI pastes some values in unescaped, so a quote style with an odd count
- * cannot be paired safely: everything from its first quote is dropped. */
-export function redactMcpDiagnostic(text: string): string {
-  let safe = text;
-  for (const quote of ['"', "'", '`']) {
-    const at: number[] = [];
-    for (let i = 0; i < safe.length; i += 1) if (safe[i] === quote && safe[i - 1] !== '\\') at.push(i);
-    if (at.length % 2 === 1) safe = `${safe.slice(0, at[0])}${quote}…`;
-  }
-  return safe
-    .replace(/(["'`])(?:\\.|(?!\1)[^\\])*\1/gu, '$1…$1')
-    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/giu, '<url>')
-    .replace(/[A-Za-z0-9_-]{24,}/gu, '…');
 }
 
 /** The refusal for a working file that is not the committed bytes. The
@@ -978,7 +960,7 @@ export class ClaudeCodeHandle implements AgentHandle {
   private readonly projectMcpCopy: string;
   private projectMcpSwept = false;
   /** The last distinct set of MCP load problems logged (see noteMcpServerProblems). */
-  private mcpServerErrorsNote: string | null = null;
+  private mcpServerProblemsNote: string | null = null;
   /** A turn is resolving its params (the project-MCP git check): the
    * operation slot is held exactly as by a live child. */
   private preparingTurn = false;
@@ -1246,23 +1228,23 @@ export class ClaudeCodeHandle implements AgentHandle {
     });
   }
 
-  /** Log the MCP servers the CLI could not load — skipped entries
-   * (mcp_server_errors) and servers it kept but could not start (status
-   * "failed") — once per distinct set (a set that clears resets, so a later
-   * recurrence is logged again). */
+  /** Log the MCP servers the CLI could not load — entries it skipped
+   * (mcp_server_errors), servers it kept but could not start (status
+   * "failed") and servers from GC's own config that need sign-in (status
+   * "needs-auth", source "dynamic") — once per distinct set (a set that
+   * clears resets, so a later recurrence is logged again). */
   private noteMcpServerProblems(errors: unknown, servers: unknown): void {
     const record = (value: unknown): Record<string, unknown> =>
       typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
-    // A name is cut on its own, so the reason always survives.
-    const line = (name: unknown, why: string): string =>
-      `${typeof name === 'string' ? name.slice(0, 80) : '?'}: ${redactMcpDiagnostic(why).slice(0, 160)}`;
-    // The CLI's own words, redacted: a message may quote a rejected value.
+    const line = (name: unknown, why: string): string => `${typeof name === 'string' ? name.slice(0, 80) : '?'}: ${why}`;
+    // Never the CLI's free text — it pastes rejected values in unescaped, and
+    // no redaction of free text is airtight — only its skip-reason code
+    // (`invalid_config`, `unknown_type`, …), accepted only when it looks like
+    // one. The CLI's own --debug output carries the details.
     const skipped = (Array.isArray(errors) ? errors : []).map((error: unknown) => {
-      if (typeof error === 'string') return line(undefined, error);
       const entry = record(error);
-      const why = typeof entry['message'] === 'string' ? entry['message']
-        : typeof entry['type'] === 'string' ? entry['type'] : 'unknown reason';
-      return line(entry['name'], why);
+      const code = typeof entry['type'] === 'string' && /^[a-z][a-z0-9_-]{0,39}$/u.test(entry['type']) ? entry['type'] : 'unknown reason';
+      return line(entry['name'], `skipped (${code})`);
     });
     // A server the CLI kept but could not start (a missing env var, a broken
     // command) shows only as status "failed"; one from GC's own config that
@@ -1276,12 +1258,12 @@ export class ClaudeCodeHandle implements AgentHandle {
           ? [line(entry['name'], 'needs authentication (a headless session cannot sign in)')] : []);
     const problems = [...skipped, ...failed];
     if (problems.length === 0) {
-      this.mcpServerErrorsNote = null;
+      this.mcpServerProblemsNote = null;
       return;
     }
     const note = JSON.stringify(problems);
-    if (note === this.mcpServerErrorsNote) return;
-    this.mcpServerErrorsNote = note;
+    if (note === this.mcpServerProblemsNote) return;
+    this.mcpServerProblemsNote = note;
     this.log('warn', 'claude could not load some MCP servers', {
       cwd: this.params.cwd, servers: problems.slice(0, 20), total: problems.length,
     });
@@ -1764,10 +1746,11 @@ export class ClaudeCodeHandle implements AgentHandle {
             }
             return;
           }
-          // Servers the CLI skipped (an entry its validation rejects, a
-          // reserved name: mcp_server_errors, --mcp-config only) or kept but
-          // could not start (status "failed") are logged once per distinct
-          // set, so none just disappears.
+          // Servers the CLI skipped (mcp_server_errors, --mcp-config only),
+          // kept but could not start (status "failed"), or that need a
+          // sign-in a headless session cannot give are logged once per
+          // distinct set. (In user mode an entry the CLI's validation
+          // rejects leaves no signal at all.)
           this.noteMcpServerProblems(frame['mcp_server_errors'], frame['mcp_servers']);
           // Record what this turn was asked right after its verified identity
           // frame: stdout carries only claude's side of the conversation. Not

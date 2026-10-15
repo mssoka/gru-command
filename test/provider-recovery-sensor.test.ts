@@ -1641,9 +1641,14 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(resolves).toBe(1); // the seen-set ends the loop at the first repeat
     expect(logs).toContain('retiring a handed-back route failed');
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(2);
-    // The next boot, with resolves working again, finishes the retirement.
+    // The next boot — a fresh sensor over the same ledger, resolves working
+    // again — finishes the retirement.
     vi.restoreAllMocks();
-    sensor.handBackDisabledWaits();
+    new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: false, claudeNative: true },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now,
+    }).handBackDisabledWaits();
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(0);
     expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route', 'active')).toBeNull();
     expect(h.ledger.getNotification('watch-neighbor')).toMatchObject({ resolvedAt: null });
