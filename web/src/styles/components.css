@@ -252,146 +252,280 @@ body {
   50% { opacity: 0.35; }
 }
 
-/* ── Status chip rail (v6): the v4 health row, relocated global ── */
+/* ── Slim status strip (v7 compact density, approved sample #spec2): one
+   wrapping status row + three stable count groups. Same derivations as
+   the pill rail it replaces; density comes from hierarchy/spacing only.
+   The rail is a size container: the group columns engage at its 640px
+   inline-size transition (the sample's), so 768px keeps tablet density
+   and 360px stacks naturally. Never nowrap, never overflow-masked. ── */
 
 .chip-rail {
   position: sticky;
   top: var(--command-bar-h, 56px);
   z-index: 29;
   display: flex;
-  align-items: stretch;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px 12px;
+  flex-direction: column;
+  container-type: inline-size;
+  padding: 6px 12px 8px;
   background: var(--paper);
-  border-bottom: 1.5px solid var(--line);
+  border-bottom: 2px solid var(--line);
 }
 
-/* Phone: one calm scrollable row instead of stacked chrome. */
+/* Phone/tablet-portrait: the wrapped strip is tall (stacked groups), so a
+   sticky copy would permanently cover a third of the viewport and occlude
+   owner actions scrolled beneath it. Below 900px it scrolls away with the
+   page instead; the sticky offsets ignore it (see measureChrome). */
 @media (max-width: 899px) {
   .chip-rail {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .chip-rail::-webkit-scrollbar {
-    display: none;
+    position: static;
   }
 }
 
-.rail-chip {
+/* Reserved tabular numeric slot: the NUMBER part only. Digits grow inside
+   the reserved box (9→10→100→1000 move nothing); counts beyond four digits
+   grow honestly and wrap — never clip. SCOPED to the two approved slim
+   surfaces (status strip + For-you band): a `.num` element anywhere else
+   keeps the app default, so this utility can never repaint an unrelated
+   band/panel (acceptance D). The e2e probe test and geometry measurements
+   in web/e2e/dashboard-strip.spec.ts prove both, not this declaration. */
+#chip-rail .num,
+#board-owner .num {
+  font-variant-numeric: tabular-nums;
+  display: inline-block;
+  text-align: right;
+}
+
+/* Four digits must fit INSIDE the floor in each surface's own font
+   metrics (measured r6): the mono strip slots overshoot 4ch by up to
+   1/64px of sub-pixel rounding, and the sans tabular band slot overshoots
+   by a full digit advance (tabular figures are wider than the '0' glyph
+   the ch unit is derived from). These floors keep 9/10, 99/100 and
+   999/1000 inside ONE box per surface; 5-digit values (10000) still
+   exceed the floor and grow honestly. Geometry proven by measurement in
+   web/e2e/dashboard-strip.spec.ts, not by this declaration. */
+#chip-rail .num { min-width: calc(4ch + 1px); }
+#board-owner .num { min-width: calc(4ch + 1em); }
+
+.strip-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 18px;
+  row-gap: 4px;
+  padding: 4px 0 8px;
+}
+
+.strip-pair {
   display: inline-flex;
-  align-items: center;
-  gap: 9px;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.strip-dot {
   flex: none;
-  min-height: 48px;
-  padding: 8px 14px;
-  border: var(--outline-thin);
-  border-radius: 999px;
-  background: var(--card);
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--park);
+  border: 1.5px solid var(--line);
+}
+
+/* ONE tone per pair: a token-coloured dot beside the label; the label and
+   value text carry the fact (never colour alone). */
+.strip-pair--ok .strip-dot { background: var(--done); }
+.strip-pair--warn .strip-dot { background: var(--work); }
+.strip-pair--alert .strip-dot { background: var(--alert); }
+.strip-pair--muted .strip-dot { background: var(--park); }
+
+.strip-key {
+  color: var(--muted);
   font-size: 12px;
   font-weight: 700;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
 }
 
-.rail-chip__label {
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.14em;
-  color: var(--faint);
-}
-
-.rail-chip__value {
-  font-size: 14px;
-  font-weight: 800;
+.strip-value,
+.strip-value__txt {
   color: var(--ink);
+  font-weight: 700;
 }
 
-/* ONE accent per chip state: a colored left edge, never a fill. */
-.rail-chip--ok { border-left: 5px solid var(--done); }
-.rail-chip--warn { border-left: 5px solid var(--work); }
-.rail-chip--alert { border-left: 5px solid var(--alert); }
-.rail-chip--muted { border-left: 5px solid var(--muted); }
-
-.rail-chip__flag {
+.strip-flag {
   font-size: 10px;
   padding: 2px 8px;
 }
 
-/* Folded KPI fields (TRACKERS): group label + total, then one labeled
-   field per count — every value carries its own visible label (v6.1). */
-.rail-kpi {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+/* Stable count groups: three columns from the 640px container transition,
+   hairline separators between neighbours, natural stacking below it. */
+.strip-groups {
+  display: grid;
+  gap: 0;
+  padding: 0;
 }
 
-.rail-kpi__label {
-  font-size: 11px;
+.strip-group {
+  min-width: 0;
+  padding: 8px 0 4px;
+}
+
+.strip-group + .strip-group {
+  border-top: 2px solid var(--line);
+}
+
+.strip-group__head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin: 0 0 5px;
+}
+
+.strip-group__mark {
+  flex: none;
+  align-self: center;
+  width: 14px;
+  height: 8px;
+  border-radius: 5px;
+  background: var(--gmark, var(--park));
+  border: 1.5px solid var(--line);
+}
+
+.strip-group--work { --gmark: var(--work); }
+.strip-group--rev { --gmark: var(--rev); }
+.strip-group--done { --gmark: var(--done); }
+
+.strip-group__name {
+  font-size: 13px;
   font-weight: 800;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.01em;
+}
+
+.strip-group__total {
+  color: var(--ink);
+  font-size: 16.5px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.strip-group__unit {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
   color: var(--faint);
 }
 
-.rail-kpi__total {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 14px;
-  font-weight: 800;
-  color: var(--ink);
-  font-variant-numeric: tabular-nums;
+.strip-group__pairs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 16px;
+  row-gap: 4px;
+  margin: 0;
+  font-size: 12.5px;
 }
 
-.rail-kpi__field {
+.strip-kpi {
   display: inline-flex;
   align-items: baseline;
-  gap: 3px;
-  padding-left: 6px;
-  border-left: 1.5px solid color-mix(in srgb, var(--line) 30%, transparent);
+  gap: 5px;
 }
 
-.rail-kpi__field-label {
-  font-size: 9.5px;
+.strip-kpi + .strip-kpi::before {
+  content: '·';
+  margin-right: 16px;
   font-weight: 800;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--muted);
+  color: var(--faint);
 }
 
-.rail-kpi__num {
+.strip-kpi__k {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.strip-kpi__num {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
   font-weight: 700;
   color: var(--ink);
-  font-variant-numeric: tabular-nums;
 }
 
-.rail-kpi__num--alert {
+.strip-kpi__num--alert {
   color: var(--band-needs-you-ink);
   font-weight: 800;
 }
 
-.rail-chip--trackers {
-  gap: 8px;
+/* Jev / needs-Gru / GRU-wake chips keep their pp-chip faces inside the
+   status row — but NOT its nowrap: chip facts wrap honestly like every
+   other label (no clipping, no overflow masking). */
+.strip-status .pp-chip {
+  white-space: normal;
 }
 
-/* Desktop: TRACKERS grows into the rail's remaining width and its
-   labeled fields flow there, instead of dead-ending in a pill wider than
-   the viewport. Below 900px the rail is a horizontal scroller and the
-   chip stays one nowrap pill like every other chip. */
-@media (min-width: 900px) {
-  .rail-chip--trackers {
-    flex: 1 1 560px;
-    min-width: 0;
-    flex-wrap: wrap;
-    row-gap: 4px;
+.strip-status .board-decisions,
+.strip-status .board-unacked,
+.strip-status .board-wakes {
+  font-size: 10.5px;
+  padding: 3px 10px;
+}
+
+/* The wakes chip carries its own ink (the chip's card fill flips
+   instantly on a theme change while an inherited body color would still
+   be animating — an inherited ink can never be the chip's contrast). */
+.strip-status .board-wakes {
+  color: var(--ink);
+}
+
+.board-wakes__count {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 800;
+}
+
+.board-wakes__unknown,
+.board-age-split__lead,
+.board-age-split__unit {
+  font-weight: 700;
+}
+
+@container (min-width: 640px) {
+  .strip-groups {
+    grid-template-columns: repeat(3, 1fr);
+    padding: 6px 0 2px;
   }
-}
 
-.rail-chip--trackers .board-decisions,
-.rail-chip--trackers .board-unacked {
-  margin-left: 2px;
+  .strip-group {
+    padding: 0 18px 4px;
+  }
+
+  .strip-group:first-child {
+    padding-left: 0;
+  }
+
+  .strip-group:last-child {
+    padding-right: 0;
+  }
+
+  .strip-group + .strip-group {
+    border-top: 0;
+    border-left: 2px solid var(--line);
+  }
+
+  /* Row-edge alignment for a 4th group (CHILDREN) wrapping to a second
+     grid row: the row's first item gets the row separator and no in-row
+     left padding (flush with the first column), the row's last item is
+     flush right — matching the 1-row layout's edges. */
+  .strip-group:nth-child(3n) {
+    padding-right: 0;
+  }
+
+  .strip-group:nth-child(3n + 1):not(:first-child) {
+    border-left: 0;
+    border-top: 2px solid var(--line);
+    padding-left: 0;
+  }
 }
 
 .app-main {

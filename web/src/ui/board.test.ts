@@ -3,16 +3,17 @@ import { withMailboxFixture } from '../lib/mailbox-fixture.test-support.js';
 
 import { request as nodeHttpRequest } from 'node:http';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type {
-  AgentView,
-  BoardSnapshot,
-  BuildView,
-  JobView,
-  NotificationView,
-  RoundView,
-  SelfHealView,
-  SilasView,
-  VerifyQueueView,
+import {
+  isValidSnapshot,
+  type AgentView,
+  type BoardSnapshot,
+  type BuildView,
+  type JobView,
+  type NotificationView,
+  type RoundView,
+  type SelfHealView,
+  type SilasView,
+  type VerifyQueueView,
 } from '../lib/board-protocol.js';
 import { memoryStorage } from '../lib/chat-storage.js';
 import { boardKpis, collectJobs } from '../lib/board-kpi.js';
@@ -131,10 +132,11 @@ function snapshot(
     selfHeal?: SelfHealView | null;
     repos?: readonly { readonly name: string; readonly jobs: readonly JobView[] }[];
     unackedNeedsOwner?: number;
-    wakes?: { readonly count: number; readonly lastAt: string | null };
+    wakes?: BoardSnapshot['wakes'];
     ownerPrs?: NonNullable<BoardSnapshot['ownerPrs']>;
     repoOverview?: NonNullable<BoardSnapshot['repoOverview']>;
     pipeline?: NonNullable<BoardSnapshot['pipeline']>;
+    children?: BoardSnapshot['children'];
   } = {},
 ): BoardSnapshot {
   return withMailboxFixture({
@@ -163,6 +165,7 @@ function snapshot(
     wakes: options.wakes ?? { count: 0, lastAt: null },
     ownerPrs: options.ownerPrs,
     pipeline: options.pipeline,
+    children: options.children,
     repoOverview: options.repoOverview,
   });
 }
@@ -510,20 +513,48 @@ describe('board view resolved-notification rendering', () => {
   });
 });
 
-describe('board v6 — status chip rail (v4 health row relocated)', () => {
+describe('board v7 — slim status strip (pill rail replaced)', () => {
+  it('every count group renders its own marker tone class (a rename must not silently drop it)', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot({ children: { active: 1, queued: 2, finished: 3, lifetimeCreations: 4 } }));
+    const tones = [...document.querySelectorAll<HTMLElement>('#chip-rail .strip-group')].map(
+      (group) => `${group.querySelector('.strip-group__name')?.textContent}:${[...group.classList].find((c) => c.startsWith('strip-group--'))}`,
+    );
+    expect(tones).toEqual([
+      'HEISTS:strip-group--work',
+      'PRS:strip-group--rev',
+      'CREW:strip-group--done',
+      'CHILDREN:strip-group--park',
+    ]);
+    const groups = [...document.querySelectorAll<HTMLElement>('#chip-rail .strip-group')];
+    expect(groups.map((group) => group.getAttribute('aria-label'))).toEqual(
+      groups.map((group) => group.querySelector('.strip-group__name')?.textContent),
+    );
+  });
+
   beforeEach(mountBoardDom);
 
-  it('renders the seven chips and discloses the rail on the first snapshot', () => {
+  it('renders the slim status pairs and the three stable groups, disclosing the rail on the first snapshot', () => {
     const view = new BoardView(() => {});
     expect(document.getElementById('chip-rail')?.hidden).toBe(true);
     view.render(snapshot());
     const rail = document.getElementById('chip-rail');
     expect(rail?.hidden).toBe(false);
-    const chips = [...(rail?.querySelectorAll('.rail-chip') ?? [])].map((node) => node.getAttribute('data-chip'));
-    expect(chips).toEqual(['deploy', 'reviews', 'silas', 'alerts', 'verify', 'cure', 'trackers']);
+    const pairs = [...(rail?.querySelectorAll('.strip-pair') ?? [])].map((node) => node.getAttribute('data-chip'));
+    expect(pairs).toEqual(['deploy', 'reviews', 'silas', 'alerts', 'verify', 'cure']);
+    const groups = rail?.querySelectorAll('.strip-group') ?? [];
+    expect(groups).toHaveLength(3);
+    const names = [...groups].map((node) => node.querySelector('.strip-group__name')?.textContent);
+    expect(names).toEqual(['HEISTS', 'PRS', 'CREW']);
+    expect([...groups].map((node) => node.getAttribute('aria-label'))).toEqual(names);
+    // Group heads are h2 (approved reference heading level, fixes the
+    // h3-before-h2 document order).
+    for (const head of document.querySelectorAll('.strip-group__head')) {
+      expect(head.tagName).toBe('H2');
+    }
   });
 
-  it('renders the deploy-drift chip with the restart-pending flag when behind', () => {
+  it('renders deploy drift with the restart-pending flag when behind', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -538,37 +569,47 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
         },
       }),
     );
-    const deploy = document.querySelector<HTMLElement>('.rail-chip[data-chip="deploy"]');
-    expect(deploy?.querySelector('.rail-chip__value')?.textContent).toBe('43 behind');
-    expect(deploy?.querySelector('.rail-chip__flag')?.textContent).toBe('RESTART PENDING');
-    expect(deploy?.classList.contains('rail-chip--alert')).toBe(true);
+    const deploy = document.querySelector<HTMLElement>('.strip-pair[data-chip="deploy"]');
+    expect(deploy?.classList.contains('strip-pair--alert')).toBe(true);
+    // The mutable number rides its own reserved slot, split from the unit.
+    expect(deploy?.querySelector('.strip-value__num')?.textContent).toBe('43');
+    expect(deploy?.querySelector('.strip-value')?.textContent?.replace(/\s+/g, ' ').trim()).toBe('43 behind');
+    expect(deploy?.querySelector('.strip-flag__txt')?.textContent).toBe('RESTART PENDING');
+    // Preserved title text: the pair AND its flag carry the card's full
+    // explanation for hover/AT users.
+    expect(deploy?.title).toContain('rebuild + restart');
+    expect(deploy?.querySelector('.strip-flag')?.getAttribute('title')).toContain('rebuild + restart');
   });
 
   it('renders n/a honestly for unwired sources (verify queue, cure efficacy)', () => {
     const view = new BoardView(() => {});
     view.render(snapshot());
-    const valueOf = (chip: string): string | undefined =>
-      document.querySelector<HTMLElement>(`.rail-chip[data-chip="${chip}"] .rail-chip__value`)?.textContent ?? undefined;
-    expect(valueOf('deploy')).toBe('n/a');
-    expect(valueOf('verify')).toBe('n/a');
-    expect(valueOf('cure')).toBe('n/a');
-    expect(valueOf('alerts')).toBe('0');
-    expect(valueOf('reviews')).toBe('1 active'); // the base job carries a live round
+    const textOf = (chip: string): string =>
+      document
+        .querySelector<HTMLElement>(`.strip-pair[data-chip="${chip}"] .strip-value`)
+        ?.textContent?.replace(/\s+/g, ' ')
+        .trim() ?? '';
+    expect(textOf('deploy')).toBe('n/a');
+    expect(textOf('verify')).toBe('n/a');
+    expect(textOf('cure')).toBe('n/a');
+    expect(textOf('alerts')).toBe('0');
+    expect(textOf('reviews')).toBe('1 active'); // the base job carries a live round
   });
 
-  it('renders the verify queue from the snapshot when the scheduler is wired', () => {
+  it('renders the verify queue from the snapshot with its queued flag split into numeric parts', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
         verify: { lockInUse: true, activeRuns: 1, queuedRuns: 2, workerBudget: 8, workersPerRun: 4 },
       }),
     );
-    const verify = document.querySelector<HTMLElement>('.rail-chip[data-chip="verify"]');
-    expect(verify?.querySelector('.rail-chip__value')?.textContent).toBe('lock held');
-    expect(verify?.querySelector('.rail-chip__flag')?.textContent).toBe('2 QUEUED');
+    const verify = document.querySelector<HTMLElement>('.strip-pair[data-chip="verify"]');
+    expect(verify?.querySelector('.strip-value')?.textContent?.replace(/\s+/g, ' ').trim()).toBe('lock held');
+    expect(verify?.querySelector('.strip-flag__num')?.textContent).toBe('2');
+    expect(verify?.querySelector('.strip-flag__txt')?.textContent).toBe(' QUEUED');
   });
 
-  it('folds the v4 KPI counts into the rail as data-kpi numbers matching boardKpis', () => {
+  it('folds the v4 KPI counts into the groups as data-kpi numbers matching boardKpis', () => {
     const jobs = [
       baseJob({ id: 'w1', status: 'working' }),
       baseJob({ id: 'w2', status: 'working' }),
@@ -600,6 +641,7 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(values.get('jobs.merged')).toBe(kpis.jobs.merged);
     expect(values.get('jobs.done')).toBe(kpis.jobs.done);
     expect(values.get('jobs.parked')).toBe(kpis.jobs.parked);
+    expect(values.get('jobs.binned')).toBe(kpis.jobs.binned);
     expect(values.get('prs.open')).toBe(kpis.prs.open);
     expect(values.get('prs.conflicting')).toBe(kpis.prs.conflicting);
     expect(values.get('prs.mergedToday')).toBe(kpis.prs.mergedToday);
@@ -614,29 +656,35 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
     expect(values.get('lanes.disposed')).toBe(1);
     // A conflict is the loudest PR state: the number carries the alert ink.
     const conflicting = [...document.querySelectorAll<HTMLElement>('[data-kpi="prs.conflicting"]')][0];
-    expect(conflicting?.classList.contains('rail-kpi__num--alert')).toBe(true);
+    expect(conflicting?.classList.contains('strip-kpi__num--alert')).toBe(true);
 
-    // v6.1 ruling 5: every rendered number carries its visible label —
-    // adjacency in the DOM, not a tooltip promise.
-    const fields = [...document.querySelectorAll<HTMLElement>('.rail-kpi__field')];
+    // v6.1 ruling 5 survives the re-face: every rendered number carries its
+    // visible label — adjacency in the DOM, not a tooltip promise.
+    const fields = [...document.querySelectorAll<HTMLElement>('.strip-kpi')];
     expect(fields.length).toBeGreaterThan(0);
     for (const field of fields) {
-      const label = field.querySelector<HTMLElement>('.rail-kpi__field-label');
+      const label = field.querySelector<HTMLElement>('.strip-kpi__k');
       const num = field.querySelector<HTMLElement>('[data-kpi]');
       expect(label?.textContent, `${num?.dataset.kpi} label text`).toBeTruthy();
       expect(num, `${label?.textContent} number`).not.toBeNull();
       expect(label?.nextElementSibling).toBe(num);
     }
-    const groupLabels = [...document.querySelectorAll<HTMLElement>('.rail-kpi__label')].map(
+    const groupNames = [...document.querySelectorAll<HTMLElement>('.strip-group__name')].map(
       (node) => node.textContent ?? '',
     );
-    expect(groupLabels.some((text) => text.startsWith('HEISTS'))).toBe(true);
-    expect(groupLabels.some((text) => text.startsWith('PRS'))).toBe(true);
-    expect(groupLabels.some((text) => text.startsWith('CREW'))).toBe(true);
-    expect(groupLabels.some((text) => text.includes('MINIONS'))).toBe(false);
+    expect(groupNames).toEqual(['HEISTS', 'PRS', 'CREW']);
+    expect(groupNames.some((text) => text.includes('MINIONS'))).toBe(false);
+    // The trackers chip's long-form explanation survives the re-face.
+    expect(document.querySelector<HTMLElement>('.strip-groups')?.title).toContain('Jev decision routing');
+    // Per-group and per-KPI explanations (title/AT text) survive too.
+    const firstPairs = document.querySelector<HTMLElement>('.strip-group__pairs');
+    expect(firstPairs?.getAttribute('title')).toBeTruthy();
+    const firstKpi = firstPairs?.querySelector<HTMLElement>('.strip-kpi');
+    expect(firstKpi?.querySelector('.strip-kpi__k')?.getAttribute('title')).toBeTruthy();
+    expect(firstKpi?.querySelector('.strip-kpi__num')?.getAttribute('title')).toBeTruthy();
   });
 
-  it('keeps the Jev decisions chip and unacked badge inside the TRACKERS chip', () => {
+  it('keeps the Jev chip; the needs-Gru number renders once, on the ALERTS pair', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
@@ -652,39 +700,165 @@ describe('board v6 — status chip rail (v4 health row relocated)', () => {
         unackedActionRequired: 2,
       }),
     );
-    const trackers = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"]');
-    expect(trackers).not.toBeNull();
-    const chip = trackers?.querySelector<HTMLElement>('#board-decisions');
+    const chip = document.querySelector<HTMLElement>('#board-decisions');
     expect(chip?.textContent).toBe('Jev: READY');
     expect(chip?.dataset.state).toBe('ready');
     expect(chip?.classList.contains('pp-chip--done')).toBe(true);
-    const unacked = trackers?.querySelector<HTMLElement>('#board-unacked');
-    expect(unacked?.hidden).toBe(false);
+    // Main's complete live-queue copy/title remains; SLIM displays its
+    // number exactly once on the ALERTS pair.
+    const unacked = document.querySelector<HTMLElement>('#board-unacked');
+    expect(unacked?.hidden).toBe(true);
     expect(unacked?.textContent).toContain('2 notifications · needs Gru');
     // The count is the LIVE machine queue: the copy says so (A4).
     expect(unacked?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
     expect(unacked?.title).toContain('closed receipts stay in the record');
+    const alerts = document.querySelector<HTMLElement>('.strip-pair[data-chip="alerts"]');
+    expect(alerts?.querySelector('.strip-value__num')?.textContent).toBe('2');
+    expect(alerts?.querySelector('.strip-flag__txt')?.textContent).toBe('NEEDS GRU');
+    expect(alerts?.classList.contains('strip-pair--alert')).toBe(true);
   });
 
-  it('shows the NEEDS GRU machine-queue chip only when the table has pending rows', () => {
+  it('renders the four GRU wake truths, independent of Silas', () => {
+    const silasAt = (iso: string | null): SilasView => ({
+      lastWakeAt: iso,
+      lastTickAt: null,
+      lastReconcileAt: null,
+      lastReconcileFailedAt: null,
+      reconcileFailedNewer: false,
+      lastUsefulActionAt: null,
+      nextAction: null,
+      openTurnSince: null,
+      reconciliationsToday: 2,
+      checkedAt: '2026-01-01T00:00:00.000Z',
+    });
     const view = new BoardView(() => {});
-    view.render(snapshot({ unackedActionRequired: 0 }));
-    const chip = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-unacked');
-    expect(chip?.hidden).toBe(true);
-    view.render(snapshot({ unackedActionRequired: 2 }));
-    expect(chip?.hidden).toBe(false);
-    expect(chip?.textContent).toContain('2 notifications · needs Gru');
-  });
-
-  it('shows the wake tracker inside TRACKERS with the durable count and last-fire stamp', () => {
-    const view = new BoardView(() => {});
-    view.render(snapshot({ wakes: { count: 0, lastAt: null } }));
-    expect(document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-wakes')?.hidden).toBe(true);
+    const wakes = document.querySelector<HTMLElement>('#board-wakes');
+    // 0 + null: the honest no-wakes state, count still visible.
+    view.render(
+      snapshot({ wakes: { count: 0, lastAt: null }, silas: silasAt('2026-01-01T00:00:00.000Z') }),
+    );
+    expect(wakes?.hidden).toBe(false);
+    expect(wakes?.textContent).toContain('no wakes yet');
+    expect(wakes?.querySelector('.board-wakes__count')?.textContent).toBe('0');
+    // count > 0 + null stamp: last wake UNKNOWN — never "no wakes yet".
+    view.render(snapshot({ wakes: { count: 3, lastAt: null } }));
+    expect(wakes?.textContent).toContain('3');
+    expect(wakes?.textContent).toContain('last wake unknown');
+    expect(wakes?.textContent).not.toContain('no wakes yet');
+    // count 0 + a supplied valid stamp: the timestamp is NOT discarded —
+    // only 0 + no stamp is the no-wakes state.
+    view.render(snapshot({ wakes: { count: 0, lastAt: '2026-01-01T00:00:00.000Z' } }));
+    expect(wakes?.textContent).not.toContain('no wakes yet');
+    expect(wakes?.querySelector('.board-wakes__count')?.textContent).toBe('0');
+    expect(wakes?.querySelector('.board-age-split__num')).not.toBeNull();
+    expect(wakes?.title).toContain('last');
+    // count > 0 + valid stamp: terse wake-age pair, digits in their slot.
     view.render(snapshot({ wakes: { count: 3, lastAt: '2026-01-01T00:00:00.000Z' } }));
-    const chip = document.querySelector<HTMLElement>('.rail-chip[data-chip="trackers"] #board-wakes');
-    expect(chip?.hidden).toBe(false);
-    expect(chip?.textContent).toContain('3 wakes');
-    expect(chip?.title).toContain('wake turn');
+    expect(wakes?.querySelector('.board-age-split__num')?.textContent).toBeTruthy();
+    expect(wakes?.querySelector('.board-wakes__unknown')).toBeNull();
+    expect(wakes?.title).toContain('wake turn');
+    // invalid stamp: unknown again — never a fabricated time.
+    view.render(snapshot({ wakes: { count: 3, lastAt: 'not-a-timestamp' } }));
+    expect(wakes?.textContent).toContain('last wake unknown');
+    expect(wakes?.title).toContain('last wake time unknown');
+    // A calendar-impossible ISO date is still accepted as an optional
+    // timestamp by the snapshot boundary; do not let Date.parse normalize
+    // Feb 30 to March 2 and display a plausible, false wake age.
+    const impossibleDate = snapshot({ wakes: { count: 3, lastAt: '2026-02-30T00:00:00.000Z' } });
+    expect(isValidSnapshot(impossibleDate)).toBe(true);
+    view.render(impossibleDate);
+    expect(wakes?.querySelector('.board-age-split__num')).toBeNull();
+    expect(wakes?.querySelector('.board-wakes__unknown')).not.toBeNull();
+    // Date.parse also normalizes this non-canonical date-only form; do not
+    // let it bypass the calendar guard and manufacture a plausible age.
+    expect(Number.isFinite(Date.parse('2026-2-30'))).toBe(true);
+    const nonCanonicalImpossibleDate = snapshot({ wakes: { count: 3, lastAt: '2026-2-30' } });
+    expect(isValidSnapshot(nonCanonicalImpossibleDate)).toBe(true);
+    view.render(nonCanonicalImpossibleDate);
+    expect(wakes?.querySelector('.board-age-split__num')).toBeNull();
+    expect(wakes?.querySelector('.board-wakes__unknown')).not.toBeNull();
+    // A timezone-less date-time parses in the viewer's local zone; date-only
+    // stamps also lack an explicit zone. Keep either snapshot but show no age.
+    for (const stamp of ['2026-10-01T00:00:00', '2026-10-01']) {
+      expect(Number.isFinite(Date.parse(stamp))).toBe(true);
+      const timezoneLess = snapshot({ wakes: { count: 3, lastAt: stamp } });
+      expect(isValidSnapshot(timezoneLess)).toBe(true);
+      view.render(timezoneLess);
+      expect(wakes?.querySelector('.board-age-split__num')).toBeNull();
+      expect(wakes?.querySelector('.board-wakes__unknown')).not.toBeNull();
+    }
+    // An explicit offset remains an unambiguous, displayable wake timestamp.
+    view.render(snapshot({ wakes: { count: 3, lastAt: '2026-10-01T00:00:00+02:00' } }));
+    expect(wakes?.querySelector('.board-age-split__num')).not.toBeNull();
+    expect(wakes?.querySelector('.board-wakes__unknown')).toBeNull();
+    // 0 + no stamp WITH deferred demand: still the honest no-wakes state —
+    // no fire time exists, so it is not "unknown"; the deferred tally is a
+    // separate fact beside it.
+    view.render(
+      snapshot({ wakes: { count: 0, lastAt: null, deferred: { count: 2, reasons: { 'quiet-hours': 2 } } } }),
+    );
+    expect(wakes?.textContent).toContain('no wakes yet');
+    expect(wakes?.textContent).toContain('2 deferred');
+    expect(wakes?.textContent).not.toContain('last wake unknown');
+    expect(wakes?.title).toContain('deferred (avoided)');
+    // Silas stays independent: its pair shows its own wake, never Gru's.
+    view.render(
+      snapshot({
+        wakes: { count: 0, lastAt: null },
+        silas: silasAt('2026-01-01T00:00:00.000Z'),
+      }),
+    );
+    const silas = document.querySelector<HTMLElement>('.strip-pair[data-chip="silas"]');
+    expect(silas?.textContent).toContain('wake');
+    expect(silas?.textContent).not.toContain('last wake unknown');
+    const silasNum = silas?.querySelector('.strip-value__num');
+    expect(silasNum).not.toBeNull();
+    expect(silasNum?.textContent).not.toBe('0');
+    expect(silas?.querySelector('.strip-value__num')?.textContent).toMatch(/^\d+$/);
+  });
+
+  it('refreshes a split wake age across 9s→10s without a new snapshot', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    try {
+      const heldSnapshot = snapshot({ wakes: { count: 1, lastAt: '2026-01-01T00:00:00.000Z' } });
+      const view = new BoardView(() => {});
+      view.render(heldSnapshot);
+      const wakes = document.querySelector<HTMLElement>('#board-wakes');
+      const age = wakes?.querySelector<HTMLElement>('.board-age-split');
+      const number = age?.querySelector<HTMLElement>('.board-age-split__num');
+      const unit = age?.querySelector<HTMLElement>('.board-age-split__unit');
+      expect(number?.textContent).toBe('0');
+      expect(view.current).toBe(heldSnapshot);
+
+      vi.advanceTimersByTime(9_000);
+      expect(number?.textContent).toBe('9');
+      vi.advanceTimersByTime(1_000);
+      expect(number?.textContent).toBe('10');
+      expect(unit?.textContent).toBe('s ago');
+      expect(age?.querySelector('.board-age-split__lead')?.textContent).toBe('wake ');
+      expect(view.current).toBe(heldSnapshot);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('includes the CHILDREN group when the server reported counters and omits it when absent', () => {
+    const view = new BoardView(() => {});
+    view.render(snapshot());
+    expect(document.querySelectorAll('#chip-rail .strip-group')).toHaveLength(3);
+    view.render(
+      snapshot({
+        // Present-but-zero is a real report; absent is unknown and omits
+        // the group (never a claimed zero) — issue #161.
+        children: { queued: 1, active: 2, finished: 3, lifetimeCreations: 6 },
+      }),
+    );
+    const groups = [...document.querySelectorAll<HTMLElement>('#chip-rail .strip-group')];
+    expect(groups).toHaveLength(4);
+    expect(groups[3]?.querySelector('.strip-group__name')?.textContent).toBe('CHILDREN');
+    expect(groups[3]?.querySelector('[data-kpi="children.active"]')?.textContent).toBe('2');
   });
 });
 
@@ -2112,8 +2286,11 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expandForGru();
     expandCold();
     const unacked = document.querySelector<HTMLElement>('#board-unacked');
-    expect(unacked?.hidden).toBe(false);
-    expect(unacked?.textContent).toContain('needs Gru');
+    // The count is visible once on the ALERTS pair; preserve main's copy in
+    // the hidden tracker source for accessible/title consumers.
+    expect(unacked?.hidden).toBe(true);
+    expect(unacked?.textContent).toContain('1 notifications · needs Gru');
+    expect(document.querySelector<HTMLElement>('.strip-pair[data-chip="alerts"] .strip-value__num')?.textContent).toBe('1');
     // The record keeps BOTH durable rows. Machine rows clear through a Gru
     // disposition, not a human Ack, so neither carries an ack control.
     const rows = [...document.querySelectorAll('.board-notification')];

@@ -151,6 +151,7 @@ function shellCommandSubstitutionDepthAt(codeLines: readonly string[], lineIndex
 const PINS: Record<string, number> = {
   'classify-scheduled-verification-red.test.ts': 9,
   'assert-binned-baseline.test.ts': 3,
+  'classify-baseline.test.ts': 32,
   'assert-merge-authority-baseline.test.ts': 8,
   'assert-notification-card-baseline.test.ts': 8,
   'assert-perkins-integration-review-baseline.test.ts': 5,
@@ -344,7 +345,7 @@ const PINS: Record<string, number> = {
   'specialist-dispose-bounded.test.ts': 2,
   'static.test.ts': 10,
   'stub-runtime.test.ts': 14,
-  'suite-shape.test.ts': 4,
+  'suite-shape.test.ts': 5,
   'supervisor.test.ts': 218,
   'tool-heartbeat.test.ts': 2,
   'transcripts.test.ts': 14,
@@ -397,6 +398,17 @@ describe('suite shape', () => {
     expect(workflow).toMatch(/- uses: actions\/checkout@v6\n\s+with:\n\s+fetch-depth: 0\n\s*- uses: actions\/setup-node@v6/);
     expect(workflow).not.toContain('github.event.pull_request.head.sha');
     expect(workflow).toContain('run: npm test');
+  });
+
+  it('the SLIM baseline scope names every independently measured instrument surface', () => {
+    const worktree = readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8');
+    const line = worktree.split('\n').find((candidate) => candidate.startsWith('dashboard-slim-strip-baseline = '));
+    const allowlist = /--require-file-substr "([^"]+)"/u.exec(line ?? '')?.[1]?.split(',') ?? [];
+    expect(allowlist).toEqual([
+      'slim strip labelled status pairs',
+      'slim strip Heists/PRs/Crew count groups',
+      'reserved numeric slot for strip KPIs',
+    ]);
   });
 
   it('distinguishes unsupported R2 shell wrappers from inert shell text', () => {

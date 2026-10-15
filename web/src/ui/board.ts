@@ -141,6 +141,40 @@ const LENS_STATE_LABEL: Readonly<Record<string, string>> = {
   unused: '—',
 };
 
+/** Slim-strip group marker tones (Heists / PRs / Crew), by group label. */
+const STRIP_GROUP_TONE: Readonly<Record<string, string>> = {
+  HEISTS: 'work',
+  PRS: 'rev',
+  CREW: 'done',
+};
+
+function validWakeStamp(stamp: string | null): string | null {
+  if (stamp === null || stamp === '') return null;
+  const parsed = Date.parse(stamp);
+  if (!Number.isFinite(parsed)) return null;
+  // Require a full timestamp with a zone; date-times without one use the
+  // viewer's local time and date-only values do not identify a zoned instant.
+  // Date.parse can also normalize impossible ISO calendar days (for example
+  // Feb 30), so validate the date before showing an age; the snapshot remains
+  // usable and the UI can say the time is unknown.
+  const dateParts =
+    /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.exec(stamp);
+  if (dateParts === null) return null;
+  const year = Number(dateParts[1]);
+  const month = Number(dateParts[2]);
+  const day = Number(dateParts[3]);
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(year, month - 1, day);
+  if (
+    calendar.getUTCFullYear() !== year ||
+    calendar.getUTCMonth() !== month - 1 ||
+    calendar.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return stamp;
+}
+
 export interface TranscriptOpenRequest {
   readonly file: string;
   readonly label: string;
@@ -611,10 +645,11 @@ export class BoardView {
     mount.replaceChildren();
     const head = el('h2', 'board-band__head');
     head.id = 'board-owner-head';
-    head.append(
-      el('span', 'board-band__label', 'FOR YOU'),
-      el('span', 'board-band__count lbl', `${rows.length} pending`),
-    );
+    // The pending number rides its own reserved tabular slot (9→10 moves
+    // no label), the same contract as the strip's counts.
+    const count = el('span', 'board-band__count lbl');
+    count.append(el('span', 'num board-band__count-num', String(rows.length)), document.createTextNode(' pending'));
+    head.append(el('span', 'board-band__label', 'FOR YOU'), count);
     mount.append(head);
     mount.hidden = false;
     if (rows.length === 0) {
@@ -1055,78 +1090,120 @@ export class BoardView {
   }
 
   // ------------------------------------------------------------------
-  // Status chip rail (v6: the v4 health row, relocated + counts folded)
+  // Slim status strip (v7 compact density): one wrapping status row plus
+  // three stable count groups — same snapshot and derivations as the pill
+  // rail it replaces, so the strip can never disagree with the board.
   // ------------------------------------------------------------------
 
-  /** The global rail: seven chips — deploy → reviews → silas → alerts →
-   * verify → cure → trackers. Same snapshot as the rows below, so the
-   * rail can never disagree with the board. */
   private renderRail(snapshot: BoardSnapshot): void {
     this.chipRail.hidden = false;
-    this.renderTrackers(snapshot);
+    const chips = railChips(snapshot);
+    this.renderTrackerChips(snapshot);
     this.chipRail.replaceChildren();
-    for (const chip of railChips(snapshot)) {
-      this.chipRail.append(chip.id === 'trackers' ? this.trackersChipNode(chip) : this.railChipNode(chip));
+    const row = el('div', 'strip-status');
+    for (const chip of chips) {
+      if (chip.id !== 'trackers') row.append(this.statusPairNode(chip));
     }
-  }
-
-  private railChipNode(chip: RailChip): HTMLElement {
-    const node = el('span', `rail-chip rail-chip--${chip.tone}`);
-    node.dataset.chip = chip.id;
-    node.title = chip.titleAttr;
-    node.append(
-      el('span', 'rail-chip__label', chip.label),
-      el('span', 'rail-chip__value', chip.value),
+    row.append(this.decisionsChip, this.unackedChip, this.wakesChip);
+    this.chipRail.append(
+      row,
+      this.stripGroupsNode(chips.find((chip) => chip.id === 'trackers') ?? null),
     );
-    if (chip.flag !== null) {
-      node.append(el('span', 'pp-chip pp-chip--alert rail-chip__flag', chip.flag));
-    }
-    return node;
   }
 
-  /** TRACKERS: the folded KPI count strips plus the Jev + unacked chips the
-   * v4 tracker strip carried (their ids/behavior survive the move). v6.1:
-   * every count renders as a labeled field — no bare slash counters. */
-  private trackersChipNode(chip: RailChip): HTMLElement {
-    const node = el('span', `rail-chip rail-chip--trackers rail-chip--${chip.tone}`);
-    node.dataset.chip = 'trackers';
-    node.title = chip.titleAttr;
-    node.append(el('span', 'rail-chip__label', chip.label));
-    for (const group of chip.kpis ?? []) {
-      const groupNode = el('span', 'rail-kpi');
-      groupNode.title = group.title;
-      const label = el('b', 'rail-kpi__label', group.label);
+  /** One terse labeled pair; the tone dot is decoration — the label and
+   * value text carry the fact (never colour alone). */
+  private statusPairNode(chip: RailChip): HTMLElement {
+    const pair = el('span', `strip-pair strip-pair--${chip.tone}`);
+    pair.dataset.chip = chip.id;
+    pair.title = chip.titleAttr;
+    const dot = el('span', 'strip-dot');
+    dot.setAttribute('aria-hidden', 'true');
+    pair.append(dot, el('span', 'strip-key', chip.label), this.stripValueNode(chip));
+    if (chip.flag !== null) pair.append(this.stripFlagNode(chip));
+    return pair;
+  }
+
+  /** The value with its numeric part in a reserved tabular slot, fed by
+   * the same derivation that produced the plain string — never re-derived. */
+  private stripValueNode(chip: RailChip): HTMLElement {
+    const value = el('span', 'strip-value');
+    const split = chip.valueSplit;
+    if (split.lead !== '') value.append(el('span', 'strip-value__txt', `${split.lead} `));
+    if (split.num !== null) value.append(el('span', 'num strip-value__num', String(split.num)));
+    if (split.unit !== '') value.append(el('span', 'strip-value__txt', split.unit));
+    if (value.childElementCount === 0) value.append(el('span', 'strip-value__txt', chip.value));
+    return value;
+  }
+
+  /** Flags split their numeric part too ("3" + " FAILED"). */
+  private stripFlagNode(chip: RailChip): HTMLElement {
+    const flag = el('span', 'pp-chip pp-chip--alert strip-flag');
+    flag.title = chip.titleAttr;
+    const split = chip.flagSplit;
+    if (split !== null && split.num !== null) {
+      flag.append(el('span', 'num strip-flag__num', String(split.num)));
+      flag.append(el('span', 'strip-flag__txt', split.unit));
+    } else {
+      flag.append(el('span', 'strip-flag__txt', chip.flag ?? ''));
+    }
+    return flag;
+  }
+
+  /** Heists / PRs / Crew (plus CHILDREN when the server reported it):
+   * stable groups with a reserved total slot and one labeled pair per
+   * count. Every number keeps its `data-kpi` identity. */
+  private stripGroupsNode(trackers: RailChip | null): HTMLElement {
+    const groups = el('div', 'strip-groups');
+    if (trackers === null) return groups;
+    groups.dataset.chip = 'trackers';
+    // The chip's long-form explanation survives the re-face (preserved
+    // title text): hover/AT users keep the Heists/PRs/minions + Jev fact.
+    groups.title = trackers.titleAttr;
+    for (const group of trackers.kpis ?? []) {
+      const groupNode = el('section', `strip-group strip-group--${STRIP_GROUP_TONE[group.label] ?? 'park'}`);
+      // The visible group heading is also its accessible name; the full
+      // status enumeration remains available through the tooltip below.
+      groupNode.setAttribute('aria-label', group.label);
+      const head = el('h2', 'strip-group__head');
+      const mark = el('span', 'strip-group__mark');
+      mark.setAttribute('aria-hidden', 'true');
+      head.append(mark, el('span', 'strip-group__name', group.label));
       if (group.total !== undefined) {
-        const total = el('span', 'rail-kpi__total', String(group.total.value));
-        total.dataset.kpi = group.total.kpi;
-        total.title = group.total.title;
-        label.append(document.createTextNode(' '), total);
+        const total = el('span', 'strip-group__total');
+        const totalNum = el('span', 'num strip-group__total-num', String(group.total.value));
+        totalNum.dataset.kpi = group.total.kpi;
+        totalNum.title = group.total.title;
+        total.append(totalNum);
+        head.append(total, el('span', 'strip-group__unit', group.total.label));
       }
-      groupNode.append(label);
+      const pairs = el('p', 'strip-group__pairs');
+      pairs.title = group.title;
       for (const value of group.values) {
-        const field = el('span', 'rail-kpi__field');
-        const fieldLabel = el('span', 'rail-kpi__field-label', value.label);
-        fieldLabel.title = value.title;
-        const number = el('span', 'rail-kpi__num', String(value.value));
-        number.dataset.kpi = value.kpi;
-        number.title = value.title;
+        const item = el('span', 'strip-kpi');
+        const key = el('span', 'strip-kpi__k', value.label);
+        key.title = value.title;
+        const num = el('span', 'num strip-kpi__num', String(value.value));
+        num.dataset.kpi = value.kpi;
+        num.title = value.title;
         if (value.kpi === 'prs.conflicting' && value.value > 0) {
-          number.classList.add('rail-kpi__num--alert');
+          num.classList.add('strip-kpi__num--alert');
         }
-        field.append(fieldLabel, number);
-        groupNode.append(field);
+        item.append(key, num);
+        pairs.append(item);
       }
-      node.append(groupNode);
+      groupNode.append(head, pairs);
+      groups.append(groupNode);
     }
-    node.append(this.decisionsChip, this.unackedChip, this.wakesChip);
-    return node;
+    return groups;
   }
 
   // ------------------------------------------------------------------
-  // Trackers: decisions chip + NEEDS GRU queue + wake count
+  // Tracker chips: decisions + NEEDS GRU queue + wake count (the tracker
+  // GROUPS themselves render in stripGroupsNode from the same derivation).
   // ------------------------------------------------------------------
 
-  private renderTrackers(snapshot: BoardSnapshot): void {
+  private renderTrackerChips(snapshot: BoardSnapshot): void {
     const decisions = snapshot.decisions;
     this.decisionsChip.className = `pp-chip board-decisions ${decisionChipTone(decisions.status)}`;
     this.decisionsChip.dataset.state = decisions.status;
@@ -1140,35 +1217,66 @@ export class BoardView {
     // NEEDS GRU is the LIVE machine queue: action-required rows awaiting a
     // machine disposition (terminal-bound rows are closed receipts below).
     // It never rings the owner bell — the FOR YOU band (bell + toasts) is
-    // the only human-facing surface.
+    // the only human-facing surface. The slim strip renders this fact ONCE
+    // (the ALERTS pair); this chip keeps its id/text/title logic but stays
+    // hidden, so the number is not duplicated.
     const needsGru = snapshot.unackedActionRequired;
-    this.unackedChip.hidden = needsGru === 0;
+    this.unackedChip.hidden = true;
     this.unackedChip.textContent = `🛠 ${needsGru} notifications · needs Gru`;
     this.unackedChip.title = `${needsGru} live machine-attention notification${needsGru === 1 ? '' : 's'} awaiting a Gru disposition — the live queue clears itself; closed receipts stay in the record and the owner bell is not rung.`;
-    // Wake tracker: every autonomous wake is a durable `gru.wake` event;
-    // the count/last fire stamp makes the wake path visible on the board.
-    // Issue #219: deferred (avoided) wakes render here too — counts and
-    // reasons — so suppression is as visible as firing.
+    // Wake tracker: every autonomous wake is a durable `gru.wake` event.
+    // Count and last-wake time are INDEPENDENT facts derived ONLY from
+    // snapshot.wakes (never from Silas): only 0 + no/invalid stamp is the
+    // honest no-wakes state; a supplied valid stamp is never discarded, and
+    // a missing stamp with a count is "last wake unknown", never
+    // fabricated. Issue #219: deferred (avoided) wakes render beside the
+    // count — counts and reasons — so suppression is as visible as firing.
     const wakes = snapshot.wakes;
     const deferred = wakes.deferred;
     const deferredCount = deferred?.count ?? 0;
-    this.wakesChip.hidden = wakes.count === 0 && deferredCount === 0;
-    this.wakesChip.textContent =
-      `⚡ ${wakes.count} wake${wakes.count === 1 ? '' : 's'}` +
-      (deferredCount > 0 ? ` · ${deferredCount} deferred` : '') +
-      (deferred?.truncated === true ? '+' : '');
-    this.wakesChip.title =
-      wakes.count === 0 && deferredCount === 0
-        ? 'No autonomous Gru wakes yet.'
-        : `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last ${wakes.lastAt !== null ? formatTs(wakes.lastAt) : '—'}.` +
-          (deferredCount > 0
-            ? ` ${deferredCount}${deferred?.truncated === true ? '+' : ''} wake demand${deferredCount === 1 ? '' : 's'} deferred (avoided): ` +
-              Object.entries(deferred?.reasons ?? {})
-                .sort(([a], [b]) => b.localeCompare(a))
-                .map(([reason, n]) => `${n} ${reason}`)
-                .join(', ') +
-              (deferred?.truncated === true ? ' — tally truncated at the scan cap' : '')
-            : '');
+    const stamp = wakes.lastAt;
+    const parsed = validWakeStamp(stamp);
+    // 0 + no/invalid stamp is the honest no-wakes state even when avoidances
+    // are tallied alongside it: no wake ever fired, so the fire time is not
+    // "unknown" — the deferred demand is an additional, separate fact.
+    this.wakesChip.hidden = false;
+    this.wakesChip.replaceChildren();
+    if (wakes.count === 0 && parsed === null) {
+      this.wakesChip.append(
+        document.createTextNode('⚡ no wakes yet · '),
+        el('span', 'num board-wakes__count', '0'),
+      );
+      this.wakesChip.title = 'No autonomous Gru wakes yet.';
+    } else {
+      this.wakesChip.append(
+        document.createTextNode('⚡ '),
+        el('span', 'num board-wakes__count', String(wakes.count)),
+        document.createTextNode(` wake${wakes.count === 1 ? '' : 's'} · `),
+      );
+      if (parsed !== null) {
+        this.wakesChip.append(this.ageSplitNode('wake', parsed, ' ago'));
+        this.wakesChip.title = `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last ${formatTs(parsed)}.`;
+      } else {
+        this.wakesChip.append(el('span', 'board-wakes__unknown', 'last wake unknown'));
+        this.wakesChip.title = `${wakes.count} autonomous Gru wake turn${wakes.count === 1 ? '' : 's'} opened; last wake time unknown.`;
+      }
+    }
+    if (deferredCount > 0) {
+      this.wakesChip.append(
+        document.createTextNode(' · '),
+        el('span', 'num board-wakes__deferred', String(deferredCount)),
+        document.createTextNode(` deferred${deferred?.truncated === true ? '+' : ''}`),
+      );
+      this.wakesChip.title +=
+        ` ${deferredCount}${deferred?.truncated === true ? '+' : ''} wake demand${deferredCount === 1 ? '' : 's'} deferred (avoided): ` +
+        (Object.entries(deferred?.reasons ?? {}).length === 0
+          ? 'reasons unavailable'
+          : Object.entries(deferred?.reasons ?? {})
+              .sort(([a], [b]) => b.localeCompare(a))
+              .map(([reason, n]) => `${n} ${reason}`)
+              .join(', ')) +
+        (deferred?.truncated === true ? ' — tally truncated at the scan cap' : '');
+    }
   }
 
   // ------------------------------------------------------------------
@@ -1185,8 +1293,40 @@ export class BoardView {
     return node;
   }
 
+  /** Live age with its numeric part in a reserved tabular slot: lead word
+   * ("wake"), the digits, then the unit letter + tail ("m ago") — a refresh
+   * grows the digits inside the reserved box (9m → 10m moves nothing). */
+  private ageSplitNode(lead: string, since: string, tail: string): HTMLElement {
+    const node = el('span', 'board-age-split');
+    node.dataset.mode = 'split';
+    node.dataset.since = since;
+    node.dataset.tail = tail;
+    if (lead !== '') node.append(el('span', 'board-age-split__lead', `${lead} `));
+    node.append(el('span', 'num board-age-split__num'), el('span', 'board-age-split__unit'));
+    this.refreshAge(node);
+    this.ageNodes.add(node);
+    return node;
+  }
+
   private refreshAge(node: HTMLElement): void {
     const since = node.dataset.since !== undefined && node.dataset.since !== '' ? node.dataset.since : null;
+    if (node.dataset.mode === 'split') {
+      const num = node.querySelector<HTMLElement>('.board-age-split__num');
+      const unit = node.querySelector<HTMLElement>('.board-age-split__unit');
+      if (num === null || unit === null) return;
+      const age = formatAge(since);
+      const parts = /^(\d+)([smhd])$/.exec(age);
+      if (parts === null) {
+        // Honest em dash: no fabricated number, no reserved gap.
+        num.hidden = true;
+        unit.textContent = `${age}${node.dataset.tail ?? ''}`;
+      } else {
+        num.hidden = false;
+        num.textContent = parts[1]!;
+        unit.textContent = `${parts[2]!}${node.dataset.tail ?? ''}`;
+      }
+      return;
+    }
     node.textContent = `${node.dataset.prefix ?? ''}${formatAge(since)}${node.dataset.suffix ?? ''}`;
   }
 
@@ -1222,7 +1362,9 @@ export class BoardView {
    * classification — stopped/live-worker truth included — so their counts
    * cannot drift apart between renders. */
   private sectionsFor(snapshot: BoardSnapshot): ReturnType<typeof boardSections> {
-    // The same snapshot-only derivation the TRACKERS chip counts from.
+    // The same snapshot-only derivation the TRACKERS chip counts from
+    // (main's helper derives the stopped/live-worker truth from the same
+    // snapshot, so the strip and the section bodies still cannot drift).
     this.currentSections ??= snapshotSections(snapshot, Date.now());
     return this.currentSections;
   }

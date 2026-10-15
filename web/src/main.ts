@@ -139,7 +139,10 @@ renderChatOnline('idle');
 function measureChrome(): void {
   const barHeight = document.getElementById('command-bar')?.offsetHeight ?? 0;
   const rail = document.getElementById('chip-rail');
-  const railHeight = rail === null || rail.hidden ? 0 : rail.offsetHeight;
+  // A static (phone) strip scrolls away with the page, so it contributes
+  // no sticky offset.
+  const railHeight =
+    rail === null || rail.hidden || getComputedStyle(rail).position !== 'sticky' ? 0 : rail.offsetHeight;
   const total = barHeight + railHeight;
   if (total > 0) {
     document.documentElement.style.setProperty('--chrome-h', `${total}px`);
