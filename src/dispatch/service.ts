@@ -31,7 +31,7 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
 import {
   admitBlindReview,
   blindCoverageOf,
-  isAdmittedBlind,
+  observeBlindSessionAccess,
   readSessionToolResults,
   recordBlindAdmission,
   recordObservedAccess,
@@ -744,15 +744,20 @@ export class DispatchService {
     }
   }
 
-  /** Issue #316: record the finished blind reviewer's observed tool access.
-   * An unreadable session records nothing (never a fabricated clean pass);
-   * a failure here is logged and never blocks the report's delivery. */
-  private observeBlindSession(jobId: string, sessionFile: string | null): void {
+  /** Issue #316/#339: record the finished blind reviewer's observed tool
+   * access. This is the dispatch settle seam AND the observer the
+   * resume/re-brief settle seam is wired to (so a prohibited read during a
+   * continuation invalidates coverage). An unreadable session records nothing
+   * (never a fabricated clean pass); a failure here is logged and never
+   * blocks the report's delivery. */
+  observeBlindSession(jobId: string, sessionFile: string | null): void {
     try {
-      if (!isAdmittedBlind(this.opts.ledger, jobId)) return;
-      const results = (this.opts.sessionToolResults ?? readSessionToolResults)(sessionFile);
-      if (results === null) return;
-      recordObservedAccess(this.opts.ledger, jobId, results, 'session');
+      observeBlindSessionAccess(
+        this.opts.ledger,
+        jobId,
+        sessionFile,
+        this.opts.sessionToolResults ?? readSessionToolResults,
+      );
     } catch (error) {
       this.log('error', 'blind review access observation failed', { job: jobId, error: String(error) });
     }

@@ -434,6 +434,10 @@ export class Supervisor {
   private readonly jitter: (capMs: number) => number;
   /** Late-bound restart specialization (issue #161; see the option doc). */
   private restartPolicyFor: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined;
+  /** Late-bound blind-coverage observer (issue #339): a restart-recovered
+   * turn is a resume too. The dispatch service that owns the scan is built
+   * after the supervisor, so this is installed by `setObserveBlindTurn`. */
+  private observeBlindTurn: ((jobId: string, sessionFile: string | null) => void) | null = null;
   private readonly agents = new Map<string, SupervisedAgent>();
   /** Rejected replacements are never job-bound/adopted. Their cleanup
    * ownership must still fence the captured job, including when disposal
@@ -485,6 +489,15 @@ export class Supervisor {
    * here. Returning undefined = default restart. */
   setRestartPolicy(policy: (agentId: string, role: Role) => SupervisorRestartPolicy | undefined): void {
     this.restartPolicyFor = policy;
+  }
+
+  /** Issue #339: install the blind-coverage observer for supervisor-recovered
+   * turns (late-bound: the dispatch service that owns the scan is built after
+   * the supervisor). A restarted blind reviewer's recovered turn is a resume,
+   * so its prohibited reads must invalidate coverage exactly like the initial
+   * dispatch and re-brief settle seams. */
+  setObserveBlindTurn(observe: (jobId: string, sessionFile: string | null) => void): void {
+    this.observeBlindTurn = observe;
   }
 
   /** Start the watchdog ticker. */
@@ -1466,6 +1479,15 @@ export class Supervisor {
       } catch (error) {
         rejection = error;
       }
+      // Issue #339: this retry turn actually started. Observe its session at
+      // its PHYSICAL prompt-completion boundary, BEFORE any logical-disposition
+      // or supersession check can return. `clearRateLimitRetry` resolves the
+      // incident's logical disposition immediately on supersession/shutdown
+      // without awaiting this running prompt, so a logical settlement is never
+      // a physical transcript snapshot; a scan tied only to it (or to the
+      // recovered turn's bookkeeping authority) would miss a prohibited read
+      // appended by this retry.
+      this.observeBlindTurnAccess(agent.agentId, handle);
       if (rejection !== null) failure = String(rejection);
       if (agent.rateLimitRetry !== incident) return; // superseded mid-flight
       if (incident.activeDelivery !== deliveryToken) {
@@ -2568,6 +2590,11 @@ export class Supervisor {
     const controller = new AbortController();
     this.clearRecoveryAdmission(agent); // supersede any older recovery wait
     agent.recoveryAdmission = controller;
+    // Issue #339: set once the recovered prompt is actually delivered to the
+    // resumed session. From that point the session may hold tool results that
+    // must be observed before this method returns, whatever the authority
+    // state is at settle time.
+    let turnStarted = false;
     const delivery: RecoveryDelivery = { retry: null, snapshots: new Set([recovery]), errors: new WeakSet(), classifications: [] };
     this.recoveryDeliveries.set(handle, delivery);
     let settleCancelled!: () => void;
@@ -2603,6 +2630,7 @@ export class Supervisor {
       // error is thrown to the catch below, which consults the retry
       // settlement and — when nothing carried the turn — posts the honest
       // recoverable-lane note instead of recording a fabricated 'resumed'.
+      turnStarted = true;
       const verdict = await promptWithTerminalVerdict(handle, pending.text, {
         ...(pending.owner !== null ? { owner: pending.owner } : {}),
         ...(pending.images !== undefined ? { images: pending.images } : {}),
@@ -2678,11 +2706,42 @@ export class Supervisor {
       });
       this.postOrphanedTurn(laneAgentId, reason, String(error));
     } finally {
+      // Issue #339: a recovered turn that actually started (its prompt was
+      // delivered to the resumed session) is a resume too — observe its
+      // settled session on EVERY exit, including the stillCurrent() guards
+      // above. Those guards fence delivery bookkeeping, not the read-only
+      // observation: a turn that loses authority mid-flight still ran and may
+      // have read prohibited material, and leaving it unscanned would keep
+      // contaminated coverage qualifying (and steer the parent to reuse it).
+      if (turnStarted) this.observeBlindTurnAccess(laneAgentId, handle);
       controller.signal.removeEventListener('abort', settleCancelled);
       detachDelivery();
       if (this.recoveryDeliveries.get(handle) === delivery) this.recoveryDeliveries.delete(handle);
       if (agent.recoveryAdmission === controller) agent.recoveryAdmission = null;
       lease?.release();
+    }
+  }
+
+  /** Issue #339: record a finished resume/retry turn's observed tool access
+   * against the rule the job was admitted under (no-op for a non-blind job
+   * or an agent with no job). This is the supervisor's one call-through to the
+   * shared blind-coverage observer for both the restart-recovered turn and the
+   * automatic rate-limit retry turn; the production observer owns its own error
+   * boundary, and this one keeps a raw port from failing an already-delivered
+   * turn. */
+  private observeBlindTurnAccess(laneAgentId: string, handle: AgentHandle): void {
+    const observe = this.observeBlindTurn;
+    if (observe === null) return;
+    try {
+      // The ledger lookup rides inside the boundary too: a throwing read must
+      // not escape as a turn failure (at the resolve path it would re-route
+      // the turn into the catch branch; at the catch path it would escape the
+      // void'd caller entirely).
+      const jobId = this.ledger.getAgent(laneAgentId)?.jobId ?? null;
+      if (jobId === null) return;
+      observe(jobId, handle.sessionFile);
+    } catch (error) {
+      this.log('error', 'blind review access observation failed', { agent: laneAgentId, error: String(error) });
     }
   }
 

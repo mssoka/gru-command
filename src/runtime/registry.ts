@@ -116,10 +116,12 @@ export function serviceRegistryOptions(
     readonly workflowLaneFor: (options: SpawnOptions) => WorktreeLane | null;
     readonly workflowBuildFor?: (lane: WorktreeLane) => boolean;
     readonly workflowAgentFor?: (options: SpawnOptions) => string | undefined;
+    /** Loaded instance config path for the verification helper next action. */
+    readonly verificationConfigFile?: string;
   },
 ): RuntimeRegistryOptions {
-  const { workflowLaneFor, workflowBuildFor, workflowAgentFor, ...options } = base;
-  return { ...options, workflowRuntime: createWorkflowSessionBinder(base.config.dataDir, workflowLaneFor, undefined, workflowBuildFor, workflowAgentFor) };
+  const { workflowLaneFor, workflowBuildFor, workflowAgentFor, verificationConfigFile, ...options } = base;
+  return { ...options, workflowRuntime: createWorkflowSessionBinder(base.config.dataDir, workflowLaneFor, undefined, workflowBuildFor, workflowAgentFor, verificationConfigFile) };
 }
 
 /**
@@ -661,6 +663,9 @@ export class RuntimeRegistry {
       ...(cwd !== undefined ? { cwd } : {}),
       ...((workflowSession?.agentId ?? options.agentId) !== undefined ? { agentId: workflowSession?.agentId ?? options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
+      ...((workflowSession?.workerVerification ?? options.workerVerification) !== undefined &&
+        (options.reviewLead ?? options.isolatedReview) === undefined
+        ? { workerVerification: workflowSession?.workerVerification ?? options.workerVerification } : {}),
       ...(options.isolatedReview !== undefined ? { isolatedReview: options.isolatedReview } : {}),
       ...(options.reviewLead !== undefined ? { reviewLead: options.reviewLead } : {}),
       ...(options.reviewModel !== undefined ? { reviewModel: options.reviewModel } : {}),

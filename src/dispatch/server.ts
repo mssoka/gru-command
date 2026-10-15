@@ -98,6 +98,10 @@ export interface DispatchServerOptions {
   readonly propertyCampaigns?: PropertyCampaignService;
   /** Book of Lessons injection for directives/re-briefs (pointers only). */
   readonly lessons?: LessonsReferencePort;
+  /** Issue #339: observe a re-briefed session at its settle seam so a
+   * prohibited read invalidates blind coverage; wired by the service to
+   * `DispatchService.observeBlindSession`. Absent = no observation. */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
   readonly log?: Log;
 }
 
@@ -1461,6 +1465,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             owner: 'silas-ops',
             ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
             ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+            ...(options.observeBlindTurn !== undefined ? { observeBlindTurn: options.observeBlindTurn } : {}),
             ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
             ...(options.childWorkers !== undefined
               ? { parentTools: (agentId: string) => options.childWorkers!.parentTools(agentId) }
@@ -1901,6 +1906,7 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
             });
           },
           ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
+          ...(options.observeBlindTurn !== undefined ? { observeBlindTurn: options.observeBlindTurn } : {}),
         });
       } catch (error) {
         if (!(error instanceof RebriefTurnCancelled)) {
