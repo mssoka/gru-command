@@ -7882,6 +7882,12 @@ export class LedgerApi {
     }
   }
 
+  /** A reservation alone is deliberately not a cleanup blocker (#362): a
+   * prompt runs only after onPrepared durably commits the native target and
+   * the producer start (both fenced), so a crash between spawn and onPrepared
+   * left no native effect. Its spawned registration stays fenced as an open
+   * turn, and the reserved request is never replayed without a positive
+   * deferral. */
   claimDirectiveDispatch(requestId: string): boolean {
     return this.transaction(() => {
       const identity = this.directiveTurnIdentity(requestId);

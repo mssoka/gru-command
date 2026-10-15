@@ -853,6 +853,64 @@ describe('restart-recovery-progress — exact native request matrix', () => {
     finally { await service.dispose(); }
   });
 
+  it('#362 the prompt never runs before the durable native target and producer start commit', async () => {
+    const f = await fixture();
+    const seen: { target: unknown; started: boolean }[] = [];
+    const prompt = f.native.prompt.bind(f.native);
+    f.native.prompt = async (text: string, options?: unknown) => {
+      let started = true;
+      try { f.ledger.directiveProducerStart(f.identity); } catch { started = false; }
+      seen.push({ target: f.ledger.getDirective(f.intent.requestId)?.nativeTarget ?? null, started });
+      return prompt(text, options);
+    };
+    await executeAcceptedDirective(f.deps, f.intent.requestId);
+    expect(seen).toEqual([{ target: { agentId: 'logical-minion', sessionFile: f.file }, started: true }]);
+  });
+
+  it('#362 a crash after spawn but before onPrepared is never replayed, and its successor waits only for the open turn', async () => {
+    const f = await fixture(); void (f.ledger.getWorktree(f.lane.id) ?? f.ledger.registerWorktree(f.lane));
+    // The durable state a process leaves when it dies after registry.spawn()
+    // and registration but before onPrepared: the reservation, the spawned
+    // registration, no native target, no producer start, no deferral.
+    expect(f.ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(true);
+    f.ledger.setAgentState('logical-minion', 'spawning');
+    const original = f.ledger.getDirective(f.intent.requestId)!;
+    expect(original).toMatchObject({ state: 'dispatching', nativeTarget: null });
+    f.db.close(); const db = new LedgerDb(f.dir); cleanups.push(() => db.close());
+    const bus = new EventBus({}); const ledger = new LedgerApi(db.handle, { bus });
+    for (const lane of ledger.listWorktrees()) rememberManagedLane(lane, ledger);
+    const registry: DirectiveRegistry = { getHandle: () => null, spawn: async (_role, options = {}) => { f.spawns.push(options); throw new Error('the reserved original must never respawn'); },
+      disposeHandle: async (handle) => handle.dispose() };
+    const deps = { ...f.deps, ledger, registry, notifications: new NotificationCenter({ ledger, bus }) };
+    const service = new DirectiveProgressService(deps);
+    try { service.reconsider(); await service.settled(); service.reconsider(); await service.settled(); }
+    finally { await service.dispose(); }
+    // Never replayed: no spawn, no prompt, no deferral invented from the missing target.
+    expect(f.spawns).toEqual([]); expect(f.native.prompts).toEqual([]);
+    expect(ledger.getDirective(f.intent.requestId)).toMatchObject({ state: 'dispatching', nativeTarget: null });
+    expect(ledger.hasDirectiveDispatchDeferral(f.intent.requestId)).toBe(false);
+    expect(ledger.claimDirectiveDispatch(f.intent.requestId)).toBe(false);
+    const debt = ledger.listObligations({ jobId: f.intent.jobId }).find((item) => item.incidentKey === `directive-recovery:${f.intent.requestId}`);
+    expect(debt?.state).toMatch(/open|waiting/);
+    const authority = ledger.directiveCurrentAuthority(f.intent.jobId);
+    const decide = () => recoverInterruptedDirectiveFromRoute({ ledger, worktrees: f.worktrees, pendingProducerBlockers: () => [],
+      requestId: f.intent.requestId, generation: debt!.generation, expectedPayloadHash: original.payloadHash,
+      expectedHead: resolveGitCommit(f.lane.path, 'HEAD'), expectedEpoch: ledger.directiveRecoveryEpoch(f.intent.jobId),
+      expectedWorkRevision: authority.workRevision, expectedContractSha256: authority.contractSha256,
+      reason: 'the reserved original never reached a native target', decision: { kind: 'successor', requestId: 'post-crash-successor', directive: 'approved correction' } });
+    // The spawned registration is still an open turn: the successor waits.
+    const refused = (() => { try { decide(); return null; } catch (error) { return error as { code?: string; blockers?: readonly string[] }; } })();
+    expect(refused?.code).toBe('live_work');
+    expect(refused?.blockers).toEqual([expect.stringMatching(/open worker turn\(s\): logical-minion \(spawning\)/u)]);
+    expect(ledger.getDirective('post-crash-successor')).toBeNull();
+    // Once that turn is terminal, no native effect can exist (no target and no
+    // producer start were ever recorded), so fresh authority may proceed.
+    ledger.setAgentState('logical-minion', 'disposed');
+    expect(decide().successor?.requestId).toBe('post-crash-successor');
+    expect(ledger.getDirective(f.intent.requestId)?.state).toBe('retired');
+    expect(f.native.prompts).toEqual([]);
+  });
+
   it('positive no-effect closes only the attached awaiting phase without completion', async () => {
     const f = await fixture(); f.ledger.failDirective({ requestId: f.intent.requestId, reason: 'fixture replaced before dispatch' });
     const row = f.ledger.beginDirectiveIntent({ jobId: f.intent.jobId, requestId: 'phase-no-effect', directive: 'approved', holder: 'gru', handoff: { kind: 'gru-decision', decision: 'inspect phase' } }).record;
