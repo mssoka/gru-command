@@ -487,13 +487,13 @@ verification budget.
   prior base into the new one) and the unit is bounded (at most 4000
   changed paths, 8 MiB of diff, strict UTF-8 paths; every `git diff --raw`
   record parsed exactly, with rename detection disabled so a rename/copy,
-  stray, duplicate or unparseable record fails closed). Any failed proof
-  reviews the whole change instead, with the reason disclosed as
-  `deltaUnavailable` (quoting at most a short, bounded excerpt of any
-  offending path). A partial integration READY
-  still owes the final whole-change pass; if the base moves again before
-  that pass runs, the next round reviews whole (whatever the candidate,
-  policy or lineage), so a moving base can never defer approval forever.
+  stray, duplicate, unparseable or unexpected-status record fails closed).
+  Any failed proof reviews the whole change instead, with the reason
+  disclosed as `deltaUnavailable` (quoting at most a 200-character escaped
+  excerpt of any offending path). A partial integration READY still owes
+  the final whole-change pass; if the base moves again before that pass
+  runs, the next round reviews whole (whatever the candidate, policy or
+  lineage), so a moving base can never defer approval forever.
 
 - **Fail-before baselines are declared scopes, not hand runs (#394).** A
   repair's fail-before claim is proved by a declared `[verify]` scope (for

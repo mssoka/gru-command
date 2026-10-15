@@ -7,11 +7,13 @@ import type { FixtureRepo } from './fixture-repo.js';
  * still writing .git while the fixture is removed, so both are disabled
  * first (#393's 4001-path fixtures). */
 export function commitManyPaths(repo: FixtureRepo, count: number, directory = 'many'): void {
+  // 100000 bounds a typo (4e9) to minutes of fixture work, never a full disk.
   if (!Number.isSafeInteger(count) || count < 1 || count > 100_000) {
     throw new Error(`commitManyPaths needs a path count from 1 to 100000 (got ${String(count)})`);
   }
-  if (directory === '' || isAbsolute(directory) || directory.split(/[\\/]/u).some((part) => part === '..' || part === '.' || part === '')) {
-    throw new Error(`commitManyPaths directory must be a plain relative path inside the fixture (got ${JSON.stringify(directory)})`);
+  if (directory === '' || isAbsolute(directory) || /^[A-Za-z]:/u.test(directory) || directory.includes('\0') ||
+      directory.split(/[\\/]/u).some((part) => part === '..' || part === '.' || part === '' || part === '.git')) {
+    throw new Error(`commitManyPaths directory must be a relative path inside the fixture's work tree (got ${JSON.stringify(directory)})`);
   }
   if (existsSync(join(repo.path, directory))) throw new Error(`commitManyPaths directory already exists: ${directory}`);
   repo.git(['config', 'gc.auto', '0']);

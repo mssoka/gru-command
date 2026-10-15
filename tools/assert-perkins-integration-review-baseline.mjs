@@ -32,7 +32,7 @@
  *           and owner-readiness assertions fail.
  */
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { posix, resolve } from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
@@ -63,30 +63,40 @@ export const BASELINE_TITLES = {
 
 const ASSERTION_HEAD = /^AssertionError: /u;
 const PROMISE_REPORT_HEAD = /^(?:AssertionError|Error): promise (?:resolved|rejected) .* instead of (?:rejecting|resolving)$/u;
-/** A V8 stack frame line: `at <fn> (<location>)` whose parenthesised part
- * ends in `:line:col` or is a V8 token (`<anonymous>`, `index N`, `native`),
- * a bare `at <absolute path or file:// URL>:line:col`, or `at <anonymous>`.
- * Indented prose in an assertion message — `at least 3 (see docs)`,
+/** A V8 stack frame line (optionally `async`): `at <fn> (<location>)` whose
+ * parenthesised location is an absolute path, a file:// or node: URL, an
+ * `eval at …` origin or a V8 token (`<anonymous>`, `index N`, `native`); a
+ * bare `at <absolute path or URL>:line:col`; or `at <anonymous>`. Indented
+ * prose in an assertion message — `at least 3 (see notes.md:1:2)`,
  * `at 12:30:15` — is not a frame. */
-const STACK_LINE = /^\s+at (?:\S.* \((?:.*:\d+:\d+|<anonymous>|index \d+|native)\)|(?:file:\/\/|[A-Za-z]:[\\/]|[\\/]).*:\d+:\d+|<anonymous>)$/u;
+const PATH_START = String.raw`(?:file:\/\/|node:|[A-Za-z]:[\\/]|[\\/])`;
+const STACK_LINE = new RegExp(String.raw`^\s+at (?:async )?(?:\S.* \((?:${PATH_START}.*:\d+:\d+|eval at .*|<anonymous>|index \d+|native)\)|${PATH_START}.*:\d+:\d+|<anonymous>)$`, 'u');
 const LOCATION = /^(file:\/\/)?(.+):\d+:\d+$/u;
-/** A location: a file:// URL is decoded (so an encoded `test%2Fhelpers`
- * segment is judged as the path it names); a plain path is kept as is. */
+/** A location as the path it names. A file:// URL is decoded (an encoded
+ * `test%2Fhelpers` is judged as the path it names), stripped of any query or
+ * fragment (a vite `?t=` stamp), given back its drive letter, and normalised
+ * (`..` resolved); an undecodable URL is unlocatable. */
 function located(match) {
   if (match === null) return undefined;
   if (match[1] === undefined) return match[2];
-  try { return decodeURIComponent(match[2]); } catch { return match[2]; }
+  let path;
+  try { path = decodeURIComponent(match[2].replace(/[?#].*$/u, '')); } catch { return undefined; }
+  if (/^\/[A-Za-z]:\//u.test(path)) path = path.slice(1);
+  return posix.normalize(path);
 }
 /** The source location a frame names, or undefined (`<anonymous>`, `index 0`,
  * `native`). Paths may contain spaces, parentheses and colons: a framed
  * location is the remainder after the FIRST " (" that yields one, so
  * `fn (/repo/a (copy)/x.ts:1:2)` and `/repo/a (copy).test.ts:1:2` both
- * resolve to their full path. An `eval` frame names the location of the
- * code that called eval. */
+ * resolve to their full path. An `eval` frame names the location of the code
+ * that called eval — the innermost origin when evals nest. */
 export function frameLocation(line) {
-  const body = line.replace(/^\s+at /u, '');
-  const evalOrigin = /\beval at .*? \(((?:file:\/\/)?[^()]+?:\d+:\d+)\)/u.exec(body);
-  if (evalOrigin !== null) return located(LOCATION.exec(evalOrigin[1]));
+  const body = line.replace(/^\s+at /u, '').replace(/^async /u, '');
+  const innermostEval = body.lastIndexOf('eval at ');
+  if (innermostEval !== -1) {
+    const origin = /^\S+ \(((?:file:\/\/)?.+?:\d+:\d+)\)(?:, |\)$)/u.exec(body.slice(innermostEval + 'eval at '.length));
+    return origin === null ? undefined : located(LOCATION.exec(origin[1]));
+  }
   if (body.endsWith(')')) {
     for (let index = body.indexOf(' ('); index !== -1; index = body.indexOf(' (', index + 1)) {
       const location = located(LOCATION.exec(body.slice(index + 2, -1)));

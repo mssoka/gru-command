@@ -275,7 +275,7 @@ const PINS: Record<string, number> = {
   'perkins-integration-review.test.ts': 15,
   'perkins-lead-schema-compat.test.ts': 6,
   'perkins-whole-review.test.ts': 141,
-  'perkins-review-convergence.test.ts': 57,
+  'perkins-review-convergence.test.ts': 58,
   'phase-handoffs.test.ts': 13,
   'pipeline-server.test.ts': 12,
   'report-jobs-backfill.test.ts': 17,

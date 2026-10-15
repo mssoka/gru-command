@@ -384,6 +384,7 @@ export interface RawChange {
  * --abbrev=40` change set. The NUL-delimited form needs no C-unquote
  * decoding; a path that does not decode as UTF-8 refuses (the caller falls
  * back to a whole review). Modes are kept so a mode-only change is not lost. */
+/** (Exported for the real-git `--no-renames` pin in the guard tests.) */
 export function rawChanges(repoPath: string, fromSha: string, toSha: string): Map<string, RawChange> {
   let bytes: Buffer;
   try {
@@ -396,9 +397,20 @@ export function rawChanges(repoPath: string, fromSha: string, toSha: string): Ma
   return parseRawChanges(bytes);
 }
 
-/** Repository text quoted into a disclosed fallback reason stays short. */
+/** Escaped characters of repository text quoted into a disclosed reason. */
+const REASON_EXCERPT_MAX_CHARS = 200;
+/** Repository text quoted into a disclosed fallback reason: a JSON literal of
+ * at most REASON_EXCERPT_MAX_CHARS escaped characters (escape expansion
+ * counted), cut on a code-point boundary and marked with … when cut. */
 function boundedForReason(text: string): string {
-  return JSON.stringify(text.length > 160 ? `${text.slice(0, 160)}…` : text);
+  let kept = '';
+  let length = 2; // the quotes
+  for (const point of text) {
+    const piece = JSON.stringify(point).length - 2;
+    if (length + piece > REASON_EXCERPT_MAX_CHARS) return `${JSON.stringify(kept).slice(0, -1)}…"`;
+    kept += point; length += piece;
+  }
+  return JSON.stringify(text);
 }
 
 /** Parse `git diff --raw -z --abbrev=40` bytes (exported for the guard
@@ -427,12 +439,16 @@ export function parseRawChanges(bytes: Buffer): Map<string, RawChange> {
     // A header that starts a raw record but does not parse is unexpected
     // output: fail closed (the caller reviews whole) rather than silently
     // shrink the reviewed unit and the carry scope.
-    if (match === null) throw new Error('git diff --raw produced an unparseable record');
+    if (match === null) {
+      throw new Error(`git diff --raw produced an unparseable record${/ [RC]\d*$/u.test(header) ? ' (it looks like a rename/copy record: rename detection must stay disabled, --no-renames)' : ''}`);
+    }
     // Rename/copy records carry TWO paths: the caller disables rename
     // detection, so one here is unexpected output and fails closed by name.
     if (match[5] === 'R' || match[5] === 'C') {
       throw new Error('git diff --raw produced a rename/copy record — rename detection must stay disabled (--no-renames)');
     }
+    // Only the statuses a commit-to-commit, no-renames diff can carry.
+    if (!['A', 'D', 'M', 'T'].includes(match[5]!)) throw new Error(`git diff --raw produced an unexpected status ${JSON.stringify(match[5])}`);
     const path = fields[index + 1];
     // A missing/empty path field is the same fail-open class: refuse it.
     if (path === undefined || path === '') throw new Error('git diff --raw produced a record with no path');

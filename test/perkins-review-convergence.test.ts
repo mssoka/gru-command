@@ -530,15 +530,29 @@ describe('integration unit fail-loud guards (#393)', () => {
   });
 
   it('reads a real rename as a deletion and an addition: rename detection stays disabled, whatever the repository config (#393)', () => {
-    const { repo } = integratedFeature('perkins-guard-renames');
-    repo.git(['config', 'diff.renames', 'copies']);
-    const before = repo.commitFile('src/moved.ts', 'export const moved = 1;\n'.repeat(20));
-    repo.git(['mv', 'src/moved.ts', 'src/renamed.ts']);
-    repo.git(['commit', '-m', 'rename without content change']);
-    const changes = rawChanges(repo.path, before, repo.head());
-    expect([...changes.keys()].sort()).toEqual(['src/moved.ts', 'src/renamed.ts']);
-    expect(changes.get('src/moved.ts')?.newSha).toBe('0'.repeat(40));
-    expect(changes.get('src/renamed.ts')?.oldSha).toBe('0'.repeat(40));
+    for (const [setting, edit] of [['copies', false], ['true', true]] as const) {
+      const { repo } = integratedFeature(`perkins-guard-renames-${setting}`);
+      repo.git(['config', 'diff.renames', setting]);
+      const before = repo.commitFile('src/moved.ts', 'export const moved = 1;\n'.repeat(20));
+      repo.git(['mv', 'src/moved.ts', 'src/renamed.ts']);
+      // A small edit makes git score the similarity (an R<score> record if detection ran).
+      if (edit) writeFileSync(join(repo.path, 'src/renamed.ts'), `${'export const moved = 1;\n'.repeat(19)}export const edited = 2;\n`);
+      repo.git(['add', '-A']);
+      repo.git(['commit', '-m', `rename (${setting}, edited ${String(edit)})`]);
+      const changes = rawChanges(repo.path, before, repo.head());
+      expect([...changes.keys()].sort(), setting).toEqual(['src/moved.ts', 'src/renamed.ts']);
+      expect(changes.get('src/moved.ts'), setting).toMatchObject({ newSha: '0'.repeat(40), newMode: '000000' });
+      expect(changes.get('src/renamed.ts'), setting).toMatchObject({ oldSha: '0'.repeat(40), oldMode: '000000' });
+    }
+  });
+
+  it('refuses unsafe commitManyPaths fixtures by name before writing anything', () => {
+    const { repo } = integratedFeature('perkins-guard-helper');
+    for (const [count, directory] of [[0, 'many'], [100_001, 'many'], [1, '../out'], [1, '/abs'], [1, 'C:foo'], [1, '.git/objects2'], [1, 'a/./b'], [1, 'a\0b']] as const) {
+      expect(() => commitManyPaths(repo, count, directory), `${String(count)} ${directory}`).toThrow(/commitManyPaths/u);
+    }
+    commitManyPaths(repo, 2, 'twice');
+    expect(() => commitManyPaths(repo, 2, 'twice')).toThrow(/directory already exists: twice/u);
   });
 
   it('refuses an unparseable or path-less git diff --raw record', () => {
@@ -558,11 +572,23 @@ describe('integration unit fail-loud guards (#393)', () => {
     // Quoted repository text is bounded in the disclosed reason.
     const long = `src/${'x'.repeat(400)}.ts`;
     const longRecord = `:100644 100644 ${sha} ${'b'.repeat(40)} M\0${long}\0`;
-    const message = (() => { try { parseRawChanges(Buffer.from(longRecord + longRecord)); return ''; } catch (error) { return String(error); } })();
-    expect(message.length).toBeLessThan(260);
-    expect(message).toContain('…');
+    const thrown = (bytes: Buffer): string => { try { parseRawChanges(bytes); return ''; } catch (error) { return String(error); } };
+    // Both quoting sites bound the excerpt, counting escape expansion.
+    for (const message of [
+      thrown(Buffer.from(longRecord + longRecord)),
+      thrown(Buffer.from(`${'x'.repeat(400)}\0${longRecord}`)),
+      thrown(Buffer.from(`${'\u0001'.repeat(400)}\0${longRecord}`)),
+    ]) {
+      expect(message.length, message.slice(0, 80)).toBeLessThan(320);
+      expect(message).toContain('…');
+    }
     // A malformed header is unparseable, whatever letter it ends in.
-    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short R\0a.ts\0`))).toThrow(/unparseable record/u);
+    expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} short R\0a.ts\0`))).toThrow(/unparseable record \(it looks like a rename\/copy record/u);
+    // Only A/D/M/T statuses are expected from a no-renames commit diff.
+    for (const status of ['U', 'X', 'B']) {
+      expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} ${status}\0a.ts\0`)), status).toThrow(/unexpected status/u);
+    }
+    expect([...parseRawChanges(Buffer.from(`:100644 120000 ${sha} ${'b'.repeat(40)} T\0link\0`)).keys()]).toEqual(['link']);
     // Rename/copy records (two paths) are refused by name, never misparsed.
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} R100\0old.ts\0new.ts\0`))).toThrow(/rename\/copy record/u);
     expect(() => parseRawChanges(Buffer.from(`:100644 100644 ${sha} ${sha} C75\0a.ts\0b.ts\0`))).toThrow(/rename\/copy record/u);

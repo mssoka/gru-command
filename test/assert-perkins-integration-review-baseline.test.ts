@@ -146,13 +146,27 @@ describe('perkins integration R4 fail-before classifier', () => {
       ['    at async Promise.all (index 0)', undefined],
       ['    at <anonymous>', undefined],
       ['    at eval (eval at load (file:///repo/test/helpers/h.ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/h.ts'],
+      ['    at eval (eval at load (file:///repo/test/helpers/a (copy).ts:4:5), <anonymous>:1:1)', '/repo/test/helpers/a (copy).ts'],
+      ['    at eval (eval at a (eval at b (file:///x/test/helpers/n.ts:1:1), <anonymous>:2:2), <anonymous>:3:3)', '/x/test/helpers/n.ts'],
       ['    at file:///repo/test%2Fhelpers/encoded.ts:1:2', '/repo/test/helpers/encoded.ts'],
+      ['    at file:///repo/test/%2e%2e/helpers/x.ts:1:2', '/repo/helpers/x.ts'],
+      ['    at file:///repo/test/a.test.ts?t=1700000000:1:2', '/repo/test/a.test.ts'],
+      ['    at file:///C:/repo/test/a.test.ts:1:2', 'C:/repo/test/a.test.ts'],
+      ['    at file:///repo/test/%E0%A4%A.ts:1:2', undefined],
+      ['    at async /repo/test/helpers/h.ts:4:5', '/repo/test/helpers/h.ts'],
+      ['    at async Promise.all (index 0)', undefined],
     ] as const) expect(frameLocation(line), line).toBe(location);
+    // An async helper frame is still a helper; a vite-stamped test URL is a test.
+    expect(isBehavioralAssertion('AssertionError: x\n    at async /repo/test/helpers/h.ts:4:5')).toBe(false);
+    expect(isBehavioralAssertion('AssertionError: x\n    at file:///repo/test/a.test.ts?t=1:1:2')).toBe(true);
+    // Real V8 shapes stay frames: node: internals, <anonymous> and native calls.
+    expect(isBehavioralAssertion('AssertionError: x\n    at new Foo (<anonymous>)\n    at Module._compile (node:internal/modules/cjs/loader:1554:14)\n    at Array.map (native)\n    at /repo/test/a.test.ts:1:2')).toBe(true);
     // An eval called from a helper, or an encoded helper URL, is still a helper.
     expect(isBehavioralAssertion('AssertionError: x\n    at eval (eval at load (file:///repo/test/helpers/h.ts:4:5), <anonymous>:1:1)')).toBe(false);
     expect(isBehavioralAssertion('AssertionError: x\n    at file:///repo/test%2Fhelpers/encoded.ts:1:2')).toBe(false);
     // Indented prose with parentheses or a clock time is never a frame.
     expect(isBehavioralAssertion('AssertionError: expected list\n    at least 3 items (see docs)\n    at 12:30:15 the job ran')).toBe(true);
+    expect(isBehavioralAssertion('AssertionError: expected list\n    at least 3 items (see notes.md:1:2)')).toBe(true);
     expect(isBehavioralAssertion('AssertionError: expected list\n    at least 3 items (see docs)\n    at /repo/test/a.test.ts:1:2')).toBe(true);
     // A helper path holding parentheses is still a helper.
     expect(isBehavioralAssertion('AssertionError: x\n    at /repo/test/helpers/a (copy).test.ts:3:4')).toBe(false);
@@ -199,7 +213,7 @@ describe('perkins integration R4 fail-before classifier', () => {
     const manifest = loadWorktreeManifest(join(import.meta.dirname, '..'));
     if (manifest === null) throw new Error('the repository has no .gru-command/worktree.toml manifest');
     const scopes = Object.entries(manifest.verify).filter(([, command]) => command.includes('assert-perkins-integration-review-baseline.mjs'));
-    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs["']?(?:\s+--?\S+)*\s+([\w-]+)/u.exec(command)?.[1];
+    const legOf = (command: string): string | undefined => /assert-perkins-integration-review-baseline\.mjs["']?(?:\s+--?[\w-]+(?:=\S+)?)*\s+["']?([A-Za-z0-9]+)["']?(?:\s|$)/u.exec(command)?.[1];
     for (const [name, command] of scopes) expect(legOf(command), `${name} names its classifier leg`).toBeDefined();
     for (const [leg, titles] of Object.entries(BASELINE_TITLES)) {
       const own = scopes.filter(([, command]) => legOf(command) === leg);
