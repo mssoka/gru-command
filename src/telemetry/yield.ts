@@ -36,6 +36,8 @@ export const SERVICE_WAKE_MARKER = 'This turn was started by the service wake po
 export const SESSION_ROLES = ['gru', 'silas', 'bob', 'perkins', 'minion'] as const;
 export type SessionRole = (typeof SESSION_ROLES)[number];
 
+import { AUTOPILOT_DECISION_EVENT, AUTOPILOT_SOURCE } from '../dispatch/silas-autopilot.js';
+
 /** Which budget a trigger spends: machine attention, delivery work, owner chat. */
 export const TURN_CLASSES = ['machine', 'delivery', 'owner'] as const;
 export type TurnClass = (typeof TURN_CLASSES)[number];
@@ -77,6 +79,7 @@ export const REPORT_EVENT_KINDS = [
   'job.status',
   'job.created',
   'decisions.shadow',
+  AUTOPILOT_DECISION_EVENT,
 ] as const;
 
 /** Notification-kind prefix of the mechanical PR-conflict alerts that
@@ -577,6 +580,38 @@ export interface GruWakeCauses {
   };
 }
 
+/** One autopilot rule family's decisions over the window, with the
+ * agreement measure the rollout reads (issue #243). Agreement is measured
+ * over `dry-run` decisions only: an `enforce` decision already acted, so
+ * there is nothing for the model to agree with. A decision AGREES when a
+ * receipt of the family's own action kinds lands for the same job AFTER the
+ * decision, names the SAME predicted debt identity (round/run/head/url),
+ * carries a `rule_id` that names the decision's family (a receipt of a kind
+ * shared across families carries no weight without it, H6), and is NOT the
+ * autopilot's own machine receipt (`source: 'silas-autopilot'`) — the model
+ * read the same row and did the same thing. It is UNOBSERVABLE when no
+ * `silas.wake` landed after it in the window: the model was never given the
+ * row again. Everything else is a disagreement; a reviewer reading the raw
+ * events decides whether a specific disagreement was harmful. */
+export interface AutopilotFamilyMeasure {
+  readonly ruleId: string;
+  /** The mode every decision of this family carried, or 'mixed'. */
+  readonly mode: string;
+  /** Dry-run decisions: the agreement sample. */
+  readonly decisions: number;
+  /** Enforce-mode decisions: the action was attempted (a failed enforcement
+   * still counts here), so there is nothing for the model to agree with. */
+  readonly enforced: number;
+  readonly agreed: number;
+  readonly unobservable: number;
+  readonly agreementShare: number | null;
+}
+
+export interface AutopilotMeasures {
+  readonly decisions: number;
+  readonly byFamily: readonly AutopilotFamilyMeasure[];
+}
+
 export interface M0Measures {
   /** Distinct jobs whose status moved to merged|done inside the window. */
   readonly finishedJobs: number;
@@ -595,6 +630,7 @@ export interface LedgerMeasures {
   readonly gruWakeCauses: GruWakeCauses;
   readonly m0: M0Measures;
   readonly decisionsShadow: DecisionShadowMeasures;
+  readonly autopilot: AutopilotMeasures;
 }
 
 /** How a provider miss came about, from its recorded diagnostics:
@@ -1152,7 +1188,179 @@ export function computeLedgerMeasures(
     costPerFinishedUsd: null, // filled by buildYieldReport from session totals
   };
 
-  return { silasYield, gruYield, digestStability: stability, gruWakeCauses, m0, decisionsShadow: computeDecisionShadowMeasures(events) };
+  return {
+    silasYield,
+    gruYield,
+    digestStability: stability,
+    gruWakeCauses,
+    m0,
+    decisionsShadow: computeDecisionShadowMeasures(events),
+    autopilot: computeAutopilotMeasures(events, since, until),
+  };
+}
+
+/** The receipt kinds that prove each autopilot family's action actually
+ * happened when LLM Silas performs it (issue #243). */
+const AUTOPILOT_FAMILY_RECEIPTS: Readonly<Record<string, readonly string[]>> = {
+  'verdict-rung-directive': ['silas.directive-sent'],
+  'verdict-rung-rebrief': ['silas.rebrief'],
+  'verification-repair': ['silas.directive-sent'],
+  'pr-conflict-rebase': ['silas.directive-sent'],
+  'clean-abort-service-restart': ['silas.review-triggered'],
+  'sweep-ack': ['silas.lane-released'],
+  // Issue #243 R2-H8: the bare, untagged `job.pr-linked` the service emits
+  // for ANY caller (including the autopilot's own `recordPr`) is NOT model
+  // evidence. Only the attributable `silas.pr-registered` receipt counts.
+  'delivered-pr-register': ['silas.pr-registered'],
+  'pr-review-trigger': ['silas.review-triggered'],
+};
+
+/** Receipt kinds shared by more than one family. A receipt of a shared kind
+ * can only be credited to a decision when it NAMES that decision's rule id
+ * (issue #243 H6): a bare `silas.directive-sent` is as likely to be another
+ * family's action, and must never count as agreement. */
+const SHARED_RECEIPT_KINDS: ReadonlySet<string> = new Set(
+  Object.values(AUTOPILOT_FAMILY_RECEIPTS).flat().filter((kind, index, all) => all.indexOf(kind) !== index),
+);
+
+function eventPayload(event: LedgerEventRecord): Record<string, unknown> {
+  return event.payload !== null && typeof event.payload === 'object'
+    ? (event.payload as Record<string, unknown>)
+    : {};
+}
+
+/** The per-row debt identity a decision predicted, from its `would_call`
+ * (issue #243 R2-H7/F-H5): the exact blocker fingerprint, source round, PR
+ * url or BOUND review head the decision named. A family with no per-row key
+ * (sweep-ack) returns `{}` and is matched on job + kind + rule only. For the
+ * review families the predicted bound head is normalised to `target_ref` so
+ * a receipt that names the ARMED/FROZEN head can be compared directly. */
+function decisionDebtIdentity(payload: Record<string, unknown>): Record<string, string> {
+  const wouldCall = payload['would_call'];
+  const call = wouldCall !== null && typeof wouldCall === 'object'
+    ? (wouldCall as Record<string, unknown>)
+    : {};
+  const identity: Record<string, string> = {};
+  for (const key of ['blocker_fingerprint', 'source_round_id', 'url'] as const) {
+    const value = call[key];
+    if (typeof value === 'string' && value !== '') identity[key] = value;
+  }
+  const head = call['target_ref'] ?? call['bound_delivered_sha'];
+  if (typeof head === 'string' && head !== '') identity['target_ref'] = head;
+  return identity;
+}
+
+/** A receipt counts for a decision's debt only when it names the SAME
+ * identity (issue #243 R2-H7) — the exact blocked fingerprint, source round
+ * or PR url. A receipt that names a different run/round/head never credits
+ * the prediction, and one that omits the identity never credits a
+ * prediction that named it. */
+function receiptMatchesDebt(identity: Record<string, string>, receipt: Record<string, unknown>): boolean {
+  const keys = Object.keys(identity);
+  if (keys.length === 0) return true;
+  return keys.every((key) => receipt[key] === identity[key]);
+}
+
+/**
+ * Autopilot decisions and their agreement with what LLM Silas actually did
+ * (issue #243, the rollout's `dry-run` read).
+ *
+ * An `enforce` decision is reported as `enforced` and excluded from the
+ * agreement sample — the machine took the action (or attempted it); there is
+ * nothing for the model to agree with. A `dry-run` decision AGREES when a
+ * receipt of the family's own action kinds lands for the same job AFTER the
+ * decision, names the SAME predicted debt identity (round/run/head/url,
+ * R2-H7), carries a `rule_id` that names the decision's family (a receipt
+ * of a kind shared across families carries no weight without it, H6), and is
+ * NOT the autopilot's own machine receipt (`source: 'silas-autopilot'`) —
+ * the model read the same row and did the same thing. It is UNOBSERVABLE
+ * when no `silas.wake` landed after it in the window, so the model was
+ * never handed the row again; everything else is a disagreement. The
+ * agreement share is computed over the OBSERVABLE decisions only (L1), and
+ * is null when none is observable.
+ */
+export function computeAutopilotMeasures(
+  events: readonly LedgerEventRecord[],
+  since: string,
+  until: string,
+): AutopilotMeasures {
+  const decisions = events.filter(
+    (event) => event.kind === AUTOPILOT_DECISION_EVENT && inWindow(event.ts, since, until),
+  );
+  const newestWakeSeq = events
+    .filter((event) => event.kind === 'silas.wake' && inWindow(event.ts, since, until))
+    .reduce((best, event) => Math.max(best, event.seq), 0);
+  const familyActions = events.filter(
+    (event) =>
+      SILAS_YIELD_ACTION_KINDS.includes(event.kind as (typeof SILAS_YIELD_ACTION_KINDS)[number]) &&
+      inWindow(event.ts, since, until),
+  );
+  const byRule = new Map<string, { modes: Set<string>; decisions: number; enforced: number; agreed: number; unobservable: number }>();
+  for (const decision of decisions) {
+    const payload =
+      decision.payload !== null && typeof decision.payload === 'object'
+        ? (decision.payload as Record<string, unknown>)
+        : {};
+    const ruleId = typeof payload['rule_id'] === 'string' ? payload['rule_id'] : 'unknown';
+    const mode = typeof payload['mode'] === 'string' ? payload['mode'] : 'unknown';
+    const entry = byRule.get(ruleId) ?? { modes: new Set<string>(), decisions: 0, enforced: 0, agreed: 0, unobservable: 0 };
+    entry.modes.add(mode);
+    if (mode === 'enforce') {
+      entry.enforced += 1;
+      byRule.set(ruleId, entry);
+      continue;
+    }
+    entry.decisions += 1;
+    const kinds = AUTOPILOT_FAMILY_RECEIPTS[ruleId] ?? [];
+    const debt = decisionDebtIdentity(payload);
+    // Issue #243 F-H6: agreement requires positive model provenance in the
+    // comparison window — a `silas.wake` AFTER this decision, i.e. the model
+    // was actually shown the row again. A tagged authenticated API action
+    // (or a wake that only precedes the decision) is NOT model observation:
+    // it stays UNOBSERVABLE rather than being credited as agreement.
+    const observedAfterDecision = newestWakeSeq > decision.seq;
+    const agreed = observedAfterDecision && familyActions.some((event) => {
+      if (event.seq <= decision.seq) return false;
+      if (event.jobId === null || event.jobId !== decision.jobId) return false;
+      if (!kinds.includes(event.kind)) return false;
+      const eventBody = eventPayload(event);
+      // The autopilot's own action is not the model's agreement (H6).
+      if (eventBody['source'] === AUTOPILOT_SOURCE) return false;
+      const receiptRuleId = typeof eventBody['rule_id'] === 'string' ? eventBody['rule_id'] : undefined;
+      if (receiptRuleId !== undefined) {
+        if (receiptRuleId !== ruleId) return false;
+      } else if (SHARED_RECEIPT_KINDS.has(event.kind)) {
+        // A receipt that names no rule is only attributable to a family whose
+        // action kind is unique (H6).
+        return false;
+      }
+      // Issue #243 R2-H7/F-H5: the debt identity must match too.
+      return receiptMatchesDebt(debt, eventBody);
+    });
+    if (agreed) entry.agreed += 1;
+    else if (!observedAfterDecision) entry.unobservable += 1;
+    byRule.set(ruleId, entry);
+  }
+  return {
+    decisions: decisions.length,
+    byFamily: [...byRule.entries()]
+      .map(([ruleId, entry]) => {
+        // Unobservable decisions are not a model disagreement — the model
+        // was never handed the row again. Compute the share over what the
+        // model actually observed (L1).
+        const observable = entry.decisions - entry.unobservable;
+        return {
+          ruleId,
+          mode: entry.modes.size === 1 ? [...entry.modes][0] ?? 'unknown' : 'mixed',
+          decisions: entry.decisions,
+          enforced: entry.enforced,
+          agreed: entry.agreed,
+          unobservable: entry.unobservable,
+          agreementShare: observable === 0 ? null : entry.agreed / observable,
+        };
+      })
+      .sort((a, b) => b.decisions - a.decisions || a.ruleId.localeCompare(b.ruleId)),
+  };
 }
 
 function toStatus(payload: unknown): string {
@@ -1179,6 +1387,8 @@ export interface YieldReport {
   readonly gruWakeCauses: GruWakeCauses;
   readonly m0: M0Measures;
   readonly decisionsShadow: DecisionShadowMeasures;
+  /** Issue #243: autopilot decisions and their agreement per family. */
+  readonly autopilot: AutopilotMeasures;
 }
 
 export interface BuildReportInput {
@@ -1210,6 +1420,7 @@ export function buildYieldReport(input: BuildReportInput): YieldReport {
     gruWakeCauses: measures.gruWakeCauses,
     m0: { ...measures.m0, costPerFinishedUsd },
     decisionsShadow: measures.decisionsShadow,
+    autopilot: measures.autopilot,
   };
 }
 
@@ -1367,6 +1578,20 @@ export function renderTextReport(report: YieldReport): string {
   }
   if (report.decisionsShadow.skipped > 0) {
     push(`  ${fmtNum(report.decisionsShadow.skipped)} unreadable shadow row(s) skipped`);
+  }
+  push('');
+  push('Silas autopilot (#243)');
+  if (report.autopilot.decisions === 0) {
+    push('  no autopilot decisions in window');
+  } else {
+    push(`  decisions ${fmtNum(report.autopilot.decisions)}`);
+    for (const family of report.autopilot.byFamily) {
+      push(
+        `  ${printable(family.ruleId)} [${printable(family.mode)}]: decisions ${fmtNum(family.decisions)}, ` +
+          `agreed ${fmtNum(family.agreed)} (${fmtPct(family.agreementShare)}), unobservable ${fmtNum(family.unobservable)}, ` +
+          `enforced ${fmtNum(family.enforced)}`,
+      );
+    }
   }
   push('');
   push('M0 — heists');

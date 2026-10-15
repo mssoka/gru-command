@@ -104,7 +104,14 @@ export interface WorktreePort {
   }): Promise<WorktreeLane>;
   getWorktree(id: string): WorktreeLane | null;
   listWorktrees(opts?: { jobId?: string }): readonly WorktreeLane[];
-  release(input: { worktreeId: string; confirmKill?: boolean; baseBranch?: string }): Promise<WorktreeSweepResult>;
+  release(input: {
+    worktreeId: string;
+    confirmKill?: boolean;
+    baseBranch?: string;
+    /** Issue #243 F-H1: an unattended release proves tracked cleanliness and
+     * fresh required containment before any forced removal. */
+    requireReleaseProofs?: boolean;
+  }): Promise<WorktreeSweepResult>;
 }
 
 export const WORKTREE_PORT_UNAVAILABLE =

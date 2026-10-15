@@ -54,7 +54,7 @@ describe('Silas deterministic-pass seam drives actual handoff reconsideration', 
       ledger: { appendCustomEvent: () => ({ seq: 1 }) } as never,
       worktrees: { listWorktrees: () => [] } as never,
       ops: { baseUrl: 'http://127.0.0.1:0', configPath: 'unused' },
-      config: { enabled: true, sweepIntervalMs: 60_000, pollIntervalMs: 0, directiveAt: 2, rebriefAt: 3, escalateAt: 4, stallThresholdMs: 1_800_000, unchangedRewakeMs: 21_600_000 },
+      config: { enabled: true, sweepIntervalMs: 60_000, pollIntervalMs: 0, directiveAt: 2, rebriefAt: 3, escalateAt: 4, stallThresholdMs: 1_800_000, unchangedRewakeMs: 21_600_000, autopilot: { enabled: false, rules: {} } },
       skills: [],
       bus,
       now: () => 0,
@@ -114,7 +114,7 @@ it('P34 real pending original native directive is reconsidered through the produ
   const driver = new SilasDriver({ ledger: { appendCustomEvent: () => ({ seq: 1 }) } as never, worktrees: { listWorktrees: () => [] } as never,
     slot: { ensure: async () => { throw new Error('no model wake'); }, viewFor: () => null } as never, bus,
     ops: { baseUrl: 'http://127.0.0.1:0', configPath: 'unused' }, skills: [],
-    config: { enabled: true, sweepIntervalMs: 60_000, pollIntervalMs: 0, directiveAt: 2, rebriefAt: 3, escalateAt: 4, stallThresholdMs: 1_800_000, unchangedRewakeMs: 21_600_000 },
+    config: { enabled: true, sweepIntervalMs: 60_000, pollIntervalMs: 0, directiveAt: 2, rebriefAt: 3, escalateAt: 4, stallThresholdMs: 1_800_000, unchangedRewakeMs: 21_600_000, autopilot: { enabled: false, rules: {} } },
     setInterval: ((callback: () => void) => { sweep = callback; return 1; }) as unknown as typeof setInterval, clearInterval: (() => {}) as never,
     onDeterministicPass: createProductionDeterministicPass({ ledger, notifications, getWave: () => undefined, directiveProgress: progress }) });
   try {

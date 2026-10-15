@@ -412,6 +412,45 @@ export class SessionStore {
   }
 
   /**
+   * Issue #243 F-H4 — the DISTINCT durable shutdown checkpoint artifact. A
+   * pre-first-await record of the still-owned pending autopilot producers
+   * plus the last-seen session sizes, written while locks and the ledger
+   * remain OPEN. It reuses the same atomic staging+rename mechanics as
+   * {@link persistSnapshot} but writes a SEPARATE file, so the original final
+   * snapshot's path/count/exactly-once semantics are untouched. The artifact
+   * is recoverable on boot only as last-seen / pending debt — never as
+   * successful delivery or proven cessation. It never releases a lock.
+   */
+  writeShutdownCheckpoint(input: { readonly pending: readonly unknown[] }): void {
+    const snapshot: Record<string, number> = {};
+    for (const file of this.listSessionFiles()) {
+      try {
+        snapshot[file] = statSync(file).size;
+      } catch {
+        /* vanished mid-scan */
+      }
+    }
+    const checkpointFile = join(this.sessionsDir, 'store-shutdown-checkpoint.json');
+    const staging = `${checkpointFile}.tmp-${process.pid}`;
+    writeFileSync(
+      staging,
+      `${JSON.stringify(
+        {
+          phase: 'shutdown-checkpoint',
+          printedAt: new Date().toISOString(),
+          bootId: this.bootId,
+          sessions: snapshot,
+          pendingWork: input.pending,
+        },
+        null,
+        2,
+      )}\n`,
+      'utf-8',
+    );
+    renameSync(staging, checkpointFile);
+  }
+
+  /**
    * One backup pass: copy every tracked session file into the backup dir
    * with an ISO-hour suffix (the slot IS the hour — a second pass in the
    * same hour refreshes the slot), then prune oldest beyond retention.
