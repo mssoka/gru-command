@@ -2380,12 +2380,10 @@ export class Supervisor {
           // adopt, never replay the recovered prompt across it.
           const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
           if (refusal !== null) {
-            await this.registry.disposeHandle(spawned).catch((error: unknown) => {
-              this.log('warn', 'dispose of the fenced replacement failed', {
-                agent_id: spawned.id,
-                error: String(error),
-              });
-            });
+            // Same exact custody as every rejected replacement (issue #280):
+            // quarantine, cleanup journal, audit and the unconfirmed-cleanup
+            // owner notice on a failed disposal. The controller stays retryable.
+            await this.rejectRestartReplacement(agent, spawned, reason, restartAuthority, false);
             this.fenceRearm(agent, opts.rearmNotificationId ?? null, refusal);
             return;
           }

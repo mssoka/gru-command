@@ -2061,6 +2061,32 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
+  it('PR306 B2: a guarded re-arm refused after the spawn keeps rejected-replacement custody when disposal fails', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    try {
+      // The re-arm spawn succeeds; an active Perkins review claims the lane
+      // while it is in flight (a re-arm fence outside native authority) and
+      // the refused replacement's disposal then fails.
+      f.rig.supervisor.setActiveReviewProbe(() => true);
+      f.replacement.dispose = async () => { throw new Error('fenced replacement cleanup failed'); };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.register).not.toHaveBeenCalled();
+      expect(f.swapped).not.toHaveBeenCalled();
+      expect(f.replacement.promptCalls).toEqual([]);
+      // Custody debt, not just a log line: producer ownership stays unknown...
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain(`cleanup unconfirmed: ${f.replacement.id}`);
+      // ...with the owner-facing unconfirmed-cleanup notice and the audit.
+      const notice = f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed');
+      expect(notice).toHaveLength(1);
+      expect(notice[0]?.detail).toContain('fenced replacement cleanup failed');
+      expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).some((event) => event.kind === 'supervision.restart-rejected')).toBe(true);
+      // The re-arm control is still fenced and retryable.
+      expect(f.rig.api.listEvents({ limit: 200 }).some((event) => event.kind === 'supervision.rearm-fenced')).toBe(true);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
   it('does not treat a disposed event followed by rejection as acknowledged cleanup', async () => {
     vi.useFakeTimers();
     const f = await deferredRestart(true);

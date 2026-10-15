@@ -667,3 +667,21 @@ describe('notification center — durable log + receipts + acks', () => {
     expect(unacked.map((n) => n.id)).toEqual([a.id]);
   });
 });
+
+describe('owner-attention registry vs main producers (PR306 B1)', () => {
+  it('a reserved recovery owner-transfer stop keeps ringing the owner through the real center', () => {
+    const rig = boot();
+    for (const kind of ['directive', 'rebrief'] as const) {
+      const row = rig.center.postIncident({
+        kind: `silas.recovery-owner-transfer.${kind}.subject-1.1`,
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Reserved owner decision',
+        detail: 'owner-only stop',
+        dedupe: 'active',
+      });
+      expect(row.routing).toBe('needs-owner');
+      expect(rig.api.getNotification(row.id)?.routing).toBe('needs-owner');
+    }
+  });
+});

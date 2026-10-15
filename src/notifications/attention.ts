@@ -50,6 +50,8 @@ const OWNER_REQUIRED_PREFIXES: readonly string[] = [
   'gru.wake-failed-escalation.',
   'decisions.enforce-gate.',
   'worktree-sweep-paused:',
+  // Reserved owner-decision stop for an owner-transferred recovery (issue #280).
+  'silas.recovery-owner-transfer.',
 ];
 
 /** Kinds whose producer decides between owner attention and passive feed. */
