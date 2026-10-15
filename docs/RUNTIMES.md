@@ -4,6 +4,16 @@ Gru Command hosts every agent session behind the `AgentRuntime` interface
 (`src/runtime/types.ts`). Nothing above the adapter layer may import a
 concrete adapter — the interface is the contract (SPEC ruling 4).
 
+## Default runtime
+
+New installs and generated configs (`config-generate`, the setup wizard) write
+`[runtimes] default = "claude-code"`. `pi` remains fully supported: choose it with
+`config-generate --runtime pi` or `--answers '{"runtime":"pi"}'`. Existing
+`config.toml` files keep whatever they say (including a config with no
+`[runtimes]` table, which still resolves to `pi`); regenerating with `--force`
+adopts the existing runtime unless one is chosen explicitly. Switch an existing
+install by editing `[runtimes] default`.
+
 ## Capability matrix
 
 | Capability | `pi` | `claude-code` | Meaning |

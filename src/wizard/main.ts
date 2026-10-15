@@ -32,12 +32,14 @@ import { configPathFor, expandTilde, instanceDirFromEnv, DEFAULT_INSTANCE_PORT, 
 import type { RuntimeProbeResult } from '../runtime/probe.js';
 import {
   AnswersError,
+  DEFAULT_NEW_INSTALL_RUNTIME,
   generateToken,
   parseAnswers,
   resolveBindHost,
   validateWorkspaceRoot,
   type WizardAnswers,
 } from './answers.js';
+import { assertRuntimeCliAvailable } from './runtime-cli.js';
 import {
   buildQrPayload,
   clearWizardDraft,
@@ -75,17 +77,17 @@ function printProbe(results: readonly RuntimeProbeResult[]): void {
   }
   if (!results.some((result) => result.installed)) {
     stdout.write(
-      '\n⚠ No runtime CLI found (pi / claude). You can proceed — the wizard\n' +
-      '  writes the config anyway, and adapters fail LOUD at spawn time until\n' +
-      '  you install one.\n',
+      '\n⚠ No runtime CLI found (claude / pi). Claude Code (the default) needs its\n' +
+      '  `claude` CLI before setup writes the config; pi can still be configured and\n' +
+      '  fails LOUD at spawn time until you install it.\n',
     );
   }
 }
 
-/** Default runtime pick: first installed probe (pi preferred), else "pi". */
-function defaultRuntimeId(results: readonly RuntimeProbeResult[]): string {
-  const installed = results.find((result) => result.installed);
-  return installed !== undefined ? installed.id : 'pi';
+/** Default runtime pick for a fresh install: Claude Code, never a silent
+ * swap to whichever CLI happens to be installed (a missing CLI fails loud). */
+function defaultRuntimeId(): string {
+  return DEFAULT_NEW_INSTALL_RUNTIME;
 }
 
 interface WizardTerminal {
@@ -245,7 +247,7 @@ async function interactiveAnswers(
     );
   }
 
-  const runtimeDefault = prior?.runtimes.default ?? defaultRuntimeId(probe);
+  const runtimeDefault = prior?.runtimes.default ?? defaultRuntimeId();
   let runtime = runtimeDefault;
   for (;;) {
     const answer = await ask(
@@ -649,6 +651,14 @@ async function main(argv: readonly string[]): Promise<number> {
     draftPath = saveWizardDraft(instanceDir, collected.draftJson);
   }
   const abortNote = draftPath === null ? '' : `\n  Your answers are saved (${draftPath}); re-running offers to reuse them.`;
+
+  if (prior === null || prior.runtimes.default !== answers.runtime) {
+    try {
+      assertRuntimeCliAvailable(answers.runtime);
+    } catch (error) {
+      fail(`${(error as Error).message}${abortNote}`);
+    }
+  }
 
   const configPath = configPathFor(instanceDir);
   if (existsSync(configPath) && !force) {

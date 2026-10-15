@@ -19,7 +19,7 @@ import {
   renderReferenceConfig,
   tomlString,
 } from '../config-reference.js';
-import type { WizardAnswers } from './answers.js';
+import { DEFAULT_NEW_INSTALL_RUNTIME, type WizardAnswers } from './answers.js';
 
 export { tomlString, discoverManagedRepos };
 
@@ -188,7 +188,7 @@ export function loadExistingInstanceConfig(instanceDir: string): GruCommandConfi
  * prompt defaults; explicit answers and non-default picks always win). */
 const PROMPT_DEFAULTS = {
   workspaceRoot: '~/code',
-  runtime: 'pi' as const,
+  runtime: DEFAULT_NEW_INSTALL_RUNTIME,
   model: 'default',
   thinkingLevel: 'default',
   host: '127.0.0.1',

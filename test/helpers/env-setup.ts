@@ -33,3 +33,17 @@ if (process.env['GRU_COMMAND_SMOKE'] !== '1') {
   // the CHILD env explicitly, never through this process's environment.
   delete process.env['GRU_SERVICE_PORT'];
 }
+
+// New installs default to Claude Code and setup fails loud when `claude` is
+// not on PATH (#374). Append (never prepend) an inert stub so wizard /
+// config-generate tests do not depend on the host having the CLI; a real
+// install earlier on PATH still wins, and tests that exercise the missing-CLI
+// path set PATH explicitly on the child env.
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
+{
+  const stubDir = mkdtempSync(join(tmpdir(), 'gru-command-claude-stub-'));
+  writeFileSync(join(stubDir, 'claude'), '#!/bin/sh\necho 1.0.0\n', { mode: 0o755 });
+  process.env['PATH'] = `${process.env['PATH'] ?? ''}${delimiter}${stubDir}`;
+}
