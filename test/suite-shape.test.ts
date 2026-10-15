@@ -173,7 +173,7 @@ const PINS: Record<string, number> = {
   'silas-h4-checkpoint.test.ts': 3,
   'silas-model-action.test.ts': 4,
   'silas-rules.test.ts': 10,
-  'silas-autopilot.test.ts': 98,
+  'silas-autopilot.test.ts': 102,
   'silas-preservation-reference.test.ts': 12,
   'smoke-claude.test.ts': 1,
   'smoke-real-model.test.ts': 1,
