@@ -185,7 +185,6 @@ function mountBoardDom(): void {
   document.body.innerHTML = `
     <div id="chip-rail" hidden>
       <span id="board-decisions"></span>
-      <span id="board-unacked" hidden></span>
       <span id="board-wakes" hidden></span>
     </div>
     <nav id="board-nav" hidden></nav>
@@ -547,11 +546,11 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     const names = [...groups].map((node) => node.querySelector('.strip-group__name')?.textContent);
     expect(names).toEqual(['HEISTS', 'PRS', 'CREW']);
     expect([...groups].map((node) => node.getAttribute('aria-label'))).toEqual(names);
-    // Group heads are h2 (approved reference heading level, fixes the
-    // h3-before-h2 document order).
-    for (const head of document.querySelectorAll('.strip-group__head')) {
-      expect(head.tagName).toBe('H2');
-    }
+    // #401: the sticky strip adds no headings or region landmarks ahead of
+    // FOR YOU — each count group is a labelled role=group container.
+    expect([...groups].map((node) => node.getAttribute('role'))).toEqual(['group', 'group', 'group']);
+    expect([...groups].map((node) => node.tagName)).toEqual(['DIV', 'DIV', 'DIV']);
+    expect(rail?.querySelectorAll('h1, h2, h3, h4, h5, h6, section, [role="region"], [role="heading"]')).toHaveLength(0);
   });
 
   it('renders deploy drift with the restart-pending flag when behind', () => {
@@ -704,15 +703,13 @@ describe('board v7 — slim status strip (pill rail replaced)', () => {
     expect(chip?.textContent).toBe('Jev: READY');
     expect(chip?.dataset.state).toBe('ready');
     expect(chip?.classList.contains('pp-chip--done')).toBe(true);
-    // Main's complete live-queue copy/title remains; SLIM displays its
-    // number exactly once on the ALERTS pair.
-    const unacked = document.querySelector<HTMLElement>('#board-unacked');
-    expect(unacked?.hidden).toBe(true);
-    expect(unacked?.textContent).toContain('2 notifications · needs Gru');
-    // The count is the LIVE machine queue: the copy says so (A4).
-    expect(unacked?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
-    expect(unacked?.title).toContain('closed receipts stay in the record');
+    // The live NEEDS GRU queue renders exactly once — the ALERTS pair — and
+    // the old hidden tracker chip is gone (#400).
+    expect(document.getElementById('board-unacked')).toBeNull();
     const alerts = document.querySelector<HTMLElement>('.strip-pair[data-chip="alerts"]');
+    // The count is the LIVE machine queue: the pair's title says so (A4).
+    expect(alerts?.title).toContain('2 live machine-attention notifications awaiting a Gru disposition');
+    expect(alerts?.title).toContain('closed receipts stay in the record');
     expect(alerts?.querySelector('.strip-value__num')?.textContent).toBe('2');
     expect(alerts?.querySelector('.strip-flag__txt')?.textContent).toBe('NEEDS GRU');
     expect(alerts?.classList.contains('strip-pair--alert')).toBe(true);
@@ -2285,12 +2282,11 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     // reveal both before asserting classification and record truth.
     expandForGru();
     expandCold();
-    const unacked = document.querySelector<HTMLElement>('#board-unacked');
-    // The count is visible once on the ALERTS pair; preserve main's copy in
-    // the hidden tracker source for accessible/title consumers.
-    expect(unacked?.hidden).toBe(true);
-    expect(unacked?.textContent).toContain('1 notifications · needs Gru');
-    expect(document.querySelector<HTMLElement>('.strip-pair[data-chip="alerts"] .strip-value__num')?.textContent).toBe('1');
+    // The count is visible once, on the ALERTS pair, whose title carries the
+    // live-queue explanation for hover/AT consumers.
+    const alerts = document.querySelector<HTMLElement>('.strip-pair[data-chip="alerts"]');
+    expect(alerts?.querySelector('.strip-value__num')?.textContent).toBe('1');
+    expect(alerts?.title).toContain('1 live machine-attention notification awaiting a Gru disposition');
     // The record keeps BOTH durable rows. Machine rows clear through a Gru
     // disposition, not a human Ack, so neither carries an ack control.
     const rows = [...document.querySelectorAll('.board-notification')];
@@ -2586,8 +2582,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(row?.getAttribute('data-worker-state')).toBe('waiting');
     expect(row?.querySelector('.board-job__status')?.textContent).toBe('waiting · quota wall');
     expect(row?.querySelector('.board-job__signal')?.textContent).toContain('needs Gru');
-    const unacked = document.querySelector<HTMLElement>('#board-unacked');
-    expect(unacked?.textContent).toContain('needs Gru');
+    expect(document.querySelector<HTMLElement>('.strip-pair[data-chip="alerts"] .strip-flag__txt')?.textContent).toBe('NEEDS GRU');
   });
 
   it('the waiting truth is scoped to working lanes: an in-review lane with a live round keeps its true chip', () => {
@@ -4008,7 +4003,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
       expect(section('NEEDS GRU').textContent).not.toContain('Notice closed-machine');
       expect(section('FEED').querySelector('[data-receipt="closed"]')?.textContent).toContain('Notice closed-machine');
       expect(section('FEED').querySelector('.board-notification__ack')).toBeNull();
-      expect(document.getElementById('board-unacked')?.textContent).toContain('needs Gru');
+      expect(document.querySelector('.strip-pair[data-chip="alerts"] .strip-flag__txt')?.textContent).toBe('NEEDS GRU');
       expect(document.querySelector('.board-band--needs-you .board-job')).toBeNull();
       expect(client.ackNotification).not.toHaveBeenCalled();
       expect(machine.ackedAt).toBeNull();
@@ -4048,7 +4043,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     // Hidden ancestor (pre-pairing board) → nothing was displayed.
     const client2 = stubClient();
     document.body.innerHTML = `<div hidden><section id="board-owner"></section></div>
-      <div id="chip-rail" hidden><span id="board-decisions"></span><span id="board-unacked" hidden></span><span id="board-wakes" hidden></span></div>
+      <div id="chip-rail" hidden><span id="board-decisions"></span><span id="board-wakes" hidden></span></div>
       <div id="board-jobs"></div><div id="board-agents"></div><section id="board-repos" data-rail-panel="agents"></section><span id="rail-agents-count">0</span>
       <nav id="board-nav" hidden></nav>
       <button id="notification-bell"><span id="notification-badge">0</span></button>

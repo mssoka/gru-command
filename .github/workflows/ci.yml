@@ -55,18 +55,23 @@ jobs:
       # This repo's `npm test` re-runs lint/typecheck/build as its own
       # definition of green, then the backend + web suites. Keeping the
       # stages above as separate steps makes a failure legible at a glance;
-      # this step is the authoritative backend/web gate. The scoped browser
-      # acceptance below also gates the shipped intake integration.
+      # this step is the authoritative backend/web gate. The browser e2e
+      # below gates every Playwright project.
       - name: Full test suite
         run: npm test
 
       - name: Build paired browser shell
         run: npm run build:web
 
-      - name: Install scoped intake browser prerequisite
+      - name: Install browser e2e prerequisite
         working-directory: web
         run: npx playwright install --with-deps chromium
 
-      - name: Paired-shell intake acceptance
+      # Every Playwright project gates CI, not just intake (#402): board
+      # geometry/hit-target, notification, strip and real-service specs
+      # regressed on main unnoticed while only intake ran here. Screenshot
+      # baselines are recorded on darwin only, so this Linux runner skips
+      # the pixel comparisons; every behavioral assertion still runs.
+      - name: Browser e2e (all projects)
         working-directory: web
-        run: npx playwright test --project=intake
+        run: npx playwright test --ignore-snapshots

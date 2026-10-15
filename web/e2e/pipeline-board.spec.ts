@@ -374,6 +374,24 @@ async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   }, selector);
 }
 
+/** Scrolls the selector's first match to the viewport centre and waits two
+ * frames. Playwright's scrollIntoViewIfNeeded treats a row whose edge
+ * overflows the viewport by a sub-pixel (fractional chrome heights left the
+ * 1440 COLD row's bottom at 900.19 of 900 — #402) as already visible and
+ * does not scroll, so the strict containment oracle below would measure a
+ * position the scroll never chose. Centring is an explicit, deterministic
+ * position; the hit test still fails on any real occluder. */
+async function scrollFullyIntoView(page: Page, selector: string): Promise<void> {
+  await page.evaluate(async (sel) => {
+    const element = document.querySelector<HTMLElement>(sel);
+    if (element === null) throw new Error(`missing ${sel}`);
+    element.scrollIntoView({ block: 'center', inline: 'nearest' });
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+  }, selector);
+}
+
 async function expectReachable(page: Page, selector: string): Promise<void> {
   const target = await hitTarget(page, selector);
   if (!target.found || !target.inViewport || !target.hit) {
@@ -554,7 +572,7 @@ async function viewportProof(browser: Browser, viewportCase: ViewportCase, theme
     await expect(page.locator('.board-band--pipeline .board-pipeline')).toHaveCount(6);
     await page.locator('.board-band--cold .board-band__more').click();
     await expect(page.locator('.board-band--cold .board-job')).toHaveCount(4);
-    await page.locator('.board-band--cold .board-job').first().scrollIntoViewIfNeeded();
+    await scrollFullyIntoView(page, '.board-band--cold .board-job');
     await expectReachable(page, '.board-band--cold .board-job');
     await page.locator('.board-band--cold .board-band__more').focus();
     await expect(page.locator('.board-band--cold .board-band__more')).toBeFocused();

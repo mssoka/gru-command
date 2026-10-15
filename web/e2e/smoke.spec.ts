@@ -858,8 +858,13 @@ test.describe('board (E6, mock feed)', () => {
       // machine attention since the owner release), never the merged lane's
       // closed receipt.
       await expect(page.locator('.strip-pair[data-chip="alerts"] .strip-value__num')).toHaveText('2');
-      await expect(page.locator('#board-unacked')).toBeHidden();
-      await expect(page.locator('#board-unacked')).toContainText('2 notifications · needs Gru');
+      // The pair is the one NEEDS GRU surface (#400): no hidden duplicate,
+      // and its title carries the live-queue explanation.
+      await expect(page.locator('#board-unacked')).toHaveCount(0);
+      await expect(page.locator('.strip-pair[data-chip="alerts"]')).toHaveAttribute(
+        'title',
+        /2 live machine-attention notifications awaiting a Gru disposition/,
+      );
       // Scoped acceptance clips (tracked-review A10): the full-page capture
       // is taken under sticky chrome that can occlude the IN FLIGHT band,
       // so the NEEDS GRU band and the waiting row get their own clips — the
@@ -922,7 +927,7 @@ test.describe('board (E6, mock feed)', () => {
         await expect(clear).toBeVisible();
         await expect(clear.locator('.board-band__clear-text')).toHaveText('nothing needs Gru');
         await expect(clear.locator('.board-band__clear-hint')).toHaveText('the crew is on it');
-        await expect(page.locator('#board-unacked')).toBeHidden();
+        await expect(page.locator('#board-unacked')).toHaveCount(0);
         // The strip's ALERTS pair carries the (zero) live machine count.
         await expect(page.locator('.strip-pair[data-chip="alerts"] .strip-value__num')).toHaveText('0');
         await page.screenshot({ path: testInfo.outputPath(`board-truth-empty-${theme}.png`), fullPage: true });
@@ -996,10 +1001,10 @@ test.describe('board (E6, mock feed)', () => {
     await expect(page.locator('.board-lens', { hasText: 'blind ×2' })).toBeVisible();
     await expect(page.locator('.board-lens--blocker')).toHaveCount(1);
 
-    // Jev decisions chip stays global; the needs-Gru number renders once
-    // (on the ALERTS pair), so the tracker chip keeps its id but stays hidden.
+    // Jev decisions chip stays global; the needs-Gru number renders once,
+    // on the ALERTS pair — there is no separate tracker chip (#400).
     await expect(page.locator('#board-decisions')).toContainText('Jev: READY');
-    await expect(page.locator('#board-unacked')).toBeHidden();
+    await expect(page.locator('#board-unacked')).toHaveCount(0);
     await expect(page.locator('.strip-pair[data-chip="alerts"]')).toBeVisible();
 
     // Disposed rows collapse by default behind the toggle on the CREW tab.

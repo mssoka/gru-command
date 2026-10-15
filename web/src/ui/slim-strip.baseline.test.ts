@@ -69,7 +69,6 @@ function mountBoardDom(): void {
   document.body.innerHTML = `
     <div id="chip-rail" hidden>
       <span id="board-decisions"></span>
-      <span id="board-unacked" hidden></span>
       <span id="board-wakes" hidden></span>
     </div>
     <nav id="board-nav" hidden></nav>
