@@ -284,9 +284,11 @@ sight).
 
 ### Attention bands (v4 → v6: dense rows)
 
-A permanent **FOR YOU** owner band (owner approval 2026-09-28) sits
-ABOVE the job bands — pending owner acks (with honest consequence copy)
-and evidence-bound ready PRs (OPEN PR, external https link only) —
+A permanent **FOR YOU** owner band (owner approval 2026-09-28;
+decision-inbox release 2026-10-11) sits
+ABOVE the job bands — typed owner decisions with recorded choices,
+owner-only notices (no fake Ack) and evidence-bound ready PRs
+(OPEN PR, external https link only) —
 see [BOARD.md](./BOARD.md) for the semantics and the fail-closed
 readiness rule. Its empty state is the calm clear state (an empty owner
 list is healthy); its rows are keyboard-focusable and a snapshot

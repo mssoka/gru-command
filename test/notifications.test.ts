@@ -134,14 +134,13 @@ describe('notification center — durable log + receipts + acks', () => {
       if (event.kind === 'notification.acked') seen.push((event.payload as { id: string }).id);
     });
     const row = rig.center.post({
-      kind: 'supervision.breaker',
+      kind: 'port-squat',
       routing: 'needs-owner',
       severity: 'error',
-      title: 'Crash-loop breaker tripped: agent a2 stopped',
-      detail: 'ack to re-arm',
-      agentId: 'a2',
+      title: 'Foreign process holds port 7665 (pid 123)',
+      detail: 'stop it, then restart the service',
     });
-    // Owner stops never enter the machine callback.
+    // Owner-required notices never enter the machine callback.
     expect(rig.actionRequired.map((n) => n.id)).not.toContain(row.id);
     const acked = rig.center.ack(row.id, 'web');
     expect(acked?.ackedAt).not.toBeNull();
@@ -303,7 +302,7 @@ describe('notification center — durable log + receipts + acks', () => {
     expect(resolutionEventsAfter).toHaveLength(resolutionEventsBefore.length);
   });
 
-  it('preserves legacy machine routing for Gru triage and makes only new owner stops human-facing', () => {
+  it('enforces the attention registry: routine stops stay machine, only registered kinds ring the owner', () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);
     const bus = new EventBus();
@@ -332,20 +331,55 @@ describe('notification center — durable log + receipts + acks', () => {
     }
     const reused = center.postIncident({ kind: legacyKinds[0]!, routing: 'needs-owner', severity: 'error', title: 'Same stop', dedupe: 'active' });
     expect(reused).toMatchObject({ id: 'legacy-0', ackedBy: 'operator' });
-    for (const kind of ['port-squat', 'roll-port-squat']) {
+    // Owner-required kinds always ring the owner, regardless of the
+    // producer's requested routing.
+    for (const kind of ['port-squat', 'roll-port-squat', 'worktree-sweep-paused']) {
       expect(center.post({ kind, routing: 'action-required', severity: 'error', title: 'Owner remedy' }).routing).toBe('needs-owner');
     }
-    // Machine-ownership amendment (2026-09-29): the supervisor's explicit
-    // provider-wall routing is honored — action-required for eligible
-    // machine-owned stops, needs-owner for the conservative fallback.
+    // Routine/machine kinds can never ring the owner: a provider stop or a
+    // crash-loop breaker stays MACHINE attention even when the producer
+    // requests owner attention — decisions beyond Silas go to Gru.
     expect(
       center.post({ kind: 'supervision.provider-wall.a.quota_wall', routing: 'action-required', severity: 'error', title: 'Machine-owned' }).routing,
     ).toBe('action-required');
     expect(
       center.post({ kind: 'supervision.provider-wall.a.authentication_wall', routing: 'needs-owner', severity: 'error', title: 'Owner fallback' }).routing,
-    ).toBe('needs-owner');
+    ).toBe('action-required');
+    expect(
+      center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash loop' }).routing,
+    ).toBe('action-required');
+    // An unregistered kind requesting owner attention is TRIAGED by Gru,
+    // never silently dropped and never a bare owner chore.
+    expect(
+      center.post({ kind: 'test.unknown.stop', routing: 'needs-owner', severity: 'error', title: 'Unknown stop' }).routing,
+    ).toBe('action-required');
+    // Owner escalations require typed reserved-decision metadata.
+    expect(() =>
+      center.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title: 'Slim plan?', detail: 'evidence' }),
+    ).toThrow(/typed decision metadata/);
+    const escalation = center.post({
+      kind: 'gru.owner-escalation',
+      routing: 'needs-owner',
+      severity: 'error',
+      title: 'Approve the slim contract?',
+      detail: 'full evidence',
+      decision: {
+        question: 'Approve the slim contract?',
+        context: 'PR256 needs an owner-controlled integration route.',
+        recommendation: 'Approve the slim contract.',
+        reservedClass: 'scope-design',
+        whyNotDelegable: 'Changes the agreed product scope.',
+        options: [
+          { id: 'approve', label: 'Approve the slim contract', consequence: 'Gru commissions the slim lane.' },
+          { id: 'keep', label: 'Keep the current approach', consequence: 'The lane stays parked.' },
+        ],
+        discussion: false,
+      },
+    });
+    expect(escalation.routing).toBe('needs-owner');
+    expect(escalation.decision?.reservedClass).toBe('scope-design');
     new NotificationCenter({ ledger: api, bus }); // repeat boot cannot promote old rows
-    expect(api.countPendingNeedsOwner()).toBe(3);
+    expect(api.countPendingNeedsOwner()).toBe(4); // 3 owner notices + the typed escalation
     expect(api.listEventsAfter(0, { kinds: ['notification.triaged'] })).toHaveLength(0);
   });
 
@@ -359,23 +393,21 @@ describe('notification center — durable log + receipts + acks', () => {
       bus,
       onNeedsOwner: (notification) => needsOwner.push(notification),
     });
-    // Pre-routing-split ledger state: an UNRESOLVED machine-routed provider
-    // wall of exactly the kind a new owner-held stop would dedupe against.
-    const kind = 'supervision.provider-wall.minion-1.authentication_wall';
+    // Pre-routing-split ledger state: an UNRESOLVED machine-routed owner
+    // kind — the exact kind a new owner-held stop would dedupe against.
+    const kind = 'worktree-sweep-paused';
     api.recordNotification({
       id: 'legacy-provider-wall',
       kind,
       routing: 'action-required',
       severity: 'error',
-      title: 'Legacy machine wall',
-      agentId: 'minion-1',
+      title: 'Legacy machine row',
     });
     const ownerStop = center.postIncident({
       kind,
       routing: 'needs-owner',
       severity: 'error',
-      title: 'Agent minion-1 stopped: authentication wall',
-      agentId: 'minion-1',
+      title: 'Worktree sweep paused: live processes',
       dedupe: 'unacked',
     });
     // The returned row honors the requested owner routing: a FRESH row that
@@ -399,12 +431,12 @@ describe('notification center — durable log + receipts + acks', () => {
     // row is the legacy machine one, so a NEW trip again honors the request
     // instead of returning the un-Ack-able legacy row.
     const repeated = center.postIncident({
-      kind, routing: 'needs-owner', severity: 'error', title: 'repeat', agentId: 'minion-1', dedupe: 'unacked',
+      kind, routing: 'needs-owner', severity: 'error', title: 'repeat', dedupe: 'unacked',
     });
     expect(repeated.id).toBe(ownerStop.id);
     expect(center.ack(ownerStop.id, 'operator')).toMatchObject({ ackedBy: 'operator' });
     const nextTrip = center.postIncident({
-      kind, routing: 'needs-owner', severity: 'error', title: 'next trip', agentId: 'minion-1', dedupe: 'unacked',
+      kind, routing: 'needs-owner', severity: 'error', title: 'next trip', dedupe: 'unacked',
     });
     expect(nextTrip.id).not.toBe('legacy-provider-wall');
     expect(nextTrip.id).not.toBe(ownerStop.id);
@@ -428,7 +460,7 @@ describe('notification center — durable log + receipts + acks', () => {
         bus,
         onNeedsOwner: (notification) => needsOwner.push(notification),
       });
-      const kind = 'supervision.provider-wall.minion-tie.authentication_wall';
+      const kind = 'decisions.degraded.provider_degraded';
       api.recordNotification({
         id: '00000000-0000-0000-0000-000000000000',
         kind,
@@ -633,5 +665,23 @@ describe('notification center — durable log + receipts + acks', () => {
     rig3.api.disposeMachineNotification(b.id, 'Done');
     const unacked = rig3.api.listNotifications({ limit: 10, unackedOnly: true });
     expect(unacked.map((n) => n.id)).toEqual([a.id]);
+  });
+});
+
+describe('owner-attention registry vs main producers (PR306 B1)', () => {
+  it('a reserved recovery owner-transfer stop keeps ringing the owner through the real center', () => {
+    const rig = boot();
+    for (const kind of ['directive', 'rebrief'] as const) {
+      const row = rig.center.postIncident({
+        kind: `silas.recovery-owner-transfer.${kind}.subject-1.1`,
+        routing: 'needs-owner',
+        severity: 'error',
+        title: 'Reserved owner decision',
+        detail: 'owner-only stop',
+        dedupe: 'active',
+      });
+      expect(row.routing).toBe('needs-owner');
+      expect(rig.api.getNotification(row.id)?.routing).toBe('needs-owner');
+    }
   });
 });

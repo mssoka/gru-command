@@ -436,6 +436,14 @@ export class DecisionRuntime implements DecisionService {
         const profile = effectiveDecisionProviders(this.currentConfig)[profileName];
         if (profile === undefined) throw new EnforceGateError(opts.surface, `enforce gate: unknown routed profile "${profileName}"`);
         assertEnforceGate({ dataDir: this.options.dataDir, surface: opts.surface, provider: profileName, model: profile.model });
+        // A gated call that PASSES is evidence the surface's enforce gate
+        // is satisfied again: its owner-only incident resolves here
+        // (owner release 2026-10-11) instead of persisting forever.
+        try {
+          this.options.notifications?.resolveExactKind(`decisions.enforce-gate.${opts.surface}`, 'enforce-gate-passed');
+        } catch (error) {
+          this.log('warn', 'enforce-gate incident resolution failed; row stays open', { surface: opts.surface, error: String(error) });
+        }
       } catch (error) {
         if (error instanceof EnforceGateError) {
           // Both production callers deliberately catch decision errors and

@@ -291,6 +291,7 @@ function boot(
      * simulate hours with a realistic window instead of flake-prone
      * microsecond beats). */
     turnSilenceMs?: number;
+    restartBackoffMs?: number;
     maxRestarts?: number;
   } = {},
 ): Harness {
@@ -328,7 +329,7 @@ function boot(
       turnSilenceMs: opts.turnSilenceMs ?? 50,
       restartWindowMs: 600_000,
       maxRestarts: opts.maxRestarts ?? 3,
-      restartBackoffMs: 1,
+      restartBackoffMs: opts.restartBackoffMs ?? 1,
     },
     registry,
     ledger: api,
@@ -391,6 +392,49 @@ function emitFailure(handle: FakeHandle, text: string): void {
 function hang(handle: FakeHandle): void {
   handle.setState('streaming');
   handle.emit({ type: 'turn_start' });
+}
+
+/** A hand-built dead slot-bound record with an OPEN breaker: the defensive
+ * merge shape `ensureSlot` otherwise cannot produce (the reachable ensure
+ * flows clear a picked open breaker before any spawn). The
+ * `pendingRearmFenceAlert` field is intentionally optional so callers can
+ * pin BOTH the carry (value present) and the normalization (field omitted). */
+function staleOpenSlotRecord(
+  slot: unknown,
+  slotGeneration: number,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    agentId: 'stale-open-stop',
+    role: 'gru',
+    slot,
+    slotGeneration,
+    handle: null,
+    sessionFile: null,
+    state: 'stopped',
+    openTurn: false,
+    openControl: false,
+    compactionWarned: false,
+    openToolCalls: new Map(),
+    pendingRecovery: null,
+    lastEventAt: 0,
+    lastFileBytes: null,
+    restartRing: [],
+    consecutiveFailures: 0,
+    breakerOpen: true,
+    stopReason: 'quota_wall',
+    stoppedAt: 0,
+    breakerNotificationId: null,
+    inRestart: false,
+    backoffTimer: null,
+    activityGeneration: 0,
+    decisionPending: false,
+    failureTerminalPending: false,
+    queuedRecovery: null,
+    rateLimitRetry: null,
+    recoveryAdmission: null,
+    ...overrides,
+  };
 }
 
 /** The prohibited read line a blind reviewer's session records — appended by a
@@ -867,7 +911,7 @@ describe('supervisor — watchdog + restart ladder', () => {
     }
   });
 
-  it('breaker trips after 3 failed rungs in the window: stop + needs-owner + board mark', async () => {
+  it('breaker trips after 3 failed rungs in the window: stop + machine alert + board mark', async () => {
     const dir = tmpDir();
     const db = new LedgerDb(dir);
     const bus = new EventBus();
@@ -907,7 +951,9 @@ describe('supervisor — watchdog + restart ladder', () => {
       .listNotifications({ limit: 50 })
       .filter((n) => n.kind === 'supervision.breaker');
     expect(escalations.length).toBe(1);
-    expect(escalations[0]?.routing).toBe('needs-owner');
+    // Routine recovery belongs to the machine chain (owner release
+    // 2026-10-11): the breaker alert wakes Gru and never rings the owner.
+    expect(escalations[0]?.routing).toBe('action-required');
     expect(escalations[0]?.agentId).toBe('minion-crashloop');
     // Exactly 3 spawns attempted, then STOPPED.
     expect(registry.spawnCalls.length).toBe(3);
@@ -916,9 +962,9 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(view.breakerOpen).toBe(true);
     expect(view.stopReason).toBe('crash loop');
 
-    // ---- ack re-arms: fresh window, the resume attempt succeeds -------
+    // ---- Gru disposition re-arms: fresh window, resume succeeds -------
     registry.spawnImpl = async (role) => new FakeHandle(role, 'minion-crashloop-resumed', null);
-    supervisor.onNotificationAcked(escalations[0]!.id);
+    supervisor.onNotificationDisposed(escalations[0]!.id);
     await sleep(50);
     const rearmView = supervisor.viewFor('minion-crashloop-resumed') as AgentSupervisionView;
     expect(rearmView.state).toBe('watching');
@@ -1174,7 +1220,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       rig.registry.spawnImpl = () => new Promise<FakeHandle>((resolve) => { releaseSpawn = resolve; });
       const swapped = vi.fn();
       slot.onSwap(swapped);
-      rig.supervisor.onNotificationAcked(stop.id);
+      rig.supervisor.onNotificationDisposed(stop.id);
       await flushMicrotasks();
       expect(rig.registry.spawnCalls).toHaveLength(3); // initial + failed rung + re-arm
       expect(rig.supervisor.pendingProducerBlockers(jobId).join(' ')).toContain('pending recovery/retry');
@@ -1521,7 +1567,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         expect(f.rig.supervisor.viewFor(f.replacement.id)).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: 'authentication_wall' });
         const stop = f.rig.notificationsOfKind(`supervision.provider-wall.${f.replacement.id}.authentication_wall`)[0]!;
         expect(stop).toBeDefined();
-        f.rig.supervisor.onNotificationAcked(stop.id);
+        f.rig.supervisor.onNotificationDisposed(stop.id);
       } else if (newerFailure === 'generic') {
         // Either B remains owned or its own lack of a prompt was truthfully
         // orphaned. A's failed delivery may not grant replay permission for A.
@@ -1621,7 +1667,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         const rearmed = new FakeHandle('minion', f.original.id, '/fixture/wall-rearmed.jsonl');
         f.rig.registry.spawnImpl = async () => rearmed;
         const notice = f.rig.notificationsOfKind(`supervision.provider-wall.${f.original.id}.quota_wall`)[0]!;
-        f.rig.supervisor.onNotificationAcked(notice.id);
+        f.rig.supervisor.onNotificationDisposed(notice.id);
         await flushMicrotasks();
         expect(rearmed.promptCalls).toEqual([{ text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` }]);
       } finally { f.rig.dispose(); vi.useRealTimers(); }
@@ -2012,6 +2058,32 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
       f.replacement.emit({ type: 'error', error: 'session stream died', fatal: true });
       await vi.advanceTimersByTimeAsync(100);
       expect(f.rig.registry.spawnCalls).toHaveLength(3);
+    } finally { f.rig.dispose(); vi.useRealTimers(); }
+  });
+
+  it('PR306 B2: a guarded re-arm refused after the spawn keeps rejected-replacement custody when disposal fails', async () => {
+    vi.useFakeTimers();
+    const f = await deferredRestart();
+    try {
+      // The re-arm spawn succeeds; an active Perkins review claims the lane
+      // while it is in flight (a re-arm fence outside native authority) and
+      // the refused replacement's disposal then fails.
+      f.rig.supervisor.setActiveReviewProbe(() => true);
+      f.replacement.dispose = async () => { throw new Error('fenced replacement cleanup failed'); };
+      f.releaseSpawn(f.replacement);
+      await flushMicrotasks();
+      expect(f.register).not.toHaveBeenCalled();
+      expect(f.swapped).not.toHaveBeenCalled();
+      expect(f.replacement.promptCalls).toEqual([]);
+      // Custody debt, not just a log line: producer ownership stays unknown...
+      expect(f.rig.supervisor.pendingProducerBlockers(f.jobId).join(' ')).toContain(`cleanup unconfirmed: ${f.replacement.id}`);
+      // ...with the owner-facing unconfirmed-cleanup notice and the audit.
+      const notice = f.rig.notificationsOfKind('supervision.restart-cleanup-unconfirmed');
+      expect(notice).toHaveLength(1);
+      expect(notice[0]?.detail).toContain('fenced replacement cleanup failed');
+      expect(f.rig.api.listJobEvents(f.jobId, { limit: 100 }).some((event) => event.kind === 'supervision.restart-rejected')).toBe(true);
+      // The re-arm control is still fenced and retryable.
+      expect(f.rig.api.listEvents({ limit: 200 }).some((event) => event.kind === 'supervision.rearm-fenced')).toBe(true);
     } finally { f.rig.dispose(); vi.useRealTimers(); }
   });
 
@@ -2505,7 +2577,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         const recovered = new FakeHandle('minion', 'recovered-retry-stop', f.replacement.sessionFile);
         f.rig.registry.spawnImpl = async () => recovered;
         const notice = f.rig.notificationsOfKind(`supervision.provider-wall.${f.replacement.id}.authentication_wall`)[0]!;
-        f.rig.supervisor.onNotificationAcked(notice.id); await flushMicrotasks();
+        f.rig.supervisor.onNotificationDisposed(notice.id); await flushMicrotasks();
         expect(recovered.promptCalls).toEqual([{ text: 'old dispatch briefing', owner: `dispatch:${f.jobId}` }]);
       } else {
         expect(f.rig.notificationsOfKind(`supervision.turn-orphaned.${f.original.id}`)).toHaveLength(1);
@@ -2626,7 +2698,7 @@ describe('supervisor — post-spawn recovery authority (GH-280)', () => {
         f.rig.registry.spawnImpl = async () => recovered;
         const notice = f.rig.notificationsOfKind(`supervision.provider-wall.${f.replacement.id}.${wall}`)[0]!;
         expect(notice).toBeDefined();
-        f.rig.supervisor.onNotificationAcked(notice.id); await flushMicrotasks();
+        f.rig.supervisor.onNotificationDisposed(notice.id); await flushMicrotasks();
         expect(recovered.promptCalls).toEqual([{ text: 'startup retry A', owner: `dispatch:${f.jobId}` }]);
       } else {
         expect(f.rig.supervisor.pendingProducerBlockers(f.jobId)).toEqual([]);
@@ -2824,7 +2896,7 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
       const stop = rig.notificationsOfKind('supervision.breaker')[0]!;
       const resumed = new FakeHandle('minion', 'idle-no-snapshot-ack-resumed', null);
       rig.registry.spawnImpl = async () => resumed;
-      rig.supervisor.onNotificationAcked(stop.id);
+      rig.supervisor.onNotificationDisposed(stop.id);
       await flushMicrotasks();
       expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toHaveLength(1);
       expect(rig.supervisor.viewFor(resumed.id)?.state).toBe('watching');
@@ -2895,7 +2967,7 @@ describe('supervisor — idle restart after retirement handoff (GH-279)', () => 
       const stop = rig.notificationsOfKind('supervision.breaker')[0]!;
       const before = rig.registry.spawnCalls.length;
       rig.registry.spawnImpl = async () => new FakeHandle('minion', 'stale-should-not-run', null);
-      rig.supervisor.onNotificationAcked(stop.id);
+      rig.supervisor.onNotificationDisposed(stop.id);
       await flushMicrotasks();
       expect(rig.registry.spawnCalls).toHaveLength(before);
       expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearmed')).toEqual([]);
@@ -3050,7 +3122,7 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.dispose();
   });
 
-  it('requires human acknowledgement when restart guidance is in the confirmation band', async () => {
+  it('requires the Gru disposition when restart guidance is in the confirmation band', async () => {
     const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) => {
       const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');
       return {
@@ -3077,9 +3149,10 @@ describe('supervisor — decision-backed failure guidance', () => {
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.registry.spawnCalls).toHaveLength(spawns);
     const incident = h.api.listNotifications({ limit: 50 }).find((row) => row.kind.includes('restart_confirmation_required'));
-    expect(incident).toMatchObject({ routing: 'needs-owner' });
-    h.center.ack(incident!.id, 'test-human');
-    h.supervisor.onNotificationAcked(incident!.id);
+    expect(incident).toMatchObject({ routing: 'action-required' });
+    expect(() => h.center.ack(incident!.id, 'test-human')).toThrow(/action-required/);
+    h.api.disposeMachineNotification(incident!.id, 'contradictory guidance reviewed');
+    h.supervisor.onNotificationDisposed(incident!.id);
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
     h.dispose();
   });
@@ -3097,7 +3170,7 @@ describe('supervisor — decision-backed failure guidance', () => {
     h.dispose();
   });
 
-  it('consumes an actual nonfatal adapter auth-wall event: no blind restart, stop + durable ask, ack re-arms', async () => {
+  it('consumes an actual nonfatal adapter auth-wall event: no blind restart, stop + durable machine ask, Gru disposition re-arms', async () => {
     const decide = vi.fn(async (request: Parameters<DecisionService['decide']>[0]) => {
       const fallback = deterministicOutcome(request, DEFAULT_DECISIONS_CONFIG.thresholds, 'disabled');
       return {
@@ -3144,15 +3217,17 @@ describe('supervisor — decision-backed failure guidance', () => {
       class: 'authentication_wall', restart_advised: false, source: 'deterministic_guard', route: 'fallback',
     });
     const incident = h.api.listNotifications({ limit: 50 }).find((row) => row.kind.includes('provider-wall'));
-    expect(incident).toMatchObject({ routing: 'needs-owner' });
-
-    h.center.ack(incident!.id, 'test-human');
-    h.supervisor.onNotificationAcked(incident!.id);
+    expect(incident).toMatchObject({ routing: 'action-required' });
+    // The owner is never prompted by a provider stop, and Ack cannot clear
+    // machine attention; Gru's guarded disposition is the supported re-arm.
+    expect(() => h.center.ack(incident!.id, 'test-human')).toThrow(/action-required/);
+    h.api.disposeMachineNotification(incident!.id, 'provider condition addressed');
+    h.supervisor.onNotificationDisposed(incident!.id);
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
     h.dispose();
   });
 
-  it('a legacy machine-routed provider-wall row never strands a new owner stop: fresh Ack-able row, ack re-arms the ladder (gh-97)', async () => {
+  it('a legacy machine-routed provider-wall row dedupes the new machine stop: one row, Gru disposition re-arms', async () => {
     const h = boot({ decide: vi.fn(async () => { throw new Error('decision service down'); }) } as unknown as DecisionService);
     const handle = new FakeHandle('minion', 'minion-legacy-wall', null);
     h.registry.adopt(handle);
@@ -3171,23 +3246,17 @@ describe('supervisor — decision-backed failure guidance', () => {
     handle.emit({ type: 'error', error: 'HTTP 401 unauthorized', fatal: false });
     await vi.waitFor(() => expect(handle.disposed).toBe(true));
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true, restarts: 0 });
-    // The stop honors its owner routing against the legacy machine row: a
-    // FRESH needs-owner row exists and the legacy row stays machine-held.
+    // The stop is machine attention, and the pre-existing machine row of
+    // the same kind is reused — one row per incident, never a second row
+    // and never an owner stop.
     const rows = h.api.listNotifications({ limit: 50 }).filter((row) => row.kind === wallKind);
-    expect(rows).toHaveLength(2);
-    const ownerStop = rows.find((row) => row.routing === 'needs-owner');
-    expect(ownerStop).toMatchObject({ ackedAt: null, resolvedAt: null });
-    expect(rows.find((row) => row.id === 'legacy-provider-wall')).toMatchObject({
-      routing: 'action-required',
-      ackedAt: null,
-      resolvedAt: null,
-    });
-    // The real owner ACK entry chain works on the fresh row (the same calls
-    // the board ack endpoint makes) and re-arms the restart ladder.
-    expect(() => h.center.ack(ownerStop!.id, 'test-human')).not.toThrow();
-    h.supervisor.onNotificationAcked(ownerStop!.id);
-    // Synchronous read: the ack closed the breaker before the async rung
-    // replaces the disposed agent slot.
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: 'legacy-provider-wall', routing: 'action-required', ackedAt: null, resolvedAt: null });
+    // Gru's disposition on that row is the supported re-arm entry chain.
+    h.api.disposeMachineNotification('legacy-provider-wall', 'provider condition addressed');
+    h.supervisor.onNotificationDisposed('legacy-provider-wall');
+    // Synchronous read: the disposition closed the breaker before the async
+    // rung replaces the disposed agent slot.
     expect(h.supervisor.viewFor(handle.id)).toMatchObject({ breakerOpen: false });
     await vi.waitFor(() => expect(h.registry.spawnCalls.length).toBe(spawns + 1));
     h.dispose();
@@ -3705,7 +3774,7 @@ describe('supervisor — intentional slot generations', () => {
     h.dispose();
   });
 
-  it('intentional replacement fails closed after the breaker opens and leaves its alert unacknowledged', async () => {
+  it('intentional replacement fails closed after the breaker opens and leaves its alert unresolved', async () => {
     const h = boot();
     vi.useFakeTimers();
     try {
@@ -3734,7 +3803,7 @@ describe('supervisor — intentional slot generations', () => {
       expect(vi.getTimerCount()).toBe(0);
       const alert = h.notificationsOfKind('supervision.breaker').find((item) => item.ackedAt === null);
       expect(alert).toBeDefined();
-      expect(alert?.routing).toBe('needs-owner');
+      expect(alert?.routing).toBe('action-required');
       expect(slot.canReplace()).toBe(false);
 
       const fresh = new FakeHandle('gru', 'fresh-after-breaker', null);
@@ -3900,35 +3969,12 @@ describe('supervisor — Perkins r1 fixes', () => {
       agents: Map<string, Record<string, unknown>>;
     };
     const internalSlot = internals.slots.get('gru-open-retire')!;
-    internals.agents.set('stale-open-stop', {
-      agentId: 'stale-open-stop',
-      role: 'gru',
-      slot: internalSlot,
-      slotGeneration: internalSlot.generation - 1,
-      handle: null,
-      sessionFile: null,
-      state: 'stopped',
-      openTurn: false,
-      openControl: false,
-      compactionWarned: false,
-      openToolCalls: new Map(),
-      pendingRecovery: null,
-      lastEventAt: 0,
-      lastFileBytes: null,
-      restartRing: [],
-      consecutiveFailures: 0,
-      breakerOpen: true,
-      stopReason: 'quota_wall',
-      breakerNotificationId: null,
-      inRestart: false,
-      backoffTimer: null,
-      activityGeneration: 0,
-      decisionPending: false,
-      failureTerminalPending: false,
-      queuedRecovery: null,
-      rateLimitRetry: null,
-      recoveryAdmission: null,
-    });
+    internals.agents.set(
+      'stale-open-stop',
+      staleOpenSlotRecord(internalSlot, internalSlot.generation - 1, {
+        pendingRearmFenceAlert: { reason: 'stale fence pending' },
+      }),
+    );
     // The current record dies outside a restart rung; ensure() spawns the
     // replacement and retires BOTH dead records, merging the open one.
     await h.registry.disposeHandle(first);
@@ -3938,7 +3984,67 @@ describe('supervisor — Perkins r1 fixes', () => {
       breakerOpen: true,
       stopReason: 'quota_wall',
     });
+    // The merge carries the fenced-rearm retry debt with the stop: dropping
+    // the carry would strand the retirement with an unbound stop (the
+    // fail-before assertion for the R7 carry line).
+    const live = internals.agents.get(replacement.id) as
+      | { pendingRearmFenceAlert?: { reason?: string } | null }
+      | undefined;
+    expect(live?.pendingRearmFenceAlert?.reason).toBe('stale fence pending');
     h.dispose();
+  });
+
+  it('a stale record that OMITS the retry field normalizes to null (no undefined reaches the tick)', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-open-normalize',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    const first = (await slot.ensure({})) as FakeHandle;
+    const internals = h.supervisor as unknown as {
+      slots: Map<string, { generation: number }>;
+      agents: Map<string, Record<string, unknown>>;
+    };
+    const internalSlot = internals.slots.get('gru-open-normalize')!;
+    // The field is OMITTED on purpose: without the ?? null normalization
+    // the merge plants `undefined`, which would abort a tick pass.
+    internals.agents.set('stale-open-stop', staleOpenSlotRecord(internalSlot, internalSlot.generation - 1));
+    await h.registry.disposeHandle(first);
+    const replacement = (await slot.ensure({})) as FakeHandle;
+    const live = internals.agents.get(replacement.id) as { pendingRearmFenceAlert?: unknown } | undefined;
+    expect(live?.pendingRearmFenceAlert).toBeNull();
+    h.advance(0); // a full tick pass survives the merged record
+    h.dispose();
+  });
+
+  it('undefined retry-field sentinels can never abort a tick or leak through a carry', () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'sentinel-job', repo: 'fixture', title: 'sentinel lane' });
+      h.api.setJobStatus('sentinel-job', 'working');
+      h.api.registerAgent({ id: 'sentinel-old', role: 'minion', jobId: 'sentinel-job' });
+      h.api.registerAgent({ id: 'sentinel-new', role: 'minion', jobId: 'sentinel-job' });
+      h.registry.adopt(new FakeHandle('minion', 'sentinel-old', null));
+      h.registry.adopt(new FakeHandle('minion', 'sentinel-new', null));
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, Record<string, unknown>>;
+        carryOverSupervision(old: unknown, newId: string): unknown;
+      };
+      const old = internals.agents.get('sentinel-old')!;
+      old.breakerOpen = true;
+      // The sentinel a hand-built/partial carry could plant.
+      (old as { pendingRearmFenceAlert?: unknown }).pendingRearmFenceAlert = undefined;
+      // The carry normalizes it before the adopted record can see it.
+      internals.carryOverSupervision(old, 'sentinel-new');
+      expect(internals.agents.get('sentinel-new')!.pendingRearmFenceAlert).toBeNull();
+      // ...and a tick pass over an undefined field never throws.
+      internals.agents.get('sentinel-new')!.pendingRearmFenceAlert = undefined;
+      expect(() => h.advance(0)).not.toThrow();
+    } finally {
+      h.dispose();
+    }
   });
 
   it('r1-2: supervision.enabled=false gates EVERY side-effect — pure registry behavior', async () => {
@@ -4003,7 +4109,7 @@ describe('supervisor — Perkins r1 fixes', () => {
     h.dispose();
   });
 
-  it('autonomous slot use cannot re-arm or Ack an owner-held Gru breaker', async () => {
+  it('autonomous slot use cannot re-arm a Gru breaker', async () => {
     const h = boot();
     const slot = h.supervisor.declareSlot({ id: 'gru-autonomous-stop', role: 'gru',
       spawn: (options) => h.registry.spawn('gru', options) });
@@ -4015,14 +4121,14 @@ describe('supervisor — Perkins r1 fixes', () => {
     const escalation = h.notificationsOfKind('supervision.breaker')[0]!;
     expect(escalation).toBeDefined();
     h.registry.spawnImpl = async (role) => new FakeHandle(role, 'should-not-spawn', null);
-    await expect(slot.ensure({ intent: 'autonomous' })).rejects.toThrow(/owner-held breaker is open/);
-    expect(h.api.getNotification(escalation.id)).toMatchObject({ ackedAt: null, routing: 'needs-owner' });
+    await expect(slot.ensure({ intent: 'autonomous' })).rejects.toThrow(/autonomous ensure cannot re-arm/);
+    expect(h.api.getNotification(escalation.id)).toMatchObject({ ackedAt: null, routing: 'action-required' });
     expect(h.api.listEventsAfter(0, { kinds: ['supervision.rearmed'] })).toEqual([]);
     expect(h.supervisor.viewFor(first.id)?.breakerOpen).toBe(true);
     h.dispose();
   });
 
-  it('r1-17/#24: slot use on an open breaker re-arms supervision AND acks the escalation row', async () => {
+  it('r1-17/#24: slot use on an open breaker re-arms supervision AND resolves the machine alert', async () => {
     const h = boot();
     const slot = h.supervisor.declareSlot({
       id: 'gru-main',
@@ -4039,13 +4145,15 @@ describe('supervisor — Perkins r1 fixes', () => {
     await sleep(250); // rungs 1-3 fail fast; the 4th need trips
     const escalation = h.notificationsOfKind('supervision.breaker')[0];
     expect(escalation).toBeDefined();
-    // Heal spawns; slot use re-arms + acks the escalation row.
+    // Heal spawns; slot use re-arms and resolves the machine alert row by
+    // evidence (human intent resumed the lane) — never an Ack.
     h.registry.spawnImpl = async (role) => new FakeHandle(role, 'slot-recovered', null);
     await slot.ensure({});
     await sleep(60);
-    const acked = h.api.getNotification(escalation!.id);
-    expect(acked?.ackedAt).not.toBeNull();
-    expect(acked?.ackedBy).toBe('slot-use');
+    const resolved = h.api.getNotification(escalation!.id);
+    expect(resolved?.resolvedAt).not.toBeNull();
+    expect(resolved?.resolvedBy).toBe('slot-use');
+    expect(resolved?.ackedAt).toBeNull();
     const view = h.supervisor.viewFor('slot-recovered');
     expect(view?.state).toBe('watching');
     expect(view?.breakerOpen).toBe(false);
@@ -5745,6 +5853,622 @@ describe('supervision decision surface identity (issue #222)', () => {
       expect(decide.mock.calls[0]![1]).toEqual({ surface: 'supervision_guidance' });
     } finally {
       lane.supervisor.dispose();
+    }
+  });
+});
+describe('supervisor — guarded re-arm fences (R1: parking and live producers)', () => {
+  function directlyStoppedTurn(jobId: string, agentId: string, workerGate?: PacingGate): {
+    readonly rig: Harness;
+    readonly handle: FakeHandle;
+    readonly stop: NotificationRecord;
+  } {
+    const rig = boot(undefined, { restartBackoffMs: 1_000, ...(workerGate === undefined ? {} : { workerGate }) });
+    rig.api.addJob({ id: jobId, repo: 'fixture', title: 'stopped lane' });
+    rig.api.setJobStatus(jobId, 'working');
+    rig.api.registerAgent({ id: agentId, role: 'minion', jobId });
+    const handle = new FakeHandle('minion', agentId, null);
+    handle.pendingTurnSnapshot = { text: 'saved interrupted prompt', owner: 'dispatch:fixture' };
+    rig.registry.adopt(handle);
+    hang(handle);
+    const internals = rig.supervisor as unknown as {
+      agents: Map<string, unknown>;
+      tripBreaker(agent: unknown): void;
+    };
+    const agent = internals.agents.get(agentId);
+    if (agent === undefined) throw new Error(`missing test agent ${agentId}`);
+    internals.tripBreaker(agent);
+    const stop = rig.api.listNotifications({ limit: 30 }).find((row) => row.kind === 'supervision.breaker');
+    if (stop === undefined) throw new Error(`breaker stop for ${agentId} was not posted`);
+    return { rig, handle, stop };
+  }
+
+  function tripBreaker(): {
+    api: LedgerApi;
+    center: NotificationCenter;
+    registry: FakeRegistry;
+    supervisor: Supervisor;
+    handle: FakeHandle;
+    close: () => void;
+  } {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    const registry = new FakeRegistry();
+    let nowMs = 2_000_000;
+    const supervisor = new Supervisor({
+      config: { enabled: true, turnSilenceMs: 30, restartWindowMs: 600_000, maxRestarts: 1, restartBackoffMs: 1 },
+      registry,
+      ledger: api,
+      notifications: center,
+      tickMs: 5,
+      now: () => nowMs,
+    });
+    api.addJob({ id: 'fenced-job', repo: 'fixture', title: 'fenced lane' });
+    api.setJobStatus('fenced-job', 'working');
+    api.registerAgent({ id: 'fenced-agent', role: 'minion', jobId: 'fenced-job' });
+    registry.spawnImpl = async () => {
+      throw new Error('fixture failed restart');
+    };
+    supervisor.start();
+    const handle = new FakeHandle('minion', 'fenced-agent', null);
+    registry.adopt(handle);
+    hang(handle);
+    nowMs += 60;
+    return {
+      api,
+      center,
+      registry,
+      supervisor,
+      handle,
+      close: () => {
+        supervisor.dispose();
+        db.close();
+      },
+    };
+  }
+
+  it('an explicit owner parking hold refuses the guarded re-arm, leaves the stop, and stays retryable', async () => {
+    const rig = tripBreaker();
+    try {
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+      expect(rig.supervisor.viewFor(rig.handle.id)?.breakerOpen).toBe(true);
+      const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+      expect(stop).toBeDefined();
+      // The owner parks the lane while the alert is open.
+      rig.api.setJobStatus('fenced-job', 'parked');
+      const refused = rig.supervisor.onNotificationDisposed(stop!.id);
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.reason).toContain('parked');
+      expect(refused).not.toHaveProperty('rearmed');
+      // The stop survives with its retryable debt: nothing was consumed.
+      expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(rig.api.getNotification(stop!.id)?.resolvedAt).toBeNull();
+      const fenced = rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.rearm-fenced');
+      expect(fenced.length).toBeGreaterThanOrEqual(1);
+      expect((fenced[0]!.payload as { reason?: string }).reason).toContain('parked');
+      // The hold lifts, but parking is a native control event: the captured
+      // interrupted prompt is superseded (issue #279/#280) and never replays,
+      // so the same control stays refused with its debt retained.
+      rig.api.setJobStatus('fenced-job', 'working');
+      rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'fenced-agent-resumed', null);
+      const stillFenced = rig.supervisor.onNotificationDisposed(stop!.id);
+      expect(stillFenced.ok).toBe(false);
+      if (!stillFenced.ok) expect(stillFenced.reason).toContain('no longer current');
+      expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(rig.api.getNotification(stop!.id)?.resolvedAt).toBeNull();
+    } finally {
+      rig.close();
+    }
+  });
+
+  it('a failed notification re-arm retry keeps the full fence and reconstructs the durable stop', async () => {
+    const { rig, stop } = directlyStoppedTurn('retry-durable-job', 'retry-durable-agent');
+    let attempts = 0;
+    let restored: Supervisor | null = null;
+    vi.useFakeTimers();
+    try {
+      rig.registry.spawnImpl = async (role) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('first re-arm spawn failed');
+        return new FakeHandle(role, 'must-not-cross-park', null);
+      };
+      expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
+      await flushMicrotasks();
+      expect(rig.registry.spawnCalls).toHaveLength(1);
+      // The accepted attempt failed and entered its backoff. Parking during
+      // that wait must survive into the scheduled re-arm rung.
+      rig.api.setJobStatus('retry-durable-job', 'parked');
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(rig.registry.spawnCalls).toHaveLength(1);
+      expect(rig.supervisor.viewFor('retry-durable-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      const fenced = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(fenced).toMatchObject({ routing: 'action-required', resolvedAt: null });
+      const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get('retry-durable-agent');
+      expect(agent?.pendingRecovery).not.toBeNull();
+      expect(rig.api.latestSupervisionEvent('retry-durable-agent')?.kind).toBe('supervision.rearm-fenced');
+      expect(rig.api.durableSupervisionStops().get('retry-durable-agent')).toMatchObject({
+        reason: expect.stringContaining('re-arm fenced:'),
+        notificationId: fenced!.id,
+        pendingFenceReason: null,
+      });
+
+      // A fresh process reconstructs the accepted-rearm → later-fence stop
+      // and its exact live control, so that alert still reaches the refusal
+      // path rather than being resolved as an unbound machine notice.
+      rig.supervisor.dispose();
+      restored = new Supervisor({
+        config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+        registry: rig.registry,
+        ledger: rig.api,
+        notifications: rig.center,
+        tickMs: 5,
+        now: () => rig.nowMs,
+      });
+      restored.start();
+      expect(restored.viewFor('retry-durable-agent')).toMatchObject({ state: 'stopped', breakerOpen: true, stopReason: expect.stringContaining('re-arm fenced:') });
+      rig.registry.adopt(new FakeHandle('minion', 'retry-durable-agent', null));
+      const restoredAgent = (restored as unknown as { agents: Map<string, { breakerOpen: boolean; breakerNotificationId: string | null }> }).agents.get('retry-durable-agent');
+      expect(restoredAgent).toMatchObject({ breakerOpen: true, breakerNotificationId: fenced!.id });
+      expect(restored.onNotificationDisposed(fenced!.id)).toMatchObject({ ok: false, reason: expect.stringContaining('parked') });
+      expect(rig.api.getNotification(fenced!.id)?.resolvedAt).toBeNull();
+      const engine = new BoardEngine({ ledger: rig.api, bus: new EventBus(), supervisionFor: (agentId) => restored?.viewFor(agentId) ?? null });
+      expect(engine.snapshot().agents.find((row) => row.id === 'retry-durable-agent')?.supervision)
+        .toMatchObject({ state: 'stopped', stopReason: expect.stringContaining('re-arm fenced:') });
+    } finally {
+      restored?.dispose();
+      rig.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failed fresh-control post survives restart without a live handle, then binds after adoption', async () => {
+    const { rig, stop } = directlyStoppedTurn('pending-control-job', 'pending-control-agent');
+    let restored: Supervisor | null = null;
+    vi.useFakeTimers();
+    const originalPost = rig.center.post.bind(rig.center);
+    try {
+      rig.api.resolveNotificationById(stop.id, 'accepted-disposition');
+      rig.center.post = ((input: Parameters<NotificationCenter['post']>[0]) => {
+        if (input.kind === 'supervision.rearm-fenced') throw new Error('fresh control storage unavailable');
+        return originalPost(input);
+      }) as typeof rig.center.post;
+      const internals = rig.supervisor as unknown as {
+        agents: Map<string, { breakerNotificationId: string | null; pendingRearmFenceAlert: { reason: string } | null }>;
+        fenceRearm(agent: unknown, notificationId: string | null, reason: string): void;
+      };
+      const agent = internals.agents.get('pending-control-agent');
+      if (agent === undefined) throw new Error('test agent was not adopted');
+      internals.fenceRearm(agent, stop.id, 'park appeared during re-arm');
+      expect(agent.pendingRearmFenceAlert?.reason).toContain('park appeared');
+      expect(rig.api.durableSupervisionStops().get('pending-control-agent')).toMatchObject({
+        notificationId: null,
+        pendingFenceReason: expect.stringContaining('park appeared'),
+      });
+
+      rig.supervisor.dispose();
+      restored = new Supervisor({
+        config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+        registry: rig.registry,
+        ledger: rig.api,
+        notifications: rig.center,
+        tickMs: 5,
+        now: () => rig.nowMs,
+      });
+      restored.start();
+      rig.center.post = originalPost;
+      expect((restored as unknown as { agents: Map<string, unknown> }).agents.has('pending-control-agent')).toBe(false);
+      (restored as unknown as { tick(): void }).tick();
+      const fresh = rig.api.listNotifications({ limit: 50, unackedOnly: true }).find(
+        (row) => row.kind === 'supervision.rearm-fenced' && row.resolvedAt === null,
+      );
+      expect(fresh).toMatchObject({ routing: 'action-required', ackedAt: null, resolvedAt: null });
+      expect(restored.viewFor('pending-control-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      rig.registry.adopt(new FakeHandle('minion', 'pending-control-agent', null));
+      const restoredAgent = (restored as unknown as { agents: Map<string, { breakerNotificationId: string | null; pendingRearmFenceAlert: { reason: string } | null }> }).agents.get('pending-control-agent');
+      expect(restoredAgent).toMatchObject({ breakerNotificationId: fresh!.id, pendingRearmFenceAlert: null });
+      expect(rig.api.durableSupervisionStops().get('pending-control-agent')).toMatchObject({
+        notificationId: fresh!.id,
+        pendingFenceReason: null,
+      });
+    } finally {
+      restored?.dispose();
+      rig.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('an acknowledged legacy stop control is consumed and replaced after restart', () => {
+    const { rig, stop } = directlyStoppedTurn('legacy-acked-job', 'legacy-acked-agent');
+    let restored: Supervisor | null = null;
+    try {
+      const database = (rig.api as unknown as {
+        readonly db: { prepare(sql: string): { run(...values: unknown[]): unknown } };
+      }).db;
+      database
+        .prepare('UPDATE notifications SET acked_at = ?, acked_by = ? WHERE id = ?')
+        .run('2026-10-12T01:00:00.000Z', 'legacy-owner', stop.id);
+      expect(rig.api.getNotification(stop.id)?.ackedAt).toBe('2026-10-12T01:00:00.000Z');
+      expect(rig.api.durableSupervisionStops().get('legacy-acked-agent')).toMatchObject({ notificationId: null });
+
+      rig.supervisor.dispose();
+      restored = new Supervisor({
+        config: { enabled: true, turnSilenceMs: 50, restartWindowMs: 600_000, maxRestarts: 3, restartBackoffMs: 1_000 },
+        registry: rig.registry,
+        ledger: rig.api,
+        notifications: rig.center,
+        tickMs: 5,
+        now: () => rig.nowMs,
+      });
+      restored.start();
+      expect((restored as unknown as { agents: Map<string, unknown> }).agents.has('legacy-acked-agent')).toBe(false);
+      (restored as unknown as { tick(): void }).tick();
+
+      const fresh = rig.api.listNotifications({ limit: 50, unackedOnly: true }).find(
+        (row) => row.agentId === 'legacy-acked-agent' && row.kind === 'supervision.rearm-fenced',
+      );
+      expect(fresh).toMatchObject({ routing: 'action-required', ackedAt: null, resolvedAt: null });
+      expect(fresh?.id).not.toBe(stop.id);
+      expect(restored.viewFor('legacy-acked-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      rig.registry.adopt(new FakeHandle('minion', 'legacy-acked-agent', null));
+      const restoredAgent = (restored as unknown as {
+        agents: Map<string, { breakerNotificationId: string | null; pendingRearmFenceAlert: { reason: string } | null }>;
+      }).agents.get('legacy-acked-agent');
+      expect(restoredAgent).toMatchObject({ breakerNotificationId: fresh!.id, pendingRearmFenceAlert: null });
+    } finally {
+      restored?.dispose();
+      rig.dispose();
+    }
+  });
+
+  it('a park during queued replay fences the handle and retains the prompt for the same control', async () => {
+    const gate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
+    const holder = await gate.acquireWorkerTurn({ id: 'fence-holder', label: 'hold recovery slot' });
+    let holderReleased = false;
+    const releaseHolder = (): void => {
+      if (holderReleased) return;
+      holderReleased = true;
+      holder.release();
+    };
+    const { rig, stop } = directlyStoppedTurn('replay-park-job', 'replay-park-agent', gate);
+    const firstReplacement: { current: FakeHandle | null } = { current: null };
+    try {
+      rig.registry.spawnImpl = async (role, options) => {
+        const replacement = new FakeHandle(role, 'replay-park-first', options?.resumeFile ?? null);
+        firstReplacement.current = replacement;
+        return replacement;
+      };
+      expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(gate.view().worker.queued.map((entry) => entry.id)).toContain('replay-park-agent'));
+      const first = firstReplacement.current;
+      if (first === null) throw new Error('restart did not spawn its first replacement');
+      rig.api.setJobStatus('replay-park-job', 'parked');
+      releaseHolder();
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(first.id)).toMatchObject({ state: 'stopped', breakerOpen: true }));
+      expect(first.disposed).toBe(true);
+      expect(first.promptCalls).toHaveLength(0);
+      const agent = (rig.supervisor as unknown as { agents: Map<string, { pendingRecovery: unknown }> }).agents.get('replay-park-agent');
+      expect(agent?.pendingRecovery).not.toBeNull();
+      const fresh = rig.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(fresh).toMatchObject({ routing: 'action-required', resolvedAt: null });
+
+      // Parking superseded the captured prompt (native control epoch): the
+      // fence control stays refused after the job resumes; nothing replays.
+      rig.api.setJobStatus('replay-park-job', 'working');
+      const stillFenced = rig.supervisor.onNotificationDisposed(fresh!.id);
+      expect(stillFenced.ok).toBe(false);
+      expect(first.promptCalls).toHaveLength(0);
+    } finally {
+      releaseHolder();
+      rig.dispose();
+    }
+  });
+
+  it('a stopped implementer cannot re-arm while an active Perkins round owns the lane', () => {
+    const { rig, stop } = directlyStoppedTurn('review-fence-job', 'review-fence-agent');
+    try {
+      const round = rig.api.addRound({ jobId: 'review-fence-job', targetRef: 'PR-306', lenses: ['blind'] });
+      rig.api.setJobStatus('review-fence-job', 'in-review');
+      rig.api.setRoundStatus(round.id, 'live');
+      rig.supervisor.setActiveReviewProbe((jobId) => rig.api.listRounds(jobId).some((candidate) => candidate.status === 'pending' || candidate.status === 'live'));
+      const refused = rig.supervisor.onNotificationDisposed(stop.id);
+      expect(refused).toMatchObject({ ok: false });
+      if (!refused.ok) expect(refused.reason).toContain('active Perkins review');
+      expect(rig.registry.spawnCalls).toHaveLength(0);
+      expect(rig.supervisor.viewFor('review-fence-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+    } finally {
+      rig.dispose();
+    }
+  });
+
+  it('a Perkins round admitted during spawn disposes the replacement before adoption', async () => {
+    const { rig, stop } = directlyStoppedTurn('review-mid-spawn-job', 'review-mid-spawn-agent');
+    const spawned: { current: FakeHandle | null } = { current: null };
+    let releaseSpawn!: () => void;
+    const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve; });
+    rig.supervisor.setActiveReviewProbe((jobId) => rig.api.listRounds(jobId).some((candidate) => candidate.status === 'pending' || candidate.status === 'live'));
+    try {
+      rig.registry.spawnImpl = async (role, options) => {
+        const replacement = new FakeHandle(role, 'review-mid-spawn-replacement', options?.resumeFile ?? null);
+        spawned.current = replacement;
+        await spawnGate;
+        return replacement;
+      };
+      expect(rig.supervisor.onNotificationDisposed(stop.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(spawned.current).not.toBeNull());
+      const round = rig.api.addRound({ jobId: 'review-mid-spawn-job', targetRef: 'PR-306', lenses: ['blind'] });
+      rig.api.setJobStatus('review-mid-spawn-job', 'in-review');
+      rig.api.setRoundStatus(round.id, 'live');
+      releaseSpawn();
+      await vi.waitFor(() => expect(rig.supervisor.viewFor('review-mid-spawn-agent')).toMatchObject({ state: 'stopped', breakerOpen: true }));
+      expect(spawned.current?.disposed).toBe(true);
+      expect(spawned.current?.promptCalls).toHaveLength(0);
+      expect(rig.api.listNotifications({ limit: 50 }).some((row) => row.kind === 'supervision.rearm-fenced')).toBe(true);
+    } finally {
+      releaseSpawn?.();
+      rig.dispose();
+    }
+  });
+
+  it('a fence that appears DURING the restart awaits refuses the respawn (post-await re-check)', async () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'mid-await-job', repo: 'fixture', title: 'mid-await lane' });
+      h.api.setJobStatus('mid-await-job', 'working');
+      h.api.registerAgent({ id: 'mid-await-agent', role: 'minion', jobId: 'mid-await-job' });
+      const handle = new FakeHandle('minion', 'mid-await-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, unknown>;
+        restartRung(agent: unknown, reason: string, opts?: { rearmFence?: boolean }): Promise<void>;
+      };
+      const agent = internals.agents.get('mid-await-agent');
+      expect(agent).toBeDefined();
+      // The parking hold lands WHILE the old handle is being disposed (a
+      // real adapter disposal can take time): the respawn must be refused
+      // after the await, and the stop must stay visible and retryable.
+      const originalDispose = h.registry.disposeHandle.bind(h.registry);
+      h.registry.disposeHandle = async (target) => {
+        h.api.setJobStatus('mid-await-job', 'parked');
+        await originalDispose(target);
+      };
+      await internals.restartRung(agent, 'fixture re-arm', { rearmFence: true });
+      expect(h.registry.spawnCalls).toHaveLength(0);
+      expect(h.supervisor.viewFor('mid-await-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      const fenced = h.api.listEvents({ limit: 100 }).filter((event) => event.kind === 'supervision.rearm-fenced');
+      expect(fenced).toHaveLength(1);
+      expect((fenced[0]!.payload as { reason?: string }).reason).toContain('parked');
+      // The consumed control is replaced: a FRESH open machine alert is
+      // bound to the stop, so the debt stays retryable through the same
+      // guarded disposition route (no private-method retry required).
+      const freshAlert = h.api
+        .listNotifications({ limit: 50 })
+        .find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(freshAlert).toMatchObject({ routing: 'action-required', resolvedAt: null, ackedAt: null });
+      expect(
+        (h.supervisor as unknown as { agents: Map<string, { breakerNotificationId: string | null }> }).agents.get(
+          'mid-await-agent',
+        )?.breakerNotificationId,
+      ).toBe(freshAlert!.id);
+      // The hold lifts: disposing the FRESH alert retries the guarded
+      // re-arm through the production path and spawns the resumed handle.
+      h.api.setJobStatus('mid-await-job', 'working');
+      expect(h.supervisor.onNotificationDisposed(freshAlert!.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(h.registry.spawnCalls).toHaveLength(1));
+      const spawnedId = [...h.registry.handlesById.keys()].at(-1)!;
+      await vi.waitFor(() => expect(h.supervisor.viewFor(spawnedId)?.state).toBe('watching'));
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a failed fenced-alert post is retried on the next tick until the stop has a live control', async () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'retry-alert-job', repo: 'fixture', title: 'retry-alert lane' });
+      h.api.setJobStatus('retry-alert-job', 'working');
+      h.api.registerAgent({ id: 'retry-alert-agent', role: 'minion', jobId: 'retry-alert-job' });
+      const handle = new FakeHandle('minion', 'retry-alert-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<
+          string,
+          {
+            breakerOpen: boolean;
+            breakerNotificationId: string | null;
+            pendingRearmFenceAlert: { reason: string } | null;
+          }
+        >;
+        fenceRearm(agent: unknown, notificationId: string | null, reason: string): void;
+        tick(): void;
+      };
+      const agent = internals.agents.get('retry-alert-agent')!;
+      const originalPost = h.center.post.bind(h.center);
+      let failPost = true;
+      h.center.post = ((input: Parameters<NotificationCenter['post']>[0]) => {
+        if (failPost && input.kind === 'supervision.rearm-fenced') throw new Error('ledger hiccup');
+        return originalPost(input);
+      }) as typeof h.center.post;
+      internals.fenceRearm(agent, null, 'fixture hold');
+      // The stop is visible, the fresh control FAILED to post, and the
+      // pending retry is remembered — no control exists yet.
+      expect(h.supervisor.viewFor('retry-alert-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(agent.pendingRearmFenceAlert?.reason).toContain('fixture hold');
+      expect(h.api.listNotifications({ limit: 50 }).some((row) => row.kind === 'supervision.rearm-fenced')).toBe(false);
+      // The ledger recovers: the next tick binds a live control.
+      failPost = false;
+      internals.tick();
+      const posted = h.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(posted).toMatchObject({ routing: 'action-required', resolvedAt: null });
+      expect(agent.breakerNotificationId).toBe(posted!.id);
+      expect(agent.pendingRearmFenceAlert).toBeNull();
+      // The control is real: its disposition re-arms the lane.
+      h.registry.spawnImpl = async (role) => new FakeHandle(role, 'retry-alert-resumed', null);
+      expect(h.supervisor.onNotificationDisposed(posted!.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(h.supervisor.viewFor('retry-alert-resumed')?.state).toBe('watching'));
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('an unreadable bound control is treated as gone: a fresh alert is raised and bound', () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'unreadable-job', repo: 'fixture', title: 'unreadable lane' });
+      h.api.setJobStatus('unreadable-job', 'working');
+      h.api.registerAgent({ id: 'unreadable-agent', role: 'minion', jobId: 'unreadable-job' });
+      const handle = new FakeHandle('minion', 'unreadable-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, { breakerOpen: boolean; breakerNotificationId: string | null }>;
+        raiseFencedAlert(agent: unknown, reason: string): void;
+      };
+      h.api.recordNotification({
+        id: 'stale-bound-row',
+        kind: 'supervision.breaker',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Old control',
+        detail: 'open',
+      });
+      const agent = internals.agents.get('unreadable-agent')!;
+      agent.breakerOpen = true;
+      agent.breakerNotificationId = 'stale-bound-row';
+      const originalGet = h.api.getNotification.bind(h.api);
+      h.api.getNotification = ((id: string) => {
+        if (id === 'stale-bound-row') throw new Error('ledger read failed');
+        return originalGet(id);
+      }) as typeof h.api.getNotification;
+      internals.raiseFencedAlert(agent, 'binding unreadable');
+      h.api.getNotification = originalGet;
+      const posted = h.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(posted).toMatchObject({ resolvedAt: null });
+      expect(agent.breakerNotificationId).toBe(posted!.id);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a ledger failure during the re-arm commit is contained and leaves a live fenced control', async () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'commit-fail-job', repo: 'fixture', title: 'commit-fail lane' });
+      h.api.setJobStatus('commit-fail-job', 'working');
+      h.api.registerAgent({ id: 'commit-fail-agent', role: 'minion', jobId: 'commit-fail-job' });
+      const handle = new FakeHandle('minion', 'commit-fail-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, unknown>;
+        completeRearm(agent: unknown, id: string | null): Promise<void>;
+      };
+      const agent = internals.agents.get('commit-fail-agent');
+      expect(agent).toBeDefined();
+      // The re-arm event write fails mid-commit: it must be contained (the
+      // fire-and-forget promise can never reject into main) and the stop
+      // must end fenced with a fresh bound control.
+      const original = h.api.appendCustomEvent.bind(h.api);
+      h.api.appendCustomEvent = ((input: Parameters<LedgerApi['appendCustomEvent']>[0]) => {
+        if (input.kind === 'supervision.rearmed') throw new Error('ledger write failed');
+        return original(input);
+      }) as typeof h.api.appendCustomEvent;
+      await internals.completeRearm(agent, null);
+      h.api.appendCustomEvent = original;
+      expect(h.supervisor.viewFor('commit-fail-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(h.registry.spawnCalls).toHaveLength(0); // the rung never started
+      const fenced = h.api.listNotifications({ limit: 50 }).find((row) => row.kind === 'supervision.rearm-fenced');
+      expect(fenced).toMatchObject({ routing: 'action-required', resolvedAt: null });
+      // The fresh control drives a successful retry once the ledger writes.
+      h.registry.spawnImpl = async (role) => new FakeHandle(role, 'commit-fail-resumed', null);
+      expect(h.supervisor.onNotificationDisposed(fenced!.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(h.registry.spawnCalls).toHaveLength(1));
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('a fence that appears DURING the spawn await disposes the fresh handle unused (no adopt, no replay)', async () => {
+    const h = boot();
+    h.supervisor.start();
+    try {
+      h.api.addJob({ id: 'spawn-await-job', repo: 'fixture', title: 'spawn-await lane' });
+      h.api.setJobStatus('spawn-await-job', 'working');
+      h.api.registerAgent({ id: 'spawn-await-agent', role: 'minion', jobId: 'spawn-await-job' });
+      const handle = new FakeHandle('minion', 'spawn-await-agent', null);
+      h.registry.adopt(handle);
+      const internals = h.supervisor as unknown as {
+        agents: Map<string, unknown>;
+        restartRung(agent: unknown, reason: string, opts?: { rearmFence?: boolean }): Promise<void>;
+      };
+      const agent = internals.agents.get('spawn-await-agent');
+      expect(agent).toBeDefined();
+      let releaseSpawn!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseSpawn = resolve;
+      });
+      let spawnedRef: FakeHandle | null = null;
+      h.registry.spawnImpl = async (role, options) => {
+        const spawned = new FakeHandle(role, 'spawn-await-resumed', options?.resumeFile ?? null);
+        spawnedRef = spawned;
+        await gate;
+        return spawned;
+      };
+      const running = internals.restartRung(agent, 'fixture re-arm', { rearmFence: true });
+      // The parking hold lands WHILE the start is in flight (after the
+      // dispose await passed, exactly at the spawn await).
+      await vi.waitFor(() => expect(spawnedRef).not.toBeNull());
+      h.api.setJobStatus('spawn-await-job', 'parked');
+      releaseSpawn();
+      await running;
+      // The fresh handle was disposed unused: never adopted, never replayed.
+      expect(spawnedRef).not.toBeNull();
+      expect((spawnedRef as unknown as FakeHandle).disposed).toBe(true);
+      expect(h.registry.handlesById.has('spawn-await-resumed')).toBe(false);
+      expect(h.supervisor.viewFor('spawn-await-agent')).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(h.api.listNotifications({ limit: 50 }).some((row) => row.kind === 'supervision.rearm-fenced')).toBe(true);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('an alert bound to no stopped breaker reports a record-only outcome (never a fake re-arm)', () => {
+    const h = boot();
+    try {
+      h.api.recordNotification({
+        id: 'unbound-alert',
+        kind: 'supervision.hang',
+        routing: 'action-required',
+        severity: 'error',
+        title: 'Already resumed lane',
+        detail: 'no stopped breaker is bound here',
+      });
+      expect(h.supervisor.onNotificationDisposed('unbound-alert')).toEqual({ ok: true, rearmed: false });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('an in-flight producer admission refuses the re-arm until the single writer releases it', async () => {
+    const rig = tripBreaker();
+    try {
+      await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+      const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+      expect(stop).toBeDefined();
+      const release = rig.api.beginJobAdmission('fenced-job', 'provider restart-fixture');
+      const refused = rig.supervisor.onNotificationDisposed(stop!.id);
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.reason).toContain('in-flight producer');
+      expect(rig.supervisor.viewFor(rig.handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
+      release();
+      rig.registry.spawnImpl = async (role) => new FakeHandle(role, 'fenced-admission-resumed', null);
+      expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: true });
+      await vi.waitFor(() => expect(rig.supervisor.viewFor('fenced-admission-resumed')?.state).toBe('watching'));
+    } finally {
+      rig.close();
     }
   });
 });

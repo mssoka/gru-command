@@ -339,7 +339,8 @@ export interface PacingConfig {
   /** Upper bound on any single automatic-retry delay. */
   readonly backoffMaxMs: number;
   /** Automatic retries per rate-limit incident before the failure stops to
-   * the existing supervisor ladder + owner ACK. 0 = no automatic retry. */
+   * the existing supervisor ladder + Gru's machine queue. 0 = no automatic
+   * retry. */
   readonly maxAutoRetries: number;
   /** Provider-keyed extra rate-limit signatures (global text signatures). */
   readonly providers: Readonly<Record<string, PacingProviderOverride>>;

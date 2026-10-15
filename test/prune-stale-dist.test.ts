@@ -54,9 +54,9 @@ describe('prune-stale-dist', () => {
     expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.has('dist/worktrees/handoff.js')).toBe(true);
     // GH270's handoff path plus main's supervision and scheduled-verification helpers.
     // PR312 adds the managed-names and runtime repository helpers.
-    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5182);
+    expect(PUBLIC_REVIEW_EXECUTABLE_PATHS.size).toBe(5186);
     expect(createHash('sha256').update(`${[...PUBLIC_REVIEW_EXECUTABLE_PATHS].sort().join('\n')}\n`).digest('hex'))
-      .toBe('d314a7cf1c11ef96a523d7cdb5b02845513410821f2504326168881a99217595');
+      .toBe('4dc977a45d0c5dcbb9168bc68ba23bdcf7ef4521d22c260caca7af808cad9854');
     const root = fixtureRoot();
     touch(root, 'src/worktrees/handoff.ts'); touch(root, 'dist/worktrees/handoff.js');
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', dependencies: {} }));

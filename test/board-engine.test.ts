@@ -845,6 +845,61 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(engine.snapshot().ownerPrs.map((row) => row.id)).toEqual(['owner-pr:job-final-pass']);
   });
 
+  it('ships an integration READY that retained whole-complete coverage without a whole replay', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-integration');
+    // The integration round reviewed the advanced-base candidate, retained
+    // whole-complete prior coverage, and recorded it: no final-pass marker and
+    // no finalPassRequired — the head itself is owner-ready.
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-integration',
+      roundId: api.listRounds('job-integration').at(-1)!.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'integration', coverageComplete: true },
+    });
+    const rows = engine.snapshot().ownerPrs;
+    expect(rows.map((row) => row.id)).toEqual(['owner-pr:job-integration']);
+    expect(rows[0]).toMatchObject({ jobId: 'job-integration', sha: SHA });
+  });
+
+  it('withholds a partial-coverage integration READY until the whole pass closes, across an interrupted pass', () => {
+    const { api, engine } = fresh();
+    stageReadyJob(api, 'job-integration-partial');
+    const round = api.listRounds('job-integration-partial').at(-1)!;
+    api.appendCustomEvent({
+      kind: 'round.final-pass-required',
+      jobId: 'job-integration-partial',
+      roundId: round.id,
+      payload: { targetSha: SHA, reviewScope: 'integration' },
+    });
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-integration-partial',
+      roundId: round.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'integration', finalPassRequired: true },
+    });
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    // The chained whole pass is INTERRUPTED: a newer, non-verdict-posted round
+    // must keep the debt visible (and the projection closed).
+    const interrupted = api.addRound({ jobId: 'job-integration-partial', targetRef: SHA });
+    api.setRoundStatus(interrupted.id, 'live');
+    api.setRoundStatus(interrupted.id, 'aborted');
+    expect(engine.snapshot().ownerPrs).toEqual([]);
+
+    // A later whole-scope READY at the same head closes the obligation.
+    const whole = api.addRound({ jobId: 'job-integration-partial', targetRef: SHA });
+    api.setRoundStatus(whole.id, 'live');
+    api.setRoundVerdict(whole.id, 'approved');
+    api.appendCustomEvent({
+      kind: 'round.perkins-review',
+      jobId: 'job-integration-partial',
+      roundId: whole.id,
+      payload: { canonicalVerdict: 'READY TO MERGE', reviewScope: 'whole', coverageComplete: true },
+    });
+    expect(engine.snapshot().ownerPrs.map((row) => row.id)).toEqual(['owner-pr:job-integration-partial']);
+  });
+
   it('drops the row when the job takes a hold (blocked) or a newer round is changes-requested', () => {
     const { api, engine } = fresh();
     stageReadyJob(api, 'job-hold');
@@ -964,6 +1019,25 @@ describe('board engine — FOR YOU owner-PR projection on the snapshot', () => {
     expect(mainSource).toMatch(
       /new BoardEngine\(\{[\s\S]*?supervisionFor:\s*\(agentId\)\s*=>\s*supervisor\?\.viewFor\(agentId\)\s*\?\?\s*null/,
     );
+  });
+
+  it('the main assembly binds the owner-decision surfaces into their producers (assembly alarm)', () => {
+    // Owner release 2026-10-11: the disposition→re-arm binding, the
+    // port-squat boot clearance, the legacy owner-row migration and the
+    // sweep-completion resolution all live in main.ts closures. Unit tests
+    // on both sides inject the seam, so dropping a production binding
+    // stayed green — this source-drift pin is the repo's established
+    // assembly-alarm shape.
+    const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
+    expect(mainSource).toMatch(/onNotificationDisposition:\s*bindSupervisorNotificationDisposition\(supervisorLive\)/u);
+    expect(mainSource).toMatch(/supervisorLive\.setActiveReviewProbe\(\(jobId\) => wave\.activeReview\(jobId\) !== null\)/u);
+    expect(mainSource).toMatch(/notifications\.resolveExactKind\('port-squat', 'service-boot'\)/u);
+    expect(mainSource).toMatch(/notifications\.resolveExactKind\('roll-port-squat', 'service-boot'\)/u);
+    expect(mainSource).toMatch(/reconcileLegacyOwnerAttention\(\{/u);
+    expect(mainSource).toMatch(/notifications\.resolveIncidents\(`worktree-sweep-paused:\$\{worktree\.id\}:/u);
+    // Both sides of the coupling: the posted kind template must carry the
+    // same `worktree-sweep-paused:<id>:<pause>` shape the resolver strips.
+    expect(mainSource).toMatch(/kind: `worktree-sweep-paused:\$\{worktree\.id\}:\$\{randomUUID\(\)\}`/u);
   });
 
   it('bounds the snapshot to the newest receipt window while live rows stay complete (D3)', () => {

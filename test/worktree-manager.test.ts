@@ -32,6 +32,7 @@ interface Harness {
   manager: WorktreeManager;
   ledger: LedgerApi;
   escalations: { title: string; detail: string }[];
+  swept: string[];
   baseFallbacks: BaseFallbackNotice[];
   enumerator: ReturnType<typeof vi.fn>;
   make: (name?: string) => FixtureRepo;
@@ -41,6 +42,7 @@ interface Harness {
 function makeHarness(useDefaultEnumerator = false): Harness {
   const repos: FixtureRepo[] = [];
   const escalations: { title: string; detail: string }[] = [];
+  const swept: string[] = [];
   const baseFallbacks: BaseFallbackNotice[] = [];
   const ledgerDb = new LedgerDb(mkdtempSync(join(tmpdir(), 'gru-command-wtdata-')));
   const ledger = new LedgerApi(ledgerDb.handle, { bus: new EventBus({}) });
@@ -57,6 +59,9 @@ function makeHarness(useDefaultEnumerator = false): Harness {
         detail: processes.map((p) => p.pid).join(','),
       });
     },
+    onSwept: ({ worktree }) => {
+      swept.push(worktree.id);
+    },
     onBaseFallback: (input) => baseFallbacks.push({ ...input }),
     ...(useDefaultEnumerator ? {} : { enumerateProcesses: (treePath: string) => enumerator(treePath) }),
   });
@@ -65,6 +70,7 @@ function makeHarness(useDefaultEnumerator = false): Harness {
     manager,
     ledger,
     escalations,
+    swept,
     baseFallbacks,
     enumerator,
     make(name?: string): FixtureRepo {
@@ -1839,6 +1845,22 @@ describe('Perkins lane-B r2: the sweep-tail catch leg is PINNED (fires on a real
   });
 });
 
+  it('the swept-row heal re-fires onSwept when the repo directory is gone too (owner release 2026-10-11)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-heal-norepo');
+    ledgerJob(h, 'job-heal-norepo', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-heal-norepo' });
+    repo.git(['worktree', 'remove', '--force', row.path]);
+    h.ledger.setWorktreeStatus('job-heal-norepo', 'swept');
+    // The other half of the same crash window: the REPO directory is gone
+    // too, so the ordinary pristine-home check must still fire the
+    // producer-resolution callback (the scoped pause notice settles).
+    rmSync(repo.path, { recursive: true, force: true });
+    const result = await h.manager.release({ worktreeId: 'job-heal-norepo' });
+    expect(result.status).toBe('swept');
+    expect(h.swept).toContain('job-heal-norepo');
+  });
+
 describe('Perkins lane-B r2/r3: crash-window reconciliation (row stranded over a removed tree)', () => {
   it('DISCRIMINATOR: a CONTAINED lane reconciles swept WITH its branch deleted — no debris, no wedge', async () => {
     const h = harness();
@@ -1875,6 +1897,29 @@ describe('Perkins lane-B r2/r3: crash-window reconciliation (row stranded over a
     // Retry of the reconciled lane is an idempotent swept.
     const again = await h.manager.release({ worktreeId: 'job-crashwin' });
     expect(again.status).toBe('swept');
+  });
+
+  it('the missing-tree reconcile fires onSwept so a paused sweep notice can resolve (owner release 2026-10-11)', async () => {
+    const h = harness();
+    const repo = h.make('fixture-crashwin-notice');
+    ledgerJob(h, 'job-cw-notice', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-cw-notice' });
+    // The crash window: the tree is removed out of band, the row stays
+    // active. The paused-sweep owner notice (keyed to this worktree) must
+    // resolve from the completed reconcile — the producer-evidence path.
+    repo.git(['worktree', 'remove', '--force', row.path]);
+    expect(existsSync(row.path)).toBe(false);
+    const result = await h.manager.release({ worktreeId: 'job-cw-notice', baseBranch: 'main' });
+    expect(result.status).toBe('swept');
+    expect(h.swept).toContain('job-cw-notice');
+    // The direct sweep path fires it too (one callback per completed sweep).
+    const h2 = harness();
+    const repo2 = h2.make('fixture-swept-notice');
+    ledgerJob(h2, 'job-swept-notice', repo2);
+    await h2.manager.createJobWorktree({ repoPath: repo2.path, jobId: 'job-swept-notice' });
+    const direct = await h2.manager.release({ worktreeId: 'job-swept-notice' });
+    expect(direct.status).toBe('swept');
+    expect(h2.swept).toEqual(['job-swept-notice']);
   });
 
   it('DISCRIMINATOR: an UNCONTAINED lane reconciles swept with its branch RETAINED — never over-deleted', async () => {
@@ -1923,6 +1968,10 @@ describe('Perkins lane-B r4: a swept row with a surviving branch HEALS on releas
     const healed = await h.manager.release({ worktreeId: 'job-heal', baseBranch: 'main' });
     expect(healed.status).toBe('swept');
     if (healed.status === 'swept') expect(healed.branch).toBe('deleted');
+    // The heal path also re-fires the sweep-completion hook: a scoped
+    // sweep-pause notice whose first resolution was lost (crash between the
+    // flip and the hook) settles on the retry (owner release 2026-10-11).
+    expect(h.swept).toContain('job-heal');
     expect(repo.git(['branch', '--list', row.branch!])).toBe('');
     // The id is reusable immediately.
     ledgerJob(h, 'job-heal-2', repo);

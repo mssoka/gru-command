@@ -922,9 +922,9 @@ export function silasBriefSections(input: {
     '{"wait_id":"...","by":"silas"}); the service rechecks approval,',
     'incident currency, blockers, actor cessation, and lane state, then',
     'resumes the interrupted session. Fan out to further waits only after',
-    'the first continuation shows actual model progress. Never ack or',
-    'dispose provider-wall notifications on the owner’s behalf — those',
-    'stay owner-held.',
+    'the first continuation shows actual model progress. Provider-wall',
+    'stops are machine attention (action-required): Gru decides and',
+    'dispositions them; never ack or dispose them on the owner’s behalf.',
   ];
 }
 
