@@ -29,8 +29,7 @@ describe('intake approval in the actual distributable', () => {
     const module = (name: string) => JSON.stringify(pathToFileURL(join(stage, 'dist', name)).href);
     const script = `
       import assert from 'node:assert/strict';
-      import { execFileSync } from 'node:child_process';
-      import { mkdirSync, readFileSync, existsSync } from 'node:fs';
+      import { readFileSync, existsSync } from 'node:fs';
       import { join } from 'node:path';
       import { IntakeService } from ${module('intake/service.js')};
       import { IntakeApprovalService } from ${module('intake/approval.js')};
@@ -38,22 +37,15 @@ describe('intake approval in the actual distributable', () => {
       import { LedgerDb } from ${module('ledger/db.js')};
       import { PipelineService } from ${module('dispatch/pipeline.js')};
       import { DispatchService } from ${module('dispatch/service.js')};
+      import { WorktreeManager } from ${module('worktrees/manager.js')};
       import { createWorkflowSessionBinder, registeredWorkflowLane } from ${module('workflows/session.js')};
       const root = ${JSON.stringify(root)}, repoPath = ${JSON.stringify(repo)}, dataDir = join(root, 'private');
       const db = new LedgerDb(dataDir), ledger = new LedgerApi(db.handle);
-      const lanes = new Map(), spawns = [], settlements = [];
-      const worktrees = {
-        getWorktree: (id) => lanes.get(id) ?? null, listWorktrees: () => [...lanes.values()],
-        async createJobWorktree({ repoPath, jobId }) {
-          const path = join(root, 'lanes', jobId); mkdirSync(join(root, 'lanes'), { recursive: true });
-          const branch = 'gru/' + jobId;
-          execFileSync('git', ['-C', repoPath, 'worktree', 'add', '-qb', branch, path], { stdio: 'ignore' });
-          const sha = execFileSync('git', ['-C', path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-          const lane = { id: jobId, kind: 'job', jobId, roundId: null, path, repoPath, repoName: 'app', branch, sha, status: 'active' };
-          lanes.set(jobId, lane); return lane;
-        },
-        async release() { throw new Error('unexpected fixture release'); }
-      };
+      const spawns = [], settlements = [];
+      // Exercise authentic service-ledger issuance from the archive, rather
+      // than manufacturing ready-looking lane rows in a separate map.
+      const worktrees = new WorktreeManager({ ledger, root: join(root, 'lanes'),
+        preserveRoot: join(root, 'preserved'), setupTimeoutMs: 30_000 });
       const bind = createWorkflowSessionBinder(dataDir, (options) => registeredWorkflowLane(options, worktrees, ledger), ${JSON.stringify(stage)});
       const dispatch = new DispatchService({ ledger, worktrees, spawner: async (role, options) => {
         const session = bind(options); spawns.push({ role, options, session });

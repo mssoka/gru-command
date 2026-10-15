@@ -153,7 +153,23 @@ describe('graceful shutdown', () => {
       // size snapshot — the next boot's growth detection has a baseline.
       const snapshotFile = join(home, 'sessions', 'store-state.json');
       expect(existsSync(snapshotFile)).toBe(true);
-      expect(JSON.parse(readFileSync(snapshotFile, 'utf-8'))).toEqual({});
+      const snapshot = JSON.parse(readFileSync(snapshotFile, 'utf-8')) as Record<string, number>;
+      const files = Object.keys(snapshot);
+      expect(files).toHaveLength(1);
+      const file = files[0]!;
+      expect(file.startsWith(join(home, 'sessions', 'gru') + '/')).toBe(true);
+      const bytes = readFileSync(file);
+      expect(Number.isSafeInteger(snapshot[file])).toBe(true);
+      expect(snapshot[file]).toBe(bytes.length);
+      expect(snapshot[file]).toBeGreaterThan(0);
+      const entries = bytes.toString('utf8').trim().split('\n').map((line) => JSON.parse(line) as { type: string; id?: string });
+      expect(entries[0]).toMatchObject({ type: 'session', id: expect.any(String) });
+      // Durable native initialization/selection is not a user turn,
+      // request admission, assistant completion or fabricated empty store.
+      expect(entries.every((entry) => ['session', 'model_change', 'thinking_level_change'].includes(entry.type))).toBe(true);
+      const db = new LedgerDb(home);
+      try { expect(db.handle.prepare('SELECT COUNT(*) AS n FROM pending_directives').get()?.n).toBe(0); }
+      finally { db.close(); }
       // And the boot line reported the session store wiring:
       const storeLine = lines.find((line) => line.msg === 'session store ready');
       expect(storeLine).toBeDefined();
@@ -263,4 +279,94 @@ describe('graceful shutdown', () => {
       if (child.exitCode === null) child.kill('SIGKILL');
     }
   });
+});
+
+it('P33 production directive resource shutdown joins progress before failing registry and cannot skip either stage', async () => {
+  const { disposeDirectiveResources } = await import('../src/dispatch/directive-progress.js');
+  const order: string[] = []; let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const run = disposeDirectiveResources({ dispose: async () => { order.push('progress-stop'); await pending; order.push('progress-joined'); } },
+    { dispose: async () => { order.push('registry'); throw new Error('registry teardown fault'); } }).then(() => null, (error: unknown) => error);
+  await Promise.resolve(); expect(order).toEqual(['progress-stop']); release();
+  expect(await run).toBeInstanceOf(AggregateError); expect(order).toEqual(['progress-stop', 'progress-joined', 'registry']);
+  order.length = 0;
+  const both = await disposeDirectiveResources({ dispose: async () => { order.push('progress'); throw new Error('progress failure'); } },
+    { dispose: async () => { order.push('registry'); throw new Error('registry failure'); } }).then(() => null, (error: unknown) => error);
+  expect(order).toEqual(['progress', 'registry']); expect((both as AggregateError).errors).toHaveLength(2);
+});
+
+it('R12 actual main boot survives a persistent historical group failure and retains its action while healthy work settles', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'gru-main-historical-fault-')); cleanupDirs.push(home);
+  const workspace = mkdtempSync(join(tmpdir(), 'gru-main-historical-workspace-')); cleanupDirs.push(workspace);
+  writeFileSync(configPathFor(home), `workspace_root = ${JSON.stringify(workspace)}\n[server]\nhost = "127.0.0.1"\nport = 0\n`);
+  const failedJob = 'boot-failed-historical'; const healthyJob = 'boot-healthy-historical';
+  const seedDb = new LedgerDb(home); const seed = new LedgerApi(seedDb.handle);
+  for (const jobId of [failedJob, healthyJob]) {
+    seed.addJob({ id: jobId, repo: 'fixture', title: 'original historical intent', briefing: 'original approved scope' });
+    seed.setJobStatus(jobId, 'working');
+    const markers = seed.beginPendingRebrief({ jobId, note: 'original correction', briefing: 'original approved scope' });
+    seed.bindPendingRebriefWorker({ ids: markers.map((row) => row.id), agentId: 'original-historical-minion', sessionFile: null });
+    for (const marker of seed.listPendingRebriefs({ jobId })) seed.appendCustomEvent({ kind: marker.kind, jobId,
+      agentId: 'original-historical-minion', payload: { marker_id: marker.id, payload_hash: marker.payloadHash,
+        work_revision: marker.workRevision, ...(marker.kind === 'silas.rebrief' ? { minion_id: 'original-historical-minion' } : { agentId: 'original-historical-minion', source: 'silas-rebrief', sha: 'original-legacy-head' }) } });
+  }
+  const original = seed.listPendingRebriefs({ jobId: failedJob });
+  const originalEvents = seed.listJobEventsByKinds(failedJob, ['silas.rebrief', 'job.delivered']); seedDb.close();
+  const root = join(import.meta.dirname, '..'); const hook = join(home, 'historical-fault-hook.mjs');
+  writeFileSync(hook, `import { LedgerApi } from ${JSON.stringify(`file://${join(root, 'dist/ledger/api.js')}`)};
+const clear = LedgerApi.prototype.clearPendingRebriefsIfCurrentAndSettle;
+LedgerApi.prototype.clearPendingRebriefsIfCurrentAndSettle = function(markers) {
+  if (markers[0]?.jobId === ${JSON.stringify(failedJob)}) throw new Error('persistent original scoped historical storage refusal');
+  return clear.call(this, markers);
+};
+`);
+  const child = spawn(process.execPath, ['--import', hook, 'dist/main.js'], { cwd: root,
+    env: { ...process.env, GRU_COMMAND_HOME: home }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = ''; child.stderr.on('data', (bytes: Buffer) => { stderr += bytes.toString('utf8'); });
+  const exited = new Promise<number | null>((resolve) => child.on('exit', resolve));
+  try {
+    const outcome = await Promise.race([
+      waitForHealthyPort(home, () => stderr).then((port) => ({ kind: 'listening' as const, port })),
+      exited.then((code) => ({ kind: 'exit' as const, code })),
+    ]);
+    expect(outcome.kind, stderr).toBe('listening');
+    if (outcome.kind !== 'listening') throw new Error('asserted service boot must reach its listener');
+    expect((await fetch(`http://127.0.0.1:${outcome.port}/health`)).status).toBe(200);
+    const summary = readLogLines(home).find((line) => line.msg === 're-brief reconciliation');
+    expect(summary).toMatchObject({ completed: 1, redispatched: 0, failed: 1 });
+    child.kill('SIGTERM'); expect(await exited).toBe(0);
+    const db = new LedgerDb(home); const ledger = new LedgerApi(db.handle);
+    try {
+      expect(ledger.listPendingRebriefs({ jobId: failedJob })).toEqual(original);
+      expect(ledger.listPendingRebriefs({ jobId: healthyJob })).toEqual([]);
+      expect(ledger.listJobEventsByKinds(failedJob, ['silas.rebrief', 'job.delivered'])).toEqual(originalEvents);
+      expect(ledger.listObligations({ jobId: failedJob }).some((row) => row.state === 'open' && row.nextAction.kind === 'gru-decision')).toBe(true);
+      expect(ledger.findNotificationByKind(`silas.rebrief-unreconciled.${failedJob}`, 'active')).toMatchObject({ routing: 'action-required' });
+      expect(ledger.latestJobEvent(failedJob, 'silas.rebrief-settled')).toBeNull();
+    } finally { db.close(); }
+  } finally { if (child.exitCode === null) child.kill('SIGKILL'); await exited; }
+});
+
+it('P33 actual main shutdown joins progress even when shared registry disposal rejects', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'gru-main-progress-fault-')); cleanupDirs.push(home);
+  writeFileSync(configPathFor(home), '[server]\nhost = "127.0.0.1"\nport = 0\n');
+  const trace = join(home, 'shutdown-order.jsonl'); const hook = join(home, 'fault-hook.mjs');
+  const root = join(import.meta.dirname, '..');
+  writeFileSync(hook, `import { appendFileSync } from 'node:fs';
+import { DirectiveProgressService } from ${JSON.stringify(`file://${join(root, 'dist/dispatch/directive-progress.js')}`)};
+import { RuntimeRegistry } from ${JSON.stringify(`file://${join(root, 'dist/runtime/registry.js')}`)};
+const trace = ${JSON.stringify(trace)}; const original = DirectiveProgressService.prototype.dispose;
+DirectiveProgressService.prototype.dispose = async function() { appendFileSync(trace, 'progress-stop\\n'); await original.call(this); appendFileSync(trace, 'progress-joined\\n'); };
+RuntimeRegistry.prototype.dispose = async function() { appendFileSync(trace, 'registry\\n'); throw new Error('controlled shared registry shutdown refusal'); };
+`);
+  const child = spawn(process.execPath, ['--import', hook, process.env.GH286_RECEIVED_MAIN ?? 'dist/main.js'], {
+    cwd: root, env: { ...process.env, GRU_COMMAND_HOME: home }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = ''; child.stderr.on('data', (bytes: Buffer) => { stderr += bytes.toString('utf8'); });
+  const exited = new Promise<number | null>((resolve) => child.on('exit', resolve));
+  try {
+    await waitForHealthyPort(home, () => stderr); child.kill('SIGTERM'); expect(await exited).toBe(0);
+    expect(readFileSync(trace, 'utf8').trim().split('\n')).toEqual(['progress-stop', 'progress-joined', 'registry']);
+    expect(readLogLines(home).some((line) => String(line.msg).includes('dispose failed'))).toBe(true);
+  } finally { if (child.exitCode === null) child.kill('SIGKILL'); await exited; }
 });

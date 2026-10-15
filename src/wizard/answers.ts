@@ -14,6 +14,10 @@ import { displayManagedRepoName, managedRepoNameError } from '../repos/managed-n
  * nothing written.
  */
 
+/** Runtime NEW installs default to. Existing configs keep what they say
+ * (seedAnswersFromConfig); the code-level fallback in config.ts is separate. */
+export const DEFAULT_NEW_INSTALL_RUNTIME: RuntimeId = 'claude-code';
+
 export interface WizardAnswers {
   /** Raw workspace-root string as answered (`~`-form preserved in output). */
   readonly workspaceRoot: string;
@@ -264,7 +268,7 @@ export function parseAnswers(json: string, home: string = homedir()): WizardAnsw
     }
   }
 
-  let runtime: RuntimeId = 'pi';
+  let runtime: RuntimeId = DEFAULT_NEW_INSTALL_RUNTIME;
   if (raw['runtime'] !== undefined) {
     const id = requireString(raw['runtime'], 'runtime');
     if (!(RUNTIME_IDS as readonly string[]).includes(id)) {

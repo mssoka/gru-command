@@ -21,6 +21,7 @@ import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtim
 import type { Role } from '../src/config.js';
 import { makeFixtureRepo, attachBareOrigin, type FixtureRepo } from './helpers/fixture-repo.js';
 import { originHeadProbe } from './helpers/pr-head-probe.js';
+import { withNativeDirectiveFixture } from './helpers/directive-native-fixture.js';
 
 const FAKE_CAPABILITIES: AgentCapabilities = {
   streaming: true,
@@ -210,7 +211,11 @@ async function bootFollowThrough(input: {
   const db = new LedgerDb(dir);
   const bus = new EventBus({});
   const ledger = new LedgerApi(db.handle, { bus });
-  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'));
+  const worktrees = new InMemoryWorktreePort(join(dir, 'wtroot'), ledger);
+  const createJobLane = worktrees.createJobWorktree.bind(worktrees);
+  vi.spyOn(worktrees, 'createJobWorktree').mockImplementation(async (input) => {
+    const lane = await createJobLane(input); if (ledger.getWorktree(lane.id) === null) ledger.registerWorktree(lane); return lane;
+  }); // original lane creation, not recovery evidence
 
   const spawns: { role: Role; options: SpawnOptions }[] = [];
   const minionPrompts: string[] = [];
@@ -224,11 +229,28 @@ async function bootFollowThrough(input: {
   let minionTurns = 0;
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
-    if (role === 'perkins') return hybrid.spawner(role, options);
+    if (role === 'perkins') {
+      const handle = await hybrid.spawner(role, options);
+      // The fixture bypasses RuntimeRegistry's event tap. Relay the fake's
+      // actual lifecycle so completed reviews do not remain spawning owners.
+      return {
+        ...handle,
+        async prompt(text, promptOptions) {
+          ledger.setAgentState(handle.id, 'streaming');
+          try { await handle.prompt(text, promptOptions); }
+          finally { ledger.setAgentState(handle.id, handle.health().state); }
+        },
+        async dispose() {
+          await handle.dispose();
+          if (ledger.getAgent(handle.id) !== null) ledger.setAgentState(handle.id, 'disposed');
+        },
+      };
+    }
     if (role === 'silas') throw new Error('the integration fakes the silas slot, never spawns it');
-    return {
+    const id = options?.agentId ?? `agent-${spawns.length}`;
+    return withNativeDirectiveFixture({
       role,
-      id: `agent-${spawns.length}`,
+      id,
       sessionFile: null,
       capabilities: FAKE_CAPABILITIES,
       async prompt(text: string) {
@@ -264,7 +286,9 @@ async function bootFollowThrough(input: {
         return { state: 'idle' as const, lastActivity: null, sessionFile: null };
       },
       async dispose() {},
-    };
+    }, join(reviewSessions, `${id}.jsonl`), (state) => {
+      if (ledger.getAgent(id) !== null) ledger.setAgentState(id, state);
+    }, options?.cwd === undefined ? undefined : () => execFileSync('git', ['-C', options.cwd!, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), options?.cwd);
   };
 
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
@@ -316,7 +340,7 @@ async function bootFollowThrough(input: {
       registry: {
         getHandle: () => null,
         spawn: (role, options) => spawner(role, options),
-        disposeHandle: async () => {},
+        disposeHandle: async (handle) => { await handle.dispose(); },
       },
       worktrees,
       notifications: new NotificationCenter({ ledger, bus }),
@@ -490,7 +514,9 @@ describe('silas follow-through (no human input)', () => {
       expect(['dispatching', 'admitted', 'settled']).toContain(h.directiveReceipts[0]?.readbackState);
 
       const rounds = h.ledger.listRounds('pr-651');
-      const events = h.ledger.listJobEvents('pr-651');
+      const events = h.ledger.listJobEventsByKinds('pr-651', [
+        'silas.directive-sent', 'silas.review-triggered', 'job.delivered',
+      ]);
       // The directive closed round 1's gap and the delivery re-armed review.
       expect(events.map((event) => event.kind)).toContain('silas.directive-sent');
       expect(events.filter((event) => event.kind === 'silas.review-triggered')).toHaveLength(2);
@@ -498,7 +524,12 @@ describe('silas follow-through (no human input)', () => {
       const deliveries = events.filter((event) => event.kind === 'job.delivered');
       expect(deliveries).toHaveLength(2);
       const followUp = deliveries[0];
-      expect(followUp?.payload).toMatchObject({ source: 'silas-directive' });
+      expect(followUp?.payload).toMatchObject({ source: 'silas-directive', request_id: h.directiveReceipts[0]!.requestId });
+      const admitted = h.ledger.getDirective(h.directiveReceipts[0]!.requestId)!;
+      expect(admitted.state).toBe('settled');
+      expect(admitted.nativeBinding?.userEntryId).toBeTruthy();
+      expect(admitted.admissionSeq).toBeTypeOf('number');
+      expect(admitted.deliverySeq).toBe(followUp?.seq);
       const followUpSha = (followUp?.payload as { sha?: string | null }).sha;
       expect(typeof followUpSha).toBe('string');
       // The freshness predicate's witness: the fix delivery moved the lane

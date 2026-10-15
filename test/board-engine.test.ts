@@ -1039,7 +1039,10 @@ describe('board engine — managed repository overview wiring', () => {
     expect(runtimeSource).toMatch(/managedRepos:\s*config\.managedRepos/);
     expect(mainSource).toMatch(/repoOverview:\s*\(\)\s*=>\s*repoOverview\.view\(\)/);
     expect(mainSource).toMatch(/repoOverview\.start\(\)/);
-    expect(mainSource).toMatch(/state\.repoOverview\?\.stop\(\)/);
+    // The stop moved into the extracted shutdown orchestration (issue #341),
+    // which main.ts invokes; the alarm follows the production wiring.
+    const shutdownSource = readFileSync(join(import.meta.dirname, '..', 'src', 'service-shutdown.ts'), 'utf8');
+    expect(shutdownSource).toMatch(/state\.repoOverview\?\.stop\(\)/);
   });
 });
 

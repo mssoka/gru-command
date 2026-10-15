@@ -34,6 +34,12 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
+/** A PATH dir holding an executable `claude` stub so runs that default to Claude Code
+ * do not depend on the host having the CLI installed. */
+const claudeBin = tempDir('gru-command-claude-stub-');
+writeFileSync(join(claudeBin, 'claude'), '#!/bin/sh\necho 1.0.0\n', { mode: 0o755 });
+const PATH_WITH_CLAUDE = `${claudeBin}:${process.env.PATH ?? ''}`;
+
 function run(instance: string, args: readonly string[] = [], env: NodeJS.ProcessEnv = {}) {
   return spawnSync(
     process.execPath,
@@ -41,6 +47,7 @@ function run(instance: string, args: readonly string[] = [], env: NodeJS.Process
     {
       env: {
         ...process.env,
+        PATH: PATH_WITH_CLAUDE,
         ...env,
         GRU_COMMAND_HOME: instance,
       },
@@ -376,6 +383,35 @@ describe('config-generate CLI', () => {
     expect(loaded.pacing).toMatchObject({ enabled: false, maxConcurrentMinions: 2, maxConcurrentReviewTurns: 2, maxAutoRetries: 1 });
   });
 
+  it('round trip preserves the [silas.autopilot] policy tables (issue #243 R2-M3)', () => {
+    const root = tempDir('gru-command-config-autopilot-');
+    const instance = join(root, 'instance');
+    mkdirSync(instance, { recursive: true });
+    const prior = [
+      '[silas]',
+      'enabled = true',
+      '[silas.autopilot]',
+      'enabled = true',
+      '[silas.autopilot.rules]',
+      'verdict-rung-directive = "enforce"',
+      'sweep-ack = "off"',
+    ].join('\n');
+    writeFileSync(join(instance, 'config.toml'), `${prior}\n`);
+    const forced = run(instance, ['--force']);
+    expect(forced.status, `${forced.stdout}\n${forced.stderr}`).toBe(0);
+    const raw = parse(readFileSync(join(instance, 'config.toml'), 'utf-8')) as Record<string, unknown>;
+    const silas = raw.silas as { autopilot: { enabled: boolean; rules: Record<string, string> } };
+    expect(silas.autopilot).toEqual({
+      enabled: true,
+      rules: { 'sweep-ack': 'off', 'verdict-rung-directive': 'enforce' },
+    });
+    const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, root);
+    expect(loaded.silas.autopilot).toEqual({
+      enabled: true,
+      rules: { 'sweep-ack': 'off', 'verdict-rung-directive': 'enforce' },
+    });
+  });
+
   it('data_dir is emitted ~-anchored for home-under instances (restore-on-new-machine portability)', () => {
     // Regression guard (Perkins R1 blocker 1): a machine-specific absolute
     // data_dir redirects all state to the OLD machine when the config is
@@ -447,5 +483,64 @@ describe('config-generate CLI', () => {
     expect(backup).toMatch(/config\.toml\.backup-\d{8}T\d{6}\d{3}Z$/);
     expect(statSync(backup!).mode & 0o777).toBe(0o600);
     expect(readFileSync(backup!, 'utf-8')).toBe(before);
+  });
+});
+
+describe('config-generate: Claude Code is the default for new installs (#374)', () => {
+  const runtimeOf = (instance: string) =>
+    (parse(readFileSync(join(instance, 'config.toml'), 'utf-8')) as { runtimes: { default: string } }).runtimes.default;
+
+  it('a fresh instance gets [runtimes] default = "claude-code" with an explanatory comment', () => {
+    const instance = join(tempDir('gru-command-cg-fresh-'), 'instance');
+    const result = run(instance);
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(runtimeOf(instance)).toBe('claude-code');
+    expect(readFileSync(join(instance, 'config.toml'), 'utf-8')).toContain('default for new installs');
+  });
+
+  it('--runtime pi still selects pi and needs no claude CLI', () => {
+    const instance = join(tempDir('gru-command-cg-pi-'), 'instance');
+    const result = run(instance, ['--runtime', 'pi'], { PATH: '/usr/bin:/bin' });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(runtimeOf(instance)).toBe('pi');
+  });
+
+  it('missing claude CLI fails loud with the fix and the pi alternative, writing nothing', () => {
+    const instance = join(tempDir('gru-command-cg-missing-'), 'instance');
+    const result = run(instance, [], { PATH: '/usr/bin:/bin' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('`claude` was not found on PATH');
+    expect(result.stderr).toContain('--runtime pi');
+    expect(existsSync(join(instance, 'config.toml'))).toBe(false);
+  });
+
+  it('an existing pi config (and one with no [runtimes] table) is untouched by --force regeneration', () => {
+    const instance = join(tempDir('gru-command-cg-existing-'), 'instance');
+    expect(run(instance, ['--runtime', 'pi']).status).toBe(0);
+    // No claude on PATH: the existing runtime is kept, so no CLI check applies.
+    const forced = run(instance, ['--force'], { PATH: '/usr/bin:/bin' });
+    expect(forced.status, `${forced.stdout}\n${forced.stderr}`).toBe(0);
+    expect(runtimeOf(instance)).toBe('pi');
+
+    const legacy = join(tempDir('gru-command-cg-legacy-'), 'instance');
+    mkdirSync(legacy, { recursive: true });
+    const legacyWorkspace = join(tempDir('gru-command-cg-legacy-ws-'), 'ws');
+    mkdirSync(legacyWorkspace, { recursive: true });
+    writeFileSync(
+      join(legacy, 'config.toml'),
+      `workspace_root = ${JSON.stringify(legacyWorkspace)}\ndata_dir = ${JSON.stringify(join(legacy, 'data'))}\n`,
+    );
+    const legacyForced = run(legacy, ['--force'], { PATH: '/usr/bin:/bin' });
+    expect(legacyForced.status, `${legacyForced.stdout}\n${legacyForced.stderr}`).toBe(0);
+    expect(runtimeOf(legacy)).toBe('pi');
+    expect(loadConfig({ GRU_COMMAND_HOME: legacy }, legacy).runtimes.default).toBe('pi');
+  });
+});
+
+describe('issue #243 F-L1 empty-digest wording', () => {
+  it('qualifies the empty-digest statement with the due-decision-recheck exception', () => {
+    const block = renderConfigDocBlock();
+    expect(block).toContain('empty digest never wakes on its own; a due decision recheck still');
+    expect(block).not.toContain('empty digest never wakes). The wake prompt carries');
   });
 });

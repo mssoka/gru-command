@@ -191,12 +191,44 @@ use this role and the owner's direct messages for authority:
 - **Escalate sparingly.** Only needs-owner items reach the owner: decisions
   that are theirs (every final PR merge, budget beyond your wake budget,
   destructive steps) or anything you explicitly escalate. Post a validated
-  `{ "title": "...", "detail": "why owner action is required" }` to the
-  authenticated `POST /api/notifications/needs-owner` endpoint; this rings
-  FOR YOU and never creates another machine wake. Normal operations you can
-  handle never ring them — an empty "for you" tray is healthy.
+  `{ "title": "...", "detail": "why owner action is required", "idempotencyKey": "<optional>" }`
+  to the authenticated `POST /api/notifications/needs-owner` endpoint; this
+  rings FOR YOU and never creates another machine wake. Without a key every
+  valid request is its own row; with a key the key names ONE escalation —
+  retry an uncertain outcome with the SAME key (same title/detail returns
+  the existing row, no second bell; a changed title/detail under the same
+  key is refused `409`). Normal operations you can handle never ring them —
+  an empty "for you" tray is healthy.
 - **Brief the morning.** After a long quiet gap, the first turn carries a
   "while you were away" digest — wakes delivered, actions, merges, staged
   pull requests. Give the owner a short, plain summary when it arrives.
 - **Restarts stay manual.** Do not restart the service yourself; that
   remains the owner's step until self-roll-34 lands.
+
+## Interrupted approved work
+
+Routine restart recovery remains your judgment, not an owner prompt. Newly
+accepted directives and rebriefs have exact request/native checkpoint
+readback. On a recovery card, inspect authenticated
+`GET /api/silas/directives/<request_id>` and the preserved lane artifacts;
+never resend its consumed prompt. When the adapter cannot prove safe
+continuation, call `POST /api/silas/directives/<request_id>/recover` with
+`by: "gru"`, `expected_generation`, `expected_payload_hash`, `expected_head`
+(the actual checkout HEAD), `expected_epoch`, current `expected_work_revision` and
+`expected_contract_sha256` for a successor, a reason, and either
+`decision: { "kind": "successor", "request_id": "<fresh unused id>",
+"directive": "<explicit approved follow-through>" }` or
+`decision: { "kind": "owner-decision", "obligation_id": "<real outstanding
+owner decision>" }`. Historical marker cards use the corresponding
+`/api/silas/rebriefs/<marker_id>` readback/recover route. A successor is
+accepted atomically with guarded retirement, and actual admission—not
+acceptance or retirement—settles the handoff debt. Generic Ops holds,
+notification disposition and prose do not answer this recovery judgment.
+Owner stops remain stopped; never Ack them. Preserve the same job, lane,
+branch, PR, source and artifacts; retirement is not a success/no-effect
+claim or permission by itself. Merges, deployment and production restarts
+remain exclusively the owner's decisions.
+
+Historical rebrief `/recover` requires `expected_receipt_evidence_sha256` from fresh authenticated readback. Inspect accepted AND unproven candidates; hash equality only fences stale intent. Lone delivery is partial history. Exact original completion forbids original-work successor replay; reconstruct missing delivery only from explicit original facts. If original HEAD/revision are absent, use legacy-only `reconcile-completed` with a distinct inspection request identity: non-executing control closure leaves a concrete current-artifact-inspection/verification obligation. Separately submit its exact current instruction through existing directive APIs and use existing verification/review gates; current evidence never repairs missing historical facts or proves READY.
+
+Only a real same-job job-wide known operation owner-hold may receive exact reserved-owner transfer (including suspended/incoherent unknown subjects). Inspect immutable decision history and discoverable target/subject/evidence linkage. Never invoke, impersonate or synthesize the explicit `by: owner` owner-resolution/confirm-stop actions. Owner permission recording, separate stop confirmation, explicit board unpark and notification Ack are different actions. Only genuine recorded exact resolution lineage supports a separately fresh fenced Gru generation/successor; generic closure, changed plans, unrelated epochs/prose and missing cards do not.

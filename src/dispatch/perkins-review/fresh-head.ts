@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { isGitHubRemote, isGitLabRemote } from '../review-path.js';
+import { repositoryGitEnv } from './artifacts.js';
 
 /**
  * Fresh-head freeze resolution (hotfix): a round that reviews a PR branch
@@ -69,6 +70,7 @@ function gitOutput(repoPath: string, args: readonly string[], gitBinary: string,
   const result = spawnSync(gitBinary, ['-C', repoPath, ...args], {
     encoding: 'utf8',
     timeout: timeoutMs,
+    env: repositoryGitEnv(false),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.error !== undefined) return { ok: false, stdout: '', detail: String(result.error) };
@@ -283,5 +285,5 @@ export async function resolveFreshPrHead(input: FreshPrHeadInput): Promise<Fresh
         'The round was not started; request the review again to freeze the current head.',
     );
   }
-  return { targetSha, movementRef: `origin/${prHeadRefName}`, prHeadSha, prHeadRefName };
+  return { targetSha, movementRef: `refs/remotes/origin/${prHeadRefName}`, prHeadSha, prHeadRefName };
 }
