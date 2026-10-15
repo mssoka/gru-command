@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createConnection } from 'node:net';
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import {
@@ -17,6 +17,7 @@ import {
   checkedInProjectMcpConfig,
   claudeInBandError,
   gitFailure,
+  isProjectMcpCopyName,
   mapRoleTools,
 } from '../src/runtime/claude-adapter.js';
 import { isRateLimitErrorText } from '../src/runtime/pacing.js';
@@ -44,7 +45,7 @@ import { makeFixtureRepo } from './helpers/fixture-repo.js';
 function copiesOf(sessionFile: string): string[] {
   const prefix = `${basename(sessionFile)}.`;
   return readdirSync(dirname(sessionFile))
-    .filter((name) => name.startsWith(prefix) && name.endsWith('.project-mcp.json'))
+    .filter((name) => name.startsWith(prefix) && isProjectMcpCopyName(basename(sessionFile), name))
     .map((name) => join(dirname(sessionFile), name));
 }
 
@@ -1883,14 +1884,17 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(pendingAtError).toEqual([expect.objectContaining({ text: 'cannot prepare' })]);
       expect(handle.pendingTurn?.()).toBeNull();
       // A subscriber that re-prompts from the error keeps ITS prompt pending.
-      let again: Promise<void> | undefined;
+      let again: Promise<unknown> | undefined;
       const unsubscribe = handle.subscribe((event) => {
-        if (event.type === 'error' && again === undefined) again = handle.prompt('re-prompted from the error');
+        if (event.type === 'error' && again === undefined) {
+          again = handle.prompt('re-prompted from the error').then(() => 'resolved', (error: unknown) => error);
+        }
       });
       await expect(handle.prompt('fails again')).rejects.toThrow(/could not be prepared/u);
       unsubscribe();
       expect(handle.pendingTurn?.()).toMatchObject({ text: 're-prompted from the error' });
-      await expect(again).rejects.toThrow(/could not be prepared/u);
+      expect(handle.health()).toMatchObject({ state: 'spawning' }); // the re-prompt owns the state
+      expect(String(await again)).toMatch(/could not be prepared/u);
       expect(handle.pendingTurn?.()).toBeNull();
       expect(events.some((event) => event.type === 'error' && /could not be prepared/u.test(event.error))).toBe(true);
       expect(handle.health()).toMatchObject({ state: 'error' });
@@ -1935,12 +1939,22 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ reason: expect.stringContaining('only in line endings') });
         // Bytes, not decoded text: invalid UTF-8 never passes for a line-ending
         // difference (both sides would decode to U+FFFD).
-        writeFileSync(join(crlf.path, '.mcp.json'), Buffer.from([0xff, 0x0a]));
+        const raw = (byte: number, eol: number[]) => Buffer.concat([Buffer.from('{"note":"'), Buffer.from([byte]), Buffer.from('"}'), Buffer.from(eol)]);
+        writeFileSync(join(crlf.path, '.mcp.json'), raw(0xff, [0x0a]));
         crlf.git(['add', '.mcp.json']);
         crlf.git(['commit', '-q', '-m', 'raw bytes']);
         expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ config: expect.anything() });
-        writeFileSync(join(crlf.path, '.mcp.json'), Buffer.from([0xfe, 0x0d, 0x0a]));
+        writeFileSync(join(crlf.path, '.mcp.json'), raw(0xfe, [0x0d, 0x0a]));
         expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+        // Only a CR right before an LF is a line ending: a lone CR is an edit.
+        crlf.commitFile('.mcp.json', '{}\n');
+        writeFileSync(join(crlf.path, '.mcp.json'), '\r{}\n');
+        expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+        // A committed file that is not a JSON object is refused at the boundary.
+        for (const content of ['not json', '["a list"]', 'null']) {
+          crlf.commitFile('.mcp.json', content);
+          expect(await checkedInProjectMcpConfig(crlf.path), content).toEqual({ reason: 'the committed .mcp.json is not a JSON object' });
+        }
       } finally {
         crlf.cleanup();
       }
@@ -1958,25 +1972,36 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     cleanupDirs.push(bin);
     const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
     const savedPath = process.env['PATH'];
-    // A lane writer racing the check: while git reads the committed blob,
-    // the working file is replaced.
+    // Restored even if a check hangs past the test timeout.
+    onTestFinished(() => {
+      if (savedPath === undefined) delete process.env['PATH'];
+      else process.env['PATH'] = savedPath;
+    });
+    const target = join(repo.path, '.mcp.json');
+    // A lane writer racing the check: while git reads the committed blob in
+    // THIS fixture repo (and nowhere else), the working file is replaced.
     const race = (action: string) => writeFileSync(join(bin, 'git'),
-      `#!/bin/sh\nif [ "$1" = "cat-file" ]; then ${action}; fi\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+      `#!/bin/sh\nif [ "$1" = "cat-file" ] && [ "$(pwd -P)" = '${realpathSync(repo.path)}' ]; then ${action}; fi\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+    // A blocking open must fail this test fast, never hang the suite.
+    const check = (): Promise<unknown> => Promise.race([
+      checkedInProjectMcpConfig(repo.path),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error('the check blocked')), 5_000).unref()),
+    ]);
     try {
       const committed = JSON.stringify({ mcpServers: {} });
       repo.commitFile('.mcp.json', committed);
       process.env['PATH'] = `${bin}:${savedPath ?? ''}`;
-      for (const swap of ['rm -f .mcp.json && mkfifo .mcp.json', 'rm -f .mcp.json && ln -s package.json .mcp.json',
-        'rm -f .mcp.json && mkdir .mcp.json']) {
+      for (const swap of [`rm -f '${target}' && mkfifo '${target}'`, `rm -f '${target}' && ln -s package.json '${target}'`,
+        `rm -f '${target}' && mkdir '${target}'`]) {
         race(swap);
-        expect(await checkedInProjectMcpConfig(repo.path), swap).toEqual({ reason: '.mcp.json is not a regular file (symlink or other)' });
-        rmSync(join(repo.path, '.mcp.json'), { recursive: true, force: true });
-        writeFileSync(join(repo.path, '.mcp.json'), committed);
+        expect(await check(), swap).toEqual({ reason: '.mcp.json is not a regular file (symlink or other)' });
+        rmSync(target, { recursive: true, force: true });
+        writeFileSync(target, committed);
       }
       // Grown to a sparse 3 GiB after the first look: refused after a few
       // bytes — an unbounded read could not even load it.
-      race('dd if=/dev/null of=.mcp.json bs=1 count=0 seek=3221225472 2>/dev/null');
-      expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
+      race(`dd if=/dev/null of='${target}' bs=1 count=0 seek=3221225472 2>/dev/null`);
+      expect(await check()).toEqual({ reason: '.mcp.json differs from its committed version' });
     } finally {
       if (savedPath === undefined) delete process.env['PATH'];
       else process.env['PATH'] = savedPath;
@@ -1987,15 +2012,19 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
   it('each handle owns its project-MCP copy: a resumed session never shares the predecessor copy', async () => {
     const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "project"\n' });
     const repo = makeFixtureRepo('mcp-project-resume');
+    const handles: AgentHandle[] = [];
+    const track = async (spawned: Promise<AgentHandle>) => { const handle = await spawned; handles.push(handle); return handle; };
     try {
       repo.commitFile('.mcp.json', JSON.stringify({ mcpServers: {} }));
       const copyOf = () => { const argv = doubleInvocations(fx).at(-1)!.argv; return argv[argv.indexOf('--mcp-config') + 1]!; };
-      const first = await fx.runtime.spawn('minion', { cwd: repo.path });
+      const first = await track(fx.runtime.spawn('minion', { cwd: repo.path }));
       await first.prompt('one');
       const firstCopy = copyOf();
       const file = first.sessionFile!;
+      // The copy a handle really writes is the one format the sweep knows.
+      expect(isProjectMcpCopyName(basename(file), basename(firstCopy))).toBe(true);
       await first.dispose();
-      const resumed = await fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file });
+      const resumed = await track(fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file }));
       await resumed.prompt('two');
       const resumedCopy = copyOf();
       expect(resumedCopy).not.toBe(firstCopy);
@@ -2004,25 +2033,33 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       // A predecessor that crashed (never disposed) left its copy behind: the
       // next handle's first project turn sweeps it — and nothing else.
       writeFileSync(`${file}.deadbeef.project-mcp.json`, '{}');
-      const other = await fx.runtime.spawn('minion', { cwd: repo.path });
+      // A session whose file name extends this one: its copy is not ours.
+      const extended = `${file}.x.jsonl.deadbeef.project-mcp.json`;
+      writeFileSync(extended, '{}');
+      const notACopy = `${file}.zz.project-mcp.json`; // not a token this code mints
+      writeFileSync(notACopy, '{}');
+      const other = await track(fx.runtime.spawn('minion', { cwd: repo.path }));
       await other.prompt('another session');
       const otherCopy = copyOf();
-      const next = await fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file });
+      const next = await track(fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file }));
       await next.prompt('three');
       await vi.waitFor(() => expect(copiesOf(file)).toEqual([copyOf()]));
       expect(existsSync(`${file}.lock`)).toBe(true); // the session's own lock is never swept
       expect(existsSync(otherCopy)).toBe(true); // nor another session's copy
+      expect(existsSync(extended)).toBe(true); // nor one whose name merely extends this session's
+      expect(existsSync(notACopy)).toBe(true); // nor anything that is not exactly a copy name
+      rmSync(extended);
+      rmSync(notACopy);
       await next.dispose();
       // A copy the sweep cannot remove is logged, never fatal.
       mkdirSync(`${file}.abcdef12.project-mcp.json`);
-      const after = await fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file });
+      const after = await track(fx.runtime.spawn('minion', { cwd: repo.path, resumeFile: file }));
       await after.prompt('four');
       expect(doubleInvocations(fx).at(-1)!.prompt).toBe('four');
       expect(fx.logs.some((entry) => entry.level === 'warn' && entry.msg === 'stale project MCP copy could not be removed')).toBe(true);
-      await after.dispose();
       rmSync(`${file}.abcdef12.project-mcp.json`, { recursive: true });
-      await other.dispose();
     } finally {
+      for (const handle of handles) await handle.dispose();
       repo.cleanup();
     }
   });

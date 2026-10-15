@@ -833,8 +833,10 @@ export class ProviderRecoverySensor {
    * provider that is now off is cancelled (which resolves its own
    * machine-owned stop) and handed to the owner through one needs-owner
    * notice per wait — posted through the notification center, so it surfaces
-   * in chat, and deduped by kind, so a crash before the cancel never posts it
-   * twice. No notice is posted when the lane already has an open owner stop
+   * in chat, and deduped by kind while unresolved, so a crash before the
+   * cancel never posts it twice (an acked notice stays unresolved; one
+   * resolved because the switch came back on lets a later hand-back be
+   * announced). No notice is posted when the lane already has an open owner stop
    * (the owner already holds it); an open wait is never assumed handled — a
    * lane Gru already re-dispatched may get a redundant notice, which is
    * cheaper than a stranded one. A
@@ -881,21 +883,26 @@ export class ProviderRecoverySensor {
     for (const wait of this.ledger.listProviderWaits()) {
       if (!this.enabledFor(wait.provider)) routes.add(wait.routeKey);
     }
+    const markers = new Map<string, string[]>();
     for (const pending of this.ledger.listPendingProviderRecoveries()) {
+      markers.set(pending.routeKey, [...(markers.get(pending.routeKey) ?? []), pending.id]);
       if (!this.routeEnabled(pending.routeKey)) routes.add(pending.routeKey);
     }
-    const markers = this.ledger.listPendingProviderRecoveries();
     for (const routeKey of routes) {
       try {
-        // Exact-kind (indexed) lookup, resolved by id: a long-retired route
-        // (no watching notice, no marker) costs one lookup, never a scan.
+        // An exact-kind (indexed) lookup first: a long-retired route (no
+        // watching notice, no marker) costs one lookup, never a scan.
         const watching = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active');
-        if (watching === null && !markers.some((pending) => pending.routeKey === routeKey)) continue;
+        const pendingIds = markers.get(routeKey) ?? [];
+        if (watching === null && pendingIds.length === 0) continue;
         if (this.ledger.listProviderWaits({ routeKey }).some((wait) => wait.status === 'waiting' || wait.status === 'recovered-pending')) continue;
-        if (watching !== null) this.ledger.resolveNotificationById(watching.id, 'provider-recovery-sensor');
-        for (const pending of this.ledger.listPendingProviderRecoveries()) {
-          if (pending.routeKey === routeKey) this.ledger.clearPendingProviderRecovery(pending.id);
+        // EXACT kind, every active row of it (never a prefix match: a legacy
+        // key may prefix another live route's key). The center's prefix
+        // resolve is a plain ledger call, so resolving by id loses nothing.
+        for (let row = watching; row !== null; row = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active')) {
+          this.ledger.resolveNotificationById(row.id, 'provider-recovery-sensor');
         }
+        for (const id of pendingIds) this.ledger.clearPendingProviderRecovery(id);
       } catch (error) {
         this.log('error', 'retiring a handed-back route failed', { route: routeKey, error: String(error) });
       }
@@ -914,7 +921,7 @@ export class ProviderRecoverySensor {
       const subject = slot ? `Silas slot ${wait.slotId ?? wait.id}` : `Agent ${wait.agentId ?? wait.id}`;
       // A chat message re-arms a stopped slot-bound agent; a job lane needs
       // Gru (an ack cannot re-arm anything at boot).
-      const resume = slot ? 'send Silas a message to resume it' : 'ask Gru to resume or re-dispatch the job';
+      const resume = slot ? 'send Silas a message (any message re-arms its slot)' : 'ask Gru to resume or re-dispatch the job';
       this.notifications.postIncident({
         kind: `provider-recovery.recovery-off.${wait.id}`,
         routing: 'needs-owner',
@@ -924,7 +931,7 @@ export class ProviderRecoverySensor {
           : `${subject} stopped: provider limit (automatic recovery off)`,
         detail: recovered
           ? `The ${wait.provider} limit has cleared, but automatic provider recovery is now off ([provider_recovery] ${key} = false), ` +
-            `so it was not resumed. To resume, ${resume}.`
+            `so it was not resumed — ${resume}.`
           : `Automatic provider recovery is off for ${wait.provider} ([provider_recovery] ${key} = false), so it stays ` +
             `stopped. Once the provider limit clears, ${resume}.`,
         agentId: wait.agentId,

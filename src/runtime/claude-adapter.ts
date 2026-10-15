@@ -817,6 +817,16 @@ export async function checkedInProjectMcpConfig(
     return { reason: `.mcp.json cannot be read: ${String(error)}`, infrastructure: true };
   }
   if (!working.equals(committed)) return differsFromCommitted(working, committed);
+  // Refused at the boundary, never handed to the CLI to fail the turn.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(committed.toString('utf8'));
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { reason: 'the committed .mcp.json is not a JSON object' };
+  }
   return { config: committed };
 }
 
@@ -852,6 +862,18 @@ function withoutCrBeforeLf(bytes: Buffer): Buffer {
  * the copy of the handle that resumed the same session. */
 export function projectMcpCopyPath(sessionFile: string, handleToken: string): string {
   return `${sessionFile}.${handleToken}.project-mcp.json`;
+}
+
+/** One handle's copy token: 8 lowercase hex characters (the single format
+ * the sweep recognizes — see isProjectMcpCopyName). */
+export function projectMcpCopyToken(): string {
+  return randomUUID().slice(0, 8);
+}
+
+/** Whether a directory entry is exactly a project-MCP copy of the session
+ * whose file is `sessionBase` — never its .lock, never another session. */
+export function isProjectMcpCopyName(sessionBase: string, name: string): boolean {
+  return name.startsWith(`${sessionBase}.`) && /^[0-9a-f]{8}\.project-mcp\.json$/u.test(name.slice(sessionBase.length + 1));
 }
 
 /** The stdin user frame for one prompt (image blocks first, then text). */
@@ -943,7 +965,7 @@ export class ClaudeCodeHandle implements AgentHandle {
     this.capabilities = capabilities;
     this.id = agentId ?? params.sessionId;
     this.sessionFile = params.sessionFile;
-    this.projectMcpCopy = projectMcpCopyPath(params.sessionFile, randomUUID().slice(0, 8));
+    this.projectMcpCopy = projectMcpCopyPath(params.sessionFile, projectMcpCopyToken());
     if (params.isolatedReview) this.reviewIsolation = true;
     if (params.reviewTools !== undefined && params.reviewTools.length > 0) {
       this.reviewTools = [...params.reviewTools];
@@ -1206,7 +1228,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       const path = join(dir, name);
       // Exactly `<this session>.<token>.project-mcp.json` — never a copy of
       // another session whose file name happens to extend this one.
-      if (!name.startsWith(`${base}.`) || !/^[0-9a-f]{8}\.project-mcp\.json$/u.test(name.slice(base.length + 1))) continue;
+      if (!isProjectMcpCopyName(base, name)) continue;
       await rm(path, { force: true }).catch((error: unknown) => {
         this.log('warn', 'stale project MCP copy could not be removed', { file: path, error: String(error) });
       });
@@ -1563,7 +1585,8 @@ export class ClaudeCodeHandle implements AgentHandle {
       // (the supervisor's restart snapshot) still sees the accepted prompt.
       if (failure !== null) {
         this.emit({ type: 'error', error: failure, fatal: false });
-        this.setState('error', failure);
+        // A subscriber that re-prompted from the error owns the state now.
+        if (this.livePrompt === accepted) this.setState('error', failure);
       }
       // Only this turn's prompt: a subscriber may already have re-prompted.
       if (this.livePrompt === accepted) this.livePrompt = null;

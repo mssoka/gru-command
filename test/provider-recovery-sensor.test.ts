@@ -1394,12 +1394,12 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(off.handBackDisabledWaits()).toBe(1);
     const recoveredNotice = h.ledger.findNotificationByKind('provider-recovery.recovery-off.wait-silas-recovered', 'unacked');
     expect(recoveredNotice?.title).toBe('Silas slot ops-slot: provider recovered, automatic resume off');
-    expect(recoveredNotice?.detail).toContain('To resume, send Silas a message to resume it.');
+    expect(recoveredNotice?.detail).toContain('so it was not resumed — send Silas a message (any message re-arms its slot).');
     expect(recoveredNotice?.detail).not.toContain('re-dispatch');
     const slotNotice = h.ledger.findNotificationByKind('provider-recovery.recovery-off.wait-silas-slot', 'unacked');
     expect(slotNotice).toMatchObject({ routing: 'needs-owner', agentId: null });
     expect(slotNotice?.title).toBe('Silas slot ops-slot stopped: provider limit (automatic recovery off)');
-    expect(slotNotice?.detail).toContain('send Silas a message to resume it');
+    expect(slotNotice?.detail).toContain('Once the provider limit clears, send Silas a message (any message re-arms its slot).');
     expect(slotNotice?.detail).not.toContain('re-dispatch the job');
     off.stop();
   });
@@ -1543,7 +1543,56 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       sensorWith(h, config).handBackDisabledWaits();
       expect(h.ledger.findNotificationByKind(`provider.waiting.${glmKey}`, 'active') === null).toBe(retiredGlm);
       expect(h.ledger.findNotificationByKind(`provider.waiting.${claudeKey}`, 'active') === null).toBe(retiredClaude);
+      // The pending delivery markers retire with exactly the same routes.
+      expect(h.ledger.listPendingProviderRecoveries().map((pending) => pending.routeKey).sort())
+        .toEqual([...(retiredGlm ? [] : [glmKey]), ...(retiredClaude ? [] : [claudeKey])].sort());
     }
+  });
+
+  it('a failing stale-notice lookup for a served wait never stops the hand-back of others', async () => {
+    const h = new Harness({ enabled: true, claudeNative: false });
+    h.makeJob('job-1');
+    h.makeJob('job-2');
+    const served = await h.establishMinionWait(); // GLM: its switch is on
+    const offWait = h.ledger.recordProviderWait({ id: 'wait-claude-off', routeKey: providerRouteKey('anthropic-claude-native', 'claude-opus-5-5', 'fp'),
+      provider: 'anthropic-claude-native', model: 'claude-opus-5-5', endpoint: 'e', credentialFingerprint: 'fp', waiterKind: 'job-minion',
+      jobId: 'job-2', agentId: 'agent-minion-2', slotId: null, sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working',
+      lineageKey: null, incidentId: 'provider-wall.claude', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    const logs: string[] = [];
+    const sensor = new ProviderRecoverySensor({
+      config: { ...DEFAULT_PROVIDER_RECOVERY_CONFIG, enabled: true, claudeNative: false, glmGenerationFallback: true },
+      ledger: h.ledger, probe: h.probe, notifications: h.notifications, wake: h.wakePort(), slotReArm: h.reArmPort(),
+      silasHosted: () => true, now: () => h.now, log: (_level, msg) => logs.push(msg),
+    });
+    const original = h.ledger.findNotificationByKind.bind(h.ledger);
+    vi.spyOn(h.ledger, 'findNotificationByKind').mockImplementation((kind, mode) => {
+      if (kind === `provider-recovery.recovery-off.${served!.id}`) throw new Error('ledger read failed');
+      return original(kind, mode);
+    });
+    expect(sensor.handBackDisabledWaits()).toBe(1);
+    expect(logs).toContain('resolving a stale recovery-off notice failed');
+    expect(h.ledger.getProviderWait(offWait.id)?.status).toBe('cancelled');
+    expect(h.ledger.getProviderWait(served!.id)?.status).toBe('waiting');
+  });
+
+  it('retiring a route never resolves the watching notice of a live route whose key it prefixes', async () => {
+    const h = new Harness({ enabled: false, claudeNative: true });
+    h.makeJob('job-live');
+    for (const routeKey of ['legacy-route', 'legacy-route2']) {
+      h.notifications.postIncident({ kind: `provider.waiting.${routeKey}`, routing: 'fyi', severity: 'info',
+        title: 'watching', detail: 'Automatic recovery watching', dedupe: 'active' });
+    }
+    // legacy-route2 still serves an open Claude wait (claude_native on);
+    // legacy-route is a GLM marker-only route (GLM off): it retires alone.
+    h.ledger.recordProviderWait({ id: 'wait-live', routeKey: 'legacy-route2', provider: 'anthropic-claude-native', model: 'claude-opus-5-5',
+      endpoint: 'e', credentialFingerprint: 'fp', waiterKind: 'job-minion', jobId: 'job-live', agentId: null, slotId: null,
+      sessionFile: null, continuation: null, jobStatusAtEstablishment: 'working', lineageKey: null,
+      incidentId: 'provider-wall.live', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    h.ledger.commitProviderRecoveryBatch({ id: 'batch-legacy', routeKey: 'legacy-route', incidentGenerations: [1],
+      evidence: { stopReason: 'stop' }, waiters: [] });
+    h.sensor.handBackDisabledWaits();
+    expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route', 'active')).toBeNull();
+    expect(h.ledger.findNotificationByKind('provider.waiting.legacy-route2', 'active')).not.toBeNull();
   });
 
   it('one failing hand-back never stalls boot reconciliation for the rest', async () => {
