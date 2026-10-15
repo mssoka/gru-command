@@ -476,22 +476,18 @@ async function commandRun(
     stderr(`capture: ${ownerPath} is malformed (${ownerRead.detail}) — withdraw it explicitly first\n`);
     return CAPTURE_EXIT.usage;
   }
-  let staleOwner = false;
-  if (ownerRead.kind === 'owner') {
-    const live = probe(ownerRead.record.pid);
-    if (live.alive) {
-      stderr(
-        `capture: sink ${sinkPath} is owned by live helper pid ${String(ownerRead.record.pid)} ` +
-          `(request_id ${ownerRead.record.request_id}) — reconnecting is a same-request_id reconcile, ` +
-          'not a second watcher\n',
-      );
-      return CAPTURE_EXIT.usage;
-    }
-    staleOwner = true; // the recorded owner is gone
+  const ownerAlive = ownerRead.kind === 'owner' && probe(ownerRead.record.pid).alive;
+  if (ownerRead.kind === 'owner' && ownerAlive) {
+    stderr(
+      `capture: sink ${sinkPath} is owned by live helper pid ${String(ownerRead.record.pid)} ` +
+        `(request_id ${ownerRead.record.request_id}) — reconnecting is a same-request_id reconcile, ` +
+        'not a second watcher\n',
+    );
+    return CAPTURE_EXIT.usage;
   }
   // After every usage refusal above, before this command's first side effect.
   const fetchImpl = transportFor(deps);
-  if (staleOwner) removeCaptureOwner(ownerPath); // stale claim: the owner is gone
+  if (ownerRead.kind === 'owner') removeCaptureOwner(ownerPath); // stale claim: the probe found the owner gone
 
   // Exclusive sink BEFORE the POST (a second capture for the same path is
   // a typed refusal, never a truncating interleave).
