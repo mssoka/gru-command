@@ -1530,6 +1530,31 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
   });
 
+  it('the boot failure notice is raised again after a retirement, and retired by a clean pass that hands nothing back', async () => {
+    const h = new Harness();
+    await glmDebt(h);
+    const failingBoot = (): string[] => {
+      const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+      try {
+        const { sensor, surfaced } = surfacingClaudeOnly(h);
+        expect(() => sensor.handBackAtBoot()).toThrow('ledger read failed');
+        return surfaced;
+      } finally {
+        reads.mockRestore();
+      }
+    };
+    expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']);
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toMatchObject({
+      routing: 'action-required', severity: 'error', agentId: null, title: 'Provider waits not handed back at boot',
+    });
+    // Every provider back on: a clean pass hands nothing back — and retires it.
+    expect(h.sensor.handBackAtBoot()).toBe(0);
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
+    // A later failing boot tells Gru again (never folded into the retired row).
+    expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']);
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).not.toBeNull();
+  });
+
   it('a boot failure notice that cannot be posted, or retired, is logged with its cause — never thrown in its place', () => {
     const logs: { readonly msg: string; readonly fields: Record<string, unknown> | undefined }[] = [];
     const broken = (h: Harness) => new ProviderRecoverySensor({
