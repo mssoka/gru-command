@@ -48,6 +48,7 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
+import { disposeAll } from './disposal.js';
 import { DirectiveCheckpointError, inspectDirectiveCheckpoint, inspectDirectiveProducers, flushDirectiveToolIntent, recordDirectiveIndependentController, prepareDirectiveBinding, prepareDirectiveProducer, recordDirectiveProducerCessation, recordDirectiveCompletion, recordDirectiveToolRefusal, recordDirectiveAuthorityRefusal, inspectDirectiveAdmission, readDirectiveBinding, type DirectiveProducer, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -135,6 +136,39 @@ function nativeReviewTools(definitions: readonly NativeAgentTool[]): ToolDefinit
 }
 
 const COMPACTION_END_RECONCILE_MS = 5_000;
+
+/**
+ * Bound on the pi adapter's native-settlement proof (abort + waitForIdle) before
+ * it may attest 'ceased' through the runtime-neutral `adapterCessationEvidence`
+ * contract (issue #341, Option A; claude-code proves cessation by observed child close). SDK 0.85.1 `AgentSession.dispose()` is synchronous
+ * and never awaits `waitForIdle`, so the adapter follows disposal with a
+ * bounded session `waitForIdle` before it may report 'ceased'. Mirrors the 5s
+ * bridge-teardown cap in `review-mcp-bridge.ts` (`BRIDGE_CLOSE_TIMEOUT_MS`):
+ * the same Promise.race against a REFERENCED timer (the bridge does not unref
+ * it either), so an otherwise-drained event loop cannot exit mid-disposal
+ * before the bound fires and disposal settles, and a stuck session can never
+ * hang disposal past this window. Exported for the deterministic bound test.
+ */
+export const CESSATION_IDLE_TIMEOUT_MS = 5_000;
+
+/** Named failure for a session that was disposed but did not confirm idle
+ * inside {@link CESSATION_IDLE_TIMEOUT_MS}. Disposal tore the session down,
+ * but 'ceased' asserts that ALL work stopped; a still-running turn must never
+ * be reported as ceased, and dispose-only semantics must never be a silent
+ * fallback (issue #341, Option A). */
+export class CessationIdleTimeoutError extends Error {
+  constructor(
+    readonly sessionId: string,
+    readonly timeoutMs: number,
+  ) {
+    super(
+      `session ${sessionId} was disposed but did not reach idle within ${timeoutMs}ms; ` +
+        "refusing to report 'ceased' — the turn may still be running, investigate " +
+        'the hung session before treating this worker as stopped',
+    );
+    this.name = 'CessationIdleTimeoutError';
+  }
+}
 
 /** Typed provenance from an SDK provider error object ONLY (numeric status
  * on the error, retry-after from its Headers). Anything else → null.
@@ -1036,7 +1070,10 @@ export class PiRuntime implements AgentRuntime {
   }
 
   async dispose(): Promise<void> {
-    for (const handle of [...this.handles]) await handle.dispose();
+    // Contain every handle: one hung session must not abandon the remaining
+    // handles' lock releases (issue #341). disposeAll runs them all and
+    // fails loud once with the per-handle causes.
+    await disposeAll([...this.handles]);
   }
 }
 
@@ -1583,10 +1620,10 @@ export class PiAgentHandle implements AgentHandle {
       }
       if (typeof this.session.abort === 'function' && typeof this.session.waitForIdle === 'function') {
         // Keep SDK listeners connected until genuine native settlement.
-        await this.session.abort();
-        await this.session.waitForIdle();
-        await turn?.catch(() => {}); // original verdict/error remains with its caller
-        await compaction?.catch(() => {});
+        await this.withinIdleBound(this.session.abort());
+        await this.withinIdleBound(this.session.waitForIdle());
+        await this.withinIdleBound(turn?.catch(() => {})); // original verdict/error remains with its caller
+        await this.withinIdleBound(compaction?.catch(() => {}));
       }
       if (!this.cleanupSucceeded) {
         await this.session.dispose();
@@ -1594,9 +1631,9 @@ export class PiAgentHandle implements AgentHandle {
       }
       // Controlled doubles dispose their deferred operations; still await
       // every adapter owner and require their explicit truthful idle state.
-      await turn?.catch(() => {});
-      await compaction?.catch(() => {});
-      if (typeof this.session.waitForIdle === 'function') await this.session.waitForIdle();
+      await this.withinIdleBound(turn?.catch(() => {}));
+      await this.withinIdleBound(compaction?.catch(() => {}));
+      if (typeof this.session.waitForIdle === 'function') await this.withinIdleBound(this.session.waitForIdle());
       this.nativeQuiescent = this.session.isIdle === true && !this.session.isStreaming && !this.session.isCompacting &&
         this.liveTurn === null && this.compactionWork === null && !this.compacting && !this.nativeCompactionOpen &&
         this.pendingCompactionEnd === null && this.explicitCompactionTerminal?.settled !== false && this.queue.length === 0;
@@ -1607,10 +1644,31 @@ export class PiAgentHandle implements AgentHandle {
     if (failures.length > 1) throw new AggregateError(failures, `Pi native disposal/ownership cleanup failed: ${failures.map(String).join('; ')}`);
   }
 
+  /** Race one native settlement step against {@link CESSATION_IDLE_TIMEOUT_MS}
+   * (issue #341). A hung session surfaces as the named
+   * {@link CessationIdleTimeoutError} instead of hanging disposal; the failed
+   * disposal retains ownership (never 'ceased') and a later dispose() retries.
+   * The timer is deliberately referenced (like the bridge-close bound) so a
+   * drained loop cannot exit mid-disposal silently. */
+  private async withinIdleBound(step: Promise<unknown> | void): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const bound = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new CessationIdleTimeoutError(this.id, CESSATION_IDLE_TIMEOUT_MS)), CESSATION_IDLE_TIMEOUT_MS);
+      });
+      // The step's own late rejection must not become unhandled after the bound wins.
+      await Promise.race([Promise.resolve(step), bound]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  }
+
   /** Compute + emit the once-only cessation evidence transition. Called
-   * after disposal settles; re-queryable (UNKNOWN can later flip to
-   * 'ceased' when an independently owned bash controller finishes — the
-   * evidence event fires on that late transition too). */
+   * after disposal settles; re-queryable
+   * (UNKNOWN can later flip to 'ceased' when an independently owned bash
+   * controller finishes — the evidence event fires on that late transition
+   * too). 'ceased' requires BOTH the post-dispose idle proof and an
+   * idle-free controller set. */
   private settleCessationEvidence(): void {
     if (this.cessationState === 'ceased') return; // once-only positive
     let evidence: 'ceased' | 'unknown';

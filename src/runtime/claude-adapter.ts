@@ -57,6 +57,7 @@ import type {
   SpawnOptions,
 } from './types.js';
 import { ToolHeartbeat, toolHeartbeatIntervalMs } from './tool-heartbeat.js';
+import { disposeAll } from './disposal.js';
 import { CLAUDE_CODE_CAPABILITIES } from './capabilities.js';
 import { DirectiveCheckpointError, type DirectiveCheckpoint, type DirectiveTurnIdentity } from './directive-checkpoint.js';
 
@@ -616,7 +617,9 @@ export class ClaudeCodeRuntime implements AgentRuntime {
   }
 
   async dispose(): Promise<void> {
-    for (const handle of [...this.handles]) await handle.dispose();
+    // Contain every handle: one failing child must not abandon the remaining
+    // handles' child kills and lock releases (issue #341).
+    await disposeAll([...this.handles]);
   }
 }
 
@@ -761,7 +764,8 @@ export class ClaudeCodeHandle implements AgentHandle {
   private cessationKind: 'live' | 'no-child' | 'close-observed' | 'error' | 'deadline' | 'close-observed-late' = 'live';
   private bridgeCloseSettled = false;
   private bridgeCloseFailed = false;
-  private evidenceEmitted = false;
+  /** Last verdict emitted as a cessation_evidence event (null = none yet). */
+  private evidenceEmitted: 'ceased' | 'unknown' | null = null;
   private readonly verificationChildren = new Set<ChildProcess>();
   private readonly closedVerificationChildren = new WeakSet<ChildProcess>();
   private verificationCleaned = false;
@@ -1039,9 +1043,12 @@ export class ClaudeCodeHandle implements AgentHandle {
    * scoped review bridge must have settled too; a failed bridge close
    * reports UNKNOWN without upgrading native state. */
   private emitEvidence(): void {
-    if (this.evidenceEmitted && this.cessationEvidence() === 'ceased') return;
     const evidence = this.cessationEvidence();
-    this.evidenceEmitted = true;
+    // Emit each verdict transition once: an 'unknown' emitted at disposal must
+    // NOT suppress the later positive (a late identity-bound close), or event
+    // consumers (registry ownership reconciliation) never learn of it.
+    if (this.evidenceEmitted === evidence) return;
+    this.evidenceEmitted = evidence;
     this.emit({ type: 'cessation_evidence', evidence });
   }
 

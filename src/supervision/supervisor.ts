@@ -4,6 +4,7 @@ import type { DirectiveProducer } from '../runtime/directive-checkpoint.js';
 import type { Role, SupervisionConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { AgentHandle, AgentState, PendingTurn, RuntimeEvent, SpawnOptions } from '../runtime/types.js';
+import { adapterCessationEvidence } from '../runtime/types.js';
 import type { AgentEventEnvelope } from '../runtime/registry.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
@@ -171,6 +172,15 @@ interface SupervisedAgent {
   breakerNotificationId: string | null;
   /** A restart rung is executing: disposed envelopes must not evict us. */
   inRestart: boolean;
+  /**
+   * Retained ordinary predecessor custody (F60-P2). When an ordinary restart
+   * is refused because the predecessor's adapter could not attest cessation,
+   * the EXACT predecessor handle is kept here — on the existing supervised
+   * entity — until positive evidence arrives. Every reachable ordinary
+   * ensure/rearm/retry/replacement re-checks it; a null handle, a breaker
+   * reset and disposal fulfillment never clear it.
+   */
+  unprovenStop: { readonly handle: AgentHandle; readonly reason: string } | null;
   /** Pending backoff timer (a scheduled next rung). */
   backoffTimer: ReturnType<typeof setTimeout> | null;
   /** Monotonic event/adoption generation; timestamps can collide within one ms. */
@@ -553,7 +563,14 @@ export class Supervisor {
           internal.swapListeners.delete(listener);
         };
       },
-      canReplace: () => this.slotAgent(internal)?.breakerOpen !== true,
+      canReplace: () => {
+        const agent = this.slotAgent(internal);
+        if (agent === null || agent === undefined) return true;
+        // A retained unproven predecessor fails closed (F60-P2): an open
+        // breaker was never the only way a replacement may be refused.
+        if (this.unprovenPredecessor(agent) !== null) return false;
+        return agent.breakerOpen !== true;
+      },
       adoptReplacement: (handle) => this.adoptSlotReplacement(internal, handle),
       release: () => {
         // Invalidate in-flight restart rungs before deleting their records.
@@ -583,6 +600,14 @@ export class Supervisor {
       throw new Error(`supervised slot "${slot.id}" owner-held breaker is open; autonomous ensure cannot re-arm it`);
     }
     if (existing !== null && existing.handle !== null) return existing.handle;
+    if (existing !== null && this.unprovenPredecessor(existing) !== null) {
+      // Fail closed (F60-P2): the entity's predecessor stop is unproven, so a
+      // later ordinary ensure — user intent and rearm included — must not
+      // resume or replace the maybe-live session.
+      throw new Error(
+        `supervised slot "${slot.id}" predecessor stop is unproven; refusing to spawn until the adapter attests cessation`,
+      );
+    }
     if (existing !== null && existing.inRestart) {
       // A restart rung owns the respawn; wait for it by polling the slot.
       return await this.waitForSlotHandle(slot);
@@ -658,6 +683,18 @@ export class Supervisor {
       await this.registry.disposeHandle(handle).catch(() => {});
       throw new Error(`supervised slot "${slot.id}" breaker is open`);
     }
+    // F60-P2: an intentional replacement must not leapfrog a retained
+    // unproven predecessor stop, and must not drop its custody by switching
+    // the slot generation. Fail closed until the adapter attests cessation.
+    const heldPredecessor = [...this.agents.values()].find(
+      (agent) => agent.slot === slot && this.unprovenPredecessor(agent) !== null,
+    );
+    if (heldPredecessor !== undefined) {
+      await this.registry.disposeHandle(handle).catch(() => {});
+      throw new Error(
+        `supervised slot "${slot.id}" predecessor stop is unproven; refusing an intentional replacement until the adapter attests cessation`,
+      );
+    }
     const retired = [...this.agents.values()].filter(
       (agent) => agent.slot === slot && agent.agentId !== handle.id,
     );
@@ -691,6 +728,12 @@ export class Supervisor {
       live.stoppedAt = inheritedBreaker?.stoppedAt ?? null;
       live.breakerNotificationId =
         inheritedBreaker?.breakerNotificationId ?? live.breakerNotificationId;
+      // Defence in depth: retained predecessor custody belongs to the stable
+      // supervised entity and must never be lost across a replacement.
+      if (live.unprovenStop === null) {
+        const inheritedHeld = retired.find((agent) => agent.unprovenStop !== null);
+        if (inheritedHeld !== undefined) live.unprovenStop = inheritedHeld.unprovenStop;
+      }
     }
 
     for (const agent of retired) {
@@ -740,6 +783,28 @@ export class Supervisor {
     return stale;
   }
 
+  /**
+   * The retained unproven predecessor for an entity, if its stop is still
+   * unproven (F60-P2). Returns null once the adapter attests 'ceased', and
+   * clears the retained custody at that point. A missing/throwing/UNKNOWN
+   * adapter answer keeps the predecessor retained — health, disposal
+   * settlement, lock release and native retirement are never proof.
+   */
+  private unprovenPredecessor(agent: SupervisedAgent): AgentHandle | null {
+    const held = agent.unprovenStop;
+    if (held === null) return null;
+    if (adapterCessationEvidence(held.handle) === 'ceased') {
+      agent.unprovenStop = null;
+      return null;
+    }
+    return held.handle;
+  }
+
+  /** Retain the exact predecessor handle once, on first refusal. */
+  private retainUnprovenPredecessor(agent: SupervisedAgent, handle: AgentHandle, reason: string): void {
+    if (agent.unprovenStop === null) agent.unprovenStop = { handle, reason };
+  }
+
   /** Retire dead (null-handle) slot-bound records other than the live
    * one, merging their restart history so the breaker stays truthful. */
   private retireStaleSlotRecords(slot: SupervisedSlotInternal, liveId: string): void {
@@ -747,6 +812,9 @@ export class Supervisor {
     for (const agent of [...this.agents.values()]) {
       if (agent.slot !== slot || agent.handle !== null || agent.agentId === liveId) continue;
       if (live !== undefined) {
+        // The retained unproven predecessor is custody of the ENTITY: never
+        // drop it when a dead record is merged into the live one (F60-P2).
+        if (live.unprovenStop === null && agent.unprovenStop !== null) live.unprovenStop = agent.unprovenStop;
         live.restartRing = [...live.restartRing, ...agent.restartRing].sort((a, b) => a - b);
         if (agent.breakerOpen && !live.breakerOpen) {
           live.breakerOpen = true;
@@ -1017,6 +1085,7 @@ export class Supervisor {
       stoppedAt: null,
       breakerNotificationId: null,
       inRestart: false,
+      unprovenStop: null,
       backoffTimer: null,
       activityGeneration: 0,
       decisionPending: false,
@@ -1934,6 +2003,13 @@ export class Supervisor {
     const agent = agentRef;
     if (this.disposed || !this.cfg.enabled || agent.inRestart || agent.breakerOpen ||
       this.agents.get(agent.agentId) !== agent) return;
+    if (this.unprovenPredecessor(agent) !== null) {
+      // A retained unproven predecessor owns the entity (F60-P2): no rung —
+      // automatic, retry, ack-rearm or provider-rearm — may spawn a
+      // replacement against a maybe-live session. The debt stays visible.
+      agent.state = 'stopped';
+      return;
+    }
     const recovery = agent.pendingRecovery ?? this.captureInterruptedTurn(agent.handle, agent);
     if (recovery !== null) agent.pendingRecovery = recovery;
     if (!this.recoveryAuthorityCurrent(agent, recovery)) return;
@@ -2091,6 +2167,37 @@ export class Supervisor {
         this.log('warn', 'agent restart refused by its owning subsystem', {
           agent_id: agent.agentId,
           reason: policy.refuse,
+        });
+        return;
+      }
+
+      // Option A / single-writer (F60-P2): an eligible ORDINARY session must
+      // never resume or replace its predecessor while that predecessor's stop
+      // is unproven. Lock release and native/active-file retirement are NOT
+      // cessation; only the adapter's own 'ceased' evidence is. This gate is
+      // scoped to exactly the ordinary path — isolated reviews were handled
+      // above and tracked children were refused above, both before it.
+      if (old !== null && adapterCessationEvidence(old) !== 'ceased') {
+        // Retain the EXACT predecessor handle in ordinary custody so every
+        // later ensure/rearm/retry re-checks the SAME unresolved proof
+        // (F60-P2) — a null handle or breaker reset cannot bypass it.
+        this.retainUnprovenPredecessor(agent, old, reason);
+        agent.state = 'stopped';
+        agent.stoppedAt = this.now();
+        agent.stopReason = 'restart refused: predecessor stop unproven';
+        this.ledger.appendCustomEvent({
+          kind: 'supervision.restart-unproven-stop',
+          agentId: agent.agentId,
+          payload: {
+            reason,
+            predecessorAgentId: old.id,
+            note: 'predecessor disposal did not prove cessation — no replacement or resume was spawned; the unresolved stop remains debt',
+          },
+        });
+        this.log('warn', 'restart blocked — predecessor cessation unproven', {
+          agent_id: agent.agentId,
+          predecessor: old.id,
+          reason,
         });
         return;
       }
