@@ -1430,7 +1430,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     const logs: string[] = [];
     handBackThenStartSupervision(off, { start: () => {} }, (_level, msg) => logs.push(msg));
     await bootProviderRecovery(off, (_level, msg) => logs.push(msg));
-    expect(logs.filter((msg) => msg.startsWith('provider-recovery boot hand-back did not run'))).toEqual([]);
+    expect(logs.filter((msg) => msg.startsWith('provider-recovery boot hand-back had not been attempted'))).toEqual([]);
     expect(logs).toContain('provider-recovery sensor disabled — owner activation stays manual');
     for (const wait of [recovered, waiting, slot]) expect(h.ledger.getProviderWait(wait.id)?.status).toBe('cancelled');
     expect(surfaced).toHaveLength(3);
@@ -1522,11 +1522,14 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
     expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).not.toBeNull();
     // Gru was told at boot 1 and may have acted: the recovered lane's notice
-    // is marked as a repeat.
+    // says a failure was reported since its wait opened.
     expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${recovered.id}`, 'active')?.detail)
-      .toContain('Announced before and the wait is still open');
-    // Boot 3 hands the last wait back and retires the failure notice.
+      .toContain('A boot hand-back failure was reported since this wait opened');
+    // Boot 3 hands the last wait back — its notice is marked the same way —
+    // and retires the failure notice.
     expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(1);
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active')?.detail)
+      .toContain('A boot hand-back failure was reported since this wait opened');
     expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
   });
 
@@ -1544,15 +1547,96 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       }
     };
     expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']);
-    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toMatchObject({
+    const first = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+    expect(first).toMatchObject({
       routing: 'action-required', severity: 'error', agentId: null, title: 'Provider waits not handed back at boot',
+      detail: expect.stringContaining('(for some or all of them)'),
     });
+    expect(first?.detail).toContain('see the service log');
     // Every provider back on: a clean pass hands nothing back — and retires it.
     expect(h.sensor.handBackAtBoot()).toBe(0);
     expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
-    // A later failing boot tells Gru again (never folded into the retired row).
+    // A later failing boot tells Gru again — a new row, never folded into
+    // the retired one.
     expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']);
-    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).not.toBeNull();
+    const again = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+    expect(again).not.toBeNull();
+    expect(again?.id).not.toBe(first?.id);
+    expect(h.ledger.getNotification(first!.id)?.resolvedAt).not.toBeNull();
+  });
+
+  it('a failure reported since a wait opened marks its notice — even once Gru disposed of it — and a wait opened later is unmarked', async () => {
+    try {
+      const h = new Harness();
+      const { waiting } = await glmDebt(h);
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+      expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+      reads.mockRestore();
+      // Gru acts on the failure and disposes of it.
+      const failure = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(h.ledger.disposeMachineNotification(failure!.id, 'Gru re-dispatched the stopped lanes')?.resolvedAt).not.toBeNull();
+      // A wait opened after the failure.
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+      const lateDetail = h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail;
+      expect(lateDetail).toContain('Automatic provider recovery is off');
+      expect(lateDetail).not.toContain('reported since');
+      expect(lateDetail).not.toContain('Announced before');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('every boot that fails raises the failure notice afresh — Gru is woken again, and a wait stranded between two failing boots is marked', async () => {
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      const failingBoot = (): string[] => {
+        const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+        try {
+          const { sensor, surfaced } = surfacingClaudeOnly(h);
+          expect(() => sensor.handBackAtBoot()).toThrow('ledger read failed');
+          return surfaced;
+        } finally {
+          reads.mockRestore();
+        }
+      };
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']);
+      const first = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      // A wait opened between the two failing boots.
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      const between = h.ledger.recordProviderWait({ id: 'wait-between-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-between'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-between', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'between-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:between-slot', incidentId: 'provider-wall.between', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      expect(failingBoot()).toEqual(['provider-recovery.hand-back-failed']); // Gru is woken again
+      const second = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(second?.id).not.toBe(first?.id);
+      expect(h.ledger.getNotification(first!.id)?.resolvedAt).not.toBeNull();
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${between.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a boot whose hand-back was never attempted is logged at error and tells Gru', async () => {
+    const h = new Harness();
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    const logs: string[] = [];
+    await bootProviderRecovery(sensor, (level, msg) => logs.push(`${level}:${msg}`));
+    expect(logs.filter((line) => line.includes('had not been attempted'))).toEqual(['error:provider-recovery boot hand-back had not been attempted when provider recovery booted — open waits of a provider whose recovery is off are kept until a boot that runs it']);
+    expect(surfaced).toEqual(['provider-recovery.hand-back-failed']);
   });
 
   it('a boot failure notice that cannot be posted, or retired, is logged with its cause — never thrown in its place', () => {
@@ -1644,8 +1728,8 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       setInterval: ((() => { intervals += 1; return { unref: () => {} }; }) as unknown) as typeof setInterval,
       clearInterval: (() => {}) as typeof clearInterval,
     });
+    expect(on.handBackAtBoot()).toBe(0); // main's order: the hand-back runs before boot
     await bootProviderRecovery(on, (_level, msg) => logs.push(msg));
-    expect(logs).toContain('provider-recovery boot hand-back did not run before supervision started — open waits of a provider whose recovery is off are kept until a boot that runs it');
     expect(intervals).toBe(1);
     expect(logs).toContain('provider-recovery sensor started');
     expect(h.wakes.length).toBe(wakes + 1);

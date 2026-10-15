@@ -289,7 +289,7 @@ const PINS: Record<string, number> = {
   'provider-recovery-metadata.test.ts': 24,
   'provider-recovery-resume.test.ts': 26,
   'provider-recovery-seam.test.ts': 17,
-  'provider-recovery-sensor.test.ts': 79,
+  'provider-recovery-sensor.test.ts': 82,
   'restart-recovery-progress.test.ts': 165,
   'restart-recovery-schema.test.ts': 3,
   'rebrief-recovery.test.ts': 93,
