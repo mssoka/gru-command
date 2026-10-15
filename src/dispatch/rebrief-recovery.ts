@@ -97,6 +97,10 @@ export interface ReconcileRebriefDeps {
   /** True while the process is deliberately stopping: a turn killed by
    * shutdown is not a recovery failure — the next boot retries the marker. */
   readonly stopping?: () => boolean;
+  /** Issue #339: observe the re-briefed/resumed turn's session at its settle
+   * seam so a prohibited read invalidates blind coverage. Wired by the service
+   * to `DispatchService.observeBlindSession`; absent = no observation. */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
 /** The incomplete-attempt disposition when the terminal branch examined
@@ -750,6 +754,7 @@ function runRebriefTurn(
     briefing: input.briefing,
     workRevision: input.group.find((marker) => marker.workRevision !== null)?.workRevision ?? null,
     ...(input.resumeFile !== undefined ? { resumeFile: input.resumeFile } : {}),
+    ...(deps.observeBlindTurn !== undefined ? { observeBlindTurn: deps.observeBlindTurn } : {}),
     beforeTurnSideEffect: () => checkRebriefTurn(deps.ledger, input.jobId, input.group),
     onSpawned: (worker) => {
       deps.ledger.bindPendingRebriefWorker({

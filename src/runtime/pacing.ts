@@ -189,6 +189,13 @@ export async function settleRetries(
   hook: ((agentId: string) => Promise<RetrySettlement>) | undefined,
   agentId: string,
   signal?: AbortSignal,
+  /** Issue #339: invoked when the cancellation wins the race while the retry
+   * settlement is still in flight, handing the caller the abandoned
+   * settlement so it can chain a FINAL observation onto the retry turn (it
+   * can still append prohibited reads after the immediate scan). The handed
+   * promise never rejects: an abandoned hook fault is irrelevant to a
+   * post-hoc rescan. */
+  onAbandonedSettlement?: (settlement: Promise<void>) => void,
 ): Promise<RetrySettlement | 'cancelled'> {
   if (hook === undefined) return 'none';
   let settle: Promise<RetrySettlement>;
@@ -197,10 +204,22 @@ export async function settleRetries(
   } catch (cause) {
     throw new RetrySettlementUnavailableError(agentId, cause);
   }
-  const surfaced = settle.catch((cause: unknown) => {
-    throw new RetrySettlementUnavailableError(agentId, cause);
-  });
-  if (signal === undefined) return surfaced;
+  // Issue #339 G6: create the throwing named-fault alias only where it is
+  // CONSUMED. The pre-aborted branch deliberately races the RAW settlement (so
+  // an already-available disposition still beats the already-landed
+  // cancellation) and converts its rejection to the named error on that
+  // branch; an eagerly created `surfaced` left a separate, unconsumed rejection
+  // there. The never-rejecting abandoned alias (handed off for a final
+  // physical observation) is safe to create eagerly.
+  const abandoned = settle.then(
+    () => undefined,
+    () => undefined,
+  );
+  if (signal === undefined) {
+    return settle.catch((cause: unknown) => {
+      throw new RetrySettlementUnavailableError(agentId, cause);
+    });
+  }
   if (signal.aborted === true) {
     // Shutdown already landed, but the hook may have had nothing to wait
     // for: an already-available disposition ('none' — no incident was
@@ -216,17 +235,22 @@ export async function settleRetries(
         throw new RetrySettlementUnavailableError(agentId, cause);
       },
     );
+    if (winner === 'cancelled') onAbandonedSettlement?.(abandoned);
     return winner;
   }
   let listener: (() => void) | null = null;
   try {
-    return await Promise.race([
-      surfaced,
+    const winner = await Promise.race([
+      settle.catch((cause: unknown) => {
+        throw new RetrySettlementUnavailableError(agentId, cause);
+      }),
       new Promise<'cancelled'>((resolve) => {
         listener = () => resolve('cancelled');
         signal.addEventListener('abort', listener, { once: true });
       }),
     ]);
+    if (winner === 'cancelled') onAbandonedSettlement?.(abandoned);
+    return winner;
   } finally {
     if (listener !== null) signal.removeEventListener('abort', listener);
   }
