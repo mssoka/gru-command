@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { expect, test, type FileChooser, type Page } from '@playwright/test';
 import { pickFreePort, startRealService, type RealServiceHandle } from '../../test/helpers/real-service.mjs';
 
@@ -208,17 +208,15 @@ test('real native compact preserves history and New chat starts unresumed behind
   await sendAndWaitReply(page, 'real context control old words');
   const pointerFile = join(durableHome, 'chat', 'gru-session.json');
   const readPointer = (): { sessionFile: string; epoch: number } => {
-    let raw: string;
-    let value: unknown;
-    try {
-      raw = readFileSync(pointerFile, 'utf-8');
-      value = JSON.parse(raw);
-    } catch (error) {
-      throw new Error(`unreadable chat session pointer ${pointerFile}: ${String(error)}`);
-    }
+    const raw = ((): string => {
+      try { return readFileSync(pointerFile, 'utf-8'); } catch (error) { throw new Error(`unreadable chat session pointer ${pointerFile}: ${String(error)}`); }
+    })();
+    const value = ((): unknown => {
+      try { return JSON.parse(raw); } catch (error) { throw new Error(`chat session pointer ${pointerFile} is not JSON: ${String(error)}`); }
+    })();
     const record = typeof value === 'object' && value !== null ? value as { sessionFile?: unknown; epoch?: unknown } : null;
     const epoch = record?.epoch;
-    if (record === null || typeof record.sessionFile !== 'string' || record.sessionFile === '' ||
+    if (record === null || typeof record.sessionFile !== 'string' || !isAbsolute(record.sessionFile) ||
         typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0) {
       throw new Error(`malformed chat session pointer ${pointerFile}: ${raw}`);
     }
@@ -239,15 +237,19 @@ test('real native compact preserves history and New chat starts unresumed behind
   // epoch pointer (the write is asynchronous): wait for the durable advance
   // rather than reading once — reading once made this test order/timing
   // sensitive (#402).
-  // A read failure is reported as the polled value, so a persistently
-  // unreadable pointer still fails with this message and its cause.
-  const polledEpoch = (): number | string => {
-    try { return readPointer().epoch; } catch (error) { return String(error); }
+  // A transient read failure is retried; if the pointer is still unreadable
+  // when the poll gives up, that cause is what the failure reports.
+  let lastReadError: string | null = null;
+  const polledEpoch = (): number | null => {
+    try { const { epoch } = readPointer(); lastReadError = null; return epoch; } catch (error) { lastReadError = String(error); return null; }
   };
-  await expect.poll(polledEpoch, {
-    message: 'New chat never durably advanced the chat session epoch pointer',
-    timeout: 10_000,
-  }).toBe(oldPointer.epoch + 1);
+  const advanced = 'New chat never durably advanced the chat session epoch pointer';
+  try {
+    await expect.poll(polledEpoch, { message: advanced, timeout: 10_000 }).toBe(oldPointer.epoch + 1);
+  } catch (error) {
+    if (lastReadError !== null) throw new Error(`${advanced}; the pointer was last unreadable: ${lastReadError}`, { cause: error });
+    throw error;
+  }
   const freshPointer = readPointer();
   expect(freshPointer.sessionFile).not.toBe(oldPointer.sessionFile);
   expect(readFileSync(oldPointer.sessionFile)).toEqual(oldBytes);

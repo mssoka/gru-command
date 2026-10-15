@@ -359,20 +359,20 @@ interface HitTarget {
 /** Center hit-target + viewport containment for one selector: the live
  * occlusion check (sticky chrome, drawer or any other element covering
  * the control fails the hit test). Containment allows a sliver of at most
- * half a CSS pixel on any edge: browsers scroll in whole pixels while layout
- * positions are fractional, so a focus/scroll that aligns an edge can leave
- * a sub-pixel sliver outside (Linux font metrics put the 1440 SETTLED and
- * 768 PIPELINE disclosures 0.1875px past the bottom edge — #402). Under half
- * a CSS pixel rounds away at 1x device pixels, so nothing visible is
- * clipped; a real overhang, an empty box or any occluder still fails
- * (every edge and the exact boundary are pinned below). */
+ * half a DEVICE pixel on any edge (0.5 CSS px at 1x, 0.25 at 2x):
+ * browsers scroll in whole pixels while layout positions are fractional, so
+ * a focus/scroll that aligns an edge can leave a sub-pixel sliver outside
+ * (Linux font metrics put the 1440 SETTLED and 768 PIPELINE disclosures
+ * 0.1875px past the bottom edge — #402). A real overhang, an empty box or
+ * any occluder still fails (every edge and the exact boundary are pinned
+ * below). */
 async function hitTarget(page: Page, selector: string): Promise<HitTarget> {
   return page.evaluate((sel) => {
     const element = document.querySelector<HTMLElement>(sel);
     if (element === null) return { found: false, inViewport: false, hit: false };
     const rect = element.getBoundingClientRect();
     const topmost = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-    const sliver = 0.5;
+    const sliver = 0.5 / window.devicePixelRatio;
     return {
       found: true,
       inViewport: rect.width > 0 && rect.height > 0 &&
@@ -675,14 +675,22 @@ test.describe('compact owner-first board — synthetic geometry proof', () => {
       '<div id="top-overhang" style="left:40px;top:-1px;width:20px;height:20px"></div>',
       '<div id="right-overhang" style="left:381px;top:40px;width:20px;height:20px"></div>',
       '<div id="right-boundary" style="left:380.5px;top:80px;width:20px;height:20px"></div>',
+      '<div id="left-boundary" style="left:-0.5px;top:120px;width:20px;height:20px"></div>',
+      '<div id="top-boundary" style="left:200px;top:-0.5px;width:20px;height:20px"></div>',
+      '<div id="past-boundary" style="left:230px;top:250.75px;width:20px;height:50px"></div>',
       '<div id="empty" style="left:100px;top:10px;width:0;height:0"></div>',
     ].join(''));
+    expect(await page.evaluate(() => window.devicePixelRatio), 'this proof runs at 1x').toBe(1);
     expect(await hitTarget(page, '#sliver')).toEqual({ found: true, inViewport: true, hit: true });
-    expect((await hitTarget(page, '#boundary')).inViewport, 'exactly half a pixel past the bottom').toBe(true);
-    expect((await hitTarget(page, '#right-boundary')).inViewport, 'exactly half a pixel past the right').toBe(true);
-    for (const id of ['#overhang', '#left-overhang', '#top-overhang', '#right-overhang', '#empty']) {
+    // Exactly half a device pixel past each edge is still contained and hittable.
+    for (const id of ['#boundary', '#right-boundary', '#left-boundary', '#top-boundary']) {
+      expect(await hitTarget(page, id), id).toEqual({ found: true, inViewport: true, hit: true });
+    }
+    // Anything beyond it, or an empty box, is not contained.
+    for (const id of ['#past-boundary', '#overhang', '#left-overhang', '#top-overhang', '#right-overhang', '#empty']) {
       expect((await hitTarget(page, id)).inViewport, id).toBe(false);
     }
+    expect((await hitTarget(page, '#empty')).hit, 'an empty box is never hit').toBe(false);
     expect(await hitTarget(page, '#missing')).toEqual({ found: false, inViewport: false, hit: false });
   });
 
