@@ -178,14 +178,20 @@ line-ending reason. A git or file failure is logged at warn with its own
 reason; git runs without inherited repository-routing variables. A file the
 CLI itself would refuse on every turn (not JSON, not an object, no
 `mcpServers` object) is refused with its reason. A server the CLI skips is
-logged by name with the CLI's own skip code — never its free text, which can
-echo rejected values; one it keeps but cannot start, or that needs a sign-in a
-headless session cannot give, is logged by name with a fixed description. A
-name that is not identifier-shaped (a key can be a credential URL) is logged
-as `(name withheld)`. In
-user mode an entry the CLI's validation rejects leaves no signal, so GC cannot
-log it. For the CLI's full diagnostics, run `claude -p --strict-mcp-config
---mcp-config .mcp.json --debug "x"` in the lane. HEAD is
+logged by name with the CLI's own skip code (or `unknown reason` when the code
+is not code-shaped) — never its free text, which can echo rejected values; one
+it keeps but cannot start, or that needs a sign-in a headless session cannot
+give, is logged by name with a fixed description. A name is logged only when
+it is a label (letters and digits of any script, `_ . -` and spaces, or the
+CLI's `plugin:<plugin>:<server>` form, up to 80 characters, with no
+credential-shaped run); any other — a key can be a credential URL — is logged
+as `(name withheld #N)`. In user mode an entry the CLI's validation rejects
+leaves no signal, so GC cannot log it. The CLI's full diagnostics go to its
+debug log (`~/.claude/debug/latest`): in project mode run
+`claude -p "x" --strict-mcp-config --mcp-config .mcp.json --debug` in the lane
+(the prompt must come before the variadic `--mcp-config`), in user mode
+`claude -p "x" --debug`. Either makes a model call and starts the servers,
+and the debug log can contain credentials — do not share it. HEAD is
 lane state a session with a shell can commit to, so only roles whose own
 tools include a shell load project servers (a server is a command such a
 session could already run); a read-only role never runs a command another

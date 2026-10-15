@@ -18,6 +18,7 @@ import {
   claudeInBandError,
   gitFailure,
   isProjectMcpCopyName,
+  loggableMcpServerName,
   mapRoleTools,
 } from '../src/runtime/claude-adapter.js';
 import { isRateLimitErrorText } from '../src/runtime/pacing.js';
@@ -1763,6 +1764,16 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     ]);
   });
 
+  it('only a label-shaped server name is ever logged', () => {
+    for (const name of ['db', 'Upper_Case.v2 x', 'café', '数据', 'plugin:edgeplug:brokensrv', `${'ab-'.repeat(26)}ab`]) {
+      expect(loggableMcpServerName(name), name).toBe(true);
+    }
+    for (const name of ['', 'x'.repeat(81), 'me@host', 'https://u:p@h/m', 'user:sk-secret', 'ok\nuser', 'a/b', '-lead',
+      'plugin:a:b:c', `ghp_${'a'.repeat(36)}`, '123e4567-e89b-12d3-a456-426614174000']) {
+      expect(loggableMcpServerName(name), name).toBe(false);
+    }
+  });
+
   it('MCP servers the CLI could not load are logged by name — skipped ones with the CLI code, failed or sign-in-blocked ones with a fixed description — once per distinct set', async () => {
     const fx = fixture();
     const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
@@ -1790,9 +1801,13 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         { name: 'bare' },
         { name: 'odd', type: 'Not A Code: sk-secret' },
         { name: 'lc', type: 'invalid_config url "https://user:sk-secret@example.invalid/mcp"' },
-        { name: 'sp', type: 'invalid config: sk-secret' },
-        { name: 'long', type: `sk-secret${'a'.repeat(40)}` },
+        { name: 'sp', type: 'invalid config' },
+        { name: 'colon', type: 'invalid:config' },
+        { name: 'upper', type: 'Invalid_config' },
+        { name: 'cap', type: 'a'.repeat(40) },
+        { name: 'long', type: 'a'.repeat(41) },
         { name: 'https://user:sk-secret-in-name@host.invalid/mcp', type: 'invalid_config' },
+        { name: 'Upper_Case.v2 x', type: 'invalid_config' },
         { name: `n${'x'.repeat(80)}`, type: 'invalid_config' },
         'a bare string from the CLI with sk-secret',
       ]);
@@ -1800,18 +1815,24 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(problemLogs()).toHaveLength(3);
       expect(problemLogs()[2]?.fields?.['servers']).toEqual(['api: skipped (invalid_config)', 'q-type: skipped (unknown_type)',
         'bare: skipped (unknown reason)', 'odd: skipped (unknown reason)', 'lc: skipped (unknown reason)',
-        'sp: skipped (unknown reason)', 'long: skipped (unknown reason)', '(name withheld): skipped (invalid_config)',
-        '(name withheld): skipped (invalid_config)', '?: skipped (unknown reason)']);
+        'sp: skipped (unknown reason)', 'colon: skipped (unknown reason)', 'upper: skipped (unknown reason)',
+        `cap: skipped (${'a'.repeat(40)})`, 'long: skipped (unknown reason)', '(name withheld #1): skipped (invalid_config)',
+        'Upper_Case.v2 x: skipped (invalid_config)', '(name withheld #2): skipped (invalid_config)', '?: skipped (unknown reason)']);
       expect(JSON.stringify(problemLogs())).not.toContain('sk-secret');
       // A server the CLI kept but could not start (status "failed": a missing
       // env var or a broken command) is logged too.
       delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
       process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'connected' }, { name: 'needs-env', status: 'failed' },
         { name: 'starting', status: 'pending' }, { name: 'connector', status: 'needs-auth', source: 'claudeai' },
-        { name: 'off', status: 'disabled' }, { name: 'hosted', status: 'needs-auth', source: 'dynamic' }]);
+        { name: 'off', status: 'disabled' }, { name: 'hosted', status: 'needs-auth', source: 'dynamic' },
+        { name: 'https://user:sk-secret@host.invalid/mcp', status: 'failed', source: 'dynamic' },
+        { name: 'plugin:edgeplug:brokensrv', status: 'failed', source: 'plugin' },
+        { name: 'me@sk-secret.invalid', status: 'needs-auth', source: 'dynamic' }]);
       await handle.prompt('six');
       expect(problemLogs()[3]?.fields).toMatchObject({
-        servers: ['needs-env: failed to start', 'hosted: needs authentication (a headless session cannot sign in)'], total: 2,
+        servers: ['needs-env: failed to start', 'hosted: needs authentication (a headless session cannot sign in)',
+          '(name withheld #1): failed to start', 'plugin:edgeplug:brokensrv: failed to start',
+          '(name withheld #2): needs authentication (a headless session cannot sign in)'], total: 5,
       });
       // A flood is capped: the first 20 entries plus the total.
       process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify(Array.from({ length: 25 }, (_, i) => ({ name: `s${i}`, status: 'failed' })));
@@ -1825,6 +1846,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'failed' }]);
       await handle.prompt('eight');
       expect(problemLogs()[5]?.fields).toMatchObject({ servers: ['x: skipped (invalid_config)', 'ok: failed to start'], total: 2 });
+      // Two different sets whose names are both withheld are still two sets:
+      // dedupe runs on the raw names (memory only), never the logged form.
+      delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'https://a:sk-secret@one.invalid/m', status: 'failed' }]);
+      await handle.prompt('nine');
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'https://b:sk-secret@two.invalid/m', status: 'failed' }]);
+      await handle.prompt('ten');
+      expect(problemLogs()).toHaveLength(8);
+      expect(problemLogs()[7]?.fields).toMatchObject({ servers: ['(name withheld #1): failed to start'], total: 1 });
       expect(JSON.stringify(problemLogs())).not.toContain('sk-secret');
     } finally {
       delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];

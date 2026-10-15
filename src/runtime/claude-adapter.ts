@@ -871,6 +871,20 @@ function withoutCrBeforeLf(bytes: Buffer): Buffer {
   return out.subarray(0, length);
 }
 
+/** Whether a server name the CLI reports may be logged. Names come straight
+ * from config — the CLI does not apply its own name rule to config files, so a
+ * key can be a credential URL — so only a label is logged: letters and digits
+ * of any script with `_ . -` and spaces, or the CLI's own
+ * `plugin:<plugin>:<server>` form, up to 80 characters; never a URL or an
+ * address (`/`, `@`, any other `:`), and never a credential-shaped run (24+
+ * alphanumerics, a UUID). */
+export function loggableMcpServerName(name: string): boolean {
+  if (name.length === 0 || name.length > 80) return false;
+  const label = '[\\p{L}\\p{N}][\\p{L}\\p{N}_. -]*';
+  if (!new RegExp(`^(?:${label}|plugin:${label}:${label})$`, 'u').test(name)) return false;
+  return !/[A-Za-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/iu.test(name);
+}
+
 /** The private copy of the verified project servers handed to --mcp-config:
  * beside the session's own transcript (GC-owned; the store lists only
  * `.jsonl`), owner-only, rewritten every turn and removed at disposal. Each
@@ -1236,40 +1250,43 @@ export class ClaudeCodeHandle implements AgentHandle {
   private noteMcpServerProblems(errors: unknown, servers: unknown): void {
     const record = (value: unknown): Record<string, unknown> =>
       typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
-    // A name comes straight from the config too (the CLI does not apply its
-    // own name rule to config files — a key can be a credential URL), so only
-    // an identifier-shaped name is logged.
-    const line = (name: unknown, why: string): string =>
-      `${typeof name !== 'string' ? '?' : /^[A-Za-z0-9_. -]{1,80}$/u.test(name) ? name : '(name withheld)'}: ${why}`;
+    const named = (entry: Record<string, unknown>): string | null => typeof entry['name'] === 'string' ? entry['name'] : null;
+    const problems: { readonly name: string | null; readonly why: string }[] = [];
     // Never the CLI's free text — it pastes rejected values in unescaped, and
     // no redaction of free text is airtight — only its skip-reason code
     // (`invalid_config`, `unknown_type`, …), accepted only when it looks like
-    // one. The CLI's own --debug output carries the details.
-    const skipped = (Array.isArray(errors) ? errors : []).map((error: unknown) => {
+    // one. The CLI's own --debug log carries the details.
+    for (const error of Array.isArray(errors) ? errors : []) {
       const entry = record(error);
       const code = typeof entry['type'] === 'string' && /^[a-z][a-z0-9_-]{0,39}$/u.test(entry['type']) ? entry['type'] : 'unknown reason';
-      return line(entry['name'], `skipped (${code})`);
-    });
+      problems.push({ name: named(entry), why: `skipped (${code})` });
+    }
     // A server the CLI kept but could not start (a missing env var, a broken
     // command) shows only as status "failed"; one from GC's own config that
     // needs OAuth ("needs-auth", source "dynamic") can never sign in from a
     // headless session. The operator's own connectors (user mode, other
     // sources) are not GC's to report. In user mode an entry the CLI's
     // validation rejects leaves no signal at all, so it cannot be logged.
-    const failed = (Array.isArray(servers) ? servers : []).map(record).flatMap((entry) =>
-      entry['status'] === 'failed' ? [line(entry['name'], 'failed to start')]
-        : entry['status'] === 'needs-auth' && entry['source'] === 'dynamic'
-          ? [line(entry['name'], 'needs authentication (a headless session cannot sign in)')] : []);
-    const problems = [...skipped, ...failed];
+    for (const entry of (Array.isArray(servers) ? servers : []).map(record)) {
+      if (entry['status'] === 'failed') problems.push({ name: named(entry), why: 'failed to start' });
+      else if (entry['status'] === 'needs-auth' && entry['source'] === 'dynamic') {
+        problems.push({ name: named(entry), why: 'needs authentication (a headless session cannot sign in)' });
+      }
+    }
     if (problems.length === 0) {
       this.mcpServerProblemsNote = null;
       return;
     }
+    // Deduped on the RAW names — held in memory only, never logged — so two
+    // different sets never collapse into one because their names are withheld.
     const note = JSON.stringify(problems);
     if (note === this.mcpServerProblemsNote) return;
     this.mcpServerProblemsNote = note;
+    let withheld = 0;
+    const lines = problems.map(({ name, why }) =>
+      `${name === null ? '?' : loggableMcpServerName(name) ? name : `(name withheld #${(withheld += 1)})`}: ${why}`);
     this.log('warn', 'claude could not load some MCP servers', {
-      cwd: this.params.cwd, servers: problems.slice(0, 20), total: problems.length,
+      cwd: this.params.cwd, servers: lines.slice(0, 20), total: lines.length,
     });
   }
 
