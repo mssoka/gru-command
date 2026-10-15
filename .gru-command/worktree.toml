@@ -802,7 +802,7 @@ repo-overview-baseline = 'set -e; base=49b558f243c7bacbfb46c7bc04f749bf131cefea;
 # recovery. Focused = touched fast suites + the classified heavy wave and
 # whole-review files (heavy config); exits never masked, approved RPC
 # patch prerequisite first.
-perkins-integration-r4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-integration-review.test.ts test/perkins-review-convergence.test.ts test/assert-perkins-integration-review-baseline.test.ts test/board-engine.test.ts test/escalation-identity.test.ts test/verify-perkins-resource.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-whole-review.test.ts test/perkins-integration-recovery.test.ts"
+perkins-integration-r4-focused = "node tools/patch-vitest-rpc-timeout.mjs && npx vitest run test/perkins-integration-review.test.ts test/assert-perkins-integration-review-baseline.test.ts test/board-engine.test.ts test/escalation-identity.test.ts test/verify-perkins-resource.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/perkins-builtin-wave.test.ts test/perkins-review-convergence.test.ts test/perkins-whole-review.test.ts test/perkins-integration-recovery.test.ts"
 
 # Static product checks for the same change: lint, compiler, build
 # (including the pinned Perkins resource verifier), approved RPC patch
