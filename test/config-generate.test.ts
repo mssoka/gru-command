@@ -367,6 +367,35 @@ describe('config-generate CLI', () => {
     expect(loaded.pacing).toMatchObject({ enabled: false, maxConcurrentMinions: 2, maxConcurrentReviewTurns: 2, maxAutoRetries: 1 });
   });
 
+  it('round trip preserves the [silas.autopilot] policy tables (issue #243 R2-M3)', () => {
+    const root = tempDir('gru-command-config-autopilot-');
+    const instance = join(root, 'instance');
+    mkdirSync(instance, { recursive: true });
+    const prior = [
+      '[silas]',
+      'enabled = true',
+      '[silas.autopilot]',
+      'enabled = true',
+      '[silas.autopilot.rules]',
+      'verdict-rung-directive = "enforce"',
+      'sweep-ack = "off"',
+    ].join('\n');
+    writeFileSync(join(instance, 'config.toml'), `${prior}\n`);
+    const forced = run(instance, ['--force']);
+    expect(forced.status, `${forced.stdout}\n${forced.stderr}`).toBe(0);
+    const raw = parse(readFileSync(join(instance, 'config.toml'), 'utf-8')) as Record<string, unknown>;
+    const silas = raw.silas as { autopilot: { enabled: boolean; rules: Record<string, string> } };
+    expect(silas.autopilot).toEqual({
+      enabled: true,
+      rules: { 'sweep-ack': 'off', 'verdict-rung-directive': 'enforce' },
+    });
+    const loaded = loadConfig({ GRU_COMMAND_HOME: instance }, root);
+    expect(loaded.silas.autopilot).toEqual({
+      enabled: true,
+      rules: { 'sweep-ack': 'off', 'verdict-rung-directive': 'enforce' },
+    });
+  });
+
   it('data_dir is emitted ~-anchored for home-under instances (restore-on-new-machine portability)', () => {
     // Regression guard (Perkins R1 blocker 1): a machine-specific absolute
     // data_dir redirects all state to the OLD machine when the config is
@@ -489,5 +518,13 @@ describe('config-generate: Claude Code is the default for new installs (#374)', 
     expect(legacyForced.status, `${legacyForced.stdout}\n${legacyForced.stderr}`).toBe(0);
     expect(runtimeOf(legacy)).toBe('pi');
     expect(loadConfig({ GRU_COMMAND_HOME: legacy }, legacy).runtimes.default).toBe('pi');
+  });
+});
+
+describe('issue #243 F-L1 empty-digest wording', () => {
+  it('qualifies the empty-digest statement with the due-decision-recheck exception', () => {
+    const block = renderConfigDocBlock();
+    expect(block).toContain('empty digest never wakes on its own; a due decision recheck still');
+    expect(block).not.toContain('empty digest never wakes). The wake prompt carries');
   });
 });

@@ -451,6 +451,36 @@ describe('gh CLI adapter', () => {
     ]);
   });
 
+  it('listPullsForHead asks the owner-qualified head filter and returns only that head (issue #243 R2-M5)', async () => {
+    const asked: string[] = [];
+    const runner: GhCommandRunner = async (args) => {
+      const path = args[args.length - 1] ?? '';
+      asked.push(path);
+      // Query-dependent: only the requested owner:branch returns a pull, so
+      // a dropped `head` parameter would change the returned identity.
+      const matches = path.includes('head=acme%3Agru%2Fjob-1');
+      const pulls = [
+        {
+          number: matches ? 11 : 12,
+          head: { ref: matches ? 'gru/job-1' : 'other', sha: matches ? 'sha-a' : 'sha-b' },
+          state: 'open',
+          merged_at: null,
+          mergeable_state: null,
+          merge_commit_sha: null,
+          html_url: matches
+            ? 'https://github.com/acme/app/pull/11'
+            : 'https://github.com/acme/app/pull/12',
+        },
+      ];
+      return { status: 0, stdout: JSON.stringify(pulls), stderr: '' };
+    };
+    const api = new GhCliApi(runner);
+    const pulls = await api.listPullsForHead({ repo: REPO, head: 'gru/job-1' });
+    expect(pulls.map((pull) => pull.number)).toEqual([11]);
+    expect(asked[0]).toContain('head=acme%3Agru%2Fjob-1');
+    expect(asked[0]).toContain('state=open');
+  });
+
   it('fails loud on unavailability, rate limits, and malformed responses', async () => {
     const unavailable = new GhCliApi(async () => ({ status: -1, stdout: '', stderr: '', error: 'spawn gh ENOENT' }));
     await expect(unavailable.listPulls({ repo: REPO, limit: 1 })).rejects.toThrow(/gh is unavailable/);
@@ -477,7 +507,7 @@ describe('gh CLI adapter', () => {
 // ------------------------------------------------------------------
 
 interface FakeCall {
-  readonly kind: 'listPulls' | 'getPull' | 'listCheckRuns';
+  readonly kind: 'listPulls' | 'listPullsForHead' | 'getPull' | 'listCheckRuns';
   readonly repo: string;
   readonly arg: number | string | null;
 }
@@ -496,6 +526,16 @@ class FakeGhApi implements GhApiPort {
     const failure = this.failList.get(repo);
     if (failure !== undefined) throw failure;
     return this.pulls.get(repo) ?? [];
+  }
+
+  async listPullsForHead(input: { repo: RepoRef; head: string }): Promise<readonly GhPull[]> {
+    const repo = repoFullName(input.repo);
+    this.calls.push({ kind: 'listPullsForHead', repo, arg: input.head });
+    const failure = this.failList.get(repo);
+    if (failure !== undefined) throw failure;
+    // The fake's `pulls` map is the repo's pull set; the head filter is the
+    // only extra behaviour the api-shaped method adds.
+    return (this.pulls.get(repo) ?? []).filter((pull) => pull.headRef === input.head);
   }
 
   async getPull(input: { repo: RepoRef; number: number }): Promise<GhPull> {

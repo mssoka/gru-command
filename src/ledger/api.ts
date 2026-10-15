@@ -921,6 +921,11 @@ export interface PendingRebriefRecord {
    * because the marker is the durable request. */
   readonly ruleId: string | null;
   readonly sourceRoundId: string | null;
+  /** The autopilot provenance (issue #243 M3): `'silas-autopilot'` when the
+   * durable request was minted by the code autopilot, null for LLM Silas's
+   * own re-brief. The finalizer replays it onto the `silas.rebrief` receipt
+   * so #214 can attribute the action. */
+  readonly source: string | null;
   /** The required work revision the request was composed with (owner rule
    * 4); the re-brief delivery carries it as its receipt. null = a request
    * accepted before work revisions existed. */
@@ -3736,9 +3741,12 @@ export class LedgerApi {
     handoff?: CompletionHandoffIntent;
     /** Firing-rule provenance (issue #117): the named Silas rule and the
      * round it consumes. Persisted in the marker payload so the receipt
-     * carries them even when a restart replays the request. */
+     * carries them even when a restart replays the request. `source`
+     * (issue #243 M3) rides the same payload so an autopilot-minted
+     * re-brief's receipt is attributable. */
     ruleId?: string;
     sourceRoundId?: string;
+    source?: string;
   }): readonly PendingRebriefRecord[] {
     return this.transaction(() => {
       // The revision is bound in the SAME transaction as the marker: the
@@ -3749,6 +3757,7 @@ export class LedgerApi {
         briefing: input.briefing,
         ...(input.ruleId !== undefined ? { rule_id: input.ruleId } : {}),
         ...(input.sourceRoundId !== undefined ? { source_round_id: input.sourceRoundId } : {}),
+        ...(input.source !== undefined ? { source: input.source } : {}),
         work_revision: requiredWorkRevision(this.listJobAmendments(input.jobId)),
       });
       const payloadHash = createHash('sha256').update(payload).digest('hex');
@@ -7297,7 +7306,7 @@ export class LedgerApi {
     holder: string;
     requestId?: string;
     kind?: 'directive' | 'rebrief';
-    sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string };
+    sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string };
     /** Explicit completion intent; omitted = ordinary directive. */
     handoff?: CompletionHandoffIntent;
   }): { readonly record: DirectiveRequestRecord; readonly created: boolean } {
@@ -7319,12 +7328,14 @@ export class LedgerApi {
     if (isJobTerminal(job.status)) {
       throw new Error(`job "${input.jobId}" is ${job.status} — terminal lanes take no directives`);
     }
-    const normalizeSourceContext = (context: { readonly ruleId?: string; readonly sourceRoundId?: string } | null | undefined) =>
-      context === null || context === undefined || context.ruleId === undefined && context.sourceRoundId === undefined ? null :
-        { ...(context.ruleId === undefined ? {} : { ruleId: context.ruleId }), ...(context.sourceRoundId === undefined ? {} : { sourceRoundId: context.sourceRoundId }) };
+    const normalizeSourceContext = (context: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } | null | undefined) =>
+      context === null || context === undefined || context.ruleId === undefined && context.sourceRoundId === undefined && context.source === undefined ? null :
+        { ...(context.ruleId === undefined ? {} : { ruleId: context.ruleId }), ...(context.sourceRoundId === undefined ? {} : { sourceRoundId: context.sourceRoundId }),
+          // Autopilot provenance (issue #243 M3): replayed onto the receipts.
+          ...(context.source === undefined ? {} : { source: context.source }) };
     const sourceContext = normalizeSourceContext(input.sourceContext);
     const payload = JSON.stringify({ directive: input.directive, blocker_fingerprint: input.blockerFingerprint ?? null,
-      ...(input.kind === 'rebrief' ? { request_kind: 'rebrief', rule_id: sourceContext?.ruleId ?? null, source_round_id: sourceContext?.sourceRoundId ?? null } : {}) });
+      ...(input.kind === 'rebrief' ? { request_kind: 'rebrief', rule_id: sourceContext?.ruleId ?? null, source_round_id: sourceContext?.sourceRoundId ?? null, ...(sourceContext?.source === undefined ? {} : { source: sourceContext.source }) } : {}) });
     const payloadHash = createHash('sha256').update(payload).digest('hex');
     return this.transaction(() => {
       if (input.requestId !== undefined) {
@@ -7442,7 +7453,7 @@ export class LedgerApi {
   }
 
   beginRebriefIntent(input: { readonly jobId: string; readonly note: string; readonly holder: string; readonly requestId?: string;
-    readonly handoff?: CompletionHandoffIntent; readonly sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string } }): ReturnType<LedgerApi['beginDirectiveIntent']> {
+    readonly handoff?: CompletionHandoffIntent; readonly sourceContext?: { readonly ruleId?: string; readonly sourceRoundId?: string; readonly source?: string } }): ReturnType<LedgerApi['beginDirectiveIntent']> {
     return this.beginDirectiveIntent({ jobId: input.jobId, directive: input.note, holder: input.holder, kind: 'rebrief',
       ...(input.requestId === undefined ? {} : { requestId: input.requestId }), ...(input.handoff === undefined ? {} : { handoff: input.handoff }),
       ...(input.sourceContext === undefined ? {} : { sourceContext: input.sourceContext }) });
@@ -7626,6 +7637,7 @@ export class LedgerApi {
         payload: { request_id: row.requestId, minion_id: binding.agentId, native_binding: binding,
           ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
           ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+          ...(row.sourceContext?.source === undefined ? {} : { source: row.sourceContext.source }),
           blocker_fingerprint: (JSON.parse(row.payload) as { blocker_fingerprint?: unknown }).blocker_fingerprint ?? null } });
       this.db.prepare('UPDATE pending_directives SET native_binding = ? WHERE request_id = ?').run(JSON.stringify(binding), row.requestId);
       const admitted = this.recordDirectiveAdmission({ requestId: row.requestId, minionId: binding.agentId, eventSeq: sent.seq });
@@ -8422,6 +8434,7 @@ export class LedgerApi {
         request_id: row.requestId, minion_id: proof.binding.agentId, note: (JSON.parse(row.payload) as { directive: string }).directive,
         ...(phase === null ? {} : { phase_id: phase.phaseId }), ...(row.sourceContext?.ruleId === undefined ? {} : { rule_id: row.sourceContext.ruleId }),
         ...(row.sourceContext?.sourceRoundId === undefined ? {} : { source_round_id: row.sourceContext.sourceRoundId }),
+        ...(row.sourceContext?.source === undefined ? {} : { source: row.sourceContext.source }),
       } });
       const delivery = this.appendEvent({ kind: 'job.delivered', jobId: row.jobId, agentId: proof.binding.agentId,
         payload: { request_id: row.requestId, agentId: proof.binding.agentId, source: row.requestKind === 'rebrief' ? 'silas-rebrief' : 'silas-directive', sha: completion?.head ?? null,
@@ -9720,10 +9733,10 @@ export class LedgerApi {
     if (!isPendingRebriefKind(kind)) {
       throw new Error(`pending_rebriefs row has unknown kind "${kind}"`);
     }
-    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; work_revision?: unknown };
+    let payload: { note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; source?: unknown; work_revision?: unknown };
     try {
       payload = JSON.parse(str(row.payload)) as {
-        note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; work_revision?: unknown;
+        note?: unknown; briefing?: unknown; rule_id?: unknown; source_round_id?: unknown; source?: unknown; work_revision?: unknown;
       };
     } catch (error) {
       throw new Error(`pending_rebriefs row ${str(row.id)} payload is not valid JSON: ${String(error)}`);
@@ -9741,6 +9754,7 @@ export class LedgerApi {
       phaseId: nstr(row.phase_id),
       ruleId: nstr(payload.rule_id),
       sourceRoundId: nstr(payload.source_round_id),
+      source: nstr(payload.source),
       workRevision: typeof payload.work_revision === 'number' && Number.isSafeInteger(payload.work_revision) &&
         payload.work_revision >= 0 ? payload.work_revision : null,
       requestedAt: str(row.requested_at),

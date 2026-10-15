@@ -649,12 +649,21 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const jobId = strField(body, 'job_id');
+      // Firing-rule provenance (issue #243): the delivered-pr-register rule
+      // fires here when Silas registers the one PR the lane actually has.
+      const prRuleId = parseSilasRouteRuleId('pr', strictOptStrField(body, 'rule_id')) ?? undefined;
+      if (prRuleId !== undefined && by !== 'silas') {
+        throw new Error(`rule_id "${prRuleId}" fires only on a silas request`);
+      }
       const job = options.dispatch.recordPr(jobId, strField(body, 'url'));
       if (by === 'silas') {
         options.ledger.appendCustomEvent({
           kind: 'silas.pr-registered',
           jobId,
-          payload: { url: job.prUrl },
+          payload: {
+            url: job.prUrl,
+            ...(prRuleId === undefined ? {} : { rule_id: prRuleId }),
+          },
         });
       }
       json(res, 200, job);
@@ -707,13 +716,25 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
       const body = await readBody(req);
       const by = byField(body);
       const force = optBoolField(body, 'force');
-      const ruleId = optStrField(body, 'rule_id');
-      const sourceRoundId = optStrField(body, 'source_round_id');
+      const ruleField = strictOptStrField(body, 'rule_id');
+      // The route validator answers `null` for an absent rule; the rest of
+      // this handler keys on `undefined` (an absent field never mints a
+      // `rule_id: null` on the deferral receipt).
+      const ruleId = parseSilasRouteRuleId('review', ruleField) ?? undefined;
+      const sourceRoundId = strictOptStrField(body, 'source_round_id');
       const requestedTargetRef = optStrField(body, 'target_ref');
       const evidenceRefs = optEvidenceField(body);
-      if ((ruleId === undefined) !== (sourceRoundId === undefined) ||
-          (ruleId !== undefined && (by !== 'silas' || ruleId !== 'clean-abort-service-restart'))) {
-        throw new Error('rule_id/source_round_id must be paired and only silas may use clean-abort-service-restart');
+      if (ruleId !== undefined && by !== 'silas') {
+        throw new Error(`rule_id "${ruleId}" fires only on a silas request`);
+      }
+      if (sourceRoundId !== undefined && ruleId === undefined) {
+        throw new Error('source_round_id must be paired with a rule_id');
+      }
+      if (ruleId === 'clean-abort-service-restart' && sourceRoundId === undefined) {
+        throw new Error('rule_id "clean-abort-service-restart" consumes a round — source_round_id is required');
+      }
+      if (ruleId === 'pr-review-trigger' && sourceRoundId !== undefined) {
+        throw new Error('rule_id "pr-review-trigger" is a first/re-review request — it carries no source round');
       }
       const jobId = strField(body, 'job_id');
       // The clean-abort re-arm freezes EXACTLY the proved delivered head:
@@ -841,6 +862,9 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
               route: outcome.route,
               ...(armed && ruleId !== undefined ? { rule_id: ruleId, source_round_id: sourceRoundId } : {}),
               ...(outcome.route === 'perkins' ? { round_id: outcome.round.id } : {}),
+              // Issue #243 F-H5: the frozen head the round actually armed on,
+              // so #214 can match a predicted bound head to the real target.
+              ...(outcome.route === 'perkins' ? { target_ref: outcome.round.targetRef } : {}),
             },
           });
         }
