@@ -880,17 +880,20 @@ function withoutCrBeforeLf(bytes: Buffer): Buffer {
  * URL or an address (`/`, `@`, any other `:`), and never a credential-shaped
  * run. */
 export function loggableMcpServerName(name: string): boolean {
-  const length = [...name].length;
-  if (length === 0 || length > 80) return false;
+  // 80 code points are at most 160 UTF-16 units, so a longer name — the CLI
+  // echoes a config key of any size — is refused before it is spread.
+  if (name.length === 0 || name.length > 160 || [...name].length > 80) return false;
   const label = '[\\p{L}\\p{N}][\\p{L}\\p{M}\\p{N}_. ()-]*';
   if (!new RegExp(`^(?:${label}|plugin:${label}:${label})$`, 'u').test(name)) return false;
   return !credentialShaped(name);
 }
 
 /** 24+ ASCII letters and digits in a row, or a UUID — counted with combining
- * marks removed, so marks cannot split a run. */
+ * marks removed, so marks cannot split a run, and without case folding, so
+ * only ASCII letters count. */
 function credentialShaped(text: string): boolean {
-  return /[A-Za-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/iu.test(text.replace(/\p{M}/gu, ''));
+  return /[A-Za-z0-9]{24}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/u
+    .test(text.replace(/\p{M}/gu, ''));
 }
 
 /** The private copy of the verified project servers handed to --mcp-config:
