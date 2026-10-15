@@ -202,7 +202,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // Of the 36 pre-existing wave sites, 33 carry bounded context; the
+    // Of the 37 pre-existing wave sites, 34 carry bounded context; the
     // three null rows are sanctioned residuals (shutdown deadline,
     // live-process pause, sweep error) that stay context-free and live (A7
     // rejection stands; a worktree id is never coerced into a round identity).
@@ -216,6 +216,7 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['title', 'context'],
       // Owner rule 3: an unproven supersession stop blocks the writer.
       ['`Review of job ${input.jobId} could not be confirmed stopped — its writer is blocked`', '{ jobId: input.jobId, ...(roundIds.size === 1 ? { roundId: [...roundIds][0]! } : {}) }'],
+      ['`Review round ${round.id} cannot be promoted: its review coverage state is missing or damaged`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} carries a posted verdict without a provider-bound receipt`', '{ jobId: round.jobId, roundId: round.id }'],
       // Native correction cycle (PR #289 blockers 2/3): durable publication
       // attempt reconciliation after restart, each bound to its round.
@@ -267,10 +268,10 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    // 36 pre-existing wave call sites + the 13 durable-publication-recovery
+    // 37 pre-existing wave call sites + the 13 durable-publication-recovery
     // escalations added by the PR #289 native correction cycle, its
     // amendments and the native R2 byte/identity fences.
-    expect(sites).toHaveLength(49);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(46);
+    expect(sites).toHaveLength(50);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(47);
   });
 });
