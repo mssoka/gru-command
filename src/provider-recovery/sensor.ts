@@ -925,10 +925,12 @@ export class ProviderRecoverySensor {
    * failed write is logged, never thrown. */
   private announceHandBackFailure(cause: 'failed' | 'skipped'): void {
     try {
-      // The open notice, if any, is the one refreshed; the caveat reads the
-      // newest notice open or not (one Gru disposed of was still seen).
+      // The open notice, if any, is the one refreshed and the one the caveat
+      // reads; with none open, the caveat reads the most recently inserted
+      // notice (insertion order — a clock step back cannot reorder it; one
+      // Gru disposed of was still seen).
       const open = this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'active');
-      const prior = open ?? this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'any');
+      const prior = open ?? this.ledger.latestNotificationByKind(HAND_BACK_FAILED);
       const what = cause === 'failed'
         ? 'Handing back the open waits of providers whose automatic recovery is off failed at boot (for some or all of them)'
         : 'The boot hand-back of providers whose automatic recovery is off was never attempted (a wiring fault — see the ' +
@@ -1086,11 +1088,13 @@ export class ProviderRecoverySensor {
         : 'resume it (dispose its re-arm control once a live agent is adopted) or re-dispatch the job';
       // Told before — this wait's own notice (Gru disposed of it while the
       // wait stayed open, or the switch was on again in between), or a boot
-      // hand-back failure reported since the wait opened (its last report
-      // time, resolved or not: Gru may have acted on it; an unreadable time
-      // counts as reported): say so, so a re-dispatch is never doubled.
+      // hand-back failure reported since the wait opened — the last report
+      // time of the most recently inserted notice (only the open notice is
+      // ever refreshed, so it carries the latest report whatever the clock
+      // did), resolved or not: Gru may have acted on it; an unreadable time
+      // counts as reported. Say so, so a re-dispatch is never doubled.
       const announced = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') !== null;
-      const failure = this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'any');
+      const failure = this.ledger.latestNotificationByKind(HAND_BACK_FAILED);
       const failureSince = failure !== null && !(lastReportedAt(failure) < Date.parse(wait.createdAt));
       const repeat = announced
         ? 'Announced before and the wait is still open — check whether the lane already resumed before you act. '

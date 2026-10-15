@@ -1666,7 +1666,9 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       // post, but the detail changes and with it the Gru mailbox basis —
       // which is what wakes Gru again.
       expect(failingBoot()).toEqual([]);
-      expect(mailboxItem()?.basis).not.toBe(before!.basis);
+      const after = mailboxItem();
+      expect(after).toBeDefined();
+      expect(after!.basis).not.toBe(before!.basis);
       const second = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
       expect(second).not.toBeNull();
       expect(second?.id).toBe(first!.id);
@@ -1762,7 +1764,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     }
     expect(logs).toContainEqual({ msg: 'the hand-back failure notice could not be written', fields: { error: 'Error: center down' } });
     expect(h.ledger.getNotification(open.id)).toMatchObject({ resolvedAt: null, detail: earlier });
-    // A refresh that finds the row gone (null) posts instead.
+    // A refresh that reports the row gone (null) falls through to a post.
     const posts: string[] = [];
     sensorWith(() => null, posts).noteBootHandBackSkipped();
     expect(posts).toEqual(['provider-recovery.hand-back-failed']);
@@ -1827,7 +1829,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     }
   });
 
-  it('the open failure notice is refreshed even when a resolved one sorts newer (the clock stepped back)', async () => {
+  it('after a clock step back the open notice is refreshed, and a wait opened before its latest report is marked', async () => {
     try {
       const h = new Harness();
       await glmDebt(h);
@@ -1844,48 +1846,82 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       failingBoot();
       const ahead = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
       expect(h.ledger.disposeMachineNotification(ahead!.id, 'Gru re-dispatched the lanes')).toMatchObject({ resolvedAt: expect.any(String) });
-      // The clock steps back: the next notice sorts older than the resolved one.
+      // The clock steps back: the next notice sorts OLDER than the resolved one.
       vi.setSystemTime(new Date(now + 60_000));
       failingBoot();
       const open = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
       expect(open).not.toBeNull();
       expect(open?.id).not.toBe(ahead!.id);
-      vi.setSystemTime(new Date(now + 120_000));
+      expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'any')?.id).toBe(ahead!.id);
+      // A wait opened, then a failing boot reports again — on the open row.
+      vi.setSystemTime(new Date(now + 5_400_000));
+      const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
+        provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
+        jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+        lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+      vi.setSystemTime(new Date(now + 7_200_000));
       failingBoot();
       const refreshed = h.ledger.getNotification(open!.id);
       expect(refreshed?.resolvedAt).toBeNull();
       expect(refreshed?.detail).not.toBe(open!.detail);
+      expect(h.ledger.latestNotificationByKind('provider-recovery.hand-back-failed')?.id).toBe(open!.id); // nothing new posted
+      // Even once Gru disposed of it too, the wait's notice reads that latest
+      // report (insertion order, not the newer-ts resolved row).
+      expect(h.ledger.disposeMachineNotification(open!.id, 'Gru checked')).toMatchObject({ resolvedAt: expect.any(String) });
+      vi.setSystemTime(new Date(now + 10_800_000));
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
+        .toContain('A boot hand-back failure was reported since this wait opened');
     } finally {
       vi.useRealTimers();
     }
   });
 
   it('a failure notice posted after Gru disposed of the previous one still says Gru was told before', async () => {
-    const h = new Harness();
-    await glmDebt(h);
-    const failingBoot = (): void => {
-      const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
-      try {
-        expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
-      } finally {
-        reads.mockRestore();
-      }
-    };
-    failingBoot();
-    const first = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
-    expect(first).not.toBeNull();
-    expect(h.ledger.disposeMachineNotification(first!.id, 'Gru re-dispatched the lanes')).toMatchObject({ resolvedAt: expect.any(String) });
-    failingBoot();
-    const second = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
-    expect(second).not.toBeNull();
-    expect(second?.id).not.toBe(first!.id);
-    expect(second?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
-    // A further failing boot refreshes that repost in place, and the earliest
-    // report time carries forward.
-    failingBoot();
-    const third = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
-    expect(third?.id).toBe(second!.id);
-    expect(third?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+    try {
+      const h = new Harness();
+      await glmDebt(h);
+      const failingBoot = (): void => {
+        const reads = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
+        try {
+          expect(() => surfacingClaudeOnly(h).sensor.handBackAtBoot()).toThrow('ledger read failed');
+        } finally {
+          reads.mockRestore();
+        }
+      };
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      failingBoot();
+      const first = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(first).not.toBeNull();
+      expect(h.ledger.disposeMachineNotification(first!.id, 'Gru re-dispatched the lanes')).toMatchObject({ resolvedAt: expect.any(String) });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      failingBoot();
+      const second = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(second).not.toBeNull();
+      expect(second?.id).not.toBe(first!.id);
+      expect(second?.ts).not.toBe(first!.ts);
+      expect(second?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+      // A further failing boot refreshes that repost in place, and the
+      // earliest report time carries forward (never the repost's own).
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      failingBoot();
+      const third = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(third?.id).toBe(second!.id);
+      expect(third?.detail).not.toBe(second!.detail);
+      expect(third?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+      expect(third?.detail).not.toContain(`previously reported ${second!.ts}`);
+      // Disposed again: the next repost reads the caveat the disposed notice
+      // carried, so the earliest report still carries forward.
+      expect(h.ledger.disposeMachineNotification(second!.id, 'Gru checked again')).toMatchObject({ resolvedAt: expect.any(String) });
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+      failingBoot();
+      const fourth = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+      expect(fourth).not.toBeNull();
+      expect(fourth?.id).not.toBe(second!.id);
+      expect(fourth?.detail).toContain(`Gru was told before (previously reported ${first!.ts})`);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a boot failure notice that cannot be posted, or retired, is logged with its cause — never thrown in its place', () => {
