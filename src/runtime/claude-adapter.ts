@@ -795,7 +795,9 @@ export async function checkedInProjectMcpConfig(
   const limit = committed.length + (text.split('\n').length - 1) - (text.split('\r\n').length - 1);
   let working: Buffer;
   try {
-    const handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    // O_NONBLOCK: a FIFO swapped in after the first look never blocks the
+    // open — the fstat below refuses it (harmless for a regular file).
+    const handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
     try {
       if (!(await handle.stat()).isFile()) return { reason: '.mcp.json is not a regular file (symlink or other)' };
       const buffer = Buffer.alloc(limit + 1);
@@ -823,11 +825,24 @@ export async function checkedInProjectMcpConfig(
  * would execute lane-configured filters), so a line-ending-only difference
  * gets its own reason instead of looking like an edit. */
 function differsFromCommitted(working: Buffer, committed: Buffer): { readonly reason: string } {
-  // Either direction: LF committed / CRLF checked out, or the reverse.
-  if (working.toString('utf8').replaceAll('\r\n', '\n') === committed.toString('utf8').replaceAll('\r\n', '\n')) {
+  // Either direction (LF committed / CRLF checked out, or the reverse),
+  // compared as BYTES: invalid UTF-8 never decodes into a false match.
+  if (withoutCrBeforeLf(working).equals(withoutCrBeforeLf(committed))) {
     return { reason: '.mcp.json differs from its committed bytes only in line endings (autocrlf/eol conversion); only byte-identical files load' };
   }
   return { reason: '.mcp.json differs from its committed version' };
+}
+
+/** The bytes with every CR that precedes an LF removed (CRLF → LF). */
+function withoutCrBeforeLf(bytes: Buffer): Buffer {
+  const out = Buffer.alloc(bytes.length);
+  let length = 0;
+  for (let i = 0; i < bytes.length; i += 1) {
+    if (bytes[i] === 0x0d && bytes[i + 1] === 0x0a) continue;
+    out[length] = bytes[i]!;
+    length += 1;
+  }
+  return out.subarray(0, length);
 }
 
 /** The private copy of the verified project servers handed to --mcp-config:
@@ -1179,7 +1194,7 @@ export class ClaudeCodeHandle implements AgentHandle {
    * failures logged, never fatal. */
   private async sweepStaleProjectMcpCopies(): Promise<void> {
     const dir = dirname(this.params.sessionFile);
-    const prefix = `${basename(this.params.sessionFile)}.`;
+    const base = basename(this.params.sessionFile);
     let names: string[];
     try {
       names = await readdir(dir);
@@ -1189,7 +1204,9 @@ export class ClaudeCodeHandle implements AgentHandle {
     }
     for (const name of names) {
       const path = join(dir, name);
-      if (!name.startsWith(prefix) || !name.endsWith('.project-mcp.json')) continue;
+      // Exactly `<this session>.<token>.project-mcp.json` — never a copy of
+      // another session whose file name happens to extend this one.
+      if (!name.startsWith(`${base}.`) || !/^[0-9a-f]{8}\.project-mcp\.json$/u.test(name.slice(base.length + 1))) continue;
       await rm(path, { force: true }).catch((error: unknown) => {
         this.log('warn', 'stale project MCP copy could not be removed', { file: path, error: String(error) });
       });
@@ -1540,6 +1557,7 @@ export class ClaudeCodeHandle implements AgentHandle {
       owner,
       ...(images !== undefined && images.length > 0 ? { images } : {}),
     };
+    const accepted = this.livePrompt;
     return this.withTurnParams((params) => this.spawnTurn(params), (failure) => {
       // Error first, exactly as a failed spawn reports: an error-time capture
       // (the supervisor's restart snapshot) still sees the accepted prompt.
@@ -1547,7 +1565,8 @@ export class ClaudeCodeHandle implements AgentHandle {
         this.emit({ type: 'error', error: failure, fatal: false });
         this.setState('error', failure);
       }
-      this.livePrompt = null;
+      // Only this turn's prompt: a subscriber may already have re-prompted.
+      if (this.livePrompt === accepted) this.livePrompt = null;
     });
   }
 

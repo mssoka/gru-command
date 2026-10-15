@@ -835,7 +835,9 @@ export class ProviderRecoverySensor {
    * notice per wait — posted through the notification center, so it surfaces
    * in chat, and deduped by kind, so a crash before the cancel never posts it
    * twice. No notice is posted when the lane already has an open owner stop
-   * (the owner already holds it); an open wait is never assumed handled. A
+   * (the owner already holds it); an open wait is never assumed handled — a
+   * lane Gru already re-dispatched may get a redundant notice, which is
+   * cheaper than a stranded one. A
    * route left with no open wait retires its "watching" notice and
    * pending delivery marker. Runs at every boot, even with the sensor off;
    * one failing wait is logged and kept for the next boot, never blocking
@@ -844,14 +846,18 @@ export class ProviderRecoverySensor {
     let handedBack = 0;
     for (const status of ['waiting', 'recovered-pending'] as const) {
       for (const wait of this.ledger.listProviderWaits({ status })) {
-        try {
-          if (this.enabledFor(wait.provider)) {
-            // The switch is on (again): the wait is served, so a notice left
-            // by an earlier hand-back that could not cancel it is not true.
+        if (this.enabledFor(wait.provider)) {
+          // The switch is on (again): the wait is served, so a notice left by
+          // an earlier hand-back that could not cancel it is not true.
+          try {
             const stale = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'active');
             if (stale !== null) this.ledger.resolveNotificationById(stale.id, 'provider-recovery-sensor');
-            continue;
+          } catch (error) {
+            this.log('error', 'resolving a stale recovery-off notice failed', { wait_id: wait.id, error: String(error) });
           }
+          continue;
+        }
+        try {
           this.handBack(wait);
           handedBack += 1;
         } catch (error) {
@@ -878,10 +884,15 @@ export class ProviderRecoverySensor {
     for (const pending of this.ledger.listPendingProviderRecoveries()) {
       if (!this.routeEnabled(pending.routeKey)) routes.add(pending.routeKey);
     }
+    const markers = this.ledger.listPendingProviderRecoveries();
     for (const routeKey of routes) {
       try {
+        // Exact-kind (indexed) lookup, resolved by id: a long-retired route
+        // (no watching notice, no marker) costs one lookup, never a scan.
+        const watching = this.ledger.findNotificationByKind(`provider.waiting.${routeKey}`, 'active');
+        if (watching === null && !markers.some((pending) => pending.routeKey === routeKey)) continue;
         if (this.ledger.listProviderWaits({ routeKey }).some((wait) => wait.status === 'waiting' || wait.status === 'recovered-pending')) continue;
-        this.notifications.resolveIncidents(`provider.waiting.${routeKey}`, 'provider-recovery-sensor');
+        if (watching !== null) this.ledger.resolveNotificationById(watching.id, 'provider-recovery-sensor');
         for (const pending of this.ledger.listPendingProviderRecoveries()) {
           if (pending.routeKey === routeKey) this.ledger.clearPendingProviderRecovery(pending.id);
         }
@@ -917,9 +928,11 @@ export class ProviderRecoverySensor {
           : `Automatic provider recovery is off for ${wait.provider} ([provider_recovery] ${key} = false), so it stays ` +
             `stopped. Once the provider limit clears, ${resume}.`,
         agentId: wait.agentId,
-        // Per-wait kind: posted once ever — an acked notice is never re-posted
-        // by a later boot that retries a wait it could not cancel.
-        dedupe: 'all',
+        // Per-wait kind, deduped while unresolved: an acked notice is never
+        // re-posted by a later boot retrying a wait it could not cancel, but
+        // one resolved because the switch came back on never blocks a later
+        // hand-back (the switch turned off again).
+        dedupe: 'active',
       });
     }
     this.ledger.setProviderWaitStatus(wait.id, 'cancelled', { why: 'recovery-disabled' });
