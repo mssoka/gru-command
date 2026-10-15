@@ -802,3 +802,27 @@ merge-authority-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lin
 # snapshot directory and ignored pointer file are preserved for
 # inspection, and the base itself is never checked out or mutated.
 merge-authority-baseline = 'set -e; base=dffa10af37691238d5f3cbb7dd03696d43e4ff01; headrev=$(git rev-parse HEAD); root="$PWD"; prep=_bmad-output/gate-prep; mkdir -p "$prep"; d=$(mktemp -d "${TMPDIR:-/tmp}/gru-baseline-merge-authority.XXXXXX"); git archive "$base" -o "$d/base.tar"; tar -xf "$d/base.tar" -C "$d"; rm -f "$d/base.tar"; for f in test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts test/github-poll.test.ts; do git show "$headrev:$f" > "$d/$f"; done; ln -s "$root/node_modules" "$d/node_modules"; printf "merge-authority-baseline base=%s head=%s dir=%s\n" "$base" "$headrev" "$d" > "$prep/merge-authority-baseline.last-snapshot.txt"; cd "$d"; node tools/patch-vitest-rpc-timeout.mjs; set +e; npx vitest run --reporter=json --outputFile="$d/results.json" test/roles-definitions.test.ts test/roles-gru.test.ts test/silas-driver.test.ts test/github-poll.test.ts; a=$?; set -e; echo "merge-authority-baseline vitest exit=$a EXPECTED-NONZERO"; if [ "$a" -eq 0 ]; then echo "FAILS-BEFORE CLAIM BROKEN: baseline passed unexpectedly"; exit 2; fi; node "$root/tools/assert-merge-authority-baseline.mjs" "$d/results.json"; echo "EXPECTED-NONZERO: named boundary assertions RED against the pre-change base dffa10af"; exit 1'
+
+# #315 strict repair: authenticated exact-head component proof; no live models.
+scheduled-verification-static = "node tools/patch-vitest-rpc-timeout.mjs && npm run lint && npm run typecheck && npm run build && git diff --check 0a864076637e01c7b8243fc321afe69f0f899829 HEAD"
+gh315-native-early = 'npm run build && node test/helpers/qualify-claude-verification.mjs "$HOME/.local/bin/claude" early'
+scheduled-verification-native = 'npm run build && node test/helpers/qualify-claude-verification.mjs "$HOME/.local/bin/claude"'
+
+scheduled-verification-focused = "node tools/patch-vitest-rpc-timeout.mjs && npm run build && npx vitest run test/classify-scheduled-verification-red.test.ts test/worker-verification-policy.test.ts test/workflow-session.test.ts test/pi-adapter.test.ts test/verification-capture.test.ts test/verification-scheduler.test.ts test/verification-evidence.test.ts test/suite-shape.test.ts && npx vitest run --config vitest.heavy.config.ts test/claude-adapter.test.ts test/verification-server.test.ts"
+gh315-original-red = "sh tools/scheduled-verification-baseline.sh"
+# Two newly retained review-4 normalization assertion cases; no prior RED replay.
+gh315-review4-red = "sh tools/scheduled-verification-review4-baseline.sh"
+# E9 fixture-only ordering/liveness investigation, NOT final native acceptance.
+# Existing scheduler/process-group and runtime-disposal bounds; no init timer.
+gh315-e9-native-investigate = 'npm run build && node test/helpers/investigate-claude-initialization.mjs "$HOME/.local/bin/claude"'
+gh315-e9-native-extended = 'npm run build && node test/helpers/investigate-claude-initialization.mjs "$HOME/.local/bin/claude" extended'
+gh315-e9-red = "sh tools/scheduled-verification-e9-baseline.sh"
+gh315-e9-receiving-native = 'npm run build && node test/helpers/investigate-claude-initialization.mjs "$HOME/.local/bin/claude" receiving'
+# Existing immutable retained reports are copied byte-for-byte into this ignored
+# repository-relative fixture directory; absence fails loud, never reruns proof.
+gh315-retained-red-classify = "node tools/classify-scheduled-verification-red.mjs 2 _bmad-output/gate-prep/gh315-retained-review2-red/fast-results.json _bmad-output/gate-prep/gh315-retained-review2-red/heavy-results.json"
+# R8 scoped regression checks: no local FULL and no replay of prior evidence.
+gh315-r8-candidates = "sh tools/scheduled-verification-review8.sh"
+gh315-r8-version = "sh tools/scheduled-verification-review8.sh version"
+gh315-r8-focused = "sh tools/scheduled-verification-review8.sh focused"
+gh315-r8-preack-mutant = "sh tools/scheduled-verification-review8-preack-mutant.sh"
