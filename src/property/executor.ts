@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { resolveVitestBinary, VITEST_FAST_CHECK_ADAPTER } from './adapters/vitest-fast-check.js';
 import { applyOverlayFiles, sha256Hex, type OverlayInputFile } from './overlay.js';
 import { assemblePropertyExecutionReceipt, buildSourceIdentity, environmentProfileString, lockfileIdentity, propertyConfigIdentity, propertyGit, retainedCounterexample } from './receipts.js';
@@ -49,13 +50,51 @@ export interface PropertyExecutorOptions {
   readonly workspaceCopyBounds?: { readonly maxFiles: number; readonly maxBytes: number };
   readonly maxRunTimeoutMs?: number;
   readonly maxMaxOutputBytes?: number;
+  /** Bound on the summed stdout+stderr bytes of retained receipts (#377). */
+  readonly maxRetainedOutputBytes?: number;
   readonly denyReadSubpaths?: readonly string[];
   readonly envSource?: Readonly<Record<string, string | undefined>>;
 }
 const ENV = new Set(['PATH', 'LANG', 'LC_ALL', 'TZ', 'CI']);
 const INSTALLERS = new Set(['npm', 'npx', 'yarn', 'pnpm', 'pip', 'pip3', 'uv', 'cargo', 'bun']);
-const POLICY = { maxRunTimeoutMs: 900_000, maxMaxOutputBytes: 64 * 1024 * 1024 };
-const CONFIG = `export default { esbuild: false, server: { host: '127.0.0.1', hmr: false, watch: null }, test: { api: false, cache: false, pool: 'threads', maxWorkers: 1, minWorkers: 1, fileParallelism: false, watch: false, deps: { optimizer: { ssr: { enabled: false }, client: { enabled: false } } } } };\n`;
+const POLICY = { maxRunTimeoutMs: 900_000, maxMaxOutputBytes: 8 * 1024 * 1024 };
+/** Retention bounds for sealed receipts in a long-lived executor (#377):
+ * the oldest receipts are evicted past either bound, so an evicted ref
+ * resolves to null and every consumer fails closed (requalify), instead of
+ * the executor holding unbounded output or refusing all later runs. */
+const RETENTION = { maxReceipts: 1024, maxRetainedOutputBytes: 256 * 1024 * 1024 };
+/** The host-owned runner config (#378). Under pool=threads the code under
+ * test shares the process with Vitest's reporter, so stdout (and any file the
+ * sandbox lets the run write) is writable by that code. The report is
+ * therefore AUTHENTICATED by a per-run nonce the code under test cannot
+ * learn: the host writes it on fd 3, and this config — evaluated in the main
+ * thread before any test worker exists — reads it and closes the fd. The
+ * reporter frames Vitest's own JSON report with the nonce; the host parses
+ * only that one framed block. The nonce never appears in argv, env or files. */
+const CONFIG = [
+  "import { closeSync, readFileSync } from 'node:fs';",
+  'const nonce = readFileSync(3, \'utf8\').trim();',
+  'closeSync(3);',
+  "if (!/^[0-9a-f]{64}$/.test(nonce)) throw new Error('host report nonce unavailable');",
+  'const { JsonReporter } = await import(process.env.GRU_PROPERTY_REPORTERS_MODULE);',
+  'class HostFramedJsonReporter extends JsonReporter {',
+  '  async writeReport(report) { process.stdout.write(`\\n${nonce}:BEGIN\\n${report}\\n${nonce}:END\\n`); }',
+  '}',
+  "export default { esbuild: false, server: { host: '127.0.0.1', hmr: false, watch: null }, test: { api: false, cache: false, pool: 'threads', maxWorkers: 1, minWorkers: 1, fileParallelism: false, watch: false, reporters: [new HostFramedJsonReporter({})], deps: { optimizer: { ssr: { enabled: false }, client: { enabled: false } } } } };",
+  '',
+].join('\n');
+
+/** The single nonce-framed report in `stdout`, or null when it is absent,
+ * duplicated or unterminated (#378). Nothing outside the frame is parsed. */
+export function framedRunnerReport(stdout: string, nonce: string): string | null {
+  const begin = `\n${nonce}:BEGIN\n`;
+  const end = `\n${nonce}:END\n`;
+  const start = stdout.indexOf(begin);
+  if (start === -1 || stdout.indexOf(begin, start + 1) !== -1) return null;
+  const finish = stdout.indexOf(end, start + begin.length);
+  if (finish === -1 || stdout.indexOf(end, finish + 1) !== -1) return null;
+  return stdout.slice(start + begin.length, finish);
+}
 const issued = new WeakMap<object, string>();
 /** Full immutable-fact digest, not just a reflectable symbol or a few fields. */
 export const isSealedExecutionReceipt: ExecutionReceiptGuard = (candidate): candidate is SealedExecutionReceipt => {
@@ -122,19 +161,42 @@ function profile(workspace: string, denied: readonly string[]): string {
   ].join('\n');
 }
 type CopyBounds = { readonly maxFiles: number; readonly maxBytes: number };
-/** Fixed storage: even an endless post-cap stream retains no incoming chunks. */
+/** Bounded storage: even an endless post-cap stream retains no incoming
+ * chunks. Storage grows only with the bytes actually kept — never a
+ * 2 × maxBytes preallocation per run (#377) — and each kept slice is a COPY,
+ * so an incoming chunk's backing allocation is never retained. */
 export function createBoundedPropertyCapture(maxBytes: number) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > POLICY.maxMaxOutputBytes) throw new PreExecutionRejectionError('budget-exceeds-policy', 'invalid capture capacity');
-  const buffers = { stdout: Buffer.alloc(maxBytes), stderr: Buffer.alloc(maxBytes) };
+  const kept: { stdout: Buffer[]; stderr: Buffer[] } = { stdout: [], stderr: [] };
   const sizes = { stdout: 0, stderr: 0 }; const truncated = { stdout: false, stderr: false };
   return {
     capacityBytes: maxBytes * 2,
     push(name: 'stdout' | 'stderr', chunk: Buffer) {
       const count = Math.min(chunk.length, maxBytes - sizes[name]);
-      if (count > 0) { chunk.copy(buffers[name], sizes[name], 0, count); sizes[name] += count; }
+      if (count > 0) { kept[name].push(Buffer.from(chunk.subarray(0, count))); sizes[name] += count; }
       if (count < chunk.length) truncated[name] = true;
     },
-    finish() { return { stdout: buffers.stdout.subarray(0, sizes.stdout).toString('utf8'), stderr: buffers.stderr.subarray(0, sizes.stderr).toString('utf8'), stdoutTruncated: truncated.stdout, stderrTruncated: truncated.stderr, complete: !truncated.stdout && !truncated.stderr }; },
+    finish() { return { stdout: Buffer.concat(kept.stdout).toString('utf8'), stderr: Buffer.concat(kept.stderr).toString('utf8'), stdoutTruncated: truncated.stdout, stderrTruncated: truncated.stderr, complete: !truncated.stdout && !truncated.stderr }; },
+  };
+}
+
+/** Insertion-ordered receipt retention with count and byte bounds (#377).
+ * `add` evicts the OLDEST receipts (never the one just added) until both
+ * bounds hold; an evicted id resolves to undefined. */
+export function createReceiptRetention<T>(bounds: { readonly maxReceipts: number; readonly maxBytes: number }) {
+  const entries = new Map<string, { readonly value: T; readonly bytes: number }>();
+  let total = 0;
+  return {
+    add(id: string, value: T, bytes: number): void {
+      entries.set(id, { value, bytes }); total += bytes;
+      for (const [oldest, entry] of entries) {
+        if (oldest === id || (entries.size <= bounds.maxReceipts && total <= bounds.maxBytes)) break;
+        entries.delete(oldest); total -= entry.bytes;
+      }
+    },
+    get(id: string | undefined): T | undefined { return id === undefined ? undefined : entries.get(id)?.value; },
+    get size(): number { return entries.size; },
+    get retainedBytes(): number { return total; },
   };
 }
 /** Read-only current harness identity, never an execution approval. */
@@ -180,13 +242,17 @@ export interface PropertyExecutor {
   approvePlan(input: Pick<ExecutePlanInput, 'plan' | 'repoRoot' | 'packageDir' | 'overlayFiles' | 'replaySeed' | 'replayPath'>): ExecutionApproval;
   executePlan(input: ExecutePlanInput): Promise<ExecutePlanResult>;
   resolveReceiptRef(ref: ExecutionReceiptRef): SealedExecutionReceipt | null;
+  /** Retained receipt count/bytes and the byte bound (#377). */
+  retention?(): { readonly receipts: number; readonly retainedOutputBytes: number; readonly maxRetainedOutputBytes: number };
 }
 export function createPropertyExecutor(options: PropertyExecutorOptions = {}): PropertyExecutor {
   const ceilings = { maxRunTimeoutMs: options.maxRunTimeoutMs ?? POLICY.maxRunTimeoutMs, maxMaxOutputBytes: options.maxMaxOutputBytes ?? POLICY.maxMaxOutputBytes };
   for (const [key, value] of Object.entries(ceilings)) if (!Number.isSafeInteger(value) || value <= 0 || value > POLICY[key as keyof typeof POLICY]) throw new PreExecutionRejectionError('budget-exceeds-policy', `invalid host ceiling ${key}`);
   if (options.workspaceCopyBounds !== undefined && (!Number.isSafeInteger(options.workspaceCopyBounds.maxFiles) || options.workspaceCopyBounds.maxFiles < 1 || options.workspaceCopyBounds.maxFiles > 60_000 || !Number.isSafeInteger(options.workspaceCopyBounds.maxBytes) || options.workspaceCopyBounds.maxBytes < 1 || options.workspaceCopyBounds.maxBytes > 2 * 1024 ** 3)) throw new WorkspaceCopyError('invalid approved workspace copy bounds');
   const approvals = new WeakMap<ExecutionApproval, { readonly digest: string; readonly workspaceTreeSha256: string }>();
-  const receipts = new Map<string, SealedExecutionReceipt>();
+  const maxRetainedOutputBytes = options.maxRetainedOutputBytes ?? RETENTION.maxRetainedOutputBytes;
+  if (!Number.isSafeInteger(maxRetainedOutputBytes) || maxRetainedOutputBytes < 1 || maxRetainedOutputBytes > RETENTION.maxRetainedOutputBytes) throw new PreExecutionRejectionError('budget-exceeds-policy', 'invalid host receipt retention bound');
+  const receipts = createReceiptRetention<SealedExecutionReceipt>({ maxReceipts: RETENTION.maxReceipts, maxBytes: maxRetainedOutputBytes });
   let running = false;
   const fingerprint = (input: Pick<ExecutePlanInput, 'plan' | 'repoRoot' | 'packageDir' | 'overlayFiles' | 'replaySeed' | 'replayPath'>) => {
     const runner = validatePlanAgainstHostApproval({ ...input, ceilings });
@@ -200,6 +266,8 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
       const token = Object.freeze({ approvalId: randomUUID() }); approvals.set(token, fingerprint(input)); return token;
     },
     resolveReceiptRef(ref) { const value = receipts.get(ref?.receiptId); return value !== undefined && isSealedExecutionReceipt(value) ? value : null; },
+    /** Retention introspection for diagnostics and tests (#377). */
+    retention() { return { receipts: receipts.size, retainedOutputBytes: receipts.retainedBytes, maxRetainedOutputBytes }; },
     async executePlan(input) {
       const { plan, repoRoot, packageDir } = input;
       if (options.signal?.aborted) return { executed: false, refusal: { kind: 'not-run', reason: 'property host aborted/disposed', backend: 'none-found' } };
@@ -209,7 +277,6 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
       if (input.adapter !== VITEST_FAST_CHECK_ADAPTER) throw new PreExecutionRejectionError('invalid-plan', 'caller-supplied adapters are not execution authority');
       const approved = input.approval === undefined ? undefined : approvals.get(input.approval);
       if (input.approval === undefined || approved === undefined || approved.digest !== fingerprint(input).digest) throw new PreExecutionRejectionError('unapproved-command', 'missing, forged or stale host approval for exact source/plan/runner');
-      if (receipts.size >= 1024) throw new PreExecutionRejectionError('invalid-plan', 'executor receipt retention limit reached');
       const root = realpathSync(repoRoot); const pkg = realpathSync(packageDir);
       const source = buildSourceIdentity(root);
       const workspace = realpathSync(mkdtempSync(join(options.workspaceParentDir ?? tmpdir(), 'gh350-exec-')));
@@ -239,6 +306,9 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         // Its UID prefix is hexadecimal; decimal is silently ignored by CF.
         env['CFFIXED_USER_HOME'] = env['HOME']!;
         env['__CF_USER_TEXT_ENCODING'] = `0x${(process.getuid?.() ?? 0).toString(16)}:0:0`;
+        // The copied Vitest's own reporters module (beside its runner), for the
+        // host config's framed reporter; the nonce itself goes only on fd 3.
+        env['GRU_PROPERTY_REPORTERS_MODULE'] = pathToFileURL(join(dirname(runner.path), 'dist', 'reporters.js')).href;
         env['GRU_PROPERTY_MAX_ITERATIONS'] = String(plan.budget.maxIterations);
         env['GRU_PROPERTY_MAX_SHRINK_STEPS'] = String(plan.budget.maxShrinkSteps);
         if (input.replaySeed != null) {
@@ -250,9 +320,17 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
           env['GRU_PROPERTY_PATH'] = input.replayPath;
         }
         const sbpl = profile(workspace, options.denyReadSubpaths ?? []);
-        const argv = [realpathSync(process.execPath), '--max-old-space-size=256', runner.path, ...plan.args, '--config', configPath, '--configLoader', 'native'];
+        // `--reporter=json` is the approved plan's report request; the host
+        // config's nonce-framed JSON reporter fulfils it (a CLI reporter flag
+        // would replace the config reporters and print an unframed report).
+        const runnerArgs = plan.args.filter((arg) => arg !== '--reporter=json');
+        const argv = [realpathSync(process.execPath), '--max-old-space-size=256', runner.path, ...runnerArgs, '--config', configPath, '--configLoader', 'native'];
+        const reportNonce = randomBytes(32).toString('hex');
         const start = Date.now();
-        const child = spawn(backend.executable, ['-p', sbpl, ...argv], { cwd: wsPkg, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        const child = spawn(backend.executable, ['-p', sbpl, ...argv], { cwd: wsPkg, env, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'pipe'] });
+        const nonceChannel = child.stdio[3] as NodeJS.WritableStream & { on(event: 'error', listener: () => void): unknown };
+        nonceChannel.on('error', () => {}); // a runner that never reads fd 3 simply yields no framed report
+        nonceChannel.end(`${reportNonce}\n`);
         const collector = createBoundedPropertyCapture(plan.budget.maxOutputBytes);
         for (const name of ['stdout', 'stderr'] as const) child[name]!.on('data', (buf: Buffer) => collector.push(name, buf));
         let timedOut = false;
@@ -272,20 +350,21 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         // not issue evidence, release resources, or claim successful cleanup.
         if (!proven) throw new SandboxSpawnError(`cessation unproven; workspace retained at ${workspace}`);
         const capture = collector.finish(); const { stdout, stderr } = capture;
-        const raw = { stdout, stderr, exitCode: child.exitCode, signal: child.signalCode, timedOut, durationMs: Date.now() - start };
+        const raw = { stdout, stderr, report: framedRunnerReport(stdout, reportNonce), exitCode: child.exitCode, signal: child.signalCode, timedOut, durationMs: Date.now() - start };
         let outcome = VITEST_FAST_CHECK_ADAPTER.interpretExecution(raw, { ...plan, cwd: wsPkg });
         if ((capture.stdoutTruncated || capture.stderrTruncated) && outcome.kind === 'pass') outcome = { ...outcome, kind: 'inconclusive', reasons: [...outcome.reasons, 'output capture was truncated'] };
         const environmentProfile = environmentProfileString(env);
         const counterexample = retainedCounterexample({ outcome, environmentProfile });
         const body = assemblePropertyExecutionReceipt({
-          identity: { source, workspaceTreeSha256: snapshot.digest, dependencyTreeSha256: snapshot.dependencyDigest, argv, selectionFilter: plan.args[2]!, lockIdentity: lockfileIdentity(pkg, root), configIdentity: propertyConfigIdentity(root), overlay, adapterProfile: `vitest-fast-check;deny-fork;native-config;${sha256Hex(CONFIG)}`, toolVersions: { node: process.versions.node, ...Object.fromEntries(['vitest', 'fast-check'].map((name) => { try { return [name, JSON.parse(readFileSync(join(wsPkg, 'node_modules', name, 'package.json'), 'utf8')).version as string]; } catch { return [name, 'unknown']; } })) } },
+          identity: { source, workspaceTreeSha256: snapshot.digest, dependencyTreeSha256: snapshot.dependencyDigest, argv, selectionFilter: plan.args[2]!, lockIdentity: lockfileIdentity(pkg, root), configIdentity: propertyConfigIdentity(root), overlay, adapterProfile: `vitest-fast-check;deny-fork;native-config;nonce-framed-report;${sha256Hex(CONFIG)}`, toolVersions: { node: process.versions.node, ...Object.fromEntries(['vitest', 'fast-check'].map((name) => { try { return [name, JSON.parse(readFileSync(join(wsPkg, 'node_modules', name, 'package.json'), 'utf8')).version as string]; } catch { return [name, 'unknown']; } })) } },
           command: argv[0]!, cwd: wsPkg, outcome, stdout, stderr,
           capture: { stdoutTruncated: capture.stdoutTruncated, stderrTruncated: capture.stderrTruncated, complete: !capture.stdoutTruncated && !capture.stderrTruncated },
           counterexample, sandbox: { backend: 'macos-sandbox-exec', profileSummary: `deny-default; read-only workspace/runtime allowlist; no disk writes/network/fork; denials may return EPERM (no per-syscall audit claim); 256MiB V8 heap; profile ${sha256Hex(sbpl)}`, networkDenied: true, filesystemIsolated: true, credentialsStripped: true, refusalReason: null }, replay: input.replaySeed == null ? counterexample?.replay ?? null : { seed: input.replaySeed, shrinkPath: input.replayPath == null ? [] : [input.replayPath], schedule: null, environmentProfile, replaySupported: true, replayDisclosure: 'host-requested native replay controls; PASS alone does not establish reproduction' }, budget: { ...plan.budget },
         });
         const sealed = body as SealedExecutionReceipt;
         issued.set(sealed, sha256Hex(JSON.stringify(sealed)));
-        const ref = { receiptId: `pex-${randomUUID()}` }; receipts.set(ref.receiptId, sealed);
+        const ref = { receiptId: `pex-${randomUUID()}` };
+        receipts.add(ref.receiptId, sealed, Buffer.byteLength(stdout) + Buffer.byteLength(stderr));
         rmSync(workspace, { recursive: true, force: true });
         return { executed: true, receipt: sealed, ref, cleanup: { proven: true, workspaceRetained: false, detail: 'actual close observed, fork denied, process group empty; workspace released' } };
       } catch (error) {

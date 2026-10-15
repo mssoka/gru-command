@@ -116,6 +116,19 @@ The host supplies iteration/shrink bounds to the reviewed property through
 that ignores those values is still bounded by the OS restrictions and wall
 clock, not by a claimed universal assertion-count monitor.
 
+**Authenticated runner report (#378).** Under `pool=threads` the code under
+test shares the process with Vitest's reporter, so stdout — and any file the
+sandbox let the run write — is writable by that code. The verdict therefore
+never comes from free stdout: the host passes a per-run 256-bit nonce on
+fd 3 only (never argv, environment or files), the host-owned config reads and
+closes fd 3 in the main thread before any test worker exists, and a framing
+reporter (Vitest's own JSON reporter) prints the report between
+`<nonce>:BEGIN` and `<nonce>:END`. The host parses exactly one such framed
+block; an unframed, duplicated or unterminated report is no report at all
+(`inconclusive`, never a pass). The approved plan's `--reporter=json` is
+fulfilled by that host reporter rather than passed as a CLI flag (a CLI
+reporter would replace it and print an unframed report).
+
 **Owner-defined trust boundary:** Seatbelt denials may return catchable
 `EPERM`/`EACCES`. A hostile runner that catches a denial and prints PASS can
 produce only an unqualified `runner-report-classification`, not product
@@ -181,8 +194,13 @@ installation permissions. Persisted JSON is audit material: it cannot recreate
 in-process execution, report, repair-directive or artifact-review authority.
 A new process must execute and qualify again.
 
-Repairs use the existing minion fix-directive router, with one-use allocations
-and at most three total attempts. Source movement across async boundaries,
+Repairs run as ordinary durable directive requests through the native
+directive path (admission, producer fences, settlement and recovery — the same
+path as every other directive), with one-use allocations and at most three
+total attempts. The repair directive is fixed host text with every value
+emitted as a line-safe JSON literal; the sandbox-controlled minimized
+counterexample is labelled untrusted data, bounded to 4096 characters and
+carried with its sha256, so it can never forge a directive line (#379). Source movement across async boundaries,
 changed dependency/lock/adapter/oracle/budget identities, and deletion of an
 already-present frozen contract require requalification. Each repair validation
 uses both the retained seed and native shrink path, so passing only the random
@@ -192,7 +210,27 @@ recognized package/root lockfiles with a 2MiB per-file ceiling. Reviewed retenti
 keeps the original candidate counterexample (not a qualification control's) and
 preserves oracle bytes and adds a closed seed/path regression wrapper plus
 the actual minimized counterexample/replay audit file. Retention changes
-source bytes and invalidates prior review evidence.
+source bytes and invalidates prior review evidence; its files land in the live
+lane all-or-nothing (a mid-way failure removes what it created and restores
+what it overwrote, #380).
+
+**Owner-service lifecycle (#380).** The owner HTTP service keeps campaigns
+process-local. At its retention cap (128) it evicts the oldest settled,
+non-blocking entry; pending proposals and unresolved blockers are never
+evicted (when only those remain, a new proposal is refused until they are
+decided). Every campaign view carries `nextAction`. A `failed` entry is
+terminal: let any live directive settle through ordinary reconciliation, then
+propose the reviewed campaign again for the current head. The candidate root
+is bound to the job's active managed lane; the qualification control roots
+(`knownBadRoot`, `healthyRoot`, `baselineRoot`) are owner-supplied paths
+accepted on the authenticated owner's word — they are read-only inputs,
+copied and executed only inside the sandbox, never written.
+
+**Bounded evidence (#377).** `max_output_bytes` is capped at 8 MiB per stream
+per run, capture storage grows only with the bytes actually kept, and a
+long-lived executor retains at most 1024 sealed receipts and 256 MiB of their
+output, evicting the oldest first — an evicted receipt reference resolves to
+nothing, so every later consumer fails closed and requalifies.
 
 `.github/workflows/property-contracts.yml` runs the bounded positive macOS
 campaign for PRs/manual runs and weekly scheduled campaigns, retaining replay

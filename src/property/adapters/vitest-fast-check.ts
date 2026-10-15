@@ -455,7 +455,12 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
     return { ...base, kind: 'infrastructure-error', selected: 0, executed: 0, skipped: 0, failed: 0, passed: 0, failures: [], unselectedFailures: [], reasons: [`runner killed by signal ${raw.signal}`], matchedDiagnostic: null };
   }
 
-  const report = parseVitestReport(raw.stdout);
+  // A host-executor receipt carries the nonce-authenticated report (#378):
+  // only it is parsed — stdout, which the code under test can write, never
+  // is. A missing/ambiguous frame is no report at all.
+  const report = raw.report !== undefined
+    ? raw.report === null ? null : parseVitestReport(raw.report)
+    : parseVitestReport(raw.stdout);
   if (report === null) {
     const diagnostic = raw.exitCode !== 0 ? recognizedDiagnostic(raw.stderr) : null;
     if (diagnostic !== null) {

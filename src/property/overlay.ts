@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { OverlayIdentity } from './types.js';
 
@@ -167,4 +167,29 @@ export function applyOverlayFiles(input: {
     );
   }
   return { files: identities, overlaySha256 };
+}
+
+/** All-or-nothing overlay into a LIVE tree (#380): applyOverlayFiles writes
+ * file by file, so a later refusal or write error would leave a partial set.
+ * Every target's prior state is captured first; on any failure each file the
+ * call created is removed and each file it overwrote is restored byte-for-byte,
+ * then the original error is rethrown. */
+export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOverlayFiles>[0]): OverlayIdentity {
+  const prior = input.files.map((file) => {
+    const target = resolveOverlayTarget(input.workspaceRoot, file.path);
+    const current = lstatSync(target, { throwIfNoEntry: false });
+    // A pre-existing non-file entry is never written (applyOverlayFiles
+    // refuses it), so it is never touched on rollback either.
+    return { target, state: current === undefined ? 'absent' as const : current.isFile() ? 'file' as const : 'other' as const,
+      content: current !== undefined && current.isFile() ? readFileSync(target) : null };
+  });
+  try {
+    return applyOverlayFiles(input);
+  } catch (error) {
+    for (const { target, state, content } of prior) {
+      if (state === 'absent') rmSync(target, { force: true });
+      else if (state === 'file' && content !== null) writeFileSync(target, content);
+    }
+    throw error;
+  }
 }

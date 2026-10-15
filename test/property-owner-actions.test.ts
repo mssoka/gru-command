@@ -109,6 +109,35 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
     expect(live).toHaveLength(1); expect(live[0]!.failReason).toMatch(/^reconcile:/);
     expect(h.ledger.latestJobEvent(h.jobId, 'job.delivered')).toBeNull();
     expect((await h.request(`${h.path}/${id}/repair`, { decision: 'approve', expectedHead, maxAttempts: 1 })).status).toBe(400); expect(h.prompts).toHaveLength(1);
+    // #380: the failed entry is terminal and says so; the supported path is
+    // to propose again, and execution waits for the live directive to settle.
+    const dead = await h.request(`${h.path}/${id}`);
+    expect(dead.body).toMatchObject({ state: 'failed', nextAction: expect.stringContaining('propose again') });
+    const again = await h.request(h.path, { campaign: (await h.request(`${h.path}/${id}`)).body.campaign });
+    expect(again.status, JSON.stringify(again.body)).toBe(201);
+    expect(again.body).toMatchObject({ state: 'proposed', nextAction: expect.stringContaining('approve execution') });
+    const waiting = await h.request(`${h.path}/${again.body.id}/execute`, { decision: 'approve', expectedHead: again.body.candidateSha });
+    expect(waiting.status).toBe(400); expect(waiting.body.detail).toMatch(/settle it/);
+  });
+
+  it('makes room at the proposal cap by evicting the oldest settled non-blocking entry, never a pending proposal or blocker (#380)', async () => {
+    const { f, h, id: first, expectedHead } = await setup();
+    const service = createPropertyCampaignService({ ...h.serviceOptions, maxRetainedProposals: 2 });
+    try {
+      const a = service.propose(h.jobId, { campaign: f.reviewed });
+      const b = service.propose(h.jobId, { campaign: f.reviewed });
+      // Both are pending proposals: nothing may be evicted.
+      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/pending proposal or an unresolved blocker/);
+      // A executes in disabled mode: settled and non-blocking, so evictable.
+      const executed = await service.decide(h.jobId, a.id, 'execute', { decision: 'approve', expectedHead });
+      expect(executed).toMatchObject({ state: 'executed', report: { blocking: false } });
+      const c = service.propose(h.jobId, { campaign: f.reviewed });
+      expect(() => service.read(h.jobId, a.id)).toThrow(/process-local/);
+      expect(service.read(h.jobId, b.id).state).toBe('proposed');
+      expect(service.read(h.jobId, c.id).state).toBe('proposed');
+      expect(() => createPropertyCampaignService({ ...h.serviceOptions, maxRetainedProposals: 0 })).toThrow(/1\.\.128/);
+      expect(first).toMatch(/^campaign-/);
+    } finally { await service.dispose(); }
   });
 
   it('refuses new work after disposal rather than minting an approval on a stopped singleton', async () => {

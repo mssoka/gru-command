@@ -2,7 +2,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { createPropertyCampaignHost, isHostPropertyResult, propertyEvidenceForReview } from '../src/property/pipeline.js';
+import { createPropertyCampaignHost, isHostPropertyRepairDirective, isHostPropertyResult, propertyEvidenceForReview, type PropertyRepairDirective } from '../src/property/pipeline.js';
 import { createPropertyExecutor } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
 import { CONTRACT_PATH, ratioContract, ratioProposal, realPlan, realToolRepo, realVersions } from './fixtures/property/real-tool/helpers.js';
@@ -10,11 +10,9 @@ import { PerkinsWholeReview } from '../src/dispatch/perkins-review/whole.js';
 import { freezeReviewInputs } from '../src/dispatch/perkins-review/artifacts.js';
 import { loadPerkinsPolicy } from '../src/dispatch/perkins-review/policy.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
-import { createPropertyFixDirectiveSink } from '../src/dispatch/fix-directive.js';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { EventBus } from '../src/events/bus.js';
-import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import type { AgentHandle } from '../src/runtime/types.js';
 import type { PropertyExecutionReceipt } from '../src/property/types.js';
 import { ownerService } from './fixtures/property/owner-service.js';
@@ -68,7 +66,13 @@ describe('real Vitest+fast-check campaign (positive macOS; explicit refusal else
         capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
         async prompt(text) { expect(text).toContain('Repair the implementation, NOT the frozen oracle'); expect(text).toContain('[[1,1]]'); f.candidate.repair(); },
         async steer() {}, async followUp() {}, subscribe() { return () => {}; }, health() { return { state: 'idle', lastActivity: null, sessionFile: null }; }, async dispose() {} };
-      const deliver = createPropertyFixDirectiveSink({ ledger, worktrees: new InMemoryWorktreePort(dbRoot), registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} } }, 'ratio-job', new AbortController().signal);
+      // Production delivery is the property-campaign service's durable
+      // directive path (test/property-owner-actions.test.ts); this real-tool
+      // proof only needs the host to hand its issued directive to the minion.
+      const deliver = async (directive: PropertyRepairDirective): Promise<void> => {
+        if (!isHostPropertyRepairDirective(directive)) throw new Error('unissued property repair directive');
+        await handle.prompt(directive.text);
+      };
       const repaired = await host.repair(report, deliver, { artifactsDir, maxAttempts: 1 });
       expect(repaired).toMatchObject({ blocking: false, candidateOutcome: 'pass', repairAttempts: 1, mergeAuthority: 'none' });
       expect(propertyEvidenceForReview(f.candidate.root, repaired.candidateSha)).toBe(repaired);

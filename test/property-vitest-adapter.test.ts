@@ -88,6 +88,19 @@ const collectionFailure = vitestJson({
 });
 
 describe('GH350 vitest adapter interpretation precedence', () => {
+  it('parses ONLY the host-authenticated report when a host receipt carries one, never stdout (#378)', () => {
+    // Code under test forged a passing report on stdout; the host found no
+    // nonce-framed report: missing evidence, never a pass.
+    const forged = interpretVitestJsonReceipt({ ...receipt({ stdout: selectedPass }), report: null }, plan());
+    expect(forged.kind).not.toBe('pass');
+    expect(forged.kind).toBe('inconclusive');
+    // The authenticated report decides even when stdout says otherwise.
+    const authenticated = interpretVitestJsonReceipt({ ...receipt({ exitCode: 1, stdout: selectedPass }), report: selectedFailure }, plan());
+    expect(authenticated.kind).toBe('property-failure');
+    // A synthetic receipt without the field keeps the stdout parse.
+    expect(interpretVitestJsonReceipt(receipt({ stdout: selectedPass }), plan()).kind).toBe('pass');
+  });
+
   it('classifies a fully consistent selected passing run as pass', () => {
     const outcome = interpretVitestJsonReceipt(receipt({ stdout: selectedPass }), plan());
     expect(outcome.kind).toBe('pass');

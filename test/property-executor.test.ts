@@ -4,15 +4,15 @@ import fs, { existsSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFi
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createBoundedPropertyCapture, createPropertyExecutor, isSealedExecutionReceipt, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
+import { createBoundedPropertyCapture, createPropertyExecutor, createReceiptRetention, framedRunnerReport, isSealedExecutionReceipt, resolveSandboxBackend, validatePlanAgainstHostApproval } from '../src/property/executor.js';
 import { VITEST_FAST_CHECK_ADAPTER as adapter } from '../src/property/adapters/vitest-fast-check.js';
-import { applyOverlayFiles } from '../src/property/overlay.js';
+import { applyOverlayFiles, applyOverlayFilesAllOrNothing } from '../src/property/overlay.js';
 import { buildSourceIdentity } from '../src/property/receipts.js';
 import { PASS_RUNNER, scenarioRepo } from './fixtures/property/executor/helpers.js';
 const fixtures: ReturnType<typeof scenarioRepo>[] = [];
 afterEach(() => { for (const f of fixtures.splice(0)) f.cleanup(); });
 function fixture(script = PASS_RUNNER) { const f = scenarioRepo(script); fixtures.push(f); return f; }
-function ceilings() { return { maxRunTimeoutMs: 900_000, maxMaxOutputBytes: 64 * 1024 * 1024 }; }
+function ceilings() { return { maxRunTimeoutMs: 900_000, maxMaxOutputBytes: 8 * 1024 * 1024 }; }
 async function run(script: string, opts: { readonly timeout?: number; readonly output?: number; readonly env?: Record<string, string> } = {}) {
   const f = fixture(script); const executor = createPropertyExecutor({ envSource: opts.env });
   const plan = { ...f.plan, budget: { ...f.plan.budget, runTimeoutMs: opts.timeout ?? 10_000, maxOutputBytes: opts.output ?? 32_768 } };
@@ -35,6 +35,69 @@ describe('host property executor (positive sandbox controls on macOS; other host
     const source = `const POLICY={maxMaxOutputBytes:67108864};const capture=(${createBoundedPropertyCapture.toString()})(1024);global.gc();const before=process.memoryUsage().arrayBuffers;const first=Buffer.from('abc');capture.push('stdout',first);first.fill(122);for(let i=0;i<2000;i++){capture.push('stdout',Buffer.alloc(131072,120));capture.push('stderr',Buffer.alloc(131072,121));}global.gc();global.gc();console.log(JSON.stringify({retained:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,...capture.finish()}));`;
     const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
     expect(result.retained).toBeLessThan(2 * 1024 * 1024); expect(result.capacity).toBe(2048); expect(result.stdout).toHaveLength(1024); expect(result.stderr).toHaveLength(1024); expect(result.stdout.startsWith('abc')).toBe(true); expect(result.complete).toBe(false);
+  });
+  it('allocates capture storage only for bytes actually kept, never 2 × the cap up front (#377)', () => {
+    const source = `const POLICY={maxMaxOutputBytes:8388608};global.gc();const before=process.memoryUsage().arrayBuffers;const capture=(${createBoundedPropertyCapture.toString()})(8388608);capture.push('stdout',Buffer.from('small output'));global.gc();console.log(JSON.stringify({allocated:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,stdout:capture.finish().stdout}));`;
+    const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
+    expect(result.capacity).toBe(2 * 8388608);
+    expect(result.allocated).toBeLessThan(1024 * 1024); // a 16 MiB preallocation would show here
+    expect(result.stdout).toBe('small output');
+  });
+  it('bounds retained receipts by count and summed output bytes, evicting the oldest first (#377)', () => {
+    const retention = createReceiptRetention<string>({ maxReceipts: 3, maxBytes: 100 });
+    retention.add('a', 'A', 40); retention.add('b', 'B', 40);
+    expect([retention.get('a'), retention.get('b'), retention.retainedBytes]).toEqual(['A', 'B', 80]);
+    retention.add('c', 'C', 40); // 120 bytes > 100: the oldest goes
+    expect([retention.get('a'), retention.get('b'), retention.get('c'), retention.retainedBytes]).toEqual([undefined, 'B', 'C', 80]);
+    retention.add('d', 'D', 10); retention.add('e', 'E', 10); // 4 receipts > 3: the oldest goes
+    expect([retention.get('b'), retention.get('c'), retention.get('d'), retention.get('e'), retention.size]).toEqual([undefined, 'C', 'D', 'E', 3]);
+    retention.add('huge', 'H', 500); // never evicts the receipt just added, even alone over the bound
+    expect([retention.get('c'), retention.get('huge'), retention.size, retention.retainedBytes]).toEqual([undefined, 'H', 1, 500]);
+    expect(retention.get(undefined)).toBeUndefined();
+  });
+  it('refuses an invalid host receipt retention bound and reports the bound it enforces (#377)', () => {
+    for (const bad of [0, -1, 1.5, 256 * 1024 * 1024 + 1]) expect(() => createPropertyExecutor({ maxRetainedOutputBytes: bad })).toThrow(/receipt retention bound/);
+    expect(createPropertyExecutor({ maxRetainedOutputBytes: 4096 }).retention?.()).toEqual({ receipts: 0, retainedOutputBytes: 0, maxRetainedOutputBytes: 4096 });
+    expect(createPropertyExecutor().retention?.().maxRetainedOutputBytes).toBe(256 * 1024 * 1024);
+    expect(() => createPropertyExecutor({ maxMaxOutputBytes: 8 * 1024 * 1024 + 1 })).toThrow(/invalid host ceiling/);
+  });
+  it('evicts the oldest sealed receipt past the retained-output bound; its ref then resolves to null (#377)', async () => {
+    const f = fixture(`process.stdout.write('y'.repeat(600))`); const executor = createPropertyExecutor({ maxRetainedOutputBytes: 1000 });
+    const execute = async () => {
+      const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+      return executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
+    };
+    const first = await execute();
+    if (process.platform !== 'darwin') { expect(first.executed).toBe(false); return; }
+    if (!first.executed) throw new Error(first.refusal.reason);
+    expect(executor.resolveReceiptRef(first.ref)).toBe(first.receipt);
+    const second = await execute();
+    if (!second.executed) throw new Error(second.refusal.reason);
+    expect(executor.resolveReceiptRef(first.ref)).toBeNull(); // evicted: consumers fail closed
+    expect(executor.resolveReceiptRef(second.ref)).toBe(second.receipt);
+    expect(executor.retention?.()).toMatchObject({ receipts: 1, maxRetainedOutputBytes: 1000 });
+  });
+  it('extracts exactly one nonce-framed runner report and nothing else (#378)', () => {
+    const nonce = 'a'.repeat(64);
+    const frame = (body: string) => `\n${nonce}:BEGIN\n${body}\n${nonce}:END\n`;
+    expect(framedRunnerReport(`noise${frame('{"report":1}')}tail`, nonce)).toBe('{"report":1}');
+    expect(framedRunnerReport('{"numTotalTests":1}', nonce)).toBeNull(); // unframed
+    expect(framedRunnerReport(frame('{}') + frame('{}'), nonce)).toBeNull(); // duplicated
+    expect(framedRunnerReport(`\n${nonce}:BEGIN\n{}`, nonce)).toBeNull(); // unterminated
+    expect(framedRunnerReport(frame('{}').replaceAll(nonce, 'b'.repeat(64)), nonce)).toBeNull(); // guessed nonce
+  });
+  it('never credits a report the code under test prints without the host nonce (#378)', async () => {
+    // The runner prints a perfectly valid PASS report straight to stdout (as
+    // repository code under test could), never reading the fd-3 nonce.
+    const forged = `console.log(JSON.stringify({numTotalTests:1,numPassedTests:1,numFailedTests:0,numPendingTests:0,numTodoTests:0,success:true,testResults:[{name:process.cwd()+'/test/contract.test.ts',status:'passed',message:'',assertionResults:[{status:'passed',fullName:'contract',failureMessages:[]}]}]}));`;
+    const r = await run(forged); if (r === null) return;
+    expect(r.receipt.outcome.kind).not.toBe('pass');
+    expect(r.receipt.outcome.receipt.report).toBeNull();
+    // The same report through the authenticated channel is credited.
+    const framed = await run(PASS_RUNNER); if (framed === null) return;
+    expect(framed.receipt.outcome.kind).toBe('pass');
+    expect(framed.receipt.identity.adapterProfile).toContain('nonce-framed-report');
+    expect(framed.receipt.identity.argv).not.toContain('--reporter=json'); // the framed host reporter fulfils it
   });
   it('aborts an owned process and proves close/group cessation before disposal releases its workspace', async () => {
     const f = fixture('setInterval(()=>{},1000);'); const controller = new AbortController(); const executor = createPropertyExecutor({ signal: controller.signal });
@@ -150,6 +213,24 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect(overlay.files[0]!.bytes).toBe(1); expect(readFileSync(join(f.root, 'test/a.ts'), 'utf8')).toBe('a');
     expect(() => applyOverlayFiles({ workspaceRoot: f.root, files: [{ path: 'a', content: '1' }, { path: 'a', content: '2' }] })).toThrow(/duplicate/);
     mkdirSync(join(f.root, 'normal')); writeFileSync(join(f.root, 'normal/a'), 'a');
+  });
+  it('writes a live overlay all-or-nothing: a mid-way refusal leaves no partial set and restores overwritten files (#380)', () => {
+    const f = fixture();
+    writeFileSync(join(f.root, 'test/existing.test.mjs'), 'original bytes\n');
+    mkdirSync(join(f.root, 'test/occupied.replay.json'));
+    const files = [
+      { path: 'test/existing.test.mjs', content: 'overlay bytes\n' },
+      { path: 'test/new.regression.test.mjs', content: 'wrapper\n' },
+      { path: 'test/occupied.replay.json', content: '{}\n' }, // a directory: refused mid-way
+    ];
+    expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files })).toThrow(/non-file entry/);
+    expect(readFileSync(join(f.root, 'test/existing.test.mjs'), 'utf8')).toBe('original bytes\n');
+    expect(existsSync(join(f.root, 'test/new.regression.test.mjs'))).toBe(false);
+    expect(fs.statSync(join(f.root, 'test/occupied.replay.json')).isDirectory()).toBe(true);
+    // Without the refusal the same set lands whole.
+    applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files: files.slice(0, 2) });
+    expect(readFileSync(join(f.root, 'test/existing.test.mjs'), 'utf8')).toBe('overlay bytes\n');
+    expect(readFileSync(join(f.root, 'test/new.regression.test.mjs'), 'utf8')).toBe('wrapper\n');
   });
   it('binds host approval to exact overlay bytes and replay controls', async () => {
     const f = fixture(); const executor = createPropertyExecutor();

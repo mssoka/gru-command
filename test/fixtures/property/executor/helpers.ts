@@ -26,8 +26,12 @@ export function scenarioRepo(script: string) {
   };
   return { root, git, plan, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
-export const PASS_RUNNER = `const name=process.cwd()+'/test/contract.test.ts';
-console.log(JSON.stringify({numTotalTests:1,numPassedTests:1,numFailedTests:0,numPendingTests:0,numTodoTests:0,success:true,testResults:[{name,status:'passed',message:'',assertionResults:[{status:'passed',fullName:'contract',failureMessages:[]}]}]}));`;
-export const FAILURE_RUNNER = `const seed=process.env.GRU_PROPERTY_SEED ?? '42';
+/** A fake runner reports through the host's authenticated channel the way
+ * the host config's reporter does (#378): the per-run nonce arrives on fd 3
+ * and the report is printed between nonce frames. Block-safe (no import). */
+export const REPORT_FRAME = `const __fs=process.getBuiltinModule('node:fs');let __nonce='';try{__nonce=__fs.readFileSync(3,'utf8').trim();__fs.closeSync(3);}catch{}const __report=(r)=>process.stdout.write('\\n'+__nonce+':BEGIN\\n'+JSON.stringify(r)+'\\n'+__nonce+':END\\n');`;
+export const PASS_RUNNER = `${REPORT_FRAME}const name=process.cwd()+'/test/contract.test.ts';
+__report(({numTotalTests:1,numPassedTests:1,numFailedTests:0,numPendingTests:0,numTodoTests:0,success:true,testResults:[{name,status:'passed',message:'',assertionResults:[{status:'passed',fullName:'contract',failureMessages:[]}]}]}));`;
+export const FAILURE_RUNNER = `${REPORT_FRAME}const seed=process.env.GRU_PROPERTY_SEED ?? '42';
 const failure='Property failed after 1 tests\\n{ seed: '+seed+', path: "0:1", endOnFailure: true }\\nCounterexample: [1]\\nShrunk 1 time(s)';
-console.log(JSON.stringify({numTotalTests:1,numPassedTests:0,numFailedTests:1,numPendingTests:0,numTodoTests:0,success:false,testResults:[{name:process.cwd()+'/test/contract.test.ts',status:'failed',message:'',assertionResults:[{status:'failed',fullName:'contract',failureMessages:[failure]}]}]}));process.exitCode=1;`;
+__report(({numTotalTests:1,numPassedTests:0,numFailedTests:1,numPendingTests:0,numTodoTests:0,success:false,testResults:[{name:process.cwd()+'/test/contract.test.ts',status:'failed',message:'',assertionResults:[{status:'failed',fullName:'contract',failureMessages:[failure]}]}]}));process.exitCode=1;`;

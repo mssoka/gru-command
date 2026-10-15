@@ -36,6 +36,11 @@ export interface RawExecutionReceipt {
   readonly timedOut: boolean;
   readonly stdout: string;
   readonly stderr: string;
+  /** The host-authenticated runner report (#378): the one nonce-framed block
+   * the host extracted, or null when the run produced none. When the field is
+   * present the report is parsed ONLY from it, never from stdout. Absent only
+   * on synthetic receipts built outside the host executor. */
+  readonly report?: string | null;
   readonly durationMs: number;
 }
 

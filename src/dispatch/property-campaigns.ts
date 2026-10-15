@@ -34,6 +34,27 @@ export interface PropertyCampaignServiceOptions extends DirectiveRoutingDeps {
   readonly notifications: RecoveryNotifications;
   readonly artifactsRoot: string;
   readonly pendingProducerBlockers: (jobId: string) => readonly string[];
+  /** Process-local proposal retention (default 128; test seam). */
+  readonly maxRetainedProposals?: number;
+}
+/** What the owner can do next with a campaign (#380). A failed entry is
+ * terminal: its allocation is spent and its report may be stale, so the
+ * supported path is to let any live directive settle through ordinary
+ * reconciliation and propose the reviewed campaign again at the current head. */
+function nextAction(entry: Entry): string {
+  switch (entry.state) {
+    case 'proposed': return 'decide: approve execution at the reviewed head, or leave it';
+    case 'executed': return entry.report?.blocking === true ? 'decide: approve a bounded repair, or keep the blocker for review' : 'none: no qualified blocker; review proceeds as usual';
+    case 'repaired': return 'decide: approve retention of the reviewed regression, or leave it';
+    case 'retained': return 'none: the reviewed regression is in the lane; commit and review it as usual';
+    case 'failed': return 'propose again: this entry is terminal — settle any live directive through ordinary reconciliation, then propose the reviewed campaign for the current head';
+  }
+}
+/** Only settled, non-blocking entries are ever evicted to make room (#380):
+ * a pending proposal or an unresolved blocker is the owner's to decide. */
+function evictable(entry: Entry): boolean {
+  return entry.state === 'failed' || entry.state === 'retained' ||
+    ((entry.state === 'executed' || entry.state === 'repaired') && entry.report?.blocking !== true);
 }
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 function head(root: string): string {
@@ -79,7 +100,9 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
     bind(jobId, entry.spec.candidateRoot);
     return entry;
   };
-  const view = (entry: Entry) => clone({ id: entry.id, jobId: entry.jobId, candidateRoot: entry.spec.candidateRoot, candidateSha: entry.report?.candidateSha ?? entry.heads[2], state: entry.state, reviewedSourceHeads: entry.heads, reviewedTreeDigests: entry.treeDigests, campaign: entry.spec, report: entry.report, retainedPaths: entry.retainedPaths, repairProposed: entry.report?.blocking === true && entry.state !== 'failed', mergeAuthority: 'none' as const });
+  const view = (entry: Entry) => clone({ id: entry.id, jobId: entry.jobId, candidateRoot: entry.spec.candidateRoot, candidateSha: entry.report?.candidateSha ?? entry.heads[2], state: entry.state, nextAction: nextAction(entry), reviewedSourceHeads: entry.heads, reviewedTreeDigests: entry.treeDigests, campaign: entry.spec, report: entry.report, retainedPaths: entry.retainedPaths, repairProposed: entry.report?.blocking === true && entry.state !== 'failed', mergeAuthority: 'none' as const });
+  const maxRetainedProposals = options.maxRetainedProposals ?? 128;
+  if (!Number.isSafeInteger(maxRetainedProposals) || maxRetainedProposals < 1 || maxRetainedProposals > 128) throw new Error('maxRetainedProposals must be 1..128');
   const audit = (entry: Entry): void => {
     mkdirSync(entry.artifactsDir, { recursive: true, mode: 0o700 });
     writeFileSync(join(entry.artifactsDir, `owner-${entry.state}-${randomUUID()}.json`), `${JSON.stringify(view(entry), null, 2)}\n`, { flag: 'wx', mode: 0o600 });
@@ -125,7 +148,13 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
     propose(jobId: string, body: Record<string, unknown>) {
       if (disposed) throw new PropertyOwnerActionError('property campaign service disposed');
       keys(body, ['campaign']);
-      if (entries.size >= 128) throw new PropertyOwnerActionError('process-local proposal retention limit reached; no automatic eviction of blockers');
+      if (entries.size >= maxRetainedProposals) {
+        // Make room by dropping the OLDEST settled, non-blocking entry (its
+        // audit files stay on disk); pending proposals and blockers stay.
+        const oldest = [...entries.values()].find(evictable);
+        if (oldest === undefined) throw new PropertyOwnerActionError('process-local proposal retention limit reached: every retained campaign is a pending proposal or an unresolved blocker; decide those first');
+        entries.delete(oldest.id);
+      }
       const spec = clone(parseReviewedCampaign(body.campaign));
       bind(jobId, spec.candidateRoot);
       const id = `campaign-${randomUUID()}`;
