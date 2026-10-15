@@ -139,7 +139,11 @@ describe('Claude Code cessation through the registry (runtime-neutral contract)'
       logger: { info: () => {}, error: () => {} },
       state: { registry, handle: { stop: async () => {} } as never },
     });
-    await vi.advanceTimersByTimeAsync(200);
+    // The kill-grace timers are armed several microtask hops after the
+    // shutdown starts, so one fixed advance can finish before they exist.
+    // Advance in small steps until the real exit signal arrives (bounded well
+    // under the force-exit guard, so a guard exit(1) would still fail below).
+    for (let step = 0; step < 100 && exits.length === 0; step += 1) await vi.advanceTimersByTimeAsync(10);
     expect(exits).toEqual([0]);
     expect(adapterCessationEvidence(resident)).toBe('unknown');
     expect(registry.residents.occupied).toBe(1); // unconfirmed exit stays visible debt
