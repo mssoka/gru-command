@@ -5,13 +5,19 @@ import { join } from 'node:path';
 import type { PropertyExecutionPlan } from '../../../../src/property/types.js';
 
 /** Fake runners are OS-mechanism unit controls, never real Vitest proof. */
-export function scenarioRepo(script: string) {
+export function scenarioRepo(script: string, options: { readonly reportersModule?: boolean } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'property-unit-')));
   const git = (args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
   mkdirSync(join(root, 'node_modules', 'vitest'), { recursive: true });
   mkdirSync(join(root, 'node_modules', '.bin'), { recursive: true });
   mkdirSync(join(root, 'test'), { recursive: true });
   writeFileSync(join(root, 'node_modules', 'vitest', 'vitest.mjs'), script);
+  // The real layout's reporters module beside the runner (the host config
+  // imports it; fake runners frame their own report and never load it).
+  if (options.reportersModule !== false) {
+    mkdirSync(join(root, 'node_modules', 'vitest', 'dist'), { recursive: true });
+    writeFileSync(join(root, 'node_modules', 'vitest', 'dist', 'reporters.js'), 'export class JsonReporter {}\n');
+  }
   symlinkSync('../vitest/vitest.mjs', join(root, 'node_modules', '.bin', 'vitest'));
   writeFileSync(join(root, 'package.json'), '{"type":"module"}\n');
   writeFileSync(join(root, '.gitignore'), 'node_modules/\n');

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { cpSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -72,9 +72,19 @@ const RETENTION = { maxReceipts: 1024, maxRetainedOutputBytes: 256 * 1024 * 1024
  * reporter frames Vitest's own JSON report with the nonce; the host parses
  * only that one framed block. The nonce never appears in argv, env or files. */
 const CONFIG = [
-  "import { closeSync, readFileSync } from 'node:fs';",
-  'const nonce = readFileSync(3, \'utf8\').trim();',
-  'closeSync(3);',
+  "import { closeSync, readSync } from 'node:fs';",
+  // fd 3 may be a non-blocking socket: retry EAGAIN (bounded), and always close it.
+  'let nonce = \'\';',
+  'try {',
+  '  const buffer = Buffer.alloc(128); let length = 0; let waited = 0;',
+  '  for (;;) {',
+  '    let read;',
+  '    try { read = readSync(3, buffer, length, buffer.length - length, null); }',
+  "    catch (error) { if (error.code !== 'EAGAIN' || waited >= 5000) throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); waited += 10; continue; }",
+  '    if (read === 0 || (length += read) >= buffer.length) break;',
+  '  }',
+  "  nonce = buffer.subarray(0, length).toString('utf8').trim();",
+  '} finally { closeSync(3); }',
   "if (!/^[0-9a-f]{64}$/.test(nonce)) throw new Error('host report nonce unavailable');",
   'const { JsonReporter } = await import(process.env.GRU_PROPERTY_REPORTERS_MODULE);',
   'class HostFramedJsonReporter extends JsonReporter {',
@@ -161,42 +171,68 @@ function profile(workspace: string, denied: readonly string[]): string {
   ].join('\n');
 }
 type CopyBounds = { readonly maxFiles: number; readonly maxBytes: number };
-/** Bounded storage: even an endless post-cap stream retains no incoming
- * chunks. Storage grows only with the bytes actually kept — never a
- * 2 × maxBytes preallocation per run (#377) — and each kept slice is a COPY,
- * so an incoming chunk's backing allocation is never retained. */
+/** Bounded storage: one growing buffer per stream (doubling, never past the
+ * cap), so even a flood of tiny writes keeps O(1) objects and at most
+ * `maxBytes` per stream — never a 2 × maxBytes preallocation (#377) and
+ * never an incoming chunk's backing allocation (kept bytes are COPIED). */
 export function createBoundedPropertyCapture(maxBytes: number) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > POLICY.maxMaxOutputBytes) throw new PreExecutionRejectionError('budget-exceeds-policy', 'invalid capture capacity');
-  const kept: { stdout: Buffer[]; stderr: Buffer[] } = { stdout: [], stderr: [] };
+  const store = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
   const sizes = { stdout: 0, stderr: 0 }; const truncated = { stdout: false, stderr: false };
   return {
-    capacityBytes: maxBytes * 2,
+    /** Bytes actually allocated (at most 2 × maxBytes, only as output arrives). */
+    get capacityBytes(): number { return store.stdout.length + store.stderr.length; },
     push(name: 'stdout' | 'stderr', chunk: Buffer) {
       const count = Math.min(chunk.length, maxBytes - sizes[name]);
-      if (count > 0) { kept[name].push(Buffer.from(chunk.subarray(0, count))); sizes[name] += count; }
+      if (count > 0) {
+        const need = sizes[name] + count;
+        if (store[name].length < need) {
+          const grown = Buffer.alloc(Math.min(maxBytes, Math.max(need, store[name].length * 2, 4096)));
+          store[name].copy(grown, 0, 0, sizes[name]);
+          store[name] = grown;
+        }
+        chunk.copy(store[name], sizes[name], 0, count);
+        sizes[name] = need;
+      }
       if (count < chunk.length) truncated[name] = true;
     },
-    finish() { return { stdout: Buffer.concat(kept.stdout).toString('utf8'), stderr: Buffer.concat(kept.stderr).toString('utf8'), stdoutTruncated: truncated.stdout, stderrTruncated: truncated.stderr, complete: !truncated.stdout && !truncated.stderr }; },
+    finish() {
+      return { stdout: store.stdout.subarray(0, sizes.stdout).toString('utf8'), stderr: store.stderr.subarray(0, sizes.stderr).toString('utf8'),
+        stdoutTruncated: truncated.stdout, stderrTruncated: truncated.stderr, complete: !truncated.stdout && !truncated.stderr };
+    },
   };
 }
 
-/** Insertion-ordered receipt retention with count and byte bounds (#377).
- * `add` evicts the OLDEST receipts (never the one just added) until both
- * bounds hold; an evicted id resolves to undefined. */
+/** Least-recently-used receipt retention with count and byte bounds (#377).
+ * `bytes` is the receipt's whole serialized size. `add` evicts the least
+ * recently added-or-read receipts (never the one just added) until both
+ * bounds hold — a receipt a campaign is still resolving stays warm; a
+ * receipt that alone exceeds the byte bound is refused by name; an evicted id
+ * resolves to undefined and is counted. */
 export function createReceiptRetention<T>(bounds: { readonly maxReceipts: number; readonly maxBytes: number }) {
   const entries = new Map<string, { readonly value: T; readonly bytes: number }>();
-  let total = 0;
+  let total = 0; let evicted = 0;
   return {
     add(id: string, value: T, bytes: number): void {
+      if (bytes > bounds.maxBytes) throw new PreExecutionRejectionError('budget-exceeds-policy', `a ${String(bytes)}-byte receipt exceeds the ${String(bounds.maxBytes)}-byte retention bound`);
+      const prior = entries.get(id);
+      if (prior !== undefined) { entries.delete(id); total -= prior.bytes; }
       entries.set(id, { value, bytes }); total += bytes;
       for (const [oldest, entry] of entries) {
         if (oldest === id || (entries.size <= bounds.maxReceipts && total <= bounds.maxBytes)) break;
-        entries.delete(oldest); total -= entry.bytes;
+        entries.delete(oldest); total -= entry.bytes; evicted += 1;
       }
     },
-    get(id: string | undefined): T | undefined { return id === undefined ? undefined : entries.get(id)?.value; },
+    get(id: string | undefined): T | undefined {
+      if (id === undefined) return undefined;
+      const entry = entries.get(id);
+      if (entry === undefined) return undefined;
+      entries.delete(id); entries.set(id, entry); // a read keeps it warm
+      return entry.value;
+    },
     get size(): number { return entries.size; },
     get retainedBytes(): number { return total; },
+    get evicted(): number { return evicted; },
   };
 }
 /** Read-only current harness identity, never an execution approval. */
@@ -243,7 +279,7 @@ export interface PropertyExecutor {
   executePlan(input: ExecutePlanInput): Promise<ExecutePlanResult>;
   resolveReceiptRef(ref: ExecutionReceiptRef): SealedExecutionReceipt | null;
   /** Retained receipt count/bytes and the byte bound (#377). */
-  retention?(): { readonly receipts: number; readonly retainedOutputBytes: number; readonly maxRetainedOutputBytes: number };
+  retention(): { readonly receipts: number; readonly retainedOutputBytes: number; readonly maxRetainedOutputBytes: number; readonly evicted: number };
 }
 export function createPropertyExecutor(options: PropertyExecutorOptions = {}): PropertyExecutor {
   const ceilings = { maxRunTimeoutMs: options.maxRunTimeoutMs ?? POLICY.maxRunTimeoutMs, maxMaxOutputBytes: options.maxMaxOutputBytes ?? POLICY.maxMaxOutputBytes };
@@ -267,7 +303,7 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
     },
     resolveReceiptRef(ref) { const value = receipts.get(ref?.receiptId); return value !== undefined && isSealedExecutionReceipt(value) ? value : null; },
     /** Retention introspection for diagnostics and tests (#377). */
-    retention() { return { receipts: receipts.size, retainedOutputBytes: receipts.retainedBytes, maxRetainedOutputBytes }; },
+    retention() { return { receipts: receipts.size, retainedOutputBytes: receipts.retainedBytes, maxRetainedOutputBytes, evicted: receipts.evicted }; },
     async executePlan(input) {
       const { plan, repoRoot, packageDir } = input;
       if (options.signal?.aborted) return { executed: false, refusal: { kind: 'not-run', reason: 'property host aborted/disposed', backend: 'none-found' } };
@@ -308,7 +344,11 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         env['__CF_USER_TEXT_ENCODING'] = `0x${(process.getuid?.() ?? 0).toString(16)}:0:0`;
         // The copied Vitest's own reporters module (beside its runner), for the
         // host config's framed reporter; the nonce itself goes only on fd 3.
-        env['GRU_PROPERTY_REPORTERS_MODULE'] = pathToFileURL(join(dirname(runner.path), 'dist', 'reporters.js')).href;
+        const reportersModule = join(dirname(runner.path), 'dist', 'reporters.js');
+        // The framed report depends on the copied Vitest's own reporters
+        // module: a layout without it is refused by name before any run.
+        if (!existsSync(reportersModule)) throw new PreExecutionRejectionError('unapproved-command', `copied Vitest has no ${relative(workspace, reportersModule)}; the host-framed report cannot be produced`);
+        env['GRU_PROPERTY_REPORTERS_MODULE'] = pathToFileURL(reportersModule).href;
         env['GRU_PROPERTY_MAX_ITERATIONS'] = String(plan.budget.maxIterations);
         env['GRU_PROPERTY_MAX_SHRINK_STEPS'] = String(plan.budget.maxShrinkSteps);
         if (input.replaySeed != null) {
@@ -328,9 +368,15 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         const reportNonce = randomBytes(32).toString('hex');
         const start = Date.now();
         const child = spawn(backend.executable, ['-p', sbpl, ...argv], { cwd: wsPkg, env, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'pipe'] });
-        const nonceChannel = child.stdio[3] as NodeJS.WritableStream & { on(event: 'error', listener: () => void): unknown };
-        nonceChannel.on('error', () => {}); // a runner that never reads fd 3 simply yields no framed report
-        nonceChannel.end(`${reportNonce}\n`);
+        // A runner that never reads fd 3 yields no framed report; the channel
+        // failure is RECORDED as that run's reason, never swallowed.
+        let nonceChannelError: string | null = null;
+        const nonceChannel = child.stdio[3] as (NodeJS.WritableStream & { on(event: 'error', listener: (error: Error) => void): unknown }) | null | undefined;
+        if (nonceChannel === null || nonceChannel === undefined) nonceChannelError = 'host report channel (fd 3) was not created';
+        else {
+          nonceChannel.on('error', (error) => { nonceChannelError = String(error); });
+          nonceChannel.end(`${reportNonce}\n`);
+        }
         const collector = createBoundedPropertyCapture(plan.budget.maxOutputBytes);
         for (const name of ['stdout', 'stderr'] as const) child[name]!.on('data', (buf: Buffer) => collector.push(name, buf));
         let timedOut = false;
@@ -353,6 +399,13 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
         const raw = { stdout, stderr, report: framedRunnerReport(stdout, reportNonce), exitCode: child.exitCode, signal: child.signalCode, timedOut, durationMs: Date.now() - start };
         let outcome = VITEST_FAST_CHECK_ADAPTER.interpretExecution(raw, { ...plan, cwd: wsPkg });
         if ((capture.stdoutTruncated || capture.stderrTruncated) && outcome.kind === 'pass') outcome = { ...outcome, kind: 'inconclusive', reasons: [...outcome.reasons, 'output capture was truncated'] };
+        // Why there is no authenticated report, by name (#378).
+        if (raw.report === null) {
+          const why = capture.stdoutTruncated ? 'no host-framed report: stdout reached the output cap before the frame closed'
+            : nonceChannelError !== null ? `no host-framed report: host report channel failed: ${nonceChannelError}`
+            : 'no host-framed report: the run printed no single complete nonce frame';
+          outcome = { ...outcome, reasons: [...outcome.reasons, why] };
+        }
         const environmentProfile = environmentProfileString(env);
         const counterexample = retainedCounterexample({ outcome, environmentProfile });
         const body = assemblePropertyExecutionReceipt({
@@ -362,9 +415,12 @@ export function createPropertyExecutor(options: PropertyExecutorOptions = {}): P
           counterexample, sandbox: { backend: 'macos-sandbox-exec', profileSummary: `deny-default; read-only workspace/runtime allowlist; no disk writes/network/fork; denials may return EPERM (no per-syscall audit claim); 256MiB V8 heap; profile ${sha256Hex(sbpl)}`, networkDenied: true, filesystemIsolated: true, credentialsStripped: true, refusalReason: null }, replay: input.replaySeed == null ? counterexample?.replay ?? null : { seed: input.replaySeed, shrinkPath: input.replayPath == null ? [] : [input.replayPath], schedule: null, environmentProfile, replaySupported: true, replayDisclosure: 'host-requested native replay controls; PASS alone does not establish reproduction' }, budget: { ...plan.budget },
         });
         const sealed = body as SealedExecutionReceipt;
-        issued.set(sealed, sha256Hex(JSON.stringify(sealed)));
+        const serialized = JSON.stringify(sealed);
+        issued.set(sealed, sha256Hex(serialized));
         const ref = { receiptId: `pex-${randomUUID()}` };
-        receipts.add(ref.receiptId, sealed, Buffer.byteLength(stdout) + Buffer.byteLength(stderr));
+        // Retention counts the WHOLE receipt (outcome, excerpts, overlay,
+        // counterexample), not just its two output streams.
+        receipts.add(ref.receiptId, sealed, Buffer.byteLength(serialized));
         rmSync(workspace, { recursive: true, force: true });
         return { executed: true, receipt: sealed, ref, cleanup: { proven: true, workspaceRetained: false, detail: 'actual close observed, fork denied, process group empty; workspace released' } };
       } catch (error) {

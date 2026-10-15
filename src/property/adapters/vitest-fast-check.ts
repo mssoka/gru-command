@@ -437,7 +437,7 @@ function notRunOutcome(reason: string): PropertyRunOutcome {
     evidenceClass: INTERPRETATION_EVIDENCE_CLASS,
     selected: 0, executed: 0, skipped: 0, failed: 0, passed: 0,
     failures: [], unselectedFailures: [], reasons: [reason], matchedDiagnostic: null,
-    receipt: { exitCode: null, signal: null, timedOut: false, stdout: '', stderr: '', durationMs: 0 },
+    receipt: { exitCode: null, signal: null, timedOut: false, stdout: '', stderr: '', report: null, durationMs: 0 },
   };
 }
 
@@ -455,12 +455,10 @@ export function interpretVitestJsonReceipt(raw: RawExecutionReceipt, plan: Prope
     return { ...base, kind: 'infrastructure-error', selected: 0, executed: 0, skipped: 0, failed: 0, passed: 0, failures: [], unselectedFailures: [], reasons: [`runner killed by signal ${raw.signal}`], matchedDiagnostic: null };
   }
 
-  // A host-executor receipt carries the nonce-authenticated report (#378):
-  // only it is parsed — stdout, which the code under test can write, never
-  // is. A missing/ambiguous frame is no report at all.
-  const report = raw.report !== undefined
-    ? raw.report === null ? null : parseVitestReport(raw.report)
-    : parseVitestReport(raw.stdout);
+  // Every receipt carries the nonce-authenticated report (#378): only it is
+  // parsed — stdout, which the code under test can write, never is. A
+  // missing/ambiguous frame is no report at all.
+  const report = raw.report === null ? null : parseVitestReport(raw.report);
   if (report === null) {
     const diagnostic = raw.exitCode !== 0 ? recognizedDiagnostic(raw.stderr) : null;
     if (diagnostic !== null) {

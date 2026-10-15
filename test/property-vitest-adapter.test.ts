@@ -41,8 +41,11 @@ function plan(overrides: Partial<PropertyExecutionPlan> = {}): PropertyExecution
   };
 }
 
+/** A synthetic receipt whose authenticated report is, unless overridden,
+ * the JSON the runner printed (what the host's framed reporter carries). */
 function receipt(overrides: Partial<RawExecutionReceipt> = {}): RawExecutionReceipt {
-  return { exitCode: 0, signal: null, timedOut: false, stdout: '', stderr: '', durationMs: 1_000, ...overrides };
+  const stdout = overrides.stdout ?? '';
+  return { exitCode: 0, signal: null, timedOut: false, stdout, stderr: '', report: stdout === '' ? null : stdout, durationMs: 1_000, ...overrides };
 }
 
 function vitestJson(payload: unknown): string {
@@ -97,8 +100,10 @@ describe('GH350 vitest adapter interpretation precedence', () => {
     // The authenticated report decides even when stdout says otherwise.
     const authenticated = interpretVitestJsonReceipt({ ...receipt({ exitCode: 1, stdout: selectedPass }), report: selectedFailure }, plan());
     expect(authenticated.kind).toBe('property-failure');
-    // A synthetic receipt without the field keeps the stdout parse.
-    expect(interpretVitestJsonReceipt(receipt({ stdout: selectedPass }), plan()).kind).toBe('pass');
+    // The report is never read from stdout: only an explicit authenticated
+    // report can pass, even when stdout carries the same JSON.
+    expect(interpretVitestJsonReceipt({ ...receipt({ stdout: selectedPass }), report: selectedPass }, plan()).kind).toBe('pass');
+    expect(interpretVitestJsonReceipt({ ...receipt({ stdout: selectedPass }), report: null }, plan()).kind).not.toBe('pass');
   });
 
   it('classifies a fully consistent selected passing run as pass', () => {

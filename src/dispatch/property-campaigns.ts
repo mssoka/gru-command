@@ -37,24 +37,29 @@ export interface PropertyCampaignServiceOptions extends DirectiveRoutingDeps {
   /** Process-local proposal retention (default 128; test seam). */
   readonly maxRetainedProposals?: number;
 }
-/** What the owner can do next with a campaign (#380). A failed entry is
- * terminal: its allocation is spent and its report may be stale, so the
- * supported path is to let any live directive settle through ordinary
- * reconciliation and propose the reviewed campaign again at the current head. */
-function nextAction(entry: Entry): string {
+/** What the owner can do next with a campaign (#380): a machine-readable
+ * `kind` plus accurate text. A failed entry is terminal: its allocation is
+ * spent and its report may be stale. */
+export type PropertyNextActionKind = 'decide-execute' | 'decide-repair' | 'decide-retain' | 'propose-again' | 'none';
+export function nextAction(entry: Pick<Entry, 'state' | 'report'>): { readonly kind: PropertyNextActionKind; readonly detail: string } {
+  const blocking = entry.report?.blocking === true;
   switch (entry.state) {
-    case 'proposed': return 'decide: approve execution at the reviewed head, or leave it';
-    case 'executed': return entry.report?.blocking === true ? 'decide: approve a bounded repair, or keep the blocker for review' : 'none: no qualified blocker; review proceeds as usual';
-    case 'repaired': return 'decide: approve retention of the reviewed regression, or leave it';
-    case 'retained': return 'none: the reviewed regression is in the lane; commit and review it as usual';
-    case 'failed': return 'propose again: this entry is terminal — settle any live directive through ordinary reconciliation, then propose the reviewed campaign for the current head';
+    case 'proposed': return { kind: 'decide-execute', detail: 'approve execution at the reviewed head, or leave it' };
+    case 'executed': return blocking
+      ? { kind: 'decide-repair', detail: 'approve a bounded repair, or keep the blocker for review' }
+      : { kind: 'none', detail: 'no qualified blocker; review proceeds as usual' };
+    case 'repaired': return blocking
+      ? { kind: 'decide-repair', detail: 'the repair did not clear the blocker: approve another bounded repair, or keep the blocker for review' }
+      : { kind: 'decide-retain', detail: 'approve retention of the reviewed regression, or leave it' };
+    case 'retained': return { kind: 'none', detail: 'the reviewed regression is in the lane; commit and review it as usual' };
+    case 'failed': return { kind: 'propose-again', detail: 'this entry is terminal: if it started a repair directive, let that settle through ordinary reconciliation first; then propose the reviewed campaign again at the current head' };
   }
 }
-/** Only settled, non-blocking entries are ever evicted to make room (#380):
- * a pending proposal or an unresolved blocker is the owner's to decide. */
-function evictable(entry: Entry): boolean {
-  return entry.state === 'failed' || entry.state === 'retained' ||
-    ((entry.state === 'executed' || entry.state === 'repaired') && entry.report?.blocking !== true);
+/** Only settled entries that owe the owner no decision are ever evicted to
+ * make room (#380): a pending proposal, an unresolved blocker or a repair
+ * awaiting its retention decision is the owner's to decide. */
+export function evictable(entry: Pick<Entry, 'state' | 'report'>): boolean {
+  return entry.state === 'failed' || entry.state === 'retained' || (entry.state === 'executed' && entry.report?.blocking !== true);
 }
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 function head(root: string): string {
@@ -79,6 +84,7 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
   const entries = new Map<string, Entry>();
   const controllers = new Set<AbortController>();
   let active = false;
+  let activeId: string | null = null;
   let settled: Promise<void> | null = null;
   let disposed = false;
   const bind = (jobId: string, root: string): void => {
@@ -94,8 +100,14 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
     });
     if (busy || options.pendingProducerBlockers(jobId).length > 0 || options.ledger.listJobAdmissions(jobId).length > 0 || options.ledger.listPendingDirectives({ jobId, states: ['dispatching', 'admitted'] }).length > 0 || options.ledger.listPendingRebriefs({ jobId }).length > 0 || options.ledger.hasUnsettledVerificationRun(jobId)) throw new PropertyOwnerActionError('job lane has an active or unresolved minion, producer, directive, re-brief or verification; settle it before property execution/writing');
   };
+  // Ids evicted to make room, kept (bounded) so a later read says so by name.
+  const evictedIds = new Map<string, { readonly jobId: string; readonly artifactsDir: string }>();
   const get = (jobId: string, id: string): Entry => {
     const entry = entries.get(id);
+    const gone = evictedIds.get(id);
+    if (entry === undefined && gone !== undefined && gone.jobId === jobId) {
+      throw new PropertyOwnerActionError(`campaign ${id} was evicted to make room for newer proposals; its audit files remain in ${gone.artifactsDir}; propose it again`);
+    }
     if (entry === undefined || entry.jobId !== jobId) throw new PropertyOwnerActionError('no process-local campaign for this job/id; serialized reports cannot restore it');
     bind(jobId, entry.spec.candidateRoot);
     return entry;
@@ -148,16 +160,24 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
     propose(jobId: string, body: Record<string, unknown>) {
       if (disposed) throw new PropertyOwnerActionError('property campaign service disposed');
       keys(body, ['campaign']);
-      if (entries.size >= maxRetainedProposals) {
-        // Make room by dropping the OLDEST settled, non-blocking entry (its
-        // audit files stay on disk); pending proposals and blockers stay.
-        const oldest = [...entries.values()].find(evictable);
-        if (oldest === undefined) throw new PropertyOwnerActionError('process-local proposal retention limit reached: every retained campaign is a pending proposal or an unresolved blocker; decide those first');
-        entries.delete(oldest.id);
-      }
+      // Validate and bind the NEW proposal first: a malformed or unbound
+      // proposal never costs a retained campaign its slot.
       const spec = clone(parseReviewedCampaign(body.campaign));
       bind(jobId, spec.candidateRoot);
       const id = `campaign-${randomUUID()}`;
+      if (entries.size >= maxRetainedProposals) {
+        // Make room by dropping the OLDEST settled entry that owes no decision,
+        // this job's first; never the entry being decided right now.
+        const candidates = [...entries.values()].filter((entry) => evictable(entry) && entry.id !== activeId);
+        const oldest = candidates.find((entry) => entry.jobId === jobId) ?? candidates[0];
+        if (oldest === undefined) throw new PropertyOwnerActionError('process-local proposal retention limit reached: every retained campaign is a pending proposal, an unresolved blocker or a repair awaiting retention; decide those first');
+        entries.delete(oldest.id);
+        evictedIds.set(oldest.id, { jobId: oldest.jobId, artifactsDir: oldest.artifactsDir });
+        if (evictedIds.size > 1024) evictedIds.delete(evictedIds.keys().next().value!);
+        // The eviction itself is audited beside the entry's own records.
+        mkdirSync(oldest.artifactsDir, { recursive: true, mode: 0o700 });
+        writeFileSync(join(oldest.artifactsDir, `owner-evicted-${randomUUID()}.json`), `${JSON.stringify({ evicted: view(oldest), byProposal: id }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+      }
       const entry: Entry = { id, jobId, spec, heads: roots(spec).map(head), treeDigests: roots(spec).map((root) => propertyWorkspaceIdentity(root).digest), configHash: propertyConfigIdentity(spec.candidateRoot), artifactsDir: join(options.artifactsRoot, id), state: 'proposed', report: null, retainedPaths: [] };
       entries.set(id, entry); audit(entry); return view(entry);
     },
@@ -171,7 +191,7 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
       if (typeof body.expectedHead !== 'string' || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u.test(body.expectedHead) || body.expectedHead !== expected || head(entry.spec.candidateRoot) !== expected) throw new PropertyOwnerActionError('approval must name this exact current candidate head');
       if (active || disposed) throw new PropertyOwnerActionError('property host busy/disposed; no concurrent allocation');
       idle(jobId, entry.spec.candidateRoot);
-      active = true;
+      active = true; activeId = entry.id;
       let resolveSettlement!: () => void;
       settled = new Promise<void>((resolve) => { resolveSettlement = resolve; });
       let release: (() => void) | null = null;
@@ -202,7 +222,7 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
         }
         audit(entry); return view(entry);
       } catch (error) { entry.state = 'failed'; audit(entry); throw error; }
-      finally { release?.(); active = false; settled = null; resolveSettlement(); }
+      finally { release?.(); active = false; activeId = null; settled = null; resolveSettlement(); }
     },
     async dispose() { disposed = true; hostController.abort(); for (const controller of controllers) controller.abort(); await settled; },
   };

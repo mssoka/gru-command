@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import type { OverlayIdentity } from './types.js';
 
@@ -175,21 +175,46 @@ export function applyOverlayFiles(input: {
  * call created is removed and each file it overwrote is restored byte-for-byte,
  * then the original error is rethrown. */
 export function applyOverlayFilesAllOrNothing(input: Parameters<typeof applyOverlayFiles>[0]): OverlayIdentity {
-  const prior = input.files.map((file) => {
-    const target = resolveOverlayTarget(input.workspaceRoot, file.path);
-    const current = lstatSync(target, { throwIfNoEntry: false });
-    // A pre-existing non-file entry is never written (applyOverlayFiles
-    // refuses it), so it is never touched on rollback either.
-    return { target, state: current === undefined ? 'absent' as const : current.isFile() ? 'file' as const : 'other' as const,
-      content: current !== undefined && current.isFile() ? readFileSync(target) : null };
-  });
+  // Parent directories this call creates, in creation order, so a rollback
+  // removes them (deepest first) and leaves no empty directory behind.
+  const createdDirs: string[] = [];
+  const prior: { readonly target: string; readonly state: 'absent' | 'file' | 'other'; readonly content: Buffer | null; readonly mode: number | null }[] = [];
+  const rollback = (error: unknown): never => {
+    const failures: unknown[] = [];
+    for (const { target, state, content, mode } of prior) {
+      try {
+        if (state === 'absent') rmSync(target, { force: true });
+        else if (state === 'file' && content !== null) {
+          writeFileSync(target, content);
+          if (mode !== null) chmodSync(target, mode);
+        }
+      } catch (restoreError) { failures.push(restoreError); }
+    }
+    for (const dir of [...createdDirs].reverse()) {
+      try { rmdirSync(dir); } catch (removeError) { failures.push(removeError); }
+    }
+    if (failures.length > 0) throw new AggregateError([error, ...failures], `overlay write failed and its rollback was incomplete: ${String(error)}`);
+    throw error;
+  };
   try {
+    const root = realpathSync(input.workspaceRoot);
+    for (const file of input.files) {
+      // Record which parents are missing before resolveOverlayTarget makes them.
+      let parent = root;
+      for (const segment of file.path.split('/').slice(0, -1)) {
+        parent = join(parent, segment);
+        if (lstatSync(parent, { throwIfNoEntry: false }) === undefined && !createdDirs.includes(parent)) createdDirs.push(parent);
+      }
+      const target = resolveOverlayTarget(input.workspaceRoot, file.path);
+      const current = lstatSync(target, { throwIfNoEntry: false });
+      // A pre-existing non-file entry is never written (applyOverlayFiles
+      // refuses it), so it is never touched on rollback either.
+      prior.push({ target, state: current === undefined ? 'absent' : current.isFile() ? 'file' : 'other',
+        content: current !== undefined && current.isFile() ? readFileSync(target) : null,
+        mode: current !== undefined && current.isFile() ? current.mode & 0o7777 : null });
+    }
     return applyOverlayFiles(input);
   } catch (error) {
-    for (const { target, state, content } of prior) {
-      if (state === 'absent') rmSync(target, { force: true });
-      else if (state === 'file' && content !== null) writeFileSync(target, content);
-    }
-    throw error;
+    return rollback(error);
   }
 }

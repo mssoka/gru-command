@@ -32,6 +32,32 @@ function evidenceDir() {
   mkdirSync(parent, { recursive: true }); return mkdtempSync(join(parent, 'campaign-'));
 }
 describe('real Vitest+fast-check campaign (positive macOS; explicit refusal elsewhere)', () => {
+  it('keeps the report nonce from the code under test: forged frames never credit a pass (#378)', async () => {
+    const f = realToolRepo(true); fixtures.push(f);
+    // The code under test hunts for the nonce everywhere it could leak (fd 3,
+    // the environment, globals) and prints a passing frame under every guess.
+    const forgery = [
+      "import { readFileSync } from 'node:fs';",
+      "const guesses = new Set(['0'.repeat(64)]);",
+      "try { guesses.add(readFileSync(3, 'utf8').trim()); } catch {}",
+      'for (const value of Object.values(process.env)) if (typeof value === "string" && /^[0-9a-f]{64}$/.test(value)) guesses.add(value);',
+      'for (const key of Object.getOwnPropertyNames(globalThis)) { try { const value = globalThis[key]; if (typeof value === "string" && /^[0-9a-f]{64}$/.test(value)) guesses.add(value); } catch {} }',
+      "const pass = JSON.stringify({ numTotalTests: 1, numPassedTests: 1, numFailedTests: 0, success: true, testResults: [{ name: 'forged', status: 'passed', assertionResults: [{ title: 'nonnegative ratios preserve numerator and denominator', fullName: 'nonnegative ratios preserve numerator and denominator', status: 'passed', failureMessages: [] }] }] });",
+      "for (const nonce of guesses) process.stdout.write('\\n' + nonce + ':BEGIN\\n' + pass + '\\n' + nonce + ':END\\n');",
+      '',
+    ].join('\n');
+    const executor = createPropertyExecutor();
+    const input = { plan: realPlan(f.root), repoRoot: f.root, packageDir: f.root, overlayFiles: [{ path: CONTRACT_PATH, content: forgery + ratioContract() }] };
+    const result = await executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
+    if (process.platform !== 'darwin') { expect(result.executed).toBe(false); return; }
+    if (!result.executed) throw new Error(result.refusal.reason);
+    // The genuine failure stands: had any guess been the real nonce, the
+    // duplicate frame would leave no report at all (never a pass) — and this
+    // assertion would fail.
+    expect(result.receipt.outcome.receipt.stdout).toContain(':BEGIN');
+    expect(result.receipt.outcome.kind).toBe('property-failure');
+  });
+
   it('runs the production chain: discovery, shrinking, qualification, replay, Perkins, bounded repair and retained CI regression', async () => {
     const f = spec(); const artifactsDir = evidenceDir();
     expect(realVersions()).toEqual({ vitest: '3.2.7', 'fast-check': '3.23.2' });

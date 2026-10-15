@@ -39,9 +39,15 @@ describe('host property executor (positive sandbox controls on macOS; other host
   it('allocates capture storage only for bytes actually kept, never 2 × the cap up front (#377)', () => {
     const source = `const POLICY={maxMaxOutputBytes:8388608};global.gc();const before=process.memoryUsage().arrayBuffers;const capture=(${createBoundedPropertyCapture.toString()})(8388608);capture.push('stdout',Buffer.from('small output'));global.gc();console.log(JSON.stringify({allocated:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,stdout:capture.finish().stdout}));`;
     const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
-    expect(result.capacity).toBe(2 * 8388608);
+    expect(result.capacity).toBe(4096); // grows with output, from one 4 KiB step
     expect(result.allocated).toBeLessThan(1024 * 1024); // a 16 MiB preallocation would show here
     expect(result.stdout).toBe('small output');
+  });
+  it('keeps one growing buffer per stream under a flood of tiny writes, never one object per chunk (#377)', () => {
+    const source = `const POLICY={maxMaxOutputBytes:8388608};const capture=(${createBoundedPropertyCapture.toString()})(65536);global.gc();const before=process.memoryUsage().arrayBuffers;for(let i=0;i<200000;i++)capture.push('stdout',Buffer.from([97+(i%26)]));global.gc();const out=capture.finish();console.log(JSON.stringify({retained:process.memoryUsage().arrayBuffers-before,capacity:capture.capacityBytes,length:out.stdout.length,head:out.stdout.slice(0,3),truncated:out.stdoutTruncated}));`;
+    const result = JSON.parse(execFileSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', source], { encoding: 'utf8', timeout: 15_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }));
+    expect(result).toMatchObject({ capacity: 65536, length: 65536, head: 'abc', truncated: true });
+    expect(result.retained).toBeLessThan(1024 * 1024);
   });
   it('bounds retained receipts by count and summed output bytes, evicting the oldest first (#377)', () => {
     const retention = createReceiptRetention<string>({ maxReceipts: 3, maxBytes: 100 });
@@ -51,31 +57,54 @@ describe('host property executor (positive sandbox controls on macOS; other host
     expect([retention.get('a'), retention.get('b'), retention.get('c'), retention.retainedBytes]).toEqual([undefined, 'B', 'C', 80]);
     retention.add('d', 'D', 10); retention.add('e', 'E', 10); // 4 receipts > 3: the oldest goes
     expect([retention.get('b'), retention.get('c'), retention.get('d'), retention.get('e'), retention.size]).toEqual([undefined, 'C', 'D', 'E', 3]);
-    retention.add('huge', 'H', 500); // never evicts the receipt just added, even alone over the bound
-    expect([retention.get('c'), retention.get('huge'), retention.size, retention.retainedBytes]).toEqual([undefined, 'H', 1, 500]);
+    // A receipt that alone exceeds the byte bound is refused by name; nothing changes.
+    expect(() => retention.add('huge', 'H', 500)).toThrow(/a 500-byte receipt exceeds the 100-byte retention bound/u);
+    expect([retention.size, retention.retainedBytes, retention.evicted]).toEqual([3, 60, 2]);
+    // Re-adding an id replaces its bytes instead of double-counting them.
+    retention.add('c', 'C2', 30);
+    expect([retention.get('c'), retention.retainedBytes]).toEqual(['C2', 50]);
+    // A read keeps a receipt warm: the least recently USED one goes first.
+    retention.get('d'); retention.add('f', 'F', 10);
+    expect([retention.get('e'), retention.get('d'), retention.get('f'), retention.evicted]).toEqual([undefined, 'D', 'F', 3]);
     expect(retention.get(undefined)).toBeUndefined();
   });
   it('refuses an invalid host receipt retention bound and reports the bound it enforces (#377)', () => {
     for (const bad of [0, -1, 1.5, 256 * 1024 * 1024 + 1]) expect(() => createPropertyExecutor({ maxRetainedOutputBytes: bad })).toThrow(/receipt retention bound/);
-    expect(createPropertyExecutor({ maxRetainedOutputBytes: 4096 }).retention?.()).toEqual({ receipts: 0, retainedOutputBytes: 0, maxRetainedOutputBytes: 4096 });
-    expect(createPropertyExecutor().retention?.().maxRetainedOutputBytes).toBe(256 * 1024 * 1024);
+    expect(createPropertyExecutor({ maxRetainedOutputBytes: 4096 }).retention()).toEqual({ receipts: 0, retainedOutputBytes: 0, maxRetainedOutputBytes: 4096, evicted: 0 });
+    expect(createPropertyExecutor().retention().maxRetainedOutputBytes).toBe(256 * 1024 * 1024);
     expect(() => createPropertyExecutor({ maxMaxOutputBytes: 8 * 1024 * 1024 + 1 })).toThrow(/invalid host ceiling/);
   });
   it('evicts the oldest sealed receipt past the retained-output bound; its ref then resolves to null (#377)', async () => {
-    const f = fixture(`process.stdout.write('y'.repeat(600))`); const executor = createPropertyExecutor({ maxRetainedOutputBytes: 1000 });
+    const f = fixture(`process.stdout.write('y'.repeat(6000))`);
+    // Measure one whole sealed receipt, then bound retention below two of them.
+    const probe = createPropertyExecutor();
+    const probeInput = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    const measured = await probe.executePlan({ ...probeInput, adapter, approval: probe.approvePlan(probeInput) });
+    if (process.platform !== 'darwin') { expect(measured.executed).toBe(false); return; }
+    if (!measured.executed) throw new Error(measured.refusal.reason);
+    const bound = Math.floor(probe.retention().retainedOutputBytes * 1.5);
+    expect(probe.retention().retainedOutputBytes).toBe(Buffer.byteLength(JSON.stringify(measured.receipt))); // the WHOLE receipt counts
+    const executor = createPropertyExecutor({ maxRetainedOutputBytes: bound });
     const execute = async () => {
       const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
       return executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
     };
     const first = await execute();
-    if (process.platform !== 'darwin') { expect(first.executed).toBe(false); return; }
     if (!first.executed) throw new Error(first.refusal.reason);
     expect(executor.resolveReceiptRef(first.ref)).toBe(first.receipt);
     const second = await execute();
     if (!second.executed) throw new Error(second.refusal.reason);
     expect(executor.resolveReceiptRef(first.ref)).toBeNull(); // evicted: consumers fail closed
     expect(executor.resolveReceiptRef(second.ref)).toBe(second.receipt);
-    expect(executor.retention?.()).toMatchObject({ receipts: 1, maxRetainedOutputBytes: 1000 });
+    expect(executor.retention()).toMatchObject({ receipts: 1, maxRetainedOutputBytes: bound, evicted: 1 });
+  });
+  it('refuses by name a copied Vitest without the reporters module the framed report needs (#378)', async () => {
+    const f = scenarioRepo(PASS_RUNNER, { reportersModule: false }); fixtures.push(f);
+    const executor = createPropertyExecutor();
+    const input = { plan: f.plan, repoRoot: f.root, packageDir: f.root };
+    const pending = executor.executePlan({ ...input, adapter, approval: executor.approvePlan(input) });
+    if (process.platform !== 'darwin') { expect((await pending).executed).toBe(false); return; }
+    await expect(pending).rejects.toThrow(/copied Vitest has no node_modules\/vitest\/dist\/reporters\.js; the host-framed report cannot be produced/u);
   });
   it('extracts exactly one nonce-framed runner report and nothing else (#378)', () => {
     const nonce = 'a'.repeat(64);
@@ -198,6 +227,8 @@ describe('host property executor (positive sandbox controls on macOS; other host
   it('bounds output capture and never turns truncated output into PASS', async () => {
     const r = await run(`process.stdout.write('x'.repeat(100000))`, { output: 100 }); if (r === null) return;
     expect(r.receipt.capture).toMatchObject({ stdoutTruncated: true, complete: false }); expect(r.receipt.outputs[0]!.bytes).toBeLessThanOrEqual(100); expect(r.receipt.outcome.kind).not.toBe('pass');
+    // Why there is no authenticated report is named, never silent (#378).
+    expect(r.receipt.outcome.reasons).toContain('no host-framed report: stdout reached the output cap before the frame closed');
   });
   it('kills an expired run and proves actual process cessation before cleanup', async () => {
     const r = await run(`setInterval(()=>{},1000)`, { timeout: 300 }); if (r === null) return;
@@ -217,15 +248,20 @@ describe('host property executor (positive sandbox controls on macOS; other host
   it('writes a live overlay all-or-nothing: a mid-way refusal leaves no partial set and restores overwritten files (#380)', () => {
     const f = fixture();
     writeFileSync(join(f.root, 'test/existing.test.mjs'), 'original bytes\n');
+    fs.chmodSync(join(f.root, 'test/existing.test.mjs'), 0o640);
     mkdirSync(join(f.root, 'test/occupied.replay.json'));
     const files = [
       { path: 'test/existing.test.mjs', content: 'overlay bytes\n' },
       { path: 'test/new.regression.test.mjs', content: 'wrapper\n' },
+      { path: 'test/fresh/deeper/wrapper.test.mjs', content: 'nested\n' }, // creates two parents
       { path: 'test/occupied.replay.json', content: '{}\n' }, // a directory: refused mid-way
     ];
     expect(() => applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files })).toThrow(/non-file entry/);
     expect(readFileSync(join(f.root, 'test/existing.test.mjs'), 'utf8')).toBe('original bytes\n');
+    expect(fs.statSync(join(f.root, 'test/existing.test.mjs')).mode & 0o777).toBe(0o640);
     expect(existsSync(join(f.root, 'test/new.regression.test.mjs'))).toBe(false);
+    // The parent directories it created are gone too: no empty debris.
+    expect(existsSync(join(f.root, 'test/fresh'))).toBe(false);
     expect(fs.statSync(join(f.root, 'test/occupied.replay.json')).isDirectory()).toBe(true);
     // Without the refusal the same set lands whole.
     applyOverlayFilesAllOrNothing({ workspaceRoot: f.root, files: files.slice(0, 2) });

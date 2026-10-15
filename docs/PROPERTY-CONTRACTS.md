@@ -198,9 +198,16 @@ Repairs run as ordinary durable directive requests through the native
 directive path (admission, producer fences, settlement and recovery — the same
 path as every other directive), with one-use allocations and at most three
 total attempts. The repair directive is fixed host text with every value
-emitted as a line-safe JSON literal; the sandbox-controlled minimized
-counterexample is labelled untrusted data, bounded to 4096 characters and
-carried with its sha256, so it can never forge a directive line (#379). Source movement across async boundaries,
+emitted as a line-safe JSON literal (newlines, quotes, controls and deceptive
+Unicode — bidi, zero-width, BOM, tag characters — escaped); the
+sandbox-controlled minimized counterexample is labelled untrusted data,
+bounded to 4096 escaped characters on a code-point boundary and carried with
+its sha256, and each reviewed oracle file is bounded the same way with its
+digest, so no value can forge or hide a directive line (#379). The reviewer's
+evidence line obeys the same rules and is bounded at 16384 escaped
+characters (past that, an excerpt plus the full literal's length and digest).
+
+Source movement across async boundaries,
 changed dependency/lock/adapter/oracle/budget identities, and deletion of an
 already-present frozen contract require requalification. Each repair validation
 uses both the retained seed and native shrink path, so passing only the random
@@ -211,26 +218,44 @@ keeps the original candidate counterexample (not a qualification control's) and
 preserves oracle bytes and adds a closed seed/path regression wrapper plus
 the actual minimized counterexample/replay audit file. Retention changes
 source bytes and invalidates prior review evidence; its files land in the live
-lane all-or-nothing (a mid-way failure removes what it created and restores
-what it overwrote, #380).
+lane all-or-nothing (a mid-way failure removes the files and parent
+directories it created and restores what it overwrote, bytes and mode; an
+incomplete rollback fails loud with every cause, #380).
 
 **Owner-service lifecycle (#380).** The owner HTTP service keeps campaigns
-process-local. At its retention cap (128) it evicts the oldest settled,
-non-blocking entry; pending proposals and unresolved blockers are never
-evicted (when only those remain, a new proposal is refused until they are
-decided). Every campaign view carries `nextAction`. A `failed` entry is
-terminal: let any live directive settle through ordinary reconciliation, then
-propose the reviewed campaign again for the current head. The candidate root
+process-local. At its retention cap (128), after the new proposal validates,
+it evicts the oldest settled entry that owes no decision (the same job's
+first; never the entry being decided). Pending proposals, unresolved blockers
+and repairs awaiting their retention decision are never evicted (when only
+those remain, a new proposal is refused until they are decided). An eviction
+is audited (`owner-evicted-*.json` beside the entry's records) and a later
+read of that id says it was evicted. Every campaign view carries
+`nextAction: { kind, detail }` with `kind` one of `decide-execute`,
+`decide-repair`, `decide-retain`, `propose-again` or `none`. A `failed` entry
+is terminal: if it started a repair directive, let that settle through
+ordinary reconciliation, then propose the reviewed campaign again for the
+current head. The candidate root
 is bound to the job's active managed lane; the qualification control roots
 (`knownBadRoot`, `healthyRoot`, `baselineRoot`) are owner-supplied paths
 accepted on the authenticated owner's word — they are read-only inputs,
 copied and executed only inside the sandbox, never written.
 
 **Bounded evidence (#377).** `max_output_bytes` is capped at 8 MiB per stream
-per run, capture storage grows only with the bytes actually kept, and a
+per run (lowered from 64 MiB: an existing config above it now fails to load
+with the named ceiling). Capture keeps one buffer per stream that grows only
+with the bytes actually kept, so a flood of tiny writes holds O(1) objects. A
 long-lived executor retains at most 1024 sealed receipts and 256 MiB of their
-output, evicting the oldest first — an evicted receipt reference resolves to
-nothing, so every later consumer fails closed and requalifies.
+WHOLE serialized size, evicting the least recently used first (a receipt a
+campaign is still resolving stays warm; evictions are counted in
+`retention()`); a single receipt larger than the bound is refused by name. An
+evicted receipt reference resolves to nothing, so every later consumer fails
+closed and requalifies.
+
+**Authenticated runner report (#378).** The host-framed report needs the
+copied Vitest's own `dist/reporters.js`; a layout without it is refused by
+name before the run. When a run yields no framed report, its outcome says why
+(output cap reached before the frame closed, a failed host report channel, or
+no single complete frame); stdout itself is never parsed for a verdict.
 
 `.github/workflows/property-contracts.yml` runs the bounded positive macOS
 campaign for PRs/manual runs and weekly scheduled campaigns, retaining replay

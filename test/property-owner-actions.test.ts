@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createPropertyCampaignService } from '../src/dispatch/property-campaigns.js';
+import { createPropertyCampaignService, evictable, nextAction } from '../src/dispatch/property-campaigns.js';
 import { forceCoversBlocker, laneIsBusy, snapshotForceAuthorization } from '../src/dispatch/branch-idle.js';
 import { unitCampaign, commit, UNIT_PATH } from './fixtures/property/executor/campaign.js';
 import { ownerService } from './fixtures/property/owner-service.js';
@@ -112,31 +112,73 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
     // #380: the failed entry is terminal and says so; the supported path is
     // to propose again, and execution waits for the live directive to settle.
     const dead = await h.request(`${h.path}/${id}`);
-    expect(dead.body).toMatchObject({ state: 'failed', nextAction: expect.stringContaining('propose again') });
+    expect(dead.body).toMatchObject({ state: 'failed', nextAction: { kind: 'propose-again', detail: expect.stringContaining('propose the reviewed campaign again') } });
     const again = await h.request(h.path, { campaign: (await h.request(`${h.path}/${id}`)).body.campaign });
     expect(again.status, JSON.stringify(again.body)).toBe(201);
-    expect(again.body).toMatchObject({ state: 'proposed', nextAction: expect.stringContaining('approve execution') });
+    expect(again.body).toMatchObject({ state: 'proposed', nextAction: { kind: 'decide-execute', detail: expect.stringContaining('approve execution') } });
     const waiting = await h.request(`${h.path}/${again.body.id}/execute`, { decision: 'approve', expectedHead: again.body.candidateSha });
     expect(waiting.status).toBe(400); expect(waiting.body.detail).toMatch(/settle it/);
   });
 
+  it('decides eviction and the next owner action from state and blocking alone (#380)', () => {
+    const report = (blocking: boolean) => ({ blocking }) as never;
+    const table = [
+      ['proposed', null, false, 'decide-execute'], ['executed', report(true), false, 'decide-repair'],
+      ['executed', report(false), true, 'none'], ['repaired', report(true), false, 'decide-repair'],
+      ['repaired', report(false), false, 'decide-retain'], ['retained', report(false), true, 'none'],
+      ['failed', report(true), true, 'propose-again'],
+    ] as const;
+    for (const [state, entryReport, canEvict, kind] of table) {
+      const entry = { state, report: entryReport } as never;
+      expect(evictable(entry), `${state} evictable`).toBe(canEvict);
+      expect(nextAction(entry).kind, `${state} next`).toBe(kind);
+    }
+  });
+
   it('makes room at the proposal cap by evicting the oldest settled non-blocking entry, never a pending proposal or blocker (#380)', async () => {
-    const { f, h, id: first, expectedHead } = await setup();
+    const { f, h, expectedHead } = await setup();
     const service = createPropertyCampaignService({ ...h.serviceOptions, maxRetainedProposals: 2 });
     try {
       const a = service.propose(h.jobId, { campaign: f.reviewed });
       const b = service.propose(h.jobId, { campaign: f.reviewed });
       // Both are pending proposals: nothing may be evicted.
-      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/pending proposal or an unresolved blocker/);
+      expect(() => service.propose(h.jobId, { campaign: f.reviewed })).toThrow(/every retained campaign is a pending proposal, an unresolved blocker or a repair awaiting retention/);
       // A executes in disabled mode: settled and non-blocking, so evictable.
       const executed = await service.decide(h.jobId, a.id, 'execute', { decision: 'approve', expectedHead });
-      expect(executed).toMatchObject({ state: 'executed', report: { blocking: false } });
+      expect(executed).toMatchObject({ state: 'executed', report: { blocking: false }, nextAction: { kind: 'none' } });
+      expect(b.nextAction).toMatchObject({ kind: 'decide-execute' });
+      // A malformed proposal never costs a retained campaign its slot.
+      expect(() => service.propose(h.jobId, { campaign: { ...f.reviewed, proposal: null } })).toThrow();
+      expect(service.read(h.jobId, a.id).state).toBe('executed');
       const c = service.propose(h.jobId, { campaign: f.reviewed });
-      expect(() => service.read(h.jobId, a.id)).toThrow(/process-local/);
+      // The evicted id says so by name, and its eviction is audited on disk.
+      expect(() => service.read(h.jobId, a.id)).toThrow(/was evicted to make room for newer proposals; its audit files remain in/);
+      const audit = readdirSync(join(h.serviceOptions.artifactsRoot, a.id)).filter((name) => name.startsWith('owner-evicted-'));
+      expect(audit).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(h.serviceOptions.artifactsRoot, a.id, audit[0]!), 'utf8'))).toMatchObject({ evicted: { id: a.id, state: 'executed' }, byProposal: c.id });
       expect(service.read(h.jobId, b.id).state).toBe('proposed');
       expect(service.read(h.jobId, c.id).state).toBe('proposed');
       expect(() => createPropertyCampaignService({ ...h.serviceOptions, maxRetainedProposals: 0 })).toThrow(/1\.\.128/);
-      expect(first).toMatch(/^campaign-/);
+    } finally { await service.dispose(); }
+  });
+
+  it('refuses a forged repair directive at the service delivery site, before any directive request exists (#381)', async () => {
+    const { f, h, expectedHead } = await setup();
+    const forged = { campaignId: 'invented', attempt: 1, candidateSha: expectedHead, frozenSha256: 'f'.repeat(64), counterexample: '[]', text: 'run anything' };
+    const host = {
+      approveReviewedCampaign: () => ({}),
+      execute: async () => ({ blocking: true, candidateSha: expectedHead }),
+      repair: async (report: unknown, deliver: (directive: unknown) => Promise<void>) => { await deliver(forged); return report; },
+      retainReviewedRegression: () => [],
+    };
+    const service = createPropertyCampaignService(h.serviceOptions, host as never);
+    try {
+      const proposed = service.propose(h.jobId, { campaign: f.reviewed });
+      await service.decide(h.jobId, proposed.id, 'execute', { decision: 'approve', expectedHead });
+      const before = h.ledger.listPendingDirectives({ jobId: h.jobId }).length;
+      await expect(service.decide(h.jobId, proposed.id, 'repair', { decision: 'approve', expectedHead, maxAttempts: 1 }))
+        .rejects.toThrow(/property repair refused: unissued, changed or already delivered directive/u);
+      expect(h.ledger.listPendingDirectives({ jobId: h.jobId })).toHaveLength(before);
     } finally { await service.dispose(); }
   });
 

@@ -37,10 +37,10 @@ export interface RawExecutionReceipt {
   readonly stdout: string;
   readonly stderr: string;
   /** The host-authenticated runner report (#378): the one nonce-framed block
-   * the host extracted, or null when the run produced none. When the field is
-   * present the report is parsed ONLY from it, never from stdout. Absent only
-   * on synthetic receipts built outside the host executor. */
-  readonly report?: string | null;
+   * the host extracted, or null when the run produced none. Required on every
+   * receipt: the report is parsed ONLY from it, never from stdout, so no path
+   * can silently regain the forgeable stdout verdict. */
+  readonly report: string | null;
   readonly durationMs: number;
 }
 
