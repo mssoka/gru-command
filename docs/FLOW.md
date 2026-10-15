@@ -424,6 +424,48 @@ verification budget.
   producer frame). The protection assumes the event loop services the
   timer; a stall longer than the client's idle limit is outside it.
 
+- **Workers cannot bypass a declared contract (issue #315).** A job lane
+  whose `.gru-command/worktree.toml` declares `[verify]` scopes carries a
+  host-owned admission policy into both runtime adapters. A normal worker
+  Bash call that runs a known unscheduled producer (the raw `npm test`,
+  `npx vitest run …`, declared `npm run …` scripts, or their bare/local-bin
+  equivalents) is refused BEFORE any child process starts: the pi runtime
+  blocks the SDK `tool_call`, and claude-code loads a private PreToolUse
+  hook plus native Bash ask routing to the host policy. The refusal names the declared
+  scopes and the authenticated capture helper's `run`/`status` actions, so
+  the supported path and the timeout-reconcile step are always one message
+  away. The guard never rewrites the command string, never submits a run
+  itself and never infers coverage; ordinary reads, Git operations and the
+  capture helper run normally. It is a bounded refusal for the known
+  conventional producer forms, NOT a general-purpose shell sandbox — opaque
+  scripts, interpreters and adversarial evasion are out of scope.
+
+  Claude's private native `permissions.ask: ["Bash"]` routes each Bash
+  permission to an original-child-bound host stdio handler, including in
+  bypass mode and when the explanatory hook fails or is unavailable. The host
+  applies the immutable manifest policy, returning unchanged valid input for
+  source/Git/helper/diagnostic reads and denying known producers; malformed,
+  foreign or failed permission transport fails closed. No MCP authority or new
+  tools are granted. Private files survive disposal until every original
+  policy child actually closes. Error settlement and deadlines are not close.
+
+  Supported conventional normalization includes assignments, nested simple
+  env/command/time/exec/nohup/nice wrappers, npm aliases/options/workspace
+  operands, npx flags and known lane-local tool paths. Literal quoted text and
+  plaintext heredoc bodies remain data; supported executable substitutions in
+  expanding text are checked. Help/config inspection (including `vitest run
+  --help`) remains an ordinary read; `--` ends option interpretation. This
+  bounded grammar does not inspect arbitrary script/interpreter bodies.
+
+  The independent offline CLI double proves raw corpus dispositions, settings
+  and stdio wiring, not execution by a vendor CLI or paid model. The declared
+  native component scope exercises installed Claude 2.1.296 with the configured
+  `gpt-6-luna`/`max`, isolated state, fake credentials and deterministic
+  loopback upstream; it verifies matching successful Bash read results and
+  zero refused producer starts. That is actual vendor permission-engine
+  evidence for its captured exact head, not paid-model behavior or native
+  Perkins READY. Final integrated/FULL/remote CI acceptance remains separate.
+
 Managed repos still own their CI: this endpoint coordinates LOCAL
 verification runs inside lane worktrees — the orchestrator never hosts a
 tenant's CI.

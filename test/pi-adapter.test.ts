@@ -1,3 +1,4 @@
+import { BUILD_INCIDENT, FULL_INCIDENT, WEB_INCIDENT, authenticatedCaptureStatus, verificationLane } from './helpers/worker-verification.js';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -6,6 +7,7 @@ import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { configPathFor, loadConfig } from '../src/config.js';
 import { PiRuntime, normalizeSessionPath, type PiRuntimeOptions } from '../src/runtime/pi-adapter.js';
+import type { WorkerVerificationPolicy } from '../src/runtime/worker-verification-policy.js';
 import { RuntimeRegistry, applyThinkingFallback, serviceRegistryOptions } from '../src/runtime/registry.js';
 import { makeWorkflowLane } from './helpers/workflow-lane.js';
 import { makeFallbackRuntimeHarness } from './helpers/fallback-runtime.js';
@@ -3166,6 +3168,35 @@ describe('Perkins r1 regressions', () => {
     }
   });
 
+  it('issue #315: a declared-scope lane blocks the producer bash call before it starts', async () => {
+    const laneDir = mkdtempSync(join(tmpdir(), 'gru-command-315-'));
+    cleanupDirs.push(laneDir);
+    // If the guard ever failed, the shell redirect would still create the
+    // sentinel before npm runs — so its absence proves zero producer starts.
+    writeFileSync(join(laneDir, 'package.json'), JSON.stringify({
+      name: 'lane-fixture',
+      scripts: { test: 'node -e "require(\'node:fs\').writeFileSync(\'started.txt\',\'x\')"' },
+    }));
+    const sentinel = join(laneDir, 'started.txt');
+    const policy: WorkerVerificationPolicy = {
+      jobId: 'job-915', laneId: 'job-915', cwd: laneDir, scopes: ['full'],
+      producerPrefixes: [['npm', 'test']], helper: '/pkg/dist/verify/capture-cli.js', configFile: '/instance/config.toml',
+    };
+    const fx = await fixture([
+      { deltas: [], toolCall: { id: 'call-producer', name: 'bash', args: { command: 'npm test > started.txt' } } },
+      { deltas: ['refused'] },
+    ]);
+    const handle = await fx.runtime.spawn('gru', { cwd: laneDir, workerVerification: policy });
+    try {
+      await handle.prompt('run the declared verification', { owner: 'alice' });
+      expect(existsSync(sentinel)).toBe(false);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).toContain('Minion verification refused before execution');
+    } finally {
+      await handle.dispose();
+      await fx.runtime.dispose();
+    }
+  });
+
   it('W7: error turn — in-band completion: error event + state error, then recovers', async () => {
     const fx = await fixture([{ deltas: [], error: 'model exploded' }, { deltas: ['recovered'] }]);
     const handle = await fx.runtime.spawn('gru');
@@ -3603,4 +3634,164 @@ describe('typed provider-response provenance (r1 #13) — pure parsers', () => {
       status: 429,
     });
   });
+});
+describe('scheduled verification ordinary Pi Bash', () => {
+  async function refuses(input: string | ((cwd: string) => string), quality = false) {
+    const lane = verificationLane(quality); cleanupDirs.push(lane.root);
+    const command = typeof input === 'string' ? input : input(lane.lane.path);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = await fixture([
+      { deltas: [], toolCall: { id: 'verification-call', name: 'bash', args: { command } } },
+      { deltas: ['settled'] },
+    ]);
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt('attempt ordinary Bash');
+      expect(existsSync(lane.starts)).toBe(false);
+      const transcript = readFileSync(handle.sessionFile!, 'utf8');
+      expect(transcript).toContain('capture-cli.js');
+      expect(transcript).toContain('focused, full');
+      expect(transcript).toContain('no receipt was created');
+      await handle.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  }
+  it('scheduled verification guard refuses the exact web incident before any producer', async () => refuses(WEB_INCIDENT));
+  it('scheduled verification guard refuses the exact npm test incident before any producer', async () => refuses(FULL_INCIDENT));
+  it('scheduled verification guard refuses the entire exact build compound before its first producer', async () => refuses(BUILD_INCIDENT));
+
+
+  it('review-1 standalone lint refuses before any producer', async () => refuses('npm run lint'));
+  it('review-1 standalone typecheck refuses before any producer', async () => refuses('npm run typecheck'));
+  it('review-1 standalone build refuses before any producer', async () => refuses('npm run build'));
+  it('review-1 standalone build:web refuses before any producer', async () => refuses('npm run build:web'));
+  it('review-1 backend script refuses before any producer', async () => refuses('npm run test:backend'));
+  it('review-1 heavy backend script refuses before any producer', async () => refuses('npm run test:backend:heavy'));
+  it('review-1 web script refuses in a minimal lane', async () => refuses('npm run test:web'));
+  it('review-1 npm prefix normalization refuses before any producer', async () => refuses('npm --prefix web test'));
+  it('review-1 npx option normalization refuses before any producer', async () => refuses('npx --no-install vitest run'));
+  it('review-1 assignment-prefixed declared custom script refuses', async () => refuses('CI=1 npm run quality', true));
+  it('review-1 wrapper nesting and options refuse before any producer', async () => {
+    for (const command of ['env -i PATH="$PATH" npm test', 'env -u UNUSED command -p env --ignore-environment PATH="$PATH" npm test', 'command -- env --unset=UNUSED npm test']) await refuses(command);
+  });
+  it('review-1 adjacent redirects refuse before any producer', async () => {
+    for (const command of ['npm test>test.log', 'npm test 2>test.log', 'npm test>>test.log']) await refuses(command);
+  });
+  it('review-1 known direct local-bin paths refuse before any producer', async () => {
+    for (const command of ['./node_modules/.bin/vitest run', 'cd web && ../node_modules/.bin/vitest run']) await refuses(command);
+    await refuses((cwd) => `${join(cwd, 'node_modules/.bin/vitest')} run`);
+    await refuses((cwd) => `${join(cwd, 'web/node_modules/.bin/vitest')} run`);
+  });
+  it('review-1 executable producers outside literal heredocs refuse whole calls', async () => {
+    await refuses("cat <<'EOF'\nnpm test\nEOF\nnpm run build:web");
+    await refuses("npm test; cat <<'EOF'\nnpx vitest run\nEOF");
+  });
+  it('review-1 each conventional direct tool independently refuses', async () => {
+    for (const producer of ['vitest run', 'jest', 'tsc --noEmit', 'eslint .', 'vite build', 'playwright test']) {
+      await refuses(producer); await refuses(`npx ${producer}`);
+    }
+  });
+  it('scheduled verification preserves normal SDK source/Git/quoted-text and helper execution', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const capture = await authenticatedCaptureStatus(lane);
+    const command = `git status --short; printf '%s' 'npm test && npx vitest run'; ${capture.command}`;
+    const f = await fixture([{ deltas: [], toolCall: { id: 'source-call', name: 'bash', args: { command } } }, { deltas: ['done'] }]);
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session);
+      await handle.prompt('source inspection');
+      expect(capture.requests).toEqual(['GET /api/verify/status?request_id=existing']);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).toContain('existing');
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused');
+      await handle.dispose();
+    } finally { await f.runtime.dispose(); await capture.close(); }
+  });
+  it('review-1 literal source heredocs and development/setup actions remain normal Bash', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const command = "cat > source.txt <<'EOF'\nnpm test && npx vitest run\nEOF\ncat source.txt; vite; vite dev; npx vite preview; playwright install; npx playwright install-deps";
+    const f = await fixture([{ deltas: [], toolCall: { id: 'source-call', name: 'bash', args: { command } } }, { deltas: ['done'] }]);
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session); await handle.prompt('source work');
+      expect(existsSync(join(lane.lane.path, 'source.txt'))).toBe(true);
+      expect(readFileSync(join(lane.lane.path, 'source.txt'), 'utf8')).toBe('npm test && npx vitest run\n');
+      expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toHaveLength(5);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused');
+      await handle.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
+  it('review-2 npm aliases refuse independently before producer start', async () => {
+    for (const command of ['npm tst', 'npm run-script lint', 'npm exec -- vitest run', 'npm x -- vitest run', 'npm rum lint', 'npm urn lint']) await refuses(command);
+  });
+  it('review-2 conventional option positions refuse independently', async () => {
+    for (const command of ['npm --loglevel error test', 'npm run --if-present lint', 'npm --loglevel error run --if-present lint']) await refuses(command);
+  });
+  it('review-2 exact declared script words refuse independently', async () => {
+    for (const command of ['npm run test.unit', 'npm run-script check/unit']) await refuses(command, true);
+  });
+  it('review-2 root-relative web bin paths refuse independently', async () => {
+    for (const command of ['web/node_modules/.bin/vitest run', './web/node_modules/.bin/vitest run']) await refuses(command);
+  });
+  it('review-2 bounded control prefixes refuse entire calls', async () => {
+    for (const command of ['! npm test', '! printf ok | npm test', 'if npm test; then printf ok; fi', '( npm test )', '{ npm test; }']) await refuses(command);
+  });
+
+  it('review-2 plain unquoted source heredocs and diagnostic reads execute normally', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const command = "cat > source.txt <<EOF\nnpm test && npx vitest run\nEOF\ncat source.txt; tsc --version; tsc --showConfig; eslint --help; npx --no-install tsc --version; npm exec -- tsc --showConfig";
+    const f = await fixture([{ deltas: [], toolCall: { id: 'source-call', name: 'bash', args: { command } } }, { deltas: ['done'] }]);
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session); await handle.prompt('source reads');
+      expect(existsSync(join(lane.lane.path, 'source.txt'))).toBe(true);
+      expect(readFileSync(join(lane.lane.path, 'source.txt'), 'utf8')).toBe('npm test && npx vitest run\n');
+      expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toEqual(['tsc', 'tsc', 'eslint', 'npx', 'npm']);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused');
+      await handle.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
+  it('review-8 Pi SDK refuses option-terminator and heredoc-FD producers before any executable starts', async () => {
+    for (const command of ['npx vitest run -- --help', 'npm 0<<EOF test\nEOF\n']) await refuses(command);
+  });
+  it('strict repair every retained producing raw case refuses through ordinary Pi with zero starts', async () => {
+    const { nativeCorpus } = await import('./helpers/verification-native-corpus.mjs');
+    for (const row of nativeCorpus.filter((row) => row.refused)) await refuses(row.raw, true);
+  });
+  it('strict repair reopened real-SDK Pi preserves identity cwd workflow and refuses all incidents', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const f = await fixture([ { deltas: ['established'] },
+      ...[WEB_INCIDENT, FULL_INCIDENT, BUILD_INCIDENT].flatMap((command, index) => [
+        { deltas: [], toolCall: { id: `reopened-${index}`, name: 'bash', args: { command } } }, { deltas: ['settled'] },
+      ]),
+    ]);
+    try {
+      const first = await f.runtime.spawn('minion', lane.session); await first.prompt('establish');
+      const id = first.id; const file = first.sessionFile!; await first.dispose();
+      const retained = JSON.stringify(lane.session.managedSkills);
+      const reopened = await f.runtime.spawn('minion', { ...lane.session, resumeFile: file });
+      expect(reopened.id).toBe(id); expect(reopened.sessionFile).toBe(file);
+      for (const incident of [WEB_INCIDENT, FULL_INCIDENT, BUILD_INCIDENT]) await reopened.prompt(incident);
+      expect(existsSync(lane.starts)).toBe(false);
+      expect(readFileSync(file, 'utf8')).toContain('focused, full');
+      expect(JSON.stringify(lane.session.managedSkills)).toBe(retained);
+      expect(readFileSync(file, 'utf8')).toContain(lane.lane.path);
+      await reopened.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
+  it('strict repair expanding escaped source plaintext and help diagnostics execute ordinary Pi', async () => {
+    const lane = verificationLane(); cleanupDirs.push(lane.root);
+    const oldPath = process.env['PATH']; process.env['PATH'] = `${lane.bin}:${oldPath ?? ''}`;
+    const command = "cat > escaped.txt <<EOF\n\\$(npm test)\n\\`npm test\\`\nEOF\ncat > empty.txt <<''\nnpm test\n\ncat escaped.txt empty.txt; tsc --pretty false --showConfig; npx vitest run --help";
+    const f = await fixture([{ deltas: [], toolCall: { id: 'escaped-source', name: 'bash', args: { command } } }, { deltas: ['done'] }]);
+    try {
+      const handle = await f.runtime.spawn('minion', lane.session); await handle.prompt('source');
+      expect(readFileSync(join(lane.lane.path, 'escaped.txt'), 'utf8')).toBe('$(npm test)\n`npm test`\n');
+      expect(readFileSync(join(lane.lane.path, 'empty.txt'), 'utf8')).toBe('npm test\n');
+      expect(readFileSync(lane.starts, 'utf8').trim().split('\n')).toEqual(['tsc', 'npx']);
+      expect(readFileSync(handle.sessionFile!, 'utf8')).not.toContain('Minion verification refused'); await handle.dispose();
+    } finally { process.env['PATH'] = oldPath; await f.runtime.dispose(); }
+  });
+
 });

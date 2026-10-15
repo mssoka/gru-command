@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventBus } from '../src/events/bus.js';
@@ -12,7 +12,38 @@ import type { AgentCapabilities, AgentHandle, SpawnOptions } from '../src/runtim
 import type { Role } from '../src/config.js';
 import { finalizeRebriefRequest, reconcilePendingRebriefs } from '../src/dispatch/rebrief-recovery.js';
 import type { DirectiveRegistry } from '../src/dispatch/fix-directive.js';
+import {
+  admitBlindReview,
+  blindCoverageOf,
+  observeBlindSessionAccess,
+  recordBlindAdmission,
+  BLIND_ACCESS_EVENT,
+} from '../src/dispatch/blind-review.js';
 import { PacingGate } from '../src/runtime/pacing.js';
+
+const BASE_SHA = 'a'.repeat(40);
+const TARGET_SHA = 'f'.repeat(40);
+
+/** A pi-session toolResult line (what the reviewer's session jsonl holds). */
+const sessionToolResult = (text: string): string =>
+  `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: text } })}\n`;
+
+/** Admit `jobId` as a blind review so the re-brief settle seam has an
+ * isolation rule to judge the re-briefed session's tool access against. */
+function admitBlindJob(h: Harness, jobId: string): void {
+  const admission = admitBlindReview({
+    ledger: h.ledger,
+    jobId,
+    title: 'review (blind)',
+    deliverable: 'review',
+    briefing: 'Review the immutable package read-only.',
+    targetSha: TARGET_SHA,
+    repoName: 'fixture',
+    inputPackage: { baseSha: BASE_SHA, targetSha: TARGET_SHA, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+  });
+  if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+  recordBlindAdmission(h.ledger, jobId, admission);
+}
 
 /**
  * Re-brief restart safety (Silas finding 2026-09-23): the durable marker
@@ -62,6 +93,10 @@ class FakeAgents implements DirectiveRegistry {
   healthError: string | null = null;
   /** When set, every minion prompt waits on this gate before settling. */
   gate: Promise<void> | null = null;
+  /** Issue #339: the side effect a real turn has on its session — tests append
+   * the continuation's reads HERE, so a scan placed before delivery reads a
+   * clean file and cannot pass by reading prewritten contamination. */
+  promptEffect: ((text: string) => void) | null = null;
   private readonly expectedSessionFile: string | null;
 
   constructor(expectedSessionFile: string | null = null) {
@@ -89,6 +124,7 @@ class FakeAgents implements DirectiveRegistry {
   private handleFor(record: { id: string; role: Role; options: SpawnOptions; prompts: string[] }): AgentHandle {
     const gate = (): Promise<void> | null => this.gate;
     const failPrompt = (): Error | null => this.failPrompt;
+    const promptEffect = (): ((text: string) => void) | null => this.promptEffect;
     const healthState = (): 'idle' | 'error' => this.healthState;
     const healthError = (): string | null => this.healthError;
     const disposedSpawned = this.disposedSpawned;
@@ -99,6 +135,7 @@ class FakeAgents implements DirectiveRegistry {
       capabilities: FAKE_CAPABILITIES,
       async prompt(text: string): Promise<void> {
         record.prompts.push(text);
+        promptEffect()?.(text);
         const pending = gate();
         if (pending !== null) await pending;
         const failure = failPrompt();
@@ -377,6 +414,40 @@ describe('re-brief restart safety (durable markers)', () => {
     expect(recovered?.payload).toMatchObject({ path: 'resumed' });
     expect(h.ledger.latestJobEvent(jobId, 'job.delivered')).not.toBeNull();
     expect(h.ledger.listPendingRebriefs()).toHaveLength(0);
+  });
+
+  it('boot re-brief observes the resumed session and invalidates blind coverage (issue #339 P4)', async () => {
+    const h = makeHarness();
+    const jobId = 'blind-rebrief-job';
+    const sessionFile = join(h.dir, 'sessions', 'reviewer-crashed.jsonl');
+    mkdirSync(join(h.dir, 'sessions'), { recursive: true });
+    // The resumed session STARTS clean; the continuation turn appends its own
+    // prohibited read during delivery, so a scan that ran before the prompt
+    // reads a clean session and cannot pass (issue #339 F5).
+    writeFileSync(sessionFile, '{}\n');
+    await seedPendingRebrief({ h, jobId, bindWorker: { agentId: 'reviewer-crashed', sessionFile } });
+    admitBlindJob(h, jobId);
+    h.registry.promptEffect = () => { appendFileSync(sessionFile, sessionToolResult('docs/issues/305-review.md:1:prior assessment')); };
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
+    const report = await reconcilePendingRebriefs(
+      {
+        registry: h.registry,
+        ledger: h.ledger,
+        worktrees: h.worktrees,
+        notifications: h.notifications,
+        observeBlindTurn: (recoveredJobId, recoveredSession) =>
+          observeBlindSessionAccess(h.ledger, recoveredJobId, recoveredSession),
+      },
+      { bootAt: new Date(Date.now() + 60_000) },
+    );
+    await report.settled;
+    expect(h.registry.workers[0]?.options.resumeFile).toBe(sessionFile);
+    // Deleting the forwarding line in runRebriefTurn leaves coverage
+    // qualifying and fails this assertion.
+    expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).not.toBeNull();
+    expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+      state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+    });
   });
 
   it('never resumes a review-only session, however new its row is (Gru ruling 2026-09-29)', async () => {
