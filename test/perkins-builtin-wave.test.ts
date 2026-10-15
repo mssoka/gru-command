@@ -8,8 +8,6 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterEach, chai, describe, expect, it, vi } from 'vitest';
 
-/** Vitest's bundled chai: no separate chai devDependency (#391). */
-const ChaiAssertionError = chai.AssertionError;
 import {
   AutoVerdictPoster,
   DefiniteNonDeliveryError,
@@ -51,6 +49,9 @@ import {
   type BoardSnapshot as WireBoardSnapshot,
 } from '../web/src/lib/board-protocol.js';
 import { terminalBoundNotificationIds } from '../web/src/lib/board-signals.js';
+
+/** Vitest's bundled chai: no separate chai devDependency (#391). */
+const ChaiAssertionError = chai.AssertionError;
 
 async function assertFormalEventAssertion(tag: string, assertion: () => unknown): Promise<void> {
   try {
@@ -174,6 +175,7 @@ import { minimalPng } from './helpers/images.js';
 import { renderRecordedVerification } from '../src/verify/evidence.js';
 import { GitReviewPort } from './helpers/git-review-port.js';
 import { PersistedReviewPort } from './helpers/persisted-review-port.js';
+
 
 class DeferredReviewPort implements WorktreePort {
   constructor(

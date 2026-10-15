@@ -87,12 +87,18 @@ export interface NodeStreamFetchOptions {
  *
  * Connecting and receiving the response HEADERS are bounded (#389): the
  * verify service writes its 200 before any queue wait, so this bound only
- * ends a service that is unreachable or accepted the connection and never
- * answered — a named transport error in the receipt instead of a hang. The
+ * ends a service that is silently unreachable (a refused connection fails
+ * at once with ECONNREFUSED) or accepted the connection and never answered
+ * — a named transport error in an UNKNOWN receipt instead of a hang. The
  * body stays unbounded: a long quiet run is never cut off.
  */
 export function nodeStreamFetch(input: string, init?: RequestInit, options: NodeStreamFetchOptions = {}): Promise<Response> {
   const responseHeadersTimeoutMs = options.responseHeadersTimeoutMs ?? CAPTURE_RESPONSE_HEADERS_TIMEOUT_MS;
+  if (!Number.isFinite(responseHeadersTimeoutMs) || responseHeadersTimeoutMs <= 0) {
+    // A zero/negative/NaN bound would fire at once and fail every request
+    // with a misleading timeout; refuse the misconfiguration by name.
+    throw new RangeError(`responseHeadersTimeoutMs must be a positive finite number of milliseconds (got ${String(responseHeadersTimeoutMs)})`);
+  }
   return new Promise((resolve, reject) => {
     const url = new URL(input);
     const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
@@ -206,7 +212,8 @@ export function nodeStreamFetch(input: string, init?: RequestInit, options: Node
       request.destroy(Object.assign(
         new Error(
           `${method} ${url.origin}${url.pathname}: no response within ${String(responseHeadersTimeoutMs)} ms ` +
-            '(connect + response headers) — the service is unreachable or hung',
+            '(connect + response headers) — the service is silently unreachable or hung; a sent request may ' +
+            'still have been accepted, so the outcome is unknown (check status with the same request id before rerunning)',
         ),
         { code: CAPTURE_RESPONSE_TIMEOUT_CODE },
       ));

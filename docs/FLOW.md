@@ -381,10 +381,12 @@ verification budget.
   honest failure (the outcome is known, the original full capture is not
   reconstructable, and a rerun to recover logs is refused). Connecting
   and receiving the response headers are bounded (60 s, #389): a
-  service that is unreachable or never answers yields an `unknown`
-  receipt whose error names the timeout (`ERESPONSETIMEOUT`) instead of
-  a hung helper; the body itself has no idle timeout, so a long quiet run
-  is never cut off. Owned helpers are withdrawn only with identity validation
+  service that is silently unreachable or never answers yields an
+  `unknown` receipt whose error names the timeout (`ERESPONSETIMEOUT`)
+  instead of a hung helper (a refused connection fails at once with
+  `ECONNREFUSED`). A sent request may still have been accepted, so check
+  `status` with the same request id before rerunning; the body itself has
+  no idle timeout, so a long quiet run is never cut off. Owned helpers are withdrawn only with identity validation
   (pid + start time + command/cwd); malformed pid records, crashes and
   stale owners are cleared without touching unrelated processes, and
   sinks/receipts are preserved.

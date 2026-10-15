@@ -652,6 +652,7 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       const error = await nodeStreamFetch(`${base}/api/verify`, { method: 'POST', body: '{}' }, { responseHeadersTimeoutMs: 150 })
         .then(() => null, (cause: unknown) => cause as NodeJS.ErrnoException);
       expect(error?.message).toMatch(/POST http:\/\/127\.0\.0\.1:\d+\/api\/verify: no response within 150 ms \(connect \+ response headers\)/u);
+      expect(error?.message).toContain('outcome is unknown');
       expect(error?.code).toBe(CAPTURE_RESPONSE_TIMEOUT_CODE);
       expect(Date.now() - started).toBeLessThan(5_000);
 
@@ -682,16 +683,23 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     }
   });
 
+  it('refuses a non-positive or non-finite headers bound by name instead of failing every request (#389)', () => {
+    for (const bound of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => nodeStreamFetch('http://127.0.0.1:9/x', undefined, { responseHeadersTimeoutMs: bound }), String(bound))
+        .toThrow(/responseHeadersTimeoutMs must be a positive finite number/u);
+    }
+  });
+
   it('the headers bound ends at the response: a body quiet for longer than it still streams to EOF (#389)', async () => {
     const server = createServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/x-ndjson' });
       res.write('first\n');
-      setTimeout(() => res.end('second\n'), 400);
+      setTimeout(() => res.end('second\n'), 1_500);
     });
     await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
     try {
       const port = (server.address() as AddressInfo).port;
-      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/quiet`, undefined, { responseHeadersTimeoutMs: 100 });
+      const response = await nodeStreamFetch(`http://127.0.0.1:${String(port)}/quiet`, undefined, { responseHeadersTimeoutMs: 750 });
       expect(await response.text()).toBe('first\nsecond\n');
     } finally {
       server.closeAllConnections();

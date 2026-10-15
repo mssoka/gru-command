@@ -383,7 +383,7 @@ const PINS: Record<string, number> = {
   'prompt-verdict.test.ts': 6,
   'test-budgets.test.ts': 10,
   'tool-call-policy.test.ts': 12,
-  'verification-capture.test.ts': 38,
+  'verification-capture.test.ts': 39,
 
 };
 

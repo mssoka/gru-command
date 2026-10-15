@@ -623,11 +623,12 @@ function isMatchingAppReviewWithUnverifiableTime(review: ProviderReview, botLogi
  *
  * An explicit provider `null` in state/commit_id/body is a typed non-value
  * (GitHub nulls a review's commit_id once its commit is garbage-collected):
- * it can never satisfy a delivery predicate, so on a review provably NOT
- * authored by our App bot it is a decidable non-match and an unrelated
- * review cannot hold the walk unresolved forever (#390, main's #182 rule).
- * On a review whose login is our bot's it may be this publication with a
- * nulled field, so it stays undecidable. */
+ * it can never satisfy a delivery predicate, so on a review whose author
+ * fails the predicates' own author check (login AND `Bot` type) it is a
+ * decidable non-match and an unrelated review cannot hold the walk
+ * unresolved forever (#390, main's #182 rule). On a review that passes the
+ * author check it may be this publication with a nulled field, so it stays
+ * undecidable. */
 function isDecidableReviewEntry(entry: unknown, windowed: boolean, botLogin: string): entry is ProviderReview {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
   const record = entry as Record<string, unknown>;
@@ -650,7 +651,9 @@ function isDecidableReviewEntry(entry: unknown, windowed: boolean, botLogin: str
       if (typeof author[field] !== 'string') return false;
     }
   }
-  const mayBeOurs = user !== null && (user as Record<string, unknown>)['login'] === botLogin;
+  // The same author check every delivery predicate applies (matchesDeliveryPredicates).
+  const mayBeOurs = user !== null && (user as Record<string, unknown>)['login'] === botLogin &&
+    (user as Record<string, unknown>)['type'] === 'Bot';
   for (const field of ['state', 'commit_id', 'body'] as const) {
     const value = record[field];
     if (typeof value === 'string') continue;

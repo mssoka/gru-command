@@ -5,8 +5,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, chai, describe, expect, it, vi } from 'vitest';
 
-/** Vitest's bundled chai: no separate chai devDependency (#391). */
-const ChaiAssertionError = chai.AssertionError;
 import {
   createGithubVerdictPoster,
   createStartupVerdictPoster,
@@ -22,6 +20,9 @@ import {
 } from '../src/dispatch/perkins-github-app.js';
 import { AutoVerdictPoster, DefiniteNonDeliveryError, GhPrPoster, GitLabMrPoster, type VerdictPoster, type VerdictPosterInput } from '../src/dispatch/perkins.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+
+/** Vitest's bundled chai: no separate chai devDependency (#391). */
+const ChaiAssertionError = chai.AssertionError;
 
 async function assertFormalEventAssertion(tag: string, assertion: () => unknown): Promise<void> {
   try {
@@ -1628,9 +1629,11 @@ describe('bounded ambiguous-POST reconciliation', () => {
     // GitHub nulls commit_id once a review's commit is garbage-collected: a
     // human's review on an old, force-pushed head must not hold every later
     // walk unresolved. A typed null can never match a delivery predicate.
-    for (const author of [{ login: 'other-user', type: 'User' }, null] as const) {
+    // Our bot's login with a non-Bot type fails the predicates' author check too.
+    const sameLoginUser = { login: MATCHING_REVIEW.user.login, type: 'User' };
+    for (const author of [{ login: 'other-user', type: 'User' }, sameLoginUser, null] as const) {
       for (const nulled of ['state', 'commit_id', 'body'] as const) {
-        const label = `${author === null ? 'ghost' : author.login}:${nulled}`;
+        const label = `${author === null ? 'ghost' : `${author.login}/${author.type}`}:${nulled}`;
         const foreign = {
           id: 3133,
           user: author,
