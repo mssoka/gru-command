@@ -1993,7 +1993,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     try {
       symlinkSync('package.json', join(repo.path, '.mcp.json'));
       repo.git(['add', '.mcp.json']);
-      repo.git(['commit', '-q', '-m', 'link']);
+      repo.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-q', '-m', 'link']);
       rmSync(join(repo.path, '.mcp.json'));
       writeFileSync(join(repo.path, '.mcp.json'), '{}');
       expect(await checkedInProjectMcpConfig(repo.path)).toEqual({ reason: 'the committed .mcp.json is not a regular file' });
@@ -2111,7 +2111,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         const raw = (byte: number, eol: number[]) => Buffer.concat([Buffer.from('{"mcpServers":{},"note":"'), Buffer.from([byte]), Buffer.from('"}'), Buffer.from(eol)]);
         writeFileSync(join(crlf.path, '.mcp.json'), raw(0xff, [0x0a]));
         crlf.git(['add', '.mcp.json']);
-        crlf.git(['commit', '-q', '-m', 'raw bytes']);
+        crlf.git(['-c', 'user.name=Fixture Tests', '-c', 'user.email=tests@example.invalid', 'commit', '-q', '-m', 'raw bytes']);
         expect(await checkedInProjectMcpConfig(crlf.path)).toMatchObject({ config: expect.anything() });
         writeFileSync(join(crlf.path, '.mcp.json'), raw(0xfe, [0x0d, 0x0a]));
         expect(await checkedInProjectMcpConfig(crlf.path)).toEqual({ reason: '.mcp.json differs from its committed version' });
