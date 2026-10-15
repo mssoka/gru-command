@@ -1965,3 +1965,46 @@ describe('Perkins lane-B r4: a swept row with a surviving branch HEALS on releas
     expect(repo.git(['branch', '--list', row.branch!])).toBe('');
   });
 });
+
+// ------------------------------------------------------------------
+// Issue #243 F-H1: automatic (unattended) release proofs
+// ------------------------------------------------------------------
+
+describe('issue #243 F-H1 automatic release proofs', () => {
+  it('refuses an UNATTENDED release that would destroy dirty tracked work, retaining the tree', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-dirty', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-dirty' });
+    // A tracked modification the forced removal would destroy (only `??`
+    // untracked entries are preserved by the sweep).
+    writeFileSync(join(row.path, 'README.md'), 'modified tracked content\n');
+    await expect(
+      h.manager.release({ worktreeId: 'job-fh1-dirty', requireReleaseProofs: true }),
+    ).rejects.toThrow(/automatic sweep refused: 1 tracked change/);
+    // The tree and the registry row are retained for the operator to resolve.
+    expect(existsSync(row.path)).toBe(true);
+    expect(h.ledger.getWorktree('job-fh1-dirty')?.status).toBe('active');
+    expect(readFileSync(join(row.path, 'README.md'), 'utf-8')).toBe('modified tracked content\n');
+  });
+
+  it('sweeps an UNATTENDED release of a clean lane (intact-positive control)', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-clean', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-clean' });
+    const result = await h.manager.release({ worktreeId: 'job-fh1-clean', requireReleaseProofs: true });
+    expect(result.status).toBe('swept');
+    expect(existsSync(row.path)).toBe(false);
+  });
+
+  it('keeps the operator path authoritative: no proof flag still sweeps a dirty lane', async () => {
+    const h = harness();
+    const repo = h.make();
+    ledgerJob(h, 'job-fh1-oper', repo);
+    const row = await h.manager.createJobWorktree({ repoPath: repo.path, jobId: 'job-fh1-oper' });
+    writeFileSync(join(row.path, 'README.md'), 'operator chose to discard this\n');
+    const result = await h.manager.release({ worktreeId: 'job-fh1-oper' });
+    expect(result.status).toBe('swept');
+  });
+});

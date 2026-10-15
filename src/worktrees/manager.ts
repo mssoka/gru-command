@@ -959,6 +959,11 @@ export class WorktreeManager {
     worktreeId: string;
     confirmKill?: boolean;
     baseBranch?: string;
+    /** Issue #243 F-H1: the UNATTENDED autopilot release must prove tracked
+     * cleanliness and fresh required containment BEFORE any forced removal —
+     * an operator release keeps its current answer/confirm authority and
+     * leaves this false. */
+    requireReleaseProofs?: boolean;
   }): Promise<SweepResult> {
     const row = this.opts.ledger.getWorktree(input.worktreeId);
     if (row === null) {
@@ -1015,6 +1020,14 @@ export class WorktreeManager {
         // note — and the response reports the TRUE outcome.
         const reconciled = this.reconcileMissingTree(row, input.baseBranch);
         return { status: 'swept', preserved: null, ...reconciled } as const;
+      }
+      // (0.9) AUTOMATIC RELEASE PROOFS (issue #243 F-H1): an unattended sweep
+      // must refuse BEFORE the forced removal when tracked work would be
+      // destroyed or fresh required containment cannot be proven. The real
+      // removal is `worktree remove --force`, which preserves only `??`
+      // untracked entries — dirty TRACKED work is not retained, so it refuses.
+      if (input.requireReleaseProofs === true) {
+        this.assertAutomaticReleaseProofs(row);
       }
       // (1) Preserve untracked deliverables FIRST — before any process
       // decision, before any removal. Deliverables are never hostages.
@@ -1588,6 +1601,38 @@ export class WorktreeManager {
       this.log('error', 'creation rollback custody unconfirmed; resources retained', { path, error: String(error) });
       throw new AggregateError([originalError, error],
         `worktree creation failed (${String(originalError)}); rollback custody unconfirmed for ${path} — inspect retained resources before retry`);
+    }
+  }
+
+  /** Issue #243 F-H1: the pre-removal proofs an UNATTENDED release owes
+   * BEFORE `worktree remove --force`. Refuses (tree retained) when:
+   *  - tracked work is dirty — the forced removal destroys it, since only
+   *    `??` untracked entries are preserved; or
+   *  - fresh required containment cannot be proven (the base cannot be
+   *    freshly resolved, so the missing-fresh-evidence removal is refused).
+   * A live process is NOT handled here: the preserve/pause-and-ask tail owns
+   * it and the human answer stays absolute. */
+  private assertAutomaticReleaseProofs(row: WorktreeRecord): void {
+    const status = runGit(row.path, ['status', '--porcelain', '-z', '--untracked-files=all']);
+    const tracked = status
+      .split('\0')
+      .filter((entry) => entry !== '')
+      .filter((entry) => !entry.startsWith('?? '))
+      .map((entry) => (entry.length > 3 ? entry.slice(3).trim() : entry.trim()))
+      .filter((entry) => entry !== '');
+    if (tracked.length > 0) {
+      throw new Error(
+        `automatic sweep refused: ${tracked.length} tracked change(s) in ${row.path} would be destroyed ` +
+          `(only untracked deliverables are preserved) — commit, stash or discard them and re-release; ` +
+          `tracked: ${tracked.slice(0, 5).join(', ')}`,
+      );
+    }
+    try {
+      this.resolveBase(row.repoPath);
+    } catch (error) {
+      throw new Error(
+        `automatic sweep refused: fresh required containment cannot be proven for ${row.path} (${String(error)}) — the tree is retained`,
+      );
     }
   }
 

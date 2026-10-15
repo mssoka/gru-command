@@ -1545,6 +1545,12 @@ interface AdmissionRetryInput {
   readonly noSpec?: boolean;
   readonly evidence?: readonly ReviewEvidenceRequest[];
   readonly claimedFixedPriors?: readonly number[];
+  /** Issue #243 H2/M2: the caller's LAST admission guard is carried through
+   * the in-memory automatic retry so EVERY readmission re-proves the
+   * original family/basis owner hold and the latest repo/PR/SHA-bound green.
+   * The closure re-reads the ledger when invoked, so it never becomes stale
+   * evidence; a first-attempt guard is not lifetime coverage. */
+  readonly finalAdmissionGuard?: () => void;
 }
 
 /** One job's automatic admission retry, held IN MEMORY only (owner decision
@@ -1577,6 +1583,7 @@ function admissionRetryInput(input: AdmissionRetryInput): AdmissionRetryInput {
     ...(input.noSpec !== undefined ? { noSpec: input.noSpec } : {}),
     ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
     ...(input.claimedFixedPriors !== undefined ? { claimedFixedPriors: input.claimedFixedPriors } : {}),
+    ...(input.finalAdmissionGuard !== undefined ? { finalAdmissionGuard: input.finalAdmissionGuard } : {}),
   };
 }
 
@@ -1681,6 +1688,12 @@ export interface ReviewRequestInput {
     /** Internal: the automatic admission retry this request carries out;
      * never accepted from the public HTTP endpoint. */
     admissionRetry?: AdmissionRetry;
+    /** Internal: the caller's LAST admission guard (issue #243 F-H2/M2). It is
+     * invoked after every awaited setup/probe step and immediately before any
+     * admission effect, so an owner hold or a CI change that landed during
+     * the awaits refuses the round instead of arming stale work. Never accepted
+     * from the public HTTP endpoint. */
+    finalAdmissionGuard?: () => void;
 }
 
 export class WaveRunner {
@@ -3281,6 +3294,9 @@ export class WaveRunner {
     /** What a forced request authorized at its original arm (#267): the
      * freeze and post-probe checks cover only that work. In memory only. */
     forceAuthorization?: ForceAuthorization;
+    /** Issue #243 F-H2/M2: the caller's last admission guard (see
+     * ReviewRequestInput.finalAdmissionGuard). */
+    finalAdmissionGuard?: () => void;
   }): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown) throw new Error('Perkins review service is shutting down');
     if (this.roundAdmission.has(input.jobId)) throw new RoundAdmissionInProgress(input.jobId);
@@ -4154,6 +4170,9 @@ export class WaveRunner {
     /** What a forced request authorized at its original arm (#267): the
      * freeze and post-probe checks cover only that work. In memory only. */
     forceAuthorization?: ForceAuthorization;
+    /** Issue #243 F-H2/M2: the caller's last admission guard (see
+     * ReviewRequestInput.finalAdmissionGuard). */
+    finalAdmissionGuard?: () => void;
   }, setupSignal: AbortSignal): Promise<{ readonly round: RoundRecord; readonly run: Promise<WaveOutcome> }> {
     if (this.shuttingDown || setupSignal.aborted) throw new Error('Perkins review service is shutting down');
     // R7-14: the delivery THIS round reviews — fixed before any await, so a
@@ -4546,6 +4565,27 @@ export class WaveRunner {
         if (input.armedTargetRef !== undefined) this.assertNamedTargetIdentity(jobWorktree.path, input.armedTargetRef);
         this.assertNamedTargetIdentity(jobWorktree.path, movementRef);
       }
+      // Issue #243 F-H7: the recorded-delivery ledger is INDEPENDENT of
+      // branch idleness — a completed same-revision delivery B can leave the
+      // lane idle while an explicitly pinned SHA A stays immutable, so the
+      // post-probe branch recheck above cannot see the drift. Re-prove the
+      // bound delivered head HERE, at the last boundary before any admission
+      // effect, so A never freezes after B arrived during the final probe.
+      if (input.boundDeliveredSha !== undefined) {
+        const deliveredNow = this.opts.ledger.latestJobEvent(job.id, 'job.delivered');
+        const shaNow = deliveredNow === null ? null : deliveredTargetSha(deliveredNow);
+        if (shaNow !== input.boundDeliveredSha) {
+          throw new Error(
+            `the bound delivered head moved during the final admission probe (${input.boundDeliveredSha} -> ${shaNow ?? 'none'}) — request the review again`,
+          );
+        }
+      }
+      // Issue #243 F-H2/M2: the caller's LAST admission guard runs here,
+      // after every awaited setup/probe step and immediately before any
+      // admission effect — a family/basis owner hold or a CI observation that
+      // landed during the awaits refuses instead of arming stale work. This is
+      // a caller-supplied guard (no private schema/ingress invented here).
+      input.finalAdmissionGuard?.();
       this.opts.ledger.appendCustomEvent({
         kind: 'round.admission-preflight',
         jobId: job.id,

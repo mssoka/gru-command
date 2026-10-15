@@ -333,6 +333,7 @@ function pendingMarker(
     sessionFile: null,
     ruleId: null,
     sourceRoundId: null,
+    source: null,
     workRevision: null,
     // Ordinary re-brief (no explicit completion intent): PR136's
     // phase-handoff identity is optional and null here.

@@ -83,6 +83,11 @@ export interface RoundBlocker {
    * part of the base fingerprint (it churns every round) — it only breaks
    * same-key ties inside roundBlockerKeys. */
   readonly evidence?: string;
+  /** The reviewer's recommended fix, when the report carried one. The
+   * autopilot's templated directive (issue #243) is the only consumer: a
+   * bullet without one refuses and leaves the row to LLM Silas. Never
+   * part of the fingerprint or of the digest row's decision projection. */
+  readonly recommendedFix?: string;
   /** Severity and detail ride along when the source report carries them —
    * they are PROJECTED OUT of the digest rows (kept byte-stable below)
    * but the #224 same-blocker shadow ask uses the fuller facts so its
@@ -394,6 +399,15 @@ export function consolidatedBlockersFor(ledger: DigestLedger): BlockersForRound 
           ...(typeof finding.detail === 'string' && finding.detail.trim() !== ''
             ? { detail: finding.detail }
             : {}),
+          // The reviewer's recommended fix (issue #243): carried for the
+          // autopilot's templated directive only — out of the fingerprint
+          // and out of the digest row projection, so provenance and the
+          // wake gate stay byte-stable. The consolidated report writes the
+          // finding field as `recommended_fix` (perkins-review types).
+          ...(typeof (finding as { recommended_fix?: unknown }).recommended_fix === 'string' &&
+          ((finding as { recommended_fix?: string }).recommended_fix ?? '').trim() !== ''
+            ? { recommendedFix: (finding as { recommended_fix: string }).recommended_fix }
+            : {}),
         }));
       return Promise.resolve({ blockers, note: null });
     } catch (error) {
@@ -584,7 +598,7 @@ export interface SilasOpsDigest {
   readonly verificationsOwed: readonly VerificationOwedRow[];
 }
 
-/** Count of actionable rows (event triggers wake even at zero; sweeps do not). */
+/** Count of actionable rows (an empty digest never wakes, issue #243). */
 export function digestActionCount(digest: SilasOpsDigest): number {
   return (
     digest.deliveredWithoutPr.length +
@@ -1631,6 +1645,7 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
             title: blocker.title,
             location: blocker.location,
             ...(blocker.evidence !== undefined ? { evidence: blocker.evidence } : {}),
+            ...(blocker.recommendedFix !== undefined ? { recommendedFix: blocker.recommendedFix } : {}),
             fingerprint,
             consecutiveRounds,
             advice: adviseFollowThrough(consecutiveRounds, input.config),
@@ -2078,9 +2093,26 @@ export async function computeSilasDigest(input: ComputeDigestInput): Promise<Sil
     return recheck > dispositionNow ? [] : [failure];
   };
   const verificationFailures = digest.verificationFailures.filter(continuationAllowed).flatMap(failureAttention);
+  // Issue #243 F-M1: an accepted directive or re-brief producer owns the
+  // lane from its durable request until its completion receipt. While that
+  // ownership is unresolved the recomputed verdict row is NOT actionable —
+  // code already owns the work — so publishing it only buys a redundant
+  // max-thinking model wake. This is the ledger's own writer-ownership test,
+  // not the earlier recovery-hold history.
+  const liveWriterOwns = (jobId: string): boolean =>
+    input.ledger.listPendingDirectives({ jobId, states: LIVE_DIRECTIVE_STATES }).length > 0 ||
+    input.ledger.listPendingRebriefs({ jobId }).length > 0;
   return {
     ...digest,
-    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(continuationAllowed),
+    // Issue #243 original-M2 carry-forward: the publish boundary must not
+    // offer a verdict row while a verification owns the lane. The digest
+    // computed the row before that verification settled in; without this
+    // fence a verdict row leaks to LLM Silas (a model wake) even though
+    // every autopilot verdict planner refuses it. Re-read at this final,
+    // no-await boundary like the sibling fences.
+    verdictsAwaitingDirective: digest.verdictsAwaitingDirective.filter(
+      (row) => continuationAllowed(row) && !verificationInFlight(input.ledger, row.jobId) && !liveWriterOwns(row.jobId),
+    ),
     verificationFailures,
     verificationWaits: digest.verificationWaits.filter(continuationAllowed),
     minionErrors: digest.minionErrors.filter(continuationAllowed),
@@ -2749,13 +2781,14 @@ export class SilasDriver {
   }
 
   /** Compute the digest; wake the slot only when there is something to
-   * do. Sweeps skip empty digests AND digests whose decision-relevant
-   * fingerprint is unchanged (issue #217) — unless the bounded safety
-   * re-look elapsed (`[silas] unchanged_rewake_ms`) or a recorded
-   * decision recheck passed since the last delivered wake (#218; a due
-   * recheck wakes even when the digest is empty, because the decision
-   * that stopped covering may be re-suppressing rows). Event wakes
-   * always deliver — the event itself is context Silas should see. */
+   * do. An empty digest is suppressed for EVERY trigger (issue #243): with
+   * the autopilot enforced, an event whose rows the code already handled
+   * must not buy a max-thinking turn. Sweeps additionally skip digests
+   * whose decision-relevant fingerprint is unchanged (issue #217) — unless
+   * the bounded safety re-look elapsed (`[silas] unchanged_rewake_ms`) or a
+   * recorded decision recheck passed since the last delivered wake (#218; a
+   * due recheck wakes even when the digest is empty, because the decision
+   * that stopped covering may be re-suppressing rows). */
   private async runWake(trigger: SilasTrigger): Promise<void> {
     let digest: SilasOpsDigest;
     try {
@@ -2777,12 +2810,17 @@ export class SilasDriver {
     }
     const actionable = digestActionCount(digest);
     const fingerprint = digestFingerprint(digest);
+    const recheckDue = this.decisionRecheckDue();
+    if (actionable === 0 && !recheckDue) {
+      // Issue #243: with families enforced the autopilot has already handled
+      // the rows an event raised, so the recomputed digest is empty and the
+      // event must not buy a max-thinking turn. LLM Silas wakes only when
+      // rows remain that need judgment. A due #218 decision recheck still
+      // wakes (the decision that stopped covering may re-suppress rows).
+      this.log('info', 'silas wake found nothing actionable', { trigger: trigger.kind });
+      return;
+    }
     if (trigger.kind === 'sweep') {
-      const recheckDue = this.decisionRecheckDue();
-      if (actionable === 0 && !recheckDue) {
-        this.log('info', 'silas sweep found nothing actionable', {});
-        return;
-      }
       const unchanged = this.lastDeliveredFingerprint === fingerprint;
       if (unchanged && !recheckDue) {
         const sinceDelivered =

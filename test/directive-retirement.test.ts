@@ -1248,7 +1248,12 @@ describe('directive retirement — continuation boundary and consumers', () => {
     const digest = () => computeSilasDigest({ ledger: h.ledger, blockersForRound: async () => ({ blockers: [], note: null }),
       config: DEFAULT_SILAS_CONFIG, trigger: 'sweep' });
     const baseline = await digest();
-    expect(baseline.verdictsAwaitingDirective).toHaveLength(1);
+    // Issue #243 F-M1: the LIVE accepted request (`req-offers`, still
+    // dispatching) already OWNS the lane, so the verdict row is suppressed by
+    // live-ownership BEFORE retirement. The retirement fence below still owns
+    // the OTHER continuation rows' 1→0→1 discrimination, and the released
+    // control proves the verdict row returns once ownership resolves.
+    expect(baseline.verdictsAwaitingDirective).toHaveLength(0);
     expect(baseline.verificationFailures).toHaveLength(1);
     expect(baseline.verificationWaits).toHaveLength(1);
     expect(baseline.minionErrors).toHaveLength(1);

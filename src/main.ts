@@ -27,6 +27,9 @@ import { createReviewEscalationNotifier } from './dispatch/escalation-identity.j
 import { createStartupVerdictPoster } from './dispatch/perkins-github-app.js';
 import { BobScheduler } from './dispatch/bob-scheduler.js';
 import { SilasDriver, computeSilasDigest, consolidatedBlockersFor, supervisionLookup } from './dispatch/silas-driver.js';
+import { createSilasModelActionTool } from './dispatch/silas-model-action.js';
+import { composeDeterministicPass, createSilasAutopilotHook } from './dispatch/silas-autopilot-pass.js';
+import { createSilasAutopilotOps } from './dispatch/silas-autopilot-ops.js';
 import { createProductionDeterministicPass } from './dispatch/durable-reconcile.js';
 import { DirectiveProgressService } from './dispatch/directive-progress.js';
 import { ProviderRecoverySensor, establishProviderWait } from './provider-recovery/sensor.js';
@@ -96,7 +99,7 @@ import {
   runRuntimeReviewPreflight,
 } from './dispatch/review-path.js';
 import { loadPerkinsPolicy } from './dispatch/perkins-review/policy.js';
-import type { NativeAgentTool, SpawnOptions } from './runtime/types.js';
+import type { AgentHandle, NativeAgentTool, SpawnOptions } from './runtime/types.js';
 import { serviceWorkflowAuthority } from './workflows/session.js';
 
 /** The process LISTENING on the configured instance port when it is not us
@@ -922,6 +925,7 @@ async function main(): Promise<number> {
     log: (level, msg, fields) => logger.log(level, msg, fields),
   });
   state.ledgerDb = ledgerDb;
+  state.ledger = ledger;
   state.board = board;
   logger.info('ledger ready', { db_path: ledgerDb.dbPath });
 
@@ -1274,14 +1278,50 @@ async function main(): Promise<number> {
   // supervised slot follows the gru-main / bob-consolidator pattern exactly
   // — model and thinking resolve from config ([models.roles] silas /
   // [thinking.roles] silas) at spawn, never hardcoded here.
+  // Issue #243 H6: the digest the model-action tool observes is computed with
+  // the SAME seams the API digest endpoint uses. It is assigned below, once
+  // those seams exist; the tool only ever runs inside a live turn, long after
+  // boot, so the placeholder is never reachable in practice.
+  let silasActionDigest: () => Promise<Awaited<ReturnType<typeof computeSilasDigest>>> = () =>
+    Promise.reject(new Error('silas action digest is not initialised'));
   const silasSlot = config.silas.enabled
     ? supervisorLive.declareSlot({
         id: 'silas-ops',
         role: 'silas',
-        spawn: (spawnOptions) => registry.spawn('silas', spawnOptions ?? {}),
+        spawn: (spawnOptions) => {
+          // Bind the model-action tool to THIS spawn's exact handle: `bound` is
+          // assigned when the spawn resolves, so a re-spawn gets its own tool
+          // bound to its own incarnation (never a late lookup of the current
+          // slot). The tool runs only during a live model turn.
+          let bound: AgentHandle | null = null;
+          const actionTool = createSilasModelActionTool({
+            getHandle: () => bound,
+            ledger,
+            digest: () => silasActionDigest(),
+            log: (level, msg, fields) => logger.log(level, msg, fields),
+          });
+          return registry
+            .spawn('silas', {
+              ...(spawnOptions ?? {}),
+              nativeTools: [...(spawnOptions?.nativeTools ?? []), actionTool],
+            })
+            .then((handle) => {
+              bound = handle;
+              return handle;
+            });
+        },
       })
     : null;
   const intake = new IntakeService({ dataDir: config.dataDir, workspaceRoot: config.workspaceRoot, uploadsDir });
+  silasActionDigest = () =>
+    computeSilasDigest({
+      ledger,
+      worktrees: worktreeManager,
+      blockersForRound: consolidatedBlockersFor(ledger),
+      config: config.silas,
+      trigger: 'api',
+      supervisionFor: supervisionLookup(() => supervisor),
+    });
   const propertyCampaigns = createPropertyCampaignService({ ledger, registry, worktrees: worktreeManager, wave, notifications, observeBlindTurn, artifactsRoot: join(config.dataDir, 'property-campaigns'), pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor, ...(config.lessons.enabled ? { lessons: lessonReferences } : {}) });
   state.propertyCampaigns = propertyCampaigns;
   const dispatchServer = createDispatchServer({
@@ -1325,15 +1365,7 @@ async function main(): Promise<number> {
             // delta pointer resolves here, computed with the SAME seams the
             // driver uses (worktrees, blockers port, supervision stop
             // truth) so the API can never disagree with what wakes Silas.
-            digest: () =>
-              computeSilasDigest({
-                ledger,
-                worktrees: worktreeManager,
-                blockersForRound: consolidatedBlockersFor(ledger),
-                config: config.silas,
-                trigger: 'api',
-                supervisionFor: supervisionLookup(() => supervisor),
-              }),
+            digest: silasActionDigest,
           },
         }
       : {}),
@@ -1496,6 +1528,58 @@ async function main(): Promise<number> {
       const remote = remoteCache.get(repoPath) ?? null;
       return remote === null ? null : { host: remote.host, owner: remote.owner, repo: remote.repo };
     };
+    // Silas autopilot (issue #243): the unambiguous rule families executed
+    // in code, before any LLM wake. It reaches the service through the SAME
+    // functions the HTTP endpoints compose (never HTTP), and it is bound to
+    // the SAME seams the driver's own digest uses, so the rows it acts on
+    // are the rows Silas was about to read. `enabled` is the owner's kill
+    // switch (default off); every family defaults to dry-run.
+    const autopilotGh = new GhCliApi();
+    const autopilotOps = createSilasAutopilotOps({
+      ledger,
+      wave,
+      registry,
+      worktrees: worktreeManager,
+      dispatch: dispatcher,
+      gh: autopilotGh,
+      resolveRemote: resolveLaneRemote,
+      workerGate: pacing.gate,
+      retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId),
+      parentTools: parentToolsFor,
+      notifications,
+      pendingProducerBlockers: (jobId, currentNative) => supervisorLive.pendingProducerBlockers(jobId, currentNative),
+      observeBlindTurn,
+      ...(config.lessons.enabled ? { lessons: lessonReferences } : {}),
+      // Service-stop ownership (issue #243 R2-H9): the shutdown signal aborts
+      // a QUEUED directive/re-brief admission so a stopped service never
+      // starts one; `drain` joins the in-flight producers without claiming
+      // cessation.
+      stopSignal: serviceStop.signal,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    state.autopilot = autopilotOps;
+    const autopilotHook = createSilasAutopilotHook({
+      ledger,
+      config: config.silas.autopilot,
+      ops: autopilotOps,
+      digest: (trigger) =>
+        computeSilasDigest({
+          ledger,
+          worktrees: worktreeManager,
+          blockersForRound: consolidatedBlockersFor(ledger),
+          config: config.silas,
+          trigger,
+          supervisionFor: supervisionLookup(() => supervisor),
+        }),
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+    });
+    const durablePass = createProductionDeterministicPass({
+      ledger,
+      notifications,
+      log: (level, msg, fields) => logger.log(level, msg, fields),
+      getWave: () => state.wave,
+      directiveProgress,
+    });
     const silas = new SilasDriver({
       slot: silasSlot,
       ledger,
@@ -1521,16 +1605,10 @@ async function main(): Promise<number> {
       // Chief phase-3 seam: every deterministic Silas pass runs the
       // production hook — the in-memory review-handoff reconsideration
       // plus the bounded durable reconciliation (issue #163) — BEFORE any
-      // LLM wake. The factory is behaviorally tested with a real ledger
-      // and driver; a wiring regression fails a behavioral test, not just
-      // a source regex.
-      onDeterministicPass: createProductionDeterministicPass({
-        ledger,
-        notifications,
-        log: (level, msg, fields) => logger.log(level, msg, fields),
-        getWave: () => state.wave,
-        directiveProgress,
-      }),
+      // LLM wake, and then the autopilot (issue #243). The composition is
+      // the exported factory (issue #243 F-M4) so the asymmetric failure
+      // behavior is behaviorally tested through a real driver, not a regex.
+      onDeterministicPass: composeDeterministicPass(durablePass, autopilotHook),
       githubPoll: new GitHubSignalPoll({
         ledger,
         notifications,
