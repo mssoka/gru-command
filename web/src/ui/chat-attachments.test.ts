@@ -547,6 +547,44 @@ it('disables files outside the selected intake repository while ordinary workspa
   expect(document.querySelectorAll('#chat-chips .attach-chip')).toHaveLength(1);
 });
 
+it('repository intake picker offers only configured roots, not siblings or nested folders', async () => {
+  const entries = (name: string) => ({ name, kind: 'dir' as const, size: null, image: false, pickable: true });
+  const browse = vi.fn(async (path: string) => {
+    if (path === '') return result('', [entries('managed'), entries('sibling')]);
+    if (path === 'managed') return result(path, [entries('nested')]);
+    return { ...result(path), parent: path === 'managed/nested' ? 'managed' : '' };
+  });
+  const view = new ChatView(() => true);
+  view.setManagedRepositoryNames(['managed']);
+  view.bindAttach(surface({ browse }));
+  const picked = vi.fn();
+  view.pickIntakeRepository(picked);
+  await settle();
+
+  const useRepository = (): HTMLButtonElement | undefined =>
+    [...document.querySelectorAll<HTMLButtonElement>('#attach-picker-list button')]
+      .find((button) => button.textContent === 'Use this repository');
+  document.querySelector<HTMLButtonElement>('#attach-picker-list [data-name="sibling"]')!.click();
+  await settle();
+  expect(useRepository()).toBeUndefined();
+  expect(document.getElementById('attach-picker-list')?.textContent).toContain(
+    'Only configured managed repository roots can be selected.',
+  );
+
+  (document.getElementById('attach-picker-up') as HTMLButtonElement).click();
+  await settle();
+  document.querySelector<HTMLButtonElement>('#attach-picker-list [data-name="managed"]')!.click();
+  await settle();
+  expect(useRepository()).toBeDefined();
+  document.querySelector<HTMLButtonElement>('#attach-picker-list [data-name="nested"]')!.click();
+  await settle();
+  expect(useRepository()).toBeUndefined();
+  (document.getElementById('attach-picker-up') as HTMLButtonElement).click();
+  await settle();
+  useRepository()!.click();
+  expect(picked).toHaveBeenCalledWith('/workspace/managed');
+});
+
 it('repository picker forbids device and stale file-input uploads, then restores normal/document consumers', async () => {
   const view = new ChatView(() => true), upload = vi.fn(async (file: File) => ({ path: `/uploads/${file.name}`, name: file.name, bytes: file.size }));
   view.bindAttach(surface({ upload }));

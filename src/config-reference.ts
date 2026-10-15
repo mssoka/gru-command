@@ -48,6 +48,7 @@ export const RUNTIMES_DOC_POINTER =
  * emitted text. */
 export const CONFIG_SECTION_HEADERS: readonly string[] = [
   'workspace_root',
+  'managed_repos',
   'data_dir',
   '[server]',
   '[auth]',
@@ -104,6 +105,7 @@ export const CONFIG_ACTIVE_TABLES: readonly string[] = [
 export interface CompleteConfigValues {
   readonly instanceDir: string;
   readonly workspaceRoot: string;
+  readonly managedRepos: readonly string[];
   readonly host: string;
   readonly port: number;
   readonly token: string;
@@ -237,8 +239,11 @@ export function renderReferenceConfig(
     '# and a one-line purpose comment. ' + RUNTIMES_DOC_POINTER,
     '# Edit values in place, then restart only your Gru Command service.',
     '',
-    '# Root: the directory containing only managed project repositories.',
+    '# Shared project directory; it may also contain repositories Gru Command does not manage.',
     `workspace_root = ${tomlString(values.workspaceRoot)}`,
+    '# Explicit project directory names relative to workspace_root; only these are managed.',
+    '# An empty list manages none. Add names here deliberately, then restart the service.',
+    `managed_repos = [${values.managedRepos.map(tomlString).join(', ')}]`,
     '# Root: per-instance state. ~-anchored so a restored config re-anchors to',
     '# the NEW machine\'s home — an absolute machine-specific path would',
     '# redirect all state to the old machine on restore. Explicit',
@@ -658,6 +663,7 @@ export function renderReferenceConfig(
 const DOC_EXAMPLE_VALUES: CompleteConfigValues = {
   instanceDir: '~/.gru-command',
   workspaceRoot: '~/code',
+  managedRepos: ['project-a', 'project-c'],
   host: '127.0.0.1',
   port: 7665,
   token: 'a-random-pairing-token',

@@ -2,7 +2,8 @@
 # The application reads ~/.gru-command/config.toml (or $GRU_COMMAND_HOME/config.toml),
 # never this docs file. Prefer `npm run config:generate` for a live teaching config.
 
-workspace_root = "~/code"          # selected managed repositories only
+workspace_root = "~/code"          # shared root; may contain unmanaged sibling projects
+managed_repos = ["project-a", "project-c"] # exact managed children; [] means none
 data_dir = "~/.gru-command"        # instance state; never inside workspace_root
 
 [server]

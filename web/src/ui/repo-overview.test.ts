@@ -71,7 +71,7 @@ describe('managed repository overview panel', () => {
     const { mount, view } = panel();
     view.render({ rows: [] } satisfies RepoOverviewView);
     expect(mount.textContent).toContain('Managed repositories');
-    expect(mount.textContent).toContain('No managed repositories found under the configured workspace root.');
+    expect(mount.textContent).toContain('No managed repositories are configured. Add explicit names to managed_repos in config.toml, then restart the service.');
     expect(mount.querySelector('.repo-overview__list')).toBeNull();
   });
 
@@ -209,7 +209,7 @@ describe('managed repository overview panel', () => {
     // A push that removes the focused row (or the whole feature) never
     // throws and leaves the section in its honest empty/hidden state.
     view.render({ rows: [] });
-    expect(mount.textContent).toContain('No managed repositories');
+    expect(mount.textContent).toContain('No managed repositories are configured');
     view.render(null);
     expect(mount.childElementCount).toBe(0);
   });

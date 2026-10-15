@@ -24,7 +24,7 @@ test.beforeAll(async () => {
   const issueRepo = join(workspace, 'issue-app'); execFileSync('git', ['clone', '-q', repo, issueRepo]); execFileSync('git', ['-C', issueRepo, 'remote', 'set-url', 'origin', 'https://github.com/owner/issue-app.git']);
   // All external GitHub/model boundaries are offline doubles, never network.
   writeFileSync(join(home, 'bin', 'gh'), `#!/usr/bin/env node\nif (process.argv.includes('repos/owner/issue-app/issues/1')) process.stdout.write(JSON.stringify({ number: 1, html_url: 'https://github.com/owner/issue-app/issues/1', title: 'Capture', body: 'Implement native capture.', updated_at: '2026-10-10T12:00:00Z' })); else process.stdout.write('[]');\n`, { mode: 0o755 });
-  service = await startRealService({ port: 0, token, home, workspace });
+  service = await startRealService({ port: 0, token, home, workspace, managedRepos: ['app', 'issue-app'] });
 });
 test.afterAll(async () => { await service?.stop(); rmSync(root, { recursive: true, force: true }); });
 async function pair(page: Page): Promise<void> {

@@ -37,7 +37,7 @@ describe('SPEC locked-rulings numbering drift pin', () => {
     expect(block).toContain('_bmad');
     // B1 (PR #8 r1): no rival ONLY-clause on the workspace root
     expect(block).not.toMatch(/workspace root\s+(holds|=)\s+ORCHESTRATION ONLY/i);
-    expect(block).toContain('holds managed repos only');
+    expect(block).toContain('only `managed_repos` controls management');
     // no garbled duplicate fragments (B-r2-1, PR #8 r2)
     expect(block).not.toContain('carries its own — never at the workspace');
   });
@@ -86,8 +86,9 @@ describe('SPEC locked-rulings numbering drift pin', () => {
   });
 
   it('load-bearing cross-references still cite the right numbers', () => {
-    // ruling 6: workspace root holds the user's managed repos
+    // ruling 6: the shared workspace root and explicit managed subset
     expect(spec).toMatch(/6\. \*\*Workspace root is config/);
+    expect(spec).toContain('runtime never enrolls');
     // ruling 8: the shared product repo ships orchestration only
     expect(spec).toMatch(/8\. \*\*Repo hygiene:\*\* the shared product repo ships orchestration only/);
     // EPICS E8 cites ruling-17 behaviors (dispatch cwd = project root)

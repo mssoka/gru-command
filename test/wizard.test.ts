@@ -1,4 +1,4 @@
-import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -6,6 +6,7 @@ import { createServer } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
 import { OwnedCommandTimeoutError, markFixtureStep, runOwnedCommand } from './helpers/harness-diagnostics.mjs';
 import { loadConfig, configPathFor } from '../src/config.js';
+import { gitProbeEnvironment, resolveManagedRepoPathSync } from '../src/repos/managed-names.js';
 import { probeRuntimes } from '../src/runtime/probe.js';
 import { formatHostForUrl, runFirstBootSmoke } from '../src/wizard/main.js';
 import { AnswersError, generateToken, parseAnswers, resolveBindHost, validateHost, validateWorkspaceRoot } from '../src/wizard/answers.js';
@@ -120,8 +121,9 @@ describe('wizard answers', () => {
     mkdirSync(join(workspace, 'repo-b', '_bmad', '_config'), { recursive: true });
     writeFileSync(join(workspace, 'repo-b', '_bmad', '_config', 'manifest.yaml'), 'existing\n');
     const defaultsByState = parseAnswers(
-      JSON.stringify({ workspace_root: workspace, repos: ['repo-a', 'repo-b'] }),
+      JSON.stringify({ workspace_root: workspace, repos: ['repo-a'] }),
     );
+    expect(defaultsByState.repos).toEqual(['repo-a']);
     expect(defaultsByState).not.toHaveProperty('bmad');
     expect(() =>
       parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['repo-a', 'repo-a'] })),
@@ -131,8 +133,25 @@ describe('wizard answers', () => {
       /not a git repo under the workspace root/,
     );
     expect(() => parseAnswers(`{"workspace_root":"${workspace}","repos":["../escape"]}`)).toThrow(
-      /plain directory names/,
+      /plain directory name/,
     );
+    expect(() => parseAnswers(`{"workspace_root":"${workspace}","repos":["*"]}`)).toThrow(/wildcard/);
+  });
+
+  it('escapes rejected control and format characters in repository-name errors', () => {
+    for (const name of ['alpha\u001b[31m', 'alpha\u202ehidden', 'alpha\u2028hidden']) {
+      let message: string | null = null;
+      try {
+        parseAnswers(JSON.stringify({ repos: [name] }));
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).not.toBeNull();
+      expect(message).not.toContain('\u001b');
+      expect(message).not.toContain('\u202e');
+      expect(message).not.toContain('\u2028');
+      expect(message).toMatch(/\\u\{(?:1b|202e|2028)\}/u);
+    }
   });
 });
 
@@ -162,6 +181,48 @@ describe('wizard config generation', () => {
     expect(config.models.default).toBe('default');
     expect(config.thinking.default).toBe('default');
     expect(config.dataDir).toBe(instanceDir);
+    expect(config.managedRepos).toEqual([]);
+  });
+
+  it('persists, seeds and explicitly replaces the managed selection across config rewrites', () => {
+    const workspace = tempDir('gru-command-wizard-managed-root-');
+    for (const name of ['alpha', 'beta', 'gamma']) mkdirSync(join(workspace, name, '.git'), { recursive: true });
+    mkdirSync(join(workspace, 'alpha', '_bmad', 'project'), { recursive: true });
+    mkdirSync(join(workspace, 'beta', '_bmad', 'project'), { recursive: true });
+    const instanceDir = tempDir('gru-command-wizard-managed-config-');
+    const selected = parseAnswers(JSON.stringify({
+      workspace_root: workspace,
+      repos: ['alpha', 'gamma'],
+      token: 'managed-selection-token',
+    }));
+    writeWizardConfig(instanceDir, selected, home);
+    expect(loadConfig({ GRU_COMMAND_HOME: instanceDir }, home).managedRepos).toEqual(['alpha', 'gamma']);
+
+    const customized = readFileSync(join(instanceDir, 'config.toml'), 'utf8').replace(
+      'max_workers = 4',
+      'max_workers = 8',
+    );
+    writeFileSync(join(instanceDir, 'config.toml'), customized);
+    writeWizardConfig(instanceDir, parseAnswers('{}'), home, true);
+    const repeated = loadConfig({ GRU_COMMAND_HOME: instanceDir }, home);
+    expect(repeated.managedRepos).toEqual(['alpha', 'gamma']);
+    expect(repeated.concurrency.maxWorkers).toBe(8);
+
+    const changed = parseAnswers(JSON.stringify({ workspace_root: workspace, repos: ['beta'] }));
+    writeWizardConfig(instanceDir, changed, home, true, new Set(['workspace_root', 'repos']));
+    const changedConfig = loadConfig({ GRU_COMMAND_HOME: instanceDir }, home);
+    expect(changedConfig.managedRepos).toEqual(['beta']);
+    expect(readFileSync(configPathFor(instanceDir), 'utf8')).toContain('managed_repos = ["beta"]');
+    expect(changedConfig.concurrency.maxWorkers).toBe(8);
+
+    writeWizardConfig(
+      instanceDir,
+      parseAnswers(JSON.stringify({ repos: [] })),
+      home,
+      true,
+      new Set(['repos']),
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: instanceDir }, home).managedRepos).toEqual([]);
   });
 
   it('config, backup, and hardened rewrite are 0600 — the pairing token is never world-readable (Perkins r1 W5)', () => {
@@ -317,7 +378,7 @@ describe('wizard pairing QR + repo discovery + runtime probe', () => {
     expect(generateToken()).not.toBe(generateToken());
   });
 
-  it('repo discovery: depth-1 .git scan, sorted, dot-dirs skipped, symlinked repos included', () => {
+  it('repo discovery: depth-1 .git scan includes dot-dirs for validation and symlinked repos', () => {
     const workspace = tempDir('gru-command-wizard-scan-');
     mkdirSync(join(workspace, 'repo-a', '.git'), { recursive: true });
     mkdirSync(join(workspace, 'repo-b'), { recursive: true });
@@ -330,7 +391,7 @@ describe('wizard pairing QR + repo discovery + runtime probe', () => {
     mkdirSync(join(realRepo, '.git'), { recursive: true });
     symlinkSync(realRepo, join(workspace, 'repo-link'));
     symlinkSync(join(workspace, 'nowhere'), join(workspace, 'broken-link'));
-    expect(discoverManagedRepos(workspace)).toEqual(['repo-a', 'repo-b', 'repo-link']);
+    expect(discoverManagedRepos(workspace)).toEqual(['.hidden', 'repo-a', 'repo-b', 'repo-link']);
     expect(discoverManagedRepos(join(workspace, 'does-not-exist'))).toEqual([]);
   });
 
@@ -378,6 +439,52 @@ describe('wizard CLI surface', () => {
     }
   });
 
+  it('headless setup rejects a symlinked .git marker that runtime treats as unavailable', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-symlink-git-ws-');
+    const repo = join(workspace, 'alpha');
+    const gitDir = join(workspace, 'alpha-git-dir');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-q', `--separate-git-dir=${gitDir}`], { cwd: repo });
+    rmSync(join(repo, '.git'));
+    symlinkSync(gitDir, join(repo, '.git'), 'dir');
+    expect(execFileSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf-8',
+      env: gitProbeEnvironment(),
+    }).trim()).toBe(realpathSync(repo));
+    expect(resolveManagedRepoPathSync(workspace, 'alpha')).toMatchObject({ kind: 'unavailable' });
+
+    const home = tempDir('gru-command-wizard-symlink-git-home-');
+    const result = spawnSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--answers', JSON.stringify({
+      workspace_root: workspace, repos: ['alpha'], port: 0, smoke: false,
+    })], { env: { ...process.env, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 30_000 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('unsupported .git marker');
+    expect(existsSync(configPathFor(home))).toBe(false);
+  });
+
+  it('headless setup refuses case-folded names that runtime cannot manage', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-case-folded-ws-');
+    const repo = join(workspace, 'Alpha');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repo });
+
+    expect(resolveManagedRepoPathSync(workspace, 'alpha').kind).toBe('unavailable');
+    const caseAliasExists = existsSync(join(workspace, 'alpha', '.git'));
+    const home = tempDir('gru-command-wizard-case-folded-home-');
+    const result = spawnSync(process.execPath, [join(repoRoot, 'dist/wizard/main.js'), '--answers', JSON.stringify({
+      workspace_root: workspace, repos: ['alpha'], port: 0, smoke: false,
+    })], { env: { ...process.env, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 30_000 });
+    expect(result.status).toBe(1);
+    expect(existsSync(configPathFor(home))).toBe(false);
+    if (caseAliasExists) {
+      expect(result.stderr).toContain('canonical directory spelling');
+    } else {
+      expect(result.stderr).toContain('not a git repo under the workspace root');
+    }
+  });
+
   it('headless setup accepts a wrong-kind user BMAD path without reading or changing it', () => {
     const repoRoot = join(import.meta.dirname, '..');
     const workspace = tempDir('gru-command-wizard-independent-ws-');
@@ -409,11 +516,124 @@ describe('wizard CLI surface', () => {
         workspace_root: workspace, repos: ['repo-a'], port: 0, smoke: false,
       })], { env: { ...process.env, GRU_COMMAND_HOME: home }, encoding: 'utf-8', timeout: 30_000 });
       expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain('Repositories selected for setup validation: repo-a');
+      expect(result.stdout).toContain('Managed repositories selected: repo-a');
       expect(readFileSync(join(repoA, '_bmad-output/brief.md'), 'utf-8')).toBe('# brief\n');
       expect(existsSync(join(repoA, '_bmad'))).toBe(false);
       expect(existsSync(join(repoA, '.agents'))).toBe(false);
     }
+  });
+
+  it('unattended repeats preserve and deliberately replace the configured selection', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const workspace = tempDir('gru-command-wizard-headless-managed-ws-');
+    const gammaName = '\u0301gamma';
+    for (const name of ['alpha', 'beta', gammaName]) {
+      const repo = join(workspace, name);
+      mkdirSync(repo);
+      execFileSync('git', ['init', '-q'], { cwd: repo });
+    }
+    const home = tempDir('gru-command-wizard-headless-managed-home-');
+    const wizard = join(repoRoot, 'dist/wizard/main.js');
+    const run = (answers: Record<string, unknown>, force = false) =>
+      spawnSync(process.execPath, [wizard, ...(force ? ['--force'] : []), '--answers', JSON.stringify({ port: 0, smoke: false, ...answers })], {
+        env: { ...process.env, GRU_COMMAND_HOME: home },
+        encoding: 'utf-8',
+        timeout: 30_000,
+      });
+
+    const first = run({ workspace_root: workspace, repos: ['alpha', gammaName] });
+    expect(first.status, first.stderr).toBe(0);
+    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', gammaName]);
+
+    rmSync(join(workspace, gammaName, '.git'), { recursive: true, force: true });
+    writeFileSync(join(workspace, gammaName, '.git'), 'gitdir: ../missing-worktree\n');
+    const repeated = run({}, true);
+    expect(repeated.status, repeated.stderr).toBe(0);
+    expect(repeated.stdout).toContain(
+      'Previously selected repository \\u{301}gamma is currently unavailable; keeping it in managed_repos.',
+    );
+    expect(first.stdout).toContain(
+      'Repository ready in \\u{301}gamma: GC setup validated; project files unchanged.',
+    );
+    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha', gammaName]);
+
+    // The prior custom workspace is used while validating the explicit new
+    // choice, even though workspace_root is omitted from these answers.
+    const changed = run({ repos: ['beta'] }, true);
+    expect(changed.status, changed.stderr).toBe(0);
+    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['beta']);
+    expect(readFileSync(configPathFor(home), 'utf8')).toContain('managed_repos = ["beta"]');
+
+    const cleared = run({ repos: [] }, true);
+    expect(cleared.status, cleared.stderr).toBe(0);
+    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual([]);
+  });
+
+  it('forced reruns require explicit managed repositories after changing the workspace binding', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const previousWorkspace = tempDir('gru-command-wizard-inherited-prior-workspace-');
+    const previousRepo = join(previousWorkspace, 'alpha');
+    mkdirSync(previousRepo);
+    execFileSync('git', ['init', '-q'], { cwd: previousRepo });
+
+    const changedWorkspace = tempDir('gru-command-wizard-inherited-changed-workspace-');
+    const changedRepo = join(changedWorkspace, 'alpha');
+    mkdirSync(changedRepo);
+    execFileSync('git', ['init', '-q'], { cwd: changedRepo });
+
+    const home = tempDir('gru-command-wizard-inherited-changed-binding-home-');
+    const wizard = join(repoRoot, 'dist/wizard/main.js');
+    const run = (answers: Record<string, unknown>, force = false) =>
+      spawnSync(process.execPath, [wizard, ...(force ? ['--force'] : []), '--answers', JSON.stringify({
+        port: 0, smoke: false, ...answers,
+      })], {
+        env: { ...process.env, GRU_COMMAND_HOME: home },
+        encoding: 'utf-8',
+        timeout: 30_000,
+      });
+
+    const first = run({ workspace_root: previousWorkspace, repos: ['alpha'] });
+    expect(first.status, first.stderr).toBe(0);
+    const priorConfig = readFileSync(configPathFor(home), 'utf8');
+
+    const changed = run({ workspace_root: changedWorkspace }, true);
+    expect(changed.status).toBe(1);
+    expect(changed.stderr).toContain('workspace_root changed; explicitly select managed_repos');
+    expect(readFileSync(configPathFor(home), 'utf8')).toBe(priorConfig);
+
+    const explicitlySelected = run({ workspace_root: changedWorkspace, repos: ['alpha'] }, true);
+    expect(explicitlySelected.status, explicitlySelected.stderr).toBe(0);
+    expect(loadConfig({ GRU_COMMAND_HOME: home }).managedRepos).toEqual(['alpha']);
+  });
+
+  it('forced reruns validate an explicitly selected same-name binding in a changed workspace before writing', () => {
+    const repoRoot = join(import.meta.dirname, '..');
+    const previousWorkspace = tempDir('gru-command-wizard-prior-workspace-');
+    const previousRepo = join(previousWorkspace, 'alpha');
+    mkdirSync(previousRepo);
+    execFileSync('git', ['init', '-q'], { cwd: previousRepo });
+
+    const changedWorkspace = tempDir('gru-command-wizard-changed-workspace-');
+    symlinkSync(previousRepo, join(changedWorkspace, 'alpha'));
+    const home = tempDir('gru-command-wizard-changed-binding-home-');
+    const wizard = join(repoRoot, 'dist/wizard/main.js');
+    const run = (workspace: string, force = false) =>
+      spawnSync(process.execPath, [wizard, ...(force ? ['--force'] : []), '--answers', JSON.stringify({
+        workspace_root: workspace, repos: ['alpha'], port: 0, smoke: false,
+      })], {
+        env: { ...process.env, GRU_COMMAND_HOME: home },
+        encoding: 'utf-8',
+        timeout: 30_000,
+      });
+
+    const first = run(previousWorkspace);
+    expect(first.status, first.stderr).toBe(0);
+    const priorConfig = readFileSync(configPathFor(home), 'utf8');
+
+    const changed = run(changedWorkspace, true);
+    expect(changed.status).toBe(1);
+    expect(changed.stderr).toContain('selected repo is a symlink');
+    expect(readFileSync(configPathFor(home), 'utf8')).toBe(priorConfig);
   });
 
   it('host validation accepts every VALID IPv6 form (Perkins r2 note)', () => {

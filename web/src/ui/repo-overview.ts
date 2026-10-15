@@ -107,7 +107,12 @@ export class RepoOverviewPanel {
     );
     if (view.rows.length === 0) {
       this.mount.append(
-        el('p', 'repo-overview__empty', 'No managed repositories found under the configured workspace root.'),
+        el(
+          'p',
+          'repo-overview__empty',
+          'No managed repositories are configured. ' +
+            'Add explicit names to managed_repos in config.toml, then restart the service.',
+        ),
       );
     } else {
       const list = el('div', 'repo-overview__list');

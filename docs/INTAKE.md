@@ -14,8 +14,10 @@ Perkins, owner approval or merge authority.
 ## Sources and identities
 
 Always supply `repoPath`: the exact canonical absolute root of a repository in
-the configured managed workspace registry. Cwd, basename guesses, aliases and
-cross-project reads are not accepted. Each logical `intakeId` has immutable
+the configured managed workspace registry (`managed_repos` in the instance
+config). A sibling under `workspace_root` that is not listed there is not an
+intake repository. Cwd, basename guesses, aliases and cross-project reads are
+not accepted. Each logical `intakeId` has immutable
 `requestId` revisions (lowercase letters/digits, dot, underscore or dash,
 1–128 characters, starting with a letter/digit).
 
