@@ -1464,7 +1464,7 @@ if (argv.includes('POST')) {
     const poster = new GhPrPoster(binary);
     const input = {
       repoPath: repo.path, prUrl: 'https://github.com/acme/assigned/pull/7', host: 'github.com',
-      targetSha: target, baseSha: target, body: 'assigned review\n',
+      targetSha: target, baseSha: target, body: 'assigned review\n', reviewEvent: 'COMMENT' as const,
     };
     poison(foreign);
     await expect(poster.post(input)).resolves.toMatchObject({ reviewId: '7', headSha: target, commitId: target });
@@ -1493,7 +1493,7 @@ if (argv.includes('POST')) {
     });
     const input = {
       repoPath: repo.path, prUrl: 'https://gitlab.example.test/acme/assigned/-/merge_requests/7',
-      host: 'gitlab.example.test', targetSha: target, baseSha: target, body: 'assigned review\n',
+      host: 'gitlab.example.test', targetSha: target, baseSha: target, body: 'assigned review\n', reviewEvent: 'COMMENT' as const,
     };
     poison(foreign);
     await expect(poster.post(input)).resolves.toMatchObject({ reviewId: '7', headSha: target, commitId: null });

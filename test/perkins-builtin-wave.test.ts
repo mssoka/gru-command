@@ -10175,7 +10175,7 @@ describe('formal GitHub verdict publication from native judgments', () => {
     dirs.push(root, artifacts, sessions);
     const db = new LedgerDb(mkdtempSync(join(tmpdir(), `formal-${name}-db-`)));
     const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
-    const port = new GitReviewPort(root, 'feature/formal-scenario', repo.head());
+    const port = new GitReviewPort(root, 'feature/formal-scenario', repo.head(), ledger);
     await port.createJobWorktree({ repoPath: repo.path, jobId });
     return { repo, root, artifacts, sessions, ledger, port };
   }
@@ -10372,7 +10372,7 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     settleLane(fix.ledger, jobId);
     fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/77');
     attachOrigin(fix.repo, 'feature/durability-crash-window', fix.root);
-    const port = new GitReviewPort(fix.root, 'feature/durability-crash-window', fix.target);
+    const port = new GitReviewPort(fix.root, 'feature/durability-crash-window', fix.target, fix.ledger);
     await port.createJobWorktree({ repoPath: fix.repo.path, jobId });
     const poster = {
       post: vi.fn(async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
@@ -10417,7 +10417,7 @@ describe('formal GitHub publication durability and restart reconciliation', () =
     settleLane(fix.ledger, jobId);
     fix.ledger.setJobPr(jobId, 'https://github.com/acme/fixture/pull/78');
     attachOrigin(fix.repo, 'feature/durability-moved-head', fix.root);
-    const port = new GitReviewPort(fix.root, 'feature/durability-moved-head', fix.target);
+    const port = new GitReviewPort(fix.root, 'feature/durability-moved-head', fix.target, fix.ledger);
     await port.createJobWorktree({ repoPath: fix.repo.path, jobId });
     // The provider accepted the frozen-commit review; the branch moves while
     // the POST response is in flight.
