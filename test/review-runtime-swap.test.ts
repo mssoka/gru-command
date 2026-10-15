@@ -11,6 +11,8 @@ const seam = vi.hoisted(() => ({
   rewriteIno: 0, rewriteFile: '', rewriteBytes: '', rewriteAtDigest: '', rewrites: 0,
   invalidReadIno: 0, invalidRead: false, updatesAfterInvalid: 0,
   addAtDigest: '', addFile: '', additions: 0,
+  ancestorIno: 0, ancestorSibling: '', ancestorAdditions: 0, ancestorFiles: [] as string[],
+  bracketIno: 0, bracketSibling: '', bracketAdditions: 0,
 }));
 vi.mock('node:fs', async (importOriginal) => {
   const fs = await importOriginal<typeof import('node:fs')>();
@@ -18,6 +20,24 @@ vi.mock('node:fs', async (importOriginal) => {
     ...fs,
     openSync: ((...args: Parameters<typeof fs.openSync>) => {
       const path = String(args[0]);
+      // #399: an unrelated sibling appears in a shared ancestor exactly while
+      // the walk climbs `..` out of it (where a change bracket used to sit).
+      const ancestorChild = seam.ancestorIno !== 0 ? /^\/proc\/self\/fd\/(\d+)\/\.\.$/u.exec(path) : null;
+      // A hoisted dependency directory (below a `..`) changes between the
+      // walk's receipt of it and its post-open check.
+      const bracketChild = seam.bracketIno !== 0 ? /^\/proc\/self\/fd\/(\d+)\/([^/]+)$/u.exec(path) : null;
+      if (bracketChild !== null && bracketChild[2] !== '..' && fs.fstatSync(Number(bracketChild[1])).ino === seam.bracketIno) {
+        seam.bracketAdditions += 1;
+        const sibling = `${seam.bracketSibling}-${seam.bracketAdditions}`;
+        seam.ancestorFiles.push(sibling);
+        fs.writeFileSync(sibling, '');
+      }
+      if (ancestorChild !== null && fs.fstatSync(Number(ancestorChild[1])).ino === seam.ancestorIno) {
+        seam.ancestorAdditions += 1;
+        const sibling = `${seam.ancestorSibling}-${seam.ancestorAdditions}`;
+        seam.ancestorFiles.push(sibling);
+        fs.writeFileSync(sibling, '');
+      }
       const heldPackage = seam.target === ':held-package.json'
         ? /^\/proc\/self\/fd\/(\d+)\/package\.json$/u.exec(path) : null;
       const hoistedParent = seam.target === ':hoisted-parent'
@@ -87,8 +107,9 @@ afterEach(() => {
     swapAfterOpen: false, checkedIno: 0, openedUnknownIno: 0, unknownReads: 0, unknownDigestUpdates: 0,
     rewriteIno: 0, rewriteFile: '', rewriteBytes: '', rewriteAtDigest: '', rewrites: 0,
     invalidReadIno: 0, invalidRead: false, updatesAfterInvalid: 0,
-    addAtDigest: '', addFile: '', additions: 0 });
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+    addAtDigest: '', addFile: '', additions: 0,
+    ancestorIno: 0, ancestorSibling: '', ancestorAdditions: 0, bracketIno: 0, bracketSibling: '', bracketAdditions: 0 });
+  for (const root of [...roots.splice(0), ...seam.ancestorFiles.splice(0)]) rmSync(root, { recursive: true, force: true });
 });
 
 function fixture(): string {
@@ -112,6 +133,85 @@ it.skipIf(process.platform !== 'linux')('keeps a checked installation valid when
   expect(reviewRuntimeVersion(root)).toBe(original);
   expect(seam.additions).toBe(1);
   expect(seam.unknownDigestUpdates).toBe(0);
+});
+
+it.skipIf(process.platform !== 'linux')('keeps the identity when a sibling appears in a shared ancestor while a missing optional dependency climbs past it (#399)', async () => {
+  const { reviewRuntimeVersion } = await import('../src/runtime/review-build-identity.js');
+  const root = fixture();
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: { tslib: '1.0.0' } }));
+  const installed = join(root, 'node_modules', 'tslib');
+  mkdirSync(installed, { recursive: true });
+  // A missing optional dependency is looked up in every ancestor's
+  // node_modules, so the walk climbs `..` through the shared tmpdir.
+  writeFileSync(join(installed, 'package.json'), JSON.stringify({
+    name: 'tslib', version: '1.0.0', optionalDependencies: { '@esbuild/linux-x64': '1.0.0' },
+  }));
+  writeFileSync(join(installed, 'tslib.js'), 'export const checked = true;');
+  const original = reviewRuntimeVersion(root);
+  Object.assign(seam, {
+    ancestorIno: statSync(dirname(root)).ino,
+    ancestorSibling: join(dirname(root), `gru-review-ancestor-sibling-${basename(root)}`),
+  });
+  expect(reviewRuntimeVersion(root)).toBe(original);
+  expect(seam.ancestorAdditions).toBeGreaterThan(0);
+  expect(seam.unknownDigestUpdates).toBe(0);
+});
+
+it.skipIf(process.platform !== 'linux')('still refuses when an ancestor is replaced while a missing optional dependency climbs past it (#399)', async () => {
+  const { reviewRuntimeVersion } = await import('../src/runtime/review-build-identity.js');
+  const base = fixture();
+  // The installation sits two levels below `base`, so the walk climbs out of
+  // `base/outer` (a pure ancestor, no change bracket) on its way up.
+  const outer = join(base, 'outer');
+  const root = join(outer, 'pkg');
+  mkdirSync(join(root, 'dist'), { recursive: true });
+  writeFileSync(join(root, 'dist', 'review-dependency-identity.json'), JSON.stringify({ schemaVersion: 1, dependencySha256: 'a'.repeat(64) }));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: { tslib: '1.0.0' } }));
+  const installed = join(root, 'node_modules', 'tslib');
+  mkdirSync(installed, { recursive: true });
+  writeFileSync(join(installed, 'package.json'), JSON.stringify({
+    name: 'tslib', version: '1.0.0', optionalDependencies: { '@esbuild/linux-x64': '1.0.0' },
+  }));
+  writeFileSync(join(installed, 'tslib.js'), 'export const checked = true;');
+  expect(reviewRuntimeVersion(root)).toMatch(/^[a-f0-9]{64}$/u);
+  // While the walk climbs out of `outer`, `outer` is replaced: the held
+  // descriptors keep the old tree, but the installation's pathname now names
+  // a different directory.
+  const replacement = join(base, 'replacement');
+  mkdirSync(join(replacement, 'pkg'), { recursive: true });
+  Object.assign(seam, { target: ':hoisted-parent', checked: outer, saved: join(base, 'outer-held'),
+    foreign: replacement, checkedIno: statSync(outer).ino, triggerAt: 1, matchingOpens: 0, swapCount: 0, holdSwap: true });
+  try {
+    expect(() => reviewRuntimeVersion(root)).toThrow('review runtime installed root changed during fingerprint');
+    expect(seam.swapCount).toBe(1);
+    expect(seam.unknownDigestUpdates).toBe(0);
+  } finally {
+    if (seam.swapCount !== 0) {
+      const { renameSync } = await import('node:fs');
+      renameSync(outer, replacement);
+      renameSync(seam.saved, outer);
+    }
+  }
+});
+
+it.skipIf(process.platform !== 'linux')('keeps the change bracket on a hoisted dependency directory below a shared ancestor (#399)', async () => {
+  const { reviewRuntimeVersion } = await import('../src/runtime/review-build-identity.js');
+  const base = fixture();
+  const root = join(base, 'pkg');
+  mkdirSync(join(root, 'dist'), { recursive: true });
+  writeFileSync(join(root, 'dist', 'review-dependency-identity.json'), JSON.stringify({ schemaVersion: 1, dependencySha256: 'a'.repeat(64) }));
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: { tslib: '1.0.0' } }));
+  // tslib is hoisted into the ancestor's node_modules: reached via `..`.
+  const hoisted = join(base, 'node_modules', 'tslib');
+  mkdirSync(hoisted, { recursive: true });
+  writeFileSync(join(hoisted, 'package.json'), JSON.stringify({ name: 'tslib', version: '1.0.0' }));
+  writeFileSync(join(hoisted, 'tslib.js'), 'export const checked = true;');
+  expect(reviewRuntimeVersion(root)).toMatch(/^[a-f0-9]{64}$/u);
+  // A new entry appears in that dependency directory mid-selection: unlike a
+  // shared ancestor, a dependency location keeps its change bracket.
+  Object.assign(seam, { bracketIno: statSync(join(base, 'node_modules')).ino, bracketSibling: join(base, 'node_modules', 'intruder') });
+  expect(() => reviewRuntimeVersion(root)).toThrow('review runtime directory changed during child selection');
+  expect(seam.bracketAdditions).toBeGreaterThan(0);
 });
 
 it.skipIf(process.platform !== 'darwin')('rejects a real-directory swap at file open before reading or hashing foreign bytes', async () => {
