@@ -1236,7 +1236,11 @@ export class ClaudeCodeHandle implements AgentHandle {
   private noteMcpServerProblems(errors: unknown, servers: unknown): void {
     const record = (value: unknown): Record<string, unknown> =>
       typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
-    const line = (name: unknown, why: string): string => `${typeof name === 'string' ? name.slice(0, 80) : '?'}: ${why}`;
+    // A name comes straight from the config too (the CLI does not apply its
+    // own name rule to config files — a key can be a credential URL), so only
+    // an identifier-shaped name is logged.
+    const line = (name: unknown, why: string): string =>
+      `${typeof name !== 'string' ? '?' : /^[A-Za-z0-9_. -]{1,80}$/u.test(name) ? name : '(name withheld)'}: ${why}`;
     // Never the CLI's free text — it pastes rejected values in unescaped, and
     // no redaction of free text is airtight — only its skip-reason code
     // (`invalid_config`, `unknown_type`, …), accepted only when it looks like

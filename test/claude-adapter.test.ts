@@ -1763,7 +1763,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     ]);
   });
 
-  it('MCP servers the CLI could not load (skipped, failed, needs sign-in) are logged by name and reason code, once per distinct set', async () => {
+  it('MCP servers the CLI could not load are logged by name — skipped ones with the CLI code, failed or sign-in-blocked ones with a fixed description — once per distinct set', async () => {
     const fx = fixture();
     const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
     cleanupDirs.push(lane);
@@ -1789,12 +1789,19 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
         { name: 'q-type', type: 'unknown_type', message: 'Skipped — unknown MCP server type "sk"secret-in-type" for server "q-type"' },
         { name: 'bare' },
         { name: 'odd', type: 'Not A Code: sk-secret' },
+        { name: 'lc', type: 'invalid_config url "https://user:sk-secret@example.invalid/mcp"' },
+        { name: 'sp', type: 'invalid config: sk-secret' },
+        { name: 'long', type: `sk-secret${'a'.repeat(40)}` },
+        { name: 'https://user:sk-secret-in-name@host.invalid/mcp', type: 'invalid_config' },
+        { name: `n${'x'.repeat(80)}`, type: 'invalid_config' },
         'a bare string from the CLI with sk-secret',
       ]);
       await handle.prompt('five');
       expect(problemLogs()).toHaveLength(3);
       expect(problemLogs()[2]?.fields?.['servers']).toEqual(['api: skipped (invalid_config)', 'q-type: skipped (unknown_type)',
-        'bare: skipped (unknown reason)', 'odd: skipped (unknown reason)', '?: skipped (unknown reason)']);
+        'bare: skipped (unknown reason)', 'odd: skipped (unknown reason)', 'lc: skipped (unknown reason)',
+        'sp: skipped (unknown reason)', 'long: skipped (unknown reason)', '(name withheld): skipped (invalid_config)',
+        '(name withheld): skipped (invalid_config)', '?: skipped (unknown reason)']);
       expect(JSON.stringify(problemLogs())).not.toContain('sk-secret');
       // A server the CLI kept but could not start (status "failed": a missing
       // env var or a broken command) is logged too.
@@ -1806,20 +1813,19 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(problemLogs()[3]?.fields).toMatchObject({
         servers: ['needs-env: failed to start', 'hosted: needs authentication (a headless session cannot sign in)'], total: 2,
       });
-      // A flood is capped: the first 20 entries, each cut short, plus the total;
-      // a long name never cuts off the reason.
-      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify(Array.from({ length: 25 }, (_, i) => ({ name: `s${i}${'x'.repeat(300)}`, status: 'failed' })));
+      // A flood is capped: the first 20 entries plus the total.
+      process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify(Array.from({ length: 25 }, (_, i) => ({ name: `s${i}`, status: 'failed' })));
       await handle.prompt('seven');
       const flood = problemLogs()[4]?.fields as { servers: string[]; total: number };
       expect(flood.total).toBe(25);
-      expect(flood.servers).toHaveLength(20);
-      expect(flood.servers.every((entry) => entry.length === 80 + ': failed to start'.length && entry.endsWith(': failed to start'))).toBe(true);
+      expect(flood.servers).toEqual(Array.from({ length: 20 }, (_, i) => `s${i}: failed to start`));
       // One init frame with both kinds (as the real CLI emits for one file):
       // skipped lines first, then failed ones.
-      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: 'x', type: 'invalid_config', message: 'word '.repeat(60) }]);
+      process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'] = JSON.stringify([{ name: 'x', type: 'invalid_config', message: 'header "sk-secret-in-message"' }]);
       process.env['CLAUDE_DOUBLE_MCP_SERVERS'] = JSON.stringify([{ name: 'ok', status: 'failed' }]);
       await handle.prompt('eight');
       expect(problemLogs()[5]?.fields).toMatchObject({ servers: ['x: skipped (invalid_config)', 'ok: failed to start'], total: 2 });
+      expect(JSON.stringify(problemLogs())).not.toContain('sk-secret');
     } finally {
       delete process.env['CLAUDE_DOUBLE_MCP_SERVER_ERRORS'];
       delete process.env['CLAUDE_DOUBLE_MCP_SERVERS'];

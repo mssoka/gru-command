@@ -177,10 +177,15 @@ run lane-configured filters — so an autocrlf-converted checkout gets its own
 line-ending reason. A git or file failure is logged at warn with its own
 reason; git runs without inherited repository-routing variables. A file the
 CLI itself would refuse on every turn (not JSON, not an object, no
-`mcpServers` object) is refused with its reason; a server the CLI only skips,
-keeps but cannot start, or cannot sign in to headlessly is logged by name with
-the CLI's reason code — never its free text, which can echo rejected values
-(the CLI's own `--debug` output has the details). HEAD is
+`mcpServers` object) is refused with its reason. A server the CLI skips is
+logged by name with the CLI's own skip code — never its free text, which can
+echo rejected values; one it keeps but cannot start, or that needs a sign-in a
+headless session cannot give, is logged by name with a fixed description. A
+name that is not identifier-shaped (a key can be a credential URL) is logged
+as `(name withheld)`. In
+user mode an entry the CLI's validation rejects leaves no signal, so GC cannot
+log it. For the CLI's full diagnostics, run `claude -p --strict-mcp-config
+--mcp-config .mcp.json --debug "x"` in the lane. HEAD is
 lane state a session with a shell can commit to, so only roles whose own
 tools include a shell load project servers (a server is a command such a
 session could already run); a read-only role never runs a command another
