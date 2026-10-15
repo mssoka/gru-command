@@ -853,7 +853,15 @@ export class BoardView {
       current.review = null;
       void load()
         .then((proposal) => {
-          if (!live() || proposal.decision === null || current.recorded === null) return;
+          if (!live()) return;
+          // The read answered the ambiguity, so the pending-choice fence ends:
+          // a recorded decision locks the opposite action itself, and no
+          // recorded decision leaves both choices available (#277).
+          current.pendingDecision = null;
+          if (proposal.decision === null || current.recorded === null) {
+            this.rerenderOwner();
+            return;
+          }
           if (current.message === uncertain) current.message = recordedMessage(current.recorded, proposal.recovery?.conflict ?? null);
           this.rerenderOwner();
         })
@@ -935,19 +943,21 @@ export class BoardView {
           // Never reuse review text after a failed submission. An ambiguous
           // result keeps its original choice as the only retryable action;
           // proven stale/mismatch refusals explicitly release that intent.
-          current.review = null;
           const provenNotApplied = error instanceof BoardApiError &&
             ['proposal_stale', 'proposal_mismatch'].includes(error.code ?? '');
-          if (provenNotApplied) current.pendingDecision = null;
+          const decidedElsewhere = error instanceof BoardApiError && error.code === 'proposal_decided';
+          // An unconfirmed outcome is reconciled below: the reload either
+          // learns the durable decision or hands back the review the owner
+          // was reading, so its text is only kept when a read confirmed it.
+          if (provenNotApplied || decidedElsewhere) current.review = null;
+          if (provenNotApplied || decidedElsewhere) current.pendingDecision = null;
           // A refusal or lost reply needs an authoritative catch-up; the
           // pending-choice fence remains until that read confirms a result.
           client.wake();
           current.message = describeDecisionFailure(error, current.recorded);
           const uncertain = current.message;
           this.rerenderOwner();
-          const settledByServer = provenNotApplied ||
-            (error instanceof BoardApiError && error.code === 'proposal_decided');
-          if (!settledByServer) reconcile(uncertain);
+          if (!provenNotApplied && !decidedElsewhere) reconcile(uncertain);
         });
     };
     accept.addEventListener('click', () => decide('accept'));

@@ -3538,7 +3538,7 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     expect(band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled).toBe(true);
   });
 
-  it('an ambiguous proposal decision keeps the opposite action locked across a fresh push and reloads before retry', async () => {
+  it('an ambiguous proposal decision is reconciled by a reload, leaves both choices open when nothing is recorded, and reloads before retry (#277)', async () => {
     const outcomes: Array<() => Promise<unknown>> = [
       () => Promise.reject(new Error('connection lost after submission')),
       () => Promise.resolve({ id: 'prop-1', decision: 'accepted' }),
@@ -3548,7 +3548,8 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     view.render(snapshot({ notifications: [proposalNotice] }));
     document.getElementById('board-owner')!.querySelector<HTMLButtonElement>('.board-owner__accept')!.click();
     await flush();
-    expect(client.getLessonProposal).toHaveBeenCalledTimes(1);
+    // The submit's own load plus the unconfirmed-outcome reconcile read (#277).
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(2);
     expect(client.decideLessonProposal).toHaveBeenCalledTimes(1);
     expect(client.wake).toHaveBeenCalled();
 
@@ -3557,10 +3558,10 @@ describe('FOR YOU owner band (permanent, top of board)', () => {
     let band = document.getElementById('board-owner')!;
     const accept = band.querySelector<HTMLButtonElement>('.board-owner__accept')!;
     const reject = band.querySelector<HTMLButtonElement>('.board-owner__reject')!;
-    expect([accept.disabled, reject.disabled]).toEqual([false, true]);
+    expect([accept.disabled, reject.disabled]).toEqual([false, false]);
     accept.click();
     await flush();
-    expect(client.getLessonProposal).toHaveBeenCalledTimes(2);
+    expect(client.getLessonProposal).toHaveBeenCalledTimes(3);
     expect(client.decideLessonProposal).toHaveBeenNthCalledWith(2, 'prop-1', 'accept');
     band = document.getElementById('board-owner')!;
     expect(band.querySelector<HTMLButtonElement>('.board-owner__reject')!.disabled).toBe(true);
