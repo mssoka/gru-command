@@ -8,12 +8,14 @@ import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
 import type { AgentHandle, AgentRuntime, ManagedSkillSet, ManagedWorkflowSession, RuntimeEvent, SpawnOptions } from './types.js';
+import { adapterCessationEvidence } from './types.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { createWorkflowSessionBinder } from '../workflows/session.js';
 import type { WorktreeLane } from '../dispatch/worktree-port.js';
 import { ResidentBudget } from './resident-budget.js';
 import type { ResidencySnapshot } from './residency-observations.js';
 import { WorkerDisposalInProgressError } from './worker-errors.js';
+import { disposePhases, type DisposableTarget } from './disposal.js';
 import { publishSpawnRegistration } from './spawn-registration.js';
 import { notifyDisposalSettlement } from './disposal-observation.js';
 
@@ -46,17 +48,6 @@ export interface RuntimeStatus {
   readonly activeSessions: number;
   /** Per-adapter health — a 'down' adapter flips liveness.healthy false. */
   readonly adapters: readonly { readonly id: string; readonly state: string }[];
-}
-
-/** Notifications are triggers, never cessation proof. Unknown/throwing
- * health and probes retain ownership until current adapter truth confirms it. */
-function provenCeased(handle: AgentHandle, disposeFulfilled = false): boolean {
-  try { if (handle.health().state === 'disposed') return true; } catch { return false; }
-  if (!disposeFulfilled) return false;
-  try {
-    return typeof handle.hasLiveProcess === 'function' && handle.hasLiveProcess() === false &&
-      typeof handle.isCompacting === 'function' && handle.isCompacting() === false;
-  } catch { return false; }
 }
 
 interface ResidentClaim {
@@ -441,9 +432,12 @@ export class RuntimeRegistry {
       /token|secret|password|api[_-]?key|authorization|bearer|basic\s/iu.test(String(error))
         ? 'credential-shaped'
         : 'rejected';
-    const fulfilledDisposals = new Set<AgentHandle>();
-    const isProvenCeased = (handle: AgentHandle, disposeSettled: boolean): boolean =>
-      provenCeased(handle, disposeSettled || fulfilledDisposals.has(handle));
+    /** Adapter-owned cessation proof (Option A, F60-P1): ONLY the adapter's
+     * own 'ceased' evidence proves a member stopped. Terminal health, dispose
+     * fulfillment/rejection settlement, lock release and native retirement are
+     * never proof; a missing/throwing/UNKNOWN answer leaves the member debt. */
+    const isProvenCeased = (handle: AgentHandle): boolean =>
+      adapterCessationEvidence(handle) === 'ceased';
     const everyMemberProven = (): boolean =>
       [...pairMembers].every((handle) => proofOutcomes.get(handle.id) === 'proved');
     /** THE single release edge for the pair: closed, no in-flight pair
@@ -462,31 +456,29 @@ export class RuntimeRegistry {
     const markDebt = (agentId: string): void => {
       proofOutcomes.set(agentId, 'debt');
     };
-    /** Owned disposal of ONE member: contained on every path; fulfillment
-     * alone is never cessation when probes are unknown/contrary. */
+    /** Owned disposal of ONE member: contained on every path; settlement
+     * alone is never cessation — only the adapter's own evidence proves it. */
     const ownedDispose = async (handle: AgentHandle): Promise<void> => {
-      let disposeSettled = false;
       try {
         await handle.dispose();
-        disposeSettled = true;
-        fulfilledDisposals.add(handle);
       } catch (error) {
-        // A rejected disposal may still prove cessation via terminal
-        // health; otherwise the member stays counted debt. Contained.
+        // Contained: attributed, but a rejected (or fulfilled) disposal is
+        // never proof. The member stays counted debt unless the adapter
+        // attests 'ceased' below.
         disposalFailures.push({ agentId: handle.id, reason: reasonCode(error) });
       }
-      if (isProvenCeased(handle, disposeSettled)) {
+      if (isProvenCeased(handle)) {
         prove(handle.id);
       } else {
         markDebt(handle.id);
       }
     };
-    /** Bounded, idempotent reconciliation (health truth only) — the debt
-     * path's production consumer is the registry 'disposed'-event
-     * traversal (no watcher/timer). */
+    /** Bounded, idempotent reconciliation (adapter evidence only) — the debt
+     * path's production consumer is the registry 'disposed'-event traversal
+     * (no watcher/timer). */
     const reconcile = (): void => {
-      for (const handle of [...pairMembers, ...extraMembers]) {
-        if (proofOutcomes.get(handle.id) === 'debt' && isProvenCeased(handle, false)) prove(handle.id);
+      for (const handle of [...pairMembers]) {
+        if (proofOutcomes.get(handle.id) === 'debt' && isProvenCeased(handle)) prove(handle.id);
       }
       releasePairIfProven();
     };
@@ -515,7 +507,7 @@ export class RuntimeRegistry {
         (isPairSlot ? pairMembers : extraMembers).add(handle);
         handle.subscribe((event) => {
           if (event.type === 'state' && event.state === 'disposed') {
-            if (isProvenCeased(handle, false)) {
+            if (isProvenCeased(handle)) {
               prove(handle.id);
               if (!lead && isPairSlot) childRunning = false;
             }
@@ -553,7 +545,7 @@ export class RuntimeRegistry {
           if (lead) leading = false;
           else if (isPairSlot) childRunning = false;
           spare?.(); // genuine pre-adapter/no-resident failure only
-        } else if (isProvenCeased(ownership.handle, false)) {
+        } else if (isProvenCeased(ownership.handle)) {
           prove(ownership.handle.id);
           if (lead) leading = false;
           else if (isPairSlot) childRunning = false;
@@ -713,8 +705,6 @@ export class RuntimeRegistry {
     let completedPrompt = false;
     let disposing: Promise<void> | null = null;
     let disposingNow = false;
-    let disposalSettled = false;
-    let disposalFulfilled = false;
     let released = false;
     let publicationFailure: { readonly error: unknown } | null = null;
     const releaseHandle = (): void => {
@@ -751,24 +741,19 @@ export class RuntimeRegistry {
         if (property === 'dispose') return (): Promise<void> => {
           if (disposing !== null) return disposing;
           disposingNow = true;
-          disposalSettled = false;
-          // Cessation proof, not fulfillment: release requires terminal
-          // 'disposed' health, OR a settled dispose PLUS explicit-false
-          // process/compaction evidence. Unknown/contrary probes retain
-          // the permit (visible debt) — no shortcut over live facts.
-          const ceased = (): boolean => provenCeased(target, disposalFulfilled);
+          // Cessation proof, not fulfillment (Option A, F60-P1): the permit is
+          // released ONLY when the adapter itself attests 'ceased'. Terminal
+          // 'disposed' health, a settled or rejected dispose, lock release and
+          // native retirement are never proof — missing/throwing/UNKNOWN
+          // evidence keeps the slot owned as visible debt, reconciled later by
+          // the adapter-evidence event path below if a late positive arrives.
           disposing = Promise.resolve().then(() => target.dispose()).then(
             () => {
-              disposalSettled = true;
-              disposalFulfilled = true;
               notifyDisposalSettlement(resident, true);
-              if (ceased()) releaseHandle();
+              if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
             },
             (error: unknown) => {
-              disposalSettled = true;
-              // A rejected disposal still proves cessation when terminal
-              // health says so; otherwise the slot stays owned/debt.
-              if (provenCeased(target)) releaseHandle();
+              if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
               disposing = null;
               disposingNow = false;
               notifyDisposalSettlement(resident, false);
@@ -885,8 +870,14 @@ export class RuntimeRegistry {
     // reconsider pass) must read the budget AFTER the release, or it can
     // see a full pool, exit, and never receive another trigger.
     handle.subscribe((event) => {
-      if (event.type === 'state' && event.state === 'disposed' && (!disposingNow || disposalSettled) && provenCeased(handle, disposalFulfilled)) {
-        releaseHandle();
+      // Ownership release is adapter-evidence-only (Option A, F60-P1). A
+      // disposed state OR a late positive cessation event releases the permit
+      // only when the adapter itself attests 'ceased'; metadata never does.
+      if (
+        (event.type === 'state' && event.state === 'disposed' && !disposingNow) ||
+        (event.type === 'cessation_evidence' && event.evidence === 'ceased')
+      ) {
+        if (adapterCessationEvidence(handle) === 'ceased') releaseHandle();
       }
     });
     handle.subscribe((event) => {
@@ -1001,9 +992,34 @@ export class RuntimeRegistry {
 
   async dispose(): Promise<void> {
     this.residents.shutdown();
-    for (const handle of [...this.handles]) await this.disposeHandle(handle);
-    for (const adapter of this.adapters.values()) await adapter.dispose();
-    this.adapters.clear();
+    // Contain every handle AND adapter (issue #341) in TWO ordered, internally
+    // concurrent phases. A plain sequential await aborts on the first
+    // CessationIdleTimeoutError, leaving the remaining handles locked and the
+    // adapters' bridges/sockets never torn down; and starting both kinds at
+    // once lets a native adapter snapshot the same underlying handles before
+    // their resident wrappers retire them, re-attributing one handle's
+    // timeout as an adapter-only failure.
+    //
+    // Phase 1 starts every resident handle's disposal concurrently and waits
+    // for ALL of them. Phase 2 then starts every adapter concurrently EVEN IF
+    // phase 1 failed: by then each underlying handle has retired from the
+    // adapter's own set, so the adapter phase does not duplicate the same
+    // failure. disposePhases combines the attributed causes of both phases
+    // (resident ids first, adapter ids second) and reports them once.
+    // Handles go through disposeHandle to preserve the override seam.
+    const residentTargets: DisposableTarget[] = [...this.handles].map((handle) => ({
+      id: handle.id,
+      dispose: (): Promise<void> => this.disposeHandle(handle),
+    }));
+    const adapterTargets: DisposableTarget[] = [...this.adapters.values()].map((adapter) => ({
+      id: adapter.id,
+      dispose: (): Promise<void> => adapter.dispose(),
+    }));
+    try {
+      await disposePhases([residentTargets, adapterTargets]);
+    } finally {
+      this.adapters.clear();
+    }
     this.quarantined.clear();
   }
 }

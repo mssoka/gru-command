@@ -67,6 +67,9 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
         return {
           id, role, sessionFile: session, capabilities: caps,
           health: () => ({ state: disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: session }),
+          // Adapter-owned cessation evidence (Option A): this fixture attests
+          // 'ceased' only after its own disposal completed — never from health.
+          cessationEvidence: () => (disposed ? 'ceased' : 'unknown'),
           prompt: async () => {}, steer: async () => {}, followUp: async () => {},
           subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
           dispose: async () => {
@@ -88,9 +91,11 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
         const listeners = new Set<RuntimeEventListener>();
         return {
           ...scripted,
-          // Terminal health truth after the wrapper's owned disposal (the
-          // real adapters report 'disposed'); the round's pair release is
-          // proof-gated on this — fulfillment alone is not cessation.
+          // Adapter-owned cessation evidence after the wrapper's owned
+          // disposal (Option A). The round's pair release is proof-gated on
+          // this EXPLICIT attestation — terminal health and fulfillment alone
+          // are not cessation.
+          cessationEvidence: () => (disposed ? 'ceased' : 'unknown'),
           health: () => ({ state: disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: scripted.sessionFile }),
           subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
           dispose: async () => {
@@ -186,6 +191,9 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
         return {
           id, role, sessionFile: join(sessions, `${id}.jsonl`), capabilities: caps,
           health: () => ({ state: disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+          // Adapter-owned cessation evidence (Option A): 'ceased' only after
+          // this fixture's own disposal completed — never from health.
+          cessationEvidence: () => (disposed ? 'ceased' : 'unknown'),
           prompt: async () => {}, steer: async () => {}, followUp: async () => {},
           subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
           dispose: async () => {
@@ -207,9 +215,11 @@ describe('four-busy-minion saturation and complete whole-PR Perkins coverage', (
         const listeners = new Set<RuntimeEventListener>();
         return {
           ...scripted,
-          // Terminal health truth after the wrapper's owned disposal (the
-          // real adapters report 'disposed'); the round's pair release is
-          // proof-gated on this — fulfillment alone is not cessation.
+          // Adapter-owned cessation evidence after the wrapper's owned
+          // disposal (Option A). The round's pair release is proof-gated on
+          // this EXPLICIT attestation — terminal health and fulfillment alone
+          // are not cessation.
+          cessationEvidence: () => (disposed ? 'ceased' : 'unknown'),
           health: () => ({ state: disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: scripted.sessionFile }),
           subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
           dispose: async () => {

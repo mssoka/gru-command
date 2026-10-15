@@ -103,6 +103,10 @@ function writeSession(path: string, assistantTexts: readonly string[]): void {
 interface FakeHandle extends AgentHandle {
   readonly prompts: string[];
   disposed: boolean;
+  /** Adapter-owned cessation evidence (Option A): 'ceased' only after this
+   * fake adapter's own disposal completed; tests may leave it 'unknown' (or
+   * point at a throwing method) to model an unproven stop. */
+  evidence: 'ceased' | 'unknown';
 }
 
 interface Harness {
@@ -149,6 +153,10 @@ function makeHarness(
     retrySettlement?: (agentId: string) => Promise<'none' | 'recovered' | 'exhausted' | 'superseded'>;
     /** dispose() rejects and health stays non-disposed (unproven stop). */
     failDispose?: boolean;
+    /** dispose() FULFILLS and health becomes disposed, but the adapter cannot
+     * attest cessation: disposed metadata + UNKNOWN evidence (the new Pi
+     * idle-timeout shape) must still be treated as debt. */
+    unprovenEvidence?: boolean;
     /** The turn writes an interim message followed by a tool result. */
     interimOnly?: boolean;
     /** The session file path never exists (unreadable baseline). */
@@ -260,6 +268,8 @@ function makeHarness(
         capabilities: FAKE_CAPABILITIES,
         prompts,
         disposed: false,
+        evidence: 'unknown',
+        cessationEvidence: () => handle.evidence,
         async prompt(text: string, _options?: PromptOptions) {
           prompts.push(text);
           if (turnGate !== null) await turnGate;
@@ -291,6 +301,9 @@ function makeHarness(
           if (failDispose) throw new Error('dispose rejected (unproven cessation)');
           state = 'disposed';
           handle.disposed = true;
+          // A disposed HEALTH is metadata, never proof: this fixture attests
+          // 'ceased' only when it is modelling a completed stop.
+          if (opts.unprovenEvidence !== true) handle.evidence = 'ceased';
         },
       };
       handles.push(handle);
@@ -738,6 +751,48 @@ describe('tracked child workers: lifecycle, results and recovery', () => {
     expect(h.ledger.latestEventOfKind('child.cleanup-debt')).not.toBeNull();
     expect(h.worktrees.getWorktree(admission.record.id)?.status).not.toBe('swept');
     h.close();
+  });
+
+  it('a DISPOSED child whose adapter attests UNKNOWN keeps its lane and cleanup debt (F60-P3)', async () => {
+    const h = makeHarness({ unprovenEvidence: true });
+    const admission = h.request();
+    await waitForChild(h, admission.record.id, (state) => state === 'done');
+    const record = h.ledger.getChildWorker(admission.record.id)!;
+    // The turn's work outcome is truthful and recorded...
+    expect(record.resultSummary).toContain('child report');
+    // ...but terminal HEALTH is not cessation: the successful turn's cleanup
+    // stays debt and the read-only lane is retained.
+    expect(h.ledger.latestEventOfKind('child.cleanup-debt')).not.toBeNull();
+    expect(h.worktrees.getWorktree(admission.record.id)?.status).not.toBe('swept');
+    h.close();
+  });
+
+  it('reconciles a finalized read-only child\'s cleanup debt exactly once on a later positive attestation (F60-P3)', async () => {
+    const h = makeHarness({ unprovenEvidence: true });
+    try {
+      const admission = h.request();
+      await waitForChild(h, admission.record.id, (state) => state === 'done');
+      const recorded = h.ledger.getChildWorker(admission.record.id)!;
+      expect(recorded.resultSummary).toContain('child report');
+      expect(h.ledger.latestEventOfKind('child.cleanup-debt')).not.toBeNull();
+      expect(h.worktrees.getWorktree(admission.record.id)?.status).not.toBe('swept');
+      // Attributable LATE positive: the adapter now attests cessation.
+      h.handles[0]!.evidence = 'ceased';
+      await h.service.cancel(admission.record.id, 'late positive cessation proof');
+      // The recorded successful result is IMMUTABLE...
+      const after = h.ledger.getChildWorker(admission.record.id)!;
+      expect(after.resultState).toBe('done');
+      expect(after.resultSummary).toBe(recorded.resultSummary);
+      // ...while the retained cleanup debt reconciles exactly once.
+      expect(h.ledger.latestEventOfKind('child.cleanup-reconciled')).not.toBeNull();
+      expect(h.worktrees.getWorktree(admission.record.id)?.status).toBe('swept');
+      // A repeat is a no-op: still exactly one reconciliation.
+      await h.service.cancel(admission.record.id, 'repeat');
+      const reconciled = h.ledger.listEvents({ limit: 200 }).filter((e) => e.kind === 'child.cleanup-reconciled');
+      expect(reconciled).toHaveLength(1);
+    } finally {
+      h.close();
+    }
   });
 
   it('keeps an uncancelled failed run non-terminal when cessation is unproven', async () => {

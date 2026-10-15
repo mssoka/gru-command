@@ -11,6 +11,7 @@ import {
 } from '../ledger/api.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { AgentHandle, NativeAgentTool, SpawnOptions } from '../runtime/types.js';
+import { adapterCessationEvidence } from '../runtime/types.js';
 import { promptWithTerminalVerdict } from '../runtime/prompt-verdict.js';
 import {
   settleRetries,
@@ -873,7 +874,10 @@ export class ChildWorkerService {
             error: String(disposeError),
           });
         }
-        ceased = safeHealthState(handle) === 'disposed';
+        // Cessation proof is adapter-owned (Option A, F60-P3): disposed health
+        // is metadata, never proof. A missing/throwing/UNKNOWN answer keeps the
+        // record non-terminal with durable stop/cleanup debt and its lane.
+        ceased = adapterCessationEvidence(handle) === 'ceased';
       }
       // A recorded result is final. The cancelled path terminalizes ONLY
       // with proven cessation; an unproven stop stays NON-TERMINAL (the
@@ -941,8 +945,18 @@ export class ChildWorkerService {
           },
         });
       }
-      if (terminal) this.live.delete(record.id);
-      else if (handle !== null) run.handle = handle; // stop debt: keep the handle for a proof-aware retry
+      if (terminal) {
+        // A recorded result is IMMUTABLE, but when cessation was NOT proven
+        // the exact handle/lane ownership stays retained as cleanup debt so a
+        // later attributable positive attestation can reconcile it exactly
+        // once (F60-P3). Only a proven stop (or a gone handle) drops the live
+        // entry here; `cancel` on a terminal record runs the proof-aware
+        // reconciliation.
+        if (ceased || handle === null) this.live.delete(record.id);
+        else run.handle = handle;
+      } else if (handle !== null) {
+        run.handle = handle; // stop debt: keep the handle for a proof-aware retry
+      }
       // Read-only children leave nothing behind: their detached lane is
       // swept once the run is terminal AND cessation is proven. A child
       // whose turn was never delivered (fenced, cancelled or aborted
@@ -960,6 +974,40 @@ export class ChildWorkerService {
         await this.releaseLaneQuietly(record.id);
       }
     }
+  }
+
+  /**
+   * Proof-aware LATE reconciliation of a finalized child's retained cleanup
+   * debt (F60-P3). The recorded result is untouched (immutable); only the
+   * retained lane/permit ownership is reconciled, exactly once, once the
+   * adapter attests 'ceased'. A read-only child's detached lane is released;
+   * a writer child's lane stays owner-managed (the delivered/undelivered
+   * distinction is not re-derivable after finalization, so this stays
+   * conservative). A no-op when nothing is retained or the stop is still
+   * unproven — a cached failed/repeated rejection is never proof.
+   */
+  async reconcileCleanup(childId: string): Promise<void> {
+    const run = this.live.get(childId);
+    if (run === undefined) return;
+    const handle = run.handle;
+    if (handle === null) return;
+    if (adapterCessationEvidence(handle) !== 'ceased') return;
+    const record = this.opts.ledger.getChildWorker(childId);
+    if (record === null || record.resultState === null) return; // terminal cleanup debt only
+    // Exactly once: drop the retained ownership BEFORE the await so a
+    // repeat/concurrent call cannot double-release.
+    run.handle = null;
+    this.live.delete(childId);
+    this.opts.ledger.appendCustomEvent({
+      kind: 'child.cleanup-reconciled',
+      agentId: handle.id,
+      jobId: record.jobId,
+      payload: {
+        childId,
+        note: 'adapter attested cessation — retained cleanup debt reconciled exactly once',
+      },
+    });
+    if (record.authority === 'read-only') await this.releaseLaneQuietly(childId);
   }
 
   /** Reuse a lane that survived a restart; otherwise create the child
@@ -1013,7 +1061,12 @@ export class ChildWorkerService {
     if (record === null) {
       throw new RecordNotFound(`child worker "${childId}" not found`);
     }
-    if (record.resultState !== null) return record;
+    if (record.resultState !== null) {
+      // A terminal result stays immutable; a retained cleanup debt is
+      // reconciled proof-aware exactly once before answering (F60-P3).
+      await this.reconcileCleanup(childId);
+      return this.opts.ledger.getChildWorker(childId) as ChildWorkerRecord;
+    }
     const run = this.live.get(childId);
     if (run === undefined) {
       // No live run (not started yet, or already finalized): record the
