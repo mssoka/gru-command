@@ -6,9 +6,11 @@ import { isJobTerminal } from '../ledger/states.js';
 import type { LedgerApi } from '../ledger/api.js';
 import { loadPropertyConfig } from '../property/config.js';
 import { createPropertyExecutor, propertyWorkspaceIdentity } from '../property/executor.js';
-import { createPropertyCampaignHost, type PropertyCampaignResult, type ReviewedPropertyCampaign } from '../property/pipeline.js';
+import { createPropertyCampaignHost, isHostPropertyRepairDirective, type PropertyCampaignResult, type PropertyRepairDirective, type ReviewedPropertyCampaign } from '../property/pipeline.js';
 import { buildSourceIdentity, propertyConfigIdentity, propertyGit } from '../property/receipts.js';
-import { createPropertyFixDirectiveSink, flipJobToWorking, recordFollowUpDelivery, type DirectiveRoutingDeps } from './fix-directive.js';
+import { executeAcceptedDirective } from './directive-progress.js';
+import type { DirectiveRoutingDeps } from './fix-directive.js';
+import type { RecoveryNotifications } from './rebrief-recovery.js';
 import type { WaveRunner } from './perkins.js';
 
 export class PropertyOwnerActionError extends Error {
@@ -29,6 +31,7 @@ interface Entry {
 export interface PropertyCampaignServiceOptions extends DirectiveRoutingDeps {
   readonly ledger: LedgerApi;
   readonly wave: Pick<WaveRunner, 'assertWriterAdmissible' | 'clearLaneForWriter'>;
+  readonly notifications: RecoveryNotifications;
   readonly artifactsRoot: string;
   readonly pendingProducerBlockers: (jobId: string) => readonly string[];
 }
@@ -81,44 +84,41 @@ export function createPropertyCampaignService(options: PropertyCampaignServiceOp
     mkdirSync(entry.artifactsDir, { recursive: true, mode: 0o700 });
     writeFileSync(join(entry.artifactsDir, `owner-${entry.state}-${randomUUID()}.json`), `${JSON.stringify(view(entry), null, 2)}\n`, { flag: 'wx', mode: 0o600 });
   };
+  const consumedDirectives = new WeakSet<PropertyRepairDirective>();
   const repair = async (entry: Entry, maxAttempts: number): Promise<void> => {
     const report = entry.report;
     if (report === null || !report.blocking) throw new PropertyOwnerActionError('repair needs this process\'s unresolved qualified enforced report');
     // Durable single-writer ownership stays live through ALL native turns
     // and frozen-oracle validation, not just through the first minion turn.
     options.wave.assertWriterAdmissible(entry.jobId);
-    const directive = `Owner-approved property repair ${entry.id}, max attempts ${maxAttempts}; exact head ${report.candidateSha}; only implementation paths ${JSON.stringify(entry.spec.implementationPaths ?? [])}; no publication/merge authority`;
-    const intent = options.ledger.beginDirectiveIntent({ jobId: entry.jobId, directive, holder: 'property-contract-repair' }).record;
-    const release = options.ledger.beginJobAdmission(entry.jobId, `property repair ${entry.id}`);
+    const admissionKind = `property repair ${entry.id}`;
+    const release = options.ledger.beginJobAdmission(entry.jobId, admissionKind);
     const controller = new AbortController(); controllers.add(controller);
-    let enteredRouter = false;
-    let minionId: string | null = null;
-    let noEffect = false;
     try {
-      await options.wave.clearLaneForWriter({ jobId: entry.jobId, writer: `property repair ${entry.id}` });
+      await options.wave.clearLaneForWriter({ jobId: entry.jobId, writer: admissionKind });
       bind(entry.jobId, entry.spec.candidateRoot);
       if (head(entry.spec.candidateRoot) !== report.candidateSha) throw new PropertyOwnerActionError('candidate moved while repair admission waited; requalify');
-      const deliver = createPropertyFixDirectiveSink(options, entry.jobId, controller.signal, (delivery) => {
-        noEffect = !delivery.delivered && delivery.admission === 'none';
-        if (delivery.delivered && delivery.minionId !== undefined) {
-          const sent = options.ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: entry.jobId, payload: { request_id: intent.requestId, minion_id: delivery.minionId, owner: 'property-contract-repair', campaign_id: entry.id } });
-          if (minionId === null) options.ledger.recordDirectiveAdmission({ requestId: intent.requestId, minionId: delivery.minionId, eventSeq: sent.seq });
-          else if (minionId !== delivery.minionId) throw new PropertyOwnerActionError('repair actor changed within the allocation; reconcile native ownership');
-          minionId = delivery.minionId;
-        }
-      });
-      entry.report = await host.repair(report, async (issued) => { enteredRouter = true; await deliver(issued); }, { artifactsDir: entry.artifactsDir, maxAttempts });
+      // Each host-issued directive is an ordinary durable directive request
+      // executed by the same native-admission path as every other directive
+      // (adapter-owned admission, producer fences, settlement, recovery).
+      const deliver = async (issued: PropertyRepairDirective): Promise<void> => {
+        if (!isHostPropertyRepairDirective(issued) || consumedDirectives.has(issued)) throw new PropertyOwnerActionError('property repair refused: unissued, changed or already delivered directive');
+        consumedDirectives.add(issued);
+        const intent = options.ledger.beginDirectiveIntent({ jobId: entry.jobId, directive: issued.text, holder: 'property-contract-repair' }).record;
+        await executeAcceptedDirective({ registry: options.registry, ledger: options.ledger, worktrees: options.worktrees, notifications: options.notifications,
+          pendingProducerBlockers: options.pendingProducerBlockers, signal: controller.signal, ownAdmissionKinds: [admissionKind],
+          ...(options.workerGate !== undefined ? { workerGate: options.workerGate } : {}),
+          ...(options.retrySettlement !== undefined ? { retrySettlement: options.retrySettlement } : {}),
+          ...(options.observeBlindTurn !== undefined ? { observeBlindTurn: options.observeBlindTurn } : {}),
+          ...(options.lessons !== undefined ? { lessons: options.lessons } : {}),
+          ...(options.parentTools !== undefined ? { parentTools: options.parentTools } : {}) }, intent.requestId);
+        const state = options.ledger.getDirective(intent.requestId)?.state;
+        if (state !== 'settled') throw new PropertyOwnerActionError(`repair directive ${intent.requestId} did not settle (state ${String(state)}); no clearance, reconcile it through the ordinary directive path`);
+      };
+      entry.report = await host.repair(report, deliver, { artifactsDir: entry.artifactsDir, maxAttempts });
       bind(entry.jobId, entry.spec.candidateRoot);
       if (head(entry.spec.candidateRoot) !== entry.report.candidateSha) throw new PropertyOwnerActionError('validated repair head moved before delivery; no clearance');
-      if (minionId === null) throw new PropertyOwnerActionError('repair has no native minion admission identity');
-      flipJobToWorking(options.ledger, entry.jobId);
-      const followUp = recordFollowUpDelivery({ ledger: options.ledger, worktrees: options.worktrees, jobId: entry.jobId, agentId: minionId, source: 'silas-directive', requestId: intent.requestId, workRevision: intent.workRevision ?? 0 });
-      options.ledger.recordDirectiveDelivery({ requestId: intent.requestId, eventSeq: followUp.eventSeq });
       entry.state = 'repaired';
-    } catch (error) {
-      if (!enteredRouter || (noEffect && minionId === null)) options.ledger.failDirective({ requestId: intent.requestId, reason: `refused before native admission: ${String(error)}` });
-      else options.ledger.recordDirectiveReconcile({ requestId: intent.requestId, note: `property repair interrupted or frozen validation refused; no delivery/clearance: ${String(error)}` });
-      throw error;
     } finally { controllers.delete(controller); release(); }
   };
   return {

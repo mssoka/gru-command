@@ -4418,7 +4418,11 @@ export class LedgerApi {
       throw new Error(`cannot admit ${kind} for job "${jobId}" (${job?.status ?? 'missing'})`);
     }
     const prior = this.listJobAdmissions(jobId);
-    if ((kind.startsWith('property ') && prior.length > 0) || (prior.some((entry) => entry.startsWith('property ')) && !kind.startsWith('provider wait establishment '))) throw new LaneWriterConflictError(`job "${jobId}" has a competing property/producer admission — wait for its proven settlement`);
+    // The one admission that may nest under a `property repair` allocation is
+    // a directive whose durable request is held by that same repair service.
+    const ownRepairDirective = kind.startsWith('directive ') && prior.filter((entry) => entry.startsWith('property ')).every((entry) => entry.startsWith('property repair ')) &&
+      this.getDirective(kind.slice('directive '.length))?.claim?.holder === 'property-contract-repair';
+    if (!ownRepairDirective && ((kind.startsWith('property ') && prior.length > 0) || (prior.some((entry) => entry.startsWith('property ')) && !kind.startsWith('provider wait establishment ')))) throw new LaneWriterConflictError(`job "${jobId}" has a competing property/producer admission — wait for its proven settlement`);
     const admission = { jobId, kind };
     this.activeJobAdmissions.add(admission);
     return () => { this.activeJobAdmissions.delete(admission); };
@@ -7379,7 +7383,10 @@ export class LedgerApi {
             'wait for its settlement (or its boot reconciliation) before sending a directive',
         );
       }
-      this.assertNoProviderProducer(input.jobId);
+      // The owner-approved property repair service holds its own `property
+      // repair` allocation across its directive turns; that is the one
+      // admission a property-repair directive may coexist with.
+      this.assertNoProviderProducer(input.jobId, input.holder === 'property-contract-repair' ? (kind) => kind.startsWith('property repair ') : undefined);
       const requestId = input.requestId ?? randomUUID();
       const ts = nowIso();
       // The revision is bound in the SAME transaction as the intent: the
@@ -9041,8 +9048,8 @@ export class LedgerApi {
     return row['epoch'] as number;
   }
 
-  private assertNoProviderProducer(jobId: string): void {
-    const admissions = this.listJobAdmissions(jobId).filter((kind) => kind.startsWith('provider ') || kind.startsWith('property '));
+  private assertNoProviderProducer(jobId: string, exempt?: (kind: string) => boolean): void {
+    const admissions = this.listJobAdmissions(jobId).filter((kind) => (kind.startsWith('provider ') || kind.startsWith('property ')) && exempt?.(kind) !== true);
     const claims = this.listOpenProviderWaitsForJob(jobId)
       .filter((wait) => wait.status === 'claimed')
       .map((wait) => `claimed provider continuation ${wait.id}`);

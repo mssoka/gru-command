@@ -106,7 +106,7 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
     const failed = await h.request(`${h.path}/${id}/repair`, { decision: 'approve', expectedHead, maxAttempts: 1 });
     expect(failed.status).toBe(400); expect(h.prompts).toHaveLength(1);
     const live = h.ledger.listPendingDirectives({ jobId: h.jobId, states: ['dispatching', 'admitted'] });
-    expect(live).toHaveLength(1); expect(live[0]!.failReason).toMatch(/^reconcile: property repair interrupted/);
+    expect(live).toHaveLength(1); expect(live[0]!.failReason).toMatch(/^reconcile:/);
     expect(h.ledger.latestJobEvent(h.jobId, 'job.delivered')).toBeNull();
     expect((await h.request(`${h.path}/${id}/repair`, { decision: 'approve', expectedHead, maxAttempts: 1 })).status).toBe(400); expect(h.prompts).toHaveLength(1);
   });

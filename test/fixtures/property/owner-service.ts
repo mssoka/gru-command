@@ -14,6 +14,7 @@ import { WaveRunner } from '../../../src/dispatch/perkins.js';
 import { PacingGate } from '../../../src/runtime/pacing.js';
 import type { AgentHandle } from '../../../src/runtime/types.js';
 import type { WorktreeLane } from '../../../src/dispatch/worktree-port.js';
+import { withNativeDirectiveFixture } from '../../helpers/directive-native-fixture.js';
 import { InMemoryWorktreePort } from '../../helpers/in-memory-worktrees.js';
 import { propertyGit } from '../../../src/property/receipts.js';
 
@@ -25,22 +26,24 @@ export async function ownerService(candidateRoot: string, onRepair: (text: strin
   const config = loadConfig({ GRU_COMMAND_HOME: dir }, dir);
   const db = new LedgerDb(dir); const bus = new EventBus(); const ledger = new LedgerApi(db.handle, { bus });
   const jobId = 'property-job'; ledger.addJob({ id: jobId, repo: candidateRoot, title: 'Owner-approved property repair' }); ledger.setJobStatus(jobId, 'working'); ledger.setJobStatus(jobId, 'delivered');
-  ledger.registerAgent({ id: 'property-minion', role: 'minion', jobId }); ledger.setAgentState('property-minion', 'idle');
+  const sessionFile = join(dir, 'minion-session.jsonl'); ledger.registerAgent({ id: 'property-minion', role: 'minion', jobId, sessionFile, parentage: 'top-level' }); ledger.setAgentState('property-minion', 'idle');
   const lane: WorktreeLane = { id: jobId, kind: 'job', jobId, roundId: null, repoPath: candidateRoot, repoName: 'property-fixture', path: candidateRoot, branch: propertyGit(candidateRoot, ['symbolic-ref', '--short', 'HEAD']).trim(), sha: propertyGit(candidateRoot, ['rev-parse', 'HEAD']).trim(), status: 'active' };
   const worktrees = Object.assign(new InMemoryWorktreePort(dir), { getWorktree: (id: string) => id === jobId ? lane : null, listWorktrees: () => [lane] });
   const prompts: string[] = [];
   let health: 'idle' | 'streaming' | 'error' = 'idle';
-  const handle: AgentHandle = { id: 'property-minion', role: 'minion', sessionFile: null,
+  const minion: AgentHandle = { id: 'property-minion', role: 'minion', sessionFile: null,
     capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
-    async prompt(text) { prompts.push(text); health = 'streaming'; ledger.setAgentState(handle.id, 'streaming'); try { await onRepair(text); health = 'idle'; ledger.setAgentState(handle.id, 'idle'); } catch (error) { health = 'error'; ledger.setAgentState(handle.id, 'error'); throw error; } },
+    async prompt(text) { prompts.push(text); health = 'streaming'; ledger.setAgentState('property-minion', 'streaming'); try { await onRepair(text); health = 'idle'; ledger.setAgentState('property-minion', 'idle'); } catch (error) { health = 'error'; ledger.setAgentState('property-minion', 'error'); throw error; } },
     async steer() {}, async followUp() {}, async dispose() {}, subscribe() { return () => {}; }, health() { return { state: health, lastActivity: null, sessionFile: null }; }, hasLiveProcess() { return health === 'streaming'; }, isCompacting() { return false; } };
-  const registry = { getHandle: (id: string) => id === handle.id ? handle : null, spawn: async () => handle, disposeHandle: async () => {} };
+  // Real persisted native admission/terminal evidence (PR334 protocol), same as the other HTTP/ledger fixtures.
+  const handle = withNativeDirectiveFixture(minion, sessionFile, () => {}, () => propertyGit(candidateRoot, ['rev-parse', 'HEAD']).trim(), candidateRoot);
+  const registry = { getHandle: (id: string) => id === handle.id ? handle : null, spawn: async () => handle, disposeHandle: async (target: AgentHandle) => { await target.dispose(); } };
   const spawner = async () => handle;
   const dispatch = new DispatchService({ ledger, worktrees, spawner });
   const wave = new WaveRunner({ ledger, worktrees, spawner, bus, reviewArtifactRoot: join(dir, 'reviews') });
   const workerGate = new PacingGate({ enabled: true, maxConcurrentMinions: 1, maxConcurrentReviewTurns: 0 });
   const artifactsRoot = join(dir, 'campaigns'); mkdirSync(artifactsRoot);
-  const serviceOptions = { ledger, worktrees, registry, wave, workerGate, artifactsRoot, pendingProducerBlockers: () => [] };
+  const serviceOptions = { ledger, worktrees, registry, wave, workerGate, artifactsRoot, notifications: { postIncident: () => null }, pendingProducerBlockers: () => [] };
   const propertyCampaigns = createPropertyCampaignService(serviceOptions);
   const server = createDispatchServer({ config, ledger, dispatch, wave, propertyCampaigns, pendingProducerBlockers: () => [] });
   const http = createServer((req, res) => { if (!server.requestHook(req, res, new URL(req.url ?? '/', 'http://localhost').pathname)) { res.writeHead(404); res.end('{}'); } });

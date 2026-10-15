@@ -1458,7 +1458,7 @@ async function main(): Promise<number> {
       })
     : null;
   const intake = new IntakeService({ dataDir: config.dataDir, workspaceRoot: config.workspaceRoot, uploadsDir });
-  const propertyCampaigns = createPropertyCampaignService({ ledger, registry, worktrees: worktreeManager, wave, artifactsRoot: join(config.dataDir, 'property-campaigns'), pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor, ...(config.lessons.enabled ? { lessons: lessonReferences } : {}) });
+  const propertyCampaigns = createPropertyCampaignService({ ledger, registry, worktrees: worktreeManager, wave, notifications, observeBlindTurn, artifactsRoot: join(config.dataDir, 'property-campaigns'), pendingProducerBlockers: (jobId) => supervisorLive.pendingProducerBlockers(jobId), workerGate: pacing.gate, retrySettlement: (agentId) => supervisorLive.awaitRetrySettlement(agentId), parentTools: parentToolsFor, ...(config.lessons.enabled ? { lessons: lessonReferences } : {}) });
   state.propertyCampaigns = propertyCampaigns;
   const dispatchServer = createDispatchServer({
     config,
