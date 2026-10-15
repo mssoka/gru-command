@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import {
   isValidLessonProposal,
   isValidSnapshot,
@@ -21,7 +21,6 @@ const MOCK_TOKEN = process.env.GRU_MOCK_TOKEN ?? 'dev-token';
 const T0 = '2026-10-07T00:00:00.000Z';
 const NOTICE_ID = 'lessons-proposal:prop-phone';
 const LONG = 'an-unbreakable-journal-handle-'.repeat(4);
-const LONG_DETAIL = 'x'.repeat(256);
 
 const NOTICE: NotificationView = {
   id: NOTICE_ID,
@@ -30,7 +29,7 @@ const NOTICE: NotificationView = {
   routing: 'needs-owner',
   severity: 'info',
   title: 'Book of Lessons: 3 lesson changes proposed',
-  detail: LONG_DETAIL,
+  detail: 'distilled from 4 journal entries',
   agentId: null,
   shownAt: null,
   ackedAt: null,
@@ -147,49 +146,8 @@ interface Box {
   readonly width: number;
 }
 
-/** Clear the hit target from sticky chrome using bounded, real page scrolls.
- * The strict viewport/hit assertions below still fail if the control remains
- * covered or cannot be brought fully on screen. */
-async function scrollFullyIntoView(locator: Locator): Promise<void> {
-  await locator.first().evaluate((element) => {
-    element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    const pad = 8;
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      const rect = element.getBoundingClientRect();
-      const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-      if (top !== null && top !== element && !element.contains(top)) {
-        const cover = top.getBoundingClientRect();
-        const downNeed = Math.max(0, cover.bottom + pad - rect.top);
-        const upNeed = Math.max(0, rect.bottom - (cover.top - pad));
-        const roomDown = Math.max(0, window.innerHeight - pad - rect.bottom);
-        const roomUp = Math.max(0, rect.top - pad);
-        const canDown = downNeed > 0.5 && downNeed <= roomDown;
-        const canUp = upNeed > 0.5 && upNeed <= roomUp;
-        if (canDown && (!canUp || downNeed <= upNeed)) {
-          window.scrollBy(0, -downNeed);
-          continue;
-        }
-        if (canUp) {
-          window.scrollBy(0, upNeed);
-          continue;
-        }
-        break;
-      }
-      if (rect.bottom > window.innerHeight - pad) {
-        window.scrollBy(0, rect.bottom - (window.innerHeight - pad));
-        continue;
-      }
-      if (rect.top < pad) {
-        window.scrollBy(0, rect.top - pad);
-        continue;
-      }
-      break;
-    }
-  });
-}
-
 for (const width of [360, 375, 390]) {
-  test(`the open proposal review stays one column and reachable with chat closed at ${width}px`, async ({ page }) => {
+  test(`the open proposal review stays one column and reachable at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 });
     const { pageErrors, decisions } = await seed(page);
     await page.goto('/');
@@ -198,17 +156,8 @@ for (const width of [360, 375, 390]) {
     await page.locator('#pair-submit').click();
     await expect(page.locator('#board-view')).toBeVisible();
 
-    const chatSheet = page.locator('#chat-sheet');
-    if (await chatSheet.getAttribute('data-open') === 'true') {
-      // The mock board opens Gru chat as a mobile sheet. Close that intentional
-      // overlay so this check measures the proposal row, not the chat drawer.
-      await page.locator('#chat-sheet .chat-panel__collapse').click();
-      await expect(chatSheet).not.toHaveAttribute('data-open', 'true');
-    }
-
     const row = page.locator('#board-owner .board-owner__row--proposal');
     await expect(row).toBeVisible();
-    await expect(row.locator('.board-owner__meta')).toHaveCSS('overflow-wrap', 'anywhere');
     await row.locator('.board-owner__review > summary').click();
     await expect(row.locator('.board-owner__review-text').first()).toContainText('Close the live shell');
 
@@ -249,81 +198,17 @@ for (const width of [360, 375, 390]) {
     // Accept and Reject: on screen and the topmost element at their centres.
     for (const selector of ['.board-owner__accept', '.board-owner__reject']) {
       const button = row.locator(selector);
-      await scrollFullyIntoView(button);
+      await button.scrollIntoViewIfNeeded();
       await expect(button).toBeEnabled();
       const hit = await button.evaluate((node) => {
         const rect = node.getBoundingClientRect();
         const inViewport = rect.left >= 0 && rect.right <= window.innerWidth && rect.top >= 0 && rect.bottom <= window.innerHeight;
         const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-        return {
-          inViewport,
-          hit: top === node || (top !== null && node.contains(top)),
-          top: top === null ? null : {
-            tag: top.tagName.toLowerCase(),
-            id: top.id,
-            className: typeof top.className === 'string' ? top.className : '',
-            ariaLabel: top.getAttribute('aria-label'),
-          },
-        };
+        return { inViewport, hit: top === node || node.contains(top) };
       });
-      expect(hit.inViewport).toBe(true);
-      expect(hit.hit, `topmost element at action center: ${JSON.stringify(hit.top)}`).toBe(true);
+      expect(hit).toEqual({ inViewport: true, hit: true });
     }
     expect(decisions).toEqual([]);
     expect(pageErrors).toEqual([]);
   });
 }
-
-test('desktop bell pointer keeps panel flow and the long proposal detail wraps', async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 900 });
-  const { pageErrors, decisions } = await seed(page);
-  await page.goto('/');
-  await expect(page.locator('#pairing-view')).toBeVisible();
-  await page.locator('#pair-token').fill(MOCK_TOKEN);
-  await page.locator('#pair-submit').click();
-  await expect(page.locator('#board-view')).toBeVisible();
-
-  const detail = page.locator('#board-owner .board-owner__row--proposal > .board-owner__meta');
-  await expect(detail).toBeVisible();
-  const detailLayout = await detail.evaluate((node) => ({
-    overflowWrap: getComputedStyle(node).overflowWrap,
-    width: node.clientWidth,
-    scrollWidth: node.scrollWidth,
-  }));
-  expect(detailLayout.overflowWrap).toBe('anywhere');
-  expect(detailLayout.width).toBeGreaterThan(0);
-  expect(detailLayout.scrollWidth).toBeLessThanOrEqual(detailLayout.width);
-
-  await page.locator('#notification-bell').click();
-  const pointer = page.locator('#notification-list .board-owner__row--pointer');
-  await expect(pointer).toBeVisible();
-  const layout = await pointer.evaluate((node) => {
-    const box = (selector: string): Box => {
-      const rect = node.querySelector(selector)!.getBoundingClientRect();
-      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width };
-    };
-    const rowStyle = getComputedStyle(node);
-    const rowRect = node.getBoundingClientRect();
-    const contentRight =
-      rowRect.right - Number.parseFloat(rowStyle.borderRightWidth) - Number.parseFloat(rowStyle.paddingRight);
-    const title = box('.board-owner__title');
-    const meta = box('.board-owner__meta');
-    return {
-      display: rowStyle.display,
-      flexWrap: rowStyle.flexWrap,
-      title,
-      meta,
-      go: box('.board-owner__goto'),
-      contentRight,
-    };
-  });
-  expect(layout.display).toBe('flex');
-  expect(layout.flexWrap).toBe('wrap');
-  expect(layout.meta.top).toBeGreaterThanOrEqual(layout.title.bottom - 1);
-  expect(layout.go.top).toBeGreaterThanOrEqual(layout.meta.bottom - 1);
-  // `margin-left:auto` computes to its used pixel value; assert the resulting
-  // alignment rather than the authored CSS token.
-  expect(Math.abs(layout.go.right - layout.contentRight)).toBeLessThanOrEqual(1);
-  expect(decisions).toEqual([]);
-  expect(pageErrors).toEqual([]);
-});

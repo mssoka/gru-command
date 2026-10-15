@@ -130,6 +130,14 @@ describe('workload-aware test budgets', () => {
     }
   });
 
+  it('keeps the observed full-run ceiling file classified heavy (perkins-review-convergence)', () => {
+    // Observed at 32817 ms against the 30 s fast ceiling under full-run
+    // co-tenant load (19622/15079/11998 ms in the other preserved runs);
+    // the classification is the documented mitigation and must not
+    // silently drop back to the fast phase.
+    expect(HEAVY_TEST_FILES).toContain('perkins-review-convergence.test.ts');
+  });
+
   it('clamps each phase by any smaller scheduler pin and never below one worker', () => {
     expect(resolveWorkerBudget({}, HEAVY_WORKER_CAP)).toBe(2);
     expect(resolveWorkerBudget({}, FAST_WORKER_CAP)).toBe(4);

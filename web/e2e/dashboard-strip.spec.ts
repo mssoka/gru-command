@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import { isValidSnapshot, type BoardSnapshot } from '../src/lib/board-protocol.js';
 
 /**
@@ -169,8 +169,6 @@ function agent(id: string, state: string): Record<string, unknown> {
 /** The exact synthetic ack strings the band must render verbatim —
  * asserted in full (never a suffix) by the reveal tests. */
 const ACK_DETAIL = (id: string): string => `synthetic detail ${id} — the complete original notice body`;
-const ACK_CONSEQUENCE =
-  'Ack re-arms this worker and resumes supervision — it does NOT clear code/test/review holds.';
 
 function ackRow(id: string): Record<string, unknown> {
   return {
@@ -551,12 +549,6 @@ async function waitForCount(page: Page, kpi: string, value: number, timeout = 5_
     .toBe(String(value));
 }
 
-async function waitForPending(page: Page, value: number): Promise<void> {
-  await expect
-    .poll(() => page.evaluate(() => document.querySelector<HTMLElement>('.board-band__count-num')?.textContent ?? ''))
-    .toBe(String(value));
-}
-
 /** Assert EVERY intended slot's actual rendered value — the family sentries
  * stand before geometry so a measurement can never outrun its evidence. */
 async function expectSlots(page: Page, kpis: readonly string[], value: number): Promise<void> {
@@ -652,28 +644,6 @@ async function expectStripFamilies(page: Page, expected: FamilyTexts): Promise<v
 async function expectTotal(page: Page, value: number): Promise<void> {
   await expect(page.locator('[data-kpi="jobs.total"]')).toHaveText(String(value));
   await expect(page.locator('.strip-group__total-num')).toHaveText(String(value));
-}
-
-/** The focused element must be EXACTLY this control — element identity
- * (never a lookalike sharing a control kind), with its stable action id
- * and control kind. */
-async function expectFocusedControl(page: Page, locator: Locator, actionId: string, control: string): Promise<void> {
-  await expect
-    .poll(() =>
-      locator.evaluate(
-        (el, expected) =>
-          el === document.activeElement &&
-          el.dataset.actionId === expected.actionId &&
-          el.dataset.control === expected.control,
-        { actionId, control },
-      ),
-    )
-    .toBe(true);
-  const focused = await page.evaluate(() => {
-    const active = document.activeElement as HTMLElement | null;
-    return { actionId: active?.dataset.actionId ?? '', control: active?.dataset.control ?? '' };
-  });
-  expect(focused).toEqual({ actionId, control });
 }
 
 /** familyA's REAL data-kpi identities (board-rail.ts): heists working/
@@ -786,38 +756,6 @@ for (const [width, height] of VIEWPORTS) {
       comparePairwise(before, after);
       await expect(page.locator('[data-kpi="jobs.total"]')).toHaveText(String(m));
     });
-
-    test(`pending count header renders exactly ${n} then ${m} at ${width}×${height}`, async ({ page }) => {
-      await page.setViewportSize({ width, height });
-      const send = await harness(page, makeSnapshot({ ...familyC(4), pending: n }));
-      await waitForPending(page, n);
-      await expectStripFamilies(page, familyBCFamilies());
-      await expectTotal(page, 4);
-      // The hidden tail renders its ACTUAL value (n − 6 visible) — asserted
-      // BEFORE before-geometry, never inferred.
-      if (n > 6) await expect(page.locator('.board-band__more-num')).toHaveText(String(n - 6));
-      const before = await geometry(page, { expectOlder: n > 6 });
-      expect(before.bodyOverflow).toBe(false);
-      expect(before.railOverflow).toBe(false);
-      await send(makeSnapshot({ ...familyC(4), pending: m }));
-      await waitForPending(page, m);
-      await expectStripFamilies(page, familyBCFamilies());
-      await expectTotal(page, 4);
-      if (m > 6) await expect(page.locator('.board-band__more-num')).toHaveText(String(m - 6));
-      const after = await geometry(page, { expectOlder: m > 6 });
-      // Rows legitimately change with membership; the header slot, the
-      // older-pending number, its button and adjacent '+N older pending'
-      // text, the strip, and the status row must not move.
-      expect(after.stripJson).toBe(before.stripJson);
-      expect(Math.abs(after.statusH - before.statusH)).toBeLessThanOrEqual(0.5);
-      expect(after.bandHead).toEqual(before.bandHead);
-      expect(after.moreNum).toEqual(before.moreNum);
-      expect(after.moreBtn).toEqual(before.moreBtn);
-      expect(after.moreTail).toEqual(before.moreTail);
-      if (m > 6) expect(after.moreNum).not.toBeNull();
-      expect(after.bodyOverflow).toBe(false);
-      expect(after.railOverflow).toBe(false);
-    });
   }
 }
 
@@ -900,48 +838,6 @@ test('GRU and SILAS wake ages vary independently; frozen clock lands 9→10, 99�
   comparePairwise(silas999, silas1000);
 });
 
-/** F4: the pending loop's hidden tail (n−6 → 3/4, 93/94, 993/994) never
- * crosses a DIGIT boundary itself. These dedicated fixtures do: exactly 6
- * visible rows with the HIDDEN count crossing 9→10, 99→100, 999→1000. */
-const HIDDEN_BOUNDARIES: ReadonlyArray<readonly [number, number]> = [
-  [9, 10],
-  [99, 100],
-  [999, 1000],
-];
-
-for (const [width, height] of VIEWPORTS) {
-  for (const [h1, h2] of HIDDEN_BOUNDARIES) {
-    test(`older-pending hidden count crosses ${h1}→${h2} inside its reserved slot at ${width}×${height}`, async ({ page }) => {
-      await page.setViewportSize({ width, height });
-      const send = await harness(page, makeSnapshot({ ...familyC(4), pending: 6 + h1 }));
-      await waitForPending(page, 6 + h1);
-      // Exactly 6 visible rows; the expander carries the ACTUAL hidden value.
-      await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(6);
-      await expect(page.locator('.board-band__more-num')).toHaveText(String(h1));
-      await expectStripFamilies(page, familyBCFamilies());
-      await expectTotal(page, 4);
-      const before = await geometry(page, { expectOlder: true });
-      await send(makeSnapshot({ ...familyC(4), pending: 6 + h2 }));
-      await waitForPending(page, 6 + h2);
-      await expect(page.locator('.board-band__more-num')).toHaveText(String(h2)); // BEFORE geometry
-      await expectStripFamilies(page, familyBCFamilies());
-      await expectTotal(page, 4);
-      const after = await geometry(page, { expectOlder: true });
-      // The hidden numeric slot, its button, AND the adjacent ' older
-      // pending' text hold their geometry across the hidden digit boundary.
-      expect(after.moreNum).not.toBeNull();
-      expect(after.moreNum).toEqual(before.moreNum);
-      expect(after.moreBtn).toEqual(before.moreBtn);
-      expect(after.moreTail).toEqual(before.moreTail);
-      expect(after.stripJson).toBe(before.stripJson);
-      expect(Math.abs(after.statusH - before.statusH)).toBeLessThanOrEqual(0.5);
-      expect(after.bandHead).toEqual(before.bandHead);
-      expect(after.bodyOverflow).toBe(false);
-      expect(after.railOverflow).toBe(false);
-    });
-  }
-}
-
 // G1: one test per viewport — a fresh page fixture per cadence means ONE
 // harness install (routes, frozen clock, pairing) each; the old single test
 // called harness four times on one page, stacking ws/HTTP handlers and
@@ -1019,229 +915,6 @@ test('768px keeps the selected tablet density; 620px stacks at the 640px contain
   expect(stacked.overflow).toBe(false);
 });
 
-test('long labels wrap as text; the long notification reveals its COMPLETE original detail and consequence; reveal sends nothing', async ({ page }) => {
-  const ackCalls: string[] = [];
-  await page.route(/\/ack/, async (route) => {
-    ackCalls.push(route.request().url());
-    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
-  });
-  await page.setViewportSize({ width: 1200, height: 900 });
-  // pending: 2 — a long NOTIFICATION row AND the long PR row both exist
-  // (pending 1 would have left only the PR row and proved nothing here).
-  const long: Partial<Slots> = { long: true, pending: 2 };
-  const send = await harness(page, makeSnapshot(slotSpec({ ...familyA(9), ...long })));
-  await waitForCount(page, 'prs.open', 9);
-  await expectStripFamilies(page, familyAFamilies(9));
-  await expectTotal(page, 3 * 9 + 1);
-  const overflow = await page.evaluate(() => {
-    const rail = document.getElementById('chip-rail')!;
-    const band = document.getElementById('board-owner')!;
-    return {
-      body: document.documentElement.scrollWidth > document.documentElement.clientWidth,
-      rail: rail.scrollWidth > rail.clientWidth,
-      band: band.scrollWidth > band.clientWidth,
-    };
-  });
-  expect(overflow.body).toBe(false);
-  expect(overflow.rail).toBe(false);
-  expect(overflow.band).toBe(false);
-  const band = page.locator('#board-owner');
-  const ackDisclose = band.locator('[data-action-id="owner-ack:pend-0000"][data-control="disclose"]');
-  await expect(ackDisclose).toBeVisible();
-  // Row anchored by the disclosure's OWN aria-controls region — a
-  // `has:`-nested locator double-roots (#board-owner inside the row can
-  // never match), so the region id is the honest identity here.
-  const ackRegion = (await ackDisclose.getAttribute('aria-controls')) ?? '';
-  const ackRow = page.locator(`.board-owner__row:has(> #${ackRegion})`);
-  // The long SUPPLIED title is the Problem face — exact, never truncated.
-  await expect(ackRow.locator('.board-owner__title')).toHaveText(
-    `long owner stop title pend-0000 ${'deliberately wordy notice heading '.repeat(6).trim()}`,
-  );
-  // G3d: the LONG notification's exact full detail + consequence are
-  // revealed via KEYBOARD (Enter), not only by click; the click path stays
-  // covered on the PR row below.
-  await ackDisclose.focus();
-  await page.keyboard.press('Enter');
-  await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true');
-  // The COMPLETE original detail and the FULL consequence, exact — a suffix
-  // match would not prove the original text survived intact.
-  await expect(ackRow.locator('.board-owner__detail-text')).toHaveText([
-    ACK_DETAIL('pend-0000'),
-    ACK_CONSEQUENCE,
-  ]);
-  const prDisclose = band.locator('[data-action-id="owner-pr:synthetic"][data-control="disclose"]');
-  const prRegion = (await prDisclose.getAttribute('aria-controls')) ?? '';
-  const prRow = page.locator(`.board-owner__row:has(> #${prRegion})`);
-  await expect(prRow.locator('.board-owner__title')).toHaveText(
-    `long ready heist ${'deliberately wordy pr heading '.repeat(6).trim()}`,
-  );
-  await prDisclose.click();
-  await expect(prDisclose).toHaveAttribute('aria-expanded', 'true');
-  await send(makeSnapshot(slotSpec({ ...familyA(10), ...long })));
-  await waitForCount(page, 'prs.open', 10);
-  await expectStripFamilies(page, familyAFamilies(10));
-  await expectTotal(page, 3 * 10 + 1);
-  // Both expansions (and the exact revealed text) survive the push.
-  await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true');
-  await expect(prDisclose).toHaveAttribute('aria-expanded', 'true');
-  await expect(ackRow.locator('.board-owner__detail-text')).toHaveText([
-    ACK_DETAIL('pend-0000'),
-    ACK_CONSEQUENCE,
-  ]);
-  expect(ackCalls).toEqual([]);
-  // Phone leg: the same long labels must wrap honestly in the ≤560px
-  // stacked band without horizontal overflow (body, band, or detail box),
-  // and BOTH long rows must still be revealed there (never vacuous).
-  await page.setViewportSize({ width: 360, height: 740 });
-  await expect(band.locator('.board-owner__detail:visible')).toHaveCount(2);
-  await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true');
-  const phoneOverflow = await page.evaluate(() => {
-    const bandEl = document.getElementById('board-owner')!;
-    const details = [...bandEl.querySelectorAll<HTMLElement>('.board-owner__detail')];
-    return {
-      body: document.documentElement.scrollWidth > document.documentElement.clientWidth,
-      band: bandEl.scrollWidth > bandEl.clientWidth,
-      detail: details.length === 2 && details.every((node) => node.scrollWidth <= node.clientWidth + 1),
-    };
-  });
-  expect(phoneOverflow.body).toBe(false);
-  expect(phoneOverflow.band).toBe(false);
-  expect(phoneOverflow.detail).toBe(true);
-});
-
-test('keyboard reveal on independent Ack and PR rows sends nothing; Ack, OPEN PR, and disclosure focus survive refresh and full reconnect', async ({ page }) => {
-  const ackCalls: string[] = [];
-  await page.route(/\/ack/, async (route) => {
-    ackCalls.push(route.request().url());
-    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
-  });
-  await page.setViewportSize({ width: 1440, height: 900 });
-  const send = await harness(page, makeSnapshot({ ...familyA(4), pending: 2 }));
-  await expectStripFamilies(page, familyAFamilies(4));
-  const band = page.locator('#board-owner');
-  const ackDisclose = band.locator('[data-action-id="owner-ack:pend-0000"][data-control="disclose"]');
-  const prDisclose = band.locator('[data-action-id="owner-pr:synthetic"][data-control="disclose"]');
-  const ackButton = band.locator('[data-action-id="owner-ack:pend-0000"][data-control="ack"]');
-  const prOpen = band.locator('[data-action-id="owner-pr:synthetic"][data-control="open"]');
-  // Stable region identity is captured up front and re-asserted after every
-  // refresh/reconnect leg below (the aria-controls target never moves).
-  const ackRegion = (await ackDisclose.getAttribute('aria-controls')) ?? '';
-  const prRegion = (await prDisclose.getAttribute('aria-controls')) ?? '';
-  expect(ackRegion).toMatch(/^fy-detail-\d+$/);
-  expect(prRegion).toMatch(/^fy-detail-\d+$/);
-  expect(ackRegion).not.toBe(prRegion);
-  // Keyboard Enter on the Ack row; Space on the PR row — independent.
-  await ackDisclose.focus();
-  await page.keyboard.press('Enter');
-  await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true');
-  // Unique accessible name per disclosure (row identity in the AT list).
-  await expect(ackDisclose).toHaveAttribute('aria-label', /^Review decision: .+\(owner-ack:pend-0000\)$/);
-  // Themed keyboard focus ring on the new control (:focus-visible after a
-  // keyboard interaction) — width, style, token colour and offset pinned.
-  const ringOf = (locator: Locator) =>
-    locator.evaluate((el) => {
-      const s = getComputedStyle(el);
-      return { width: s.outlineWidth, style: s.outlineStyle, color: s.outlineColor, offset: s.outlineOffset };
-    });
-  // The ring colour is the theme's focus token, read from the document
-  // rather than duplicated here: a legitimate token change keeps the test
-  // meaningful, and a ring that ignores the token still fails (the ring
-  // must EQUAL the token, not merely be a colour).
-  const focusRingColor = await page.evaluate(() => {
-    const probe = document.createElement('span');
-    probe.style.color = 'var(--work)';
-    document.body.append(probe);
-    const computed = getComputedStyle(probe).color;
-    probe.remove();
-    return computed;
-  });
-  expect(await ringOf(ackDisclose)).toEqual({
-    width: '3px',
-    style: 'solid',
-    color: focusRingColor,
-    offset: '2px',
-  });
-  // The button is literally labeled Ack; the FULL consequence and the
-  // complete original detail sit in the same row's visible region,
-  // beside the control, BEFORE any activation.
-  await expect(ackButton).toHaveText('Ack');
-  await expect(ackButton).toBeVisible();
-  const ackRow = page.locator(`.board-owner__row:has(> #${ackRegion})`);
-  await expect(ackRow.locator('.board-owner__detail-text')).toHaveText([
-    ACK_DETAIL('pend-0000'),
-    ACK_CONSEQUENCE,
-  ]);
-  await prDisclose.focus();
-  await page.keyboard.press('Space');
-  await expect(prDisclose).toHaveAttribute('aria-expanded', 'true');
-  await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true'); // rows disclose independently
-  expect(ackCalls).toEqual([]);
-  // Focused Ack survives a genuinely changed scripted push (4→10) — proved
-  // by the rendered number AND by exact focused-element identity.
-  await ackButton.focus();
-  await send(makeSnapshot({ ...familyA(10), pending: 2 }));
-  await waitForCount(page, 'prs.open', 10);
-  await expectStripFamilies(page, familyAFamilies(10));
-  await expectFocusedControl(page, ackButton, 'owner-ack:pend-0000', 'ack');
-  // Themed keyboard focus ring survives the restore on the explicit Ack
-  // control too (not only on the disclosure).
-  expect(await ringOf(ackButton)).toEqual({ width: '3px', style: 'solid', color: focusRingColor, offset: '2px' });
-  // Focused OPEN PR survives the same way (10→99) — focused, never activated.
-  await prOpen.focus();
-  await send(makeSnapshot({ ...familyA(99), pending: 2 }));
-  await waitForCount(page, 'prs.open', 99);
-  await expectFocusedControl(page, prOpen, 'owner-pr:synthetic', 'open');
-  expect(await ringOf(prOpen)).toEqual({ width: '3px', style: 'solid', color: focusRingColor, offset: '2px' });
-  // Full reconnect (socket close → re-auth → HTTP refetch) with the OPEN PR
-  // control focused: the refetched state is genuinely CHANGED (100).
-  send.stage(makeSnapshot({ ...familyA(100), pending: 2 }));
-  sockets[sockets.length - 1]!.close();
-  await waitForCount(page, 'prs.open', 100, 15_000);
-  await expect.poll(() => send.socketCount(), { timeout: 15_000 }).toBeGreaterThanOrEqual(2);
-  await expectFocusedControl(page, prOpen, 'owner-pr:synthetic', 'open');
-  // F5/G3a-b-c: DISCLOSURE focus + expanded region survive a genuinely
-  // changed push (the rendered 100→5 proves the re-render), asserted by
-  // EXACT element identity — a restore to the other row's disclosure fails.
-  await ackDisclose.focus();
-  await send(makeSnapshot({ ...familyA(5), pending: 2 }));
-  await waitForCount(page, 'prs.open', 5);
-  await expectFocusedControl(page, ackDisclose, 'owner-ack:pend-0000', 'disclose');
-  await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true');
-  await expect(ackDisclose).toHaveAttribute('aria-controls', ackRegion);
-  await prDisclose.focus();
-  await send(makeSnapshot({ ...familyA(6), pending: 2 }));
-  await waitForCount(page, 'prs.open', 6);
-  await expectFocusedControl(page, prDisclose, 'owner-pr:synthetic', 'disclose');
-  await expect(prDisclose).toHaveAttribute('aria-expanded', 'true');
-  await expect(prDisclose).toHaveAttribute('aria-controls', prRegion);
-  // G3a: DISCLOSURE focus and region survive a FULL reconnect too — stage a
-  // genuinely changed refetch state (200), close the socket, prove the
-  // refetched number rendered, then prove the SAME disclosure element holds
-  // focus; the other row's disclosure must NOT hold it.
-  await ackDisclose.focus();
-  send.stage(makeSnapshot({ ...familyA(200), pending: 2 }));
-  sockets[sockets.length - 1]!.close();
-  await waitForCount(page, 'prs.open', 200, 15_000);
-  await expect.poll(() => send.socketCount(), { timeout: 15_000 }).toBeGreaterThanOrEqual(3);
-  await expectFocusedControl(page, ackDisclose, 'owner-ack:pend-0000', 'disclose');
-  await expect(ackDisclose).toHaveAttribute('aria-expanded', 'true');
-  await expect(ackDisclose).toHaveAttribute('aria-controls', ackRegion);
-  expect(await prDisclose.evaluate((el) => el === document.activeElement)).toBe(false);
-  // The focused ACK control also survives a full reconnect (201 refetch).
-  await ackButton.focus();
-  send.stage(makeSnapshot({ ...familyA(201), pending: 2 }));
-  sockets[sockets.length - 1]!.close();
-  await waitForCount(page, 'prs.open', 201, 15_000);
-  await expect.poll(() => send.socketCount(), { timeout: 15_000 }).toBeGreaterThanOrEqual(4);
-  await expectFocusedControl(page, ackButton, 'owner-ack:pend-0000', 'ack');
-  await expect(ackDisclose).toHaveAttribute('aria-controls', ackRegion); // region identity survived reconnect
-  // No unexpected mutation, no PR navigation: pending unchanged, nothing
-  // acked, still on the board (controls were focused, never activated).
-  await waitForPending(page, 2);
-  expect(new URL(page.url()).pathname).toBe('/');
-  expect(ackCalls).toEqual([]);
-});
-
 test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   // Every measured target must actually be RENDERED (an absent target fails
@@ -1295,15 +968,7 @@ test('essential text and numbers hold >=4.5:1 contrast in both themes', async ({
         silasValue: '.strip-pair[data-chip="silas"] .strip-value__num',
         cureValue: '.strip-pair[data-chip="cure"] .strip-value__num',
         ownerTitle: '.board-owner__title',
-        ownerNext: '.board-owner__next',
-        // The bold "Next step:" label is measured in BOTH themes: the dark
-        // capture shows it as the row's least legible text.
-        ownerNextLabel: '.board-owner__next-label',
-        ownerConsequence: '.board-owner__detail-text',
-        detailMeta: '.board-owner__detail-meta',
-        detailNotice: '.board-owner__detail-notice',
         bandCount: '.board-band__count',
-        bandMoreNum: '.board-band__more-num',
       };
       return Object.fromEntries(Object.entries(targets).map(([k, s]) => [k, Math.round(ratioOf(s) * 100) / 100]));
     });
@@ -1491,84 +1156,6 @@ test('visual captures for inspection — 1440/1200/768/360 in both themes', asyn
   }
 });
 
-/** The 1200x900 dark ambiguity, resolved by measurement: the essential FOR
- * YOU labels hold >=4.5:1 once transitions settle, and the dim frame is
- * reproduced as a genuine pre-settlement state (running transition, low
- * ratio) — a capture-timing artifact, not a retained contrast defect. */
-test('1200x900 dark: the FOR YOU essentials hold >=4.5:1 settled; the dim frame is a transition state', async ({ page }) => {
-  await page.setViewportSize({ width: 1200, height: 900 });
-  await harness(page, makeSnapshot({ ...familyA(9), pending: 2 }));
-  await waitForCount(page, 'prs.open', 9);
-  await expectStripFamilies(page, familyAFamilies(9));
-
-  const target = '.board-owner__title';
-  await page.locator('#theme-toggle').click();
-  await expect(page.locator('html')).toHaveClass(/dark/);
-
-  // Native r4 warning: requiring a still-running transition after several
-  // protocol round trips races the 250ms flip. Sample deterministically
-  // instead — pause the real transition INSIDE the same evaluate that reads
-  // the colours, so the pre-settlement ratio is a controlled animation
-  // time, not a race. No transition left to pause is reported, not failed.
-  const transient = await page.evaluate((sel) => {
-    const lum = (rgb: string): number => {
-      const m = rgb.match(/\d+/g)!.map(Number);
-      const [r, g, b] = m.slice(0, 3).map((v) => {
-        const c = v / 255;
-        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-      });
-      return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
-    };
-    const el = document.querySelector<HTMLElement>(sel);
-    if (!el) throw new Error(`missing contrast target ${sel}`);
-    const running = document
-      .getAnimations()
-      .filter((a): a is CSSTransition => a instanceof CSSTransition && a.playState === 'running');
-    const sampled: CSSTransition[] = [];
-    for (const t of running) {
-      try {
-        t.pause();
-        t.currentTime = 125; // mid-flip, the exact state the artifact caught
-        sampled.push(t);
-      } catch {
-        /* a transition that cannot seek is simply not sampled */
-      }
-    }
-    let bg = 'rgb(250, 246, 239)';
-    let bgEl: Element | null = el;
-    while (bgEl) {
-      const c = getComputedStyle(bgEl).backgroundColor;
-      if (c && c !== 'transparent' && !/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0\s*\)/.test(c)) { bg = c; break; }
-      bgEl = bgEl.parentElement;
-    }
-    const l1 = lum(getComputedStyle(el).color);
-    const l2 = lum(bg);
-    const ratio = (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
-    for (const t of sampled) t.play();
-    return { ratio, sampled: sampled.length };
-  }, target);
-  console.log(`1200x900 dark transient sample: ${transient.ratio.toFixed(2)} (${transient.sampled} transition(s) paused at 125ms)`);
-
-  // Settled state: the same label measures the approved essential-text floor
-  // against its effective background once nothing is still transitioning.
-  await settle(page);
-  const stillRunning = await page.evaluate(() =>
-    document.getAnimations().filter((a) => a instanceof CSSTransition && a.playState === 'running').length);
-  expect(stillRunning, 'settlement is real: no transition still running').toBe(0);
-  const settledRatio = await contrastRatio(page, target);
-  console.log(`1200x900 dark ${target}: settled ratio ${settledRatio.toFixed(2)} (transient sample ${transient.ratio.toFixed(2)}, ${transient.sampled} paused)`);
-  expect(settledRatio, `settled ${target} contrast (dark, 1200x900)`).toBeGreaterThanOrEqual(4.5);
-  // When a real mid-flip sample was taken, the steady state must be the
-  // better state (the causal claim, measured not assumed). If the executor
-  // was slow enough that the flip had already finished, the settled floor
-  // above is still the assertion that matters — never a flaky failure.
-  if (transient.sampled > 0) {
-    expect(transient.ratio, 'the mid-flip sample is the lower-contrast state').toBeLessThan(settledRatio);
-  }
-  await page.screenshot({ path: 'e2e-artifacts/slim-strip-1200-dark-settled.png', fullPage: false });
-  await expect(page.locator('html')).toHaveClass(/dark/);
-});
-
 /**
  * Await real rendering settlement: every running CSS animation/transition on
  * the page finishes, then two frames pass, and no animation is running. A
@@ -1599,33 +1186,6 @@ async function settle(page: Page): Promise<void> {
     // rAF is faked under page.clock; a timer fallback keeps this bounded.
     setTimeout(tick, 50);
   }));
-}
-
-/** True contrast ratio of a selector's text against its effective
- * background (foreground/background computed colours, not peak luminance). */
-async function contrastRatio(page: Page, selector: string): Promise<number> {
-  return page.evaluate((sel) => {
-    const lum = (rgb: string): number => {
-      const m = rgb.match(/\d+/g)!.map(Number);
-      const [r, g, b] = m.slice(0, 3).map((v) => {
-        const s = v / 255;
-        return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
-      });
-      return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
-    };
-    const el = document.querySelector<HTMLElement>(sel);
-    if (!el) throw new Error(`missing contrast target ${sel}`);
-    let bgEl: Element | null = el;
-    let bg = 'rgb(250, 246, 239)';
-    while (bgEl) {
-      const c = getComputedStyle(bgEl).backgroundColor;
-      if (c && c !== 'transparent' && !/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0\s*\)/.test(c)) { bg = c; break; }
-      bgEl = bgEl.parentElement;
-    }
-    const l1 = lum(getComputedStyle(el).color);
-    const l2 = lum(bg);
-    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
-  }, selector);
 }
 
 /** A1: the reserved numeric utility is scoped to the two approved slim

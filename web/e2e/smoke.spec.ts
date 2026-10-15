@@ -575,46 +575,34 @@ test.describe('board (E6, mock feed)', () => {
     const band = page.locator('#board-owner');
     await expect(band).toBeVisible();
     await expect(band.locator('.board-band__label')).toHaveText('FOR YOU');
-    // The combined fixtures owe three owner actions: crash-loop and
-    // provider-wall stops plus one evidence-bound ready PR.
-    await expect(band.locator('.board-band__count')).toHaveText('3 pending');
-    const providerStop = band.locator('.board-owner__row', { hasText: 'Agent mock-minion-quota stopped: quota wall' });
-    await expect(providerStop).toBeVisible();
-    // Rows are collapsed by default: the reveal-only disclosure fronts the
-    // explicit Ack control, and the complete consequence copy rides the
-    // expanded region — never available before reveal.
-    const providerDetail = providerStop.locator('.board-owner__detail');
-    await expect(providerDetail).toBeHidden();
-    await providerStop.locator('[data-control="disclose"]').click();
-    await expect(providerStop.locator('[data-control="disclose"]')).toHaveAttribute('aria-expanded', 'true');
-    await expect(providerDetail).toBeVisible();
-    await expect(providerStop.locator('.board-owner__ack')).toBeVisible();
-    await expect(providerStop.locator('.board-owner__ack')).toHaveText('Ack');
-    // The owner stop carries its Ack control and the honest scope copy —
-    // visible only after the reveal; the disclosure itself never acks.
-    const stop = band.locator('.board-owner__row', { hasText: 'Crash-loop breaker tripped' });
-    await expect(stop).toBeVisible();
-    await expect(stop.locator('.board-owner__detail')).toBeHidden();
-    await stop.locator('[data-control="disclose"]').click();
-    await expect(stop.locator('.board-owner__detail')).toBeVisible();
-    await expect(stop.locator('.board-owner__ack')).toBeVisible();
-    await expect(stop.locator('.board-owner__ack')).toHaveText('Ack');
-    await expect(stop.locator('.board-owner__detail')).toContainText('does NOT clear code/test/review holds');
-    // The ready PR row: exact-head evidence behind the disclosure; OPEN PR
-    // stays an external link beside the face (never an in-app merge button).
+    // The combined fixtures owe two owner actions: one typed decision plus
+    // one evidence-bound ready PR. Machine stops never ring the owner band.
+    await expect(band.locator('.board-band__count')).toHaveText('2 pending');
+    const decision = band.locator('.board-owner__row', { hasText: 'Approve the payment retry fix?' });
+    await expect(decision).toBeVisible();
+    await expect(decision.locator('.board-notification__question')).toHaveText('Approve the payment retry fix and re-arm the lane?');
+    await expect(decision.locator('.board-notification__recommendation')).toContainText('Gru recommends');
+    await expect(decision.locator('.board-notification__option-button')).toHaveCount(2);
+    await expect(decision.locator('.board-notification__option-consequence').first()).toContainText('Gru re-arms the lane');
+    // No generic Ack and no routine re-arm control on the owner surface.
+    await expect(decision.locator('.board-owner__ack')).toHaveCount(0);
+    await expect(decision.locator('.board-notification__ack')).toHaveCount(0);
+    await expect(band).not.toContainText('ack this notification');
+    // Machine attention stays out of the owner band (NEEDS GRU owns it).
+    await expect(band).not.toContainText('quota wall');
+    // The ready PR row: exact-head reason + OPEN PR as an external link
+    // (never an in-app merge button).
     const pr = band.locator('.board-owner__row--pr', { hasText: 'Fix the payment retry loop' });
     await expect(pr).toBeVisible();
     await expect(pr).toContainText('ready for you');
-    await expect(pr.locator('.board-owner__detail')).toBeHidden();
-    await pr.locator('[data-control="disclose"]').click();
-    await expect(pr.locator('.board-owner__detail')).toBeVisible();
-    await expect(pr.locator('.board-owner__detail')).toContainText('CI green');
+    await expect(pr).toContainText('CI green');
     const open = pr.locator('.board-owner__open');
     await expect(open).toHaveText('OPEN PR ↗');
     await expect(open).toHaveAttribute('href', 'https://example.invalid/pr/41');
     await expect(open).toHaveAttribute('target', '_blank');
     // Machine attention stays OUT of the owner band (NEEDS GRU owns it).
     await expect(band).not.toContainText('Review round demo-api-payment-fix-r1 is INCOMPLETE');
+    await expect(band).not.toContainText('Agent mock-minion-quota stopped');
   });
 
   test('dense rows collapse by default; expanding reveals the round lens chips', async ({ page }) => {
@@ -849,9 +837,10 @@ test.describe('board (E6, mock feed)', () => {
         page.locator('.board-band--needs-you .board-job', { hasText: 'Rotate the staging tokens' }),
       ).toHaveCount(0);
 
-      // The quota-walled lane shows its true state: waiting on the provider,
-      // never a bare "working" and never stalled/COLD.
-      const walled = page.locator('.board-band--in-flight .board-job', { hasText: 'Migrate the search index' });
+      // The quota-walled lane shows its true state: waiting on the provider
+      // with a live machine alert, so it surfaces under FOR GRU (the
+      // needs-you band) — never a bare "working" and never stalled/COLD.
+      const walled = page.locator('.board-band--needs-you .board-job', { hasText: 'Migrate the search index' });
       await expect(walled).toBeVisible();
       await expect(walled).toHaveAttribute('data-worker-state', 'waiting');
       await expect(walled.locator('.board-job__status')).toHaveText('waiting · quota wall');
@@ -864,10 +853,13 @@ test.describe('board (E6, mock feed)', () => {
       await expect(silent.locator('.board-job__stale')).toHaveText('stalled');
       await expect(silent.locator('.board-job__status')).toHaveText('working');
 
-      // Chip and bands agree: only the live machine row (mock-n5) counts.
-      await expect(page.locator('.strip-pair[data-chip="alerts"] .strip-value__num')).toHaveText('1');
+      // Chip and bands agree: the live machine rows count — the global
+      // review escalation (mock-n5) AND the provider-wall stop (mock-n4,
+      // machine attention since the owner release), never the merged lane's
+      // closed receipt.
+      await expect(page.locator('.strip-pair[data-chip="alerts"] .strip-value__num')).toHaveText('2');
       await expect(page.locator('#board-unacked')).toBeHidden();
-      await expect(page.locator('#board-unacked')).toContainText('1 notifications · needs Gru');
+      await expect(page.locator('#board-unacked')).toContainText('2 notifications · needs Gru');
       // Scoped acceptance clips (tracked-review A10): the full-page capture
       // is taken under sticky chrome that can occlude the IN FLIGHT band,
       // so the NEEDS GRU band and the waiting row get their own clips — the
@@ -1494,7 +1486,7 @@ test.describe('themes', () => {
     // reply wait above covers the chat only (observed RED under load: the
     // capture missed the band while the DOM already had it). Synchronize
     // on the band's authoritative rows before the screenshot.
-    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(3);
+    await expect(page.locator('#board-owner .board-owner__row')).toHaveCount(2);
     await expect(
       page.locator('#board-owner .board-owner__row', { hasText: 'Fix the payment retry loop' }),
     ).toBeVisible();
@@ -1564,7 +1556,12 @@ test.describe('phone chrome', () => {
     const m = await page.evaluate(() => {
       const rail = document.querySelector<HTMLElement>('#chip-rail');
       const bar = document.querySelector('.command-bar')!.getBoundingClientRect().bottom;
-      const railBottom = rail === null || rail.hidden ? 0 : rail.getBoundingClientRect().bottom;
+      // Only a STICKY rail is chrome; below 900px the strip scrolls away with
+      // the page (a sticky copy would cover a third of a phone viewport).
+      const railBottom =
+        rail === null || rail.hidden || getComputedStyle(rail).position !== 'sticky'
+          ? 0
+          : rail.getBoundingClientRect().bottom;
       return {
         chromeBottom: Math.max(bar, railBottom),
         panelTop: document.querySelector('#notification-panel')!.getBoundingClientRect().top,

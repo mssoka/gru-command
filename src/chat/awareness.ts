@@ -78,7 +78,8 @@ type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => v
  * durable under the chat dir; wake turns never consume the owner's digest.
  * Content is derived from the ledger only — an acked or resolved notification is
  * never injected; action-required rows are Gru's machine queue while
- * needs-owner rows keep the owner's acknowledgement.
+ * registered needs-owner rows carry owner decisions and notices;
+ * machine recovery rides the disposition path.
  */
 
 export const AWARENESS_STATE_NAME = 'awareness.json';
@@ -95,7 +96,10 @@ export const AWARENESS_WAKE_INSTRUCTION =
   'Delivery is only a receipt, never resolution or authority. Reuse actual controls and obligations; do not acknowledge owner stops, merge, restart or infer child completion from a parent. ' +
   'This is machine attention and it is meant to be acted on in-turn: diagnose the item, ' +
   'take one substantive step per incident (a fix lane, a re-arm, or a disposition), and ' +
-  'stage the rest. After acting on an action-required alert, explicitly resolve its ' +
+  'stage the rest. When an owner discussion-only escalation (empty options, discussion true) ' +
+  'reaches agreement in chat, attach the agreed options with POST /api/notifications/{id}/decision-options ' +
+  '({ options: [{ id, label, consequence }], by: "gru" }) so the owner can record the choice — it records nothing itself. ' +
+  'After acting on an action-required alert, explicitly resolve its ' +
   'notification ID with POST /api/notifications/{id}/disposition and a nonempty detail; ' +
   'prompt delivery alone never clears it. A producer-resolved alert (lessons.dream-failed) refuses ' +
   'a disposition: fix its cause and leave it open — it closes itself when its producer succeeds. When the right outcome is a hold or "needs no ' +
@@ -180,13 +184,15 @@ export type GruAwarenessLedger = Pick<
   | 'listNotifications'
   | 'recordNotification'
   | 'resolveNotificationById'
+  // Uncapped exact-kind open-incident lookup (wake-stop dedupe).
+  | 'findNotificationByKindAndRouting'
   | 'listJobs'
   | 'listAgents'
   | 'coveringDecision'
   // Decision memory reads (issues #218/#224): present on the real ledger;
   // optional so narrow test fakes stay honest. Absent = triage asks run
   // without the open-decisions/dispositions context.
-> & Partial<Pick<LedgerApi, 'listDecisions'>>;
+> & Partial<Pick<LedgerApi, 'listDecisions' | 'resolveNotificationsByKindPrefix'>>;
 
 /** The escalation notification kinds the triage surface applies to — the
  * Silas-authored family: the ops endpoint's `silas.escalation` and the
@@ -1242,6 +1248,18 @@ export class GruAwareness {
       this.failedRetryAtMs = 0;
       this.log('info', 'gru wake opened', { notification_ids: delivered, count: delivered.length, mode: this.wakeMode });
       this.persistWakeState();
+      // A DELIVERED wake is positive evidence that the chat recovery route
+      // works again: the owner-only blocked/failed wake stops (owner
+      // release 2026-10-11) resolve here instead of waiting for a
+      // display receipt or an Ack. The machine alert itself stays open
+      // until its own disposition.
+      try {
+        this.ledger.resolveNotificationsByKindPrefix?.('gru.wake-blocked.', 'chat-recovered');
+        this.ledger.resolveNotificationsByKindPrefix?.('gru.wake-blocked-mailbox.', 'chat-recovered');
+        this.ledger.resolveNotificationsByKindPrefix?.('gru.wake-failed-escalation.', 'chat-recovered');
+      } catch (error) {
+        this.log('error', 'wake-stop resolution failed — rows stay open', { error: String(error) });
+      }
       // Issue #224 escalation-triage shadow ask at the delivery receipt —
       // the exact point the labelled extractor links (the gru.wake
       // notification_ids), so backtest states and production states share
@@ -1360,9 +1378,17 @@ export class GruAwareness {
         if (existing !== null && (existing.kind !== kind || existing.routing !== 'needs-owner')) {
           throw new Error(`Gru blocked-wake ID ${escalationId} is already assigned to another notification`);
         }
-        if (existing === null) {
+        // Open-incident deduplication: while ANY row of this incident's
+        // kind is open the stop exists and is reused; a resolved or acked
+        // row is history, so a NEW block episode posts a fresh stop (the
+        // machine alert would otherwise never re-raise its debt to the
+        // bell). UNCAPPED exact-kind lookup: a page window would miss an
+        // old open stop behind newer notifications and duplicate it.
+        const incidentKind = kind;
+        const open = this.ledger.findNotificationByKindAndRouting(incidentKind, 'needs-owner', 'unacked');
+        if (open === null) {
           const posted = this.ledger.recordNotification({
-            id: escalationId,
+            id: existing === null ? escalationId : this.nextEscalationId(escalationId),
             kind,
             routing: 'needs-owner',
             severity: 'error',
@@ -1387,6 +1413,16 @@ export class GruAwareness {
     } catch (error) {
       this.log('error', 'gru wake failure event failed', { error: String(error) });
     }
+  }
+
+  /** A fresh escalation identity when the canonical one is closed history:
+   * `base`, `base:2`, `base:3`… never colliding with a live row. */
+  private nextEscalationId(base: string): string {
+    for (let suffix = 2; suffix < 1000; suffix += 1) {
+      const candidate = `${base}:${suffix}`;
+      if (this.ledger.getNotification(candidate) === null) return candidate;
+    }
+    return `${base}:${this.now()}`;
   }
 
   /** Issue #115 terminal path: exactly one truthful needs-owner escalation
@@ -1422,9 +1458,14 @@ export class GruAwareness {
       if (existing !== null && (existing.kind !== kind || existing.routing !== 'needs-owner')) {
         throw new Error(`Gru failed-wake escalation id ${escalationId} is already assigned to another notification`);
       }
-      if (existing === null) {
+      // Open-incident dedupe: an OPEN stop for this exact kind reuses the
+      // row; a resolved/acked stop is history, so a fresh exhaustion
+      // re-raises the debt with a new identity instead of staying silent.
+      // UNCAPPED exact-kind lookup (same reason as the blocked-wake path).
+      const open = this.ledger.findNotificationByKindAndRouting(kind, 'needs-owner', 'unacked');
+      if (open === null) {
         const posted = this.ledger.recordNotification({
-          id: escalationId,
+          id: existing === null ? escalationId : this.nextEscalationId(escalationId),
           kind,
           routing: 'needs-owner',
           severity: 'error',

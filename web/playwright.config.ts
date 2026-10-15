@@ -74,6 +74,14 @@ export default defineConfig({
       use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
     },
     {
+      // Notification readability regression (owner release 2026-10-11):
+      // synthetic WebSocket-seeded long-content fixtures; measured
+      // overflow/contrast, keyboard Details, no side-effect requests.
+      name: 'notification-readability',
+      testMatch: 'notification-readability.spec.ts',
+      use: { baseURL: `http://localhost:${PREVIEW_PORT}` },
+    },
+    {
       // Crew-rail acceptance surface (isolated mock fixture): short
       // authored names, long/Unicode names and bounded rendering captured
       // for desktop/phone in light/dark. A dedicated project, like

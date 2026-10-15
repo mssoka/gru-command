@@ -6,8 +6,9 @@ import { hashToken, tokenConfigured, tokenMatches } from '../auth.js';
 import { ROLES, type GruCommandConfig } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import type { EventBus } from '../events/bus.js';
-import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
+import { LedgerApi, RecordNotFound, AdminCloseoutRefusal, NotificationDecisionRefusal, producerResolvedBy, type DecisionActor, type DecisionKind, type NotificationRecord } from '../ledger/api.js';
 import { isDecisionActor, isDecisionKind } from '../ledger/decision-memory.js';
+import { parseDecisionOptions, parseNotificationDecision, serializeNotificationDecision } from '../ledger/notification-decision.js';
 import { isJobStatus, isRoundStatus, isRoundVerdict } from '../ledger/states.js';
 import { isAgentState } from '../runtime/types.js';
 import type { NotificationCenter } from '../notifications/center.js';
@@ -47,9 +48,17 @@ export interface BoardServerOptions {
   readonly bus: EventBus;
   /** E7: the notification write path (shown receipts + acks). */
   readonly notifications: NotificationCenter;
-  /** E7: fired after a successful ack — the supervisor re-arms an open
-   * breaker whose notification was acked. */
+  /** E7: fired after a successful ack (feed/notice receipts). */
   readonly onNotificationAck?: (id: string) => void;
+  /** E7 (owner release 2026-10-11): the GUARDED machine re-arm control,
+   * consulted BEFORE any disposition is recorded. The supervisor returns a
+   * typed outcome; a refusal (or a throw) leaves the alert and its
+   * retryable recovery debt intact instead of consuming the only control,
+   * and `rearmed: false` honestly reports that no stopped lane matched. */
+  readonly onNotificationDisposition?: (
+    id: string,
+    detail: string,
+  ) => { readonly ok: boolean; readonly rearmed?: boolean; readonly reason?: string } | void;
   readonly decisionsStatus?: () => DecisionRuntimeStatus;
   readonly onDecisionsRecheck?: () => Promise<DecisionRuntimeStatus>;
   readonly log?: Log;
@@ -105,6 +114,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
   const transcripts = options.transcripts;
   const notifications = options.notifications;
   const onNotificationAck = options.onNotificationAck ?? (() => {});
+  const onNotificationDisposition = options.onNotificationDisposition ?? (() => {});
   const siblings = new Set(options.siblingUpgradePaths ?? []);
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
@@ -598,11 +608,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           if (title === '' || title.length > 500 || detail === '' || detail.length > 4_000) {
             throw new Error('owner escalation title (1-500) and detail (1-4000) must be non-blank');
           }
+          // Owner escalation means a RESERVED decision (owner release
+          // 2026-10-11): typed decision metadata is required and validated
+          // here, so an operational chore can never be posted to FOR YOU as
+          // a bare acknowledgement notice.
+          const decision = parseNotificationDecision(body['decision']);
           // Retry identity (decision #100, 2026-10-12): an optional client-
           // supplied idempotency key names ONE escalation. The same key with
-          // the same title/detail returns the existing row (200, no second
-          // FOR YOU item or bell); the same key with a changed request is
-          // refused (409). Without a key every request is a distinct decision.
+          // the same title/detail/decision returns the existing row (200, no
+          // second FOR YOU item or bell); the same key with a changed request
+          // is refused (409). Without a key every request is a distinct decision.
           const rawKey = body.idempotencyKey;
           if (rawKey !== undefined && (typeof rawKey !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(rawKey))) {
             throw new Error('idempotencyKey must be 1-128 chars of [A-Za-z0-9._:-]');
@@ -611,7 +626,12 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             const id = `owner-escalation:${rawKey}`;
             const existing = ledger.getNotification(id);
             if (existing !== null) {
-              if (existing.title !== title || existing.detail !== detail) {
+              if (
+                existing.title !== title ||
+                existing.detail !== detail ||
+                existing.decision === null ||
+                serializeNotificationDecision(existing.decision) !== serializeNotificationDecision(decision)
+              ) {
                 json(res, 409, {
                   error: 'idempotency_conflict',
                   detail: `idempotencyKey "${rawKey}" already names a different escalation; use a new key for a new decision`,
@@ -621,18 +641,84 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               json(res, 200, existing);
               return;
             }
-            json(res, 201, notifications.post({ id, kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail }));
+            json(res, 201, notifications.post({ id, kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail, decision }));
             return;
           }
-          const row = notifications.post({ kind: 'gru.owner-escalation', routing: 'needs-owner', severity: 'error', title, detail });
+          const row = notifications.post({
+            kind: 'gru.owner-escalation',
+            routing: 'needs-owner',
+            severity: 'error',
+            title,
+            detail,
+            decision,
+          });
           json(res, 201, row);
           return;
         }
-        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack') || path.endsWith('/disposition'))) {
+        if (req.method === 'POST' && path.startsWith('/api/notifications/') && (path.endsWith('/shown') || path.endsWith('/ack') || path.endsWith('/disposition') || path.endsWith('/decision-options') || path.endsWith('/decision'))) {
           if (!authed(req, res)) return;
-          const suffix = path.endsWith('/shown') ? '/shown' : path.endsWith('/disposition') ? '/disposition' : '/ack';
+          const suffix = path.endsWith('/shown')
+            ? '/shown'
+            : path.endsWith('/disposition')
+              ? '/disposition'
+              : path.endsWith('/decision-options')
+                ? '/decision-options'
+                : path.endsWith('/decision')
+                  ? '/decision'
+                  : '/ack';
           const id = decodeURIComponent(path.slice('/api/notifications/'.length, -suffix.length));
           const body = (await readBody(req)) as Record<string, unknown>;
+          if (suffix === '/decision') {
+            // Owner decision submission: the displayed typed decision is
+            // part of the request so a reused option id cannot make a stale
+            // label record a different current choice. Recording never
+            // resolves the row — follow-through stays separately evidenced.
+            if (!Object.prototype.hasOwnProperty.call(body, 'expectedDecision')) {
+              json(res, 400, {
+                error: 'bad_request',
+                detail: 'expectedDecision must echo the typed decision shown to the owner',
+              });
+              return;
+            }
+            const expectedDecision = parseNotificationDecision(body['expectedDecision']);
+            const optionId = strField(body, 'optionId');
+            const row = notifications.decide(
+              id,
+              optionId,
+              optStrField(body, 'by') ?? 'web',
+              expectedDecision,
+            );
+            if (row === null) {
+              json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+              return;
+            }
+            json(res, 200, row);
+            return;
+          }
+          if (suffix === '/decision-options') {
+            // Supported discussion bridge (owner release 2026-10-11): attach
+            // agreed options to an existing discussion-only decision so the
+            // owner's eventual choice records through the typed path. The
+            // ledger refuses every other row shape (not_discussion,
+            // decision_recorded, not_open, no_decision, not_owner_decision).
+            const options = parseDecisionOptions((body as Record<string, unknown>)['options']);
+            const by = optStrField(body, 'by') ?? 'gru';
+            try {
+              const row = notifications.attachDecisionOptions(id, options, by);
+              if (row === null) {
+                json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
+                return;
+              }
+              json(res, 200, row);
+            } catch (error) {
+              if (error instanceof NotificationDecisionRefusal) {
+                json(res, 409, { error: error.code, code: error.code, detail: error.message });
+                return;
+              }
+              throw error;
+            }
+            return;
+          }
           if (suffix === '/shown') {
             // Display receipt (the shown:true doctrine): one per surface,
             // idempotent server-side; the client sends each (id, surface)
@@ -652,6 +738,13 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
           }
           if (suffix === '/disposition') {
             const detail = strField(body, 'detail');
+            // The ledger refuses a blank disposition detail (after the
+            // hook would already have run): validate it at the boundary so
+            // a ledger-side refusal can never consume the guarded control.
+            if (detail.trim() === '') {
+              json(res, 400, { error: 'bad_request', detail: 'disposition detail must be non-empty' });
+              return;
+            }
             // The board has ONE shared bearer for owner and agent callers, so
             // the credential proves "a paired caller", not "Gru". A caller may
             // declare its actor; only 'gru' is a valid declaration for a
@@ -671,12 +764,52 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
               });
               return;
             }
-            const row = ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
+            // A DECIDED owner decision resolves through the same route as
+            // its follow-through record; an UNDECIDED owner row is refused
+            // (resolution never silences an unanswered question).
+            const ownerFollowThrough = target !== null && target.routing === 'needs-owner';
+            // Machine attention: the re-arm is a GUARDED action, so the
+            // supervisor's typed outcome is consulted BEFORE anything is
+            // recorded. A refused or failed re-arm returns an honest
+            // outcome and keeps the alert open with its retryable debt —
+            // settlement is never reported before the control accepts it.
+            let rearm: 'accepted' | 'not_applicable' = 'not_applicable';
+            if (!ownerFollowThrough && target !== null && target.resolvedAt === null) {
+              try {
+                const outcome = onNotificationDisposition(id, detail);
+                if (outcome !== undefined && outcome.ok === false) {
+                  ledger.appendCustomEvent({
+                    kind: 'notification.rearm-refused',
+                    payload: { id, reason: outcome.reason ?? 'refused' },
+                  });
+                  json(res, 409, {
+                    error: 'rearm_refused',
+                    code: 'rearm_refused',
+                    detail: outcome.reason ?? 'the guarded re-arm refused this disposition',
+                  });
+                  return;
+                }
+                // Truthful typed outcome: `rearmed: false` means no
+                // stopped breaker matched this alert (pure record).
+                if (outcome !== undefined) rearm = outcome.rearmed === false ? 'not_applicable' : 'accepted';
+              } catch (error) {
+                const message = String(error instanceof Error ? error.message : error);
+                ledger.appendCustomEvent({
+                  kind: 'notification.rearm-failed',
+                  payload: { id, error: message },
+                });
+                json(res, 502, { error: 'rearm_failed', detail: message });
+                return;
+              }
+            }
+            const row = ownerFollowThrough
+              ? ledger.resolveOwnerDecision(id, detail)
+              : ledger.disposeMachineNotification(id, detail, { credential: 'shared-bearer', declaredActor });
             if (row === null) {
               json(res, 404, { error: 'not_found', detail: `notification "${id}" not found` });
               return;
             }
-            json(res, 200, row);
+            json(res, 200, { ...row, rearm });
             return;
           }
           const existing = ledger.getNotification(id);
@@ -686,6 +819,16 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
             json(res, 409, {
               error: 'decision_required',
               detail: 'lesson proposals are decided with Accept or Reject (POST /api/lessons/proposal/:id/accept|reject)',
+            });
+            return;
+          }
+          if (existing?.routing === 'needs-owner' && existing.decision !== null) {
+            // A typed owner decision is never ack-able: an ack would hide
+            // the question without recording a choice (same doctrine as
+            // lesson proposals; the ledger refuses this as a backstop).
+            json(res, 409, {
+              error: 'decision_required',
+              detail: 'typed owner decisions are recorded with POST /api/notifications/:id/decision; an Ack cannot erase the question',
             });
             return;
           }
@@ -707,7 +850,7 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         // Typed mapping: the ledger and transcript layers throw
         // RecordNotFound for missing entities; a missing/unreadable
         // transcript FILE is also a not-found. Everything else is a 400
-        // except a guarded closeout refusal, which is a typed 409.
+        // except guarded refusals, which are typed 409s.
         if (error instanceof BoardUnavailableError) {
           log('error', 'board evidence unavailable', { method: req.method, path, error: message });
           json(res, 503, { error: 'board_unavailable', detail: message });
@@ -716,6 +859,14 @@ export function createBoardServer(options: BoardServerOptions): BoardServer {
         const refused = error instanceof AdminCloseoutRefusal;
         if (error instanceof MailboxConflictError) {
           json(res, 409, { error: 'mailbox_conflict', detail: message });
+          return;
+        }
+        if (error instanceof NotificationDecisionRefusal) {
+          json(res, error.code === 'unknown_option' ? 400 : 409, {
+            error: 'decision_refused',
+            code: error.code,
+            detail: message,
+          });
           return;
         }
         const notFound =

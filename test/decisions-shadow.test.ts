@@ -125,7 +125,14 @@ function surfaceEntry(profile: string, mode?: 'off' | 'shadow' | 'enforce'): { p
   return mode === undefined ? { provider: profile } : { provider: profile, mode };
 }
 
-async function startedRuntime(surfaces: DecisionsConfig['surfaces'], options: { dataDir?: string; onShadowRecord?: (record: ShadowDecisionRecord) => void } = {}): Promise<DecisionRuntime> {
+async function startedRuntime(
+  surfaces: DecisionsConfig['surfaces'],
+  options: {
+    dataDir?: string;
+    onShadowRecord?: (record: ShadowDecisionRecord) => void;
+    notifications?: import('../src/notifications/center.js').NotificationCenter;
+  } = {},
+): Promise<DecisionRuntime> {
   const runtime = new DecisionRuntime(configWithSurfaces(surfaces), {
     instanceDir: temp('gru-decisions-shadow-'),
     // The default profile resolves its startup-probe credential from the
@@ -135,6 +142,7 @@ async function startedRuntime(surfaces: DecisionsConfig['surfaces'], options: { 
     watchConfig: false,
     ...(options.dataDir !== undefined ? { dataDir: options.dataDir } : {}),
     ...(options.onShadowRecord !== undefined ? { onShadowRecord: options.onShadowRecord } : {}),
+    ...(options.notifications !== undefined ? { notifications: options.notifications } : {}),
   });
   const status = await runtime.start();
   expect(status).toMatchObject({ status: 'ready' });
@@ -315,6 +323,42 @@ describe('the enforce gate (issue #223)', () => {
     const runtime = await startedRuntime({ [surface]: surfaceEntry(profile, 'enforce') }, { dataDir });
     const outcome = await runtime.decide(eventRequest(), { surface });
     expect(outcome.provenance).toMatchObject({ source: 'jev', model: 'laya-421m-test' });
+    runtime.dispose();
+  });
+
+  it('a passing gated call resolves the surface owner-only enforce-gate incident', async () => {
+    const dataDir = temp('gru-decisions-gate-resolve-');
+    const ledgerDir = temp('gru-decisions-gate-ledger-');
+    const db = new LedgerDb(ledgerDir);
+    const bus = new EventBus();
+    const ledger = new LedgerApi(db.handle, { bus });
+    const notifications = new NotificationCenter({ ledger, bus });
+    const incident = notifications.postIncident({
+      kind: `decisions.enforce-gate.${surface}`,
+      routing: 'needs-owner',
+      severity: 'error',
+      title: `Decision enforce gate blocked for ${surface}`,
+      detail: 'no recorded backtest evidence yet',
+      dedupe: 'active',
+    });
+    // A lookalike kind that EXTENDS the surface name must stay open: the
+    // consumer must settle the exact kind, never a LIKE prefix (the CONSUMER,
+    // not just the helper, is what this test discriminates).
+    const lookalike = notifications.postIncident({
+      kind: `decisions.enforce-gate.${surface}-extra`,
+      routing: 'needs-owner',
+      severity: 'error',
+      title: `Decision enforce gate blocked for ${surface}-extra`,
+      detail: 'a different surface, still gated',
+      dedupe: 'active',
+    });
+    expect(incident.routing).toBe('needs-owner');
+    saveBacktestRecord(dataDir, backtestRecordFromReport(minimalReport, { metric: 'precision', label: null, min: 0.9 }));
+    const runtime = await startedRuntime({ [surface]: surfaceEntry(profile, 'enforce') }, { dataDir, notifications });
+    const outcome = await runtime.decide(eventRequest(), { surface });
+    expect(outcome.provenance).toMatchObject({ source: 'jev' });
+    expect(ledger.getNotification(incident.id)?.resolvedBy).toBe('enforce-gate-passed');
+    expect(ledger.getNotification(lookalike.id)?.resolvedAt).toBeNull();
     runtime.dispose();
   });
 

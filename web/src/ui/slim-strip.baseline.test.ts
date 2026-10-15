@@ -106,28 +106,4 @@ describe('slim strip — fail-before feature absence on the recorded base', () =
     expect(document.getElementById('chip-rail')?.children.length, 'rail mounted (setup proof)').toBeGreaterThan(0);
     expect(document.querySelector('.num.strip-kpi__num'), 'reserved numeric slot for strip KPIs').toBeTruthy();
   });
-
-  it('FOR YOU rows are compact faces with a reveal-only disclosure (base shows the ack inline)', () => {
-    const view = new BoardView(() => {});
-    view.render(
-      snap({
-        notifications: [
-          {
-            id: 'stop-1',
-            kind: 'supervision.breaker',
-            routing: 'needs-owner',
-            severity: 'info',
-            title: 'Worker stopped',
-            detail: 'quota wall',
-            ts: new Date(Date.now() - 5_000).toISOString(),
-            ackedAt: null,
-            resolvedAt: null,
-            shownAt: null,
-          } as NotificationView,
-        ],
-      }),
-    );
-    expect(document.getElementById('board-owner')?.textContent, 'band rendered (setup proof)').toContain('Worker stopped');
-    expect(document.querySelector('#board-owner [data-control="disclose"]'), 'reveal-only compact disclosure').toBeTruthy();
-  });
 });

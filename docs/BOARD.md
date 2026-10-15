@@ -39,10 +39,12 @@ restart produce the same truth without data edits.
 | `POST /api/rounds/:id/status` / `:id/verdict` | `{status}` / `{verdict}` |
 | `POST /api/agents` | `{id, role, label?, jobId?, roundId?, sessionFile?}` (upsert) |
 | `POST /api/agents/state` | `{id, state}` |
-| `POST /api/notifications/needs-owner` | `{title (1-500), detail (1-4000), idempotencyKey? (1-128 of [A-Za-z0-9._:-])}` — Gru's owner escalation into FOR YOU (decision #100, 2026-10-12). Without a key every valid request is its own row. With a key the key names ONE escalation: a retry with the same key and same title/detail returns the existing row (`200`, no second row or bell; first creation is `201`); the same key with a changed title/detail is `409 idempotency_conflict`; a new key is a new decision. Retry an uncertain outcome with the SAME key |
+| `POST /api/notifications/needs-owner` | `{title (1-500), detail (1-4000), decision (required typed object: question, context, recommendation, reservedClass, whyNotDelegable, discussion, options), idempotencyKey? (1-128 of [A-Za-z0-9._:-])}` — Gru's owner escalation into FOR YOU (decision #100, 2026-10-12); a bare title/detail post is `400`. Without a key every valid request is its own row. With a key the key names ONE escalation: a retry with the same key and same title/detail/decision returns the existing row (`200`, no second row or bell; first creation is `201`); the same key with a changed title/detail/decision is `409 idempotency_conflict`; a new key is a new decision. Retry an uncertain outcome with the SAME key |
 | `POST /api/notifications/:id/shown` | `{surface}` — display receipt (idempotent per surface; the shown:true doctrine) |
-| `POST /api/notifications/:id/ack` | `{by?}` — owner/FYI ack; refuses machine rows (400), and owner ack re-arms an open breaker |
-| `POST /api/notifications/:id/disposition` | `{detail, actor?}` — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops. **Actorship (decision #99, 2026-10-12):** the board has ONE shared bearer for owner and agent callers, so the credential proves a paired caller, not Gru. `by: 'gru'` in the ledger names the disposition *role*; the `notification.resolved` event also records `credential: 'shared-bearer'` and the caller-declared `declaredActor` (`null` when omitted). `actor` may only be omitted or `"gru"` (anything else is 400). Neither value is proof of identity; a separate owner credential is deliberately not introduced (no new auth framework). Owner Ack (`/ack`) is likewise shared-bearer and its `by` is caller-declared; when omitted the server records `web` |
+| `POST /api/notifications/:id/ack` | `{by?}` — feed/notice acknowledgement only; refuses machine rows (400). The UI shows it only on FYI rows (`Mark seen`) |
+| `POST /api/notifications/:id/decision` | `{optionId, expectedDecision, by?}` — records the owner's choice only when the full typed decision still matches what the caller displayed, so a reused option ID cannot bind an old label to a new consequence (`409 decision_changed`). A recorded decision is distinct from resolution; duplicates are idempotent and a different option is refused (409) |
+| `POST /api/notifications/:id/decision-options` | `{options, by?}` — the supported discussion bridge: attaches agreed options to an undecided, unresolved, discussion-only `needs-owner` decision (audited as `notification.decision-options`). It records NO choice and every other row shape is refused (409: `not_discussion`, `decision_recorded`, `not_open`, `no_decision`, `not_owner_decision`) |
+| `POST /api/notifications/:id/disposition` | `{detail, actor?}` (non-empty detail). **Actorship (decision #99, 2026-10-12):** `actor` may only be omitted or `"gru"`, else 400; the shared bearer proves a paired caller, not Gru — `notification.resolved` records `credential: 'shared-bearer'` and the caller-declared `declaredActor`) — authenticated Gru disposition for an action-required ID after substantive action; resolves it with a ledger event and closes any unresolved-attention owner follow-up; never clears unrelated owner stops. A blank detail is refused (400) before anything runs. Disposing an open `supervision.breaker` (or re-arm-fenced) alert re-arms the stopped lane through the guarded recovery-authority fence: a refusal is a typed `409 rearm_refused` and consumes nothing; a throwing guard is `502 rearm_failed`; the response carries `rearm: accepted \| not_applicable` (accepted = a stopped lane was re-armed, not_applicable = pure record). A fence appearing after acceptance keeps the stop visible and raises a fresh bound alert, so the debt always has a live control. On a `needs-owner` row it records FOLLOW-THROUGH for an already-recorded owner decision (an undecided row is refused: resolution never silences an unanswered question) |
 | `POST /api/lenses/bind` | `{roundId, lens, agentId}` — chip follows the agent's events |
 | `POST /api/lenses/outcome` | `{roundId, lens, state: done\|error, note?}` (live derives from agent events — never posted) |
 
@@ -112,16 +114,19 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   board behind); below 900px the rail stacks under the board and the FAB
   opens a bottom sheet.
 - **Dashboard:** a permanent **FOR YOU** owner band sits ABOVE the job
-  bands (owner approval 2026-09-28): the owner's pending obligations —
-  unacked `needs-owner` rows (Ack, with consequence copy that names what
-  the ack does and does NOT do — a quota/breaker ack re-arms the worker
-  but never clears code/test/review holds) plus the server-projected,
-  evidence-bound **ready PRs** (see below). Viewing completes nothing:
-  the header count is owed actions, not unseen rows; the count only
-  moves on an authoritative ack (any device) or confirmed merged/closed
-  state. Rows are deterministic (newest first, stable
-  `owner-ack:{id}`/`owner-pr:{jobId}` ids), focus survives snapshot
-  re-renders, and the older tail hides behind a `+N older pending`
+  bands (owner approval 2026-09-28; decision-inbox release 2026-10-11):
+  the owner's pending obligations — typed owner decisions (question,
+  recommendation, options with consequences; choosing one RECORDS the
+  choice and the row stays "awaiting follow-through" until its producer
+  resolves it), owner notices whose action is outside the app (no fake
+  Ack), lesson proposals, and the server-projected, evidence-bound
+  **ready PRs** (see below). Viewing completes nothing: the header count
+  is owed actions, not unseen rows; a row settles only on recorded
+  follow-through or confirmed merged/closed state. Rows are
+  deterministic (newest first, stable `owner-decision:{id}` /
+  `owner-notice:{id}` / `owner-proposal:{id}` / `owner-pr:{jobId}` action
+  keys), focus survives snapshot re-renders, and the older tail hides
+  behind a `+N older pending`
   expander — the engine already merges EVERY unacked needs-owner row
   into the snapshot, so no pending obligation is lost to the bounded
   feed. The PR action is **OPEN PR** (external https link only) — a
@@ -222,28 +227,38 @@ and — as the last-attached handler — terminates unclaimed upgrade paths
   independent scroll; the module follows the CREW tab and disappears with
   it on TRANSCRIPTS. Reads and disclosures are display-only — nothing
   here acks, executes or changes GitHub state.
-- **Notification center (E7; routing split 2026-09-23; section truth
-  2026-09-29):** the bell panel renders the durable notification log in
-  three bands — FOR YOU (all pending needs-owner rows, even older than the
-  bounded latest feed: owner-only decisions and stops whose ack re-arms
-  supervision), NEEDS GRU (all pending machine rows, including those older
-  than the recent feed; it wakes Gru once and refuses human Ack. Rows bound
-  to a terminal merged/done/binned lane are CLOSED RECEIPTS: they render
-  under FEED, never as live queue entries, and the live unacked chip does
-  not count them), and FEED (FYI rows plus closed receipts). The bell
+- **Notification center (E7; routing split 2026-09-23; owner-attention
+  registry 2026-10-11; section truth 2026-09-29):** the bell panel
+  renders the durable notification log in three bands — FOR YOU (pending
+  typed decisions, owner notices, proposals and ready PRs, even older
+  than the bounded latest feed), NEEDS GRU (all pending machine rows,
+  including those older than the recent feed; it wakes Gru once and
+  refuses human Ack. Rows bound to a terminal merged/done/binned lane are
+  CLOSED RECEIPTS: they render under FEED, never as live queue entries,
+  and the live unacked chip does not count them), and FEED (FYI rows
+  plus closed receipts). Route assignment is enforced server-side: only
+  registered owner-reserved kinds can reach FOR YOU; a `needs-owner`
+  request from any unregistered or machine kind is routed to Gru
+  (action-required) and logged, and an unknown stop is triaged by Gru
+  rather than dropped. Routine recovery (crash-loop breakers,
+  provider-wall stops, re-brief/directive reconciliation) stays machine
+  attention. Every card is the same readable shared component in both
+  surfaces: mixed-case prose, a short metadata label, typed decision
+  blocks and a Details disclosure holding the full diagnostics. The bell
   is the alert/history surface: it shares the SAME authoritative owner
-  projection as the board's permanent FOR YOU band — pending acks AND
-  ready PRs, so the two surfaces never disagree about what the owner
-  owes (the badge and toasts still count needs-owner notifications
-  only); opening it never completes an obligation. There is no
-  timed escalation: a machine alert is never promoted to the owner by age
-  (docs/FLOW.md forbids promotion by age). It stays in NEEDS GRU for Gru to
-  triage and dispose; only genuine owner decisions are posted to FOR YOU, and
-  those rows persist until the owner's Ack. The badge and live
+  projection as the board's permanent FOR YOU band, so the two surfaces
+  never disagree about what the owner owes (the badge and toasts still
+  count needs-owner notifications only); opening it never completes an
+  obligation. There is no timed escalation: machine alerts never promote
+  to owner attention by age alone (docs/FLOW.md forbids promotion by age);
+  a machine row leaves the queue when its producer resolves
+  it, and only a concrete typed escalation (never a timer) places an owner
+  decision in FOR YOU. The badge and live
   toasts serve needs-owner only; every displayed row earns a shown receipt
-  per surface (a display receipt is not an acknowledgement); acking an
-  owner row clears it where an ack has meaning (a breaker row re-arms
-  supervision). Informational owner stops earn the same unread badge as
+  per surface (a display receipt is not an acknowledgement). Owner
+  decisions are recorded through the decision endpoint; owner notices
+  carry no in-app control and clear when their producer resolves them on
+  evidence. Informational owner stops earn the same unread badge as
   errors. The
   wake tracker chip counts durable Gru wakes (`gru.wake` events). Live
   needs-owner arrivals toast (plus a browser notification when permission

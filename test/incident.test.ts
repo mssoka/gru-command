@@ -71,6 +71,9 @@ describe('incident identity (issue #219)', () => {
     expect(isHardFloorRow({ kind: 'supervision.provider-wall.a1.quota_wall', title: 'x', routing: 'action-required' })).toBe(true);
     expect(isHardFloorRow({ kind: 'provider.false-recovery.route-x', title: 'x', routing: 'action-required' })).toBe(true);
     expect(isHardFloorRow({ kind: 'supervision.breaker', title: 'x', routing: 'action-required' })).toBe(true);
+    // A fenced re-arm is the same recovery-control family: its successor
+    // alert must wake Gru even when the incident key was claimed before.
+    expect(isHardFloorRow({ kind: 'supervision.rearm-fenced', title: 'Re-arm fenced', routing: 'action-required' })).toBe(true);
     // Ordinary machine work stays deferrable.
     expect(isHardFloorRow({ kind: 'github.ci-failed:j-1:abc', title: 'x', routing: 'action-required' })).toBe(false);
     expect(isHardFloorRow({ kind: 'supervision.turn-orphaned.a2', title: 'x', routing: 'action-required' })).toBe(false);

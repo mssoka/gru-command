@@ -577,3 +577,12 @@ Tracked report job `review-dashboard-slim-r18-blind-475fce3e` targeted exact hea
 | R18-B2 — skipped-only Vitest instrument is classified as a broken claim | medium — patch (G6) | `failed === 0` returned code 2 before the named instrument's skipped-test guard could return code 3. A skipped-only instrument is non-evidence, not a baseline pass. Move the zero-failure broken-claim check after named-instrument validation and add a deterministic regression for an all-skipped instrument; retain code 2 for a genuinely passing instrument. |
 
 Root-cause groups: G5 is incomplete fail-before coverage: one hard status-pair expectation prevented the count-group selector from running, and the allowlist did not name that cause. G6 is classifier ordering that treated a named skipped-only instrument as a broken claim before checking its non-evidence state. Both are small classifier/test/config repairs; no product behavior or accepted scope changes. No `intent_gap` or `bad_spec` is triggered.
+
+## Scope reduction after #306 (2026-10-15)
+
+#306 rebuilt FOR YOU as readable notification cards with typed owner
+decisions, owner-only notices and proposal locks, so this PR's compact
+collapsed FOR YOU band (reveal-only "Review decision" disclosure over Ack
+rows) is superseded and was dropped; main's band is unchanged. What remains
+is the slim status strip (six labelled pairs + HEISTS / PRS / CREW groups,
+reserved tabular numeric slots) and the FOR YOU pending-count slot.

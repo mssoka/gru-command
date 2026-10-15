@@ -284,17 +284,13 @@ sight).
 
 ### Attention bands (v4 → v6: dense rows)
 
-A permanent **FOR YOU** owner band (owner approval 2026-09-28) sits
-ABOVE the job bands — pending owner acks and evidence-bound ready PRs
+A permanent **FOR YOU** owner band (owner approval 2026-09-28;
+decision-inbox release 2026-10-11) sits
+ABOVE the job bands — typed owner decisions with recorded choices,
+owner-only notices (no fake Ack) and evidence-bound ready PRs
 (OPEN PR, external https link only) —
 see [BOARD.md](./BOARD.md) for the semantics and the fail-closed
-readiness rule. Rows are **compact and initially collapsed**: the face
-shows the supplied title (the Problem) and one short typed Next step, and
-a **reveal-only** disclosure expands the authoritative metadata, the
-complete original detail and the honest consequence copy beside the Ack
-control. Revealing never acknowledges, approves or executes anything —
-the Ack stays a separate control — and both the disclosure state and
-keyboard focus survive a snapshot re-render. Its empty state is the calm clear state (an empty owner
+readiness rule. Its empty state is the calm clear state (an empty owner
 list is healthy); its rows are keyboard-focusable and a snapshot
 re-render preserves focus (stable action ids) and never toasts or rings
 a chime.
