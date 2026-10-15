@@ -23,6 +23,31 @@ import { formatAge, isSameLocalDay, shortRev } from './board-time.js';
 
 export type HealthTone = 'ok' | 'warn' | 'alert' | 'muted';
 
+/** Presentation-only split of a card VALUE for the slim strip's reserved
+ * numeric slot: lead text, the mutable number, trailing unit text. The
+ * unit owns any leading space it needs (' behind' vs 'm ago'). `num: null`
+ * = no number in the value; `value` keeps the exact original string. */
+export interface ValueSplit {
+  readonly lead: string;
+  readonly num: number | null;
+  readonly unit: string;
+}
+
+/** Same numeric-part split for a numeric FLAG pill ('3 FAILED'). */
+export interface FlagSplit {
+  readonly num: number | null;
+  readonly unit: string;
+}
+
+/** Split an age fragment (`10m`) plus its tail (` ago` / ``) into the
+ * reserved numeric slot parts; an honest non-numeric age (`—`) stays pure
+ * text and never fabricates a number. */
+function ageSplitValue(lead: string, age: string, tail: string): ValueSplit {
+  const parts = /^(\d+)([smhd])$/.exec(age);
+  if (parts === null) return { lead, num: null, unit: `${age}${tail}` };
+  return { lead, num: Number(parts[1]), unit: `${parts[2]}${tail}` };
+}
+
 export interface HealthCardView {
   readonly id: 'deploy' | 'reviews' | 'silas' | 'alerts' | 'verify' | 'cure';
   readonly title: string;
@@ -33,6 +58,10 @@ export interface HealthCardView {
   readonly flag: string | null;
   /** Longer explanation for the title attribute. */
   readonly titleAttr: string;
+  /** Numeric-part split of `value` (slim-strip reserved slots). */
+  readonly valueSplit: ValueSplit;
+  /** Numeric-part split of `flag`; null when there is no flag. */
+  readonly flagSplit: FlagSplit | null;
 }
 
 const N_A_DETAIL: Readonly<Record<HealthCardView['id'], string>> = {
@@ -52,12 +81,28 @@ function card(
   tone: HealthTone,
   flag: string | null = null,
   titleAttr = '',
+  valueSplit: ValueSplit = { lead: '', num: null, unit: '' },
+  flagSplit: FlagSplit | null = null,
 ): HealthCardView {
-  return { id, title, value, detail, tone, flag, titleAttr: titleAttr === '' ? detail : titleAttr };
+  return {
+    id,
+    title,
+    value,
+    detail,
+    tone,
+    flag,
+    titleAttr: titleAttr === '' ? detail : titleAttr,
+    valueSplit,
+    flagSplit,
+  };
 }
 
 function notAvailable(id: HealthCardView['id'], title: string, titleAttr?: string): HealthCardView {
-  return card(id, title, 'n/a', N_A_DETAIL[id], 'muted', null, titleAttr ?? N_A_DETAIL[id]);
+  return card(id, title, 'n/a', N_A_DETAIL[id], 'muted', null, titleAttr ?? N_A_DETAIL[id], {
+    lead: '',
+    num: null,
+    unit: 'n/a',
+  });
 }
 
 /** The restart-pending flag: the running build is behind origin/main, so a
@@ -78,6 +123,7 @@ export function deployDriftCard(build: BuildView | null | undefined, now = Date.
       'warn',
       null,
       `running build ${shortRev(build.buildRev)}; drift unknown — ${why}`,
+      { lead: '', num: null, unit: 'unknown' },
     );
   }
   if (build.commitsBehind === 0) {
@@ -89,6 +135,7 @@ export function deployDriftCard(build: BuildView | null | undefined, now = Date.
       'ok',
       null,
       `running build ${shortRev(build.buildRev)} matches origin/main ${shortRev(build.originMainRev)}`,
+      { lead: '', num: null, unit: 'current' },
     );
   }
   return card(
@@ -99,6 +146,7 @@ export function deployDriftCard(build: BuildView | null | undefined, now = Date.
     'alert',
     'RESTART PENDING',
     `running build ${shortRev(build.buildRev)} is ${build.commitsBehind} commits behind origin/main ${shortRev(build.originMainRev)} — rebuild + restart`,
+    { lead: '', num: build.commitsBehind, unit: ' behind' },
   );
 }
 
@@ -141,6 +189,8 @@ export function reviewCard(jobs: readonly JobView[], now = Date.now()): HealthCa
     counts.failedToday > 0 ? 'alert' : counts.active > 0 ? 'ok' : 'muted',
     counts.failedToday > 0 ? `${counts.failedToday} FAILED` : null,
     `${counts.active} round(s) active · ${counts.failedToday} failed today · ${verdicts} today`,
+    { lead: '', num: counts.active, unit: ' active' },
+    counts.failedToday > 0 ? { num: counts.failedToday, unit: ' FAILED' } : null,
   );
 }
 
@@ -153,15 +203,28 @@ export function silasCard(silas: SilasView | null | undefined, now = Date.now())
   // engine compares durable event ORDER, so same-millisecond passes cannot
   // tie-break wrongly.
   const failedNewer = silas.reconcileFailedNewer;
-  const value = failedNewer
-    ? `pass failed ${formatAge(silas.lastReconcileFailedAt, now)} ago`
-    : silas.openTurnSince !== null
-      ? `turn open ${formatAge(silas.openTurnSince, now)}`
-      : silas.lastReconcileAt !== null
-        ? `reconciled ${formatAge(silas.lastReconcileAt, now)} ago`
-        : silas.lastWakeAt === null
-          ? 'no wakes yet'
-          : `wake ${formatAge(silas.lastWakeAt, now)} ago`;
+  let value: string;
+  let valueSplit: ValueSplit;
+  if (failedNewer) {
+    const failedAge = formatAge(silas.lastReconcileFailedAt, now);
+    value = `pass failed ${failedAge} ago`;
+    valueSplit = ageSplitValue('pass failed', failedAge, ' ago');
+  } else if (silas.openTurnSince !== null) {
+    const turnAge = formatAge(silas.openTurnSince, now);
+    value = `turn open ${turnAge}`;
+    valueSplit = ageSplitValue('turn open', turnAge, '');
+  } else if (silas.lastReconcileAt !== null) {
+    const reconcileAge = formatAge(silas.lastReconcileAt, now);
+    value = `reconciled ${reconcileAge} ago`;
+    valueSplit = ageSplitValue('reconciled', reconcileAge, ' ago');
+  } else if (silas.lastWakeAt !== null) {
+    const wakeAge = formatAge(silas.lastWakeAt, now);
+    value = `wake ${wakeAge} ago`;
+    valueSplit = ageSplitValue('wake', wakeAge, ' ago');
+  } else {
+    value = 'no wakes yet';
+    valueSplit = { lead: '', num: null, unit: 'no wakes yet' };
+  }
   // An open turn must not hide whether the deterministic loop is still
   // moving: the detail carries the reconcile freshness beside the count.
   const detail =
@@ -190,6 +253,7 @@ export function silasCard(silas: SilasView | null | undefined, now = Date.now())
     failedNewer ? 'alert' : 'muted',
     failedNewer ? 'FAILED' : null,
     full,
+    valueSplit,
   );
 }
 
@@ -202,6 +266,7 @@ export function alertsCard(unacked: number): HealthCardView {
     unacked > 0 ? 'alert' : 'ok',
     unacked > 0 ? 'NEEDS GRU' : null,
     `${unacked} live machine-attention notification(s) awaiting Gru; closed receipts and the owner bell stay quiet`,
+    { lead: '', num: unacked, unit: '' },
   );
 }
 
@@ -216,6 +281,8 @@ export function verifyCard(verify: VerifyQueueView | null | undefined): HealthCa
     verify.queuedRuns > 0 ? 'warn' : 'ok',
     queuedFlag,
     `verification scheduler: ${verify.activeRuns} active, ${verify.queuedRuns} queued, ${verify.workersPerRun} of ${verify.workerBudget} workers per run`,
+    { lead: '', num: null, unit: `lock ${verify.lockInUse ? 'held' : 'free'}` },
+    verify.queuedRuns > 0 ? { num: verify.queuedRuns, unit: ' QUEUED' } : null,
   );
 }
 
@@ -229,6 +296,8 @@ export function cureCard(selfHeal: SelfHealView | null | undefined): HealthCardV
     selfHeal.sessionsOrphaned > 0 ? 'alert' : 'ok',
     selfHeal.sessionsOrphaned > 0 ? `${selfHeal.sessionsOrphaned} ORPHANED` : null,
     `${selfHeal.sessionsResumed} session(s) resumed, ${selfHeal.sessionsOrphaned} orphaned since boot`,
+    { lead: '', num: selfHeal.sessionsResumed, unit: ' resumed' },
+    selfHeal.sessionsOrphaned > 0 ? { num: selfHeal.sessionsOrphaned, unit: ' ORPHANED' } : null,
   );
 }
 

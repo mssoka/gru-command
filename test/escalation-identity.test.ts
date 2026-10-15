@@ -202,10 +202,11 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ts.forEachChild(node, visit);
     };
     visit(file);
-    // 34 of 37 sites carry the bounded context; the three null rows are the
-    // sanctioned residuals (shutdown deadline, live-process pause, sweep
-    // error) that stay deliberately context-free and live (A7 rejection
-    // stands; a worktree id is never coerced into a round identity).
+    // Of the 37 pre-existing wave sites, 34 carry bounded context; the
+    // three null rows are sanctioned residuals (shutdown deadline,
+    // live-process pause, sweep error) that stay context-free and live (A7
+    // rejection stands; a worktree id is never coerced into a round identity).
+    // All added publication-recovery sites carry their round-bound context.
     const expected: readonly (readonly [string, string | null])[] = [
       ['`Queued review handoff for job ${job.id} needs reconciliation`', '{ jobId: job.id }'],
       ['`Queued review handoff failed for job ${job.id}`', '{ jobId: job.id }'],
@@ -217,9 +218,24 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review of job ${input.jobId} could not be confirmed stopped — its writer is blocked`', '{ jobId: input.jobId, ...(roundIds.size === 1 ? { roundId: [...roundIds][0]! } : {}) }'],
       ['`Review round ${round.id} cannot be promoted: its review coverage state is missing or damaged`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} carries a posted verdict without a provider-bound receipt`', '{ jobId: round.jobId, roundId: round.id }'],
+      // Native correction cycle (PR #289 blockers 2/3): durable publication
+      // attempt reconciliation after restart, each bound to its round.
+      ['`Perkins publication for round ${round.id} could not be re-bound at restart and stays held`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} is malformed`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication for round ${round.id} was proven at the provider but never credited`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication absence for round ${round.id} is not bound to its intent`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} could not be reconciled after restart`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} cannot be reconciled safely`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} cannot be certified absent`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} did not land`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication for round ${round.id} was found at the provider after restart and is retained UNCREDITED`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Perkins publication attempt for round ${round.id} stays unresolved after restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
       ['`Review round ${String(lane.roundId)} could not be processed during startup recovery`', '{ ...(lane.jobId !== null ? { jobId: lane.jobId } : {}), ...(lane.roundId !== null ? { roundId: lane.roundId } : {}), }'],
       ['`Review round ${round.id} is INCOMPLETE after service restart`', '{ jobId: round.jobId, roundId: round.id }'],
+      ['`Review round ${String(round.id)} could not be processed during startup recovery`', '{ jobId: job.id, roundId: round.id }'],
       ['`Queued review handoff for job ${jobId} is held`', '{ jobId }'],
       ['`Queued review handoff failed for job ${jobId}`', '{ jobId }'],
       // Owner decision 2026-10-08: a transient refusal retries; only the
@@ -252,7 +268,10 @@ describe('wave escalation identity (A4 owner-approved extension)', () => {
       ['`Review worktree for round ${worktreeId} could not be swept`', null],
     ];
     expect(sites.map((site) => [site.title, site.context])).toEqual(expected);
-    expect(sites).toHaveLength(37);
-    expect(sites.filter((site) => site.context !== null)).toHaveLength(34);
+    // 37 pre-existing wave call sites + the 13 durable-publication-recovery
+    // escalations added by the PR #289 native correction cycle, its
+    // amendments and the native R2 byte/identity fences.
+    expect(sites).toHaveLength(50);
+    expect(sites.filter((site) => site.context !== null)).toHaveLength(47);
   });
 });

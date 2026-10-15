@@ -135,6 +135,64 @@
 
 - verificationFailures digest rows with a null scope can never follow the `verification-failure:<scope>@<run_id>` fingerprint discipline: the retirement fingerprints are only built when scope is non-null, so a null-scope failure row can only retire via resubmission (impossible for null scope) or terminality. Pre-existing digest identity gap (unchanged by #117, which only names the pre-existing instruction as the `verification-repair` rule). Fix: give the null-scope row an actionable identity or withhold the rule offer.
 
+## Deferred from: bmad-build review of dashboard-slim-strip-current-main (2026-10-07)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The two fail-before baseline scopes guard an unexpected GREEN but cannot distinguish a behavioral feature-absence RED from a build/import/collection failure.
+  evidence: The scopes now terminate exit 2 on an unexpected pass (`FAILS-BEFORE CLAIM BROKEN`) and keep the real exit otherwise; adding the binned-baseline failure-kind assertion (`tools/assert-binned-baseline.mjs` pattern: per-leg JSON reporter + named-behavioral-failure check) needs a lane helper and a re-verified run. The recorded REDs (runs e7bf5e64/f5976535, 6bda4166/a0cf1b64) are behavioral today.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The wake-age and deferred-count digit-boundary legs (9→10, 99→100, 999→1000) run at 1440 only, while the acceptance names 1440/1200/768/360.
+  evidence: The familyA/B/C boundary loops cover all four viewports for the other slots and the reserved-slot CSS is shared, but the age/deferred slots cross their own boundaries at one width only; extend the two long tests with narrow-width legs at the next suite touch (the long-label test now has a 360 leg).
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The bell panel's ready-PR row keeps its prior content and explicit OPEN PR link but flows with a flex override instead of the base grid alignment; no test compares the panel layout to base.
+  evidence: Round-3 blind-hunter follow-up (panel variant added by the port commit, not the review delta). Content/regions/controls are preserved and asserted structurally; revisit only when the notification panel is next touched, with a panel-level visual or computed-style pin.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The optional CHILDREN group falls through the tone map to the neutral park marker; no tone is assigned or asserted.
+  evidence: Round-3 blind-hunter follow-up. The approved reference defines only HEISTS/PRS/CREW marker tones; decide a CHILDREN tone (or keep neutral) and pin it when the group is next touched.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Each `.strip-group` section's accessible name is the tooltip enumeration (`working / in-review / …`) rather than the visible heading (HEISTS/PRS/CREW/CHILDREN).
+  evidence: Round-3 blind-hunter follow-up. No test asserts the section name; switch to the visible name or `aria-labelledby` the head when the strip next receives an a11y pass.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: `geometry()` cannot measure wake states without a valid stamp (`no wakes yet` / `last wake unknown`), so those states have text assertions only.
+  evidence: Round-3 blind-hunter follow-up: `need(.board-age-split__num)` throws for unstamped states; add optional-slot handling when the geometry helper is next extended.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: `bindClient` (re-pair) does not clear the owner band's `expandedOwnerRows`/`ownerRegionIds`, so an actionId reused by the new connection can render pre-expanded with a recycled region id.
+  evidence: Round-6 edge-case follow-up; reachable only across re-pair with a server that reuses ids; harden at the next owner-band touch (clear the maps in `bindClient` and pin with a unit test).
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The capture suite overwrites fixed ignored screenshot paths without clearing or run-scoping, so a failed run can leave stale images that satisfy the manual inspection step.
+  evidence: Round-6 blind-hunter follow-up (F-7); clear or run-scope `web/e2e-artifacts/` before capturing at the next suite touch.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The `.strip-kpi + .strip-kpi::before` separator glyphs are CSS-generated content exposed to assistive technology.
+  evidence: Round-6 blind-hunter follow-up (F-6); replace with a real `aria-hidden` span or non-content separator at the next strip a11y pass.
+
+## v7 review rounds — assessed follow-ups (from the workflow reviewers; not fixed here)
+
+These are real observations that are either outside the approved SLIM
+acceptance, by-design decisions, or carry more risk than the finding
+warrants. They are recorded, not dropped:
+
+- A persistently malformed `200` snapshot joins the rate-bounded trailing
+  chain with no duration cap and no connection-state surface (repeat: round 2
+  and round 3).
+- The e2e fixture's module-global `spec` couples cases under `workers: 1`
+  (asked for twice).
+- The strip has no `aria-live`/`role="status"` region: counts/alerts change
+  silently for screen readers. New a11y feature work, beyond the approved
+  scope.
+- `#board-unacked` stays rendered but permanently hidden (it keeps the
+  id/text/title so the number is not duplicated); documented contract holder.
+- `stripFlagNode` styles every flag with the alert pill regardless of pair
+  tone (carried; pairs other than DEPLOY are unpinned).
+- Group `aria-label` is the tooltip enumeration and the `::before` separators
+  are AT-audible (carried).
+- The `dashboard-slim-strip-baseline` overlay's "base-import-clean" premise is
+  not mechanically guarded; a future slim-only import would turn behavioral
+  evidence into a classifier exit 3 (which fails loud, not silently).
+- `scrollFullyIntoView` in `pipeline-board.spec.ts` scrolls before the
+  reachability assert (the strict-oracle helper from the amendment-#2 repair;
+  changing it risks re-opening that strict-containment work).
+- The visual-capture e2e test always runs and writes fixed ignored paths
+  (that is its purpose: operator/vision evidence).
 ## Deferred from: BMAD review rounds 1-5 of PR #284 (2026-10-09)
 
 - [Review][Defer] Consumer-level keepalive reproduction — a client socket (or dispatcher) with a small body-idle deadline proving `TypeError('terminated')` without the heartbeat and clean EOF with it (the incident report's §8.6 sketch). Deferred: acceptance 1-3 are proven by real byte arrivals with a bounded idle gap on an isolated server at an injected cadence; this is a stronger end-to-end variant, not a missing requirement. Settled by: a `node:http` client test that destroys the socket after an idle deadline, run against a quiet producer.
@@ -147,6 +205,27 @@
 - [Review][Defer] Receipt validation is asymmetric — `readCaptureReceipt` validates only the `pings` field this change added; a v1 receipt with a missing/wrongly-typed `frames`/`capture_bytes`/`started` still reads back as a `CaptureReceipt`. Pre-existing; a full receipt validator is a separate change.
 - [Review][Defer] Ping wire literal duplicated — `PingFrame` is exported but the reader compares a bare `frame['type'] === 'ping'`; a rename on either side compiles clean and silently reclassifies the keepalive as a producer frame. Settled by: a shared `PING_FRAME_TYPE` constant (or type guard) owned by the verify wire vocabulary.
 - [Review][Defer] Synchronous write-failure branch has no test double — the `stopHeartbeat()` in `writeFrame`'s catch (ERR_STREAM_*/serialization) is defensive and unreachable by the current socket tests. Settled by: a fake `res` whose `write` throws, asserting the interval is cleared.
+- [Review][Defer] Legacy `GhPrPoster.reconcile` credits without a submission-time window — `boundMatchFrom` accepts any body-identical same-state review by the authenticated account at the frozen head, where the App poster's ambiguous-POST walk applies a 60 s window; a colliding older round's bytes could be mis-attributed when the provider state still enacts the judgment. Pre-existing documented idempotent-recovery seam (R4/R28); the formal-event change only narrows it by state. Settled by: extending the window to the legacy seam or documenting the collision explicitly. (perkins-formal-verdicts-review-20261010-r2 OB1)
+- [Review][Defer] Mid-delivery abort leaves a formal review on the provider — if the abort signal fires after a verified receipt, the round ends aborted/unrecorded while the remote review exists; the escalation already tells the operator to verify manually. Inherent to an irreversible external write and structurally identical to the COMMENT era; no behavior change is claimed or required by the formal-event contract. (perkins-formal-verdicts-review-20261010-r2 OB2)
+
+## Deferred from: native R6 whole review of PR #289 (2026-10-11)
+
+- [Review][Defer] A submitted exact frozen-head/publication-body review with unknown authorship can still be filtered from foreign-account reconciliation (`src/dispatch/perkins.ts` / configured-App review path) — the R6 report verified this F2 shape but marked it explicitly nonholding and outside the current foreign submitted-state correction. It remains a final whole-change follow-up, not a waiver: preserve nullable/covered-empty-list distinctions and do not launch a blanket null/history campaign; the exact-final-head whole native judgment must still resolve the accepted scope.
+
+## Deferred from: tracked review of PR #289 R6 correction (2026-10-11)
+
+- [Review][Defer] Preserve the prior whole-change blocker: GitHub CLI's prepared identity is not bound to the credential used for the irreversible POST (`src/dispatch/perkins.ts`, `GhPrPoster`). The earlier full native review source-traced preparation as A, POST as B after external credential rotation, lost response/crash, and restart as A; the current R6 foreign-submission correction holds an exact visible B-authored review but does not pin credentials. The new blind review repeats the gap and notes the conditional case where the review is not visible to the later lookup. No credential/provider change or live rotation/owner-account experiment is authorized in this lane. Do not mark the blocker false or fixed; leave it for exact-final-head whole native judgment and an explicitly authorized design/test if that judgment requires it.
+
+## Deferred from: tracked R6d review of PR #289 (head 26f5751f, 2026-10-11)
+
+- [Review][Defer] GitHub CLI lookup identity can rotate between the `/user` subprocess and the later review-list subprocesses (`src/dispatch/perkins.ts`, `GhPrPoster.reconcile`). `onLookupIdentity` records the result of the first process, but does not prove the subsequent list ran under that credential; a lookup under a different account could be mis-bound to the prepared identity and certify absence. This is an additional manifestation of the existing credential-continuity blocker above. No provider/credential redesign or live rotation experiment is authorized; leave the blocker for exact-final-head whole native judgment.
+- [Review][Defer] Prior same-state reviews may match the unbounded recovery lookup (`GhPrPoster.boundMatchFrom`; configured-App `reconcile` passes `notBeforeMs: null`). The legacy path is the documented R2 OB1/R4/R28 idempotent-recovery seam; App restart recovery records a found receipt only as `credited: false` evidence and holds the attempt, so this variant is a false uncredited recovery signal rather than a completed formal verdict. A coherent fix needs an explicitly selected cross-provider recovery-window contract; no such expansion is authorized here. Preserve the prior defer and do not claim the seam resolved.
+- [Review][Defer] `GhPrPoster.post` still performs its irreversible write via `spawnSync`; cancellation cannot interrupt the synchronous subprocess and is observed after it returns. The host retains the receipt as uncredited evidence and refuses `recordDelivery` when the signal is aborted, but cannot prevent a provider-side review created during that window. This is the same irreversible mid-delivery abort exposure documented as R2 OB2; no process/credential redesign is authorized in this cycle.
+
+## Deferred from: tracked R6e reviews of PR #289 (target aa27b61b, 2026-10-11)
+
+- [Review][Defer] Exact frozen-head/publication-body GitHub/App reviews with unknown authorship may still be skipped during foreign-account reconciliation (`src/dispatch/perkins.ts`, `src/dispatch/perkins-github-app.ts`). This repeats the already accepted nonholding native R6 F2 follow-up; preserve null/covered-empty-list distinctions, avoid a blanket null/history campaign, and leave the whole-change scope decision to exact-final-head native judgment. Not fixed or waived.
+- [Review][Defer] GitHub CLI credential identity can change between preparation, irreversible POST, `/user`, and review-list subprocesses; a same-state older review can also match the documented unbounded idempotent recovery seam. These repeat existing R6/R6d whole-change follow-ups. No credential/provider redesign, live rotation test, or cross-provider recovery-window expansion is authorized here; do not claim resolved.
 
 ## Deferred from: native R4 repair of job perkins-integration-review-coverage-20261009 (2026-10-10)
 
@@ -210,6 +289,38 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-merge-authority-boundary.md`
   summary: The BMAD-onboarding rehearsal script still describes the fallback as "clear to merge" and Perkins as carrying "autonomous-merge authority".
   evidence: `scripts/rehearsal-bmad-onboarding.mjs:62-66` — repo-internal rehearsal harness (not shipped in the package, not session-reaching). The round-3 concluding review flagged it as a follow-up on untouched code; the shipped boundary (a fallback PASS is not a Perkins READY; no agent merges a PR) already governs real sessions.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The mailbox snapshot validator accepts `kind: "job"` with `jobId: null`; For Gru membership can omit the item while mailbox counts still include it if a malformed server frame reaches the client. Current `projectMailbox` derives kind from the job ID, so this is a pre-existing protocol-validation gap, not a SLIM change.
+  evidence: `web/src/lib/board-protocol.ts:1143` permits nullable IDs; `web/src/lib/board-bands.ts:293-295` filters null-ID jobs; `src/gru-mailbox/projection.ts:49-54` derives `kind` from `jobId`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The mailbox snapshot validator accepts an empty `reasons` array for a non-resolved item, leaving its For Gru detail without a human-readable reason label if a malformed frame reaches the client. The required basis is still displayed, and current projection emits items with reasons; this is pre-existing protocol hardening, not a SLIM change.
+  evidence: `web/src/lib/board-protocol.ts:1144` checks array shape but not non-emptiness; `web/src/ui/board.ts:1555-1559` renders reason labels and basis; `src/gru-mailbox/projection.ts:176-177` appends a job item only when `reasons.length > 0`, while incident reasons derive from notification rows at `src/gru-mailbox/projection.ts:219-235`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: A signal-less GET that receives HTTP 401 can be reported as a status-0 timeout because `refused()` stops the client and aborts the same request controller before the GET result is returned. The POST race was fixed in the SLIM integration; the GET variant is existing integrated-main client behavior and should be addressed in a separately scoped BoardClient follow-up.
+  evidence: Round 13 verification-gap review at `web/src/lib/board-client.ts:329-380`; GET consumers include proposal, receipt, and transcript reads. This finding is not part of the approved SLIM presentation acceptance.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: The repo-internal BMAD-onboarding rehearsal script appears incompatible with the current build: its static import targets a removed `dist/wizard/bmad-onboarding.js`, and its `parseAnswers` fixture includes the retired `bmad` answer. The script is unchanged in the SLIM review range; handle separately from this feature.
+  evidence: Round 13 edge-case review at `scripts/rehearsal-bmad-onboarding.mjs:13,34-41`; this script is outside the approved SLIM product scope.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Fallback review input capture mutates the lane's real Git index, dropping staged changes and their partial-staging boundaries before review.
+  evidence: `src/dispatch/perkins.ts:1475-1489` runs `git add -N .`, then a worktree-only `git diff`, then `git reset -q --` with the real repository index; the fallback runner captures before and after reviewer turns. A disposable-repository reproduction showed the staged diff disappear and the change move to the unstaged diff after reset. This implementation is present at integrated `main` (`79c032e5`) and unchanged by the SLIM branch since that integration; fix it in a separately scoped review-infrastructure change.
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: A pushed board frame arriving during a post-action snapshot refresh can be left as the last displayed state when that in-flight GET then fails, because the stale-epoch error branch returns without retrying.
+  evidence: R15-B3 — `BoardClient.refetchSnapshot`'s stale-epoch catch path is present at integrated main `79c032e5` and unchanged in the SLIM delta; the owner-action `client.wake()` caller is also integrated-main code. Unlike the success path, the error path does not set `refreshOwed` or start the trailing refetch. This is a real main-side BoardClient refresh issue, not caused by the approved presentation change; handle in a separately scoped client follow-up.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Pending lesson-proposal rows remain full-detail instead of receiving the compact owner face proposed by R16.
+  evidence: The R16 observation at `web/src/ui/board.ts:759-765` is factually visible, but the owner scope-restoration amendment #7 and effective contract v11 exclude this absorbed-later-main proposal UI from the approved SLIM acceptance. The proposal row is already a current-main behavior at integration base `79c032e5`; compacting or otherwise redesigning it is a later feature decision. Preserve its current behavior in this PR rather than broadening the product change.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-dashboard-slim-strip-current-main.md`
+  summary: Defer the inherited uppercase-host GitHub issue-source identity mismatch to a separate intake scope; no intake repair is commissioned by PR #256.
+  evidence: R17 Edge report source-checked `src/intake/sources.ts`: `parseRepoRemote` preserves host spelling while `URL.hostname` canonicalizes case, and later identity comparisons can reject an otherwise valid issue URL. The file is unchanged from PR base `79c032e5a5a1ba7607b5daf6cafa36c2aecbdd37`; this is not a SLIM change.
+
 - source_spec: `_bmad-output/implementation-artifacts/spec-for-you-readable-notifications-20261009-v3.md`
   summary: `web/e2e/real-server.spec.ts` "real native compact preserves history and New chat starts unresumed behind a durable epoch" is order-sensitive: it reads `chat/gru-session.json` right after clicking New chat and can observe the pre-activation epoch (0) instead of the incremented one.
   evidence: Reproduced at the pristine base f738b9b1 (isolated worktree, same suite): 18 passed / 1 failed with `expect(freshPointer.epoch).toBe(oldPointer.epoch + 1)` receiving 0; the test passes when run alone. Not caused by this change (the notification work touches only message strings in `src/chat/server.ts`); the fix is test-side synchronization (wait for the pointer file's epoch to advance) before asserting.
@@ -219,3 +330,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-for-you-readable-notifications-20261009-v3.md`
   summary: `docs/SUPERVISION.md` and `docs/OPERATIONS.md` inaccurately say a service restart clears a durable open breaker.
   evidence: R6 edge review at `821dfdb67853ce9f809fca47a045d4e26bc72b75`, `docs/SUPERVISION.md:119-121` and `docs/OPERATIONS.md:107-108`; `Supervisor.hydrateRestoredStops()` reconstructs durable open stops on startup. This is a pre-existing documentation correction outside the notification acceptance; updating it is deferred without changing restart/recovery behavior.
+
+## Deferred from: post-integration tracked review of PR #289 (2026-10-12)
+
+- [Review][Defer] `captureFallbackInput` (`src/dispatch/perkins.ts`) runs `git reset -q --` after `git add -N .`; this can reset the caller's whole index (including staged-only content), and a partial `git add -N` failure may leave temporary intent-to-add entries. The exact code is already present at main `79c032e5` and unchanged by the task's PR-base diff, so it is outside this integration correction and remains an explicit follow-up, not fixed or dismissed as harmless. A separately authorized change should preserve/restore the caller's index and test staged-only content plus partial preparation failure.

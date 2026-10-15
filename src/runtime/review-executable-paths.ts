@@ -2602,6 +2602,7 @@ export const PUBLIC_REVIEW_EXECUTABLE_PATHS: ReadonlySet<string> = new Set([
   "dist/dispatch/perkins.js",
   "dist/dispatch/pipeline.js",
   "dist/dispatch/pr-creation.js",
+  "dist/dispatch/publication-evidence.js",
   "dist/dispatch/property-campaigns.js",
   "dist/dispatch/rebrief-recovery.js",
   "dist/dispatch/recovery-owner.js",

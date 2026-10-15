@@ -19,7 +19,7 @@ import { branchNameForRef } from '../src/dispatch/branch-idle.js';
 import { freezeReviewInputs, repositoryGitEnv, sourceMovementSinceFreeze } from '../src/dispatch/perkins-review/artifacts.js';
 import { headMovedSinceFreeze } from '../src/dispatch/perkins-review/whole.js';
 import { prBranchCandidate, resolveFreshPrHead, type PrHeadProbe } from '../src/dispatch/perkins-review/fresh-head.js';
-import { GhPrPoster, GitLabMrPoster, WaveRunner } from '../src/dispatch/perkins.js';
+import { enactedStateFor, GhPrPoster, GitLabMrPoster, WaveRunner, type VerdictReviewEvent } from '../src/dispatch/perkins.js';
 import { probeGitHubRemote, repoRemote, runReviewPreflight } from '../src/dispatch/review-path.js';
 import { EventBus } from '../src/events/bus.js';
 import { LedgerApi } from '../src/ledger/api.js';
@@ -115,8 +115,8 @@ async function waveFixture(repo: FixtureRepo, probe: PrHeadProbe, linkedPr = tru
   const wave = new WaveRunner({
     ledger, worktrees, spawner: runtime.spawner,
     poster: {
-      post: async ({ targetSha, body }) => ({
-        reviewId: 'fixture-review', actor: 'fixture-bot', event: 'COMMENTED',
+      post: async ({ targetSha, body, reviewEvent }) => ({
+        reviewId: 'fixture-review', actor: 'fixture-bot', event: enactedStateFor(reviewEvent),
         commitId: targetSha, headSha: targetSha, baseSha: 'fixture-base',
         bodySha256: createHash('sha256').update(body, 'utf8').digest('hex'),
       }),
@@ -667,7 +667,7 @@ describe('review Git repository environment isolation (GH-270)', () => {
       const h = await waveFixture(repo, probe);
       const alias = () => git(repo.path, ['symbolic-ref', 'refs/remotes/origin/topic', 'refs/tags/terminal-tip']);
       const runtime = fakeWholeSpawner(directory(), { childAnswer: () => '[]', ...(seam === 'submission' ? { beforeSubmit: alias } : {}) });
-      const post = vi.fn(async ({ targetSha, body }: { targetSha: string; body: string }) => ({ reviewId: 'r8-review', actor: 'fixture-bot', event: 'COMMENTED' as const,
+      const post = vi.fn(async ({ targetSha, body, reviewEvent }: { targetSha: string; body: string; reviewEvent: VerdictReviewEvent }) => ({ reviewId: 'r8-review', actor: 'fixture-bot', event: enactedStateFor(reviewEvent),
         commitId: targetSha, headSha: targetSha, baseSha: repo.git(['rev-parse', 'main']), bodySha256: createHash('sha256').update(body).digest('hex') }));
       const wave = new WaveRunner({ ledger: h.ledger, worktrees: h.worktrees, reviewArtifactRoot: h.artifactRoot, poster: { post }, prHeadProbe: probe,
         spawner: async (role, options) => {
@@ -1464,7 +1464,7 @@ if (argv.includes('POST')) {
     const poster = new GhPrPoster(binary);
     const input = {
       repoPath: repo.path, prUrl: 'https://github.com/acme/assigned/pull/7', host: 'github.com',
-      targetSha: target, baseSha: target, body: 'assigned review\n',
+      targetSha: target, baseSha: target, body: 'assigned review\n', reviewEvent: 'COMMENT' as const,
     };
     poison(foreign);
     await expect(poster.post(input)).resolves.toMatchObject({ reviewId: '7', headSha: target, commitId: target });
@@ -1493,7 +1493,7 @@ if (argv.includes('POST')) {
     });
     const input = {
       repoPath: repo.path, prUrl: 'https://gitlab.example.test/acme/assigned/-/merge_requests/7',
-      host: 'gitlab.example.test', targetSha: target, baseSha: target, body: 'assigned review\n',
+      host: 'gitlab.example.test', targetSha: target, baseSha: target, body: 'assigned review\n', reviewEvent: 'COMMENT' as const,
     };
     poison(foreign);
     await expect(poster.post(input)).resolves.toMatchObject({ reviewId: '7', headSha: target, commitId: null });

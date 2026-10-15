@@ -258,17 +258,17 @@ product + `ONE GRU · ONE WINDOW`, the inline monospace status **ticker**
 socket's radar state, the top live/pending review round), the
 notification bell, theme and settings. No Chat/Board lens toggle (v6.1):
 chat is always docked on desktop and the FAB owns mobile chat. Below it
-the **status chip rail** (sticky, wrapping on desktop) relocates the v4
-health row globally: DEPLOY → REVIEWS → SILAS → ALERTS → VERIFY → CURE →
-TRACKERS, each with one accent edge and its own flags (e.g. REVIEWS
-carries `12 FAILED`). The TRACKERS chip folds the v4 KPI counts in as
-labeled fields (`HEISTS 17 working 2 in review 2 merged 0 done 0 parked 1`,
-`PRS 1 open 1 conflicting 0 merged today 0`, `CREW 1 minions 1 mid-turn 1
-disposed 1` — the crew group counts the whole crew: gru, silas, minions,
-lens children; every number is a `data-kpi` span tied to the same
-`boardKpis` derivation the v4 strip used) plus the Jev decisions chip and
-the unacked action-required badge. No bare slash counters survive: every
-value carries its label beside it.
+the **slim status strip** (sticky, wrapping on desktop) renders the v4
+health row as labelled status pairs — DEPLOY → REVIEWS → SILAS → ALERTS →
+VERIFY → CURE, each pair a key and its value with the card's flags (e.g.
+REVIEWS carries `12 FAILED`) — plus the Jev decisions, NEEDS GRU and wake
+facts, and three stable count groups: **HEISTS** / **PRS** / **CREW**
+(each with a reserved-width total and its labelled fields; the CHILDREN
+group appears only when the server actually reported counters). Every
+number is a `data-kpi` span tied to the same `boardKpis` derivation the v4
+strip used, and every numeric slot is `tabular-nums` with a reserved floor,
+so a count crossing 9→10→100→1000 moves nothing beside it. No bare slash
+counters survive: every value carries its label beside it.
 
 **Display vocabulary (v6.1):** the render boundary renders `lane` /
 `job(s)` as **heist(s)** and the worker-meta word as **minion**; the

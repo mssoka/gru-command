@@ -14,6 +14,7 @@ import { IntakeError } from '../intake/types.js';
 import { IntakePartialFailure, type IntakeApprovalService } from '../intake/approval.js';
 import type { NotificationCenter } from '../notifications/center.js';
 import type { DispatchService } from './service.js';
+import { pendingPublicationAttempt } from './publication-evidence.js';
 import { ReviewInProgressError, ReviewSupersessionUnconfirmedError, type WaveRunner } from './perkins.js';
 import { isAmendmentEffect, type AmendmentEffect } from '../review-inputs/amendments.js';
 import type { DirectiveRegistry } from './fix-directive.js';
@@ -760,6 +761,15 @@ export function createDispatchServer(options: DispatchServerOptions): DispatchSe
         // candidate — it is never re-armed.
         if (options.ledger.latestRoundEvent(sourceRoundId, 'round.superseded') !== null) {
           throw new Error(`source round ${sourceRoundId} was superseded by an approved change — it is never re-armed`);
+        }
+        // An irreversible provider write is not undone by a restart: while a
+        // durable publication attempt has no conclusive outcome, re-arming a
+        // new publication on the same head could duplicate an unrecorded
+        // formal review. Reconcile it first (recovery does; the guard reports
+        // only evidence, never a fabricated result).
+        const pendingPublication = pendingPublicationAttempt(options.ledger, sourceRoundId);
+        if (pendingPublication !== null) {
+          throw new Error(`clean-abort re-arm refused: ${pendingPublication.detail}`);
         }
         if (requestedTargetRef !== undefined && requestedTargetRef !== sha) {
           throw new Error('clean-abort re-arm target_ref must be the proved delivered head sha');

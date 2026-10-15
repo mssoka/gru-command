@@ -8,6 +8,14 @@ import { PersistedReviewPort } from './helpers/persisted-review-port.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createHash } from 'node:crypto';
 
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
+
 /**
  * DISPOSABLE CRASH CHILD (R19): spawned by
  * `perkins-builtin-wave.test.ts` with PERKINS_CRASH_CHILD pointing at a
@@ -72,8 +80,8 @@ describe.skipIf(payloadPath === undefined)('perkins crash child (R19)', () => {
         } } : {}),
       }).spawner,
       poster: {
-        post: async (call: { readonly body: string; readonly targetSha: string }) => ({
-          reviewId: '9001', actor: 'gru-bot', event: 'COMMENTED', commitId: call.targetSha,
+        post: async (call: { readonly body: string; readonly targetSha: string; readonly reviewEvent?: string }) => ({
+          reviewId: '9001', actor: 'gru-bot', event: enactedFor(call.reviewEvent), commitId: call.targetSha,
           headSha: call.targetSha, baseSha: 'b'.repeat(40),
           bodySha256: createHash('sha256').update(call.body, 'utf8').digest('hex'),
         }),

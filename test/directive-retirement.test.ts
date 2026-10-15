@@ -38,6 +38,14 @@ import { establishProviderWait, ProviderRecoverySensor } from '../src/provider-r
 import type { AgentCapabilities, AgentHandle, AgentState, SpawnOptions } from '../src/runtime/types.js';
 import type { LessonsReferencePort } from '../src/lessons/types.js';
 
+/** The enacted provider state a fixture publisher reports for the intent the
+ * host hands it. An intent-less call (a base-era poster) keeps the historical
+ * COMMENTED shape, so the overlay stays compilable against the old build. */
+const ENACTED_REVIEW_STATE: Record<string, string> = {
+  APPROVE: 'APPROVED', REQUEST_CHANGES: 'CHANGES_REQUESTED', COMMENT: 'COMMENTED',
+};
+const enactedFor = (event: string | undefined): string => ENACTED_REVIEW_STATE[event ?? 'COMMENT'] ?? 'COMMENTED';
+
 /**
  * Guarded interrupted-directive recovery (owner approval j-1348).
  *
@@ -174,11 +182,11 @@ async function boot(opts: { completeReview?: boolean; noDirectiveChanges?: boole
     spawner,
     bus,
     poster: {
-      async post(input: { readonly targetSha: string; readonly body: string; readonly baseSha: string }) {
+      async post(input: { readonly targetSha: string; readonly body: string; readonly baseSha: string; readonly reviewEvent?: string }) {
         return {
           reviewId: '9001',
           actor: 'gru-bot',
-          event: 'COMMENTED',
+          event: enactedFor(input.reviewEvent),
           commitId: input.targetSha,
           headSha: input.targetSha,
           baseSha: opts.completeReview === true ? input.baseSha : 'stub-base',
