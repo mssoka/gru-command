@@ -16,6 +16,10 @@ import {
   type VerificationRecord,
 } from '../src/verify/scheduler.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
+import { LedgerDb } from '../src/ledger/db.js';
+import { LedgerApi } from '../src/ledger/api.js';
+import { EventBus } from '../src/events/bus.js';
+import { laneIsBusy } from '../src/dispatch/branch-idle.js';
 
 /**
  * The verification scheduler (contention fix, 2026-09-22): one global test
@@ -300,6 +304,259 @@ describe('verification scheduler — global budget', () => {
     expect(scheduler.activeCount()).toBe(0);
   });
 
+  it('reentrant shutdown after native child spawn cannot mislabel a missing started frame as no-start', async () => {
+    const repo = makeRepo(); const records: VerificationRecord[] = [];
+    let disposal: Promise<void> | null = null;
+    const scheduler = new VerificationScheduler({ storageDir: join(tempDir(), 'verify'),
+      limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 5000 },
+      record: (record) => records.push(record),
+      onSpawn: () => { disposal = scheduler.dispose(); }, disposeGraceMs: 1000,
+    });
+    const outcome = await scheduler.submit(repoSpec(repo, 'spawned-job', { command: 'node -e "setTimeout(() => {}, 3000)"', requestId: 'spawned-before-shutdown' }));
+    await disposal;
+    expect(outcome.ok).toBe(false); expect(outcome.signal).toBe('SIGTERM');
+    expect(records.filter((record) => record.kind === 'verification.no-start')).toEqual([]);
+    expect(scheduler.attemptStatus({ requestId: 'spawned-before-shutdown' })).toMatchObject({ state: 'completed', started: true, runId: outcome.runId });
+  });
+
+  it('shutdown durably settles a queued original run as no-start across restart, without executing or losing its identity', async () => {
+    const { scheduler, records, storageDir } = makeScheduler(); scheduler.start();
+    const holder = await scheduler.acquire(spec('independent-holder'));
+    const requestId = 'shutdown-never-started-request';
+    const input = { ...spec('queued-job', 'node -e "process.exit(99)"'), requestId };
+    const frames: VerificationProgress[] = [];
+    let queued!: () => void; const queuedBoundary = new Promise<void>((resolve) => { queued = resolve; });
+    const pending = scheduler.submit(input, (frame) => { frames.push(frame); if (frame.type === 'queued') queued(); });
+    const rejected = expect(pending).rejects.toBeInstanceOf(VerificationDisposedError);
+    await queuedBoundary;
+    const requested = records.find((record) => record.kind === 'verification.requested')!;
+    expect(frames[0]?.type).toBe('queued');
+    await scheduler.dispose(); await rejected;
+    const noStart = records.filter((record) => record.kind === 'verification.no-start');
+    expect(noStart).toHaveLength(1); expect(noStart[0]?.payload).toMatchObject({ run_id: requested.payload['run_id'], request_ids: [requestId], started: false });
+    expect(frames.some((frame) => frame.type === 'started' || frame.type === 'completed')).toBe(false);
+    scheduler.release(holder);
+    const resumed = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 } });
+    resumed.start();
+    try {
+      expect(resumed.attemptStatus({ requestId })).toMatchObject({ state: 'admission-failed', runId: requested.payload['run_id'], started: false, error: { code: 'scheduler_disposed' } });
+      await expect(resumed.submit(input, (frame) => { frames.push(frame); })).rejects.toBeInstanceOf(VerificationDisposedError);
+      expect(resumed.inFlightCount()).toBe(0); expect(frames).toHaveLength(1);
+    } finally { await resumed.dispose(); }
+  });
+
+  it('two attached queued identities retain original scheduler-disposed no-start settlement through persistent restart and independent replay', async () => {
+    const dir = tempDir(); let db = new LedgerDb(dir); let ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+    ledger.addJob({ id: 'queued-job', repo: 'fixture', title: 'attached queued identities' }); ledger.setJobStatus('queued-job', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'queued-job', payload: { work_revision: 0 } });
+    const repo = makeRepo(); let spawns = 0;
+    const opts = { storageDir: join(dir, 'verify'), limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 },
+      onSpawn: () => { spawns += 1; }, record: (event: VerificationRecord) => {
+        if (!ledger.hasJobEventWithPayloadValues(event.jobId, [event.kind], [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) ledger.appendCustomEvent(event);
+      } };
+    let scheduler = new VerificationScheduler(opts); scheduler.start();
+    try {
+      const held = await scheduler.acquire(spec('independent-holder'));
+      let queued!: () => void; const boundary = new Promise<void>((resolve) => { queued = resolve; });
+      const first = repoSpec(repo, 'queued-job', { requestId: 'attached-shutdown-first' });
+      const second = { ...first, requestId: 'attached-shutdown-second' };
+      const firstRun = scheduler.submit(first, (frame) => { if (frame.type === 'queued') queued(); });
+      const firstRefused = expect(firstRun).rejects.toBeInstanceOf(VerificationDisposedError); await boundary;
+      const secondRun = scheduler.submit(second); const secondRefused = expect(secondRun).rejects.toBeInstanceOf(VerificationDisposedError);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const original = ledger.latestJobEvent('queued-job', 'verification.requested')!;
+      expect(scheduler.attemptStatus({ requestId: first.requestId })).toMatchObject({ runId: (original.payload as { run_id: string }).run_id, state: 'accepted', started: false });
+      expect(scheduler.queuedCount()).toBe(1);
+      expect(scheduler.attemptStatus({ requestId: second.requestId })).toMatchObject({ runId: (original.payload as { run_id: string }).run_id, state: 'accepted', started: false });
+      await scheduler.dispose(); await Promise.all([firstRefused, secondRefused]); scheduler.release(held);
+      const receipt = ledger.latestJobEvent('queued-job', 'verification.no-start')!;
+      expect(receipt.payload).toMatchObject({ run_id: (original.payload as { run_id: string }).run_id, request_ids: [first.requestId, second.requestId], started: false });
+      db.close(); db = new LedgerDb(dir); ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+      scheduler = new VerificationScheduler(opts); scheduler.start();
+      for (const input of [first, second]) {
+        expect(scheduler.attemptStatus({ requestId: input.requestId })).toMatchObject({ state: 'admission-failed', runId: (original.payload as { run_id: string }).run_id, started: false, error: { code: 'scheduler_disposed' } });
+        await expect(scheduler.submit(input)).rejects.toBeInstanceOf(VerificationDisposedError);
+      }
+      expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(false); expect(laneIsBusy(ledger, ledger.getJob('queued-job')!)).toBe(false);
+      expect(ledger.listJobEventsByKinds('queued-job', ['verification.no-start'])).toEqual([receipt]);
+      expect(ledger.listJobEventsByKinds('queued-job', ['verification.started'])).toEqual([]); expect(spawns).toBe(0);
+    } finally { await scheduler.dispose(); db.close(); }
+  });
+
+  async function assertNoStartRecovery(fault: 'pre-commit' | 'post-commit' | 'state-storage' | 'identity-storage', spawnFailed = false) {
+    const dir = tempDir(); const db = new LedgerDb(dir); const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+    ledger.addJob({ id: 'queued-job', repo: 'fixture', title: 'queued' }); ledger.setJobStatus('queued-job', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'queued-job', payload: { work_revision: 0 } });
+    const repo = makeRepo(); const storageDir = join(dir, 'verify');
+    let fail = true; let spawns = 0; const errors: string[] = [];
+    const record = (event: VerificationRecord) => {
+      if (event.kind === 'verification.no-start' && fail && fault === 'pre-commit') throw new Error('no-start publication refused');
+      if (!ledger.hasJobEventWithPayloadValues(event.jobId, [event.kind], [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) ledger.appendCustomEvent(event);
+      if (event.kind === 'verification.no-start' && fail && fault === 'post-commit') throw new Error('no-start committed then observer failed');
+    };
+    const opts = { storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 }, record, onSpawn: () => { spawns += 1; }, log: (_level: unknown, message: string) => { errors.push(message); } };
+    const scheduler = new VerificationScheduler(opts); scheduler.start();
+    const held = spawnFailed ? null : await scheduler.acquire(spec('holder'));
+    let queued!: () => void; const boundary = new Promise<void>((resolve) => { queued = resolve; });
+    const input = repoSpec(repo, 'queued-job', { requestId: 'original-no-start', ...(spawnFailed ? { cwd: join(dir, 'positively-missing-cwd'), head: null } : {}) });
+    const pending = scheduler.submit(input, (frame) => { if (frame.type === 'queued') queued(); });
+    const rejected = spawnFailed ? expect(pending).rejects.toThrow(/ENOENT/) : expect(pending).rejects.toBeInstanceOf(VerificationDisposedError); await boundary;
+    const original = ledger.latestJobEvent('queued-job', 'verification.requested')!;
+    expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true); expect(laneIsBusy(ledger, ledger.getJob('queued-job')!)).toBe(true);
+    if (fault === 'state-storage') { rmSync(join(storageDir, 'scheduler.json')); mkdirSync(join(storageDir, 'scheduler.json')); }
+    if (fault === 'identity-storage') mkdirSync(join(storageDir, 'requests.ndjson'));
+    if (spawnFailed) await rejected;
+    await scheduler.dispose(); await rejected; if (held !== null) scheduler.release(held);
+    if (fault === 'pre-commit' || fault === 'identity-storage') expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true);
+    if (fault === 'state-storage') rmSync(join(storageDir, 'scheduler.json'), { recursive: true });
+    if (fault === 'identity-storage') rmSync(join(storageDir, 'requests.ndjson'), { recursive: true });
+    fail = false;
+    const resumed = new VerificationScheduler(opts); resumed.start();
+    try {
+      expect(resumed.attemptStatus({ requestId: 'original-no-start' })).toMatchObject({ state: 'admission-failed', runId: (original.payload as { run_id: string }).run_id, started: false, error: { code: spawnFailed ? 'spawn_failed' : 'scheduler_disposed' } });
+      expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(false); expect(laneIsBusy(ledger, ledger.getJob('queued-job')!)).toBe(false);
+      if (spawnFailed) await expect(resumed.submit(input)).rejects.toThrow(/ENOENT/);
+      else await expect(resumed.submit(input)).rejects.toBeInstanceOf(VerificationDisposedError);
+      expect(spawns).toBe(0); expect(ledger.listJobEventsByKinds('queued-job', ['verification.no-start'])).toHaveLength(1);
+      ledger.appendCustomEvent({ kind: 'verification.requested', jobId: 'queued-job', payload: { run_id: 'unrelated-open' } });
+      expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true); expect(laneIsBusy(ledger, ledger.getJob('queued-job')!)).toBe(true);
+      expect(errors.length).toBeGreaterThan(0);
+    } finally { await resumed.dispose(); db.close(); }
+  }
+  it('PR334 anonymous (request-id-less) no-start refusal survives a failed publication and restart', async () => {
+    const dir = tempDir(); const db = new LedgerDb(dir); const ledger = new LedgerApi(db.handle, { bus: new EventBus({}) });
+    ledger.addJob({ id: 'queued-job', repo: 'fixture', title: 'queued' }); ledger.setJobStatus('queued-job', 'working');
+    ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'queued-job', payload: { work_revision: 0 } });
+    const repo = makeRepo(); const storageDir = join(dir, 'verify'); let fail = true;
+    const record = (event: VerificationRecord) => {
+      if (event.kind === 'verification.no-start' && fail) throw new Error('no-start publication refused');
+      if (!ledger.hasJobEventWithPayloadValues(event.jobId, [event.kind], [{ key: 'run_id', value: String(event.payload['run_id']) }], 0)) ledger.appendCustomEvent(event);
+    };
+    const opts = { storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 }, record, log: () => {} };
+    const scheduler = new VerificationScheduler(opts); scheduler.start();
+    const held = await scheduler.acquire(spec('holder'));
+    let queued!: () => void; const boundary = new Promise<void>((resolve) => { queued = resolve; });
+    const pending = scheduler.submit(repoSpec(repo, 'queued-job'), (frame) => { if (frame.type === 'queued') queued(); });
+    const rejected = expect(pending).rejects.toBeInstanceOf(VerificationDisposedError); await boundary;
+    expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true);
+    await scheduler.dispose(); await rejected; scheduler.release(held);
+    expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(true);
+    fail = false;
+    const resumed = new VerificationScheduler(opts); resumed.start();
+    try {
+      expect(ledger.hasUnsettledVerificationRun('queued-job')).toBe(false);
+      expect(ledger.listJobEventsByKinds('queued-job', ['verification.no-start'])).toHaveLength(1);
+    } finally { await resumed.dispose(); db.close(); }
+  });
+
+  it('PR334 shutdown during terminal delivery of a childless head-change outcome keeps that outcome', async () => {
+    const { scheduler, records } = makeScheduler();
+    scheduler.start();
+    const repo = makeRepo();
+    let atCompleted!: () => void; const reached = new Promise<void>((resolve) => { atCompleted = resolve; });
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    const staleHead = 'a'.repeat(40);
+    const running = scheduler.submit(repoSpec(repo, 'job-head', { head: staleHead, requestId: 'pr334-head-change' }), async (frame) => {
+      if (frame.type === 'completed') { atCompleted(); await gate; }
+    });
+    await reached;
+    const disposing = scheduler.dispose();
+    release();
+    const outcome = await running; await disposing;
+    expect(outcome.error).toMatch(/head_changed/);
+    expect(records.filter((record) => record.kind === 'verification.no-start')).toEqual([]);
+    expect(scheduler.attemptStatus({ requestId: 'pr334-head-change' })).toMatchObject({ state: 'completed' });
+  });
+
+  it('PR334 startup retry of a refused no-start never persists an emptied live-holder map', async () => {
+    const storageDir = join(tempDir(), 'verify'); const repo = makeRepo();
+    const limits = { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 1000, runTimeoutMs: 1000 };
+    const records: VerificationRecord[] = [];
+    const first = new VerificationScheduler({ storageDir, limits, record: (event) => { records.push(event); if (event.kind === 'verification.no-start') throw new Error('refused'); }, log: () => {} });
+    first.start();
+    const held = await first.acquire(spec('holder'));
+    const queued = first.submit(repoSpec(repo, 'queued-job', { requestId: 'pr334-startup-holders' }), () => {});
+    const refused = expect(queued).rejects.toBeInstanceOf(VerificationDisposedError);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await first.dispose(); await refused; first.release(held);
+    // The disposed scheduler's holder is a live orphan on disk; a restarted
+    // scheduler whose publication keeps failing must not erase it.
+    const persistedPath = join(storageDir, 'scheduler.json');
+    const written = JSON.parse(readFileSync(persistedPath, 'utf-8')) as { slots: { run_id: string; pid: number }[] };
+    written.slots = [{ run_id: held.runId, job_id: 'holder', scope: 'full', command: 'x', cwd: process.cwd(), head: null, pid: process.pid, granted_at: Date.now(), request_ids: [] } as never];
+    writeFileSync(persistedPath, JSON.stringify(written));
+    const writes: string[] = [];
+    const resumed = new VerificationScheduler({ storageDir, limits, record: () => { writes.push(readFileSync(persistedPath, 'utf-8')); throw new Error('still refused'); }, log: () => {} });
+    try {
+      resumed.start();
+      expect(writes.length).toBeGreaterThan(0);
+      for (const snapshot of writes) expect((JSON.parse(snapshot) as { slots: unknown[] }).slots).toHaveLength(1);
+    } finally { await resumed.dispose(); }
+  });
+
+  it('retries original no-start pre-commit failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('pre-commit'));
+  it('retries original no-start post-commit failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('post-commit'));
+  it('retries original no-start state-storage failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('state-storage'));
+  it('retries original no-start identity-storage failure on persisted restart and releases only its ledger lane fence', () => assertNoStartRecovery('identity-storage'));
+
+  it('P41 childless spawn retries pre-commit failure with original spawn-failed identity', () => assertNoStartRecovery('pre-commit', true));
+  it('P41 childless spawn retries post-commit failure with original spawn-failed identity', () => assertNoStartRecovery('post-commit', true));
+  it('P41 childless spawn retries state-storage failure with original spawn-failed identity', () => assertNoStartRecovery('state-storage', true));
+  it('P41 childless spawn retries identity-storage failure with original spawn-failed identity', () => assertNoStartRecovery('identity-storage', true));
+
+  it('P41 genuine attached childless history-only restart restores exact original IDs and refuses command replay', async () => {
+    const storageDir = join(tempDir(), 'verify'); const restoredDir = join(tempDir(), 'history-only'); const cwd = join(tempDir(), 'missing-original-cwd');
+    const records: VerificationRecord[] = []; const frames: VerificationProgress[] = []; let spawns = 0; let release!: () => void; let observed!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; }); const queued = new Promise<void>((resolve) => { observed = resolve; });
+    const limits = { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 };
+    const first = new VerificationScheduler({ storageDir, limits, onSpawn: () => { spawns += 1; }, record: (record) => { records.push(record); if (record.kind === 'verification.no-start') throw new Error('original no-start publication unavailable'); } });
+    const input = { jobId: 'P41-history-only', requestId: 'history-first', scope: 'full', cwd, head: null, command: 'printf forbidden-replay > replayed' };
+    try {
+      const a = first.submit(input, async (frame) => { frames.push(frame); if (frame.type === 'queued') { observed(); await hold; } }); const refusedA = expect(a).rejects.toThrow(/ENOENT/); await queued;
+      const b = first.submit({ ...input, requestId: 'history-attached' }, (frame) => { frames.push(frame); }); const refusedB = expect(b).rejects.toThrow(/ENOENT/);
+      const accepted = [first.attemptStatus({ requestId: input.requestId }), first.attemptStatus({ requestId: 'history-attached' })];
+      expect(accepted[0]!.runId).toBe(accepted[1]!.runId);
+      for (const status of accepted) { expect(status).toMatchObject({ started: false }); expect(status!.error).toBeUndefined(); }
+      const originalObservations = structuredClone(records); release(); await Promise.all([refusedA, refusedB]); await first.dispose();
+      expect(records.slice(0, originalObservations.length)).toEqual(originalObservations); expect(spawns).toBe(0); expect(frames.some((frame) => frame.type === 'started')).toBe(false);
+      const original = records.find((record) => record.kind === 'verification.no-start')!;
+      expect(original.payload).toMatchObject({ run_id: accepted[0]!.runId, request_ids: ['history-first', 'history-attached'], reason: 'spawn_failed', started: false, command: input.command, cwd, head: null });
+      const originalBytes = readFileSync(join(storageDir, 'scheduler.json'), 'utf8');
+      // A compatibility snapshot carries only genuine original refusal history.
+      // Its original append-only index and accepted observations remain untouched.
+      mkdirSync(restoredDir, { recursive: true }); writeFileSync(join(restoredDir, 'scheduler.json'), originalBytes); mkdirSync(cwd, { recursive: true });
+      const published: VerificationRecord[] = [];
+      const restored = new VerificationScheduler({ storageDir: restoredDir, limits, onSpawn: () => { spawns += 1; }, record: (record) => { published.push(record); } }); restored.start();
+      try {
+        expect(published.filter((record) => record.kind === 'verification.no-start')).toEqual([original]);
+        for (const requestId of ['history-first', 'history-attached']) { expect(restored.attemptStatus({ requestId })).toMatchObject({ state: 'admission-failed', runId: original.payload['run_id'], started: false, error: { code: 'spawn_failed' } }); await expect(restored.submit({ ...input, requestId })).rejects.toThrow(/ENOENT/); }
+        expect(spawns).toBe(0); expect(existsSync(join(cwd, 'replayed'))).toBe(false); expect(published).toEqual([original]);
+        expect(readFileSync(join(storageDir, 'scheduler.json'), 'utf8')).toBe(originalBytes);
+      } finally { await restored.dispose(); }
+    } finally { release(); await first.dispose(); }
+  });
+
+  it('P41 attached childless identities and reentrant publication shutdown retain no-start without spawned hooks', async () => {
+    const storageDir = join(tempDir(), 'verify'); const cwd = join(tempDir(), 'missing');
+    let release!: () => void; let queued!: () => void; const hold = new Promise<void>((resolve) => { release = resolve; }); const observed = new Promise<void>((resolve) => { queued = resolve; });
+    const records: VerificationRecord[] = []; let shutdown: Promise<void> | undefined; let spawns = 0;
+    const scheduler = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 },
+      onSpawn: () => { spawns += 1; }, record: (record) => { records.push(record); if (record.kind === 'verification.no-start') shutdown = scheduler.dispose(); } });
+    const input = { jobId: 'P41-attached', scope: 'full', cwd, head: null, command: 'printf never-started', requestId: 'P41-first' };
+    try {
+      const first = scheduler.submit(input, async (frame) => { if (frame.type === 'queued') { queued(); await hold; } }); const refusedFirst = expect(first).rejects.toThrow(/ENOENT/); await observed;
+      const second = scheduler.submit({ ...input, requestId: 'P41-second' }); const refusedSecond = expect(second).rejects.toThrow(/ENOENT/);
+      release(); await Promise.all([refusedFirst, refusedSecond]); await shutdown;
+      expect(spawns).toBe(0); expect(records.filter((record) => record.kind === 'verification.started')).toHaveLength(0);
+      const receipts = records.filter((record) => record.kind === 'verification.no-start'); expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.payload).toMatchObject({ request_ids: ['P41-first', 'P41-second'], started: false, reason: 'spawn_failed' });
+      const reopened = new VerificationScheduler({ storageDir, limits: { maxConcurrent: 1, workerBudget: 1, lockWaitTimeoutMs: 5000, runTimeoutMs: 5000 } });
+      reopened.start();
+      try { for (const requestId of ['P41-first', 'P41-second']) { expect(reopened.attemptStatus({ requestId })).toMatchObject({ started: false, error: { code: 'spawn_failed' } }); await expect(reopened.submit({ ...input, requestId })).rejects.toThrow(/ENOENT/); } }
+      finally { await reopened.dispose(); }
+    } finally { release(); await scheduler.dispose(); await shutdown; }
+  });
+
   it('rejects a queued request parked on its queued frame when dispose runs', async () => {
     const { scheduler } = makeScheduler({ maxConcurrent: 1 });
     scheduler.start();
@@ -470,6 +727,21 @@ describe('verification scheduler — global budget', () => {
     expect(outcome.durationMs).toBeLessThan(5_000);
     const state = JSON.parse(readFileSync(join(storageDir, 'scheduler.json'), 'utf-8')) as { slots: unknown[] };
     expect(state.slots).toEqual([]);
+  });
+
+  it('PR334 timeout escalation still SIGKILLs a TERM-resistant descendant after its shell exited', async () => {
+    const { scheduler } = makeScheduler({ runTimeoutMs: 250, lockWaitTimeoutMs: 500 });
+    scheduler.start();
+    const pidFile = join(tempDir(), 'descendant.pid');
+    const command = `trap 'exit 0' TERM; (trap '' TERM; exec /bin/sh -c 'echo $$ > ${pidFile}; exec sleep 600') >/dev/null 2>&1 & wait`;
+    const outcome = await scheduler.run(spec('job-descendant', command));
+    expect(outcome.timedOut).toBe(true);
+    const descendant = Number(readFileSync(pidFile, 'utf-8').trim());
+    try {
+      await waitFor(() => !pidAlive(descendant), 3_000);
+    } finally {
+      try { process.kill(descendant, 'SIGKILL'); } catch { /* already gone */ }
+    }
   });
 
   it('dispose terminates active runs and refuses new work', async () => {
@@ -996,6 +1268,34 @@ describe('verification scheduler — global budget', () => {
     ).rejects.toThrow(/request_id/);
     expect(scheduler.inFlightCount()).toBe(0);
     expect(scheduler.activeCount()).toBe(0);
+  });
+
+  it('P41 positive real childless spawn retains exact no-start identity without start hooks frames or restart replay', async () => {
+    const storageDir = join(tempDir(), 'verify'); const cwd = join(tempDir(), 'does-not-exist');
+    const records: VerificationRecord[] = []; const frames: VerificationProgress[] = []; let spawns = 0;
+    const make = () => new VerificationScheduler({ storageDir,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 5000, runTimeoutMs: 20000 },
+      record: (record) => { if (!records.some((old) => old.kind === record.kind && old.payload['run_id'] === record.payload['run_id'])) records.push(record); },
+      onSpawn: () => { spawns += 1; }, sweepIntervalMs: 20, disposeGraceMs: 500 });
+    const spec = { jobId: 'P41-original-job', requestId: 'P41-original-request', scope: 'full', command: 'printf never-replayed', cwd, head: null };
+    const first = make(); first.start();
+    try {
+      await expect(first.submit(spec, (frame) => { frames.push(frame); })).rejects.toThrow(/ENOENT/);
+      expect(spawns).toBe(0); expect(frames.some((frame) => frame.type === 'started')).toBe(false);
+      expect(records.some((record) => record.kind === 'verification.started')).toBe(false);
+      const noStart = records.find((record) => record.kind === 'verification.no-start')!;
+      expect(noStart).toBeDefined(); expect(noStart.payload).toMatchObject({ request_ids: ['P41-original-request'], cwd, command: spec.command, head: null, started: false, reason: 'spawn_failed' });
+      const status = first.attemptStatus({ requestId: spec.requestId });
+      expect(status).toMatchObject({ state: 'admission-failed', started: false, runId: noStart.payload['run_id'], cwd, head: null, error: { code: 'spawn_failed' } });
+      await expect(first.submit(spec)).rejects.toThrow(/ENOENT/);
+      await first.dispose();
+      const second = make(); second.start();
+      try {
+        expect(second.attemptStatus({ requestId: spec.requestId })).toMatchObject({ started: false, runId: status.runId, error: { code: 'spawn_failed' } });
+        await expect(second.submit(spec)).rejects.toThrow(/ENOENT/);
+        expect(records.filter((record) => record.kind === 'verification.no-start')).toHaveLength(1); expect(spawns).toBe(0);
+      } finally { await second.dispose(); }
+    } finally { await first.dispose(); }
   });
 
   it('starts idempotently and keeps the holder file inside the instance storage dir', async () => {

@@ -33,6 +33,8 @@ export interface StubTurn {
   readonly stopReason?: 'stop' | 'error' | 'toolUse' | 'length';
   /** Emit a tool call (the session executes the tool, then calls again). */
   readonly toolCall?: { readonly id: string; readonly name: string; readonly args: Record<string, unknown> };
+  /** Multiple calls in ONE assistant invocation (native batch ordering tests). */
+  readonly toolCalls?: readonly NonNullable<StubTurn['toolCall']>[];
   /** Reported assistant usage tokens — drives native compaction thresholds. */
   readonly usageTokens?: number;
 }
@@ -92,11 +94,11 @@ function makeMessage(
   text: string,
   stopReason: 'stop' | 'error' | 'toolUse' | 'length',
   errorMessage?: string,
-  toolCall?: { id: string; name: string; args: Record<string, unknown> },
+  toolCalls?: readonly { readonly id: string; readonly name: string; readonly args: Record<string, unknown> }[],
   usageTokens?: number,
 ): AssistantMessage {
   const content: unknown[] = [];
-  if (toolCall !== undefined) {
+  for (const toolCall of toolCalls ?? []) {
     content.push({
       type: 'toolCall',
       id: toolCall.id,
@@ -217,12 +219,14 @@ export async function makeStubModelRuntime(
     const stream = new AssistantMessageEventStream();
     const text = turn.deltas.join('');
     void (async () => {
-      const isTool = turn.toolCall !== undefined;
+      if (turn.toolCall !== undefined && turn.toolCalls !== undefined) throw new Error('stub turn must not supply both toolCall and toolCalls');
+      const toolCalls = turn.toolCalls ?? (turn.toolCall === undefined ? [] : [turn.toolCall]);
+      const isTool = toolCalls.length > 0;
       const final = makeMessage(
         text,
         turn.stopReason ?? (turn.error !== undefined ? 'error' : isTool ? 'toolUse' : 'stop'),
         turn.error,
-        turn.toolCall,
+        toolCalls,
         turn.usageTokens,
       );
       stream.push({ type: 'start', partial: final });
@@ -233,16 +237,16 @@ export async function makeStubModelRuntime(
         stream.push({ type: 'thinking_end', contentIndex: index, content: delta, partial: final });
         index += 1;
       }
-      if (isTool && turn.toolCall !== undefined) {
+      for (const toolCall of toolCalls) {
         stream.push({ type: 'toolcall_start', contentIndex: index, partial: final });
         stream.push({
           type: 'toolcall_end',
           contentIndex: index,
           toolCall: {
             type: 'toolCall',
-            id: turn.toolCall.id,
-            name: turn.toolCall.name,
-            arguments: turn.toolCall.args,
+            id: toolCall.id,
+            name: toolCall.name,
+            arguments: toolCall.args,
           },
           partial: final,
         });

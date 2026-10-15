@@ -265,6 +265,25 @@ describe('pipeline ledger — evaluation, order and projection', () => {
     db.close();
   });
 
+  it('R13 pipeline board keeps historical-only delivery fenced until a current candidate actually lands', () => {
+    const { db, ledger } = boot();
+    try {
+      enqueue(ledger, 'r13-parent'); enqueue(ledger, 'r13-child', { prerequisites: [{ id: 'r13-parent', milestone: 'delivered' }] });
+      ledger.claimPipelineEntry({ id: 'r13-parent', holder: 'silas' });
+      ledger.addJob({ id: 'r13-parent', repo: 'demo', title: 'Entry r13-parent', briefing: 'Briefing for r13-parent' });
+      ledger.markPipelineAdmitted({ id: 'r13-parent', jobId: 'r13-parent' });
+      ledger.setJobStatus('r13-parent', 'working'); ledger.setJobStatus('r13-parent', 'delivered');
+      const historical = ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'r13-parent', payload: {
+        sha: 'original-completed-head', candidate_delivery_proven: false, historical_bookkeeping_only: true,
+      } });
+      expect(ledger.latestCandidateDelivery('r13-parent')).toBeNull();
+      expect(ledger.pipelineBoardView(FULL_CAPACITY).entries.find((row) => row.id === 'r13-child')).toMatchObject({ state: 'waiting', reason: 'waiting for r13-parent to be delivered (now delivered)' });
+      ledger.appendCustomEvent({ kind: 'job.delivered', jobId: 'r13-parent', payload: { sha: 'later-current-delivered-head' } });
+      expect(ledger.pipelineBoardView(FULL_CAPACITY).entries.find((row) => row.id === 'r13-child')).toMatchObject({ state: 'ready', reason: null });
+      expect(ledger.getEvent(historical.seq)).toEqual(historical);
+    } finally { db.close(); }
+  });
+
   it('resolves milestones admitted/delivered/merged/done and never invents one', () => {
     const { db, ledger } = boot();
     enqueue(ledger, 'pipe-a');

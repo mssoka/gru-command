@@ -319,6 +319,9 @@ export class ChildWorkerService {
       typeof input === 'object' && input !== null && !Array.isArray(input)
         ? (input as Record<string, unknown>)
         : {};
+    const authorityManifest = (capability: string): string => JSON.stringify({ version: 1, capability, parentAgentId: agentId,
+      maxChildrenPerParent: MAX_CHILDREN_PER_PARENT, maxPurposeChars: CHILD_PURPOSE_MAX_CHARS,
+      maxTaskChars: CHILD_TASK_MAX_CHARS, maxIdempotencyKeyChars: CHILD_IDEMPOTENCY_KEY_MAX_CHARS });
     const failureText = (error: unknown): string => {
       const refusal = childRefusalStatus(error);
       return JSON.stringify({
@@ -334,6 +337,7 @@ export class ChildWorkerService {
           'The child gets its own lane, session and durable result; read-only authority cannot write, ' +
           'writer authority gets its own branch. Children cannot spawn children. Use the returned child_id ' +
           'with list_child_workers to discover the result.',
+        authorityManifest: authorityManifest('request-child-worker'),
         inputSchema: {
           type: 'object',
           additionalProperties: false,
@@ -381,6 +385,7 @@ export class ChildWorkerService {
         description:
           'List this session\'s GC-tracked child workers with their lifecycle state and durable result ' +
           '(result_state, result_summary, result_ref). This is how a parent discovers completion or failure.',
+        authorityManifest: authorityManifest('list-child-workers'),
         inputSchema: { type: 'object', additionalProperties: false, properties: {} },
         execute: async () => {
           const children = this.opts.ledger.listChildWorkers({ parentAgentId: agentId }).map((child) => ({
@@ -400,6 +405,7 @@ export class ChildWorkerService {
         description:
           'Cancel one of this session\'s child workers (by child_id). Terminal children are immutable. ' +
           'Cancellation is proof-aware: a session that cannot prove cessation stays non-terminal.',
+        authorityManifest: authorityManifest('cancel-child-worker'),
         inputSchema: {
           type: 'object',
           additionalProperties: false,

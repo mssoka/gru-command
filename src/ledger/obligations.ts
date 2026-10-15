@@ -51,6 +51,7 @@ export const KNOWN_BLOCKER_CATEGORIES = [
   'verification-failure',
   'review-verdict',
   'lane-unavailable',
+  'restart-recovery',
   'phase-completion',
 ] as const;
 export type KnownBlockerCategory = (typeof KNOWN_BLOCKER_CATEGORIES)[number];
@@ -160,6 +161,7 @@ export const FIRING_RULE_IDS = [
   'verification-failure-gru-decision',
   'review-verdict-gru-decision',
   'lane-unavailable-gru-decision',
+  'restart-recovery-gru-decision',
   'phase-completion-gru-decision',
   'unknown-triage-gru',
 ] as const;
@@ -207,6 +209,12 @@ export const FIRING_RULES: readonly FiringRule[] = [
     id: 'lane-unavailable-gru-decision',
     category: { kind: 'known', category: 'lane-unavailable' },
     nextAction: { kind: 'gru-decision', decision: 'lane unavailability requires a recovery ruling' },
+    wakeCondition: { kind: 'sweep' },
+  },
+  {
+    id: 'restart-recovery-gru-decision',
+    category: { kind: 'known', category: 'restart-recovery' },
+    nextAction: { kind: 'gru-decision', decision: 'inspect exact request/native progress; guarded fresh successor or concrete reserved owner decision' },
     wakeCondition: { kind: 'sweep' },
   },
   {

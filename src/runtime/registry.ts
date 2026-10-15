@@ -660,6 +660,7 @@ export class RuntimeRegistry {
     });
     const handle = await adapter.spawn(role, {
       ...(options.resumeFile !== undefined ? { resumeFile: options.resumeFile } : {}),
+      ...(options.directiveRecoveryProducer !== undefined ? { directiveRecoveryProducer: options.directiveRecoveryProducer } : {}),
       ...(cwd !== undefined ? { cwd } : {}),
       ...((workflowSession?.agentId ?? options.agentId) !== undefined ? { agentId: workflowSession?.agentId ?? options.agentId } : {}),
       ...(options.roleTools !== undefined ? { roleTools: options.roleTools } : {}),
@@ -739,7 +740,7 @@ export class RuntimeRegistry {
           );
           return disposing;
         };
-        if (['prompt', 'steer', 'followUp', 'promptWithVerdict', 'compact'].includes(String(property))) {
+        if (['prompt', 'steer', 'followUp', 'promptWithVerdict', 'compact', 'resumeDirective'].includes(String(property))) {
           if (wrappers.has(String(property))) return wrappers.get(String(property));
           const tracked = String(property);
           const method = Reflect.get(target, property) as ((...args: unknown[]) => Promise<unknown>) | undefined;
@@ -747,7 +748,7 @@ export class RuntimeRegistry {
             // Per-turn evidence is an OPTIONAL capability (r6 architecture):
             // absence means "no attestation", not an adapter defect — callers
             // check for it. Required methods still fail loud.
-            if (tracked === 'promptWithVerdict') return undefined;
+            if (tracked === 'promptWithVerdict' || tracked === 'resumeDirective') return undefined;
             throw new Error(
               `resident handle was asked for "${String(property)}" but its runtime adapter does not implement it`,
             );

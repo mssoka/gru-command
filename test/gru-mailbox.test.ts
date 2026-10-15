@@ -1,11 +1,13 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LedgerDb } from '../src/ledger/db.js';
 import { LedgerApi } from '../src/ledger/api.js';
 import { GruMailbox } from '../src/gru-mailbox/service.js';
 import { branchStatePayload } from '../src/dispatch/github-poll.js';
+import { DirectiveNativeFixture } from './helpers/directive-native-fixture.js';
+import { inspectDirectiveAdmission } from '../src/runtime/directive-checkpoint.js';
 
 const ids = [
   'perkins-integration-review-coverage-20261009', 'dashboard-slim-strip-current-main-20261007',
@@ -24,7 +26,7 @@ function fixture() {
   const ledger = new LedgerApi(db.handle);
   let now = Date.parse('2026-10-11T00:20:01Z');
   const mailbox = new GruMailbox(ledger, () => now);
-  return { db, ledger, mailbox, advance: (ms: number) => { now += ms; } };
+  return { dir, db, ledger, mailbox, advance: (ms: number) => { now += ms; } };
 }
 
 describe('GH-305 canonical durable mailbox', () => {
@@ -258,17 +260,35 @@ describe('GH-305 canonical durable mailbox', () => {
   });
 
   it('G03 refreshes cached controls after an eventless directive admission', () => {
-    const { ledger, mailbox } = fixture();
+    const { dir, ledger, mailbox } = fixture();
     ledger.addJob({ id: 'j', repo: 'r', title: 'j' });
     ledger.setJobStatus('j', 'blocked');
-    ledger.registerAgent({ id: 'worker', role: 'minion', jobId: 'j' });
+    const sessionFile = join(dir, 'original-worker.jsonl');
+    ledger.registerAgent({ id: 'worker', role: 'minion', jobId: 'j', sessionFile });
     ledger.beginDirectiveIntent({ jobId: 'j', directive: 'existing work', holder: 'silas', requestId: 'control' });
-    const sent = ledger.appendCustomEvent({ kind: 'silas.directive-sent', jobId: 'j', payload: { request_id: 'control' } });
-    const before = mailbox.snapshot().items[0]!;
-    const watermark = ledger.latestEventSeq();
-    ledger.recordDirectiveAdmission({ requestId: 'control', minionId: 'worker', eventSeq: sent.seq });
-    expect(ledger.latestEventSeq()).toBe(watermark);
-    expect(mailbox.snapshot().items[0]?.basis).not.toBe(before.basis);
+    ledger.prepareDirectiveTarget('control', { agentId: 'worker', sessionFile });
+    const native = new DirectiveNativeFixture(sessionFile, 'worker');
+    const recordAdmission = ledger.recordDirectiveAdmission.bind(ledger);
+    let beforeBasis: string | undefined;
+    let watermark = -1;
+    // The supported binder records the native sent event before its eventless
+    // admission transition. Observe that exact seam, never fabricate a binding.
+    const admission = vi.spyOn(ledger, 'recordDirectiveAdmission').mockImplementation((input) => {
+      beforeBasis = mailbox.snapshot().items[0]!.basis;
+      watermark = ledger.latestEventSeq();
+      return recordAdmission(input);
+    });
+    try {
+      native.begin('existing approved work', { directive: {
+        identity: ledger.directiveTurnIdentity('control'), beforeAdmission: () => {},
+        onAdmitted: (binding) => { ledger.bindDirectiveNativeAdmission(binding); },
+      } });
+      expect(admission).toHaveBeenCalledTimes(1);
+      expect(inspectDirectiveAdmission(sessionFile, ledger.directiveTurnIdentity('control'))).toEqual(ledger.getDirective('control')!.nativeBinding);
+      expect(ledger.getDirective('control')?.state).toBe('admitted');
+      expect(ledger.latestEventSeq()).toBe(watermark);
+      expect(mailbox.snapshot().items[0]?.basis).not.toBe(beforeBasis);
+    } finally { admission.mockRestore(); }
   });
 
   it('G04 reopens waiting when supporting decisions are cleared', () => assertRevokedDisposition('waiting'));

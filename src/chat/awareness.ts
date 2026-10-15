@@ -88,6 +88,7 @@ export const AWARENESS_BLOCK_HEADER = '[gru awareness · service context — not
 /** Prompt suffix for a policy-started turn (the block itself is prepended). */
 export const AWARENESS_WAKE_INSTRUCTION =
   'This turn was started by the service wake policy — no user message is waiting. ' +
+  'Directive/rebrief recovery debt requires its concrete generation/hash/head/epoch-fenced recovery endpoint; generic Ops holds and alert disposition do not answer it. Never replay a consumed prompt or Ack an owner-only stop. ' +
   'FOR GRU mailbox items are shared server state. Read GET /api/mailbox for full reason bases, restrictions, receipts and control references. ' +
   'Record next actions with POST /api/mailbox/{id}/disposition using its exact basis, state, owner, detail, references and dependency/recheckAt for waiting or delegated work. ' +
   'Mailbox delivery keys are not notification IDs; the notification instructions below apply only to actual notification IDs. ' +
