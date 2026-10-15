@@ -28,6 +28,18 @@ describe('reviewed-candidate behavioral RED custody', () => {
     expect(classifyReviewedRed(r, 2, 'fast')).toHaveLength(1);
     expect(() => classifyReviewedRed(report('Error: Command failed: missing fixture'), 2, 'fast')).toThrow(/non-behavioral/);
   });
+  it('accepts a wrapped subprocess rejection only for the status action, and never a setup failure (#358)', () => {
+    const status = 'review-2 advertised shell-safe status action authenticates literal dollar/backtick host config paths';
+    const wrapped = 'Error: promise rejected "Error: Command failed: node "/private/var… { …(6) }" instead of resolving';
+    // Any other listed title: a wrapped subprocess rejection is not its behavioral RED.
+    expect(() => classifyReviewedRed(report(wrapped), 2, 'fast')).toThrow(/non-behavioral/);
+    const named = (message: string) => { const r = report(message); r.testResults[0]!.assertionResults[0]!.title = status; return r; };
+    expect(classifyReviewedRed(named(wrapped), 2, 'fast')).toEqual([status]);
+    // The status test's own setup guard and non-subprocess rejections are refused.
+    expect(() => classifyReviewedRed(named('Error: fixture setup: compiled capture helper is missing at /x/dist/verify/capture-cli.js'), 2, 'fast')).toThrow(/non-behavioral/);
+    expect(() => classifyReviewedRed(named('Error: promise rejected "TypeError: cannot read properties of undefined" instead of resolving'), 2, 'fast')).toThrow(/non-behavioral/);
+  });
+
   it('rejects missing reports and missing collected suites', () => {
     for (const value of [null, {}, { testResults: [] }]) expect(() => classifyReviewedRed(value, 2, 'fast')).toThrow(/missing collected/);
   });

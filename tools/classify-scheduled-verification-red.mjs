@@ -39,6 +39,20 @@ const review1Names = [
   'owned fallback resource resolution retains config authority on declared-scope lanes',
 ];
 
+/** The one listed test whose behavioral RED is a wrapped subprocess
+ * rejection: it awaits the advertised status action with `.resolves`, so the
+ * candidate's failing action surfaces as `promise rejected "Error: Command
+ * failed…"`. The test throws a named `fixture setup:` error (never an
+ * assertion) when its compiled helper is missing, so that wrapper here can
+ * only be the advertised action failing (#358). No other title may pass a
+ * wrapped rejection off as behavioral RED. */
+const wrappedRejectionNames = new Set(['advertised shell-safe status action authenticates literal dollar/backtick host config paths']);
+
+function isBehavioralFailure(name, text) {
+  if (/^AssertionError:/su.test(text)) return true;
+  return wrappedRejectionNames.has(name) && /^Error: promise rejected "Error: Command failed\b.* instead of resolving/su.test(text);
+}
+
 /** RED is a named behavioral assertion, never an arbitrary nonzero runner exit.
  * Both legs are checked; exact reports remain immutable custody artifacts. */
 export function classifyReviewedRed(report, generation, phase) {
@@ -54,8 +68,9 @@ export function classifyReviewedRed(report, generation, phase) {
     'actual prompt registration retains pre-disposal errored original until delayed close',
     'actual compaction registration retains pre-disposal errored original until delayed close'];
   for (const entry of failed) {
-    if (!names.includes(entry.title?.replace(`review-${generation} `, '')) || !entry.title?.startsWith(`review-${generation} `)) throw new Error(`unlisted failure: ${entry.title}`);
-    if (!Array.isArray(entry.failureMessages) || !entry.failureMessages.some((text) => /^AssertionError:|^Error: promise rejected .* instead of resolving/su.test(text))) throw new Error(`non-behavioral failure: ${entry.title}`);
+    const name = entry.title?.replace(`review-${generation} `, '');
+    if (!names.includes(name) || !entry.title?.startsWith(`review-${generation} `)) throw new Error(`unlisted failure: ${entry.title}`);
+    if (!Array.isArray(entry.failureMessages) || !entry.failureMessages.some((text) => isBehavioralFailure(name, text))) throw new Error(`non-behavioral failure: ${entry.title}`);
   }
   return failed.map((entry) => entry.title);
 }
