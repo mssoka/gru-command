@@ -24,7 +24,7 @@ export async function ownerService(candidateRoot: string, onRepair: (text: strin
   writeFileSync(join(dir, 'config.toml'), '[auth]\ntoken="property-owner-test-token"\n[server]\nhost="127.0.0.1"\nport=0\n');
   const config = loadConfig({ GRU_COMMAND_HOME: dir }, dir);
   const db = new LedgerDb(dir); const bus = new EventBus(); const ledger = new LedgerApi(db.handle, { bus });
-  const jobId = 'property-job'; ledger.addJob({ id: jobId, repo: candidateRoot, title: 'Owner-approved property repair' }); ledger.setJobStatus(jobId, 'delivered');
+  const jobId = 'property-job'; ledger.addJob({ id: jobId, repo: candidateRoot, title: 'Owner-approved property repair' }); ledger.setJobStatus(jobId, 'working'); ledger.setJobStatus(jobId, 'delivered');
   ledger.registerAgent({ id: 'property-minion', role: 'minion', jobId }); ledger.setAgentState('property-minion', 'idle');
   const lane: WorktreeLane = { id: jobId, kind: 'job', jobId, roundId: null, repoPath: candidateRoot, repoName: 'property-fixture', path: candidateRoot, branch: propertyGit(candidateRoot, ['symbolic-ref', '--short', 'HEAD']).trim(), sha: propertyGit(candidateRoot, ['rev-parse', 'HEAD']).trim(), status: 'active' };
   const worktrees = Object.assign(new InMemoryWorktreePort(dir), { getWorktree: (id: string) => id === jobId ? lane : null, listWorktrees: () => [lane] });

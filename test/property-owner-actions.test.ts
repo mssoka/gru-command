@@ -100,12 +100,13 @@ describe('ordinary owner HTTP property actions (controlled minion; no JSON issua
     expect(h.ledger.listJobAdmissions(h.jobId)).toEqual([]);
   });
 
-  it('leaves interrupted native repair admitted for ordinary reconciliation, without delivery or automatic retry', async () => {
+  it('leaves interrupted native repair live for ordinary reconciliation, without delivery or automatic retry', async () => {
     const { h, id, expectedHead } = await setup('enforced', 'proposed', () => { throw new Error('controlled native minion error'); });
     await h.request(`${h.path}/${id}/execute`, { decision: 'approve', expectedHead }); if (process.platform !== 'darwin') return;
     const failed = await h.request(`${h.path}/${id}/repair`, { decision: 'approve', expectedHead, maxAttempts: 1 });
     expect(failed.status).toBe(400); expect(h.prompts).toHaveLength(1);
-    expect(h.ledger.listPendingDirectives({ jobId: h.jobId, states: ['admitted'] })).toHaveLength(1);
+    const live = h.ledger.listPendingDirectives({ jobId: h.jobId, states: ['dispatching', 'admitted'] });
+    expect(live).toHaveLength(1); expect(live[0]!.failReason).toMatch(/^reconcile: property repair interrupted/);
     expect(h.ledger.latestJobEvent(h.jobId, 'job.delivered')).toBeNull();
     expect((await h.request(`${h.path}/${id}/repair`, { decision: 'approve', expectedHead, maxAttempts: 1 })).status).toBe(400); expect(h.prompts).toHaveLength(1);
   });

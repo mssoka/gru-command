@@ -70,6 +70,11 @@ function outcomeFromFixture(name: string, exitCode: number): PropertyRunOutcome 
   return interpretVitestJsonReceipt(rawFromFixture(name, exitCode), plan());
 }
 
+/** Fixture reports carry no parseable input; attribution needs a replayable example. */
+function replayable<T extends { replay: object }>(example: T): T {
+  return { ...example, replay: { ...example.replay, replaySupported: true } };
+}
+
 /** A hand-built outcome for shapes the honest adapter never emits (the
  * point: qualification must not trust self-declared kinds). */
 function bareOutcome(overrides: Partial<PropertyRunOutcome> & Pick<PropertyRunOutcome, 'kind'>): PropertyRunOutcome {
@@ -380,7 +385,7 @@ describe('GH350 production qualification accepts only host-issued evidence', () 
   it('never attributes a random baseline PASS without the retained candidate replay controls', () => {
     const fake = fakeEvidenceSource(); const outcome = outcomeFromFixture('known-bad-fails.report.json', 1);
     const candidate = fake.issue(outcome, 'candidate-random-baseline'); const baseline = fake.issue(outcomeFromFixture('healthy-passes.report.json', 0), 'random-baseline');
-    const example = retainedCounterexample({ outcome, environmentProfile: 'unit' })!;
+    const example = replayable(retainedCounterexample({ outcome, environmentProfile: 'unit' })!);
     Object.assign(fake.source.resolve(candidate)!, { counterexample: example });
     expect(attributeCounterexampleWithHostEvidence(candidate, baseline, fake.source)).toBe('unattributed');
     Object.assign(fake.source.resolve(baseline)!, { replay: example.replay });
@@ -389,7 +394,7 @@ describe('GH350 production qualification accepts only host-issued evidence', () 
 
   it('attributes the original assertion rather than treating any unrelated baseline failure as the candidate example', () => {
     const fake = fakeEvidenceSource(); const outcome = outcomeFromFixture('known-bad-fails.report.json', 1);
-    const candidate = fake.issue(outcome, 'candidate-unrelated'); const example = retainedCounterexample({ outcome, environmentProfile: 'unit' })!;
+    const candidate = fake.issue(outcome, 'candidate-unrelated'); const example = replayable(retainedCounterexample({ outcome, environmentProfile: 'unit' })!);
     Object.assign(fake.source.resolve(candidate)!, { counterexample: example });
     const other = { ...outcome.failures[0]!, testIdentity: 'unrelated baseline assertion' };
     const baseline = fake.issue(bareOutcome({ kind: 'property-failure', failed: 1, passed: 1, failures: [other], selectedAssertions: [{ testIdentity: example.testIdentity!, status: 'passed' }, { testIdentity: other.testIdentity, status: 'failed' }], receipt: { ...outcome.receipt, exitCode: 1 } }), 'baseline-unrelated');
@@ -404,7 +409,7 @@ describe('GH350 production qualification accepts only host-issued evidence', () 
     const candidateRef = fake.issue(outcomeFromFixture('known-bad-fails.report.json', 1), 'rcpt-candidate');
     const baselineRef = fake.issue(outcomeFromFixture('healthy-fails-contradictory.report.json', 1), 'rcpt-baseline');
     const candidate = fake.source.resolve(candidateRef) as PropertyExecutionReceipt;
-    const example = retainedCounterexample({ outcome: candidate.outcome, environmentProfile: 'unit' })!;
+    const example = replayable(retainedCounterexample({ outcome: candidate.outcome, environmentProfile: 'unit' })!);
     Object.assign(candidate, { counterexample: example });
     Object.assign(fake.source.resolve(baselineRef)!, { replay: example.replay });
     expect(attributeCounterexampleWithHostEvidence(candidateRef, baselineRef, fake.source)).toBe('baseline-also-fails');
