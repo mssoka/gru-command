@@ -476,7 +476,7 @@ async function commandRun(
     stderr(`capture: ${ownerPath} is malformed (${ownerRead.detail}) — withdraw it explicitly first\n`);
     return CAPTURE_EXIT.usage;
   }
-  const staleOwner = ownerRead.kind === 'owner';
+  let staleOwner = false;
   if (ownerRead.kind === 'owner') {
     const live = probe(ownerRead.record.pid);
     if (live.alive) {
@@ -487,6 +487,7 @@ async function commandRun(
       );
       return CAPTURE_EXIT.usage;
     }
+    staleOwner = true; // the recorded owner is gone
   }
   // After every usage refusal above, before this command's first side effect.
   const fetchImpl = transportFor(deps);

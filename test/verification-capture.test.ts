@@ -685,96 +685,118 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
     }
   });
 
-  it('refuses a headers bound that cannot time correctly by name — a rejection, and before any run starts (#389)', async () => {
+  const BAD_BOUND = /responseHeadersTimeoutMs must be a number of milliseconds from 1 to 2147483647/u;
+  const OPS = ['--url', 'http://127.0.0.1:9', '--token', 't'] as const;
+  const deadProbe = { alive: false, startTime: null, cwd: null, command: null };
+
+  it('refuses a headers bound that cannot time correctly by name, as a rejection (#389)', async () => {
     // The timer's real range is accepted at both edges.
     expect(checkResponseHeadersTimeoutMs(1)).toBe(1);
     expect(checkResponseHeadersTimeoutMs(2_147_483_647)).toBe(2_147_483_647);
     for (const bound of [0, 0.5, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 31]) {
       // A Promise-returning transport rejects; it never throws synchronously.
       const pending = nodeStreamFetch('http://127.0.0.1:9/x', undefined, { responseHeadersTimeoutMs: bound });
-      await expect(pending, String(bound)).rejects.toThrow(/responseHeadersTimeoutMs must be a number of milliseconds from 1 to 2147483647/u);
+      await expect(pending, String(bound)).rejects.toThrow(BAD_BOUND);
     }
-    // Every command that talks to the service refuses it after its own usage
-    // checks, whatever transport is injected: no request, no sink, no
-    // receipt, no output — a named error a caller can act on.
+  });
+
+  it('run and status refuse a bad bound before any request, sink, receipt or output, whatever the transport (#389)', async () => {
     const dir = tempDir();
     const fetchImpl = vi.fn();
-    const named = /responseHeadersTimeoutMs must be a number of milliseconds from 1 to 2147483647/u;
     const cases = [
-      { label: 'run/default transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-1', '--url', 'http://127.0.0.1:9', '--token', 't'], bound: 0, injected: false },
-      { label: 'run/injected transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-2', '--url', 'http://127.0.0.1:9', '--token', 't'], bound: 0.5, injected: true },
-      { label: 'status/default transport', argv: () => ['status', '--request-id', 'req-bad-3', '--url', 'http://127.0.0.1:9', '--token', 't'], bound: Number.NaN, injected: false },
-      { label: 'status/injected transport', argv: () => ['status', '--request-id', 'req-bad-4', '--url', 'http://127.0.0.1:9', '--token', 't'], bound: 2 ** 31, injected: true },
+      { label: 'run/default transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-run-1', ...OPS], bound: 0, injected: false },
+      { label: 'run/injected transport', argv: (sink: string) => [...BASE_ARGS, '--sink', sink, '--request-id', 'req-bad-run-2', ...OPS], bound: 0.5, injected: true },
+      { label: 'status/default transport', argv: () => ['status', '--request-id', 'req-bad-status-1', ...OPS], bound: Number.NaN, injected: false },
+      { label: 'status/injected transport', argv: () => ['status', '--request-id', 'req-bad-status-2', ...OPS], bound: 2 ** 31, injected: true },
     ];
     for (const [index, entry] of cases.entries()) {
       const sinkPath = join(dir, `bad-bound-${String(index)}.ndjson`);
       const out: string[] = [];
       const cliDeps: CaptureCliDeps = { ...deps({ stdout: (text: string) => out.push(text) }), stderr: (text: string) => out.push(text), responseHeadersTimeoutMs: entry.bound,
         ...(entry.injected ? { fetchImpl: fetchImpl as never } : {}) };
-      await expect(runCaptureCli(entry.argv(sinkPath), cliDeps), entry.label).rejects.toThrow(named);
+      await expect(runCaptureCli(entry.argv(sinkPath), cliDeps), entry.label).rejects.toThrow(BAD_BOUND);
       expect(out, entry.label).toEqual([]);
       expect(existsSync(sinkPath), entry.label).toBe(false);
       expect(existsSync(captureReceiptPath(sinkPath)), entry.label).toBe(false);
     }
     expect(fetchImpl).not.toHaveBeenCalled();
-    // Usage errors keep their own usage exit and message: help, no command,
-    // flag-parse errors, unknown commands, missing flags and missing ops.
-    vi.stubEnv('GRU_OPS_URL', ''); vi.stubEnv('GRU_OPS_TOKEN', ''); vi.stubEnv('GRU_COMMAND_CONFIG', '');
+  });
+
+  it('every usage error keeps its own usage exit and message despite a bad bound (#389)', async () => {
+    const dir = tempDir();
+    const fetchImpl = vi.fn();
     try {
+      vi.stubEnv('GRU_OPS_URL', ''); vi.stubEnv('GRU_OPS_TOKEN', ''); vi.stubEnv('GRU_COMMAND_CONFIG', '');
       const usageCases: readonly (readonly [readonly string[], RegExp])[] = [
         [['--help'], /^usage:/u], [['-h'], /^usage:/u], [[], /^usage:/u],
         [['run', '--bogus'], /--bogus requires a value/u], [['frobnicate'], /unknown command "frobnicate"/u],
         [['run'], /--job is required/u], [['status'], /--request-id is required/u],
         [[...BASE_ARGS, '--sink', join(dir, 'no-ops.ndjson')], /--url \(or GRU_OPS_URL\) is required/u],
         [['status', '--request-id', 'req-no-ops'], /--url \(or GRU_OPS_URL\) is required/u],
+        [['status', '--request-id', 'req-no-token', '--url', 'http://127.0.0.1:9'], /--token \(or GRU_OPS_TOKEN\)/u],
       ];
       for (const [argv, message] of usageCases) {
         const usage: string[] = [];
         expect(await runCaptureCli(argv, { responseHeadersTimeoutMs: 0, fetchImpl: fetchImpl as never, stderr: (text: string) => usage.push(text) }), argv.join(' ')).toBe(CAPTURE_EXIT.usage);
         expect(usage.join(''), argv.join(' ')).toMatch(message);
+        expect(usage.join(''), argv.join(' ')).not.toMatch(BAD_BOUND);
       }
     } finally {
       vi.unstubAllEnvs();
     }
-    // Owner refusals come first too; the stale-owner removal (the first side
-    // effect) comes only after the bound check, so a bad bound removes nothing.
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('owner refusals precede the bound check, and the stale-owner removal follows it (#389)', async () => {
+    const dir = tempDir();
+    const fetchImpl = vi.fn();
+    const run = (sink: string, requestId: string, probe: ProcessProbe, stderr: (text: string) => void) => runCaptureCli(
+      [...BASE_ARGS, '--sink', sink, '--request-id', requestId, ...OPS],
+      { ...deps({ probe: () => probe }), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0, stderr });
+    // Malformed owner: its usage refusal, the record untouched.
     const malformedSink = join(dir, 'malformed.ndjson');
     writeFileSync(captureOwnerPath(malformedSink), 'not an owner record');
-    const refusal: string[] = [];
-    expect(await runCaptureCli([...BASE_ARGS, '--sink', malformedSink, '--request-id', 'req-bad-5', '--url', 'http://127.0.0.1:9', '--token', 't'],
-      { ...deps(), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0, stderr: (text: string) => refusal.push(text) })).toBe(CAPTURE_EXIT.usage);
-    expect(refusal.join('')).toMatch(/is malformed/u);
+    const malformed: string[] = [];
+    expect(await run(malformedSink, 'req-owner-malformed', liveProbe, (text) => malformed.push(text))).toBe(CAPTURE_EXIT.usage);
+    expect(malformed.join('')).toMatch(/is malformed/u);
+    expect(malformed.join('')).not.toMatch(BAD_BOUND);
     expect(readFileSync(captureOwnerPath(malformedSink), 'utf-8')).toBe('not an owner record');
     expect(existsSync(malformedSink)).toBe(false);
+    // Live owner (explicitly alive): its usage refusal, the record untouched.
     const liveSink = join(dir, 'live.ndjson');
     writeCaptureOwner(captureOwnerPath(liveSink), ownerRecord(liveSink));
-    const liveOwner = readFileSync(captureOwnerPath(liveSink), 'utf-8');
-    const liveRefusal: string[] = [];
-    expect(await runCaptureCli([...BASE_ARGS, '--sink', liveSink, '--request-id', 'req-bad-7', '--url', 'http://127.0.0.1:9', '--token', 't'],
-      { ...deps(), fetchImpl: fetchImpl as never, responseHeadersTimeoutMs: 0, stderr: (text: string) => liveRefusal.push(text) })).toBe(CAPTURE_EXIT.usage);
-    expect(liveRefusal.join('')).toMatch(/owned by live helper/u);
-    expect(readFileSync(captureOwnerPath(liveSink), 'utf-8')).toBe(liveOwner);
+    const liveRecord = readFileSync(captureOwnerPath(liveSink), 'utf-8');
+    const live: string[] = [];
+    expect(await run(liveSink, 'req-owner-live', liveProbe, (text) => live.push(text))).toBe(CAPTURE_EXIT.usage);
+    expect(live.join('')).toMatch(/owned by live helper/u);
+    expect(live.join('')).not.toMatch(BAD_BOUND);
+    expect(readFileSync(captureOwnerPath(liveSink), 'utf-8')).toBe(liveRecord);
     expect(existsSync(liveSink)).toBe(false);
+    // Stale owner: the bound error comes first, so the record is NOT removed.
     const staleSink = join(dir, 'stale.ndjson');
     writeCaptureOwner(captureOwnerPath(staleSink), ownerRecord(staleSink));
-    await expect(runCaptureCli([...BASE_ARGS, '--sink', staleSink, '--request-id', 'req-bad-6', '--url', 'http://127.0.0.1:9', '--token', 't'],
-      { ...deps({ probe: () => ({ alive: false, startTime: null, cwd: null, command: null }) }), responseHeadersTimeoutMs: 0 })).rejects.toThrow(named);
-    expect(existsSync(captureOwnerPath(staleSink))).toBe(true);
+    const staleRecord = readFileSync(captureOwnerPath(staleSink), 'utf-8');
+    await expect(run(staleSink, 'req-owner-stale', deadProbe, () => {})).rejects.toThrow(BAD_BOUND);
+    expect(readFileSync(captureOwnerPath(staleSink), 'utf-8')).toBe(staleRecord);
     expect(existsSync(staleSink)).toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
-    // The valid edges are accepted at the CLI: the injected transport is used.
+  });
+
+  it('accepts the bound at both timer edges and uses the injected transport (#389)', async () => {
     for (const bound of [1, 2_147_483_647]) {
       const edgeFetch = vi.fn(async (): Promise<Response> => { throw new Error('fixture transport unreachable'); });
-      expect(await runCaptureCli(['status', '--request-id', 'req-edge', '--url', 'http://127.0.0.1:9', '--token', 't'],
+      expect(await runCaptureCli(['status', '--request-id', 'req-edge', ...OPS],
         { responseHeadersTimeoutMs: bound, fetchImpl: edgeFetch, stdout: () => {}, stderr: () => {} }), String(bound)).toBe(CAPTURE_EXIT.unknown);
       expect(edgeFetch, String(bound)).toHaveBeenCalledTimes(1);
     }
-    // withdraw makes no request: a bad bound never blocks owner recovery.
+  });
+
+  it('withdraw makes no request, so a bad bound never blocks owner recovery (#389)', async () => {
     const withdraw: string[] = [];
-    expect(await runCaptureCli(['withdraw', '--owner', join(dir, 'absent.owner.json')],
+    expect(await runCaptureCli(['withdraw', '--owner', join(tempDir(), 'absent.owner.json')],
       { responseHeadersTimeoutMs: 0, stdout: (text: string) => withdraw.push(text), stderr: (text: string) => withdraw.push(text) })).toBe(CAPTURE_EXIT.usage);
     expect(withdraw.join('')).toMatch(/withdrawal refused: no owner record at this path/u);
-    expect(withdraw.join('')).not.toMatch(named);
+    expect(withdraw.join('')).not.toMatch(BAD_BOUND);
   });
 
   it('the headers bound ends at the response: a body quiet for longer than it still streams to EOF (#389)', async () => {
