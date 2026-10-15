@@ -17,7 +17,7 @@ The config file is always `<instance dir>/config.toml`.
 
 The setup wizard (`npm run wizard`, or `node dist/wizard/main.js`) is
 the supported installation path. It reads prompts from `/dev/tty`, so a
-`curl | bash` install remains one invocation, probes runtime CLIs, asks
+`curl | bash` install remains one invocation, probes runtime CLIs, defaults new installs to Claude Code (`pi` stays selectable; a missing CLI for the chosen runtime stops setup with the fix, never a silent fallback; an existing config keeps its runtime), asks
 which real repository directories to validate during setup, checks Git roots and GC worktree setup without provisioning
 or inspecting independent BMAD ([BMAD-RUNTIME.md](./BMAD-RUNTIME.md)), and writes the same
 **complete teaching config** as the generator below. Every concrete
@@ -112,7 +112,8 @@ port = 7665
 token = "a-random-pairing-token"
 
 [runtimes]
-# Session host runtime: "pi" or "claude-code".
+# Session host runtime: "claude-code" (default for new installs) or "pi".
+# Existing installs keep whatever is set here; switch by editing this line.
 default = "pi"
 
 [runtimes.roles]
