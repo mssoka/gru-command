@@ -255,7 +255,7 @@ describe('suite shape', () => {
   it('the SLIM baseline scope names every independently measured instrument surface', () => {
     const worktree = readFileSync(join(import.meta.dirname, '..', '.gru-command', 'worktree.toml'), 'utf-8');
     const line = worktree.split('\n').find((candidate) => candidate.startsWith('dashboard-slim-strip-baseline = '));
-    const allowlist = /--require-file-substr "([^"]+)"/u.exec(line ?? '')?.[1].split(',') ?? [];
+    const allowlist = /--require-file-substr "([^"]+)"/u.exec(line ?? '')?.[1]?.split(',') ?? [];
     expect(allowlist).toEqual([
       'slim strip labelled status pairs',
       'slim strip Heists/PRs/Crew count groups',
