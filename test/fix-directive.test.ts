@@ -1,7 +1,7 @@
 import { standaloneFixtureLedger } from './helpers/fixture-handoff.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rebriefFreshMinion, recordFollowUpDelivery, renderRebriefPrompt, routeFixDirectiveToMinion } from '../src/dispatch/fix-directive.js';
@@ -14,7 +14,8 @@ import { appendWorkerRules } from '../src/dispatch/worker-rules.js';
 import type { WorktreeLane, WorktreePort } from '../src/dispatch/worktree-port.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { makeFixtureRepo, type FixtureRepo } from './helpers/fixture-repo.js';
-import { PacingGate } from '../src/runtime/pacing.js';
+import { PacingGate, RetrySettlementUnavailableError, type RetrySettlement } from '../src/runtime/pacing.js';
+import { admitBlindReview, blindCoverageOf, observeBlindSessionAccess, recordBlindAdmission, BLIND_ACCESS_EVENT } from '../src/dispatch/blind-review.js';
 import type { AgentRecord } from '../src/ledger/api.js';
 
 /**
@@ -787,6 +788,539 @@ describe('cancelled retry settlement on directive consumers (r4 verification#3)'
     await vi.waitFor(() => expect(prompted).toHaveLength(1));
     controller.abort();
     await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
+  });
+
+  it('observes the settled turn on the exhaustion failure exit too — the scan precedes the throw (issue #339 P1)', async () => {
+    const observed: { jobId: string; sessionFile: string | null }[] = [];
+    const handle = {
+      id: 'minion-scan-exhausted', sessionFile: '/sessions/scan.jsonl',
+      prompt: async () => {},
+      dispose: async () => {},
+    };
+    await expect(rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listImplementerMinions: () => [],
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id) => minionRecord(id, 'job-cancel', null),
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'contract',
+      retrySettlement: async () => 'exhausted',
+      observeBlindTurn: (jobId, sessionFile) => { observed.push({ jobId, sessionFile }); },
+    })).rejects.toThrow(/automatic rate-limit retry exhausted/);
+    // The observer ran BEFORE the failure exit: without this, a continuation
+    // that fails before delivery leaves its prohibited reads unscanned.
+    expect(observed).toEqual([{ jobId: 'job-cancel', sessionFile: '/sessions/scan.jsonl' }]);
+  });
+
+  it('a prohibited read appended by an abandoned retry turn is observed after cancellation (issue #339 N2)', async () => {
+    const controller = new AbortController();
+    const prompted: string[] = [];
+    const observed: { jobId: string; sessionFile: string | null }[] = [];
+    const handle = {
+      id: 'minion-rebrief-abandoned', sessionFile: '/sessions/rebrief-abandoned.jsonl',
+      prompt: async (text: string) => { prompted.push(text); },
+      dispose: async () => {},
+    };
+    let releaseRetry: () => void = () => {};
+    const retrySettled = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    const routing = rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listImplementerMinions: () => [],
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id) => minionRecord(id, 'job-cancel', null),
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'original contract',
+      signal: controller.signal,
+      retrySettlement: async () => { await retrySettled; return 'recovered'; },
+      observeBlindTurn: (jobId, sessionFile) => { observed.push({ jobId, sessionFile }); },
+    });
+    await vi.waitFor(() => expect(prompted).toHaveLength(1));
+    controller.abort();
+    await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
+    // The immediate scan ran before the abandoned retry turn settled.
+    expect(observed).toHaveLength(1);
+    // The retry turn settles AFTER the cancellation; its reads must still be
+    // observed, so a final scan is chained onto the abandoned settlement.
+    releaseRetry();
+    await vi.waitFor(() => expect(observed).toHaveLength(2));
+    expect(observed[1]).toEqual({ jobId: 'job-cancel', sessionFile: '/sessions/rebrief-abandoned.jsonl' });
+  });
+
+  it('a settlement-hook rejection still observes the delivered turn before the named error propagates (issue #339 N3)', async () => {
+    const observed: { jobId: string; sessionFile: string | null }[] = [];
+    const handle = {
+      id: 'minion-rebrief-hookfault', sessionFile: '/sessions/rebrief-hookfault.jsonl',
+      prompt: async () => {},
+      dispose: async () => {},
+    };
+    await expect(rebriefFreshMinion({
+      registry: { getHandle: () => null, spawn: async () => handle as never, disposeHandle: async () => {} },
+      ledger: {
+        listImplementerMinions: () => [],
+        listAgents: () => [],
+        registerAgent: (input) => minionRecord(input.id, input.jobId ?? null, input.sessionFile ?? null),
+        getJob: () => null,
+        getAgent: () => null,
+        setAgentState: (id) => minionRecord(id, 'job-cancel', null),
+      },
+      worktrees: { listWorktrees: () => [lane] } as never,
+      jobId: 'job-cancel',
+      note: 'resume',
+      briefing: 'original contract',
+      retrySettlement: async () => { throw new Error('settlement hook fault'); },
+      observeBlindTurn: (jobId, sessionFile) => { observed.push({ jobId, sessionFile }); },
+    })).rejects.toThrow(RetrySettlementUnavailableError);
+    // The prompt already ran: the scan must precede the named hook-fault error.
+    expect(observed).toEqual([{ jobId: 'job-cancel', sessionFile: '/sessions/rebrief-hookfault.jsonl' }]);
+  });
+});
+
+describe('directive-driven resume blind observation (issue #339 D1)', () => {
+  const TARGET = 'a'.repeat(40);
+  const PROHIBITED = `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`;
+
+  function blindDirectiveLedger(jobId: string, agentId: string, sessionFile: string): { ledger: LedgerApi; dispose(): void } {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-directive-blind-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    ledger.addJob({ id: jobId, repo: 'fixture', title: 'direct blind review' });
+    ledger.setJobStatus(jobId, 'working');
+    // A directly admitted blind review is a TOP-LEVEL minion (no round/lens
+    // binding): it survives listImplementerMinions, so the directive router is
+    // a real continuation seam for it.
+    ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
+    const admission = admitBlindReview({
+      ledger, jobId, title: 'review (blind)', deliverable: 'review',
+      briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture',
+      inputPackage: { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+    });
+    if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+    recordBlindAdmission(ledger, jobId, admission);
+    return { ledger, dispose: () => db.close() };
+  }
+
+  it('observes a RESUMED directive fallback session and invalidates blind coverage', async () => {
+    const jobId = 'job-blind-directive';
+    const priorId = 'prior-reviewer';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-directive-blind-resume-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'prior.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = blindDirectiveLedger(jobId, priorId, sessionFile);
+    try {
+      let resumedFile: string | null | undefined;
+      const handle = {
+        id: 'resumed-reviewer', role: 'minion', sessionFile,
+        async prompt() { appendFileSync(sessionFile, PROHIBITED); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: false });
+      const outcome = await routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: {
+          getHandle: () => null,
+          spawn: async (_role, options) => { resumedFile = options?.resumeFile ?? null; return handle; },
+          disposeHandle: async () => {},
+        },
+        observeBlindTurn: (observedJobId, observedSession) => observeBlindSessionAccess(h.ledger, observedJobId, observedSession),
+      });
+      expect(resumedFile).toBe(sessionFile);
+      expect(outcome.delivered).toBe(true);
+      // Without the directive-routing observer the resumed blind reviewer's
+      // prohibited read would leave coverage qualifying (and reuse-steering).
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('observes a LIVE directive continuation session and invalidates blind coverage', async () => {
+    const jobId = 'job-blind-directive-live';
+    const agentId = 'live-reviewer';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-directive-blind-live-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'live.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = blindDirectiveLedger(jobId, agentId, sessionFile);
+    try {
+      const handle = {
+        id: agentId, role: 'minion', sessionFile,
+        async prompt() { appendFileSync(sessionFile, PROHIBITED); },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const outcome = await routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: new AbortController().signal,
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        observeBlindTurn: (observedJobId, observedSession) => observeBlindSessionAccess(h.ledger, observedJobId, observedSession),
+      });
+      expect(outcome).toMatchObject({ delivered: true, minionId: agentId });
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('F4: a pre-aborted settlement observes its deferred retry tail and invalidates coverage', async () => {
+    const jobId = 'job-blind-prebort';
+    const agentId = 'minion-blind-prebort';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-directive-blind-prebort-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'session.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = blindDirectiveLedger(jobId, agentId, sessionFile);
+    try {
+      // Shutdown already landed when the settlement call runs: the pre-aborted
+      // branch of settleRetries returns 'cancelled' and hands off the STILL
+      // RUNNING retry settlement.
+      const controller = new AbortController();
+      controller.abort();
+      let completeRetry: () => void = () => {};
+      const physicalRetry = new Promise<RetrySettlement>((resolve) => { completeRetry = () => resolve('recovered'); });
+      const handle = {
+        id: agentId, role: 'minion', sessionFile,
+        async prompt() { /* the initial prompt ran; its retry completion is deferred */ },
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        async steer() {}, async followUp() {},
+        subscribe() { return () => {}; },
+        health() { return { state: 'idle' as const, lastActivity: null, sessionFile }; },
+        async dispose() {},
+      } satisfies AgentHandle;
+      const routing = rebriefFreshMinion({
+        registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        jobId, note: 'resume', briefing: 'contract', signal: controller.signal,
+        retrySettlement: () => physicalRetry,
+        observeBlindTurn: (observedJobId, observedSession) => observeBlindSessionAccess(h.ledger, observedJobId, observedSession),
+      });
+      await expect(routing).rejects.toThrow(/cancelled before its automatic retries settled/);
+      // The retry turn physically completes AFTER the cancelled settlement
+      // returned: it appends the prohibited read, then its settlement resolves —
+      // the chained final observation must catch it.
+      appendFileSync(sessionFile, PROHIBITED);
+      completeRetry();
+      await vi.waitFor(() => {
+        expect(blindCoverageOf(h.ledger, jobId).state).toBe('invalidated');
+      }, { timeout: 5_000 });
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+    } finally {
+      h.dispose();
+    }
+  });
+});
+
+describe('directive continuation physical-tail observation (issue #339 D1 tail)', () => {
+  const TARGET = 'a'.repeat(40);
+  const PERMITTED = 'src/feature.ts:1:export const feature = 1;';
+  const PROHIBITED = `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`;
+
+  function observedSessionLedger(jobId: string, agentId: string, sessionFile: string, opts: { admit: boolean }): { ledger: LedgerApi; dispose: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-'));
+    cleanupDirs.push(dir);
+    const db = new LedgerDb(dir);
+    const ledger = new LedgerApi(db.handle, { bus: new EventBus() });
+    ledger.addJob({ id: jobId, repo: 'fixture', title: 'directive lane' });
+    ledger.setJobStatus(jobId, 'working');
+    ledger.registerAgent({ id: agentId, role: 'minion', jobId, sessionFile });
+    if (opts.admit) {
+      const admission = admitBlindReview({
+        ledger, jobId, title: 'review (blind)', deliverable: 'review',
+        briefing: 'Review the immutable package read-only.', targetSha: TARGET, repoName: 'fixture',
+        inputPackage: { baseSha: 'b'.repeat(40), targetSha: TARGET, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+      });
+      if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+      recordBlindAdmission(ledger, jobId, admission);
+    }
+    return { ledger, dispose: () => db.close() };
+  }
+
+  const CAPS = { streaming: true, steer: 'native' as const, resume: 'file' as const, images: false, thinking: false, thinkingLevelControl: false, followUp: false };
+
+  function tailHandle(input: {
+    id: string; sessionFile: string; onPrompt: () => void | Promise<void>; gates?: Promise<void>;
+  }) {
+    return {
+      id: input.id, role: 'minion' as const, sessionFile: input.sessionFile, capabilities: CAPS,
+      async prompt() { await input.onPrompt(); if (input.gates !== undefined) await input.gates; },
+      async steer() {}, async followUp() {},
+      subscribe() { return () => {}; },
+      health() { return { state: 'idle' as const, lastActivity: null, sessionFile: input.sessionFile }; },
+      async dispose() {},
+    } satisfies AgentHandle;
+  }
+
+  const observed = (ledger: LedgerApi) => (jobId: string, sessionFile: string | null) => observeBlindSessionAccess(ledger, jobId, sessionFile);
+
+  it('LIVE: an abort after the prompt started does not skip the physical prompt\'s later prohibited read (no retry)', async () => {
+    const jobId = 'job-tail-live';
+    const agentId = 'tail-live';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-live-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'live.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = observedSessionLedger(jobId, agentId, sessionFile, { admit: true });
+    try {
+      const controller = new AbortController();
+      let started = false;
+      let promptCalls = 0;
+      let release: () => void = () => {};
+      const physicalGate = new Promise<void>((resolve) => { release = resolve; });
+      const handle = tailHandle({
+        id: agentId, sessionFile,
+        onPrompt: () => { promptCalls += 1; started = true; return undefined; },
+        gates: physicalGate,
+      });
+      let settleCalls = 0;
+      const routing = routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: controller.signal, owner: 'test',
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        // Pre-prompt interlock resolves; the POST-prompt settlement is pending,
+        // so cancellation wins as 'cancelled' and NO retry turn ever runs.
+        retrySettlement: () => (++settleCalls === 1 ? Promise.resolve('none' as const) : new Promise<RetrySettlement>(() => {})),
+        observeBlindTurn: observed(h.ledger),
+      });
+      await vi.waitFor(() => expect(started).toBe(true));
+      controller.abort();
+      const outcome = await routing;
+      expect(outcome).toMatchObject({ delivered: false, admission: 'unknown' });
+      expect(promptCalls).toBe(1);
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', accessObserved: false });
+      // The still-running physical prompt now reads prohibited material.
+      appendFileSync(sessionFile, PROHIBITED);
+      release();
+      await vi.waitFor(() => expect(blindCoverageOf(h.ledger, jobId).state).toBe('invalidated'), { timeout: 5_000 });
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1 });
+      expect(promptCalls).toBe(1); // no retry healed it
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('RESUMED: an abort after the fallback prompt started still observes its physical read (no retry)', async () => {
+    const jobId = 'job-tail-resumed';
+    const agentId = 'tail-resumed';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-resumed-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'resumed.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = observedSessionLedger(jobId, agentId, sessionFile, { admit: true });
+    try {
+      const controller = new AbortController();
+      let started = false;
+      let promptCalls = 0;
+      let release: () => void = () => {};
+      const physicalGate = new Promise<void>((resolve) => { release = resolve; });
+      const handle = tailHandle({
+        id: 'resumed-tail', sessionFile,
+        onPrompt: () => { promptCalls += 1; started = true; return undefined; },
+        gates: physicalGate,
+      });
+      const routing = routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: controller.signal, owner: 'test',
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => null, spawn: async () => handle, disposeHandle: async () => {} },
+        retrySettlement: () => new Promise<RetrySettlement>(() => {}),
+        observeBlindTurn: observed(h.ledger),
+      });
+      await vi.waitFor(() => expect(started).toBe(true));
+      controller.abort();
+      const outcome = await routing;
+      expect(outcome).toMatchObject({ delivered: false, admission: 'unknown' });
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', accessObserved: false });
+      appendFileSync(sessionFile, PROHIBITED);
+      release();
+      await vi.waitFor(() => expect(blindCoverageOf(h.ledger, jobId).state).toBe('invalidated'), { timeout: 5_000 });
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1 });
+      expect(promptCalls).toBe(1);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('HOOK FAULT: a completed directive prompt is observed even when the settlement hook throws a named error', async () => {
+    const jobId = 'job-tail-hookfault';
+    const agentId = 'tail-hookfault';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-hookfault-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'hookfault.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = observedSessionLedger(jobId, agentId, sessionFile, { admit: true });
+    try {
+      const handle = tailHandle({
+        id: agentId, sessionFile,
+        // The prompt COMPLETES (reads prohibited material) before the hook faults.
+        onPrompt: () => { appendFileSync(sessionFile, PROHIBITED); return undefined; },
+      });
+      let settleCalls = 0;
+      await expect(routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: new AbortController().signal, owner: 'test',
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        // Pre-prompt interlock resolves; the POST-prompt settlement hook faults.
+        retrySettlement: () => {
+          settleCalls += 1;
+          if (settleCalls === 1) return Promise.resolve('none' as const);
+          throw new Error('settlement hook fault');
+        },
+        observeBlindTurn: observed(h.ledger),
+      })).rejects.toThrow(RetrySettlementUnavailableError);
+      expect(settleCalls).toBe(2);
+      // The observation precedes the named error: the completed turn's read counts.
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1 });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('CONTROL authorized: a permitted read keeps coverage qualifying (and is observed)', async () => {
+    const jobId = 'job-tail-authorized';
+    const agentId = 'tail-authorized';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-authorized-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'authorized.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = observedSessionLedger(jobId, agentId, sessionFile, { admit: true });
+    try {
+      const handle = tailHandle({
+        id: agentId, sessionFile,
+        onPrompt: () => { appendFileSync(sessionFile, `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'read', content: PERMITTED } })}\n`); return undefined; },
+      });
+      const outcome = await routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: new AbortController().signal, owner: 'test',
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        observeBlindTurn: observed(h.ledger),
+      });
+      expect(outcome).toMatchObject({ delivered: true, minionId: agentId });
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', qualifying: true, accessObserved: true, prohibitedAccess: 0 });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('CONTROL non-blind: a directive turn on a non-blind job records no observation', async () => {
+    const jobId = 'job-tail-plain';
+    const agentId = 'tail-plain';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-plain-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'plain.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = observedSessionLedger(jobId, agentId, sessionFile, { admit: false });
+    try {
+      const handle = tailHandle({
+        id: agentId, sessionFile,
+        onPrompt: () => { appendFileSync(sessionFile, PROHIBITED); return undefined; },
+      });
+      const outcome = await routeFixDirectiveToMinion({
+        jobId, directive: 'continue', signal: new AbortController().signal, owner: 'test',
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        observeBlindTurn: observed(h.ledger),
+      });
+      expect(outcome).toMatchObject({ delivered: true });
+      expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).toBeNull();
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'unclassified', accessObserved: false });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('CONTROL no-start: a pre-aborted directive starts no turn and fabricates no observation', async () => {
+    const jobId = 'job-tail-prebort';
+    const agentId = 'tail-prebort';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-prebort-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'prebort.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = observedSessionLedger(jobId, agentId, sessionFile, { admit: true });
+    try {
+      const controller = new AbortController();
+      controller.abort();
+      let promptCalls = 0;
+      const handle = tailHandle({
+        id: agentId, sessionFile,
+        onPrompt: () => { promptCalls += 1; appendFileSync(sessionFile, PROHIBITED); return undefined; },
+      });
+      await expect(routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: controller.signal, owner: 'test',
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        observeBlindTurn: observed(h.ledger),
+      })).rejects.toThrow(/review operation aborted/);
+      expect(promptCalls).toBe(0);
+      expect(h.ledger.latestJobEvent(jobId, BLIND_ACCESS_EVENT)).toBeNull();
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({ state: 'qualifying', accessObserved: false });
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('G4: a REJECTED live directive prompt is still observed and preserves the original failure', async () => {
+    const jobId = 'job-tail-reject';
+    const agentId = 'tail-reject';
+    const dir = mkdtempSync(join(tmpdir(), 'gru-command-tail-reject-'));
+    cleanupDirs.push(dir);
+    const sessionFile = join(dir, 'reject.jsonl');
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const h = observedSessionLedger(jobId, agentId, sessionFile, { admit: true });
+    try {
+      const handle = tailHandle({
+        id: agentId, sessionFile,
+        // The physical prompt reads prohibited material AND then rejects: the
+        // rejection arm of runObservedPrompt must still observe the read.
+        onPrompt: () => {
+          appendFileSync(sessionFile, PROHIBITED);
+          throw new Error('directive turn rejected after the read');
+        },
+      });
+      const failure = await routeFixDirectiveToMinion({
+        jobId, directive: 'continue the review', signal: new AbortController().signal, owner: 'test',
+        ledger: h.ledger, worktrees: { listWorktrees: () => [laneAt(dir)] } as unknown as WorktreePort,
+        registry: { getHandle: () => handle, spawn: async () => handle, disposeHandle: async () => {} },
+        observeBlindTurn: observed(h.ledger),
+      }).then(() => null, (error: unknown) => error);
+      // The ORIGINAL prompt failure is preserved (never replaced by a
+      // coverage/bookkeeping error).
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain('directive turn rejected after the read');
+      // Deleting only the rejection-arm observation leaves coverage qualifying.
+      expect(blindCoverageOf(h.ledger, jobId)).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+    } finally {
+      h.dispose();
+    }
   });
 });
 

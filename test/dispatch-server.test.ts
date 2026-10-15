@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
@@ -15,6 +15,13 @@ import { DispatchService } from '../src/dispatch/service.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { fakeWholeSpawner } from './helpers/perkins-whole-double.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
+import {
+  admitBlindReview,
+  blindCoverageOf,
+  observeBlindSessionAccess,
+  recordBlindAdmission,
+  BLIND_ACCESS_EVENT,
+} from '../src/dispatch/blind-review.js';
 import { PacingGate, type RetrySettlement } from '../src/runtime/pacing.js';
 import { computeSilasDigest } from '../src/dispatch/silas-driver.js';
 import { NotificationCenter } from '../src/notifications/center.js';
@@ -41,6 +48,24 @@ import { originHeadProbe } from './helpers/pr-head-probe.js';
 
 const TOKEN = 'test-token-éphémeral';
 const PR_URL = 'https://git.example.invalid/fixture-owner/fixture-app/pull/5';
+
+/** Admit `jobId` as a blind review (issue #316) so the silas re-brief settle
+ * seam has an isolation rule to judge the re-briefed session against. */
+function admitJobAsBlind(ledger: LedgerApi, jobId: string): void {
+  const targetSha = 'f'.repeat(40);
+  const admission = admitBlindReview({
+    ledger,
+    jobId,
+    title: 'review (blind)',
+    deliverable: 'review',
+    briefing: 'Review the immutable package read-only.',
+    targetSha,
+    repoName: 'fixture',
+    inputPackage: { baseSha: 'a'.repeat(40), targetSha, files: [{ path: 'src/feature.ts', content: 'export const feature = 1;\n' }] },
+  });
+  if (admission === null) throw new Error(`job "${jobId}" was not admitted as a blind review`);
+  recordBlindAdmission(ledger, jobId, admission);
+}
 
 const cleanupDirs: string[] = [];
 const cleanupRepos: FixtureRepo[] = [];
@@ -84,6 +109,14 @@ async function boot(opts: {
   retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
   /** Provider pacing: worker gate forwarded to the silas routes. */
   workerGate?: PacingGate;
+  /** Issue #339: the blind-coverage observer forwarded to the silas routes. */
+  observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
+  /** Issue #339: the session file the fake minion handle reports at settle
+   * (the transcript a blind-coverage observer scans). */
+  minionSessionFile?: string | null;
+  /** Issue #339: runs inside every minion prompt (the side effect a real turn
+   * has on its session), so a scan placed before delivery reads a clean file. */
+  minionPromptEffect?: (text: string) => void;
 } = {}): Promise<ServerHarness & { wave: WaveRunner }> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-dispatch-server-'));
   cleanupDirs.push(dir);
@@ -106,6 +139,7 @@ async function boot(opts: {
   const reviewSessions = join(dir, 'review-sessions');
   mkdirSync(reviewSessions, { recursive: true });
   const hybrid = fakeWholeSpawner(reviewSessions, { childAnswer: () => '[]' });
+  const minionSessionFile = opts.minionSessionFile ?? null;
   const spawner = async (role: Role, options?: SpawnOptions): Promise<AgentHandle> => {
     spawns.push({ role, options: options ?? {} });
     if (role === 'perkins') return hybrid.spawner(role, options);
@@ -114,7 +148,7 @@ async function boot(opts: {
     return {
       role,
       id,
-      sessionFile: null,
+      sessionFile: minionSessionFile,
       capabilities: FAKE_CAPABILITIES,
       async prompt(text: string) {
         if (role !== 'minion' || options?.cwd === undefined) return;
@@ -124,6 +158,7 @@ async function boot(opts: {
         if (gate !== undefined) await gate;
         // idempotent per prompt: a fresh file per turn, so a second minion
         // turn on the same lane (silas re-brief) always has a commit to make.
+        opts.minionPromptEffect?.(text);
         const file = join(options.cwd, `http-deliverable-${id}.txt`);
         writeFileSync(file, 'review me\n');
         execFileSync('git', ['-C', options.cwd, 'add', file]);
@@ -144,8 +179,8 @@ async function boot(opts: {
       },
       health() {
         return turnHealth === 'error'
-          ? { state: 'error' as const, lastActivity: null, sessionFile: null, error: 'runtime settled the turn with an in-band error' }
-          : { state: 'idle' as const, lastActivity: null, sessionFile: null };
+          ? { state: 'error' as const, lastActivity: null, sessionFile: minionSessionFile, error: 'runtime settled the turn with an in-band error' }
+          : { state: 'idle' as const, lastActivity: null, sessionFile: minionSessionFile };
       },
       async dispose() {
         // The directive route disposes a freshly spawned fallback minion
@@ -179,6 +214,7 @@ async function boot(opts: {
     ...(opts.log !== undefined ? { log: opts.log } : {}),
     ...(opts.retrySettlement !== undefined ? { retrySettlement: opts.retrySettlement } : {}),
     ...(opts.workerGate !== undefined ? { workerGate: opts.workerGate } : {}),
+    ...(opts.observeBlindTurn !== undefined ? { observeBlindTurn: opts.observeBlindTurn } : {}),
     ...(opts.silasOps === false
       ? {}
       : {
@@ -1595,6 +1631,90 @@ describe('dispatch server (E8)', () => {
         event.kind === 'job.delivered' && (event.payload as { source?: string }).source === 'silas-rebrief',
       )).toBe(false);
       expect(h.ledger.listPendingRebriefs({ jobId: 'reb-settle' })).toHaveLength(2);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/rebrief observes the re-briefed session and invalidates blind coverage (issue #339 P4)', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'gru-command-silas-rebrief-blind-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    // The session STARTS clean; the re-brief turn appends its own prohibited
+    // read during delivery, so an accidentally early scan cannot pass by
+    // reading prewritten contamination (issue #339 F5).
+    writeFileSync(sessionFile, '{}\n');
+    const prohibited = `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`;
+    let appendProhibited = false;
+    // The observer closure needs the ledger, which boot mints.
+    let ledgerRef: LedgerApi | null = null;
+    const h = await boot({
+      minionSessionFile: sessionFile,
+      minionPromptEffect: () => { if (appendProhibited) appendFileSync(sessionFile, prohibited); },
+      observeBlindTurn: (jobId, recovered) => {
+        if (ledgerRef !== null) observeBlindSessionAccess(ledgerRef, jobId, recovered);
+      },
+    });
+    ledgerRef = h.ledger;
+    const repo = makeFixtureRepo('fixture-silas-rebrief-blind');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'reb-blind', repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, 'reb-blind');
+      admitJobAsBlind(h.ledger, 'reb-blind');
+      expect(blindCoverageOf(h.ledger, 'reb-blind')).toMatchObject({ state: 'qualifying', accessObserved: false });
+      appendProhibited = true;
+      const res = await call(h.port, 'POST', '/api/silas/rebrief', { job_id: 'reb-blind', note: 'try again' }, TOKEN);
+      expect(res.status).toBe(200);
+      // Deleting the forwarding line in the silas re-brief route leaves
+      // coverage qualifying and fails this assertion.
+      expect(h.ledger.latestJobEvent('reb-blind', BLIND_ACCESS_EVENT)).not.toBeNull();
+      expect(blindCoverageOf(h.ledger, 'reb-blind')).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('/api/silas/directive observes a resumed blind reviewer session and invalidates coverage (issue #339 D1)', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'gru-command-silas-directive-blind-'));
+    cleanupDirs.push(sessionDir);
+    const sessionFile = join(sessionDir, 'reviewer.jsonl');
+    // The session STARTS clean; the directive continuation appends its own
+    // prohibited read during delivery (issue #339 F5 shape).
+    writeFileSync(sessionFile, '{}\n');
+    const prohibited = `${JSON.stringify({ type: 'message', message: { role: 'toolResult', toolName: 'bash', content: 'docs/issues/305-review.md:1:prior assessment' } })}\n`;
+    let appendProhibited = false;
+    let ledgerRef: LedgerApi | null = null;
+    const h = await boot({
+      minionSessionFile: sessionFile,
+      minionPromptEffect: () => { if (appendProhibited) appendFileSync(sessionFile, prohibited); },
+      observeBlindTurn: (jobId, recovered) => {
+        if (ledgerRef !== null) observeBlindSessionAccess(ledgerRef, jobId, recovered);
+      },
+    });
+    ledgerRef = h.ledger;
+    const repo = makeFixtureRepo('fixture-silas-directive-blind');
+    cleanupRepos.push(repo);
+    try {
+      await call(h.port, 'POST', '/api/dispatch', { job_id: 'dir-blind', repo_path: repo.path, title: 'blind lane', briefing: 'b' }, TOKEN);
+      await waitForDelivery(h, 'dir-blind');
+      admitJobAsBlind(h.ledger, 'dir-blind');
+      h.ledger.setJobStatus('dir-blind', 'in-review');
+      expect(blindCoverageOf(h.ledger, 'dir-blind')).toMatchObject({ state: 'qualifying', accessObserved: false });
+      // No live handle: the router resumes the recorded blind reviewer session.
+      appendProhibited = true;
+      const res = await call(h.port, 'POST', '/api/silas/directive', {
+        job_id: 'dir-blind', directive: 'Continue the review.', blocker_fingerprint: 'correctness::blind::resume',
+      }, TOKEN);
+      expect(res.status).toBe(202);
+      const requestId = field<string>(res.json, 'request_id');
+      expect((await awaitDirectiveTerminal(h, requestId)).state).toBe('settled');
+      // Deleting the directive-route forwarding leaves coverage qualifying.
+      expect(blindCoverageOf(h.ledger, 'dir-blind')).toMatchObject({
+        state: 'invalidated', qualifying: false, accessObserved: true, prohibitedAccess: 1,
+      });
     } finally {
       await h.close();
     }

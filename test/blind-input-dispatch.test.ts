@@ -10,6 +10,7 @@ import { LedgerDb } from '../src/ledger/db.js';
 import { loadConfig } from '../src/config.js';
 import { InMemoryWorktreePort } from './helpers/in-memory-worktrees.js';
 import { DispatchService } from '../src/dispatch/service.js';
+import type { LogLevel } from '../src/logger.js';
 import { WaveRunner } from '../src/dispatch/perkins.js';
 import { createDispatchServer } from '../src/dispatch/server.js';
 import type { ObservedToolResult } from '../src/dispatch/blind-input.js';
@@ -50,7 +51,10 @@ interface Harness {
   repo: FixtureRepo;
 }
 
-async function boot(opts: { sessionToolResults?: (file: string | null) => readonly ObservedToolResult[] | null } = {}): Promise<Harness> {
+async function boot(opts: {
+  sessionToolResults?: (file: string | null) => readonly ObservedToolResult[] | null;
+  log?: (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
+} = {}): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'gru-command-blind-'));
   cleanupDirs.push(dir);
   writeFileSync(join(dir, 'config.toml'), `[auth]\ntoken = "${TOKEN}"\n[server]\nhost = "127.0.0.1"\nport = 0\n`, 'utf-8');
@@ -75,7 +79,13 @@ async function boot(opts: { sessionToolResults?: (file: string | null) => readon
       async dispose() {},
     };
   };
-  const dispatch = new DispatchService({ ledger, worktrees, spawner, ...(opts.sessionToolResults !== undefined ? { sessionToolResults: opts.sessionToolResults } : {}) });
+  const dispatch = new DispatchService({
+    ledger,
+    worktrees,
+    spawner,
+    ...(opts.sessionToolResults !== undefined ? { sessionToolResults: opts.sessionToolResults } : {}),
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
+  });
   const wave = new WaveRunner({ ledger, worktrees, spawner, bus });
   const server = createDispatchServer({ pendingProducerBlockers: () => [], config: cfg, dispatch, wave, ledger });
   const http: HttpServer = createServer((req, res) => {
@@ -380,6 +390,22 @@ describe('blind review commissioning (issue #316)', () => {
     expect((await call(h.port, 'GET', '/api/dispatch/jobs/rev-seen/blind-coverage')).json).toMatchObject({
       state: 'invalidated', qualifying: false, accessObserved: true,
     });
+  });
+
+  it('a throwing session reader is logged and swallowed — never failing the settled turn (issue #339 P5)', async () => {
+    const logs: string[] = [];
+    const h = await boot({
+      sessionToolResults: () => { throw new Error('session unreadable'); },
+      log: (_level, msg) => { logs.push(msg); },
+    });
+    await dispatchParent(h);
+    const created = await call(h.port, 'POST', '/api/dispatch', blindReview('rev-reader-fault', { repo_path: h.repo.path, input_package: validPackage() }));
+    expect(created.status).toBe(202);
+    await waitFor(() => h.ledger.latestJobEvent('rev-reader-fault', 'job.delivered') !== null);
+    // The bookkeeping fault is logged and swallowed; the delivery stands and
+    // no observation was fabricated from a failed read.
+    expect(logs).toContain('blind review access observation failed');
+    expect(h.ledger.latestJobEvent('rev-reader-fault', BLIND_ACCESS_EVENT)).toBeNull();
   });
 
   it('reuses already-owned qualifying coverage instead of spawning a replacement, and replaces only invalidated coverage', async () => {

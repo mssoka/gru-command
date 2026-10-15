@@ -13,6 +13,7 @@ import type { WorktreePort } from '../dispatch/worktree-port.js';
 import { blockedByOwnWallSettle } from './settle-attribution.js';
 import { isJobTerminal } from '../ledger/states.js';
 import type { SlotReArmPort } from './sensor.js';
+import type { RetrySettlement } from '../runtime/pacing.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
 
@@ -42,6 +43,17 @@ export interface RecoveryClaimDeps {
   readonly worktrees: WorktreePort;
   readonly slotReArm?: SlotReArmPort;
   readonly log?: Log;
+  /** Provider pacing: the bounded settlement of an automatic rate-limit
+   * retry covering the resumed turn (supervisor-backed in production). The
+   * #339 settle-scan MUST run after those retry turns settle, or a prohibited
+   * read performed by a retry lands after the scan and is never observed.
+   * Wired by the service exactly like the boot re-brief path; absent = no
+   * interlock. */
+  readonly retrySettlement?: (agentId: string) => Promise<RetrySettlement>;
+  /** Issue #339: observe the resumed continuation session's tool access so a
+   * prohibited read during a resume invalidates blind coverage. Wired by the
+   * service to `DispatchService.observeBlindSession`; absent = no observation. */
+  readonly observeBlindTurn?: (jobId: string, sessionFile: string | null) => void;
 }
 
 /** The fresh provider-recovery worker's contract half: the effective
@@ -308,6 +320,8 @@ async function claimJobMinion(
         ? withRevisionContinuation(continuationPrompt ?? job.briefing ?? '', pendingCorrection) || null
         : freshBriefing(deps.ledger.effectiveContract(job.id)?.text ?? job.briefing, continuationPrompt, revisionState),
       ...(resumeFile !== null ? { resumeFile } : {}),
+      ...(deps.retrySettlement !== undefined ? { retrySettlement: deps.retrySettlement } : {}),
+      ...(deps.observeBlindTurn !== undefined ? { observeBlindTurn: deps.observeBlindTurn } : {}),
       beforeTurnSideEffect: () => {
         // A hold or terminal disposition may land during the awaited
         // worker gate/spawn. Never prompt the replacement against it;
