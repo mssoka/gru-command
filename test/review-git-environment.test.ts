@@ -11,7 +11,7 @@ import { rebriefFreshMinion } from '../src/dispatch/fix-directive.js';
 import { PacingGate } from '../src/runtime/pacing.js';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -260,11 +260,12 @@ describe('review Git repository environment isolation (GH-270)', () => {
     }
   });
 
-  it('refuses successful job and writer bootstrap FIFO HEAD before synchronous Git with finite owned unblock (final review)', async () => {
-    for (const authority of ['job', 'writer'] as const) for (const fifo of [false, true]) {
+  it('refuses successful job and writer bootstrap FIFO HEAD and loose refs before Git with finite owned unblock (final review)', async () => {
+    const failures: { metadata: string; authority: string; fifo: boolean; error: unknown }[] = [];
+    for (const metadata of ['HEAD', 'loose-ref'] as const) for (const authority of ['job', 'writer'] as const) for (const fifo of [false, true]) {
       const h = await rollbackRaceFixture(`final-success-fifo-${authority}-${fifo}`, authority);
       const root = directory(), ready = join(root, 'ready.json'), finished = join(root, 'finished'), unblocked = join(root, 'unblocked'), script = join(root, 'setup.cjs');
-      writeFileSync(script, `const fs=require('node:fs'),cp=require('node:child_process'),p=require('node:path');const admin=cp.execFileSync('git',['rev-parse','--absolute-git-dir'],{encoding:'utf8'}).trim(),file=p.join(admin,'HEAD'),head=fs.readFileSync(file,'utf8');fs.writeFileSync(p.join(process.cwd(),'retained-data'),'owned successful setup');${fifo ? "fs.unlinkSync(file);cp.execFileSync('mkfifo',[file]);" : ''}fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({file,head,tree:process.cwd(),admin}));`);
+      writeFileSync(script, `const fs=require('node:fs'),cp=require('node:child_process'),p=require('node:path');const admin=cp.execFileSync('git',['rev-parse','--absolute-git-dir'],{encoding:'utf8'}).trim(),common=fs.realpathSync(p.resolve(admin,fs.readFileSync(p.join(admin,'commondir'),'utf8').trim())),file=${metadata === 'HEAD' ? "p.join(admin,'HEAD')" : "p.join(common,cp.execFileSync('git',['symbolic-ref','HEAD'],{encoding:'utf8'}).trim())"},head=fs.readFileSync(file,'utf8');fs.writeFileSync(p.join(process.cwd(),'retained-data'),'owned successful setup');${fifo ? "fs.unlinkSync(file);cp.execFileSync('mkfifo',[file]);" : ''}fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({file,head,tree:process.cwd(),admin}));`);
       mkdirSync(join(h.repo.path, '.gru-command'), { recursive: true });
       writeFileSync(join(h.repo.path, '.gru-command/worktree.toml'), `[[setup]]\ncommand = ${JSON.stringify(`"${process.execPath}" "${script}"`)}\n`);
       const child = spawn(process.execPath, ['-e', `const fs=require('node:fs');let n=0;const poll=setInterval(()=>{if(fs.existsSync(${JSON.stringify(finished)})){clearInterval(poll);}else if(fs.existsSync(${JSON.stringify(ready)})){clearInterval(poll);setTimeout(()=>{if(fs.existsSync(${JSON.stringify(finished)}))return;const r=JSON.parse(fs.readFileSync(${JSON.stringify(ready)},'utf8'));if(!fs.lstatSync(r.file).isFIFO())return;const fd=fs.openSync(r.file,fs.constants.O_RDWR|fs.constants.O_NONBLOCK);fs.writeSync(fd,r.head);fs.closeSync(fd);fs.unlinkSync(r.file);fs.writeFileSync(r.file,r.head);fs.writeFileSync(${JSON.stringify(unblocked)},'owned unblock');},800);}else if(++n===1000){clearInterval(poll);process.exitCode=9;}},10);`], { stdio: 'pipe' });
@@ -273,22 +274,34 @@ describe('review Git repository environment isolation (GH-270)', () => {
       try {
         const creation = h.create();
         if (fifo) {
-          await expect(creation).rejects.toThrow(/custody unconfirmed/);
-          expect(h.ledger.getWorktree(h.id)).toBeNull(); expect(existsSync(unblocked)).toBe(false);
-          const state = JSON.parse(readFileSync(ready, 'utf8')) as { tree: string; admin: string };
+          const error = await creation.then(() => null, (failure: unknown) => failure);
+          expect(existsSync(unblocked)).toBe(false);
+          await expect(Promise.reject(error)).rejects.toThrow(/custody unconfirmed/);
+          expect(h.ledger.getWorktree(h.id)).toBeNull();
+          const state = JSON.parse(readFileSync(ready, 'utf8')) as { tree: string; admin: string; file: string; head: string };
           expect(readFileSync(join(state.tree, 'retained-data'), 'utf8')).toBe('owned successful setup');
           expect(existsSync(join(state.admin, 'locked'))).toBe(true);
-          expect(git(h.repo.path, ['rev-parse', h.ref])).toBe(h.repo.head());
+          if (metadata === 'HEAD') expect(git(h.repo.path, ['rev-parse', h.ref])).toBe(h.repo.head());
+          else { expect(lstatSync(state.file).isFIFO()).toBe(true); expect(state.head.trim()).toBe(h.repo.head()); }
+          const allocate = vi.fn<AgentRuntime['spawn']>(async () => { throw new Error('unresolved checkout must not reach an adapter'); });
+          const adapter: AgentRuntime = { id: 'pi', capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+            health: () => ({ state: 'ok' }), dispose: async () => {}, spawn: allocate };
+          class Registry extends RuntimeRegistry { override runtimeIdFor(): RuntimeId { return 'pi'; } override runtimeFor(): AgentRuntime { return adapter; } }
+          const registry = new Registry({ config: loadConfig({ GRU_COMMAND_HOME: directory() }), store: new SessionStore(directory()) });
+          try { await expect(registry.spawn('minion', { cwd: state.tree })).rejects.toThrow(/handoff unresolved/); expect(allocate).not.toHaveBeenCalled(); }
+          finally { await registry.dispose(); }
         } else {
           const lane = await creation; handoffProof.capturePortLaneHandoff(h.worktrees, lane)();
           expect(readFileSync(join(lane.path, 'retained-data'), 'utf8')).toBe('owned successful setup');
         }
-      } finally {
+      } catch (error) { failures.push({ metadata, authority, fifo, error }); }
+      finally {
         writeFileSync(finished, 'creation settled');
         try { expect(await settled).toBe(0); }
-        finally { if (existsSync(ready)) { const state = JSON.parse(readFileSync(ready, 'utf8')) as { file: string; head: string }; rmSync(state.file, { force: true }); writeFileSync(state.file, state.head); } }
+        finally { if (existsSync(ready)) { const state = JSON.parse(readFileSync(ready, 'utf8')) as { file: string; head: string }; if (existsSync(join(state.file, '..'))) { rmSync(state.file, { force: true }); writeFileSync(state.file, state.head); } } }
       }
     }
+    expect(failures).toEqual([]); // report every authority, never stop at the first FIFO
   });
 
   it('retains original forced verification authority after admission resident and pacing waits without rearming (final review)', async () => {
@@ -1150,6 +1163,34 @@ describe('review Git repository environment isolation (GH-270)', () => {
       const restart = await refused(freshRebrief({ ledger, worktrees: forwarded, registry, jobId: job.id, note: 'reopened service ledger', briefing: null }));
       const directive = await refused(freshDirective({ ledger, worktrees: forwarded, registry, jobId: job.id, directive: 'accepted repair', signal: new AbortController().signal }));
       observations.push({ observer: duringPublication, restart, directive, spawns: registry.spawn.mock.calls.length, prompts: prompt.mock.calls.length });
+      // Exercise the merged LIVE path: custody precedes exactly one physical
+      // prompt, and main's observer follows its real completion, not a race.
+      const sessionFile = join(directory(), 'directive-live.jsonl'); writeFileSync(sessionFile, '');
+      let finish!: () => void;
+      const physical = new Promise<void>((done) => { finish = done; });
+      const livePrompt = vi.fn(async () => { await physical; writeFileSync(sessionFile, 'physical completion'); });
+      const liveHandle: AgentHandle = { id: 'contained-live', role: 'minion', sessionFile,
+        capabilities: { streaming: true, steer: 'native', resume: 'file', images: false, thinking: false, thinkingLevelControl: false, followUp: false },
+        prompt: livePrompt, steer: async () => {}, followUp: async () => {}, dispose: async () => {}, subscribe: () => () => {},
+        health: () => ({ state: 'idle', lastActivity: null, sessionFile }) };
+      ledger.registerAgent({ id: liveHandle.id, role: 'minion', jobId: job.id, parentage: 'top-level', sessionFile });
+      const observe = vi.fn(() => readFileSync(sessionFile, 'utf8'));
+      const liveRegistry = { ...registry, getHandle: (id: string) => id === liveHandle.id ? liveHandle : null };
+      const routing = freshDirective({ ledger, worktrees: forwarded, registry: liveRegistry, jobId: job.id, directive: 'one physical continuation',
+        signal: new AbortController().signal, observeBlindTurn: observe });
+      try {
+        if (forged) await expect(routing).rejects.toThrow(/handoff unresolved/);
+        else {
+          await vi.waitFor(() => expect(livePrompt).toHaveBeenCalledTimes(1));
+          expect(observe).not.toHaveBeenCalled();
+          finish();
+          await expect(routing).resolves.toMatchObject({ delivered: true, outcome: 'completed', minionId: liveHandle.id });
+          expect(observe).toHaveBeenCalledExactlyOnceWith(job.id, sessionFile);
+          expect(observe).toHaveReturnedWith('physical completion'); // outside the observer's swallowed-error boundary
+        }
+        expect(livePrompt).toHaveBeenCalledTimes(forged ? 0 : 1);
+        expect(observe).toHaveBeenCalledTimes(forged ? 0 : 1);
+      } finally { finish(); await Promise.allSettled([routing]); }
       expect(ledger.getWorktree(job.id)?.status).toBe('active');
       expect(readFileSync(join(row.path, 'retained-data'), 'utf8')).toBe('retain');
       expect(existsSync(admin)).toBe(true); expect(existsSync(join(admin, 'locked'))).toBe(false);

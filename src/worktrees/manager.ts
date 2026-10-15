@@ -1353,6 +1353,7 @@ export class WorktreeManager {
         if (this.branchHasForeignHolder(trees, ref, ownedPath)) throw new Error(`created branch ${ref} acquired a foreign holder`);
         const receipt = await query(repoPath, ['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
         if (receipt !== `${custody.sha}\0${custody.token}`) throw new Error(`created branch ${ref} receipt changed under deletion lock`);
+        this.assertRollbackBranchMetadata(repoPath, custody, common);
         // No await after the final nonce/backlink/HEAD proof and before commit.
         const admin = existsSync(ownedPath) ? this.assertCreationCustody(repoPath, ownedPath, custody, common)
           : this.orphanCreationAdmin(repoPath, ownedPath, custody, common);
@@ -1478,15 +1479,49 @@ export class WorktreeManager {
     }
   }
 
-  private assertBranchCreationCustody(repoPath: string, custody: CreationCustody, ownedPath: string | null): void {
+  /** Derive the assigned common directory without letting Git read an
+   * unproven ref/HEAD before rollback's finite metadata checks. */
+  private creationCommonDirectory(repoPath: string): string {
+    const git = join(repoPath, '.git');
+    const canonical = realpathSync(git);
+    if (lstatSync(canonical).isDirectory()) return canonical;
+    const gitFile = readWorktreeMetadata(git).trim();
+    if (!gitFile.startsWith('gitdir: ')) throw new Error('missing repository gitdir');
+    const admin = realpathSync(resolve(repoPath, gitFile.slice('gitdir: '.length)));
+    return realpathSync(resolve(admin, readWorktreeMetadata(join(admin, 'commondir')).trim()));
+  }
+
+  private assertRollbackBranchMetadata(repoPath: string, custody: CreationCustody, common: string): void {
+    if (this.creationCommonDirectory(repoPath) !== common) throw new Error('creation common directory changed during rollback');
+    if (custody.branch === null) return;
+    const ref = `refs/heads/${custody.branch}`, file = join(common, ref);
+    if (existsSync(file)) {
+      if (realpathSync(file) !== file || readWorktreeMetadata(file).trim() !== custody.sha) throw new Error(`created branch ${ref} changed`);
+    } else readWorktreeMetadata(join(common, 'packed-refs'), 16 * 1024 * 1024);
+  }
+
+  private async assertBranchCreationCustody(repoPath: string, custody: CreationCustody, ownedPath: string | null, common: string, assertResources: () => void): Promise<void> {
     if (!custody.branchCreated || custody.branch === null) return;
     const ref = `refs/heads/${custody.branch}`;
-    if (spawnGit(repoPath, ['symbolic-ref', '--quiet', '--no-recurse', ref]).status !== 1) {
+    const query = async (args: readonly string[]) => {
+      assertResources();
+      this.assertRollbackBranchMetadata(repoPath, custody, common);
+      const result = await this.creationMetadata(repoPath, args);
+      assertResources();
+      this.assertRollbackBranchMetadata(repoPath, custody, common); // reprove after every awaited query
+      return result;
+    };
+    if ((await query(['symbolic-ref', '--quiet', '--no-recurse', ref])).status !== 1) {
       throw new Error(`created branch ${ref} is no longer a direct ref`);
     }
-    const receipt = runGit(repoPath, ['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
-    const tip = runGit(repoPath, ['rev-parse', '--verify', ref]);
-    const trees = runGit(repoPath, ['worktree', 'list', '--porcelain', '-z']);
+    const read = async (args: readonly string[]): Promise<string> => {
+      const result = await query(args);
+      if (result.status !== 0) throw new Error(`creation custody query ${args[0]} failed`);
+      return result.stdout.trim();
+    };
+    const receipt = await read(['reflog', 'show', '-1', '--format=%H%x00%gs', ref]);
+    const tip = await read(['rev-parse', '--verify', ref]);
+    const trees = await read(['worktree', 'list', '--porcelain', '-z']);
     if (tip !== custody.sha || receipt !== `${custody.sha}\0${custody.token}` || this.branchHasForeignHolder(trees, ref, ownedPath)) {
       throw new Error(`created branch ${ref} changed or is held by another worktree`);
     }
@@ -1507,28 +1542,43 @@ export class WorktreeManager {
    * resources and reports both the original failure and the missing proof. */
   private async rollbackPartialLane(repoPath: string, path: string, custody: CreationCustody, originalError: unknown): Promise<void> {
     try {
+      const common = this.creationCommonDirectory(repoPath);
       const present = custody.addAttempted && existsSync(path);
-      const orphanAdmin = custody.addAttempted && !present ? this.orphanCreationAdmin(repoPath, path, custody) : null;
+      const orphanAdmin = custody.addAttempted && !present ? this.orphanCreationAdmin(repoPath, path, custody, common) : null;
       const ownedPath = present || orphanAdmin !== null ? path : null;
-      if (present) this.assertCreationCustody(repoPath, path, custody);
-      this.assertBranchCreationCustody(repoPath, custody, ownedPath);
+      const assertResources = (): void => {
+        if (this.creationCommonDirectory(repoPath) !== common) throw new Error('creation common directory changed during rollback');
+        if (present) this.assertCreationCustody(repoPath, path, custody, common);
+        else if (orphanAdmin !== null && this.orphanCreationAdmin(repoPath, path, custody, common) !== orphanAdmin) throw new Error('orphaned worktree custody changed during rollback');
+      };
+      assertResources();
+      await this.assertBranchCreationCustody(repoPath, custody, ownedPath, common, assertResources);
+      assertResources();
       if (custody.branchCreated && custody.branch !== null) {
         // Keep the invocation-owned checkout holding this branch until its
         // compare-and-delete finishes. Dropping the checkout first opens a
         // window for an ordinary external worktree to adopt the same tip.
         // No owned holder means no destructive authority: retain the ref.
-        const heldRef = orphanAdmin === null ? (ownedPath === null ? null : runGit(ownedPath, ['symbolic-ref', 'HEAD']))
-          : readWorktreeMetadata(join(orphanAdmin, 'HEAD')).trim().replace(/^ref: /u, '');
+        let heldRef: string | null = null;
+        if (orphanAdmin !== null) heldRef = readWorktreeMetadata(join(orphanAdmin, 'HEAD')).trim().replace(/^ref: /u, '');
+        else if (ownedPath !== null) {
+          const result = await this.creationMetadata(ownedPath, ['symbolic-ref', 'HEAD']);
+          if (result.status !== 0) throw new Error('creation custody HEAD query failed');
+          heldRef = result.stdout.trim();
+        }
+        assertResources();
         if (ownedPath === null || heldRef !== `refs/heads/${custody.branch}`) {
           throw new Error(`created branch ${custody.branch} has no invocation-owned checkout reservation`);
         }
+        this.assertRollbackBranchMetadata(repoPath, custody, common);
         await this.updateDirectCreationRef(repoPath, custody, 'delete', ownedPath);
       }
       if (ownedPath !== null) {
         // The awaited transaction may run configured hooks or external actors.
         // Never remove a path/admin entry using the pre-await custody proof.
-        if (existsSync(path)) this.assertCreationCustody(repoPath, path, custody);
-        else if (this.orphanCreationAdmin(repoPath, path, custody) !== orphanAdmin || orphanAdmin === null) {
+        if (this.creationCommonDirectory(repoPath) !== common) throw new Error('creation common directory changed during rollback');
+        if (existsSync(path)) this.assertCreationCustody(repoPath, path, custody, common);
+        else if (this.orphanCreationAdmin(repoPath, path, custody, common) !== orphanAdmin || orphanAdmin === null) {
           throw new Error('orphaned worktree custody changed during rollback');
         }
         // Git protects locked lanes even against a single --force.
