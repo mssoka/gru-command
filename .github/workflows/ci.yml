@@ -75,3 +75,15 @@ jobs:
       - name: Browser e2e (all projects)
         working-directory: web
         run: npx playwright test --ignore-snapshots
+
+      # A Linux-only e2e failure is debuggable from its traces/screenshots.
+      - name: Upload browser e2e results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: |
+            web/test-results*/
+            web/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7

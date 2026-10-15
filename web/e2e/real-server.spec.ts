@@ -35,24 +35,39 @@ const JEV_MODE_FILE = join(tmpdir(), `gru-e2e-jev-mode-${Date.now()}`);
 const JEV_PRELOAD = join(import.meta.dirname, '..', '..', 'test', 'helpers', 'jev-fetch-double.mjs');
 process.env.CLAUDE_DOUBLE_LOG = DOUBLE_LOG;
 
-/** The newest {prompt, images, argv} the agent-side double received whose
- * prompt carries `text` — the invocation this test sent. Never just the
- * log's last line: a background service turn (a wake, an awareness pass)
- * that ends after the reply would be "last" and make the receipt depend
- * on test order (#402). */
-function agentPromptContaining(text: string): { prompt: string; images: number; argv: string[] } | null {
+type AgentInvocation = { prompt: string; images: number; argv: string[] };
+
+/** The newest invocation the agent-side double logged whose prompt carries
+ * `text` — the one this test sent. Never just the log's last line: a
+ * background service turn (a wake, an awareness pass) that ends after the
+ * reply would be "last" and make the receipt depend on test order (#402).
+ * A line still being appended by a concurrent turn is not a record yet. */
+function newestInvocationContaining(text: string): AgentInvocation | null {
   let lines: string[];
   try {
-    lines = readFileSync(DOUBLE_LOG, 'utf-8').trim().split('\n');
+    lines = readFileSync(DOUBLE_LOG, 'utf-8').split('\n');
   } catch {
     return null;
   }
-  for (const line of lines.reverse()) {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!;
     if (line === '') continue;
-    const record = JSON.parse(line) as { prompt: string; images: number; argv: string[] };
+    let record: AgentInvocation;
+    try {
+      record = JSON.parse(line) as AgentInvocation;
+    } catch {
+      continue;
+    }
     if (typeof record.prompt === 'string' && record.prompt.includes(text)) return record;
   }
   return null;
+}
+
+/** Waits (bounded) for the double to log the invocation carrying `text`:
+ * it appends at turn end, which can trail the rendered reply. */
+async function agentPromptContaining(text: string): Promise<AgentInvocation> {
+  await expect.poll(() => newestInvocationContaining(text) !== null, { message: `double logged a prompt carrying ${JSON.stringify(text)}` }).toBe(true);
+  return newestInvocationContaining(text)!;
 }
 
 let service: RealServiceHandle | null = null;
@@ -152,7 +167,7 @@ test('multi-line prompt rides the real socket intact (agent receives the newline
   await expect(input).toHaveValue('');
   // AGENT-SIDE receipt: the double's prompt log carries the EXACT
   // composer text — the wire never flattened the newline.
-  expect(agentPromptContaining(line2)?.prompt).toContain(`${line1}\n${line2}`);
+  expect((await agentPromptContaining(`${line1}\n${line2}`)).prompt).toContain(`${line1}\n${line2}`);
 });
 
 test('real native compact preserves history and New chat starts unresumed behind a durable epoch', async ({ page }) => {
@@ -184,7 +199,7 @@ test('real native compact preserves history and New chat starts unresumed behind
   await page.reload();
   await expect(page.locator('.msg--user', { hasText: 'real context control old words' })).toHaveCount(0);
   await sendAndWaitReply(page, 'first real words in fresh epoch');
-  const invocation = agentPromptContaining('first real words in fresh epoch');
+  const invocation = await agentPromptContaining('first real words in fresh epoch');
   expect(invocation?.argv).toContain('--session-id');
   expect(invocation?.argv).not.toContain('--resume');
 });
@@ -662,7 +677,7 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
 
     // AGENT-SIDE receipt (not just UI): the double's prompt log carries
     // the manifest with the absolute workspace path…
-    const agentPrompt = agentPromptContaining('read the plan');
+    const agentPrompt = await agentPromptContaining('read the plan');
     expect(agentPrompt?.prompt).toContain('[attached files — read them yourself at these paths]');
     expect(agentPrompt?.prompt).toContain(realWsFile);
     // …and NO image bytes were ever attached through the runtime.
@@ -733,7 +748,7 @@ test.describe('attach flow (SPEC ruling 19) — full gesture', () => {
 
     // The sent path points AT it — the agent received THAT path.
     await expect(page.locator('.msg--gru', { hasText: storedPath })).toBeVisible();
-    const agentPrompt = agentPromptContaining('what did I just shoot');
+    const agentPrompt = await agentPromptContaining('what did I just shoot');
     expect(agentPrompt?.prompt).toContain(storedPath);
     expect(agentPrompt?.prompt).toContain('(image)');
     expect(agentPrompt?.images ?? -1).toBe(0); // paths only, never bytes

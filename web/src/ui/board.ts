@@ -6,7 +6,8 @@
  * The surface stack:
  *   - the status chip rail (v4 health row relocated; `board-rail.ts`)
  *     under the command bar carries whole-system state incl. the labeled
- *     heist/PR/minion counts and the Jev/unacked trackers;
+ *     heist/PR/minion counts, the live machine (ALERTS) count and the
+ *     Jev/wake trackers;
  *   - attention-bucketed job rows (NEEDS GRU / IN FLIGHT / SETTLED /
  *     COLD) with sticky headers and counts;
  *   - the crew rail (CREW/TRANSCRIPTS tabs, dense rows, disposed overflow);
