@@ -71,6 +71,14 @@ class FakeHandle implements AgentHandle {
   state: AgentState = 'idle';
   disposed = false;
   promptCount = 0;
+  /** Adapter-owned cessation evidence (Option A, F60-P2). A COMPLETED fake
+   * disposal attests 'ceased'; tests may force 'unknown' (or a throwing
+   * method) to model an unproven predecessor stop. Never derived from
+   * health/metadata by any consumer. */
+  cessation: 'ceased' | 'unknown' = 'unknown';
+  cessationEvidence(): 'ceased' | 'unknown' {
+    return this.cessation;
+  }
   /** Recorded prompt deliveries (text + owner) — resume assertions. */
   readonly promptCalls: { text: string; owner: string | null }[] = [];
   /** hasLiveProcess probe result; false = no live child process. */
@@ -151,6 +159,7 @@ class FakeHandle implements AgentHandle {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.setState('disposed');
+    this.cessation = 'ceased';
   }
 }
 
@@ -384,6 +393,29 @@ describe('supervisor — watchdog + restart ladder', () => {
     expect(h.supervisor.viewFor('gru-hang')).toBeNull(); // old id retired
     // The FYI hang notification fired exactly once for the cluster.
     expect(h.notificationsOfKind('supervision.hang').length).toBe(1);
+  });
+
+  it('never replaces an eligible ordinary session whose predecessor stop is unproven (Option A, F60-P2)', async () => {
+    const sessionFile = join(tmpDir(), 'gru-unproven', 'session.jsonl');
+    mkdirSync(join(sessionFile, '..'), { recursive: true });
+    writeFileSync(sessionFile, '{}\n', 'utf-8');
+    const handle = new FakeHandle('gru', 'gru-unproven-stop', sessionFile);
+    h.registry.adopt(handle);
+    const spawnsBefore = h.registry.spawnCalls.length;
+    // The adapter cannot attest cessation: its disposal rejects and its
+    // evidence stays UNKNOWN. Lock/native/active-file retirement is NOT proof.
+    handle.dispose = async () => { throw new Error('dispose rejected (unproven cessation)'); };
+    hang(handle);
+    h.advance(60); // past turn_silence_ms (50)
+    await sleep(60);
+    // NO replacement was spawned or resumed against the maybe-live session...
+    expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+    // ...the agent is stopped as visible debt, never silently replaced...
+    expect(h.supervisor.viewFor('gru-unproven-stop')?.state).toBe('stopped');
+    // ...and the unresolved predecessor stop is durably reported.
+    expect(
+      h.api.listEvents({ limit: 100 }).some((e) => e.kind === 'supervision.restart-unproven-stop'),
+    ).toBe(true);
   });
 
   it('an open silent native compaction is warned about once and never restarted', async () => {
@@ -1537,9 +1569,146 @@ describe('supervisor — declared slots (the Gru chat session shape)', () => {
     expect(view?.slotId).toBe('gru-main');
     h.dispose();
   });
+
+  it('reports canReplace truthfully for an empty declared slot (F60-P2 null-custody regression)', () => {
+    const h = boot();
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-p2-empty',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      expect(slot.current()).toBeNull(); // no bound agent yet
+      // Framed as a NAMED behavioral assertion, not an accidental uncaught
+      // TypeError: a brand-new slot has no predecessor custody, so canReplace
+      // must answer truthfully without throwing.
+      let outcome: boolean | string;
+      try {
+        outcome = slot.canReplace();
+      } catch (error) {
+        outcome = `THREW:${String(error)}`;
+      }
+      expect(outcome).toBe(true);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('refuses every later ordinary slot ensure/replace while the predecessor stop is unproven (F60-P2 fence)', async () => {
+    const h = boot();
+    const slot = h.supervisor.declareSlot({
+      id: 'gru-p2-fence',
+      role: 'gru',
+      spawn: (options) => h.registry.spawn('gru', options),
+    });
+    try {
+      const first = (await slot.ensure({})) as FakeHandle;
+      const spawnsBefore = h.registry.spawnCalls.length;
+      // Independent non-vacuous replacement-side-effect observer: the SAME
+      // recorder is required to fire on a healthy replacement (the positive
+      // control below), so a zero count here is a real observation.
+      const swaps: FakeHandle[] = [];
+      slot.onSwap((handle) => swaps.push(handle as FakeHandle));
+      // The adapter cannot attest cessation: its disposal rejects and its
+      // evidence stays UNKNOWN. Lock/native/metadata retirement is NOT proof.
+      first.dispose = async () => { throw new Error('dispose rejected (unproven cessation)'); };
+      hang(first);
+      h.advance(60); // past turn_silence_ms (50): the ordinary restart rung runs
+      // Deterministic settlement on the DURABLE observable, not an absence sleep.
+      await vi.waitFor(() => {
+        expect(
+          h.api.listEvents({ limit: 200 }).some((e) => e.kind === 'supervision.restart-unproven-stop'),
+        ).toBe(true);
+      }, { timeout: 2_000 });
+      // The rung-local guard must NOT be the only fence: the RETAINED ordinary
+      // slot custody must refuse a later ensure/replace (including human intent).
+      expect(slot.canReplace()).toBe(false);
+      await expect(slot.ensure({ intent: 'user' })).rejects.toThrow(/unproven|predecessor/);
+      expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+      // ...and a REPEATED autonomous ensure is fenced the same way.
+      await expect(slot.ensure({ intent: 'autonomous' })).rejects.toThrow(/unproven|predecessor/);
+      expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+      // The legitimate ATTEMPT record is PRESERVED: the rung tried and then
+      // correctly stopped BEFORE replacing (its absence was the mis-specified
+      // fourth control).
+      expect(h.api.listEvents({ limit: 200 }).some((e) => e.kind === 'supervision.restart')).toBe(true);
+      // Independent replacement-side-effect observation: the observer that
+      // fires on a healthy replacement (proved in the next test) adopted
+      // NOTHING here, and the retained custody is presented truthfully as
+      // stopped/held rather than silently served.
+      expect(swaps).toHaveLength(0);
+      expect(slot.current()).toBeNull();
+      expect(h.supervisor.viewFor(first.id)?.state).toBe('stopped');
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it('fires the SAME onSwap/recovery observer exactly once on a healthy replacement (F60-P2 observer positive control)', async () => {
+    const h = boot();
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-p2-observer',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const first = (await slot.ensure({})) as FakeHandle;
+      // A real open turn with a named pending prompt: the replacement must
+      // adopt it AND recover the interrupted turn as an observable effect.
+      first.pendingTurnSnapshot = { text: 'finish the audit', owner: 'gru' };
+      const swaps: FakeHandle[] = [];
+      slot.onSwap((handle) => swaps.push(handle as FakeHandle));
+      hang(first); // this fixture's completed disposal attests 'ceased'
+      h.advance(60);
+      await vi.waitFor(() => { expect(swaps).toHaveLength(1); }, { timeout: 2_000 });
+      // The SAME observer fires on the healthy positive...
+      expect(slot.current()?.id).toBe(swaps[0]?.id);
+      expect(swaps[0]!.disposed).toBe(false);
+      // ...and the interrupted turn is recovered on the replacement handle.
+      await vi.waitFor(() => {
+        expect(swaps[0]!.promptCalls.some((call) => call.text === 'finish the audit')).toBe(true);
+      }, { timeout: 2_000 });
+      expect(h.api.listEvents({ limit: 200 }).some((e) => e.kind === 'supervision.turn-recovery')).toBe(true);
+      // No unproven-stop debt was created on this healthy path.
+      expect(h.api.listEvents({ limit: 200 }).some((e) => e.kind === 'supervision.restart-unproven-stop')).toBe(false);
+    } finally {
+      h.dispose();
+    }
+  });
 });
 
 describe('supervisor — intentional slot generations', () => {
+  it('refuses an intentional replacement while a predecessor stop is unproven (F60-P2 adoption fence)', async () => {
+    const h = boot();
+    try {
+      const slot = h.supervisor.declareSlot({
+        id: 'gru-p2-adopt',
+        role: 'gru',
+        spawn: (options) => h.registry.spawn('gru', options),
+      });
+      const first = (await slot.ensure({})) as FakeHandle;
+      const spawnsBefore = h.registry.spawnCalls.length;
+      // The adapter cannot attest cessation: disposal rejects, evidence UNKNOWN.
+      first.dispose = async () => { throw new Error('dispose rejected (unproven cessation)'); };
+      hang(first);
+      h.advance(60);
+      await vi.waitFor(() => {
+        expect(
+          h.api.listEvents({ limit: 200 }).some((e) => e.kind === 'supervision.restart-unproven-stop'),
+        ).toBe(true);
+      }, { timeout: 2_000 });
+      // A direct intentional replacement must NOT leapfrog the retained debt
+      // (and must not drop it by switching the slot generation).
+      const fresh = new FakeHandle('gru', 'gru-p2-adopt-fresh', null);
+      await expect(slot.adoptReplacement(fresh)).rejects.toThrow(/unproven|predecessor/);
+      expect(slot.canReplace()).toBe(false);
+      expect(h.registry.spawnCalls.length).toBe(spawnsBefore);
+      expect(slot.current()).toBeNull();
+    } finally {
+      h.dispose();
+    }
+  });
+
   it('disposes an ordinary ensure spawn that completes after supervisor shutdown', async () => {
     const h = boot();
     const slot = h.supervisor.declareSlot({

@@ -183,6 +183,45 @@ describe('service shutdown orchestration (issue #341, R3-2 executable)', () => {
     }
   });
 
+  it('a never-settling registry still reaches forced exit exactly once at the REFRESHED deadline (F60-P5)', async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      const state: ServiceShutdownState = {
+        // An earlier stage completes well inside the first window.
+        wave: {
+          shutdown: async () => { order.push('wave'); await delay(5_000); },
+        } as unknown as WaveRunner,
+        // The runtime teardown never settles: the guard was re-armed at t=5s.
+        registry: { dispose: () => new Promise<void>(() => {}) } as unknown as RuntimeRegistry,
+        store: fakeStore(order),
+        handle: fakeHandle(order),
+      };
+      const run = runShutdown(state);
+      const priorStageMs = 5_000;
+      await vi.advanceTimersByTimeAsync(priorStageMs);
+      expect(order).toEqual(['wave']); // earlier stage done; re-arm landed here
+      expect(run.exits).toEqual([]);
+      // Refreshed deadline = prior-stage duration + the ORIGINAL
+      // SHUTDOWN_FORCE_EXIT_MS. Minus 1ms: no early exit (a stale original
+      // window would already have fired at t=15s).
+      await vi.advanceTimersByTimeAsync(priorStageMs + SHUTDOWN_FORCE_EXIT_MS - 1 - priorStageMs);
+      expect(run.exits).toEqual([]);
+      expect(run.forced()).toBe(false);
+      // ...plus 1ms: exactly ONE forced exit at the refreshed deadline.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(run.exits).toEqual([1]);
+      expect(run.forced()).toBe(true);
+      // Controlled post-deadline observation: no further exit and no later
+      // store/snapshot/persistence side effects.
+      await vi.advanceTimersByTimeAsync(SHUTDOWN_FORCE_EXIT_MS);
+      expect(run.exits).toEqual([1]);
+      expect(order).toEqual(['wave']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('is the orchestration main.ts actually invokes (wiring alarm)', () => {
     const mainSource = readFileSync(join(import.meta.dirname, '..', 'src', 'main.ts'), 'utf8');
     expect(mainSource).toContain("from './service-shutdown.js'");

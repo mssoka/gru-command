@@ -7,6 +7,7 @@ import { ClaudeCodeRuntime } from './claude-adapter.js';
 import type { ClaudeReviewSnapshot } from './claude-review-settings.js';
 import { isStreamingState, withFallbacks } from './fallbacks.js';
 import type { AgentHandle, AgentRuntime, ManagedSkillSet, ManagedWorkflowSession, RuntimeEvent, SpawnOptions } from './types.js';
+import { adapterCessationEvidence } from './types.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { createWorkflowSessionBinder } from '../workflows/session.js';
 import type { WorktreeLane } from '../dispatch/worktree-port.js';
@@ -400,24 +401,12 @@ export class RuntimeRegistry {
       /token|secret|password|api[_-]?key|authorization|bearer|basic\s/iu.test(String(error))
         ? 'credential-shaped'
         : 'rejected';
-    /** Probe evidence: explicit false only; missing/undefined/non-boolean/
-     * throwing = unknown. Returns 'false' | 'unknown'. */
-    const probeEvidence = (handle: AgentHandle, probe: keyof AgentHandle): 'false' | 'unknown' => {
-      try {
-        const method = handle[probe] as unknown as (() => unknown) | undefined;
-        if (typeof method !== 'function') return 'unknown';
-        return method.call(handle) === false ? 'false' : 'unknown';
-      } catch { return 'unknown'; }
-    };
-    /** Adapter-owned cessation proof — NO fulfillment shortcut over
-     * contrary/unknown facts (terminal health, or settled dispose AND
-     * explicit-false process/compaction evidence). */
-    const isProvenCeased = (handle: AgentHandle, disposeSettled: boolean): boolean => {
-      if (handle.health().state === 'disposed') return true;
-      return disposeSettled === true &&
-        probeEvidence(handle, 'hasLiveProcess') === 'false' &&
-        probeEvidence(handle, 'isCompacting') === 'false';
-    };
+    /** Adapter-owned cessation proof (Option A, F60-P1): ONLY the adapter's
+     * own 'ceased' evidence proves a member stopped. Terminal health, dispose
+     * fulfillment/rejection settlement, lock release and native retirement are
+     * never proof; a missing/throwing/UNKNOWN answer leaves the member debt. */
+    const isProvenCeased = (handle: AgentHandle): boolean =>
+      adapterCessationEvidence(handle) === 'ceased';
     const everyMemberProven = (): boolean =>
       [...pairMembers].every((handle) => proofOutcomes.get(handle.id) === 'proved');
     /** THE single release edge for the pair: closed, no in-flight pair
@@ -436,30 +425,29 @@ export class RuntimeRegistry {
     const markDebt = (agentId: string): void => {
       proofOutcomes.set(agentId, 'debt');
     };
-    /** Owned disposal of ONE member: contained on every path; fulfillment
-     * alone is never cessation when probes are unknown/contrary. */
+    /** Owned disposal of ONE member: contained on every path; settlement
+     * alone is never cessation — only the adapter's own evidence proves it. */
     const ownedDispose = async (handle: AgentHandle): Promise<void> => {
-      let disposeSettled = false;
       try {
         await handle.dispose();
-        disposeSettled = true;
       } catch (error) {
-        // A rejected disposal may still prove cessation via terminal
-        // health; otherwise the member stays counted debt. Contained.
+        // Contained: attributed, but a rejected (or fulfilled) disposal is
+        // never proof. The member stays counted debt unless the adapter
+        // attests 'ceased' below.
         disposalFailures.push({ agentId: handle.id, reason: reasonCode(error) });
       }
-      if (isProvenCeased(handle, disposeSettled)) {
+      if (isProvenCeased(handle)) {
         prove(handle.id);
       } else {
         markDebt(handle.id);
       }
     };
-    /** Bounded, idempotent reconciliation (health truth only) — the debt
-     * path's production consumer is the registry 'disposed'-event
-     * traversal (no watcher/timer). */
+    /** Bounded, idempotent reconciliation (adapter evidence only) — the debt
+     * path's production consumer is the registry 'disposed'-event traversal
+     * (no watcher/timer). */
     const reconcile = (): void => {
       for (const handle of [...pairMembers]) {
-        if (proofOutcomes.get(handle.id) === 'debt' && isProvenCeased(handle, false)) prove(handle.id);
+        if (proofOutcomes.get(handle.id) === 'debt' && isProvenCeased(handle)) prove(handle.id);
       }
       releasePairIfProven();
     };
@@ -701,24 +689,16 @@ export class RuntimeRegistry {
         if (property === 'dispose') return (): Promise<void> => {
           if (disposing !== null) return disposing;
           disposingNow = true;
-          // Cessation proof, not fulfillment: release requires terminal
-          // 'disposed' health, OR a settled dispose PLUS explicit-false
-          // process/compaction evidence. Unknown/contrary probes retain
-          // the permit (visible debt) — no shortcut over live facts.
-          const ceased = (): boolean => {
-            if (target.health().state === 'disposed') return true;
-            const probe = (probeFn: unknown): 'false' | 'unknown' => {
-              if (typeof probeFn !== 'function') return 'unknown';
-              try { return (probeFn as () => unknown).call(target) === false ? 'false' : 'unknown'; } catch { return 'unknown'; }
-            };
-            return probe(target.hasLiveProcess) === 'false' && probe(target.isCompacting) === 'false';
-          };
+          // Cessation proof, not fulfillment (Option A, F60-P1): the permit is
+          // released ONLY when the adapter itself attests 'ceased'. Terminal
+          // 'disposed' health, a settled or rejected dispose, lock release and
+          // native retirement are never proof — missing/throwing/UNKNOWN
+          // evidence keeps the slot owned as visible debt, reconciled later by
+          // the adapter-evidence event path below if a late positive arrives.
           disposing = Promise.resolve().then(() => target.dispose()).then(
-            () => { if (ceased()) releaseHandle(); },
+            () => { if (adapterCessationEvidence(target) === 'ceased') releaseHandle(); },
             (error: unknown) => {
-              // A rejected disposal still proves cessation when terminal
-              // health says so; otherwise the slot stays owned/debt.
-              if (target.health().state === 'disposed') releaseHandle();
+              if (adapterCessationEvidence(target) === 'ceased') releaseHandle();
               disposing = null;
               disposingNow = false;
               throw error;
@@ -797,8 +777,14 @@ export class RuntimeRegistry {
     // reconsider pass) must read the budget AFTER the release, or it can
     // see a full pool, exit, and never receive another trigger.
     handle.subscribe((event) => {
-      if (event.type === 'state' && event.state === 'disposed' && !disposingNow) {
-        releaseHandle();
+      // Ownership release is adapter-evidence-only (Option A, F60-P1). A
+      // disposed state OR a late positive cessation event releases the permit
+      // only when the adapter itself attests 'ceased'; metadata never does.
+      if (
+        (event.type === 'state' && event.state === 'disposed' && !disposingNow) ||
+        (event.type === 'cessation_evidence' && event.evidence === 'ceased')
+      ) {
+        if (adapterCessationEvidence(handle) === 'ceased') releaseHandle();
       }
     });
     handle.subscribe((event) => {

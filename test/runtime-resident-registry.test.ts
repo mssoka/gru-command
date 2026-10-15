@@ -23,7 +23,7 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean, closeSe
   let peak = 0;
   /** Optional hold for verdict-bearing prompts (pending-work assertions). */
   let verdictHold: Promise<void> | null = null;
-  const controllers = new Map<string, { active: boolean; disposed: boolean }>();
+  const controllers = new Map<string, { active: boolean; disposed: boolean; evidence: 'ceased' | 'unknown' }>();
   const events = new Map<string, (event: RuntimeEvent) => void>();
   const made: Array<{ id: string; adapter: string; resumeFile?: string }> = [];
   const adapter = (id: RuntimeId): AgentRuntime => ({
@@ -31,7 +31,7 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean, closeSe
     spawn: async (role: Role, opts: SpawnOptions = {}): Promise<AgentHandle> => {
       if (shouldFail?.(role) === true) throw new Error('fake adapter refused spawn');
       const agentId = `worker-${++next}`;
-      const activity = { active: false, disposed: false };
+      const activity = { active: false, disposed: false, evidence: 'unknown' as 'ceased' | 'unknown' };
       controllers.set(agentId, activity);
       made.push({ id: agentId, adapter: id, ...(opts.resumeFile === undefined ? {} : { resumeFile: opts.resumeFile }) });
       live += 1;
@@ -42,6 +42,10 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean, closeSe
       return {
         id: agentId, role, sessionFile: `${dir}/${agentId}.jsonl`, capabilities: caps,
         health: () => ({ state: activity.disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: `${dir}/${agentId}.jsonl` }),
+        // Adapter-owned cessation evidence (Option A): this fixture attests
+        // 'ceased' only when its own disposal completed. Tests may leave it
+        // 'unknown' (or point at a throwing method) to model the new timeout.
+        cessationEvidence: () => activity.evidence,
         subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
         prompt: async () => {}, steer: async () => {}, followUp: async () => {},
         promptWithVerdict: async () => {
@@ -52,8 +56,10 @@ function harness(capacity: number, shouldFail?: (role: Role) => boolean, closeSe
         dispose: async () => {
           if (activity.disposed) return;
           activity.disposed = true;
+          activity.evidence = 'ceased';
           live -= 1;
           emit({ type: 'state', state: 'disposed' });
+          emit({ type: 'cessation_evidence', evidence: 'ceased' });
         },
       };
     },
@@ -381,9 +387,11 @@ describe('registry resident boundary across adapters', () => {
       // A queued implementer can never be admitted above the cap by the debt.
       const leadActivity = h.controllers.get(lead.id)!;
       h.controllers.clear();
-      // Proven cessation (terminal health truth) reconciles and releases ONCE.
+      // Proven cessation is ADAPTER-OWNED (Option A, F60-P1): terminal health
+      // alone is metadata, so the fixture supplies the explicit adapter
+      // attestation a completed stop produces; reconcile then releases ONCE.
       leadActivity.disposed = true;
-      h.events.get(lead.id)!({ type: 'state', state: 'disposed' });
+      leadActivity.evidence = 'ceased';
       round.reconcileCleanup();
       expect(round.cleanupDebt()).toHaveLength(0);
       expect(h.registry.residents.occupied).toBe(0);
@@ -417,10 +425,11 @@ describe('registry resident boundary across adapters', () => {
         value: () => Promise.reject(new Error('lead disposal failed')),
         configurable: true,
       });
-      // The adapter refused the dispose CALL, but the child's terminal exit
-      // was already observed (health truth): the pair must release, and the
-      // close still reports the disposal failure.
+      // The adapter refused the dispose CALL, but it attests the stop itself
+      // completed (adapter-owned evidence, NOT health): the pair must release,
+      // and the close still reports the disposal failure.
       h.controllers.get(lead.id)!.disposed = true;
+      h.controllers.get(lead.id)!.evidence = 'ceased';
       await expect(round.close()).rejects.toThrow(/review reservation disposal failed/);
       // The pair is free again: a queued single worker is admitted at once.
       const admitted = h.registry.spawn('minion');
@@ -466,6 +475,7 @@ describe('registry resident boundary across adapters', () => {
         return {
           id: 'late-child', role, sessionFile: `${dir}/late.jsonl`, capabilities: caps,
           health: () => ({ state: 'idle', lastActivity: null, sessionFile: `${dir}/late.jsonl` }),
+          cessationEvidence: () => 'ceased',
           prompt: async () => {}, steer: async () => {}, followUp: async () => {},
           hasLiveProcess: () => false, isCompacting: () => false,
           subscribe: () => () => {}, dispose: async () => {},
@@ -515,17 +525,18 @@ describe('registry resident boundary across adapters', () => {
     const dir = mkdtempSync(join(tmpdir(), 'resident-probe-variants-'));
     const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 1 } };
     const caps2 = caps;
-    const made: Array<{ id: string; probe: () => boolean | undefined; disposed: boolean }> = [];
+    const made: Array<{ id: string; probe: () => boolean | undefined; disposed: boolean; evidence: 'ceased' | 'unknown' }> = [];
     const listeners = new Map<string, (event: RuntimeEvent) => void>();
     const adapter: AgentRuntime = {
       id: 'pi', capabilities: caps2, health: () => ({ state: 'ok' }), dispose: async () => {},
       spawn: async (role: Role): Promise<AgentHandle> => {
         const id = `variant-${made.length + 1}`;
-        made.push({ id, probe: () => undefined, disposed: false });
+        made.push({ id, probe: () => undefined, disposed: false, evidence: 'unknown' });
         const entry = made.at(-1)!;
         return {
           id, role, sessionFile: null, capabilities: caps2,
           health: () => ({ state: entry.disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
+          cessationEvidence: () => entry.evidence,
           prompt: async () => {}, steer: async () => {}, followUp: async () => {},
           // Deliberately malformed probe return (models "cannot tell"): the
           // runtime contract declares boolean, the reclaim contract must
@@ -533,7 +544,7 @@ describe('registry resident boundary across adapters', () => {
           hasLiveProcess: () => entry.probe() as boolean,
           isCompacting: () => false,
           subscribe: (listener) => { listeners.set(id, listener); return () => { listeners.delete(id); }; },
-          dispose: async () => { entry.disposed = true; listeners.get(id)?.({ type: 'state', state: 'disposed' }); },
+          dispose: async () => { entry.disposed = true; entry.evidence = 'ceased'; listeners.get(id)?.({ type: 'state', state: 'disposed' }); },
         };
       },
     };
@@ -600,6 +611,7 @@ describe('registry resident boundary across adapters', () => {
         late.release = () => resolve({
           id: 'late-pair', role: 'perkins', sessionFile: null, capabilities: caps,
           hasLiveProcess: () => false, isCompacting: () => false,
+          cessationEvidence: () => 'ceased',
           health: () => ({ state: 'idle', lastActivity: null, sessionFile: null }),
           prompt: async () => {}, steer: async () => {}, followUp: async () => {},
           subscribe: () => () => {}, dispose: async () => {},
@@ -620,28 +632,30 @@ describe('registry resident boundary across adapters', () => {
       late.release?.(); // LATE success AFTER deadline: owned cleanup, counted until proven
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
       round.reconcileCleanup();
-      expect(registry.residents.occupied).toBe(0); // proven ceased (explicit-false probes) releases ONCE
+      expect(registry.residents.occupied).toBe(0); // proven ceased (adapter evidence) releases ONCE
       round.reconcileCleanup();
       expect(registry.residents.occupied).toBe(0);
       await registry.dispose();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('a fulfilled dispose with unknown probes does NOT release; real later cessation releases once', async () => {
+  it('a fulfilled dispose with MISSING adapter evidence does NOT release; explicit adapter cessation releases once', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'resident-fulfilled-unknown-'));
     const config = { ...loadConfig({ GRU_COMMAND_HOME: dir }), concurrency: { maxWorkers: 2 } };
-    const state = { live: 'unknown' as 'unknown' | 'false', disposed: false };
+    const state = { live: 'unknown' as 'unknown' | 'false', disposed: false, evidence: 'unknown' as 'ceased' | 'unknown' };
     const handle: AgentHandle = {
       id: 'opaque', role: 'perkins', sessionFile: null, capabilities: caps,
       // Deliberately malformed probe return (models "cannot tell"): not
       // literal false, so it must never be read as proven cessation.
       hasLiveProcess: () => (state.live === 'false' ? false : undefined) as boolean,
       isCompacting: () => false,
+      // Adapter-owned cessation evidence: starts UNKNOWN and is supplied
+      // EXPLICITLY by the test — never derived from health or settlement.
+      cessationEvidence: () => state.evidence,
       health: () => ({ state: state.disposed ? 'disposed' : 'idle', lastActivity: null, sessionFile: null }),
       prompt: async () => {}, steer: async () => {}, followUp: async () => {},
-      // Fulfills WITHOUT terminal health or explicit-false probes: the debt
-      // path, not a positive release.
-      subscribe: () => () => {}, dispose: async () => {},
+      // Fulfills WITHOUT proving cessation: the debt path, not a positive release.
+      subscribe: () => () => {}, dispose: async () => { state.disposed = true; },
     };
     class OneRegistry extends RuntimeRegistry {
       override runtimeIdFor(): RuntimeId { return 'pi'; }
@@ -651,11 +665,11 @@ describe('registry resident boundary across adapters', () => {
     try {
       const round = await registry.reserveReviewRound();
       await round.spawn({ reviewLead: { systemPrompt: 'lead', tools: [], nativeTools: [] } });
-      await expect(round.close()).rejects.toThrow(/not proven ceased/); // dispose fulfilled, probes UNKNOWN -> debt, reported
+      await expect(round.close()).rejects.toThrow(/not proven ceased/); // dispose fulfilled, evidence UNKNOWN -> debt, reported
       expect(registry.residents.occupied).toBe(2); // unknown evidence retains capacity
-      state.disposed = true; // real later cessation: terminal health truth
+      state.evidence = 'ceased'; // real later cessation: the ADAPTER attests 'ceased'
       round.reconcileCleanup();
-      expect(registry.residents.occupied).toBe(0); // health-truth proof releases ONCE
+      expect(registry.residents.occupied).toBe(0); // adapter evidence releases ONCE
       await registry.dispose();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
