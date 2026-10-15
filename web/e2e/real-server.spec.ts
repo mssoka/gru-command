@@ -47,8 +47,9 @@ function newestInvocationContaining(text: string): AgentInvocation | null {
   let content: string;
   try {
     content = readFileSync(DOUBLE_LOG, 'utf-8');
-  } catch {
-    return null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; // no turn has ended yet
+    throw error;
   }
   const lines = content.split('\n');
   const last = lines.length - 1;
