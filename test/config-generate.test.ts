@@ -479,7 +479,12 @@ describe('config-generate: Claude Code is the default for new installs (#374)', 
 
     const legacy = join(tempDir('gru-command-cg-legacy-'), 'instance');
     mkdirSync(legacy, { recursive: true });
-    writeFileSync(join(legacy, 'config.toml'), 'workspace_root = "/tmp"\n');
+    const legacyWorkspace = join(tempDir('gru-command-cg-legacy-ws-'), 'ws');
+    mkdirSync(legacyWorkspace, { recursive: true });
+    writeFileSync(
+      join(legacy, 'config.toml'),
+      `workspace_root = ${JSON.stringify(legacyWorkspace)}\ndata_dir = ${JSON.stringify(join(legacy, 'data'))}\n`,
+    );
     const legacyForced = run(legacy, ['--force'], { PATH: '/usr/bin:/bin' });
     expect(legacyForced.status, `${legacyForced.stdout}\n${legacyForced.stderr}`).toBe(0);
     expect(runtimeOf(legacy)).toBe('pi');
