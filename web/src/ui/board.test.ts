@@ -2259,7 +2259,7 @@ describe('board v6 — section truth: closed receipts never queue, stopped lanes
     expect(receipt?.querySelector('.board-job__signal')).toBeNull(); // no 🔔 alert chip
   });
 
-  it('the unacked chip counts only live rows while the record keeps every durable row', () => {
+  it('the live machine count (ALERTS) counts only live rows while the record keeps every durable row', () => {
     const view = new BoardView(() => {});
     view.render(
       snapshot({
