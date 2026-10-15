@@ -400,7 +400,7 @@ function sameRebriefGeneration(current: readonly PendingRebriefRecord[], expecte
 }
 
 export class RebriefTurnCancelled extends Error {
-  constructor(readonly reason: 'terminal' | 'superseded') {
+  constructor(readonly reason: 'terminal' | 'superseded' | 'refused') {
     super(`re-brief turn cancelled before admission: ${reason}`);
     this.name = 'RebriefTurnCancelled';
   }

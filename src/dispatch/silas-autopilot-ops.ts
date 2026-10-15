@@ -662,8 +662,15 @@ export function createSilasAutopilotOps(deps: SilasAutopilotOpsDeps): SilasAutop
           // an owner hold or a verification that took the lane while this
           // producer queued must refuse before spawn/prompt.
           beforeTurnSideEffect: () => {
-            requireHoldUncovered(input.jobId, input.hold, 're-brief');
-            requireNoUnsettledVerification(input.jobId, 're-brief');
+            // A hold/verification refusal is a pre-admission cancel: it must
+            // close the markers (RebriefTurnCancelled), never strand them
+            // pending for a boot reconcile to re-deliver.
+            try {
+              requireHoldUncovered(input.jobId, input.hold, 're-brief');
+              requireNoUnsettledVerification(input.jobId, 're-brief');
+            } catch {
+              throw new RebriefTurnCancelled('refused');
+            }
             checkRebriefTurn(deps.ledger, input.jobId, markers);
           },
           onSpawned: (worker) => {

@@ -3159,5 +3159,8 @@ describe('F-H3 verification ownership re-proved at the fresh-spawn and re-brief 
     await vi.waitFor(() => expect(gate.view().worker.queued).toHaveLength(0));
     await ops.drain();
     expect(spawns).toBe(0);
+    // The refusal closes the durable markers: a pending marker would wedge the
+    // lane and a boot reconcile would re-deliver a re-brief the pass refused.
+    expect(ledger.listPendingRebriefs({ jobId: job.id })).toEqual([]);
   }, 30_000);
 });
