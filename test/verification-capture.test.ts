@@ -802,10 +802,10 @@ describe('capture CLI run: exclusive sink + honest outcome', () => {
       { ...deps({ probe: () => deadProbe }), fetchImpl, responseHeadersTimeoutMs: 30_000, stdout: () => {}, stderr: () => {} });
     expect(code).toBe(CAPTURE_EXIT.unknown);
     expect(fetchImpl).toHaveBeenCalledTimes(3);
-    // The dead claim was cleared and replaced by this run's own ownership,
-    // which the run withdrew on exit; its UNKNOWN receipt is written.
+    // The dead claim was cleared and replaced by this run's OWN ownership
+    // (kept for reconciliation after an UNKNOWN outcome); its receipt exists.
     expect(existsSync(captureReceiptPath(sinkPath))).toBe(true);
-    expect(existsSync(captureOwnerPath(sinkPath))).toBe(false);
+    expect(JSON.parse(readFileSync(captureOwnerPath(sinkPath), 'utf-8'))).toMatchObject({ request_id: 'req-stale-valid' });
   });
 
   it('accepts the bound at both timer edges and uses the injected transport (#389)', async () => {
