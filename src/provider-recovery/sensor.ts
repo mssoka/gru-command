@@ -1096,17 +1096,15 @@ export class ProviderRecoverySensor {
       // "Since the wait opened" is ledger event order — the report's stamp
       // against the wait's `provider.wait-established` event — never
       // wall-clock time, so a clock step back in any direction cannot hide
-      // a report. The latest stamp is on the open or the most recently
-      // inserted notice (only the open one is refreshed; a new one is posted
-      // only when none is open), so those two are asked; an unreadable
-      // stamp, or a wait with no establishment event, counts as reported
+      // a report. The latest stamp is on the most recently inserted notice:
+      // only the open notice is ever refreshed, a new one is posted only when
+      // none is open, and no notice is ever reopened. An unreadable stamp, or
+      // a wait with no establishment event, counts as reported
       // (conservative).
       const announced = this.ledger.findNotificationByKind(`provider-recovery.recovery-off.${wait.id}`, 'any') !== null;
       const opened = this.ledger.providerWaitEstablishedSeq(wait.id);
-      const failureSince = [
-        this.ledger.findNotificationByKind(HAND_BACK_FAILED, 'active'),
-        this.ledger.latestNotificationByKind(HAND_BACK_FAILED),
-      ].some((row) => row !== null && (opened === null || !(lastReportedAfterSeq(row) < opened)));
+      const failure = this.ledger.latestNotificationByKind(HAND_BACK_FAILED);
+      const failureSince = failure !== null && (opened === null || !(lastReportedAfterSeq(failure) < opened));
       const repeat = announced
         ? 'Announced before and the wait is still open — check whether the lane already resumed before you act. '
         : failureSince

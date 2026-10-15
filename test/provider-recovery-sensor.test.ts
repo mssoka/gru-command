@@ -1923,28 +1923,38 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     } finally {
       reads.mockRestore();
     }
-    const stamp = Number(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')?.detail
-      ?.match(/\(after ledger event (\d+)\)\.$/u)?.[1]);
-    const late = h.ledger.recordProviderWait({ id: 'wait-late-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-late'),
-      provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-late', waiterKind: 'silas-slot',
-      jobId: null, agentId: null, slotId: 'late-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
-      lineageKey: 'slot:late-slot', incidentId: 'provider-wall.late', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    const failure = h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active');
+    expect(failure).not.toBeNull();
+    const stamp = Number(failure!.detail?.match(/\(after ledger event (\d+)\)\.$/u)?.[1]);
+    expect(Number.isInteger(stamp)).toBe(true);
+    // Two waits opened after the report.
+    const later = h.ledger.recordProviderWait({ id: 'wait-later-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-wait-later-slot'),
+      provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-wait-later-slot', waiterKind: 'silas-slot',
+      jobId: null, agentId: null, slotId: 'wait-later-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+      lineageKey: 'slot:wait-later-slot', incidentId: 'provider-wall.wait-later-slot', incidentGeneration: 1, reasonClass: 'temporary-limit' });
+    const unknown = h.ledger.recordProviderWait({ id: 'wait-unknown-slot', routeKey: providerRouteKey('zai-coding-cn', 'glm-5.3', 'fp-wait-unknown-slot'),
+      provider: 'zai-coding-cn', model: 'glm-5.3', endpoint: 'e', credentialFingerprint: 'fp-wait-unknown-slot', waiterKind: 'silas-slot',
+      jobId: null, agentId: null, slotId: 'wait-unknown-slot', sessionFile: null, continuation: null, jobStatusAtEstablishment: null,
+      lineageKey: 'slot:wait-unknown-slot', incidentId: 'provider-wall.wait-unknown-slot', incidentGeneration: 1, reasonClass: 'temporary-limit' });
     // Ledger order: the earlier wait at or below the report's stamp, the
-    // later one above it; an unknown wait has no establishment event.
+    // later ones above it; an unknown wait has no establishment event.
     expect(h.ledger.providerWaitEstablishedSeq(waiting.id)).toBeLessThanOrEqual(stamp);
-    expect(h.ledger.providerWaitEstablishedSeq(late.id)).toBeGreaterThan(stamp);
+    expect(h.ledger.providerWaitEstablishedSeq(later.id)).toBeGreaterThan(stamp);
     expect(h.ledger.providerWaitEstablishedSeq('no-such-wait')).toBeNull();
-    // A wait whose establishment event cannot be found counts as reported.
+    // One later wait's establishment event cannot be found: it counts as
+    // reported, while its unmocked twin stays unmarked (the control).
     const original = h.ledger.providerWaitEstablishedSeq.bind(h.ledger);
-    const seqs = vi.spyOn(h.ledger, 'providerWaitEstablishedSeq').mockImplementation((id) => (id === late.id ? null : original(id)));
+    const seqs = vi.spyOn(h.ledger, 'providerWaitEstablishedSeq').mockImplementation((id) => (id === unknown.id ? null : original(id)));
     try {
-      // The two waits glmDebt opened and the late one.
-      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(3);
+      // The two waits glmDebt opened and the two later ones.
+      expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(4);
     } finally {
       seqs.mockRestore();
     }
-    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${late.id}`, 'active')?.detail)
-      .toContain('A boot hand-back failure was reported since this wait opened');
+    const marker = 'A boot hand-back failure was reported since this wait opened';
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active')?.detail).toContain(marker);
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${later.id}`, 'active')?.detail).not.toContain(marker);
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${unknown.id}`, 'active')?.detail).toContain(marker);
   });
 
   it('a clock step back the other way — a report after the wait opened, then a repost that sorts older — still marks the wait', async () => {
