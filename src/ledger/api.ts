@@ -472,6 +472,14 @@ export function isNotificationSeverity(value: string): value is NotificationSeve
 
 /** One durable notification row (EPICS E7 story 2 — the notification log
  * lives in the ledger; ack ids are the proven-ack contract). */
+/** Who authenticated a notification decision/disposition and which actor
+ * (if any) it declared (decision #99: a shared bearer proves only a paired
+ * caller, never an actor). */
+export interface NotificationProvenance {
+  readonly credential: string;
+  readonly declaredActor: string | null;
+}
+
 export interface NotificationRecord {
   readonly id: string;
   readonly ts: string;
@@ -3290,6 +3298,14 @@ export class LedgerApi {
    * a later re-arm-fenced event restores stop truth, so an accepted re-arm
    * followed by asynchronous refusal remains stopped after a restart.
    */
+  /** Whether a breaker alert's stop was closed as superseded (#385): the
+   * durable record a retried disposition is answered from, across restarts. */
+  hasSupervisionStopSuperseded(notificationId: string): boolean {
+    return this.db.prepare(
+      "SELECT 1 FROM events WHERE kind = 'supervision.stop-superseded' AND json_extract(payload, '$.notification_id') = ? LIMIT 1",
+    ).get(notificationId) !== undefined;
+  }
+
   durableSupervisionStops(): Map<
     string,
     {
@@ -5176,9 +5192,10 @@ export class LedgerApi {
     detail: string,
     // Required, never defaulted (#396): every caller states the credential
     // that authenticated it and any actor it declared.
-    provenance: { readonly credential: string; readonly declaredActor: string | null },
+    provenance: NotificationProvenance,
   ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('owner-decision resolution detail must be non-empty');
+    if (provenance.credential.trim() === '') throw new Error('owner-decision resolution credential must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
       if (current === null) return null;
@@ -5223,7 +5240,7 @@ export class LedgerApi {
   disposeMachineNotification(
     id: string,
     detail: string,
-    provenance: { readonly credential: string; readonly declaredActor: string | null } = { credential: 'internal', declaredActor: null },
+    provenance: NotificationProvenance = { credential: 'internal', declaredActor: null },
   ): NotificationRecord | null {
     if (detail.trim() === '') throw new Error('machine disposition detail must be non-empty');
     return this.transaction(() => {
@@ -5418,12 +5435,13 @@ export class LedgerApi {
   adoptLegacyOwnerDecision(
     id: string,
     decision: NotificationDecision,
-    provenance: { readonly credential: string; readonly declaredActor: string | null },
+    provenance: NotificationProvenance,
   ): NotificationRecord | null {
     if (provenance.credential.trim() === '') throw new Error('decision adoption credential must be non-empty');
     return this.transaction(() => {
       const current = this.getNotification(id);
-      if (current === null) return null;
+      const stored = this.db.prepare('SELECT decision_json FROM notifications WHERE id = ?').get(id) as { decision_json: string | null } | undefined;
+      if (current === null || stored === undefined) return null;
       if (current.routing !== 'needs-owner') {
         throw new NotificationDecisionRefusal(
           'not_owner_decision',
@@ -5432,8 +5450,9 @@ export class LedgerApi {
       }
       // Legacy means the STORED column is empty — never a stored decision
       // that merely failed to parse — and nothing was ever decided on it.
-      const stored = this.db.prepare('SELECT decision_json FROM notifications WHERE id = ?').get(id) as { decision_json: unknown } | undefined;
-      if (current.decision !== null || stored?.decision_json !== null || current.decidedOption !== null) {
+      const storedDecision = stored.decision_json !== null;
+      const alreadyDecided = current.decidedOption !== null;
+      if (current.decision !== null || storedDecision || alreadyDecided) {
         throw new NotificationDecisionRefusal(
           'decision_present',
           `notification "${id}" already carries a typed decision — it is never replaced`,
@@ -5451,7 +5470,7 @@ export class LedgerApi {
       this.appendEvent({
         kind: 'notification.decision-adopted',
         agentId: current.agentId,
-        payload: { id, credential: provenance.credential, declared_actor: provenance.declaredActor, option_ids: decision.options.map((option) => option.id) },
+        payload: { id, credential: provenance.credential, declaredActor: provenance.declaredActor, option_ids: decision.options.map((option) => option.id) },
       });
       return this.getNotification(id) as NotificationRecord;
     });

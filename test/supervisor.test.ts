@@ -5983,8 +5983,19 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       // The closed stop is no longer a durable stop: a restart never raises a
       // fresh control for it.
       expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(false);
-      // A retried disposition reports the same closure, never a bare record.
+      // A retried disposition reports the same closure, never a bare record —
+      // answered from the durable record, so a restarted service agrees.
       expect(rig.supervisor.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      const restarted = new Supervisor({ config: { enabled: true, turnSilenceMs: 30, restartWindowMs: 600_000, maxRestarts: 1, restartBackoffMs: 1 },
+        registry: rig.registry, ledger: rig.api, notifications: rig.center, tickMs: 5, now: () => 9_000_000 });
+      try {
+        expect(restarted.onNotificationDisposed(stop!.id)).toEqual({ ok: true, rearmed: false, superseded: true });
+      } finally {
+        restarted.dispose();
+      }
+      // Nothing the closed record owned fires later.
+      await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+      expect(rig.registry.spawnCalls).toHaveLength(spawnsBefore);
       // A fresh re-brief/directive adopts the same logical id as a NEW watching
       // record: never disposed as a restored stop, never re-alerted.
       const alertsBefore = rig.api.listNotifications({ limit: 100 }).length;
@@ -5999,6 +6010,48 @@ describe('supervisor — guarded re-arm fences (R1: parking and live producers)'
       expect(rig.api.durableSupervisionStops().has(rig.handle.id)).toBe(true);
     } finally {
       rig.close();
+    }
+  });
+
+  it('never closes a superseded stop whose agent is live, restarting, or whose closure cannot be recorded (#385)', async () => {
+    for (const variant of ['live-handle', 'in-restart', 'append-fails', 'producer-unreadable'] as const) {
+      const rig = tripBreaker();
+      try {
+        await vi.waitFor(() => expect(rig.supervisor.viewFor(rig.handle.id)?.state).toBe('stopped'));
+        const stop = rig.api.listNotifications({ limit: 30 }).find((n) => n.kind === 'supervision.breaker');
+        rig.api.setJobStatus('fenced-job', 'parked');
+        rig.api.setJobStatus('fenced-job', 'working');
+        const agents = (rig.supervisor as unknown as { agents: Map<string, { handle: unknown; inRestart: boolean; pendingRecovery: unknown }> }).agents;
+        const restore: (() => void)[] = [];
+        if (variant === 'live-handle') agents.get(rig.handle.id)!.handle = new FakeHandle('minion', rig.handle.id, null);
+        if (variant === 'in-restart') agents.get(rig.handle.id)!.inRestart = true;
+        if (variant === 'append-fails') {
+          const append = rig.api.appendCustomEvent.bind(rig.api);
+          rig.api.appendCustomEvent = ((event: Parameters<typeof append>[0]) => {
+            if (event.kind === 'supervision.stop-superseded') throw new Error('ledger write failed');
+            return append(event);
+          }) as typeof rig.api.appendCustomEvent;
+          restore.push(() => { rig.api.appendCustomEvent = append; });
+        }
+        if (variant === 'producer-unreadable') {
+          const list = rig.api.listPendingRebriefs.bind(rig.api);
+          rig.api.listPendingRebriefs = () => { throw new Error('rebrief audit unreadable'); };
+          restore.push(() => { rig.api.listPendingRebriefs = list; });
+        }
+        let outcome: ReturnType<typeof rig.supervisor.onNotificationDisposed>;
+        try {
+          outcome = rig.supervisor.onNotificationDisposed(stop!.id);
+        } finally {
+          for (const undo of restore) undo();
+        }
+        expect(outcome, variant).not.toMatchObject({ superseded: true });
+        expect(rig.api.listEvents({ limit: 200 }).filter((event) => event.kind === 'supervision.stop-superseded'), variant).toEqual([]);
+        expect(agents.get(rig.handle.id)?.pendingRecovery, variant).not.toBeNull();
+        expect(rig.supervisor.viewFor(rig.handle.id), variant).not.toBeNull();
+        expect(rig.api.durableSupervisionStops().has(rig.handle.id), variant).toBe(true);
+      } finally {
+        rig.close();
+      }
     }
   });
 

@@ -385,6 +385,10 @@ describe('decision follow-through and cross-route guards', () => {
     // Machine attention keeps its own path.
     const machine = rig.center.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Breaker' });
     expect(() => rig.api.resolveOwnerDecision(machine.id, 'nope', INTERNAL)).toThrow(/use the disposition route/u);
+    // Machine attention never adopts a typed owner decision either (#395).
+    expect(() => rig.api.adoptLegacyOwnerDecision(machine.id, decision(), INTERNAL)).toThrow(/only owner decisions adopt a typed decision/u);
+    // Provenance is required and never blank (#396).
+    expect(() => rig.api.resolveOwnerDecision(machine.id, 'x', { credential: ' ', declaredActor: null })).toThrow(/credential must be non-empty/u);
   });
 
   it('an ack can never erase a typed owner decision (feed clears stay separate)', () => {

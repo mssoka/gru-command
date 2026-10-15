@@ -15,6 +15,7 @@ import {
   type NotificationRecord,
   type NotificationRouting,
   type NotificationSeverity,
+  type NotificationProvenance,
 } from '../ledger/api.js';
 
 type Log = (level: LogLevel, msg: string, fields?: Record<string, unknown>) => void;
@@ -296,7 +297,7 @@ export class NotificationCenter {
   adoptLegacyDecision(
     id: string,
     decision: NotificationDecision,
-    provenance: { readonly credential: string; readonly declaredActor: string | null },
+    provenance: NotificationProvenance,
   ): NotificationRecord | null {
     return this.ledger.adoptLegacyOwnerDecision(id, decision, provenance);
   }

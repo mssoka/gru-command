@@ -565,7 +565,7 @@ describe('board server — HTTP API', () => {
     expect(api.getNotification('owner-escalation:legacy-open')?.decision?.options.map((option) => option.id)).toEqual(['approve']);
     expect(count()).toBe(start); // the ONE existing item, never a second
     expect(api.listEventsAfter(0, { kinds: ['notification.decision-adopted'] })).toMatchObject([
-      { payload: { id: 'owner-escalation:legacy-open', credential: 'shared-bearer', declared_actor: null, option_ids: ['approve'] } },
+      { payload: { id: 'owner-escalation:legacy-open', credential: 'shared-bearer', declaredActor: null, option_ids: ['approve'] } },
     ]);
     // The adopted row now replays like any typed escalation.
     expect((await postJson(port, path, 'board-test-token', body)).status).toBe(200);
@@ -593,6 +593,19 @@ describe('board server — HTTP API', () => {
       body: { error: 'idempotency_conflict', code: 'decision_present' },
     });
     expect(db.prepare('SELECT decision_json FROM notifications WHERE id = ?').get('owner-escalation:legacy-corrupt')).toEqual({ decision_json: '{corrupt' });
+    // A legacy row with a recorded choice is never re-decided by adoption.
+    legacy('legacy-decided');
+    db.prepare('UPDATE notifications SET decided_option = ? WHERE id = ?').run('approve', 'owner-escalation:legacy-decided');
+    expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-decided' })).toMatchObject({
+      status: 409, body: { code: 'decision_present' },
+    });
+    expect(api.getNotification('owner-escalation:legacy-decided')?.decision).toBeNull();
+    // A RESOLVED (not just acked) legacy row is closed too.
+    legacy('legacy-resolved');
+    api.resolveNotificationById('owner-escalation:legacy-resolved', 'fixture: closed before the upgrade');
+    expect(await postJson(port, path, 'board-test-token', { ...body, idempotencyKey: 'legacy-resolved' })).toMatchObject({
+      status: 409, body: { code: 'legacy_closed' },
+    });
     // A row that vanished before adoption is a 404, never a 200 with no body.
     legacy('legacy-vanished');
     const adopt = vi.spyOn(NotificationCenter.prototype, 'adoptLegacyDecision').mockReturnValueOnce(null);

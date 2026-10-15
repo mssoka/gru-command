@@ -121,10 +121,14 @@ resumed, or a fresh directive/re-brief took over — that prompt never
 replays, so the disposition instead **closes the stop** (owner decision
 2026-10-15, #385): no restart of the stale worker, a
 `supervision.stop-superseded` event records the dropped turn, the response
-says `rearm: superseded` (a retried disposition says so again), the lane no
+says `rearm: superseded` (a retried disposition says so again, answered from
+that durable event — restarts included), the lane no
 longer reads as stopped — its supervision record is retired in-process and
 durably alike — and the fresh re-brief or directive is supervised as a new
-watching record. Any other fence (an active park, a hold, a live producer, a
+watching record. The event is written first — a failed write refuses and
+changes nothing — with `notification_id`, `job_id`, `captured_epoch`,
+`current_epoch`, `producer_changed`, `had_open_turn`, `prompt_named` and
+`stop_reason`. Any other fence (an active park, a hold, a live producer, a
 live handle or restart, an unreadable authority) still refuses with the
 debt retained. A
 service restart also resets breaker state (in-memory by design) — the

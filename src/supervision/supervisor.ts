@@ -481,9 +481,6 @@ export class Supervisor {
   /** Durable stop truth for agents whose live record is gone (restart
    * hydration; code review 2026-10-04). viewFor falls back to this map. */
   private restoredStops = new Map<string, AgentSupervisionView>();
-  /** Alerts whose stop closed as superseded (#385), by notification id: a
-   * retried disposition reports the same outcome instead of a bare record. */
-  private readonly supersededClosures = new Set<string>();
   /** Durable breaker controls and alert-post debt paired with restored stops. */
   private readonly restoredRearmControls = new Map<
     string,
@@ -3178,7 +3175,12 @@ export class Supervisor {
     const recovery = agent.pendingRecovery;
     if (recovery === null || recovery.jobId === null || recovery.authorityEpoch === null) return null;
     // A live handle or an in-flight restart rung owns the agent: never close it.
-    if (agent.handle !== null || agent.inRestart) return null;
+    if (agent.handle !== null || agent.inRestart) {
+      this.log('info', 'superseded closure deferred: the agent is live or restarting', {
+        agent_id: agent.agentId, live_handle: agent.handle !== null, in_restart: agent.inRestart,
+      });
+      return null;
+    }
     const jobId = recovery.jobId;
     try {
       if ((this.ledger.getAgent(agent.agentId)?.jobId ?? null) !== jobId) return null;
@@ -3192,6 +3194,9 @@ export class Supervisor {
     }
   }
 
+  /** Records the closure DURABLY first — a failed append throws and leaves
+   * the stop exactly as it was — then retires the supervision record
+   * in-process, so memory and the ledger can never disagree. */
   private closeSupersededStop(
     agent: SupervisedAgent,
     notificationId: string,
@@ -3199,6 +3204,21 @@ export class Supervisor {
   ): void {
     const recovery = agent.pendingRecovery;
     const stopReason = `stop closed: its captured turn was superseded on job "${closure.jobId}" — it will never replay; continue the lane with a fresh re-brief or directive`;
+    this.ledger.appendCustomEvent({
+      kind: 'supervision.stop-superseded',
+      agentId: agent.agentId,
+      jobId: closure.jobId,
+      payload: {
+        notification_id: notificationId,
+        job_id: closure.jobId,
+        captured_epoch: closure.capturedEpoch,
+        current_epoch: closure.currentEpoch,
+        producer_changed: closure.producerChanged,
+        had_open_turn: recovery?.hadOpenTurn ?? false,
+        prompt_named: recovery?.pending !== null && recovery?.pending !== undefined,
+        stop_reason: stopReason,
+      },
+    });
     // The stop is CLOSED, not held: retire this supervision record entirely —
     // in-process exactly as durably (the stop leaves durableSupervisionStops)
     // — so the lane no longer reads as stopped and a fresh re-brief/directive
@@ -3211,17 +3231,6 @@ export class Supervisor {
     this.agents.delete(agent.agentId);
     this.restoredStops.delete(agent.agentId);
     this.restoredRearmControls.delete(agent.agentId);
-    this.supersededClosures.add(notificationId);
-    this.recordEvent('supervision.stop-superseded', agent.agentId, {
-      notification_id: notificationId,
-      job_id: closure.jobId,
-      captured_epoch: closure.capturedEpoch,
-      current_epoch: closure.currentEpoch,
-      producer_changed: closure.producerChanged,
-      had_open_turn: recovery?.hadOpenTurn ?? false,
-      prompt_named: recovery?.pending !== null && recovery?.pending !== undefined,
-      stop_reason: stopReason,
-    });
     this.log('info', 'breaker stop closed as superseded — the stale captured turn never replays', {
       agent_id: agent.agentId,
       job_id: closure.jobId,
@@ -3454,7 +3463,12 @@ export class Supervisor {
       if (agent.breakerNotificationId !== notificationId || !agent.breakerOpen) continue;
       const superseded = this.supersededStopClosure(agent);
       if (superseded !== null) {
-        this.closeSupersededStop(agent, notificationId, superseded);
+        try {
+          this.closeSupersededStop(agent, notificationId, superseded);
+        } catch (error) {
+          // Nothing changed: the stop keeps its control and its debt.
+          return { ok: false, reason: `superseded stop closure could not be recorded: ${String(error)}` };
+        }
         return { ok: true, rearmed: false, superseded: true };
       }
       const refusal = this.rearmRefusal(agent, agent.pendingRecovery);
@@ -3489,8 +3503,12 @@ export class Supervisor {
       }
     }
     // A retried disposition of a stop already closed as superseded reports
-    // that same outcome (the first attempt may have failed after closing).
-    if (this.supersededClosures.has(notificationId)) return { ok: true, rearmed: false, superseded: true };
+    // that same outcome, from the durable record (restarts included).
+    try {
+      if (this.ledger.hasSupervisionStopSuperseded(notificationId)) return { ok: true, rearmed: false, superseded: true };
+    } catch (error) {
+      return { ok: false, reason: `superseded closure lookup failed: ${String(error)}` };
+    }
     // No stopped breaker is bound to this alert: the disposition is a pure
     // record. Say so — an accepted outcome must never claim a re-arm that
     // did not happen.
