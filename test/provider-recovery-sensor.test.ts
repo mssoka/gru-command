@@ -1313,6 +1313,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     const wakes = h.wakes.length;
     const calls = h.probe.calls.length;
     const { sensor, surfaced, logs } = surfacingClaudeOnly(h);
+    expect(sensor.handBackAtBoot()).toBe(2);
     expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
     expect(logs).toContainEqual({ msg: 'open provider waits cancelled — automatic recovery is off for their provider', fields: { cancelled: 2 } });
     expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
@@ -1381,8 +1382,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     const h3 = new Harness();
     const debt3 = await glmDebt(h3);
     h3.notifications.postIncident({ kind: 'supervision.provider-wall.agent-minion-1.quota_wall', routing: 'action-required',
-      severity: 'error', title: 'Agent agent-minion-1 stopped: quota wall', agentId: 'agent-minion-1', dedupe: 'unacked',
-      detail: 'Machine-owned temporary provider limit: the recovery sensor owns this stop (no owner ACK required).' });
+      severity: 'error', title: 'Agent agent-minion-1 stopped: quota wall', agentId: 'agent-minion-1', dedupe: 'unacked' });
     const s3 = surfacingClaudeOnly(h3);
     expect(s3.sensor.handBackDisabledWaits()).toBe(2);
     expect(h3.ledger.findNotificationByKind('supervision.provider-wall.agent-minion-1.quota_wall', 'unacked')).not.toBeNull();
@@ -1428,6 +1428,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     });
     expect(off.enabled).toBe(false);
     const logs: string[] = [];
+    handBackThenStartSupervision(off, { start: () => {} }, (_level, msg) => logs.push(msg));
     await bootProviderRecovery(off, (_level, msg) => logs.push(msg));
     expect(logs).toContain('provider-recovery sensor disabled — owner activation stays manual');
     for (const wait of [recovered, waiting, slot]) expect(h.ledger.getProviderWait(wait.id)?.status).toBe('cancelled');
@@ -1451,23 +1452,48 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     off.stop();
   });
 
-  it('a boot hand-back that fails before supervision start is logged, never blocks supervision, and is not retried after hydration', async () => {
+  it('a boot hand-back that fails outright is attempted before supervision starts, tells Gru, never blocks supervision, and waits for the next boot', async () => {
     const h = new Harness();
     const { waiting } = await glmDebt(h);
-    const { sensor } = surfacingClaudeOnly(h);
-    const failing = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => { throw new Error('ledger read failed'); });
-    let starts = 0;
+    const { sensor, surfaced } = surfacingClaudeOnly(h);
+    const order: string[] = [];
+    const failing = vi.spyOn(h.ledger, 'listProviderWaits').mockImplementation(() => {
+      order.push('hand-back');
+      throw new Error('ledger read failed');
+    });
     const errors: string[] = [];
-    handBackThenStartSupervision(sensor, { start: () => { starts += 1; } }, (_level, msg) => errors.push(msg));
+    handBackThenStartSupervision(sensor, { start: () => { order.push('start'); } }, (_level, msg) => errors.push(msg));
     failing.mockRestore();
-    expect(starts).toBe(1);
+    expect(order).toEqual(['hand-back', 'start']);
     expect(errors).toEqual(['provider wait hand-back failed before supervision start — kept for the next boot']);
-    // The boot reconciliation runs after hydration, so it never hands back:
+    // Gru is told: no lane is left stopped in silence.
+    expect(surfaced).toEqual(['provider-recovery.hand-back-failed']);
+    // The boot reconciliation never hands back (it runs after hydration):
     // the wait is kept for the next boot's pre-start hand-back.
     expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
     expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
-    expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(2); // the next boot
+    // The next boot hands it back and retires the failure notice.
+    expect(surfacingClaudeOnly(h).sensor.handBackAtBoot()).toBe(2);
     expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('cancelled');
+    expect(h.ledger.findNotificationByKind('provider-recovery.hand-back-failed', 'active')).toBeNull();
+  });
+
+  it('a wait whose boot hand-back fails is kept for the next boot — the boot reconciliation never cancels it after hydration', async () => {
+    const h = new Harness();
+    const { waiting, recovered } = await glmDebt(h);
+    const { sensor } = surfacingClaudeOnly(h);
+    const original = h.ledger.setProviderWaitStatus.bind(h.ledger);
+    const failing = vi.spyOn(h.ledger, 'setProviderWaitStatus').mockImplementation((id, status, payload) => {
+      if (id === waiting.id) throw new Error('ledger write failed');
+      return original(id, status, payload);
+    });
+    handBackThenStartSupervision(sensor, { start: () => {} }, () => {});
+    failing.mockRestore();
+    expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
+    expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting');
+    // Gru was still told before the failed cancel (never stranded).
+    expect(h.ledger.findNotificationByKind(`provider-recovery.recovery-off.${waiting.id}`, 'active')).not.toBeNull();
   });
 
   it('route retirement works from durable state: a route whose waits an earlier boot cancelled still retires', async () => {
@@ -1732,7 +1758,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.ledger.getNotification('watch-neighbor')).toMatchObject({ resolvedAt: null });
   });
 
-  it('one failing hand-back never stalls boot reconciliation for the rest', async () => {
+  it('one failing hand-back never stalls the boot hand-back for the rest', async () => {
     const h = new Harness();
     const { recovered, waiting } = await glmDebt(h);
     const { sensor } = surfacingClaudeOnly(h);
@@ -1741,7 +1767,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
       if (id === waiting.id) throw new Error('ledger write failed');
       return original(id, status, payload);
     });
-    expect(await sensor.reconcileAtBoot()).toEqual({ rewoken: 0 });
+    expect(sensor.handBackAtBoot()).toBe(1);
     expect(h.ledger.getProviderWait(recovered.id)?.status).toBe('cancelled');
     expect(h.ledger.getProviderWait(waiting.id)?.status).toBe('waiting'); // kept for the next boot
   });
@@ -1793,6 +1819,7 @@ describe('native Claude quota walls (claude-code lanes)', () => {
     expect(h.wakes).toHaveLength(wakes);
     expect(h.ledger.getProviderWait(waiting!.id)?.status).toBe('waiting');
     expect(h.ledger.listPendingProviderRecoveries()).toHaveLength(1);
+    expect(off.handBackAtBoot()).toBe(2);
     expect(await off.reconcileAtBoot()).toEqual({ rewoken: 0 });
     expect(h.wakes).toHaveLength(wakes);
     expect(reads).toHaveLength(readsBefore);
