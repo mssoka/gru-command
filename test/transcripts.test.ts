@@ -314,6 +314,40 @@ describe('transcript service', () => {
     expect(page.skippedTornLines).toBe(0);
   });
 
+  it('claude-code tool calls, thinking and API errors render like their pi equivalents (real CLI frame shapes)', () => {
+    const { dir, svc } = tmpStore();
+    const file = join(dir, 'sessions', 'minion', 'd', 'claude.jsonl');
+    mkdirSync(join(dir, 'sessions', 'minion', 'd'), { recursive: true });
+    const at = '2026-10-15T04:02:16.257Z';
+    writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 'c1' }),
+        // the adapter-recorded prompt (written right after init)
+        JSON.stringify({ type: 'user', message: { role: 'user', content: 'list the repo' }, session_id: 'c1', timestamp: at, gc_prompt: true }),
+        JSON.stringify({ type: 'assistant', message: { id: 'm1', role: 'assistant', content: [{ type: 'thinking', thinking: 'use ls' }] }, session_id: 'c1' }),
+        JSON.stringify({ type: 'assistant', message: { id: 'm1', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'ls' } }] }, session_id: 'c1' }),
+        JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'README.md\nsrc', is_error: false }] }, session_id: 'c1' }),
+        JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: [{ type: 'text', text: 'denied' }], is_error: true }] }, session_id: 'c1' }),
+        JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done' }),
+        JSON.stringify({ type: 'assistant', is_api_error_message: true, error: 'model_not_found', message: { id: 'x', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'There is an issue with the selected model' }] }, session_id: 'c1' }),
+        JSON.stringify({ type: 'result', subtype: 'success', is_error: true, result: 'There is an issue with the selected model' }),
+      ].join('\n') + '\n',
+    );
+    const entries = [...svc.page('minion/d/claude.jsonl').entries].reverse(); // oldest first
+    expect(entries.map((e) => [e.kind, e.text, e.toolName, e.isError])).toEqual([
+      ['user', 'list the repo', null, false],
+      ['assistant', '', null, false],
+      ['tool_result', 'README.md\nsrc', 'Bash', false],
+      ['tool_result', 'denied', null, true],
+      ['system', 'turn result: success', null, false],
+      ['assistant', 'There is an issue with the selected model', null, true],
+      ['system', 'turn result: success — There is an issue with the selected model', null, true],
+    ]);
+    expect(entries[0]?.ts).toBe(Date.parse(at));
+    expect(entries[1]?.thinking).toBe('use ls');
+  });
+
   it('an empty session file pages cleanly (total 0)', () => {
     const { dir, svc } = tmpStore();
     mkdirSync(join(dir, 'sessions', 'gru', 'd'), { recursive: true });

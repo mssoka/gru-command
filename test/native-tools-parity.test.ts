@@ -85,11 +85,13 @@ interface Exposure {
 
 type ReviewSeam = Pick<SpawnOptions, 'isolatedReview' | 'reviewLead'>;
 
-const CLAUDE_BUILTIN_PRODUCT: Readonly<Record<string, string>> = {
-  Read: 'read',
-  Grep: 'grep',
-  Glob: 'find',
-  LS: 'ls',
+/** Claude built-in → the product tool ids it serves. The CLI no longer
+ * ships `LS`: its Glob tool serves both find and directory listing, so a
+ * declaration naming only one of them would surface here as a mismatch. */
+const CLAUDE_BUILTIN_PRODUCT: Readonly<Record<string, readonly string[]>> = {
+  Read: ['read'],
+  Grep: ['grep'],
+  Glob: ['find', 'ls'],
 };
 
 async function piExposure(rt: PiRuntime, workspace: string, seam: ReviewSeam): Promise<Exposure> {
@@ -136,7 +138,7 @@ async function claudeExposure(rt: ClaudeCodeRuntime, workspace: string, seam: Re
     const allowedIndex = argv.indexOf('--allowedTools');
     const allowed = allowedIndex === -1 ? [] : (argv[allowedIndex + 1] ?? '').split(',').filter(Boolean);
     return {
-      fileTools: builtins.map((name) => CLAUDE_BUILTIN_PRODUCT[name] ?? name),
+      fileTools: builtins.flatMap((name) => CLAUDE_BUILTIN_PRODUCT[name] ?? [name]),
       nativeTools: allowed
         .filter((entry) => entry.startsWith('mcp__gru_perkins__'))
         .map((entry) => entry.slice('mcp__gru_perkins__'.length)),

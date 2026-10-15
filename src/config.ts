@@ -53,8 +53,24 @@ export interface RuntimeModelPolicy {
   readonly modelRefresh?: boolean;
   /** pi only: deadline for that refresh, in milliseconds (default 10 000). */
   readonly modelRefreshTimeoutMs?: number;
+  /** claude-code only: which MCP servers non-review sessions may load
+   * (default "none" — exactly the role's mapped tools, like pi). */
+  readonly mcp?: ClaudeMcpMode;
   readonly roles: Readonly<Partial<Record<Role, RuntimeRolePolicyEntry>>>;
 }
+
+/**
+ * [runtimes.claude-code] mcp — the MCP servers a non-review claude-code
+ * session loads (owner decision 2026-10-15: off by default, opt-in):
+ *   none    — no MCP servers; the session gets only its role's tools
+ *   project — only the servers in the session cwd's checked-in .mcp.json
+ *   user    — everything the operator's own Claude configuration loads
+ * Isolated review sessions never load ambient MCP regardless.
+ */
+export const CLAUDE_MCP_MODES = ['none', 'project', 'user'] as const;
+export type ClaudeMcpMode = (typeof CLAUDE_MCP_MODES)[number];
+/** Default for [runtimes.claude-code] mcp. */
+export const DEFAULT_CLAUDE_MCP_MODE: ClaudeMcpMode = 'none';
 
 /** Default for [runtimes.pi] model_refresh (network catalog refresh ON). */
 export const DEFAULT_MODEL_REFRESH = true;
@@ -1986,7 +2002,7 @@ function readDecisionsConfig(
 /** Keys accepted per [runtimes.<id>]; the catalog-refresh knobs are pi-only. */
 const RUNTIME_POLICY_KEYS: Readonly<Record<RuntimeId, readonly string[]>> = {
   pi: ['model', 'thinking_level', 'model_refresh', 'model_refresh_timeout_ms', 'roles'],
-  'claude-code': ['model', 'thinking_level', 'roles'],
+  'claude-code': ['model', 'thinking_level', 'mcp', 'roles'],
 };
 
 /**
@@ -2016,6 +2032,7 @@ function readRuntimePolicy(
   let thinkingLevel: string | undefined;
   let modelRefresh: boolean | undefined;
   let modelRefreshTimeoutMs: number | undefined;
+  let mcp: ClaudeMcpMode | undefined;
   const roles: Partial<Record<Role, RuntimeRolePolicyEntry>> = {};
   if (table['model'] !== undefined) {
     model = requireString(table['model'], file, `${field}.model`);
@@ -2032,6 +2049,17 @@ function readRuntimePolicy(
       file,
       `${field}.model_refresh_timeout_ms`,
     );
+  }
+  if (runtimeId === 'claude-code' && table['mcp'] !== undefined) {
+    const value = requireString(table['mcp'], file, `${field}.mcp`);
+    if (!(CLAUDE_MCP_MODES as readonly string[]).includes(value)) {
+      throw new ConfigError(
+        `${field}.mcp must be one of ${CLAUDE_MCP_MODES.map((mode) => `"${mode}"`).join(', ')}, got "${value}"`,
+        file,
+        `${field}.mcp`,
+      );
+    }
+    mcp = value as ClaudeMcpMode;
   }
   if (table['roles'] !== undefined) {
     const rolesTable = requireTable(table['roles'], file, `${field}.roles`);
@@ -2083,6 +2111,7 @@ function readRuntimePolicy(
     ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     ...(modelRefresh !== undefined ? { modelRefresh } : {}),
     ...(modelRefreshTimeoutMs !== undefined ? { modelRefreshTimeoutMs } : {}),
+    ...(mcp !== undefined ? { mcp } : {}),
     roles,
   };
 }

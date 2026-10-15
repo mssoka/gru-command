@@ -125,7 +125,7 @@ default = "pi"
 # bob = "pi"
 
 [models]
-# Default model reference. An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# Default model reference. pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 default = "default"
 
 [models.roles]
@@ -155,7 +155,7 @@ default = "default"
 # [runtimes.pi]
 # # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
 # # Thinking levels accepted: minimal | low | medium | high | xhigh | max.
-# # An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
@@ -176,10 +176,14 @@ default = "default"
 # [runtimes.claude-code]
 # # Optional runtime-wide policy; omitted keys inherit [models]/[thinking].
 # # Thinking levels accepted: low | medium | high | xhigh | max | ultracode (mapped to the CLI --effort; anything else fails loud at spawn naming the valid set).
-# # An explicit "provider/model" reference is passed to pi as-is; claude-code strips the provider segment for its CLI --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
+# # pi takes an explicit "provider/model" reference as-is. claude-code is always Anthropic and needs no provider: use the CLI's own names ("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag (bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). The literal "default" means the runtime's own configuration (SPEC ruling 16).
 # # Full per-runtime semantics (binding, session flags, effort mapping, resolution order): docs/RUNTIMES.md.
 # # model = "default"
 # # thinking_level = "default"
+# # MCP servers for non-review sessions: "none" = only the role's tools
+# # (like pi); "project" = only the cwd's checked-in .mcp.json; "user" = your
+# # own Claude MCP configuration, connectors included, without prompts.
+# # mcp = "none"
 
 # [runtimes.claude-code.roles]
 # # Optional per-role inline tables (at least one field when uncommented).
@@ -447,6 +451,7 @@ example.
 | Bad port | `server.port must be an integer between 0 and 65535 (0 = ephemeral)` |
 | Unknown runtime policy key | `unknown key \`x\` in [runtimes.pi] (valid keys: model, thinking_level, model_refresh, model_refresh_timeout_ms, roles)` |
 | Empty runtime role entry | `[runtimes.pi.roles.gru] must set at least one of model, thinking_level` |
+| Bad claude-code MCP mode | `runtimes.claude-code.mcp must be one of "none", "project", "user", got "x"` |
 | Unknown runtime id as a table | `unknown key \`x\` in [runtimes] (valid keys: default, roles, or a runtime id: pi, claude-code)` |
 | Relative `GRU_COMMAND_HOME` | `GRU_COMMAND_HOME must be an absolute path` (an empty value is rejected the same way) |
 | Path not absolute after expansion | `workspace_root must resolve to an absolute path` |

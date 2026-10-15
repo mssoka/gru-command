@@ -94,11 +94,11 @@ interface Fixture {
   runtime: ClaudeCodeRuntime;
 }
 
-function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string; spawnProcess?: typeof spawn } = {}): Fixture {
+function fixture(knobs: { killGraceMs?: number; modelRuntime?: ModelRuntime; toolHeartbeatMs?: number; reviewSettingsFile?: string; spawnProcess?: typeof spawn; configToml?: string } = {}): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
   const workspace = mkdtempSync(join(tmpdir(), 'gru-command-ws-'));
   cleanupDirs.push(home, workspace);
-  writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n`, 'utf-8');
+  writeFileSync(configPathFor(home), `workspace_root = "${workspace}"\n${knobs.configToml ?? ''}`, 'utf-8');
   const config = loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester');
   const store = new SessionStore(config.dataDir);
   const logs: Fixture['logs'] = [];
@@ -748,6 +748,28 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     }
   });
 
+  it('a bare CLI model name needs no provider: it reads the anthropic catalog entry for vision', async () => {
+    const lookups: string[] = [];
+    const catalog = {
+      getModel: (provider: string, id: string) => {
+        lookups.push(`${provider}/${id}`);
+        return provider === 'anthropic' && id === 'claude-opus-5-5' ? { input: ['text', 'image'] } : undefined;
+      },
+    } as unknown as ModelRuntime;
+    const fx = fixture({ modelRuntime: catalog });
+    const handle = await fx.runtime.spawn('gru', { model: 'claude-opus-5-5' });
+    try {
+      expect(handle.capabilities.images).toBe(true);
+      expect(lookups).toEqual(['anthropic/claude-opus-5-5']);
+      await handle.prompt('bare model');
+      const argv = doubleInvocations(fx).at(-1)!.argv;
+      expect(argv[argv.indexOf('--model') + 1]).toBe('claude-opus-5-5');
+      expect(fx.logs.some((entry) => entry.msg.includes('declines conservatively'))).toBe(false);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it('maps "default" to no flags and "provider/model" + level to --model/--effort', async () => {
     const fx = fixture();
     // default: neither flag leaves the adapter.
@@ -1177,13 +1199,18 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       expect(record.argv.join(' ')).toContain('--output-format stream-json');
       expect(record.argv.join(' ')).toContain('--input-format stream-json');
       expect(record.argv.join(' ')).toContain('--include-partial-messages');
+      // No ambient MCP by default. The CLI replay echo is never used: it
+      // would echo permission control_responses into the verification channel.
+      expect(record.argv).not.toContain('--replay-user-messages');
+      expect(record.argv).toContain('--strict-mcp-config');
+      expect(record.argv).not.toContain('--mcp-config');
       expect(record.argv[record.argv.indexOf('--permission-mode') + 1]).toBe('bypassPermissions');
       const sysAt = record.argv.indexOf('--append-system-prompt');
       expect(record.argv[sysAt + 1]!.length).toBeGreaterThan(20);
       expect(record.argv[record.argv.indexOf('--session-id') + 1]).toBe(record.sessionId);
     }
-    expect(review!.argv[review!.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,LS');
-    expect(build!.argv[build!.argv.indexOf('--tools') + 1]).toBe('Read,Bash,Edit,Write,Grep,Glob,LS');
+    expect(review!.argv[review!.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
+    expect(build!.argv[build!.argv.indexOf('--tools') + 1]).toBe('Read,Bash,Edit,Write,Grep,Glob');
     // Issue #161: a child worker's bounded authority reaches the CLI's
     // own --tools allowlist, and its product-owned identity is honored.
     const child = await fx.runtime.spawn('minion', {
@@ -1194,7 +1221,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     await child.prompt('audit this');
     await child.dispose();
     const childInvocation = doubleInvocations(fx).at(-1)!;
-    expect(childInvocation.argv[childInvocation.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,LS');
+    expect(childInvocation.argv[childInvocation.argv.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
     // An override can only NARROW: an undeclared tool refuses loud.
     await expect(
       fx.runtime.spawn('perkins', { roleTools: ['undeclared-tool'] }),
@@ -1239,7 +1266,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const [record] = doubleInvocations(fx);
       const tools = record!.argv[record!.argv.indexOf('--tools') + 1]!;
       const allowed = record!.argv[record!.argv.indexOf('--allowedTools') + 1]!;
-      expect(tools.split(',')).toEqual(['Read', 'Grep', 'Glob', 'LS', 'mcp__gru_perkins__gc_submit_fallback_findings']);
+      expect(tools.split(',')).toEqual(['Read', 'Grep', 'Glob', 'mcp__gru_perkins__gc_submit_fallback_findings']);
       expect(allowed).toContain('mcp__gru_perkins__gc_submit_fallback_findings');
       expect(allowed).not.toMatch(/Bash|Edit|Write/u);
       expect(record!.argv).toContain('--strict-mcp-config');
@@ -1376,7 +1403,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       // File tools stay the declared read set, mapped to claude built-ins;
       // the enabled list also names the one bridged MCP tool.
       expect((record!.argv[record!.argv.indexOf('--tools') + 1] ?? '').split(',')).toEqual([
-        'Read', 'Grep', 'Glob', 'LS', 'mcp__gru_perkins__perkins_submit_findings',
+        'Read', 'Grep', 'Glob', 'mcp__gru_perkins__perkins_submit_findings',
       ]);
       const configFile = record!.argv[record!.argv.indexOf('--mcp-config') + 1]!;
       bridgeDirectory = dirname(configFile);
@@ -1421,7 +1448,7 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       const [record] = doubleInvocations(fx);
       expect(record!.argv).not.toContain('--mcp-config');
       const allowed = (record!.argv[record!.argv.indexOf('--allowedTools') + 1] ?? '').split(',');
-      expect(allowed.map((entry) => entry.split('(')[0])).toEqual(['Read', 'Grep', 'Glob', 'LS']);
+      expect(allowed.map((entry) => entry.split('(')[0])).toEqual(['Read', 'Grep', 'Glob']);
       expect(allowed.some((entry) => entry.startsWith('mcp__'))).toBe(false);
     } finally {
       await handle.dispose();
@@ -1618,13 +1645,15 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
     })).rejects.toThrow(/must be fresh/);
   });
 
-  it('mapRoleTools maps every known role tool and fails loud on an unknown id', () => {
+  it('mapRoleTools maps every known role tool to a tool the CLI ships and fails loud on an unknown id', () => {
+    // The CLI silently ignores unknown --tools names and no longer ships
+    // `LS`: directory listing maps to Glob, listed once.
     expect(mapRoleTools('perkins', ['read', 'grep', 'find', 'ls'])).toEqual([
       'Read',
       'Grep',
       'Glob',
-      'LS',
     ]);
+    expect(mapRoleTools('perkins', ['ls'])).toEqual(['Glob']);
     expect(mapRoleTools('minion', ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'])).toEqual([
       'Read',
       'Bash',
@@ -1632,11 +1661,85 @@ describe('ClaudeCodeRuntime over the stubbed CLI double', () => {
       'Write',
       'Grep',
       'Glob',
-      'LS',
     ]);
     expect(() => mapRoleTools('minion', ['nope'])).toThrow(
       /role "minion" tool "nope" has no claude-code tool mapping/,
     );
+  });
+
+  it('loads no ambient MCP servers by default; [runtimes.claude-code] mcp opts into project or user servers', async () => {
+    const run = async (configToml: string, withProjectFile: boolean) => {
+      const fx = fixture({ configToml });
+      const lane = mkdtempSync(join(tmpdir(), 'gru-command-lane-'));
+      cleanupDirs.push(lane);
+      if (withProjectFile) writeFileSync(join(lane, '.mcp.json'), JSON.stringify({ mcpServers: {} }));
+      const handle = await fx.runtime.spawn('minion', { cwd: lane });
+      await handle.prompt('which servers');
+      await handle.dispose();
+      return { argv: doubleInvocations(fx).at(-1)!.argv, projectFile: join(lane, '.mcp.json') };
+    };
+    const byDefault = await run('', true);
+    expect(byDefault.argv).toContain('--strict-mcp-config');
+    expect(byDefault.argv).not.toContain('--mcp-config');
+    const project = await run('[runtimes.claude-code]\nmcp = "project"\n', true);
+    expect(project.argv).toContain('--strict-mcp-config');
+    expect(project.argv[project.argv.indexOf('--mcp-config') + 1]).toBe(project.projectFile);
+    const projectWithoutFile = await run('[runtimes.claude-code]\nmcp = "project"\n', false);
+    expect(projectWithoutFile.argv).toContain('--strict-mcp-config');
+    expect(projectWithoutFile.argv).not.toContain('--mcp-config');
+    const user = await run('[runtimes.claude-code]\nmcp = "user"\n', true);
+    expect(user.argv).not.toContain('--strict-mcp-config');
+    expect(user.argv).not.toContain('--mcp-config');
+    const badHome = mkdtempSync(join(tmpdir(), 'gru-command-claude-'));
+    cleanupDirs.push(badHome);
+    writeFileSync(configPathFor(badHome), `workspace_root = "${badHome}"\n[runtimes.claude-code]\nmcp = "all"\n`, 'utf-8');
+    expect(() => loadConfig({ GRU_COMMAND_HOME: badHome }, '/home/tester')).toThrow(
+      /runtimes\.claude-code\.mcp must be one of "none", "project", "user", got "all"/,
+    );
+  });
+
+  it('isolated review sessions stay strict with only their scoped bridge even when mcp = "user"', async () => {
+    const fx = fixture({ configToml: '[runtimes.claude-code]\nmcp = "user"\n' });
+    const review = await fx.runtime.spawn('perkins', { isolatedReview: { systemPrompt: 'isolated', tools: ['read'] } });
+    try {
+      await review.prompt('frozen diff only');
+      const record = doubleInvocations(fx).at(-1)!;
+      expect(record.argv).toContain('--strict-mcp-config');
+      expect(record.argv).not.toContain('--mcp-config');
+    } finally {
+      await review.dispose();
+    }
+  });
+
+  it('records each prompt in the product transcript right after its verified init frame', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('minion');
+    await handle.prompt('first ask');
+    await handle.prompt('second ask');
+    const file = handle.sessionFile!;
+    await handle.dispose();
+    const frames = readFileSync(file, 'utf-8').trim().split('\n').map((line) => JSON.parse(line) as StreamFrame);
+    const prompts = frames.filter((frame) => frame['type'] === 'user' && frame['gc_prompt'] === true);
+    expect(prompts.map((frame) => (frame['message'] as { content: unknown }).content)).toEqual(['first ask', 'second ask']);
+    expect(prompts.every((frame) => frame['session_id'] === handle.id && typeof frame['timestamp'] === 'string')).toBe(true);
+    for (const prompt of prompts) {
+      expect(frames[frames.indexOf(prompt) - 1]).toMatchObject({ type: 'system', subtype: 'init' });
+    }
+    // Identity stays first: the prompt follows init, so resume still reads
+    // the session id from the transcript head.
+    expect(extractSessionId(readFileSync(file, 'utf-8'))).toBe(handle.id);
+  });
+
+  it('a synthetic API-error message is the turn error, never streamed as the agent\'s words', async () => {
+    const fx = fixture();
+    const handle = await fx.runtime.spawn('gru');
+    const events = collect(handle);
+    await handle.prompt('api-error please');
+    await handle.dispose();
+    expect(deltas(events, 'text_delta')).toEqual([]);
+    const errors = events.filter((e) => e.type === 'error').map((e) => (e as { error: string }).error);
+    expect(errors).toEqual([expect.stringMatching(/issue with the selected model/)]);
+    expect(states(events)).toContain('error');
   });
 
   it('resumes a previous session file: --resume pinned, same file appended, history intact', async () => {

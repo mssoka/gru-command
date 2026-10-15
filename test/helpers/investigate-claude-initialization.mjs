@@ -35,7 +35,9 @@ const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, CLAUDE_CONFIG_DIR: join(
 for (const key of Object.keys(process.env)) delete process.env[key];
 Object.assign(process.env, env);
 const version = execFileSync(executable, ['--version'], { env, cwd: lane, encoding: 'utf8' }).trim();
-assert(version.startsWith('2.1.296'));
+// Any installed Claude Code release qualifies (it auto-updates); the exact
+// version is part of the recorded evidence, never a gate.
+assert(/^\d+\.\d+\.\d+ \(Claude Code\)$/u.test(version), `not a Claude Code executable: ${version}`);
 const config = loadConfig({ GRU_COMMAND_HOME: home }, home);
 const policy = workerVerificationPolicy({ id: 'e9-owned', jobId: 'e9-owned', kind: 'job', status: 'active', path: lane }, configPathFor(home));
 let active; let sent = false;

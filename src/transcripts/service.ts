@@ -348,6 +348,9 @@ export function parseTranscriptContent(content: string): {
   const parsed = parseSessionEntries(content);
   const nonEmptyLines = content.split('\n').filter((l) => l.trim() !== '').length;
   const tornLines = Math.max(0, nonEmptyLines - parsed.length);
+  // claude-code tool_result blocks name their call only by id; the tool name
+  // lives on the earlier assistant tool_use block.
+  const claudeToolNames = new Map<string, string>();
   for (const entry of parsed) {
     if (entry.type === 'session') continue; // header
     if (entry.type === 'message') {
@@ -355,7 +358,7 @@ export function parseTranscriptContent(content: string): {
       entries.push(entryFromMessage(entries.length, message));
       continue;
     }
-    const claude = claudeFrameEntry(entry, entries.length);
+    const claude = claudeFrameEntry(entry, entries.length, claudeToolNames);
     if (claude !== null) entries.push(claude);
     // else: claude-code raw stream frames (init metadata, stream_event
     // deltas) are duplicate representations of the assistant/user message
@@ -364,52 +367,105 @@ export function parseTranscriptContent(content: string): {
   return { entries, tornLines };
 }
 
+/** Text of a claude content value: text blocks joined, images marked. */
+function claudeBlocksText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  let text = '';
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue;
+    const blockText = (block as { text?: unknown }).text;
+    if (typeof blockText === 'string') text += blockText;
+    else if ((block as { type?: unknown }).type === 'image') text += '[image]';
+  }
+  return text;
+}
+
+/** claude frames carry an ISO `timestamp`; pi entries carry epoch ms. */
+function claudeFrameTs(entry: Record<string, unknown>): number | null {
+  const raw = entry['timestamp'];
+  if (typeof raw !== 'string') return null;
+  const ms = Date.parse(raw);
+  return Number.isNaN(ms) ? null : ms;
+}
+
 /**
  * claude-code adapter frames (raw stream-json forensics appended to the
- * session file): user/assistant frames carry an anthropic-shaped message;
- * result frames mark turn outcomes. Everything else (system init,
- * stream_event deltas) returns null — covered by the message entries.
+ * session file): user frames carry the replayed prompt (text/image blocks)
+ * or tool_result blocks; assistant frames carry text/thinking/tool_use
+ * blocks (one block per frame with partial messages); result frames mark
+ * turn outcomes. Everything else (system init, stream_event deltas)
+ * returns null — covered by the message entries. A tool_use-only assistant
+ * frame also returns null: the call surfaces as its named tool_result,
+ * exactly like a pi session's toolResult entry.
  */
-function claudeFrameEntry(rawEntry: object, index: number): TranscriptEntry | null {
+function claudeFrameEntry(
+  rawEntry: object,
+  index: number,
+  toolNames: Map<string, string>,
+): TranscriptEntry | null {
   const entry = rawEntry as Record<string, unknown>;
   const type = String(entry['type'] ?? '');
+  const ts = claudeFrameTs(entry);
   if (type === 'user' || type === 'assistant') {
     const message = entry['message'];
     if (typeof message !== 'object' || message === null) return null;
     const content = (message as { content?: unknown }).content;
-    let text = '';
-    if (typeof content === 'string') text = content;
-    else if (Array.isArray(content)) {
-      for (const block of content) {
-        if (typeof block === 'object' && block !== null) {
-          const blockText = (block as { text?: unknown }).text;
-          if (typeof blockText === 'string') text += blockText;
-          else if ((block as { type?: unknown }).type === 'image') text += '[image]';
-        }
+    const blocks = Array.isArray(content)
+      ? content.filter((block): block is Record<string, unknown> => typeof block === 'object' && block !== null)
+      : [];
+    if (type === 'user') {
+      const results = blocks.filter((block) => block['type'] === 'tool_result');
+      if (results.length > 0) {
+        const callId = results[0]!['tool_use_id'];
+        return {
+          index,
+          ts,
+          kind: 'tool_result',
+          role: 'tool',
+          text: results.map((block) => claudeBlocksText(block['content'])).join('\n'),
+          thinking: null,
+          toolName: typeof callId === 'string' ? (toolNames.get(callId) ?? null) : null,
+          isError: results.some((block) => block['is_error'] === true),
+        };
+      }
+      return { index, ts, kind: 'user', role: 'user', text: claudeBlocksText(content), thinking: null, toolName: null, isError: false };
+    }
+    let thinking: string | null = null;
+    for (const block of blocks) {
+      if (block['type'] === 'tool_use' && typeof block['id'] === 'string' && typeof block['name'] === 'string') {
+        toolNames.set(block['id'], block['name']);
+      } else if (block['type'] === 'thinking' && typeof block['thinking'] === 'string') {
+        thinking = (thinking ?? '') + block['thinking'];
       }
     }
+    const text = claudeBlocksText(content);
+    if (text === '' && thinking === null) return null;
     return {
       index,
-      ts: null,
-      kind: type === 'user' ? 'user' : 'assistant',
-      role: type,
+      ts,
+      kind: 'assistant',
+      role: 'assistant',
       text,
-      thinking: null,
+      thinking,
       toolName: null,
-      isError: false,
+      // The CLI reports API failures as a synthetic assistant message.
+      isError: entry['is_api_error_message'] === true,
     };
   }
   if (type === 'result') {
-    const subtype = entry['subtype'];
+    const subtype = typeof entry['subtype'] === 'string' ? entry['subtype'] : 'unknown';
+    const isError = entry['is_error'] === true || subtype.startsWith('error');
+    const detail = isError && typeof entry['result'] === 'string' && entry['result'] !== '' ? ` — ${entry['result']}` : '';
     return {
       index,
-      ts: null,
+      ts,
       kind: 'system',
       role: null,
-      text: `turn result: ${typeof subtype === 'string' ? subtype : 'unknown'}`,
+      text: `turn result: ${subtype}${detail}`,
       thinking: null,
       toolName: null,
-      isError: subtype === 'error_during_execution' || subtype === 'error_max_turns',
+      isError,
     };
   }
   return null;

@@ -83,7 +83,8 @@ claude -p --output-format stream-json --input-format stream-json \
   --verbose --include-partial-messages \
   (--session-id <uuid> | --resume <uuid>) [--model M] [--effort E] \
   --permission-mode bypassPermissions --tools <role tools> \
-  --append-system-prompt <role prompt>
+  --append-system-prompt <role prompt> \
+  [--strict-mcp-config [--mcp-config <cwd>/.mcp.json]]
 ```
 
 fed with ONE stdin user frame (text, or image blocks + text) followed by
@@ -98,7 +99,11 @@ idle, never interleaved.
 on the same UUID. Continuity rides claude's own transcript store under
 `~/.claude/` — that is the harness's private resume substrate; the product
 never reads it. The PRODUCT transcript is the raw NDJSON frame stream
-appended verbatim to the session-store file
+appended verbatim to the session-store file, plus one adapter-written
+`{"type":"user", …, "gc_prompt":true}` frame right after each turn's
+verified `init` recording what the turn was asked (stdout carries only
+claude's side; the CLI's `--replay-user-messages` is deliberately not used
+because it also echoes the worker-verification permission responses)
 (`sessions/<role>/--<dashed-cwd>--<hash8>/<ISO-ts>_<session-uuid>.jsonl`),
 so the lock / hourly backup / boot growth-detection machinery applies
 unchanged (SPEC ruling 12). Resume by `resumeFile` reads the session id
@@ -106,17 +111,19 @@ back out of the transcript's frames, is confined to the store, locks
 before reading, and rejects a file already hosted by this process.
 
 **Emergency console** for a claude-hosted session: stop the service, then
-`claude --resume <session-uuid>` in the workspace (pre-v2.1.223 CLIs only
-search the current project directory for a session id — the adapter always
-spawns with cwd = the configured workspace root, which keeps this working;
-newer CLIs find it from anywhere). The product transcript is not claude's
+`claude --resume <session-uuid>` (newer CLIs find the id from any directory;
+pre-v2.1.223 CLIs only search the current project directory — run it from
+the session's cwd, which the transcript's `system/init` frame records:
+the lane worktree for a minion, the workspace root otherwise). The product transcript is not claude's
 format — it is the forensic record, not the console's input.
 
 **Events.** `system/init` starts the turn (state `streaming`, `turn_start`;
 a session-id mismatch kills the process and rejects — never continue a
 foreign session). `stream_event` partials become text/thinking deltas and
 tool input updates; complete `assistant` frames are the no-partials
-fallback (per-kind dedupe: never emitted twice); `tool_use`/`tool_result`
+fallback (per-kind dedupe: never emitted twice); the CLI's synthetic
+API-error message (`is_api_error_message`) is never streamed as the
+agent's words — it becomes the turn's error detail; `tool_use`/`tool_result`
 blocks become `tool_start`/`tool_end` (`is_error` → `isError`);
 `tool_progress` heartbeats become `tool_update`. A `result` frame ends the
 turn: `is_error: true` is an IN-BAND error (error event, sticky `error`
@@ -130,14 +137,24 @@ escalating to SIGKILL after a grace window.
 **Permissions and roles.** Headless has no interactive approval channel,
 so sessions run `--permission-mode bypassPermissions` with `--tools`
 restricted to the role's mapped built-ins (read→Read, bash→Bash,
-edit→Edit, write→Write, grep→Grep, find→Glob, ls→LS); the role system
-prompt rides `--append-system-prompt`. MCP tools follow the user's own
-claude configuration (`--tools` restricts built-ins only). The richer
+edit→Edit, write→Write, grep→Grep, find→Glob, ls→Glob — the CLI silently
+ignores names it does not ship, and it no longer ships `LS`); the role
+system prompt rides `--append-system-prompt`. `--tools` restricts built-ins
+only, so MCP servers are governed separately by `[runtimes.claude-code] mcp`
+(owner decision 2026-10-15, off by default): `"none"` (default) passes
+`--strict-mcp-config`, so a session gets exactly its role's tools, like pi;
+`"project"` loads only the session cwd's checked-in `.mcp.json`;
+`"user"` loads the operator's own Claude MCP configuration (claude.ai
+connectors included), all without prompts. Isolated review sessions are
+always strict regardless. The richer
 per-role permission model is E8 territory; LAN bind + pairing token
 (ruling 9) is the v1 security perimeter.
 
 **Model & thinking.** `"default"` omits both flags (claude's own
-configuration decides). An explicit `"provider/model"` reference strips
+configuration decides). Claude Code is always Anthropic, so a model needs
+no provider: the CLI's own names (`opus`, `claude-opus-5-5`) are the native
+form, and a bare name reads the `anthropic` catalog entry for its declared
+vision support. An explicit `"provider/model"` reference strips
 the provider segment for `--model` (`anthropic/claude-x` → `claude-x`;
 Bedrock-style dotted ids survive: `bedrock/us.anthropic.claude-x` →
 `us.anthropic.claude-x`). Thinking maps to `--effort`; claude accepts

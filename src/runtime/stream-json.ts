@@ -212,6 +212,7 @@ export class ClaudeTurnTranslator {
   private readonly openBlocks = new Map<number, OpenBlock>();
   private initInfo: InitInfo | null = null;
   private resultInfo: ResultInfo | null = null;
+  private apiErrorText: string | null = null;
 
   /** The system/init frame's info, once seen. */
   get init(): InitInfo | null {
@@ -221,6 +222,11 @@ export class ClaudeTurnTranslator {
   /** The result frame's info, once seen. */
   get result(): ResultInfo | null {
     return this.resultInfo;
+  }
+
+  /** Text of the CLI's synthetic API-error message, once seen. */
+  get apiError(): string | null {
+    return this.apiErrorText;
   }
 
   /** Consume one parsed frame; returns the interface events it implies. */
@@ -280,6 +286,16 @@ export class ClaudeTurnTranslator {
     if (typeof message !== 'object' || message === null) return [];
     const content = (message as StreamFrame)['content'];
     if (!Array.isArray(content)) return [];
+    if (frame['is_api_error_message'] === true) {
+      // The CLI reports an API failure (unknown model, auth, overload) as a
+      // synthetic assistant message. It is not model output: it must never
+      // stream as the agent's words. The turn's error event carries it.
+      const text = content
+        .map((block) => (typeof block === 'object' && block !== null && typeof (block as StreamFrame)['text'] === 'string' ? (block as StreamFrame)['text'] as string : ''))
+        .join('');
+      if (text !== '') this.apiErrorText = text;
+      return [];
+    }
     // Dedupe granularity: per message id when partials carry ids, else the
     // turn-global per-kind flags.
     const mid = (message as StreamFrame)['id'];

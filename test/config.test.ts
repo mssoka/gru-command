@@ -498,7 +498,7 @@ bob = { thinking_level = "medium" }
     const home = tmpHome();
     writeConfig(home, '[runtimes.claude-code]\nmodel_refresh = false\n');
     expect(() => loadConfig({ GRU_COMMAND_HOME: home }, '/home/tester')).toThrow(
-      /unknown key `model_refresh` in \[runtimes\.claude-code\] \(valid keys: model, thinking_level, roles\)/,
+      /unknown key `model_refresh` in \[runtimes\.claude-code\] \(valid keys: model, thinking_level, mcp, roles\)/,
     );
     const home2 = tmpHome();
     writeConfig(home2, '[runtimes.claude-code]\nmodel_refresh_timeout_ms = 2500\n');

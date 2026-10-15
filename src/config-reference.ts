@@ -1,6 +1,7 @@
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import {
+  DEFAULT_CLAUDE_MCP_MODE,
   DEFAULT_MODEL_REFRESH,
   DEFAULT_MODEL_REFRESH_TIMEOUT_MS,
   MODEL_DEFAULT_SENTINEL,
@@ -31,8 +32,9 @@ export const RUNTIME_THINKING_LEVELS: Readonly<Record<RuntimeId, readonly string
 };
 
 export const MODEL_REFERENCE_NOTE =
-  'An explicit "provider/model" reference is passed to pi as-is; ' +
-  'claude-code strips the provider segment for its CLI --model flag ' +
+  'pi takes an explicit "provider/model" reference as-is. ' +
+  'claude-code is always Anthropic and needs no provider: use the CLI\'s own names ' +
+  '("opus", "claude-opus-5-5"); a provider segment, if present, is stripped for its --model flag ' +
   '(bedrock-style dotted ids survive: "bedrock/us.anthropic.x" → "us.anthropic.x"). ' +
   'The literal "default" means the runtime\'s own configuration (SPEC ruling 16).';
 
@@ -195,6 +197,19 @@ function runtimePolicyLines(
       refreshTimeout === undefined
         ? `${c}# model_refresh_timeout_ms = ${DEFAULT_MODEL_REFRESH_TIMEOUT_MS}`
         : `${c}model_refresh_timeout_ms = ${refreshTimeout}`,
+    );
+  }
+  if (runtime === 'claude-code') {
+    const mcp = policy?.mcp;
+    lines.push(
+      `${c}# MCP servers for non-review sessions: "none" = only the role's tools`,
+      `${c}# (like pi); "project" = only the cwd's checked-in .mcp.json; "user" = your`,
+      `${c}# own Claude MCP configuration, connectors included, without prompts.`,
+    );
+    lines.push(
+      mcp === undefined
+        ? `${c}# mcp = ${tomlString(DEFAULT_CLAUDE_MCP_MODE)}`
+        : `${c}mcp = ${tomlString(mcp)}`,
     );
   }
   lines.push('', `${c}[runtimes.${runtime}.roles]`);

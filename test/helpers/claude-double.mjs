@@ -11,6 +11,8 @@
  *                        before completing the turn (25s safety exit 4)
  *   "crash"            — stderr + exit 2, no result frame
  *   "no-result-ok"     — exit 0 with no result frame (protocol violation)
+ *   "api-error"        — the real CLI's synthetic API-error assistant
+ *                        message (is_api_error_message) + is_error result
  *   "error"            — result frame with is_error:true
  *   "garbage"          — blank/non-JSON lines + a torn final line at EOF
  *   "partial"          — assistant frame written in byte chunks, splitting
@@ -659,6 +661,14 @@ async function run() {
   if (prompt.includes('tool:')) {
     await emitToolTurn(prompt.split('tool:')[1].split(/\s/)[0] || 'Bash');
     out(resultFrame('tool done', false));
+    return;
+  }
+  if (prompt.includes('api-error')) {
+    // Real CLI shape (2.1.x): the API failure arrives as a synthetic
+    // assistant message, then an is_error result carrying the same text.
+    const text = "There's an issue with the selected model (double-model). It may not exist or you may not have access to it.";
+    out({ ...assistantFrame([{ type: 'text', text }]), error: 'model_not_found', is_api_error_message: true, api_error_status: 404 });
+    out({ ...resultFrame(text, true), subtype: 'success' });
     return;
   }
   if (prompt.includes('error')) {

@@ -32,6 +32,26 @@ function check(deps: DirectiveProgressDeps, identity: DirectiveTurnIdentity): vo
   if (deps.signal.aborted) throw new DirectiveCheckpointError('service stopping — directive recovery cancelled');
   deps.ledger.assertDirectiveAuthority(identity);
 }
+/** The target minion's runtime cannot host a native directive at all. Raised
+ * before any target binding, header read or prompt — positive no-effect. */
+class DirectiveRuntimeUnsupportedError extends DirectiveCheckpointError {
+  constructor(message: string) { super(message); this.name = 'DirectiveRuntimeUnsupportedError'; }
+}
+/** A runtime without native admission/producer attestation (claude-code
+ * declares this gap) must be refused before the target is bound: a bound
+ * target whose producer journal can never exist leaves cessation UNKNOWN
+ * forever, turning a declared runtime gap into an owner-only stop. */
+function assertNativeDirectiveRuntime(handle: AgentHandle): asserts handle is AgentHandle & {
+  readonly sessionFile: string;
+  readonly prepareDirectiveProducer: NonNullable<AgentHandle['prepareDirectiveProducer']>;
+} {
+  if (handle.sessionFile === null || handle.inspectDirective === undefined || handle.prepareDirectiveProducer === undefined) {
+    throw new DirectiveRuntimeUnsupportedError(
+      `minion ${handle.id} runs on a runtime that cannot attest native directive admission or producer ownership ` +
+        '(the claude-code runtime declares this gap); Silas directives and re-briefs need a pi-hosted minion',
+    );
+  }
+}
 interface CleanupOwner {
   readonly identity: DirectiveTurnIdentity;
   readonly handle: AgentHandle;
@@ -134,6 +154,7 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
     catch (error) { throw new DirectiveCheckpointError(`original registered branch cannot be proven; fresh native directive effects are forbidden: ${String(error)}`); }
     if (branch !== originalLane.branch) throw new DirectiveCheckpointError('original registered branch differs from the checkout; fresh native directive effects are forbidden');
     const prepared = preparedHandle ?? handle;
+    if (prepared !== undefined) assertNativeDirectiveRuntime(prepared);
     if (prepared !== undefined && (prepared.sessionFile === null || readDirectiveSessionHeader(prepared.sessionFile).cwd !== originalLane.path)) {
       throw new DirectiveCheckpointError('original native cwd differs from its registered lane; fresh directive effects are forbidden');
     }
@@ -171,9 +192,8 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
       onPrepared: (handle) => {
         preparedHandle = handle;
         check(deps, identity);
-        if (handle.sessionFile === null || handle.inspectDirective === undefined) throw new DirectiveCheckpointError('runtime cannot durably attest directive admission');
+        assertNativeDirectiveRuntime(handle);
         deps.ledger.prepareDirectiveTarget(requestId, { agentId: handle.id, sessionFile: handle.sessionFile });
-        if (handle.prepareDirectiveProducer === undefined) throw new DirectiveCheckpointError('runtime cannot attest physical native producer ownership');
         preparedProducer = handle.prepareDirectiveProducer(identity);
         producerStartSeq = deps.ledger.startDirectiveProducer(identity, preparedProducer);
       },
@@ -215,7 +235,11 @@ export async function executeAcceptedDirective(deps: DirectiveProgressDeps, requ
       try { recordCleanup(deps, identity, preparedHandle, producerStartSeq); } catch (journalError) { failures.push(journalError); }
     }
     const failure = failures.length === 1 ? error : new AggregateError(failures, `directive execution/cleanup failed: ${failures.map(String).join('; ')}`);
-    if (!deps.signal.aborted) {
+    if (error instanceof DirectiveRuntimeUnsupportedError && failures.length === 1 && !deps.signal.aborted) {
+      // Refused before any target binding or prompt, and every cleanup
+      // settled: a positive no-effect. Retrying cannot change the runtime.
+      deps.ledger.failDirective({ requestId, reason: error.message });
+    } else if (!deps.signal.aborted) {
       deps.ledger.recordDirectiveReconcile({ requestId, note: String(failure) });
       surfaceDirectiveRecovery(deps, requestId, String(failure));
     }

@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import {
   closeSync,
   createWriteStream,
+  existsSync,
   mkdirSync,
   openSync,
   readSync,
@@ -17,7 +18,7 @@ import type { WriteStream } from 'node:fs';
 import { basename, isAbsolute, join, relative } from 'node:path';
 import { finished } from 'node:stream/promises';
 import type { GruCommandConfig, Role } from '../config.js';
-import { resolveSpawnPolicy } from '../config.js';
+import { DEFAULT_CLAUDE_MCP_MODE, resolveSpawnPolicy } from '../config.js';
 import type { LogLevel } from '../logger.js';
 import { ROLE_DEFINITIONS } from '../roles.js';
 import { managedSkillsPromptNote } from './managed-skills.js';
@@ -73,9 +74,11 @@ const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracod
 
 /**
  * Role tool ids (pi-flavored, src/roles.ts) → claude built-in tool names
- * for --tools (a hard restriction of the tool set, enforced in any
+ * for --tools (a hard restriction of the built-in tool set, enforced in any
  * permission mode). An unmapped id fails loud at spawn — silently dropping
- * a restriction is never acceptable.
+ * a restriction is never acceptable. Every target must be a tool the CLI
+ * actually ships: the CLI silently ignores unknown --tools names (it dropped
+ * its `LS` tool), so directory listing maps to Glob, its listing tool.
  */
 const CLAUDE_TOOL_MAP: Readonly<Record<string, string>> = {
   read: 'Read',
@@ -84,18 +87,20 @@ const CLAUDE_TOOL_MAP: Readonly<Record<string, string>> = {
   write: 'Write',
   grep: 'Grep',
   find: 'Glob',
-  ls: 'LS',
+  ls: 'Glob',
 };
 
-/** Map role tool ids to claude built-in tool names (fail-loud on unknown). */
+/** Map role tool ids to claude built-in tool names (fail-loud on unknown;
+ * several role ids may share one claude tool, which is listed once). */
 export function mapRoleTools(role: Role, tools: readonly string[]): string[] {
-  return tools.map((tool) => {
-    const mapped = CLAUDE_TOOL_MAP[tool];
-    if (mapped === undefined) {
+  const mapped = tools.map((tool) => {
+    const name = CLAUDE_TOOL_MAP[tool];
+    if (name === undefined) {
       throw new Error(`role "${role}" tool "${tool}" has no claude-code tool mapping`);
     }
-    return mapped;
+    return name;
   });
+  return [...new Set(mapped)];
 }
 
 /** Default grace between SIGTERM and SIGKILL when disposing a live turn. */
@@ -159,6 +164,7 @@ export interface ClaudeCodeRuntimeOptions {
  *           (--session-id <uuid> | --resume <uuid>) [--model M] [--effort E]
  *           --permission-mode bypassPermissions --tools <role tools>
  *           --append-system-prompt <role prompt>
+ *           [--strict-mcp-config [--mcp-config <cwd>/.mcp.json]]
  * fed with ONE stdin user frame followed by EOF; the turn ends with the
  * `result` frame and the process exits. Session continuity chains through
  * the CLI's own resume substrate keyed by the product-minted session UUID;
@@ -272,13 +278,15 @@ export class ClaudeCodeRuntime implements AgentRuntime {
         : resolveSpawnPolicy(this.config, 'claude-code', role).model;
     const cliModel = claudeCliModel(ref);
     if (cliModel === undefined) return {};
+    // Claude Code is always Anthropic: a bare CLI name needs no provider and
+    // reads the anthropic catalog entry (an explicit prefix is honored).
     const slash = ref.indexOf('/');
-    const provider = slash < 0 ? undefined : ref.slice(0, slash);
+    const provider = slash < 0 ? 'anthropic' : ref.slice(0, slash);
     const modelId = cliModel;
     let declared: ReturnType<ModelRuntime['getModel']> = undefined;
     let metadataError: unknown;
     try {
-      if (provider !== undefined) declared = (await this.runtime()).getModel(provider, modelId);
+      declared = (await this.runtime()).getModel(provider, modelId);
     } catch (error) {
       // Metadata enriches the CLI spawn but is not its transport. A torn
       // cache must decline vision conservatively, not take Claude offline.
@@ -460,6 +468,17 @@ export class ClaudeCodeRuntime implements AgentRuntime {
             '(use the pi runtime for parent child-worker tools — declared capability gap, issue #161)',
         );
       }
+      // Owner decision 2026-10-15: ordinary sessions load no ambient MCP
+      // servers unless [runtimes.claude-code] mcp opts in. --tools restricts
+      // built-ins only, so without this every server in the operator's own
+      // Claude configuration (claude.ai connectors included) would run under
+      // bypassPermissions regardless of the role's declared tools.
+      const mcpMode = this.config.runtimes.policies['claude-code']?.mcp ?? DEFAULT_CLAUDE_MCP_MODE;
+      const projectMcpFile = join(cwd, '.mcp.json');
+      const ambientMcp: HandleParams['ambientMcp'] =
+        reviewMode !== undefined || mcpMode === 'none' ? { mode: 'none' }
+          : mcpMode === 'user' ? { mode: 'user' }
+            : existsSync(projectMcpFile) ? { mode: 'project', file: projectMcpFile } : { mode: 'none' };
       const declaredNativeTools = reviewMode !== undefined ? reviewMode.nativeTools : undefined;
       if (declaredNativeTools !== undefined && declaredNativeTools.length > 0) {
         reviewBridge = await ReviewMcpBridge.start(declaredNativeTools);
@@ -545,6 +564,7 @@ export class ClaudeCodeRuntime implements AgentRuntime {
           ...(reviewConfiguration !== undefined ? { reviewAuthEnv: claudeReviewProcessEnv(reviewConfiguration) } : {}),
           fileTools,
           nativeTools,
+          ambientMcp,
           ...(reviewBridge !== undefined ? {
               mcpConfigFile: reviewBridge.configFile,
               reviewBridge,
@@ -645,6 +665,9 @@ interface HandleParams {
   /** Raw perkins_* names wired through the bridge (capability declaration). */
   readonly reviewTools?: readonly string[];
   readonly mcpConfigFile?: string;
+  /** MCP servers an ordinary (non-review) session loads; absent = none.
+   * Review sessions always run strict with only their scoped bridge. */
+  readonly ambientMcp?: { readonly mode: 'none' } | { readonly mode: 'user' } | { readonly mode: 'project'; readonly file: string };
   readonly reviewBridge?: ReviewMcpBridge;
   readonly killGraceMs: number;
   readonly resume: boolean;
@@ -695,6 +718,11 @@ export function claudeTurnArgs(params: HandleParams, resume: boolean): string[] 
     ];
     if (allowed.length > 0) args.push('--allowedTools', allowed.join(','));
     if (params.mcpConfigFile !== undefined) args.push('--mcp-config', params.mcpConfigFile);
+  }
+  if (!params.isolatedReview) {
+    const mcp = params.ambientMcp ?? { mode: 'none' };
+    if (mcp.mode !== 'user') args.push('--strict-mcp-config');
+    if (mcp.mode === 'project') args.push('--mcp-config', mcp.file);
   }
   if (params.verificationSettingsFile !== undefined && !params.isolatedReview) {
     // Native ask reaches the original-child-bound host, even in bypass mode.
@@ -1382,6 +1410,17 @@ export class ClaudeCodeHandle implements AgentHandle {
             }
             return;
           }
+          // Record what this turn was asked right after its verified identity
+          // frame: stdout carries only claude's side of the conversation. Not
+          // the CLI's --replay-user-messages: it also echoes the permission
+          // control_responses the worker-verification channel writes, which
+          // that channel rightly fails closed on as foreign frames.
+          transcript.write(`${JSON.stringify({
+            ...claudePromptFrame(text, images),
+            session_id: params.sessionId,
+            timestamp: new Date().toISOString(),
+            gc_prompt: true,
+          })}\n`);
           this.setState('streaming');
           this.emit({ type: 'turn_start' });
           this.sessionEstablished = true;
@@ -1442,7 +1481,7 @@ export class ClaudeCodeHandle implements AgentHandle {
             if (result.isError) {
               // In-band error (pi W7 parity): the turn COMPLETED with an
               // error — resolve, sticky error state, next turn recovers.
-              const detail = result.text ?? `turn ended with result subtype "${result.subtype}"`;
+              const detail = result.text ?? translator.apiError ?? `turn ended with result subtype "${result.subtype}"`;
               this.emit({ type: 'error', error: detail, fatal: false });
               this.setState('error', detail);
             } else {

@@ -1,13 +1,12 @@
-/** Only these published CLI model names and provider spellings may enter a
- * Claude recovery manifest. The CLI discards the provider prefix, so lexical
- * validity alone cannot prove that prefix is not a user-supplied credential. */
-const PUBLIC_CLAUDE_MODELS: ReadonlySet<string> = new Set([
-  'sonnet', 'opus', 'haiku',
-  'claude-fable-5', 'claude-fable-5-1', 'claude-haiku-4-5', 'claude-haiku-4-5-20251001',
-  'claude-opus-4-5', 'claude-opus-4-5-20251101', 'claude-opus-4-6', 'claude-opus-4-7',
-  'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-4-5', 'claude-sonnet-4-5-20250929',
-  'claude-sonnet-4-6', 'claude-sonnet-5',
-]);
+/** A Claude recovery manifest persists the configured model reference. The
+ * CLI discards a provider prefix, so an arbitrary prefix is unverifiable (it
+ * could be pasted credential material that the CLI silently ignores): only a
+ * bare CLI model or the `anthropic/` spelling may enter the manifest. The
+ * model itself is checked by SHAPE only — never against a list of published
+ * names, which every model release would make stale (owner ruling
+ * 2026-10-15). A credential in the model position is not silent: the CLI
+ * sends it as the model name and the turn fails at once. */
+const CLAUDE_MODEL_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:@[\]-]{0,127}$/u;
 const PUBLIC_CLAUDE_EFFORT: ReadonlySet<string> = new Set([
   'default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode',
 ]);
@@ -33,6 +32,6 @@ export function publicRecoveryModelIdentity(input: {
   const parts = input.modelRef.split('/');
   const model = parts.length === 1 ? parts[0] :
     parts.length === 2 && parts[0] === 'anthropic' ? parts[1] : undefined;
-  return model !== undefined && PUBLIC_CLAUDE_MODELS.has(model) &&
-    (input.settingsModel === undefined || PUBLIC_CLAUDE_MODELS.has(input.settingsModel));
+  return model !== undefined && CLAUDE_MODEL_TOKEN.test(model) &&
+    (input.settingsModel === undefined || CLAUDE_MODEL_TOKEN.test(input.settingsModel));
 }

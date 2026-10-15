@@ -459,7 +459,8 @@ verification budget.
 
   The independent offline CLI double proves raw corpus dispositions, settings
   and stdio wiring, not execution by a vendor CLI or paid model. The declared
-  native component scope exercises installed Claude 2.1.296 with the configured
+  native component scope exercises the installed Claude CLI (any release — its
+  exact version and sha256 are recorded with the evidence) with the configured
   `gpt-6-luna`/`max`, isolated state, fake credentials and deterministic
   loopback upstream; it verifies matching successful Bash read results and
   zero refused producer starts. That is actual vendor permission-engine
