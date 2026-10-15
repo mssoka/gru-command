@@ -222,7 +222,7 @@ export async function establishProviderWait(
 
 /** Service boot for provider recovery: the timer starts only while a switch
  * is on, but boot reconciliation always runs — a provider switch turned off
- * hands its open waits back to the owner even with the whole sensor off.
+ * hands its open waits to Gru even with the whole sensor off.
  * Returns the reconciliation so callers (and tests) can observe it settle. */
 export function bootProviderRecovery(sensor: ProviderRecoverySensor, log: Log): Promise<void> {
   if (sensor.enabled) {
@@ -831,15 +831,18 @@ export class ProviderRecoverySensor {
   /** A provider's switch turned off across a restart (`claude_native` or
    * `enabled`) must never strand the waits it left open: each open wait of a
    * provider that is now off is cancelled (which resolves its own
-   * machine-owned stop) and handed to the owner through one needs-owner
-   * notice per wait — posted through the notification center, so it surfaces
-   * in chat, and deduped by kind while unresolved, so a crash before the
-   * cancel never posts it twice (an acked notice stays unresolved; one
+   * machine-owned stop) and handed to Gru through one action-required notice
+   * per wait (a provider stop is machine attention: Gru decides the
+   * direction) — posted through the notification center, and deduped by kind
+   * while unresolved, so a crash before the cancel never posts it twice while
+   * it is open (once Gru has disposed of it, a boot that still finds the wait
+   * open tells Gru again: a disposition does not prove the lane resumed; one
    * resolved because the switch came back on lets a later hand-back be
-   * announced). No notice is posted when the lane already has an open owner stop
-   * (the owner already holds it); an open wait is never assumed handled — a
-   * lane Gru already re-dispatched may get a redundant notice, which is
-   * cheaper than a stranded one. A
+   * announced). No notice is posted when the
+   * lane still has an open owner stop (a legacy needs-owner row the boot's
+   * re-triage left in place: the owner already holds it); an open wait is
+   * never assumed handled — a lane Gru already re-dispatched may get a
+   * redundant notice, which is cheaper than a stranded one. A
    * route left with no open wait retires its "watching" notice and
    * pending delivery marker. Runs at every boot, even with the sensor off;
    * one failing wait is logged and kept for the next boot, never blocking
@@ -869,7 +872,7 @@ export class ProviderRecoverySensor {
     }
     this.retireDisabledRoutes();
     if (handedBack > 0) {
-      this.log('warn', 'provider waits handed back to the owner — automatic recovery is off for their provider', { handed_back: handedBack });
+      this.log('warn', 'provider waits handed to Gru — automatic recovery is off for their provider', { handed_back: handedBack });
     }
     return handedBack;
   }
@@ -930,12 +933,14 @@ export class ProviderRecoverySensor {
     if (ownerStop?.routing !== 'needs-owner') {
       const slot = wait.waiterKind === 'silas-slot';
       const subject = slot ? `Silas slot ${wait.slotId ?? wait.id}` : `Agent ${wait.agentId ?? wait.id}`;
-      // A chat message re-arms a stopped slot-bound agent; a job lane needs
-      // Gru (an ack cannot re-arm anything at boot).
-      const resume = slot ? 'send Silas a message (any message re-arms its slot)' : 'ask Gru to resume or re-dispatch the job';
+      // A chat message re-arms a stopped slot-bound agent; a job lane is
+      // resumed or re-dispatched (an ack cannot re-arm anything at boot).
+      // Machine attention: Gru decides, and asks the owner only through a
+      // typed reserved decision.
+      const resume = slot ? 'message Silas (any message re-arms its slot)' : 'resume or re-dispatch the job';
       this.notifications.postIncident({
         kind: `provider-recovery.recovery-off.${wait.id}`,
-        routing: 'needs-owner',
+        routing: 'action-required',
         severity: 'error',
         title: recovered
           ? `${subject}: provider recovered, automatic resume off`
@@ -946,10 +951,10 @@ export class ProviderRecoverySensor {
           : `Automatic provider recovery is off for ${wait.provider} ([provider_recovery] ${key} = false), so it stays ` +
             `stopped. Once the provider limit clears, ${resume}.`,
         agentId: wait.agentId,
-        // Per-wait kind, deduped while unresolved: an acked notice is never
-        // re-posted by a later boot retrying a wait it could not cancel, but
-        // one resolved because the switch came back on never blocks a later
-        // hand-back (the switch turned off again).
+        // Per-wait kind, deduped while unresolved: an open notice is never
+        // re-posted by a later boot retrying a wait it could not cancel, and
+        // one resolved (Gru's disposition, or the switch coming back on)
+        // never blocks a later hand-back of a wait still open.
         dedupe: 'active',
       });
     }

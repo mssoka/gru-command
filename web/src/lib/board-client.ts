@@ -8,6 +8,7 @@
 
 import {
   BOARD_WS_PATH,
+  isNotificationView,
   isValidDecisionStatus,
   isValidLessonProposal,
   isValidLessonProposalDecision,
@@ -17,6 +18,7 @@ import {
   type DecisionStatusView,
   type LessonProposalDecisionView,
   type LessonProposalView,
+  type NotificationDecisionView,
   type NotificationView,
   type TranscriptInfo,
   type TranscriptPage,
@@ -40,9 +42,11 @@ export type BoardConnectionState =
   | 'reconnecting'
   | 'offline';
 
+export type BoardSnapshotSource = 'http' | 'push';
+
 export interface BoardClientEvents {
   connection(state: BoardConnectionState): void;
-  snapshot(snapshot: BoardSnapshot): void;
+  snapshot(snapshot: BoardSnapshot, source?: BoardSnapshotSource): void;
   /** Current membership is unavailable; retained rows/counts are last-known only. */
   unavailable?(message: string): void;
   /** Fatal (bad token) — pairing must redo. */
@@ -65,8 +69,8 @@ export interface BoardClientOptions {
 const BACKOFF_MS = [800, 1_600, 3_200, 6_400, 12_000] as const;
 const DEFAULT_LIVENESS_WINDOW_MS = 75_000;
 const DEFAULT_LIVENESS_CHECK_MS = 5_000;
-/** R7-05: a snapshot request (fetch AND body) that outlives this is abandoned. */
-const SNAPSHOT_DEADLINE_MS = 15_000;
+/** R7-05: board snapshots and owner-review GETs are bounded across fetch and body reads. */
+const HTTP_REQUEST_DEADLINE_MS = 15_000;
 /** R7-04: trailing refetches run back to back this many times in a chain... */
 const TRAILING_BURST = 2;
 /** ...then wait, capped — owed demand is kept, never dropped. */
@@ -90,7 +94,7 @@ export class BoardClient {
   private readonly options: BoardClientOptions;
   private readonly webSocketCtor: new (url: string) => WebSocket;
   private readonly fetchImpl: typeof fetch;
-  /** Pushed snapshots seen: an HTTP answer asked for before a push is stale. */
+  /** Pushes and connection loss invalidate HTTP snapshots requested before them. */
   private snapshotEpoch = 0;
   /** The newest HTTP snapshot request; older answers are dropped. */
   private fetchSeq = 0;
@@ -217,6 +221,7 @@ export class BoardClient {
    * `fromStale` is set the 'stale' state persists through the backoff so
    * the dot shows why the board is behind. */
   private forceReopen(fromStale = false): void {
+    this.snapshotEpoch += 1; // A pre-disconnect HTTP answer cannot clear the stale fence.
     const socket = this.socket;
     this.socket = null;
     if (socket !== null) {
@@ -264,7 +269,7 @@ export class BoardClient {
         this.attempts = 0;
         this.setState('open');
         this.snapshotEpoch += 1;
-        this.events.snapshot(frame.snapshot);
+        this.events.snapshot(frame.snapshot, 'push');
         return;
       }
       if (frame.type === 'ping') return;
@@ -279,6 +284,7 @@ export class BoardClient {
     };
     ws.onclose = () => {
       if (this.socket !== ws) return; // already force-reopened
+      this.snapshotEpoch += 1; // A pre-disconnect HTTP answer cannot restore stale actions.
       this.socket = null;
       if (this.stopped) return;
       this.scheduleReconnect();
@@ -329,8 +335,12 @@ export class BoardClient {
     let code: string | null = null;
     let detail: string | null = null;
     try {
-      const body = (await res.json()) as { error?: unknown; detail?: unknown };
-      code = typeof body.error === 'string' ? body.error : null;
+      const body = (await res.json()) as { error?: unknown; code?: unknown; detail?: unknown };
+      // Domain refusals carry a transport-level `error` (for example,
+      // `decision_refused`) and a more precise `code` (for example,
+      // `decision_recorded`). Callers need the latter to reconcile stale
+      // owner choices instead of presenting the conflict as retryable.
+      code = typeof body.code === 'string' ? body.code : typeof body.error === 'string' ? body.error : null;
       detail = typeof body.detail === 'string' ? body.detail : null;
     } catch {
       /* a non-JSON error body keeps the status alone */
@@ -350,7 +360,7 @@ export class BoardClient {
       // A stopped (re-paired) client's late answer never reaches the board.
       if (this.stopped || request !== this.fetchSeq) return;
       if (epoch === this.snapshotEpoch) {
-        this.events.snapshot(snapshot);
+        this.events.snapshot(snapshot, 'http');
         this.demandMet();
       } else {
         // C13: the push that won may itself be OLDER (queued before a
@@ -384,7 +394,7 @@ export class BoardClient {
     const expired = new Promise<never>((_, reject) => {
       request.signal.addEventListener('abort', () => reject(new Error('board snapshot request abandoned')), { once: true });
     });
-    const timer = setTimeout(() => request.abort(), SNAPSHOT_DEADLINE_MS);
+    const timer = setTimeout(() => request.abort(), HTTP_REQUEST_DEADLINE_MS);
     try {
       return await Promise.race([this.api<unknown>('/api/board', request.signal), expired]);
     } finally {
@@ -480,10 +490,35 @@ export class BoardClient {
   }
 
   /** The pending Book of Lessons proposal, for the owner's review. */
-  async getLessonProposal(): Promise<LessonProposalView> {
-    const proposal = await this.api<unknown>('/api/lessons/proposal');
-    if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
-    return proposal;
+  async getLessonProposal(signal?: AbortSignal): Promise<LessonProposalView> {
+    const request = new AbortController();
+    let deadlineExpired = false;
+    const timeoutMessage = `lesson proposal review timed out after ${HTTP_REQUEST_DEADLINE_MS / 1000} seconds`;
+    let rejectAborted!: (error: Error) => void;
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAborted = reject; });
+    const onAbort = (): void => {
+      rejectAborted(deadlineExpired ? new Error(timeoutMessage) : new DOMException('aborted', 'AbortError'));
+    };
+    request.signal.addEventListener('abort', onAbort, { once: true });
+    const abortFromCaller = (): void => request.abort();
+    if (signal?.aborted) request.abort();
+    else signal?.addEventListener('abort', abortFromCaller, { once: true });
+    const deadline = setTimeout(() => {
+      deadlineExpired = true;
+      request.abort();
+    }, HTTP_REQUEST_DEADLINE_MS);
+    try {
+      const proposal = await Promise.race([
+        this.api<unknown>('/api/lessons/proposal', request.signal),
+        aborted,
+      ]);
+      if (!isValidLessonProposal(proposal)) throw new Error('lesson proposal review is malformed');
+      return proposal;
+    } finally {
+      clearTimeout(deadline);
+      signal?.removeEventListener('abort', abortFromCaller);
+      request.signal.removeEventListener('abort', onAbort);
+    }
   }
 
   /** The owner's decision on a lesson proposal — the ONLY way it closes
@@ -501,9 +536,27 @@ export class BoardClient {
     return body;
   }
 
-  /** E7: human ack (action-required clearance; re-arms an open breaker). */
+  /** E7: human ack (feed/notice clearance; machine rows refuse). */
   async ackNotification(id: string): Promise<void> {
     await this.postApi(`/api/notifications/${encodeURIComponent(id)}/ack`, { by: 'web' });
+  }
+
+  /** Record the owner's typed decision (owner release 2026-10-11). The
+   * server validates both the option and the displayed decision snapshot;
+   * the returned row carries the authoritative decided state. Recording a
+   * decision is not completion — the row stays until its producer resolves it. */
+  async decideNotification(
+    id: string,
+    optionId: string,
+    expectedDecision: NotificationDecisionView,
+  ): Promise<NotificationView> {
+    const { body } = await this.postApiWithStatus(`/api/notifications/${encodeURIComponent(id)}/decision`, {
+      optionId,
+      by: 'web',
+      expectedDecision,
+    });
+    if (!isNotificationView(body)) throw new Error('decision reply is malformed');
+    return body;
   }
 
   private async postApi(path: string, body: unknown): Promise<unknown> {

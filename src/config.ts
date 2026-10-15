@@ -356,7 +356,8 @@ export interface PacingConfig {
   /** Upper bound on any single automatic-retry delay. */
   readonly backoffMaxMs: number;
   /** Automatic retries per rate-limit incident before the failure stops to
-   * the existing supervisor ladder + owner ACK. 0 = no automatic retry. */
+   * the existing supervisor ladder + Gru's machine queue. 0 = no automatic
+   * retry. */
   readonly maxAutoRetries: number;
   /** Provider-keyed extra rate-limit signatures (global text signatures). */
   readonly providers: Readonly<Record<string, PacingProviderOverride>>;
@@ -386,7 +387,7 @@ export interface ProviderRecoveryConfig {
   /** Automatic recovery for claude-code lanes on the native claude.ai login
    * (read-only usage-endpoint checks, never generation). The ONLY switch for
    * that route, independent of `enabled` either way. ON by default (owner
-   * decision 2026-10-15); false keeps Claude quota walls owner-controlled. */
+   * decision 2026-10-15); false leaves Claude quota walls to Gru. */
   readonly claudeNative: boolean;
   /** Sensor tick: how often routes are re-examined. The check cadence
    * itself is bounded below by cadenceMinMs. */

@@ -878,6 +878,17 @@ awareness layer batches, persists, and calls the chat wake sink.
   `action-required`. Open machine rows seed bounded wake turns; an owner
   decision is a new explicit `needs-owner` post, never an automatic rewrite.
   All mode includes FYI/owner context too.
+- **Owner-attention registry (owner release 2026-10-11)** — the
+  notification center enforces who an incident may reach: only registered
+  owner-reserved kinds (typed `gru.owner-escalation` decisions, lessons
+  proposals, port squats, sweep confirmations, degraded decision
+  providers, blocked wakes) may occupy FOR YOU; a `needs-owner` request
+  from a machine or unregistered kind routes to Gru (`action-required`)
+  and is logged. Crash-loop breakers and provider-wall stops are machine
+  attention. At boot a bounded, note-preserving pass re-triages unacked
+  legacy owner rows that predate the registry (including
+  `gru.owner-escalation` rows without typed decision metadata) to Gru —
+  never dropped, never acked, never executed.
 
 **Mechanics.** A wake calls the chat server's `wakeAwareness()`: when the
 lane is idle it opens one ordinary turn whose prompt is the awareness
@@ -919,7 +930,7 @@ next user-directed context block:
 | routing | meaning | surface |
 |---|---|---|
 | `action-required` | machine attention: Gru resolves/acts in-turn | NEEDS GRU queue (live rows only; terminal-job rows are closed receipts under FEED); wakes Gru; never rings the owner bell |
-| `needs-owner` | owner-only decisions (every final PR merge, budget, destructive ops) and anything Gru escalates | FOR YOU band + owner bell + morning digest |
+| `needs-owner` | reserved owner decisions (scope/design or risk tradeoffs, authority/cost beyond delegation, destructive or irreversible choices, lesson proposals, merges) with typed decision metadata, plus owner-only notices whose action is outside the app | FOR YOU band + owner bell + morning digest |
 | `fyi` | standing feed | board feed only |
 
 **Unresolved follow-up.** A successful prompt is delivery, not resolution.
@@ -933,11 +944,34 @@ creates an owner stop. A machine disposition closes the original incident.
 After acting on an `action-required` row Gru calls the authenticated
 `POST /api/notifications/{id}/disposition` with a nonempty JSON `detail`
 (the action taken or why no safe action was possible). The ledger records
-`notification.resolved` by `gru` with the action detail; the endpoint refuses `needs-owner` and
-FYI rows. The authenticated `/ack` API itself refuses machine rows, not
-just the web UI. Both open machine alerts and owner stops remain in their
-board bands regardless of newer feed traffic. Only the owner Ack clears
-owner stops.
+`notification.resolved` by `gru` with the action detail; the endpoint refuses FYI
+and UNDECIDED `needs-owner` rows (a decided owner row resolves its
+follow-through through the same route, below). Disposing an open `supervision.breaker` alert is also the
+supported re-arm control for the stopped lane (same guarded
+recovery-authority fence as the historical ack). The authenticated `/ack`
+API itself refuses machine rows, not just the web UI. Both open machine
+alerts and owner stops remain in their
+board bands regardless of newer feed traffic.
+
+**Owner decisions, not acknowledgements.** A FOR YOU decision carries
+typed metadata validated server-side (question, context, Gru's
+recommendation, reserved class, why it cannot be delegated, options with
+consequences). `POST /api/notifications/{id}/decision` records the
+owner's choice durably and idempotently — it never acks or resolves the
+row, and a decision receipt is not proof its follow-on operation ran; the
+row stays visible as "decision recorded — awaiting follow-through" until
+its owner records the follow-through (`POST /api/notifications/{id}/disposition`
+with the action detail; an undecided row is refused). A discussion-only
+decision (no options yet) is settled through the supported bridge: Gru
+attaches the agreed options with
+`POST /api/notifications/{id}/decision-options` after the chat discussion —
+audited, records no choice, and refused once the owner has decided — then
+the owner's recorded choice and the follow-through proceed normally. Owner-only notices
+carry no in-app control at all; they clear when their producer sees the
+condition end: a successful bind for port squats, decision-service
+recovery for degraded providers, a passing gated call for enforce-gate
+incidents, a delivered wake for blocked/failed wake stops, and a completed
+sweep for a paused worktree. An ack cannot erase a typed decision (409).
 
 **Morning digest.** The first delivered block after `morning_digest_gap_ms`
 (default 8 h; 0 disables) carries a ledger-derived "while you were away"

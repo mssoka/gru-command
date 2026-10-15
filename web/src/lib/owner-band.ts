@@ -1,48 +1,69 @@
 /**
- * FOR YOU owner-band row model (owner approval 2026-09-28) — pure
- * derivations so the band's honesty rules are testable without a DOM.
+ * FOR YOU owner-band row model (owner approval 2026-09-28; decision-inbox
+ * release 2026-10-11) — pure derivations so the band's honesty rules are
+ * testable without a DOM.
  *
  * The band renders ONE authoritative pending-owner list:
- *   - ack rows: `needs-owner` notifications still unacked AND unresolved
- *     (pending = action still owed; seen/opened never completes one);
+ *   - decision rows: typed owner decisions (question, recommendation,
+ *     options with consequences) the owner answers here; recording the
+ *     choice never settles the row — follow-through stays distinct;
+ *   - notice rows: owner-only notices whose action is outside the app
+ *     (stop a process, fix a credential, restart); no fake Ack, no
+ *     invented option — the row remains visible until its producer
+ *     resolves it on evidence;
  *   - proposal rows: a pending Book of Lessons proposal, decided with
  *     Accept/Reject after reviewing it (never a plain Ack);
  *   - PR rows: the server-computed, evidence-bound `ownerPrs` projection
  *     (the browser never re-derives merge readiness).
  *
  * Ordering is deterministic (newest first, action id tiebreak) and row
- * ids are stable across renders (`owner-ack:{id}` / `owner-pr:{jobId}`)
- * so focus, aria and tests address the same control before and after a
- * snapshot push. No text-based dedupe, no grouping, no bulk actions.
+ * ids are stable across renders so focus, aria and tests address the same
+ * control before and after a snapshot push. No text-based dedupe, no
+ * grouping, no bulk actions, and never an action derived from prose.
  */
 
-import { LESSONS_PROPOSAL_KIND, type BoardSnapshot, type NotificationView, type OwnerPrView } from './board-protocol.js';
+import { LESSONS_PROPOSAL_KIND, type BoardSnapshot, type NotificationDecisionView, type NotificationView, type OwnerPrView } from './board-protocol.js';
 
-/** Consequence copy explains WHAT an ack does and does NOT do. Static
- * per kind — never parsed out of notification prose (prose is display
- * data, not execution authority). */
-export function ackConsequence(kind: string): string {
-  if (kind.startsWith('supervision.provider-wall.') || kind === 'supervision.breaker') {
-    return 'Ack re-arms this worker and resumes supervision — it does NOT clear code/test/review holds.';
+/** What the owner must actually do for a notice-only kind — static copy,
+ * never parsed out of notification prose (prose is display data, not
+ * execution authority). A notice carries no in-app control. */
+export function ownerNoticeGuidance(kind: string): string {
+  if (kind === 'port-squat' || kind === 'roll-port-squat') {
+    return 'Stop the foreign process yourself, then restart the service. This notice clears on a successful bind.';
+  }
+  if (kind.startsWith('decisions.enforce-gate.')) {
+    return 'Repair or produce passing backtest evidence for this gate, then retry the gated surface.';
   }
   if (kind.startsWith('decisions.degraded.')) {
-    return 'Ack records that you saw this; the system stays degraded until the credential or provider is fixed.';
+    return 'Fix the decision-provider credential or configuration, then use Recheck. This notice clears when the decision service recovers.';
   }
-  if (kind === 'worktree-sweep-paused') {
-    return 'Ack confirms removal of the listed worktree — check nothing live is rooted there first.';
+  if (kind === 'worktree-sweep-paused' || kind.startsWith('worktree-sweep-paused:')) {
+    return 'Confirm nothing live is rooted in the listed worktree. The sweep stays paused until an operator deliberately completes it; the notice clears when that worktree is swept.';
   }
-  if (kind === 'port-squat' || kind === 'roll-port-squat') {
-    return 'Stop the foreign process yourself; ack only clears the notice.';
+  if (
+    kind.startsWith('gru.wake-blocked.') ||
+    kind.startsWith('gru.wake-blocked-mailbox.') ||
+    kind.startsWith('gru.wake-failed-escalation.')
+  ) {
+    return 'Restart the service to recover chat safely. The machine alert remains pending for retry.';
   }
-  return 'Ack clears this notice from your queue; it does not by itself prove the underlying operation ran.';
+  return 'No in-app action is supported for this notice; it stays visible until its producer resolves it.';
 }
 
-export interface OwnerAckRow {
-  readonly kind: 'ack';
+export interface OwnerDecisionRow {
+  readonly kind: 'decision';
   readonly actionId: string;
   readonly ts: string;
   readonly notification: NotificationView;
-  readonly consequence: string;
+  readonly decision: NotificationDecisionView;
+}
+
+export interface OwnerNoticeRow {
+  readonly kind: 'notice';
+  readonly actionId: string;
+  readonly ts: string;
+  readonly notification: NotificationView;
+  readonly guidance: string;
 }
 
 export interface OwnerPrRow {
@@ -67,7 +88,7 @@ export interface OwnerProposalRow {
   readonly consequence: string;
 }
 
-export type OwnerRow = OwnerAckRow | OwnerPrRow | OwnerProposalRow;
+export type OwnerRow = OwnerDecisionRow | OwnerNoticeRow | OwnerPrRow | OwnerProposalRow;
 
 /** Pending owner obligations, newest first (id tiebreak). The snapshot's
  * notification list already carries EVERY unacked needs-owner row — the
@@ -87,12 +108,24 @@ export function ownerRows(snapshot: BoardSnapshot): readonly OwnerRow[] {
       });
       continue;
     }
+    if (notification.decision !== null && notification.decision !== undefined) {
+      rows.push({
+        kind: 'decision',
+        actionId: `owner-decision:${notification.id}`,
+        ts: notification.ts,
+        notification,
+        decision: notification.decision,
+      });
+      continue;
+    }
+    // A needs-owner row without a typed decision is an owner notice (the
+    // action is outside the app) — it never grows an invented control.
     rows.push({
-      kind: 'ack',
-      actionId: `owner-ack:${notification.id}`,
+      kind: 'notice',
+      actionId: `owner-notice:${notification.id}`,
       ts: notification.ts,
       notification,
-      consequence: ackConsequence(notification.kind),
+      guidance: ownerNoticeGuidance(notification.kind),
     });
   }
   for (const pr of snapshot.ownerPrs ?? []) {
@@ -102,7 +135,9 @@ export function ownerRows(snapshot: BoardSnapshot): readonly OwnerRow[] {
 }
 
 /** The pending count shown in the band header — owed actions, not unseen
- * rows. Opening the board or the bell never changes it. */
+ * rows. Opening the board or the bell never changes it. A recorded
+ * decision keeps its row visible (awaiting follow-through) until the
+ * producer resolves it, exactly like an unanswered one. */
 export function ownerPendingCount(snapshot: BoardSnapshot): number {
   return ownerRows(snapshot).length;
 }
@@ -119,6 +154,13 @@ export interface OwnerWindowView {
 export function ownerWindow(rows: readonly OwnerRow[], expanded: boolean, limit = OWNER_WINDOW_SIZE): OwnerWindowView {
   if (expanded || rows.length <= limit) return { rows, hidden: 0 };
   return { rows: rows.slice(0, limit), hidden: rows.length - limit };
+}
+
+/** The recorded option's label for the "decision recorded" line. Unknown
+ * ids fall back to the raw id — a decided row NEVER renders as pending. */
+export function decidedOptionLabel(decision: NotificationDecisionView, optionId: string | null | undefined): string {
+  if (optionId === null || optionId === undefined) return 'decision recorded';
+  return decision.options.find((option) => option.id === optionId)?.label ?? optionId;
 }
 
 /** OPEN PR targets: https only. A non-https prUrl renders no link (fail

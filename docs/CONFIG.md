@@ -358,14 +358,15 @@ enabled = false
 # on the native claude.ai login are checked by read-only usage-metadata
 # reads instead (no generation). GLM/Codex are DISABLED BY DEFAULT: owner
 # activation is manual. Auth/billing/ambiguous failures and unsupported
-# providers always stay owner-controlled.
+# providers stay machine attention: Gru decides the direction and asks the
+# owner only through a typed reserved decision.
 enabled = false
 # claude-code lanes on the native claude.ai login: a usage-limit wall
 # waits on the claude.ai usage endpoint and resumes when the window
-# resets. ON by default, independent of `enabled`; false keeps Claude
-# quota walls owner-controlled. API-key logins always stay owner-controlled.
-# Turning either switch off hands that provider's open waits back to you
-# at the next boot (needs-owner stops) — never stranded.
+# resets. ON by default, independent of `enabled`. Off — and always for
+# API-key logins — Claude quota walls are left to Gru. Turning either
+# switch off hands that provider's open waits to Gru at the next boot
+# (one action-required notice per wait) — never stranded.
 claude_native = true
 # Sensor tick (how often routes are re-examined). The check cadence
 # itself cannot go below the approved 300 s floor.

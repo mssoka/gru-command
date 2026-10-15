@@ -280,6 +280,27 @@ class SeamHarness {
     this.supervisor.start();
   }
 
+  /** A jobless Silas logical slot with an open turn, then a structured
+   * GLM quota error; its provider wait must stay owned by the sensor. */
+  async runSilasIntoQuotaWall(): Promise<FakeHandle> {
+    const slot = this.supervisor.declareSlot({
+      id: 'silas-ops',
+      role: 'silas',
+      spawn: (options) => this.registry.spawn('silas', options),
+    });
+    const handle = await slot.ensure() as FakeHandle;
+    handle.emit({ type: 'turn_start' });
+    handle.emit({
+      type: 'error',
+      error: '429: {"error":{"code":"1302","message":"usage window limit reached"}}',
+      fatal: false,
+      provider: 'zai-coding-cn',
+      model: 'glm-5.3',
+      typed: { origin: 'provider-message', status: 429, bodyCode: '1302' },
+    });
+    return handle;
+  }
+
   /** A live minion with an open turn, then a structured quota error (GLM
    * unless the caller supplies the runtime's own event). */
   async runMinionIntoQuotaWall(jobId: string, error: RuntimeEvent = {
@@ -535,6 +556,30 @@ describe('supervisor ⇄ sensor seam', () => {
     expect(handle.disposed).toBe(true);
   });
 
+  it('a jobless Silas notification disposition cannot bypass its open provider wait', async () => {
+    const h = new SeamHarness();
+    try {
+      const handle = await h.runSilasIntoQuotaWall();
+      await h.settle();
+      const wait = h.ledger.openProviderWaitForAgent(handle.id);
+      expect(wait).toMatchObject({ waiterKind: 'silas-slot', jobId: null, slotId: 'silas-ops', status: 'waiting' });
+      const incident = h.ledger.listNotifications({ routing: 'action-required', unackedOnly: true })
+        .find((row) => row.kind.startsWith('supervision.provider-wall.'));
+      expect(incident?.agentId).toBe(handle.id);
+      expect(incident?.resolvedAt).toBeNull();
+      const spawnsBeforeDisposition = h.registry.spawns;
+      const refused = h.supervisor.onNotificationDisposed(incident!.id);
+      expect(refused).toMatchObject({ ok: false });
+      if (!refused.ok) expect(refused.reason).toContain(`open provider recovery ${wait!.id}`);
+      expect(h.registry.spawns).toBe(spawnsBeforeDisposition);
+      expect(h.supervisor.viewFor(handle.id)).toMatchObject({ state: 'stopped', breakerOpen: true });
+      expect(h.ledger.openProviderWaitForAgent(handle.id)?.id).toBe(wait?.id);
+    } finally {
+      h.supervisor.dispose();
+      h.sensor.stop();
+    }
+  });
+
   it('exhausted pacing retries hand the latest typed provider evidence to the recovery sensor', async () => {
     let releaseBackoff!: () => void;
     const backoff = new Promise<void>((resolve) => { releaseBackoff = resolve; });
@@ -593,18 +638,20 @@ describe('supervisor ⇄ sensor seam', () => {
     }
   });
 
-  it('an auth wall keeps the conservative owner stop and never becomes a wait', async () => {
+  it('an auth wall stays a machine decision: no wait, no owner bell', async () => {
     const h = new SeamHarness();
     await h.runMinionIntoAuthWall('job-auth');
     await h.settle();
     expect(h.observations).toHaveLength(1);
     expect(h.observations[0]?.failureClass).toBe('authentication_wall');
     expect(h.ledger.listProviderWaits()).toHaveLength(0);
-    // Owner control preserved: the conservative needs-owner stop still posts.
-    expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(1);
+    // Owner release 2026-10-11: no blind restart and no owner chore — the
+    // stop is machine attention so Gru determines the direction.
+    expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(0);
+    expect(h.ledger.listNotifications({ routing: 'action-required' })).toHaveLength(1);
   });
 
-  it('an unsupported provider wall keeps the conservative owner stop (no machine notice, no wait)', async () => {
+  it('an unsupported provider wall stays a machine decision (no wait, no owner bell)', async () => {
     const h = new SeamHarness();
     const dir = mkdtempSync(join(tmpdir(), 'pr-seam-unsup-'));
     cleanupDirs.push(dir);
@@ -627,8 +674,8 @@ describe('supervisor ⇄ sensor seam', () => {
     });
     await h.settle();
     expect(h.ledger.listProviderWaits()).toHaveLength(0);
-    expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(1);
-    expect(h.ledger.listNotifications({ routing: 'action-required' })).toHaveLength(0);
+    expect(h.ledger.listNotifications({ routing: 'needs-owner' })).toHaveLength(0);
+    expect(h.ledger.listNotifications({ routing: 'action-required' })).toHaveLength(1);
   });
 
   it('the guarded owned re-arm clears exactly the provider-stopped breaker', async () => {
@@ -657,7 +704,7 @@ describe('supervisor ⇄ sensor seam', () => {
     expect(h.supervisor.ownedProviderReArm(handle.id, 'not-a-wait')).toBe(false);
   });
 
-  it('an ack re-arm still works independently of the sensor path (owner-held auth stop)', async () => {
+  it('a Gru disposition re-arms independently of the sensor path (machine-held auth stop)', async () => {
     const h = new SeamHarness();
     await h.runMinionIntoAuthWall('job-seam-3');
     await h.settle();
@@ -665,11 +712,12 @@ describe('supervisor ⇄ sensor seam', () => {
       .listNotifications({ unackedOnly: true })
       .find((n) => n.kind.startsWith('supervision.provider-wall.'));
     expect(incident).toBeDefined();
-    expect(incident?.routing).toBe('needs-owner');
-    // The owner's ack (returned by ackNotification) re-arms as before.
-    const acked = h.notifications.ack(incident!.id, 'owner');
-    expect(acked?.ackedAt).not.toBeNull();
-    h.supervisor.onNotificationAcked(incident!.id);
+    expect(incident?.routing).toBe('action-required');
+    // Gru's disposition (the supported machine control) re-arms as before;
+    // a human Ack is refused for the machine row.
+    expect(() => h.notifications.ack(incident!.id, 'owner')).toThrow(/action-required/);
+    h.ledger.disposeMachineNotification(incident!.id, 'provider condition addressed');
+    h.supervisor.onNotificationDisposed(incident!.id);
     await h.settle();
     // The respawn happened through the normal ladder.
     expect(h.registry.spawns).toBeGreaterThanOrEqual(1);

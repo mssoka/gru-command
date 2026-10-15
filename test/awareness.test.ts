@@ -121,7 +121,7 @@ describe('gru awareness — passive injection', () => {
   it('never injects a disposed machine row or acknowledged owner stop', () => {
     const rig = boot();
     const acked = rig.notifications.post({
-      kind: 'supervision.breaker',
+      kind: 'port-squat',
       routing: 'needs-owner',
       severity: 'error',
       title: 'Ack me first',
@@ -144,7 +144,7 @@ describe('gru awareness — passive injection', () => {
 
   it('passive mode carries owner-only stops in every user turn without autonomously waking', () => {
     const rig = boot({ wakeMode: 'never' });
-    const stop = rig.notifications.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Owner re-arm required' });
+    const stop = rig.notifications.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Owner re-arm required' });
     expect(rig.woke).toHaveLength(0);
     const first = rig.awareness.prepare();
     expect(first?.text).toContain('Owner re-arm required');
@@ -158,7 +158,7 @@ describe('gru awareness — passive injection', () => {
   it('retains a machine follow-up in the user block even with more than eight open owner stops', () => {
     const rig = boot({ wakeMode: 'never' });
     for (let i = 0; i < 10; i += 1) {
-      rig.notifications.post({ kind: `owner-${i}`, routing: 'needs-owner', severity: 'error', title: `Owner ${i}` });
+      rig.notifications.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: `Owner ${i}` });
     }
     const machine = rig.notifications.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Still needs Gru' });
     rig.awareness.commit(rig.awareness.prepare()!);
@@ -505,18 +505,25 @@ describe('gru awareness — wake policy', () => {
     const dir = tmpDir();
     const passive = boot({ dir });
     const row = passive.notifications.post({ kind: 'a', routing: 'action-required', severity: 'error', title: 'Old machine alert' });
-    for (let i = 0; i < 55; i += 1) passive.notifications.post({ kind: 'noise', routing: i % 2 ? 'fyi' : 'needs-owner', severity: 'info', title: `Noise ${i}` });
+    for (let i = 0; i < 55; i += 1) {
+      passive.notifications.post({
+        kind: i % 2 ? 'noise.fyi' : 'port-squat',
+        routing: i % 2 ? 'fyi' : 'needs-owner',
+        severity: 'info',
+        title: `Noise ${i}`,
+      });
+    }
     passive.awareness.commit(passive.awareness.prepare()!);
     const active = boot({ dir, wakeMode: 'action-required' });
     expect(active.woke).toHaveLength(1);
     expect(active.wakeBlocks[0]).toContain(row.id);
   });
 
-  it('all mode includes FYI and needs-owner rows in the turn payload', () => {
+  it('all mode includes FYI and owner rows in the turn payload', () => {
     const rig = boot({ wakeMode: 'all' });
-    for (const routing of ['fyi', 'needs-owner'] as const) {
-      const row = rig.notifications.post({ kind: routing, routing, severity: 'info', title: `Alert ${routing}` });
-      expect(rig.wakeBlocks.at(-1)).toContain(`Alert ${routing}`);
+    for (const entry of [{ kind: 'noise.fyi', routing: 'fyi' }, { kind: 'port-squat', routing: 'needs-owner' }] as const) {
+      const row = rig.notifications.post({ kind: entry.kind, routing: entry.routing, severity: 'info', title: `Alert ${entry.routing}` });
+      expect(rig.wakeBlocks.at(-1)).toContain(`Alert ${entry.routing}`);
       expect(rig.wakeBlocks.at(-1)).toContain(row.id);
     }
   });
@@ -563,6 +570,30 @@ describe('gru awareness — wake policy', () => {
     }
   });
 
+  it('a delivered wake resolves blocked/failed wake stops but leaves machine alerts open', () => {
+    const dir = tmpDir();
+    const db = new LedgerDb(dir);
+    const bus = new EventBus();
+    const api = new LedgerApi(db.handle, { bus });
+    const center = new NotificationCenter({ ledger: api, bus });
+    const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+    const blocked = center.post({ kind: 'gru.wake-blocked.machine-alert', routing: 'needs-owner', severity: 'error', title: 'Gru wake blocked' });
+    const mailboxBlocked = center.post({ kind: 'gru.wake-blocked-mailbox.incident-x', routing: 'needs-owner', severity: 'error', title: 'Mailbox wake blocked' });
+    const failed = center.post({ kind: 'gru.wake-failed-escalation.incident-x', routing: 'needs-owner', severity: 'error', title: 'Gru wake failed' });
+    const machine = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Machine alert stays open' });
+    awareness.setWakeSink(() => {
+      const injection = awareness.prepare('wake');
+      if (injection === null) return;
+      awareness.commit(injection);
+      awareness.noteWakeOutcome(true, undefined, injection);
+    });
+    center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Wake me' });
+    expect(api.getNotification(blocked.id)?.resolvedBy).toBe('chat-recovered');
+    expect(api.getNotification(mailboxBlocked.id)?.resolvedBy).toBe('chat-recovered');
+    expect(api.getNotification(failed.id)?.resolvedBy).toBe('chat-recovered');
+    expect(api.getNotification(machine.id)).toMatchObject({ resolvedAt: null, ackedAt: null, routing: 'action-required' });
+  });
+
   it('escalates an undeliverable recovery-blocked wake and retains the machine ID for retry', () => {
     vi.useFakeTimers();
     try {
@@ -582,6 +613,167 @@ describe('gru awareness — wake policy', () => {
       vi.advanceTimersByTime(5_000);
       expect(attempts).toBe(2);
       expect(api.listNotifications({ routing: 'needs-owner' }).filter((row) => row.id === `gru-wake-blocked:${alert.id}`)).toHaveLength(1);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a resolved blocked-wake stop no longer suppresses the NEXT block episode (recurrence)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+      awareness.setWakeSink(() => awareness.noteWakeBlocked('native writer uncertain'));
+      const alert = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Needs a wake' });
+      const canonical = `gru-wake-blocked:${alert.id}`;
+      expect(api.getNotification(canonical)).toMatchObject({ routing: 'needs-owner', resolvedAt: null });
+      // The operator closes the notices after the manual recovery.
+      api.resolveNotificationById(canonical, 'operator');
+      expect(api.getNotification(canonical)?.resolvedAt).not.toBeNull();
+      // The machine alert is still pending; the next blocked retry must
+      // post a FRESH stop, not find the closed receipt and stay silent.
+      vi.advanceTimersByTime(5_000);
+      const stops = api.listNotifications({ limit: 100, routing: 'needs-owner' }).filter((row) => row.kind === `gru.wake-blocked.${alert.id}`);
+      expect(stops).toHaveLength(2);
+      const fresh = stops.find((row) => row.id !== canonical);
+      expect(fresh).toMatchObject({ routing: 'needs-owner', ackedAt: null, resolvedAt: null });
+      expect(fresh?.id.startsWith(`${canonical}:`)).toBe(true);
+      // Dedupe holds while the fresh stop is open: no further rows.
+      vi.advanceTimersByTime(15_000);
+      expect(
+        api.listNotifications({ limit: 100, routing: 'needs-owner' }).filter((row) => row.kind === `gru.wake-blocked.${alert.id}`),
+      ).toHaveLength(2);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an open blocked-wake stop outside the newest page window still dedupes (uncapped exact-kind lookup)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-09-23T12:00:00Z'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const center = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMinIntervalMs: 0, now: () => Date.now() });
+      awareness.setWakeSink(() => awareness.noteWakeBlocked('native writer uncertain'));
+      const alert = center.post({ kind: 'test.machine', routing: 'action-required', severity: 'error', title: 'Needs a wake' });
+      const canonical = `gru-wake-blocked:${alert.id}`;
+      expect(api.getNotification(canonical)).toMatchObject({ resolvedAt: null });
+      // More than a 1000-row page of NEWER needs-owner rows: a paged dedupe
+      // would miss the still-open canonical stop and duplicate the debt.
+      vi.advanceTimersByTime(1_000);
+      for (let index = 0; index < 1_001; index += 1) {
+        api.recordNotification({
+          id: `flood-${String(index).padStart(4, '0')}`,
+          kind: 'test.flood',
+          routing: 'needs-owner',
+          severity: 'info',
+          title: `flood ${index}`,
+        });
+      }
+      vi.advanceTimersByTime(5_000); // the blocked retry fires again
+      const stops = api
+        .listNotifications({ limit: 5_000, routing: 'needs-owner' })
+        .filter((row) => row.kind === `gru.wake-blocked.${alert.id}`);
+      expect(stops).toHaveLength(1);
+      expect(stops[0]?.id).toBe(canonical);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an OPEN failed-wake escalation outside the newest page window still dedupes (uncapped exact-kind lookup)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection === null) return;
+        awareness.noteWakeOutcome(true, undefined, injection);
+        awareness.noteWakeTurnFailure('model stream died', injection);
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-31:abc', routing: 'action-required', severity: 'error', title: 'Failing turn' });
+      vi.advanceTimersByTime(60_000); // the bound is spent: one escalation
+      const canonical = 'gru-wake-failed:github.ci-failed_j-31_abc';
+      expect(api.getNotification(canonical)).toMatchObject({ resolvedAt: null });
+      // More than a 1000-row page of NEWER needs-owner rows: a paged dedupe
+      // would miss the still-open canonical stop and post a duplicate :2.
+      vi.advanceTimersByTime(1_000);
+      for (let index = 0; index < 1_001; index += 1) {
+        api.recordNotification({
+          id: `fwarena-${String(index).padStart(4, '0')}`,
+          kind: 'test.flood',
+          routing: 'needs-owner',
+          severity: 'info',
+          title: `flood ${index}`,
+        });
+      }
+      const injection = { text: 'again', coveredThroughSeq: 0, notificationIds: [row.id] };
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      const stops = api
+        .listNotifications({ limit: 5_000, routing: 'needs-owner' })
+        .filter((entry) => entry.kind === 'gru.wake-failed-escalation.github.ci-failed_j-31_abc');
+      expect(stops).toHaveLength(1);
+      expect(stops[0]?.id).toBe(canonical);
+      awareness.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a resolved failed-wake escalation re-raises on the next exhausted cycle with a fresh identity', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-05T12:00:00'));
+      const dir = tmpDir();
+      const db = new LedgerDb(dir);
+      const bus = new EventBus();
+      const api = new LedgerApi(db.handle, { bus });
+      const notifications = new NotificationCenter({ ledger: api, bus });
+      const awareness = new GruAwareness({ dir, ledger: api, bus, wakeMode: 'action-required', wakeMinIntervalMs: 0, now: () => Date.now() });
+      awareness.setWakeSink(() => {
+        const injection = awareness.prepare('wake');
+        if (injection === null) return;
+        awareness.noteWakeOutcome(true, undefined, injection);
+        awareness.noteWakeTurnFailure('model stream died', injection);
+      });
+      const row = notifications.post({ kind: 'github.ci-failed:j-21:abc', routing: 'action-required', severity: 'error', title: 'Failing turn' });
+      vi.advanceTimersByTime(60_000);
+      const canonical = 'gru-wake-failed:github.ci-failed_j-21_abc';
+      expect(api.getNotification(canonical)).toMatchObject({ routing: 'needs-owner', resolvedAt: null });
+      api.resolveNotificationById(canonical, 'operator');
+      // A second exhausted cycle for the SAME incident (the machine alert
+      // is still open) must re-raise instead of dying against the closed row.
+      const injection = { text: 'retry', coveredThroughSeq: 0, notificationIds: [row.id] };
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      awareness.noteWakeTurnFailure('model stream died again', injection);
+      const escalations = api
+        .listNotifications({ limit: 100, routing: 'needs-owner' })
+        .filter((entry) => entry.kind === 'gru.wake-failed-escalation.github.ci-failed_j-21_abc');
+      expect(escalations.length).toBeGreaterThanOrEqual(2);
+      const fresh = escalations.find((entry) => entry.id !== canonical);
+      expect(fresh).toMatchObject({ resolvedAt: null, ackedAt: null });
+      expect(fresh?.id.startsWith(`${canonical}:`)).toBe(true);
       awareness.dispose();
     } finally {
       vi.useRealTimers();
@@ -1668,13 +1860,15 @@ describe('gru awareness — wake rework (issue #219)', () => {
       rig.notifications.post({ kind: 'supervision.provider-wall.a1.quota_wall', routing: 'action-required', severity: 'error', title: 'Agent a1 stopped: quota wall' });
       expect(rig.woke).toHaveLength(1); // provider wall: hard floor, never deferred
       expect(rig.api.listEventsAfter(0, { kinds: ['gru.wake-deferred'] })).toHaveLength(0);
-      // needs-owner routing is a floor too (all mode wakes for it).
+      // needs-owner routing is a floor too (all mode wakes for it, and the
+      // registered owner kind is NOT downgraded to machine attention).
       rig.api.recordDecision({
-        subject: 'incident:supervision.breaker:crash-loop-breaker-tripped',
-        decision: 'hold', covers: ['supervision.breaker'], basisFingerprint: null,
-        reason: 'meaningless hold on a breaker', by: 'owner', clientKey: 'hold-breaker',
+        subject: 'incident:port-squat:foreign-listener',
+        decision: 'hold', covers: ['port-squat'], basisFingerprint: null,
+        reason: 'meaningless hold on an owner notice', by: 'owner', clientKey: 'hold-owner-notice',
       });
-      rig.notifications.post({ kind: 'supervision.breaker', routing: 'needs-owner', severity: 'error', title: 'Crash-loop breaker tripped' });
+      const ownerNotice = rig.notifications.post({ kind: 'port-squat', routing: 'needs-owner', severity: 'error', title: 'Foreign process holds the port' });
+      expect(ownerNotice.routing).toBe('needs-owner');
       expect(rig.woke).toHaveLength(2);
     } finally {
       vi.useRealTimers();

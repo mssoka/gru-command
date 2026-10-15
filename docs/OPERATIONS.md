@@ -90,7 +90,8 @@ defenses, each with its own loud failure:
   the roll — a squatter answering 200 is never read as success.
 - **Boot checks the listener pid.** A service that binds but finds a
   foreign listener on its port logs the squatter pid + command, posts an
-  action-required notification, and exits — never a silent loopback 503.
+  owner-only `port-squat` notice (it clears on a later successful bind),
+  and exits — never a silent loopback 503.
 
 ## Supervision and the crash-loop breaker
 
@@ -100,10 +101,11 @@ restart ladder with resume — the conversation survives, and the
 interrupted prompt is re-delivered or the lane is escalated as
 recoverable). Sleep/wake gaps grant a fresh silence window instead of
 restarting. ≥ 3 restarts inside 10 minutes trips the **crash-loop
-breaker**: the agent is stopped, a needs-owner notification escalates
-(FOR YOU band + owner bell + chat notice), and **acking that notification
-re-arms** supervision — re-arm is the human's step. A service restart also clears an open breaker —
-the ack record is durable, the breaker state is not.
+breaker**: the agent is stopped and an action-required machine alert wakes
+Gru; **Gru's guarded disposition on that alert re-arms** supervision (an
+operator using the lane's slot does too) — the owner is never asked to
+ack. A service restart also clears an open breaker — the resolution record
+is durable, the breaker state is not.
 
 Knobs (`[supervision]` in `config.toml`): `turn_silence_ms` (default 15
 min), `restart_window_ms` / `max_restarts` / `restart_backoff_ms`, and
