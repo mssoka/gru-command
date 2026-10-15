@@ -658,6 +658,21 @@ describe('verification scheduler — global budget', () => {
     expect(state.slots).toEqual([]);
   });
 
+  it('PR334 timeout escalation still SIGKILLs a TERM-resistant descendant after its shell exited', async () => {
+    const { scheduler } = makeScheduler({ runTimeoutMs: 250, lockWaitTimeoutMs: 500 });
+    scheduler.start();
+    const pidFile = join(tempDir(), 'descendant.pid');
+    const command = `trap 'exit 0' TERM; (trap '' TERM; exec /bin/sh -c 'echo $$ > ${pidFile}; exec sleep 600') >/dev/null 2>&1 & wait`;
+    const outcome = await scheduler.run(spec('job-descendant', command));
+    expect(outcome.timedOut).toBe(true);
+    const descendant = Number(readFileSync(pidFile, 'utf-8').trim());
+    try {
+      await waitFor(() => !pidAlive(descendant), 3_000);
+    } finally {
+      try { process.kill(descendant, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  });
+
   it('dispose terminates active runs and refuses new work', async () => {
     const { scheduler } = makeScheduler({ runTimeoutMs: 60_000 });
     scheduler.start();

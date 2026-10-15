@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -315,6 +315,29 @@ describe('verification build reuse (#318)', () => {
       rmSync(storage, { recursive: true, force: true });
     }
   }
+
+  it('PR334 later-step spawn failure keeps the consumed request identity non-replayable', async () => {
+    const lane = makeLane(); const storage = mkdtempSync(join(tmpdir(), 'gru-pr334-later-step-'));
+    const moved = `${lane.repo.path}.moved`;
+    let settledSteps = 0;
+    const scheduler = new VerificationScheduler({ storageDir: storage,
+      limits: { maxConcurrent: 1, workerBudget: 4, lockWaitTimeoutMs: 30_000, runTimeoutMs: 30_000 },
+      sweepIntervalMs: 50, killGraceMs: 100, disposeGraceMs: 500,
+      onSettled: () => { settledSteps += 1; if (settledSteps === 1) renameSync(lane.repo.path, moved); } });
+    const submit = () => scheduler.submit({ jobId: 'j-334', scope: 'docs', command: DOCS, cwd: lane.repo.path, head: lane.repo.head(), requestId: 'pr334-later-step' }, () => {});
+    try {
+      const first = await submit().catch((error: unknown) => error);
+      renameSync(moved, lane.repo.path);
+      expect(lane.steps()).toEqual(['build']);
+      const second = await submit().catch((error: unknown) => error);
+      // The consumed identity is never replayable: the original executed
+      // step must not run again whatever the first attempt reported.
+      expect(lane.steps()).toEqual(['build']);
+      expect((first as VerificationOutcome).ok).toBe(false); expect(second).toBeDefined();
+    } finally {
+      await scheduler.dispose(); rmSync(storage, { recursive: true, force: true });
+    }
+  });
 
   it('R16 post-source healthy owned native exit detaches before the original grace callback', async () => {
     await assertR16OriginalNativeGrace(false);

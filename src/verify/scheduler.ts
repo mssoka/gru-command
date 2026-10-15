@@ -559,6 +559,17 @@ export function pidAlive(pid: number): boolean {
 
 /** Signal the child's whole process group (detached spawn) so vitest
  * workers cannot outlive a timed-out shell; fall back to the child. */
+/** True while any member of the child's process group exists (signal 0 probe). */
+function processGroupAlive(child: ChildProcess): boolean {
+  if (child.pid === undefined) return false;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   if (child.pid === undefined) return;
   try {
@@ -1817,9 +1828,11 @@ export class VerificationScheduler {
         if (live === null) return;
         signalGroup(live, 'SIGTERM');
         const killTimer = setTimeout(() => {
-          // The original grace bound grants no authority over a detached
-          // completed step (or a later child which reused its number).
-          if (current === live) signalGroup(live, 'SIGKILL');
+          // Shell exit is not process-group cessation: a TERM-resistant
+          // descendant can outlive its shell. A live group pins its pgid, so
+          // a positive probe proves these are still our descendants and an
+          // absent group grants no authority over a reused number.
+          if (current === live || processGroupAlive(live)) signalGroup(live, 'SIGKILL');
         }, this.killGraceMs);
         killTimer.unref?.();
       }, this.opts.limits.runTimeoutMs);
@@ -1894,13 +1907,20 @@ export class VerificationScheduler {
       // Real child existence precedes every callback/started-frame await;
       // shutdown must not convert an owned native step into a no-start.
       const attempt = [...this.attempts.values()].find((owner) => owner.runId === lease.runId);
+      const earlierStepRan = attempt?.started === true;
       if (attempt !== undefined && child.pid !== undefined) attempt.started = true;
       const spawnResult = await new Promise<Error | null>((resolveSpawn) => {
         child.once('spawn', () => resolveSpawn(null));
         child.once('error', (error: Error) => resolveSpawn(error));
       });
       if (spawnResult !== null) {
-        if (child.pid === undefined) { current = null; slot.child = null; slot.pid = null; throw new VerificationSpawnFailedError(spawnResult.message); }
+        if (child.pid === undefined) {
+          current = null; slot.child = null; slot.pid = null;
+          // An earlier step already executed under this identity: it is
+          // consumed, so report a failed run instead of a replayable no-start.
+          if (earlierStepRan) { runError = spawnResult; return { exitCode: null, signal: null }; }
+          throw new VerificationSpawnFailedError(spawnResult.message);
+        }
         throw spawnResult;
       }
       if (child.pid === undefined) throw new Error('native spawn event has no bound PID; verification ownership is UNKNOWN');
