@@ -1,4 +1,4 @@
-import { readWorktreeMetadata, commonDirectoryOfGitdir, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
+import { readWorktreeMetadata, repositoryCommonDirectory, capturePortLaneHandoff, captureCwdHandoff, beginLaneHandoff, completeLaneHandoff, rememberManagedLane, registerHandoffManager, assertPendingLaneHandoff, captureCleanupHandoff, assertLaneResourcesAbsent, WorktreeHandoffUnresolvedError } from './handoff.js';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
@@ -1517,14 +1517,9 @@ export class WorktreeManager {
   /** Derive the assigned common directory without letting Git read an
    * unproven ref/HEAD before rollback's finite metadata checks. */
   private creationCommonDirectory(repoPath: string): string {
-    const git = join(repoPath, '.git');
-    const canonical = realpathSync(git);
-    if (lstatSync(canonical).isDirectory()) return canonical;
-    const gitFile = readWorktreeMetadata(git).trim();
-    if (!gitFile.startsWith('gitdir: ')) throw new Error('missing repository gitdir');
-    // A linked worktree resolves through `commondir`; a --separate-git-dir
-    // checkout's gitdir is the common directory itself (#372).
-    return commonDirectoryOfGitdir(realpathSync(resolve(repoPath, gitFile.slice('gitdir: '.length))));
+    // The same layout reading as the handoff proof (#372): a .git directory,
+    // a linked worktree (through commondir) or a --separate-git-dir checkout.
+    return repositoryCommonDirectory(repoPath);
   }
 
   private assertRollbackBranchMetadata(repoPath: string, custody: CreationCustody, common: string): void {

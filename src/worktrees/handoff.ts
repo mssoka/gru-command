@@ -118,12 +118,18 @@ function assertIssued(receipt: Receipt, lane: WorktreeRecord, ledger: LedgerApi)
     JSON.stringify(ledger.getEvent(fact.seq)) !== JSON.stringify(fact)) throw new Error('service handoff issuance conflicts with original binding');
 }
 
-function adminFor(path: string): string {
+/** The gitdir a checkout's `.git` FILE names, resolved against the checkout
+ * but not yet followed — so a dangling target can still be refused by name. */
+function linkedGitdir(path: string): string {
   const file = join(path, '.git');
-  if (!lstatSync(file).isFile()) throw new Error('managed checkout no longer has its linked gitdir file');
+  if (!lstatSync(file).isFile()) throw new Error(`checkout ${path} no longer has its linked gitdir file`);
   const text = readWorktreeMetadata(file).trim();
-  if (!text.startsWith('gitdir: ')) throw new Error('managed checkout lost its linked gitdir');
-  return realpathSync(resolve(path, text.slice(8)));
+  if (!text.startsWith('gitdir: ')) throw new Error(`checkout ${path} lost its linked gitdir: its .git file has no "gitdir: " line`);
+  return resolve(path, text.slice(8));
+}
+
+function adminFor(path: string): string {
+  return realpathSync(linkedGitdir(path));
 }
 
 /** The common git directory a `.git` FILE's gitdir resolves to (#372): a
@@ -131,19 +137,29 @@ function adminFor(path: string): string {
  * `--separate-git-dir` checkout's gitdir IS the full git directory (no
  * `commondir`). Anything else is not a supported layout and fails loud. */
 export function commonDirectoryOfGitdir(gitdir: string): string {
-  const commondir = join(gitdir, 'commondir');
-  if (!absent(commondir)) return realpathSync(resolve(gitdir, readWorktreeMetadata(commondir).trim()));
-  if (!lstatSync(gitdir).isDirectory() || absent(join(gitdir, 'HEAD')) || absent(join(gitdir, 'objects')) || absent(join(gitdir, 'refs'))) {
-    throw new Error('repository gitdir is neither a linked worktree administration nor a git directory');
+  const refuse = (problem: string): never => {
+    throw new Error(`repository gitdir ${gitdir} is neither a linked worktree administration nor a git directory: ${problem}`);
+  };
+  if (absent(gitdir)) refuse('it does not exist');
+  const canonical = realpathSync(gitdir);
+  if (!lstatSync(canonical).isDirectory()) refuse('it is not a directory');
+  const commondir = join(canonical, 'commondir');
+  if (!absent(commondir)) return realpathSync(resolve(canonical, readWorktreeMetadata(commondir).trim()));
+  if (absent(join(canonical, 'HEAD')) || !lstatSync(join(canonical, 'HEAD')).isFile()) refuse('it has no HEAD file');
+  for (const name of ['objects', 'refs']) {
+    if (absent(join(canonical, name)) || !lstatSync(join(canonical, name)).isDirectory()) refuse(`it has no ${name} directory`);
   }
-  return gitdir;
+  return canonical;
 }
 
-/** The repository's common git directory: its `.git` directory, or what its
- * `.git` file's gitdir resolves to (linked worktree or separate git dir). */
+/** The repository's common git directory: its `.git` directory (a symlinked
+ * one followed), or what its `.git` file's gitdir resolves to (linked
+ * worktree or separate git dir). The ONE layout reading behind the handoff
+ * proof, the absence proof and creation custody. */
 export function repositoryCommonDirectory(repoPath: string): string {
   const repoGit = join(repoPath, '.git');
-  return lstatSync(repoGit).isDirectory() ? realpathSync(repoGit) : commonDirectoryOfGitdir(adminFor(repoPath));
+  const canonical = realpathSync(repoGit);
+  return lstatSync(canonical).isDirectory() ? canonical : commonDirectoryOfGitdir(linkedGitdir(repoPath));
 }
 
 function validate(receipt: Receipt, lane: WorktreeLane): void {
